@@ -12,7 +12,10 @@ import type {
 import { matches_filter } from '../table-transform';
 import type { CsvSaveOperation, FilterEntry, SheetTransformState } from '../types';
 import { CsvDataSource } from '../data-source/csv-source';
-import { create_edit_session_store } from '../webview/edit-session-store';
+import {
+    create_edit_session_store,
+    type DirtyEntry,
+} from '../webview/edit-session-store';
 import { create_history_store, type HistoryStore } from '../webview/history-store';
 import {
     LAST_COLUMN_RESIZE_GUTTER_PX,
@@ -112,7 +115,7 @@ const grid_mock = vi.hoisted(() => ({
     // durable edit-key row space is non-vacuous.
     source_row_for_display: null as null | ((display_row: number) => number | undefined),
     ensure_rows: vi.fn(),
-    ensure_rows_loaded: vi.fn(async () => true),
+    ensure_rows_loaded: vi.fn(async (_start?: number, _end?: number) => true),
     trim_rows: vi.fn(),
     // Eviction holds. Recorded rather than simulated: what the loader does with a
     // pin is pinned by use-row-loader.test.ts; what matters here is that GridShell
@@ -163,6 +166,7 @@ vi.mock('../webview/glide-data-grid', () => {
 // bounded display window stands in for the loader's source→page index; the harness
 // only ever renders a handful of rows.
 const SCANNED_DISPLAY_ROWS = vi.hoisted(() => 64);
+const additionally_loaded_source_rows = vi.hoisted(() => new Map<number, number>());
 const resident_display_row = vi.hoisted(() => (source_row: number): number | undefined => {
     for (let display_row = 0; display_row < SCANNED_DISPLAY_ROWS; display_row++) {
         const claimed = grid_mock.source_row_for_display
@@ -210,7 +214,13 @@ vi.mock('../webview/use-row-loader', () => ({
                 return grid_mock.get_row(display_row)?.[col] ?? null;
             },
             has_source_row: (source_row: number) => (
-                resident_display_row(source_row) !== undefined
+                additionally_loaded_source_rows.has(source_row)
+                || resident_display_row(source_row) !== undefined
+            ),
+            get_display_row_for_source: (source_row: number) => (
+                additionally_loaded_source_rows.has(source_row)
+                    ? additionally_loaded_source_rows.get(source_row)
+                    : resident_display_row(source_row)
             ),
             get_compare_status: (row: number) => grid_mock.compare_status[row],
             get_compare_base: (row: number, col: number) =>
@@ -364,6 +374,7 @@ afterEach(() => {
     // Back to identity: a leaked permutation would silently change which source
     // row every later test's edits land on.
     grid_mock.source_row_for_display = null;
+    additionally_loaded_source_rows.clear();
     grid_mock.row_resize_props = null;
     grid_mock.row_resize_set_target.mockReset();
     grid_mock.update_cells.mockReset();
@@ -931,6 +942,24 @@ describe('GridShell column projection', () => {
         expect(document.activeElement).toBe(
             container!.querySelector('.data-editor-stub'),
         );
+
+        // Glide moves the live cell editor outside the grid tree into #portal.
+        // It is still the grid's focus for save/rejection handoff purposes.
+        const portal = document.createElement('div');
+        portal.id = 'portal';
+        const clip = document.createElement('div');
+        clip.className = 'gdg-clip-region';
+        const editor = document.createElement('textarea');
+        clip.appendChild(editor);
+        portal.appendChild(clip);
+        document.body.appendChild(portal);
+        editor.focus();
+        expect(grid_focus_ref.current?.has_focus()).toBe(true);
+
+        const unrelated = document.createElement('input');
+        document.body.appendChild(unrelated);
+        unrelated.focus();
+        expect(grid_focus_ref.current?.has_focus()).toBe(false);
     });
 
     it('wraps Tab and Shift+Tab through displayed columns', async () => {
@@ -1135,7 +1164,7 @@ describe('GridShell column projection', () => {
         const on_cell_edited = edit_one(grid_mock.props!.onCellsEdited);
         await act(async () => on_cell_edited([0, 0], { kind: 'text', data: 'typed' }));
         expect(Object.fromEntries(store.snapshot())).toEqual({
-            '0:0': { value: 'typed', base: 'source-a' },
+            '0:0': { value: 'typed', base: 'source-a', formattingKnown: true },
         });
 
         await close_overlay();
@@ -1355,7 +1384,9 @@ describe('GridShell column projection', () => {
         await act(async () => editing_ref.current?.commit_live_edit());
         const latest_status = on_editing_change.mock.calls.at(-1)![0];
         expect(latest_status.edits).toEqual({
-            '0:2': { value: 'typed but not closed', base: 'source-c' },
+            '0:2': {
+                value: 'typed but not closed', base: 'source-c', formattingKnown: true,
+            },
         });
         expect(editing_ref.current?.has_uncommitted_changes()).toBe(true);
 
@@ -2898,6 +2929,135 @@ describe('GridShell column projection', () => {
     });
 });
 
+describe('GridShell pending-edit Diff painting', () => {
+    it('loads and reveals a nonresident source row in an identity view', async () => {
+        const editing_ref = React.createRef<EditingHandle | null>();
+        grid_mock.ensure_rows_loaded.mockImplementation(async (start = 0, end = start) => {
+            for (let row = start; row <= end; row += 1) {
+                additionally_loaded_source_rows.set(row, row);
+            }
+            return true;
+        });
+        await render_grid(props({
+            editing_ref,
+            sheet_meta: {
+                ...props().sheet_meta,
+                rowCount: 100,
+                sourceRowCount: 100,
+            },
+        }));
+
+        await expect(editing_ref.current!.reveal_source_cell(75, 0)).resolves.toBe(true);
+        expect(grid_mock.ensure_rows_loaded).toHaveBeenCalledWith(75, 75);
+        expect(grid_mock.scroll_to).toHaveBeenCalledWith(0, 75);
+        expect(document.activeElement).toBe(container!.querySelector('.data-editor-stub'));
+    });
+
+    it('does not focus a row after its navigation request was cancelled while loading', async () => {
+        const editing_ref = React.createRef<EditingHandle | null>();
+        let finish_loading: (() => void) | undefined;
+        grid_mock.ensure_rows_loaded.mockImplementation(async (start = 0, end = start) => {
+            await new Promise<void>((resolve) => { finish_loading = resolve; });
+            for (let row = start; row <= end; row += 1) {
+                additionally_loaded_source_rows.set(row, row);
+            }
+            return true;
+        });
+        await render_grid(props({
+            editing_ref,
+            sheet_meta: {
+                ...props().sheet_meta,
+                rowCount: 100,
+                sourceRowCount: 100,
+            },
+        }));
+        let current = true;
+        const reveal = editing_ref.current!.reveal_source_cell(75, 0, () => current);
+        current = false;
+        finish_loading?.();
+
+        await expect(reveal).resolves.toBe(false);
+        expect(grid_mock.scroll_to).not.toHaveBeenCalled();
+        expect(grid_mock.focus).not.toHaveBeenCalled();
+    });
+
+    it('maps the last physical row around a promoted header before loading it', async () => {
+        const editing_ref = React.createRef<EditingHandle | null>();
+        grid_mock.ensure_rows_loaded.mockImplementation(async (start = 0, end = start) => {
+            expect([start, end]).toEqual([99, 99]);
+            additionally_loaded_source_rows.set(100, 99);
+            return true;
+        });
+        await render_grid(props({
+            editing_ref,
+            row_count: 100,
+            sheet_meta: {
+                ...props().sheet_meta,
+                rowCount: 100,
+                sourceRowCount: 101,
+                excelFirstRowHeader: {
+                    mode: 'on',
+                    detected: true,
+                    active: true,
+                    available: true,
+                    sourceRow: 0,
+                },
+            },
+        }));
+
+        expect(editing_ref.current!.can_reveal_source_cell(100, 0)).toBe(true);
+        await expect(editing_ref.current!.reveal_source_cell(100, 0)).resolves.toBe(true);
+        expect(grid_mock.ensure_rows_loaded).toHaveBeenCalledWith(99, 99);
+        expect(grid_mock.scroll_to).toHaveBeenCalledWith(0, 99);
+    });
+
+    it('does not offer navigation for a projected nonresident source row', async () => {
+        const editing_ref = React.createRef<EditingHandle | null>();
+        await render_grid(props({
+            editing_ref,
+            row_count: 100,
+            sheet_meta: {
+                ...props().sheet_meta,
+                rowCount: 100,
+                sourceRowCount: 100,
+            },
+            transform_state: {
+                sort: [{ colIndex: 0, direction: 'asc' }],
+                filters: [],
+            },
+        }));
+
+        expect(editing_ref.current!.can_reveal_source_cell(75, 0)).toBe(false);
+        await expect(editing_ref.current!.reveal_source_cell(75, 0)).resolves.toBe(false);
+        expect(grid_mock.ensure_rows_loaded).not.toHaveBeenCalled();
+    });
+
+    it('shows the current file value after that cell changed', async () => {
+        await render_grid(props({
+            diff_mode: true,
+            edit_mode: true,
+            csv_editable: true,
+            initial_edits: {
+                '0:0': {
+                    value: 'my pending edit',
+                    base: 'value when editing began',
+                    observedBase: { value: 'source-a' },
+                },
+            },
+        }));
+
+        const cell = (grid_mock.props!.getCellContent as (
+            location: [number, number],
+        ) => { data: string | { lines: { text: string }[][] } })([0, 0]);
+        expect(cell.data).toMatchObject({ kind: 'rich-text' });
+        const text = (cell.data as { lines: { text: string }[][] })
+            .lines.flat().map((run) => run.text).join('');
+        expect(text).toContain('source-a');
+        expect(text).toContain('my pending edit');
+        expect(text).not.toContain('value when editing began');
+    });
+});
+
 describe('GridShell link-only edits', () => {
     it('keeps the formatted display when only the hyperlink changed', async () => {
         // A link-only entry's `value` is the unedited cell's raw text, and the
@@ -3708,6 +3868,7 @@ describe('GridShell edit-admission lifetime', () => {
         expect(store.snapshot().get('0:0')).toEqual({
             value: 'typed',
             base: 'source-a',
+            formattingKnown: true,
         });
         expect(changed).toHaveBeenCalledTimes(1);
 
@@ -4667,7 +4828,191 @@ describe('GridShell hyperlink dialog admission', () => {
         expect(editing_ref.current!.has_uncommitted_changes()).toBe(true);
     });
 
-    it('refuses a hyperlink once the close barrier is raised', async () => {
+    it('folds a hyperlink draft into a Cmd/Ctrl+S save', async () => {
+        const editing_ref = React.createRef<EditingHandle | null>();
+        const store = create_edit_session_store({ session_id: 'session-1' });
+        let submitted: Record<string, DirtyEntry> = {};
+        const on_save_request = vi.fn((): CsvSaveOperation => {
+            submitted = Object.fromEntries(store.snapshot());
+            return {
+                editSessionId: 'session-1',
+                saveRequestId: 'save-link-draft',
+                worksheets: [{
+                    sheetIndex: 0,
+                    sheetName: 'Sheet1',
+                    edits: Object.fromEntries(
+                        Object.entries(submitted).map(([key, entry]) => [key, entry.value]),
+                    ),
+                    dirtyEdits: submitted,
+                }],
+            };
+        });
+        await render_grid({
+            ...link_props(editing_ref),
+            edit_session: store,
+            on_save_request,
+        });
+        await open_dialog();
+        const dialog_pin = grid_mock.pin_rows.mock.results.at(-1)!.value as symbol;
+        await act(async () => set_input_value(
+            field('hyperlink-target') as HTMLInputElement,
+            'https://shortcut.test/path',
+        ));
+
+        await act(async () => {
+            field('hyperlink-target').dispatchEvent(new KeyboardEvent('keydown', {
+                key: 's',
+                ctrlKey: true,
+                bubbles: true,
+                cancelable: true,
+            }));
+        });
+
+        expect(on_save_request).toHaveBeenCalledOnce();
+        expect(submitted['0:0']).toEqual(expect.objectContaining({
+            link: { kind: 'external', target: 'https://shortcut.test/path' },
+            baseLink: null,
+        }));
+        expect(document.getElementById('hyperlink-target')).toBeNull();
+        expect(grid_mock.unpin_rows).toHaveBeenCalledWith(dialog_pin);
+    });
+
+    it('allows Cmd/Ctrl+S through an untouched empty hyperlink dialog', async () => {
+        const editing_ref = React.createRef<EditingHandle | null>();
+        const store = create_edit_session_store({ session_id: 'session-1' }, {
+            '0:1': { value: 'pending', base: 'middle' },
+        });
+        const on_save_request = vi.fn((): CsvSaveOperation => ({
+            editSessionId: 'session-1',
+            saveRequestId: 'save-with-untouched-link-dialog',
+            worksheets: [],
+        }));
+        await render_grid({
+            ...link_props(editing_ref),
+            edit_session: store,
+            on_save_request,
+        });
+        await open_dialog();
+
+        await act(async () => {
+            field('hyperlink-target').dispatchEvent(new KeyboardEvent('keydown', {
+                key: 's',
+                ctrlKey: true,
+                bubbles: true,
+                cancelable: true,
+            }));
+        });
+
+        expect(on_save_request).toHaveBeenCalledOnce();
+        expect(document.getElementById('hyperlink-target')).toBeNull();
+        expect(store.get('0:1')).toMatchObject({ value: 'pending', base: 'middle' });
+        expect(store.get('0:1')?.link).toBeUndefined();
+        expect(store.get('0:0')).toBeUndefined();
+    });
+
+    it('keeps an invalid hyperlink draft open and blocks Cmd/Ctrl+S', async () => {
+        const editing_ref = React.createRef<EditingHandle | null>();
+        const on_save_request = vi.fn();
+        await render_grid({ ...link_props(editing_ref), on_save_request });
+        await open_dialog();
+        await act(async () => set_input_value(
+            field('hyperlink-target') as HTMLInputElement,
+            'not a web address',
+        ));
+
+        await act(async () => {
+            field('hyperlink-target').dispatchEvent(new KeyboardEvent('keydown', {
+                key: 'S',
+                metaKey: true,
+                bubbles: true,
+                cancelable: true,
+            }));
+        });
+
+        expect(on_save_request).not.toHaveBeenCalled();
+        expect((field('hyperlink-target') as HTMLInputElement).value)
+            .toBe('not a web address');
+    });
+
+    it('keeps a hyperlink draft when history replay refuses the gesture', async () => {
+        const editing_ref = React.createRef<EditingHandle | null>();
+        const store = create_edit_session_store({ session_id: 'session-1' });
+        let gestures_admitted = false;
+        const on_save_request = vi.fn((): CsvSaveOperation => ({
+            editSessionId: 'session-1',
+            saveRequestId: 'save-after-replay',
+            worksheets: [{ sheetIndex: 0, edits: {}, dirtyEdits: {} }],
+        }));
+        await render_grid({
+            ...link_props(editing_ref),
+            edit_session: store,
+            gestures_admitted: () => gestures_admitted,
+            on_save_request,
+        });
+        await open_dialog();
+        await act(async () => set_input_value(
+            field('hyperlink-target') as HTMLInputElement,
+            'https://after-replay.test',
+        ));
+
+        const save_shortcut = () => field('hyperlink-target').dispatchEvent(
+            new KeyboardEvent('keydown', {
+                key: 's',
+                ctrlKey: true,
+                bubbles: true,
+                cancelable: true,
+            }),
+        );
+        await act(async () => { save_shortcut(); });
+        expect(on_save_request).not.toHaveBeenCalled();
+        expect(store.size()).toBe(0);
+        expect(document.getElementById('hyperlink-target')).not.toBeNull();
+
+        gestures_admitted = true;
+        await act(async () => { save_shortcut(); });
+        expect(on_save_request).toHaveBeenCalledOnce();
+        expect(store.get('0:0')?.link).toEqual({
+            kind: 'external',
+            target: 'https://after-replay.test/',
+        });
+        expect(document.getElementById('hyperlink-target')).toBeNull();
+    });
+
+    it('keeps a hyperlink draft when its history row is no longer resident', async () => {
+        const editing_ref = React.createRef<EditingHandle | null>();
+        const store = create_edit_session_store({ session_id: 'session-1' });
+        const on_save_request = vi.fn();
+        await render_grid({
+            ...link_props(editing_ref),
+            edit_session: store,
+            history_store: create_history_store(),
+            on_save_request,
+        });
+        await open_dialog();
+        await act(async () => set_input_value(
+            field('hyperlink-target') as HTMLInputElement,
+            'https://evicted-row.test',
+        ));
+        // The dialog owns the source identity, but history can no longer describe
+        // the persisted side once the row leaves the loader. The gesture must be
+        // refused without turning that refusal into permission to save.
+        grid_mock.source_row_for_display = () => undefined;
+
+        await act(async () => {
+            field('hyperlink-target').dispatchEvent(new KeyboardEvent('keydown', {
+                key: 's',
+                ctrlKey: true,
+                bubbles: true,
+                cancelable: true,
+            }));
+        });
+
+        expect(on_save_request).not.toHaveBeenCalled();
+        expect(store.size()).toBe(0);
+        expect(document.getElementById('hyperlink-target')).not.toBeNull();
+    });
+
+    it('closes a hyperlink once the close barrier is raised', async () => {
         // The barrier goes up while the dialog is already open — the one
         // ordering the menu gate cannot catch. Past it `post_pending_edits`
         // refuses to publish, so a link accepted here would sit in the store
@@ -4677,8 +5022,79 @@ describe('GridShell hyperlink dialog admission', () => {
         await render_grid(link_props(editing_ref));
         await open_dialog();
         await act(async () => editing_ref.current!.stop_edit_admission());
-        await save_link();
+        expect(document.getElementById('hyperlink-target')).toBeNull();
         expect(editing_ref.current!.has_uncommitted_changes()).toBe(false);
+    });
+
+    it('closes a hyperlink draft when the edit session ends', async () => {
+        // A successful save no longer remounts GridShell. The dialog therefore
+        // has to follow the session identity explicitly instead of relying on
+        // unmount to make its now-sessionless Save button disappear.
+        const editing_ref = React.createRef<EditingHandle | null>();
+        const GridShell = await render_grid(link_props(editing_ref));
+        await open_dialog();
+        const dialog_pin = grid_mock.pin_rows.mock.results.at(-1)!.value as symbol;
+        expect(field('hyperlink-target')).not.toBeNull();
+
+        await act(async () => root!.render(React.createElement(GridShell, {
+            ...link_props(editing_ref),
+            edit_mode: false,
+            edit_session_id: undefined,
+        })));
+        expect(document.getElementById('hyperlink-target')).toBeNull();
+        expect(grid_mock.unpin_rows).toHaveBeenCalledWith(dialog_pin);
+        expect(editing_ref.current!.has_uncommitted_changes()).toBe(false);
+
+        // Reusing the same stable mount for a later session must not resurrect
+        // the previous session's draft.
+        await act(async () => root!.render(React.createElement(
+            GridShell,
+            link_props(editing_ref),
+        )));
+        expect(document.getElementById('hyperlink-target')).toBeNull();
+    });
+
+    it('does not carry a hyperlink draft into a replacement edit session', async () => {
+        const editing_ref = React.createRef<EditingHandle | null>();
+        const GridShell = await render_grid(link_props(editing_ref));
+        await open_dialog();
+        const dialog_pin = grid_mock.pin_rows.mock.results.at(-1)!.value as symbol;
+        await act(async () => set_input_value(
+            field('hyperlink-target') as HTMLInputElement,
+            'https://old-session.test',
+        ));
+        field('hyperlink-target').focus();
+        expect(document.activeElement).toBe(field('hyperlink-target'));
+
+        await act(async () => root!.render(React.createElement(GridShell, {
+            ...link_props(editing_ref),
+            edit_session_id: 'session-2',
+            edit_session: create_edit_session_store({ session_id: 'session-2' }),
+        })));
+
+        expect(document.getElementById('hyperlink-target')).toBeNull();
+        expect(grid_mock.unpin_rows).toHaveBeenCalledWith(dialog_pin);
+        expect(editing_ref.current!.has_uncommitted_changes()).toBe(false);
+        await vi.waitUntil(() => document.activeElement
+            === document.querySelector('.data-editor-stub'));
+    });
+
+    it('does not steal focus on session replacement when another control owns it', async () => {
+        const editing_ref = React.createRef<EditingHandle | null>();
+        const GridShell = await render_grid(link_props(editing_ref));
+        await open_dialog();
+        const surviving_target = document.createElement('button');
+        document.body.appendChild(surviving_target);
+        surviving_target.focus();
+
+        await act(async () => root!.render(React.createElement(GridShell, {
+            ...link_props(editing_ref),
+            edit_session_id: 'session-2',
+            edit_session: create_edit_session_store({ session_id: 'session-2' }),
+        })));
+
+        expect(document.getElementById('hyperlink-target')).toBeNull();
+        expect(document.activeElement).toBe(surviving_target);
     });
 });
 

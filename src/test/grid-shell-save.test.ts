@@ -3,7 +3,14 @@
 import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { CsvSaveLifecycle, CsvSaveOperation } from '../types';
+import type {
+    CsvDirtyEntry,
+    CsvObservedFileBase,
+    CsvSaveLifecycle,
+    CsvSaveOperation,
+    PerFileState,
+} from '../types';
+import { decode_stored_per_file_state } from '../types';
 import type { EditingHandle } from '../webview/grid-shell';
 import {
     create_edit_session_store,
@@ -13,7 +20,11 @@ import {
 const grid_mock = vi.hoisted(() => ({
     props: null as null | {
         onCellsEdited?: (
-            items: readonly { location: [number, number]; value: { kind: string; data: string } }[],
+            items: readonly {
+                location: [number, number];
+                value: { kind: string; data: string };
+                movedFrom?: [number, number];
+            }[],
             source: string,
         ) => boolean | void;
         onGridSelectionChange?: (selection: unknown) => void;
@@ -44,6 +55,7 @@ const grid_mock = vi.hoisted(() => ({
     // attached to the right row however the mapping is permuted.
     source_row_for_display: null as null | ((display_row: number) => number | undefined),
     text_for_source_row: null as null | ((source_row: number) => readonly string[]),
+    formula_for_source_cell: null as null | ((source_row: number, column: number) => string | undefined),
 }));
 
 vi.mock('../webview/glide-data-grid', () => {
@@ -103,11 +115,14 @@ vi.mock('../webview/use-row-loader', () => ({
             // Page not resident: the real loader returns undefined, which
             // get_cell_raw must forward as "unknown", never as a blank cell.
             if (source_row === undefined) return undefined;
-            return source_row_text(source_row).map((raw) => ({
+            return source_row_text(source_row).map((raw, column) => ({
                 raw,
                 formatted: raw,
                 bold: false,
                 italic: false,
+                ...(grid_mock.formula_for_source_cell?.(source_row, column) === undefined
+                    ? {}
+                    : { formula: grid_mock.formula_for_source_cell(source_row, column) }),
             }));
         },
         get_source_row: (display_row: number) => (
@@ -124,7 +139,14 @@ vi.mock('../webview/use-row-loader', () => ({
             if (resident_display_row(source_row) === undefined) return undefined;
             const raw = source_row_text(source_row)[col];
             if (raw === undefined) return null;
-            return { raw, formatted: raw, bold: false, italic: false };
+            const formula = grid_mock.formula_for_source_cell?.(source_row, col);
+            return {
+                raw,
+                formatted: raw,
+                bold: false,
+                italic: false,
+                ...(formula === undefined ? {} : { formula }),
+            };
         },
         has_source_row: (source_row: number) => resident_display_row(source_row) !== undefined,
         sample_loaded_rows: () => [],
@@ -176,10 +198,11 @@ async function render_grid(
     save_props: {
         save_operation?: CsvSaveOperation;
         save_lifecycle?: CsvSaveLifecycle;
-        initial_edits?: Record<string, string | { value: string; base: string }>;
+        initial_edits?: Record<string, string | CsvDirtyEntry>;
         edit_session?: EditSessionStore;
         use_fallback_store?: boolean;
         host_rejected_keys?: readonly string[];
+        host_observed_bases?: Readonly<Record<string, CsvObservedFileBase>>;
         on_editing_change?: (status: {
             is_dirty: boolean;
             has_live_uncommitted: boolean;
@@ -192,6 +215,13 @@ async function render_grid(
         on_save_request?: () => CsvSaveOperation | undefined;
         initial_scroll_position?: { left: number; top: number };
         on_scroll_position_change?: (position: { left: number; top: number }) => void;
+        edit_syntax?: 'plain' | 'markdown';
+        value_edit_order_floor?: number;
+        formula_move_retargeter?: (
+            formula: string,
+            sheet_index: number,
+            after_order?: number,
+        ) => string;
     } = {},
 ) {
     vi.resetModules();
@@ -394,6 +424,7 @@ afterEach(() => {
     // which source row every later test's edits land on.
     grid_mock.source_row_for_display = null;
     grid_mock.text_for_source_row = null;
+    grid_mock.formula_for_source_cell = null;
     vi.unstubAllGlobals();
 });
 
@@ -602,7 +633,11 @@ describe('GridShell CSV save', () => {
         post_message.mockClear();
         await edit_cell('second');
         expect(pending_edit_messages(post_message)).toEqual([
-            { edits: { '0:0': { value: 'second', base: 'base' } } },
+            {
+                edits: {
+                    '0:0': { value: 'second', base: 'base', formattingKnown: true },
+                },
+            },
         ]);
     });
 
@@ -683,7 +718,9 @@ describe('GridShell CSV save', () => {
             type: 'saveCsv', edits: { '0:0': 'open editor value' },
         }]);
         expect(post_message.mock.calls.at(-1)?.[0].operation.worksheets[0].dirtyEdits).toEqual({
-            '0:0': { value: 'open editor value', base: 'base' },
+            '0:0': {
+                value: 'open editor value', base: 'base', formattingKnown: true,
+            },
         });
         await edit_cell('too late');
         expect(save_messages(post_message)).toHaveLength(1);
@@ -723,7 +760,65 @@ describe('GridShell CSV save', () => {
         });
         expect(await request_save(editing_ref)).toBe(true);
         expect(post_message.mock.calls.at(-1)?.[0].operation.worksheets[0].dirtyEdits).toEqual({
-            '0:0': { value: 'overlay', base: 'exact-conflict-base' },
+            '0:0': {
+                value: 'overlay',
+                base: 'exact-conflict-base',
+                observedBase: { value: 'base' },
+            },
+        });
+    });
+
+    it('adopts a host-observed base and includes it in the retry payload', async () => {
+        // Keep the rejected source nonresident so only the host observation
+        // path can supply its newer file side. This is the seam the host payload
+        // exists to cover: the grid cannot independently read an unloaded row.
+        grid_mock.source_row_for_display = () => 1;
+        const dirty: Record<string, CsvDirtyEntry> = {
+            '0:0': { value: 'pending', base: 'original' },
+        };
+        const store = create_edit_session_store({ session_id: 'session-1' }, dirty);
+        const { post_message, editing_ref } = await render_grid(undefined, {
+            initial_edits: dirty,
+            edit_session: store,
+            host_rejected_keys: ['0:0'],
+            host_observed_bases: { '0:0': { value: 'host current' } },
+        });
+
+        expect(store.get('0:0')).toEqual({
+            value: 'pending',
+            base: 'original',
+            observedBase: { value: 'host current' },
+        });
+        expect(await request_save(editing_ref)).toBe(true);
+        expect(posted_save(post_message)?.worksheets[0].dirtyEdits).toEqual({
+            '0:0': {
+                value: 'pending',
+                base: 'original',
+                observedBase: { value: 'host current' },
+            },
+        });
+    });
+
+    it('saves restored equal-value write intent instead of treating it as a no-op', async () => {
+        grid_mock.text_for_source_row = () => ['C'];
+        const restored: Record<string, CsvDirtyEntry> = {
+            '0:0': {
+                value: 'A',
+                base: 'A',
+                observedBase: { value: 'C' },
+                writeValue: true,
+            },
+        };
+        const store = create_edit_session_store({ session_id: 'session-1' }, restored);
+        const { post_message, editing_ref } = await render_grid(undefined, {
+            initial_edits: restored,
+            edit_session: store,
+        });
+
+        expect(await request_save(editing_ref)).toBe(true);
+        expect(posted_save(post_message)?.worksheets[0]).toMatchObject({
+            edits: { '0:0': 'A' },
+            dirtyEdits: restored,
         });
     });
 
@@ -915,7 +1010,7 @@ describe('GridShell CSV save', () => {
     });
 
     it('does not hydrate a failed operation into a different current session', async () => {
-        const newer = { '0:0': { value: 'newer', base: 'new-base' } };
+        const newer = { '0:0': { value: 'newer', base: 'base' } };
         const failed: CsvSaveOperation = {
             editSessionId: 'old-session',
         saveRequestId: 'old-failure',
@@ -936,7 +1031,7 @@ describe('GridShell CSV save', () => {
     });
 
     it('preserves a newer session across an older succeeded lifecycle', async () => {
-        const newer = { '0:0': { value: 'newer', base: 'new-base' } };
+        const newer = { '0:0': { value: 'newer', base: 'base' } };
         const succeeded: CsvSaveOperation = {
             editSessionId: 'old-session',
         saveRequestId: 'old-success',
@@ -957,7 +1052,7 @@ describe('GridShell CSV save', () => {
     });
 
     it('ignores a live failed lifecycle from a different session', async () => {
-        const newer = { '0:0': { value: 'newer', base: 'new-base' } };
+        const newer = { '0:0': { value: 'newer', base: 'base' } };
         const failed: CsvSaveOperation = {
             editSessionId: 'old-session',
         saveRequestId: 'old-failure',
@@ -1142,6 +1237,7 @@ describe('GridShell edits across a generation bump', () => {
         expect(store.snapshot().get('0:0')).toEqual({
             value: 'typed but not closed',
             base: 'base',
+            formattingKnown: true,
         });
     });
 
@@ -1175,12 +1271,15 @@ describe('GridShell edits across a generation bump', () => {
         expect(store.snapshot().get('0:0')).toEqual({
             value: 'typed but not closed',
             base: 'base',
+            formattingKnown: true,
         });
         expect(post_message).toHaveBeenCalledWith({
             type: 'pendingEditsChanged',
             editSessionId: 'session-1',
             edits: {
-                '0:0': { value: 'typed but not closed', base: 'base' },
+                '0:0': {
+                    value: 'typed but not closed', base: 'base', formattingKnown: true,
+                },
             },
             sequence: expect.any(Number),
             sheetIndex: 0,
@@ -1225,12 +1324,14 @@ describe('GridShell edits across a generation bump', () => {
 // the assertions would prove nothing.
 describe('GridShell source-keyed save payloads', () => {
     // Display row 0 shows source row 5 — what a sort or a filter produces.
-    function permute_display_0_to_source_5() {
+    function permute_display_0_to_source_5(
+        source_row_5 = ['five-a', 'five-b', 'five-c'],
+    ) {
         grid_mock.source_row_for_display = (display_row: number) => (
             display_row === 0 ? 5 : display_row + 100
         );
         grid_mock.text_for_source_row = (source_row: number) => (
-            source_row === 5 ? ['five-a', 'five-b', 'five-c'] : ['', '', '']
+            source_row === 5 ? source_row_5 : ['', '', '']
         );
     }
 
@@ -1268,7 +1369,7 @@ describe('GridShell source-keyed save payloads', () => {
         const operation = posted_save(post_message)!;
         expect(operation.worksheets[0].edits).toEqual({ '5:0': 'typed' });
         expect(operation.worksheets[0].dirtyEdits).toEqual({
-            '5:0': { value: 'typed', base: 'five-a' },
+            '5:0': { value: 'typed', base: 'five-a', formattingKnown: true },
         });
     });
 
@@ -1284,7 +1385,7 @@ describe('GridShell source-keyed save payloads', () => {
         const operation = posted_save(post_message)!;
         expect(operation.worksheets[0].edits).toEqual({ '5:0': 'overlay-text' });
         expect(operation.worksheets[0].dirtyEdits).toEqual({
-            '5:0': { value: 'overlay-text', base: 'five-a' },
+            '5:0': { value: 'overlay-text', base: 'five-a', formattingKnown: true },
         });
     });
 
@@ -1314,8 +1415,244 @@ describe('GridShell source-keyed save payloads', () => {
         // Outside act on purpose, as in the identity-mapped test above: the
         // write-through is synchronous.
         expect(Object.fromEntries(store.snapshot())).toEqual({
-            '5:0': { value: 'typed but not closed', base: 'five-a' },
+            '5:0': {
+                value: 'typed but not closed', base: 'five-a', formattingKnown: true,
+            },
         });
+    });
+
+    it('commit_live_edit preserves a deliberate choice made against a retargeted formula', async () => {
+        permute_display_0_to_source_5(['=A1', 'five-b', 'five-c']);
+        grid_mock.formula_for_source_cell = (source_row, column) => (
+            source_row === 5 && column === 0 ? '=A1' : undefined
+        );
+        const store = create_edit_session_store({ session_id: 'session-1' });
+        const { editing_ref } = await render_grid(undefined, {
+            edit_session: store,
+            edit_syntax: 'markdown',
+            formula_move_retargeter: (formula, _sheet_index, after_order) => (
+                after_order === undefined ? '=B1' : formula
+            ),
+        });
+
+        // The editor opened on the effective =B1. The user explicitly chose the
+        // persisted spelling =A1 again, then a remount boundary folded the live
+        // editor before Glide's ordinary finish callback.
+        await open_overlay('=A1', [0, 0]);
+        editing_ref.current!.commit_live_edit();
+
+        expect(store.get('5:0')).toMatchObject({
+            value: '=A1',
+            base: '=A1',
+            formattingKnown: true,
+            valueEditOrder: expect.any(Number),
+        });
+    });
+});
+
+describe('GridShell edit order and move provenance', () => {
+    it('gives a cut source and destination the same move order', async () => {
+        const store = create_edit_session_store({ session_id: 'session-1' });
+        await render_grid({
+            visible_to_source: [0, 1],
+            source_to_visible: [0, 1, undefined],
+            hidden_count: 1,
+        }, {
+            edit_session: store,
+            edit_syntax: 'markdown',
+        });
+
+        await act(async () => {
+            grid_mock.props!.onCellsEdited!([
+                { location: [0, 0], value: { kind: 'text', data: '' } },
+                {
+                    location: [1, 0],
+                    value: { kind: 'text', data: 'base' },
+                    movedFrom: [0, 0],
+                },
+            ], 'paste');
+        });
+
+        const source = store.snapshot().get('0:0');
+        const destination = store.snapshot().get('0:1');
+        expect(source?.valueEditOrder).toBeDefined();
+        expect(destination?.valueEditOrder).toBe(source?.valueEditOrder);
+        expect(destination?.movedFrom).toEqual({
+            row: 0,
+            col: 0,
+            order: source?.valueEditOrder,
+        });
+    });
+
+    it('orders an explicit same-formula paste after a move but ignores an unchanged edit close', async () => {
+        grid_mock.text_for_source_row = () => ['source', 'destination', '=A1'];
+        const store = create_edit_session_store({ session_id: 'session-1' });
+        await render_grid({
+            visible_to_source: [0, 1, 2],
+            source_to_visible: [0, 1, 2],
+            hidden_count: 0,
+        }, {
+            edit_session: store,
+            edit_syntax: 'markdown',
+        });
+
+        await act(async () => {
+            grid_mock.props!.onCellsEdited!([
+                { location: [0, 0], value: { kind: 'text', data: '' } },
+                {
+                    location: [1, 0],
+                    value: { kind: 'text', data: 'source' },
+                    movedFrom: [0, 0],
+                },
+            ], 'paste');
+        });
+        const move_order = store.get('0:1')?.valueEditOrder;
+        expect(move_order).toBeDefined();
+
+        await act(async () => {
+            grid_mock.props!.onCellsEdited!([
+                { location: [2, 0], value: { kind: 'text', data: '=A1' } },
+            ], 'edit');
+        });
+        expect(store.get('0:2')).toBeUndefined();
+
+        await act(async () => {
+            grid_mock.props!.onCellsEdited!([
+                { location: [2, 0], value: { kind: 'text', data: '=A1' } },
+            ], 'paste');
+        });
+        expect(store.get('0:2')).toMatchObject({
+            value: '=A1',
+            base: '=A1',
+            formattingKnown: true,
+        });
+        expect(store.get('0:2')?.valueEditOrder).toBeGreaterThan(move_order!);
+    });
+
+    it('floors new edit orders above restored durable move provenance', async () => {
+        grid_mock.text_for_source_row = () => ['source', 'destination', '=A1'];
+        const restored_order = Date.now() * 1_000 + 1_000_000;
+        const store = create_edit_session_store({ session_id: 'session-1' }, {
+            '0:0': { value: '', base: 'source', valueEditOrder: restored_order },
+            '0:1': {
+                value: 'source',
+                base: 'destination',
+                movedFrom: { row: 0, col: 0, order: restored_order },
+                valueEditOrder: restored_order,
+            },
+        });
+        await render_grid({
+            visible_to_source: [0, 1, 2],
+            source_to_visible: [0, 1, 2],
+            hidden_count: 0,
+        }, {
+            edit_session: store,
+            edit_syntax: 'markdown',
+        });
+
+        await act(async () => {
+            grid_mock.props!.onCellsEdited!([
+                { location: [0, 0], value: { kind: 'text', data: 'replacement' } },
+            ], 'edit');
+        });
+        const refill_order = store.get('0:0')?.valueEditOrder;
+        expect(refill_order).toBeGreaterThan(restored_order);
+
+        await act(async () => {
+            grid_mock.props!.onCellsEdited!([
+                { location: [2, 0], value: { kind: 'text', data: '=A1' } },
+            ], 'paste');
+        });
+        expect(store.get('0:2')?.valueEditOrder).toBeGreaterThan(refill_order!);
+    });
+
+    it('floors formula orders above provenance restored on another worksheet', async () => {
+        grid_mock.text_for_source_row = () => ['base', 'middle', '=A1'];
+        const workbook_floor = Date.now() * 1_000 + 1_000_000;
+        const store = create_edit_session_store({ session_id: 'session-1' });
+        await render_grid({
+            visible_to_source: [0, 1, 2],
+            source_to_visible: [0, 1, 2],
+            hidden_count: 0,
+        }, {
+            edit_session: store,
+            edit_syntax: 'markdown',
+            value_edit_order_floor: workbook_floor,
+        });
+
+        await act(async () => {
+            grid_mock.props!.onCellsEdited!([
+                { location: [2, 0], value: { kind: 'text', data: '=A1' } },
+            ], 'paste');
+        });
+
+        expect(store.get('0:2')?.valueEditOrder).toBeGreaterThan(workbook_floor);
+    });
+
+    it.each([
+        Number.MAX_SAFE_INTEGER,
+        Number.MAX_SAFE_INTEGER - 1,
+    ])('rebases hydrated edit order %s before issuing another', async (hydrated_order) => {
+        grid_mock.text_for_source_row = () => ['restored', 'middle', '=A1'];
+        const state = decode_stored_per_file_state({
+            pendingEdits: [{
+                cells: {
+                    '0:0': {
+                        value: 'restored',
+                        base: 'base',
+                        valueEditOrder: hydrated_order,
+                    },
+                },
+            }],
+        }) as PerFileState;
+        const store = create_edit_session_store(
+            { session_id: 'session-1' },
+            state.pendingEdits?.[0]?.cells,
+        );
+        await render_grid({
+            visible_to_source: [0, 1, 2],
+            source_to_visible: [0, 1, 2],
+            hidden_count: 0,
+        }, {
+            edit_session: store,
+            edit_syntax: 'markdown',
+        });
+        const restored_order = store.get('0:0')?.valueEditOrder;
+        expect(store.get('0:0')).toMatchObject({ value: 'restored', base: 'base' });
+        expect(restored_order).toEqual(expect.any(Number));
+        expect(restored_order).toBeLessThan(hydrated_order);
+
+        await act(async () => {
+            grid_mock.props!.onCellsEdited!([
+                { location: [2, 0], value: { kind: 'text', data: '=A1' } },
+            ], 'paste');
+        });
+
+        expect(store.get('0:2')?.valueEditOrder).toBeGreaterThan(restored_order!);
+    });
+
+    it('discard_keys removes both halves of a pending move', async () => {
+        const store = create_edit_session_store({ session_id: 'session-1' });
+        store.install(
+            { session_id: 'session-1' },
+            {
+                '0:0': { value: '', base: 'base', valueEditOrder: 7 },
+                '0:1': {
+                    value: 'base',
+                    base: 'other',
+                    movedFrom: { row: 0, col: 0, order: 7 },
+                    valueEditOrder: 7,
+                },
+            },
+        );
+        const { editing_ref } = await render_grid(undefined, {
+            edit_session: store,
+            generation: 1,
+        });
+
+        await act(async () => { editing_ref.current!.discard_keys(['0:1']); });
+
+        expect(Object.fromEntries(store.snapshot())).toEqual({});
     });
 });
 

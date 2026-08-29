@@ -213,6 +213,46 @@ describe('xlsx edit sessions', () => {
         });
     });
 
+    const STYLED_A2 = '<c r="A2" t="inlineStr"><is>'
+        + '<r><t>Al</t></r><r><rPr><b/></rPr><t>ice</t></r>'
+        + '</is></c>';
+
+    function cell_xml_a2(zip: Uint8Array): string | undefined {
+        return read_part(zip, 'xl/worksheets/sheet1.xml')!
+            .toString('utf8').match(/<c r="A2"[^>]*>[\s\S]*?<\/c>/)?.[0];
+    }
+
+    async function patch_styled_a2() {
+        const file = CFB.read(bytes, { type: 'buffer' });
+        const sheet = CFB.find(file, '/xl/worksheets/sheet1.xml')!;
+        const source = Buffer.from(sheet.content as Uint8Array).toString('utf8');
+        const patched = Buffer.from(
+            source.replace('<c r="A2" t="s"><v>4</v></c>', STYLED_A2),
+            'utf8',
+        );
+        sheet.content = patched;
+        sheet.size = patched.length;
+        const written = CFB.write(file, {
+            type: 'buffer',
+            fileType: 'zip',
+            compression: true,
+        });
+        bytes = written instanceof Uint8Array
+            ? written
+            : new Uint8Array(written as ArrayBufferLike);
+
+        const before = await parse_xlsx(bytes);
+        const before_cell = before.data.sheets[0].rows[1][0]!;
+        expect(before_cell.richText).toBeDefined();
+        expect(cell_xml_a2(bytes)).toBe(STYLED_A2);
+        return {
+            before,
+            before_cell,
+            base_text: String(before_cell.raw ?? ''),
+            cell_xml_before: STYLED_A2,
+        };
+    }
+
     async function open_with_plan_spy() {
         const base_profile = profile_for(file_path);
         if (!base_profile.editing) throw new Error('XLSX profile must be editable.');
@@ -638,6 +678,141 @@ describe('xlsx edit sessions', () => {
             kind: 'external',
             target: 'https://example.com/a',
         });
+    });
+
+    it('retains ambiguous value membership without rewriting styled cell XML', async () => {
+        const { before, before_cell, base_text, cell_xml_before } =
+            await patch_styled_a2();
+
+        const panel = await open_ready_xlsx(file_path);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 0 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: {
+                editSessionId: session,
+                saveRequestId: 'save-retained-value-link',
+                worksheets: [{
+                    sheetIndex: 0,
+                    sheetName: 'People',
+                    worksheetId: '1',
+                    edits: {},
+                    dirtyEdits: {
+                        '1:0': {
+                            value: base_text,
+                            base: base_text,
+                            link: { kind: 'external', target: 'https://example.com/retained' },
+                            baseLink: null,
+                            observedBase: {
+                                value: base_text,
+                                runs: before_cell.richText,
+                                link: null,
+                            },
+                            retainValue: true,
+                        },
+                    },
+                }],
+            },
+        });
+        await wait_for_observable(() => save_results(panel).length > 0);
+
+        expect(save_results(panel).at(-1)).toMatchObject({ success: true });
+        const cell_xml_after = cell_xml_a2(bytes);
+        expect(cell_xml_after).toBe(cell_xml_before);
+        const after = await parse_xlsx(bytes);
+        expect(after.data.sheets[0].rows[1][0]?.richText)
+            .toEqual(before.data.sheets[0].rows[1][0]?.richText);
+        expect(after.data.sheets[0].rows[1][0]?.hyperlink).toEqual({
+            kind: 'external',
+            target: 'https://example.com/retained',
+        });
+    });
+
+    it('preserves styled cell XML after resolving an equal legacy scalar', async () => {
+        const { before_cell, base_text, cell_xml_before } = await patch_styled_a2();
+
+        const panel = await open_ready_xlsx(file_path);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 0 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: {
+                editSessionId: session,
+                saveRequestId: 'save-resolved-equal-rich-value',
+                worksheets: [{
+                    sheetIndex: 0,
+                    sheetName: 'People',
+                    worksheetId: '1',
+                    edits: {},
+                    dirtyEdits: {
+                        '1:0': {
+                            value: base_text,
+                            base: base_text,
+                            valueRuns: before_cell.richText,
+                            baseRuns: before_cell.richText,
+                        },
+                    },
+                }],
+            },
+        });
+        await wait_for_observable(() => save_results(panel).length > 0);
+
+        expect(save_results(panel).at(-1)).toMatchObject({ success: true });
+        const cell_xml_after = cell_xml_a2(bytes);
+        expect(cell_xml_after).toBe(cell_xml_before);
+        const after = await parse_xlsx(bytes);
+        expect(after.data.sheets[0].rows[1][0]?.richText).toEqual(before_cell.richText);
+    });
+
+    it('rejects a stale equal-value write before it can replace newer formatting', async () => {
+        const { before_cell, base_text, cell_xml_before } = await patch_styled_a2();
+        const untouched = bytes;
+
+        const panel = await open_ready_xlsx(file_path);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 0 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: {
+                editSessionId: session,
+                saveRequestId: 'reject-stale-equal-value-write',
+                worksheets: [{
+                    sheetIndex: 0,
+                    sheetName: 'People',
+                    worksheetId: '1',
+                    edits: { '1:0': base_text },
+                    dirtyEdits: {
+                        '1:0': {
+                            value: base_text,
+                            base: base_text,
+                            observedBase: { value: 'Different file text' },
+                            writeValue: true,
+                        },
+                    },
+                }],
+            },
+        });
+        await wait_for_observable(() => save_results(panel).length > 0);
+
+        expect(save_results(panel).at(-1)).toMatchObject({
+            success: false,
+            rejection: {
+                reason: 'baseMismatch',
+                worksheetOperationIndex: 0,
+                keys: ['1:0'],
+                observedBases: {
+                    '1:0': {
+                        value: base_text,
+                        runs: before_cell.richText,
+                    },
+                },
+            },
+        });
+        expect(bytes).toBe(untouched);
+        const cell_xml_after = cell_xml_a2(bytes);
+        expect(cell_xml_after).toBe(cell_xml_before);
+        expect((await parse_xlsx(bytes)).data.sheets[0].rows[1][0]?.richText)
+            .toEqual(before_cell.richText);
     });
 
     it('clears a hyperlink the workbook already carried', async () => {

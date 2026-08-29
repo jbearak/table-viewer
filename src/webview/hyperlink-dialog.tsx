@@ -1,4 +1,12 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, {
+    forwardRef,
+    useCallback,
+    useEffect,
+    useImperativeHandle,
+    useLayoutEffect,
+    useRef,
+    useState,
+} from 'react';
 import type { CellHyperlink } from '../cell-content';
 import { parse_http_external_url } from '../external-url';
 import { MAX_HYPERLINK_LENGTH, is_valid_hyperlink } from '../pending-changes';
@@ -9,8 +17,17 @@ export interface HyperlinkDialogProps {
      *  over the loaded cell), or null for a linkless cell. */
     initial: CellHyperlink | null;
     /** Save/Remove: the next whole-cell link, or null to clear it. */
-    on_commit: (next: CellHyperlink | null) => void;
+    on_commit: (next: CellHyperlink | null) => boolean | void;
     on_cancel: () => void;
+    /** Temporarily suspend the draft while another edit gesture is in flight. */
+    disabled?: boolean;
+    /** Hand focus off when this dialog is removed while one of its controls owns it. */
+    on_focused_unmount?: () => void;
+}
+
+export interface HyperlinkDialogHandle {
+    /** Commit the current valid draft; false leaves an invalid draft open. */
+    commit: () => boolean;
 }
 
 type LinkKind = CellHyperlink['kind'];
@@ -56,11 +73,14 @@ export function draft_hyperlink(
  * mode. Modal in behavior only (Escape / outside click cancel via
  * use_dismiss); one dialog exists at a time, owned by GridShell.
  */
-export function HyperlinkDialog({
+export const HyperlinkDialog = forwardRef<HyperlinkDialogHandle, HyperlinkDialogProps>(
+function HyperlinkDialog({
     initial,
     on_commit,
     on_cancel,
-}: HyperlinkDialogProps): React.JSX.Element {
+    disabled = false,
+    on_focused_unmount,
+}, ref): React.JSX.Element {
     const [kind, set_kind] = useState<LinkKind>(initial?.kind ?? 'external');
     const [target, set_target] = useState(() => initial_target(initial));
     const [tooltip, set_tooltip] = useState(initial?.tooltip ?? '');
@@ -79,11 +99,25 @@ export function HyperlinkDialog({
         const timer = window.setTimeout(() => target_ref.current?.focus(), 0);
         return () => window.clearTimeout(timer);
     }, []);
+    useLayoutEffect(() => () => {
+        const active = document.activeElement;
+        if (active && dialog_ref.current?.contains(active)) on_focused_unmount?.();
+    }, [on_focused_unmount]);
 
     const draft = draft_hyperlink(kind, target, tooltip);
-    const commit = () => {
-        if (draft !== null) on_commit(draft);
-    };
+    const commit = useCallback((): boolean => {
+        if (disabled) return false;
+        if (draft === null) {
+            const untouched = kind === (initial?.kind ?? 'external')
+                && target === initial_target(initial)
+                && tooltip === (initial?.tooltip ?? '');
+            if (!untouched) return false;
+            on_cancel();
+            return true;
+        }
+        return on_commit(draft) !== false;
+    }, [disabled, draft, initial, kind, on_cancel, on_commit, target, tooltip]);
+    useImperativeHandle(ref, () => ({ commit }), [commit]);
 
     return (
         <div
@@ -104,6 +138,7 @@ export function HyperlinkDialog({
                     id="hyperlink-kind"
                     className="filter-popover-select"
                     value={kind}
+                    disabled={disabled}
                     onChange={(event) => set_kind(event.target.value as LinkKind)}
                 >
                     <option value="external">Web address</option>
@@ -120,6 +155,7 @@ export function HyperlinkDialog({
                     value={target}
                     placeholder={kind === 'external' ? 'https://example.com' : "'Sheet2'!A1"}
                     spellCheck={false}
+                    disabled={disabled}
                     onChange={(event) => set_target(event.target.value)}
                     onKeyDown={(event) => {
                         if (event.key === 'Enter') {
@@ -147,6 +183,7 @@ export function HyperlinkDialog({
                     type="text"
                     value={tooltip}
                     spellCheck={false}
+                    disabled={disabled}
                     onChange={(event) => set_tooltip(event.target.value)}
                 />
             </div>
@@ -155,6 +192,7 @@ export function HyperlinkDialog({
                     <button
                         type="button"
                         className="filter-popover-btn filter-popover-btn-danger"
+                        disabled={disabled}
                         onClick={() => on_commit(null)}
                     >
                         Remove link
@@ -170,7 +208,7 @@ export function HyperlinkDialog({
                 <button
                     type="button"
                     className="filter-popover-btn filter-popover-btn-primary"
-                    disabled={draft === null}
+                    disabled={disabled || draft === null}
                     onClick={commit}
                 >
                     Save
@@ -178,4 +216,4 @@ export function HyperlinkDialog({
             </div>
         </div>
     );
-}
+});

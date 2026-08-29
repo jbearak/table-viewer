@@ -63,6 +63,11 @@ export function wire_overlay_from_cell_overlay_state(
             value: wire_history_value(state.value.value),
             base: wire_history_value(state.value.base),
             basePending: state.value.basePending,
+            ...(state.value.writeValue === true ? { writeValue: true as const } : {}),
+            ...(state.value.retainValue === true ? { retainValue: true as const } : {}),
+            ...(state.value.formattingKnown === true
+                ? { formattingKnown: true as const }
+                : {}),
             ...(state.value.movedFrom === undefined
                 ? {}
                 : { movedFrom: state.value.movedFrom }),
@@ -115,7 +120,14 @@ export function cell_overlay_state_from_wire(
     const base = history_value_from_wire(dimension.base);
     if (hyperlink.kind === 'untouched') {
         return value_only_overlay(
-            present, base, dimension.basePending, dimension.movedFrom, dimension.valueEditOrder,
+            present,
+            base,
+            dimension.basePending,
+            dimension.writeValue,
+            dimension.retainValue,
+            dimension.formattingKnown,
+            dimension.movedFrom,
+            dimension.valueEditOrder,
         );
     }
     return combined_overlay(
@@ -124,6 +136,9 @@ export function cell_overlay_state_from_wire(
         hyperlink.value,
         hyperlink.base,
         dimension.basePending,
+        dimension.writeValue,
+        dimension.retainValue,
+        dimension.formattingKnown,
         dimension.movedFrom,
         dimension.valueEditOrder,
     );
@@ -149,6 +164,7 @@ export function read_state_from_prepared_replay(
             {
                 overlay: cell_overlay_state_from_wire(cell.overlay),
                 persisted: history_value_from_wire(cell.persisted),
+                persistedHyperlink: cell.persistedHyperlink,
             },
         );
     }

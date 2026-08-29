@@ -41,6 +41,8 @@ export interface UseRowLoader {
     get_cell_for_source(source_row: number, col: number): RenderedCell | null | undefined;
     /** Whether a canonical source row is currently resident on some cached page. */
     has_source_row(source_row: number): boolean;
+    /** Display position of a resident canonical source row. */
+    get_display_row_for_source(source_row: number): number | undefined;
     /** Git-compare band for a display row, when resident. Derived from
      *  `CompareRowDiff` rather than restated, so a new status cannot drift. */
     get_compare_status(row: number): CompareRowDiff['status'] | undefined;
@@ -134,6 +136,10 @@ export function use_row_loader(
         [loader],
     );
     const has_source_row = useCallback((source_row: number) => loader.has_source_row(source_row), [loader]);
+    const get_display_row_for_source = useCallback(
+        (source_row: number) => loader.get_display_row_for_source(source_row),
+        [loader],
+    );
     const get_compare_status = useCallback(
         (row: number) => loader.get_compare_status(row),
         [loader],
@@ -156,6 +162,7 @@ export function use_row_loader(
         get_cell_raw_for_source,
         get_cell_for_source,
         has_source_row,
+        get_display_row_for_source,
         get_compare_status,
         get_compare_base,
         sample_loaded_rows,

@@ -16,7 +16,10 @@ import {
 } from '../webview/history-stack-model';
 import { create_history_store } from '../webview/history-store';
 import { plan_history_replay, type ReplayPlan } from '../webview/history-replay-model';
-import { read_state_from_prepared_replay } from '../webview/history-replay-wire-model';
+import {
+    read_state_from_prepared_replay,
+    wire_overlay_from_cell_overlay_state,
+} from '../webview/history-replay-wire-model';
 import {
     build_commit_request,
     build_prepare_request,
@@ -72,6 +75,9 @@ function pending_base_change(
         history_value(text, runs),
         history_value(''),
         true,
+        undefined,
+        undefined,
+        undefined,
         move?.movedFrom,
         move?.valueEditOrder,
     );
@@ -423,6 +429,37 @@ describe('build_commit_request', () => {
         // action's first — the 'a' cell. It keeps its current overlay's value
         // rather than being reverted by omission.
         expect(commit?.cells[1]?.entry).toMatchObject({ value: 'a', base: 'base' });
+    });
+
+    it('keeps all value metadata on a prepared cell the plan leaves alone', () => {
+        const changes = [cell_change(0, 0, 'a'), cell_change(1, 1, 'b')];
+        const request = prepare(changes)!;
+        const prepared = prepared_for(request);
+        const full = plan_for(changes, prepared);
+        const partial: ReplayPlan = { ...full, writes: full.writes.slice(0, 1) };
+        const overlay = wire_overlay_from_cell_overlay_state(value_only_overlay(
+            history_value('a'), history_value('base'), false,
+            true, undefined, true, { row: 4, col: 3, order: 7 }, 8,
+        ));
+        const enriched: HistoryReplayPrepared = {
+            ...prepared,
+            cells: prepared.cells.map((cell, index) => index === 1 ? {
+                ...cell,
+                overlay,
+                persisted: { text: 'current file' },
+            } : cell),
+        };
+
+        expect(build_commit_request(enriched, partial, 'm-1', 0)?.cells[1]?.entry)
+            .toMatchObject({
+                value: 'a',
+                base: 'base',
+                writeValue: true,
+                formattingKnown: true,
+                observedBase: { value: 'current file' },
+                movedFrom: { row: 4, col: 3, order: 7 },
+                valueEditOrder: 8,
+            });
     });
 });
 

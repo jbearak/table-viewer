@@ -30,10 +30,21 @@ function value_overlay(
     value: WireHistoryValue,
     base: WireHistoryValue,
     base_pending = false,
+    write_value?: true,
+    retain_value?: true,
+    formatting_known?: true,
 ): WireCellOverlayState {
     return {
         kind: 'present',
-        value: { kind: 'present', value, base, basePending: base_pending },
+        value: {
+            kind: 'present',
+            value,
+            base,
+            basePending: base_pending,
+            ...(write_value === true ? { writeValue: true as const } : {}),
+            ...(retain_value === true ? { retainValue: true as const } : {}),
+            ...(formatting_known === true ? { formattingKnown: true as const } : {}),
+        },
         hyperlink: { kind: 'untouched' },
     };
 }
@@ -70,8 +81,18 @@ function cells(entries: Record<string, string | CsvDirtyEntry>): SheetPendingEdi
 function expectation(
     overlay: WireCellOverlayState,
     persisted: WireHistoryValue = PLAIN,
+    persisted_hyperlink?: CellHyperlink | null,
 ): ReplayCellExpectation {
-    return { sheetIndex: 0, sourceRow: 3, sourceColumn: 4, overlay, persisted };
+    return {
+        sheetIndex: 0,
+        sourceRow: 3,
+        sourceColumn: 4,
+        overlay,
+        persisted,
+        ...(persisted_hyperlink !== undefined
+            ? { persistedHyperlink: persisted_hyperlink }
+            : {}),
+    };
 }
 
 describe('replay_cell_key', () => {
@@ -108,6 +129,53 @@ describe('entry_from_wire_overlay', () => {
         expect(projection.entry.link).toBeUndefined();
     });
 
+    it('projects explicit equal-value write intent', () => {
+        const projection = entry_from_wire_overlay(
+            value_overlay({ text: 'A' }, { text: 'A' }, false, true),
+        );
+        expect(projection).toEqual({
+            kind: 'entry',
+            entry: { value: 'A', base: 'A', writeValue: true },
+        });
+    });
+
+    it('projects retained equal-value membership without save-write intent', () => {
+        const projection = entry_from_wire_overlay(
+            value_overlay({ text: 'A' }, { text: 'A' }, false, undefined, true),
+        );
+        expect(projection).toEqual({
+            kind: 'entry',
+            entry: { value: 'A', base: 'A', retainValue: true },
+        });
+    });
+
+    it('projects formatting and move metadata together', () => {
+        const overlay: WireCellOverlayState = {
+            kind: 'present',
+            value: {
+                kind: 'present',
+                value: { text: 'new' },
+                base: { text: 'old' },
+                basePending: false,
+                formattingKnown: true,
+                movedFrom: { row: 4, col: 3, order: 7 },
+                valueEditOrder: 8,
+            },
+            hyperlink: { kind: 'untouched' },
+        };
+
+        expect(entry_from_wire_overlay(overlay)).toEqual({
+            kind: 'entry',
+            entry: {
+                value: 'new',
+                base: 'old',
+                formattingKnown: true,
+                movedFrom: { row: 4, col: 3, order: 7 },
+                valueEditOrder: 8,
+            },
+        });
+    });
+
     it('projects a plain base-pending overlay as the bare string it came from', () => {
         // A pending base has exactly one origin in durable state: a bare string,
         // whose base is the empty placeholder and which carries neither runs nor
@@ -137,6 +205,25 @@ describe('entry_from_wire_overlay', () => {
             value: { kind: 'present', value: { text: 'new' }, base: { text: '' }, basePending: true },
             hyperlink: { kind: 'present', value: LINK, base: null },
         })).toEqual({ kind: 'unrepresentable' });
+        for (const metadata of [
+            { writeValue: true as const },
+            { retainValue: true as const },
+            { formattingKnown: true as const },
+            { movedFrom: { row: 1, col: 2, order: 3 } },
+            { valueEditOrder: 3 },
+        ]) {
+            expect(entry_from_wire_overlay({
+                kind: 'present',
+                value: {
+                    kind: 'present',
+                    value: { text: 'new' },
+                    base: { text: '' },
+                    basePending: true,
+                    ...metadata,
+                },
+                hyperlink: { kind: 'untouched' },
+            })).toEqual({ kind: 'unrepresentable' });
+        }
     });
 
     it('distinguishes a cleared link from an untouched one', () => {
@@ -156,11 +243,13 @@ describe('stored_entry', () => {
         const entry = stored_entry('typed', { text: 'disk', runs: undefined });
         expect(entry?.value).toBe('typed');
         expect(entry?.base).toBe('disk');
+        expect(entry?.formattingKnown).toBe(true);
     });
 
-    it('carries the persisted runs onto the legacy entry base', () => {
+    it('copies persisted runs to both sides of an equal legacy entry', () => {
         const entry = stored_entry('typed', { text: 'typed', runs: BOLD });
         expect(entry?.baseRuns).toEqual(BOLD);
+        expect(entry?.valueRuns).toEqual(BOLD);
     });
 
     it('passes a full entry through untouched', () => {
@@ -193,7 +282,10 @@ describe('replay_cell_matches', () => {
         )).toBe(false);
         expect(replay_cell_matches(
             cells({ '3:4': make_dirty_entry('same', 'same') }),
-            expectation(value_overlay({ text: 'same' }, { text: 'same' })),
+            expectation(
+                value_overlay({ text: 'same' }, { text: 'same' }),
+                { text: 'same' },
+            ),
         )).toBe(true);
     });
 
@@ -214,12 +306,29 @@ describe('replay_cell_matches', () => {
     it('compares a legacy string entry through the persisted content', () => {
         expect(replay_cell_matches(
             cells({ '3:4': 'new' }),
-            expectation(value_overlay({ text: 'new' }, { text: 'disk' })),
+            expectation(value_overlay(
+                { text: 'new' }, { text: 'disk' }, false,
+                undefined, undefined, true,
+            )),
         )).toBe(true);
         expect(replay_cell_matches(
             cells({ '3:4': 'new' }),
             expectation(value_overlay({ text: 'new' }, { text: 'other' })),
         )).toBe(false);
+    });
+
+    it('matches a resolved rich overlay against its equal legacy string', () => {
+        expect(replay_cell_matches(
+            cells({ '3:4': 'typed' }),
+            expectation(value_overlay(
+                { text: 'typed', runs: BOLD },
+                { text: 'typed', runs: BOLD },
+                false,
+                undefined,
+                undefined,
+                true,
+            ), { text: 'typed', runs: BOLD }),
+        )).toBe(true);
     });
 
     it('matches a plain base-pending expectation against the stored bare string', () => {
@@ -252,6 +361,77 @@ describe('replay_cell_matches', () => {
             cells({ '3:4': stored }),
             expectation(value_overlay({ text: 't' }, { text: 't' })),
         )).toBe(false);
+    });
+
+    it('reconstructs the latest observed text side for the durable CAS', () => {
+        const overlay = value_overlay({ text: 'pending' }, { text: 'original' });
+        const observed = make_dirty_entry(
+            'pending',
+            'original',
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            { observedBase: { value: 'current' } },
+        );
+        expect(replay_cell_matches(
+            cells({ '3:4': observed }),
+            expectation(overlay, { text: 'current' }),
+        )).toBe(true);
+        expect(replay_cell_matches(
+            cells({ '3:4': make_dirty_entry('pending', 'original') }),
+            expectation(overlay, { text: 'current' }),
+        )).toBe(false);
+    });
+
+    it('reconstructs the latest observed hyperlink side for the durable CAS', () => {
+        const overlay = combined_overlay(
+            { text: 'pending' },
+            { text: 'original' },
+            OTHER,
+            LINK,
+        );
+        const observed = make_dirty_entry(
+            'pending',
+            'original',
+            undefined,
+            undefined,
+            OTHER,
+            LINK,
+            { observedBase: { value: 'current', link: null } },
+        );
+        expect(replay_cell_matches(
+            cells({ '3:4': observed }),
+            expectation(overlay, { text: 'current' }, null),
+        )).toBe(true);
+    });
+
+    it('requires equal-value write intent to match exactly', () => {
+        const overlay = value_overlay({ text: 'A' }, { text: 'A' }, false, true);
+        const expected = expectation(overlay, { text: 'C' });
+        expect(replay_cell_matches(cells({
+            '3:4': make_dirty_entry(
+                'A', 'A', undefined, undefined, undefined, undefined,
+                { observedBase: { value: 'C' }, writeValue: true },
+            ),
+        }), expected)).toBe(true);
+        expect(replay_cell_matches(cells({
+            '3:4': make_dirty_entry(
+                'A', 'A', undefined, undefined, undefined, undefined,
+                { observedBase: { value: 'C' } },
+            ),
+        }), expected)).toBe(false);
+    });
+
+    it('canonicalizes an older equal sparse entry over styled persisted text', () => {
+        const overlay = value_overlay({ text: 'A' }, { text: 'A' });
+        const styled_a: RichText = {
+            runs: [{ text: 'A', style: { bold: true } }],
+        };
+        expect(replay_cell_matches(
+            cells({ '3:4': make_dirty_entry('A', 'A') }),
+            expectation(overlay, { text: 'A', runs: styled_a }),
+        )).toBe(true);
     });
 
     it('reads a foreign or empty slot as holding nothing', () => {

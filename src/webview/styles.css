@@ -959,9 +959,8 @@ body.vscode-high-contrast-light .toolbar-split-caret.open {
 }
 
 /*
- * Informational, so it borrows `.truncation-banner`'s neutral info colours rather
- * than `.conflict-banner`'s warning ones: rows holding their position mid-edit is
- * intended, and warning colours would tell the user something is wrong.
+ * Informational notices share the neutral info colours. Neither one asks the
+ * user to resolve an error.
  */
 .stale-view-banner {
     padding: 4px 8px;
@@ -997,10 +996,10 @@ body.vscode-high-contrast-light .toolbar-split-caret.open {
     background: var(--vscode-button-secondaryHoverBackground, #45494e);
 }
 
-.conflict-banner {
+.external-change-banner {
     padding: 4px 8px;
-    background: var(--vscode-editorWarning-background, rgba(204, 167, 0, 0.1));
-    color: var(--vscode-editorWarning-foreground, #cca700);
+    background: var(--vscode-editorInfo-background, rgba(0, 122, 204, 0.1));
+    color: var(--vscode-editorInfo-foreground, var(--vscode-foreground, #ccc));
     border-bottom: 1px solid var(--vscode-panel-border, #444);
     font-size: var(--tv-font-size-md);
     flex-shrink: 0;
@@ -1012,12 +1011,13 @@ body.vscode-high-contrast-light .toolbar-split-caret.open {
     flex-wrap: wrap;
 }
 
-.conflict-banner-actions {
+.external-change-banner-actions {
     display: flex;
     gap: 4px;
 }
 
-.conflict-banner-actions button {
+.external-change-banner-actions button,
+.external-change-review button {
     background: var(--vscode-button-secondaryBackground, #3a3d41);
     color: var(--vscode-button-secondaryForeground, #ccc);
     border: 1px solid var(--vscode-panel-border, #444);
@@ -1027,8 +1027,98 @@ body.vscode-high-contrast-light .toolbar-split-caret.open {
     font-size: var(--tv-font-size-sm);
 }
 
-.conflict-banner-actions button:hover {
+.external-change-banner-actions button:hover,
+.external-change-review button:hover {
     background: var(--vscode-button-secondaryHoverBackground, #45494e);
+}
+
+.external-change-review {
+    flex-shrink: 0;
+    max-height: min(48vh, 520px);
+    overflow: auto;
+    padding: 10px 12px 12px;
+    background: var(--vscode-sideBar-background, var(--vscode-editor-background, #1e1e1e));
+    color: var(--vscode-foreground, #ccc);
+    border-bottom: 1px solid var(--vscode-panel-border, #444);
+}
+
+.external-change-review-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 8px;
+}
+
+.external-change-review h2,
+.external-change-review h3 {
+    margin: 0;
+    font-size: var(--tv-font-size-md);
+}
+
+.external-change-list {
+    display: grid;
+    gap: 8px;
+    list-style: none;
+    padding: 0;
+    margin: 0;
+}
+
+.external-change-item {
+    padding: 8px;
+    border: 1px solid var(--vscode-panel-border, #444);
+    border-radius: 3px;
+    background: var(--vscode-editor-background, #1e1e1e);
+}
+
+.external-change-values,
+.external-change-pending {
+    display: grid;
+    gap: 5px;
+    margin-top: 7px;
+}
+
+.external-change-value-row,
+.external-change-pending {
+    display: grid;
+    grid-template-columns: max-content minmax(0, auto);
+    align-items: baseline;
+    column-gap: 7px;
+}
+
+.external-change-values code,
+.external-change-pending code {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    padding: 1px 4px;
+    color: var(--vscode-textPreformat-foreground, var(--vscode-foreground, #ccc));
+    background: var(--vscode-textCodeBlock-background, rgba(128, 128, 128, 0.15));
+    border-radius: 2px;
+}
+
+.external-change-detail {
+    margin-top: 6px;
+    color: var(--vscode-descriptionForeground, #aaa);
+}
+
+.external-change-item-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 5px;
+    margin-top: 8px;
+}
+
+.external-change-review-status {
+    min-height: 1.2em;
+    margin-top: 6px;
+    color: var(--vscode-descriptionForeground, #aaa);
+}
+
+@media (max-width: 620px) {
+    .external-change-value-row,
+    .external-change-pending {
+        grid-template-columns: 1fr;
+    }
 }
 
 /* Cell editing */
@@ -1062,7 +1152,7 @@ body.vscode-high-contrast-light .toolbar-split-caret.open {
 }
 
 .data-table td.cell-conflicted {
-    color: var(--vscode-editorWarning-foreground, #cca700);
+    color: var(--vscode-editorInfo-foreground, #007acc);
 }
 
 .toggle.has-unsaved {

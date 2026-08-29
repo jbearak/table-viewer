@@ -1435,27 +1435,25 @@ describe('theme × Glide grid theme', () => {
 
     it('derives a distinct edit tint per theme rather than silently falling back', () => {
         const dirty = new Set<string>();
-        const conflict = new Set<string>();
+        const externally_changed = new Set<string>();
         for (const id of THEME_IDS) {
             const vars = THEME_DEFINITIONS[id].variables;
             const tints = build_edit_tints_from_vars((name) => vars[name] ?? '');
             // Fixed semantic alpha, canonical rgb: a theme whose variable went
             // missing would emit the fallback literal instead.
             expect(tints.dirtyBg, id).toMatch(/^rgba\(\d+, \d+, \d+, 0\.16\)$/);
-            expect(tints.conflictBg, id).toMatch(/^rgba\(\d+, \d+, \d+, 0\.22\)$/);
+            expect(tints.conflictBg, id).toMatch(/^rgba\(\d+, \d+, \d+, 0\.18\)$/);
             dirty.add(tints.dirtyBg);
-            conflict.add(tints.conflictBg);
+            externally_changed.add(tints.conflictBg);
         }
-        // 22 themes. The collisions are all intended
-        // palette sharing: solarized-light and solarized-dark share one palette;
-        // each gruvbox kind's three contrasts differ only in their background;
-        // and the two Cyberpunk variants share their warning and error colors.
+        // 22 themes. The collisions are intentional palette sharing between
+        // light/dark variants and contrast variants of the same theme family.
         expect(dirty.size).toBe(16);
-        expect(conflict.size).toBe(15);
+        expect(externally_changed.size).toBe(14);
         // A typo'd variable name would collapse every theme onto the fallback.
         // (`dark`'s warning genuinely IS #cca700 — the same rgb as the dirty
-        // fallback — so only the conflict side can assert non-fallback.)
-        expect(conflict.has(CONFLICT_BG_FALLBACK)).toBe(false);
+        // fallback — so only the file-change side can assert non-fallback.)
+        expect(externally_changed.has(CONFLICT_BG_FALLBACK)).toBe(false);
     });
 });
 

@@ -533,6 +533,75 @@ describe('history_replay_proposal_digest', () => {
             .not.toBe(history_replay_proposal_digest(cleared!));
     });
 
+    it('separates different observed file sides', () => {
+        const first = sanitized_commit_history_replay_request(commit_request({
+            cells: [{
+                ordinal: 0,
+                entry: {
+                    value: 'pending',
+                    base: 'original',
+                    observedBase: { value: 'current-a' },
+                },
+            }],
+        }));
+        const second = sanitized_commit_history_replay_request(commit_request({
+            cells: [{
+                ordinal: 0,
+                entry: {
+                    value: 'pending',
+                    base: 'original',
+                    observedBase: { value: 'current-b' },
+                },
+            }],
+        }));
+        expect(history_replay_proposal_digest(first!))
+            .not.toBe(history_replay_proposal_digest(second!));
+    });
+
+    it('separates inferred value intent from an explicit equal-value write', () => {
+        const inferred = sanitized_commit_history_replay_request(commit_request({
+            cells: [{ ordinal: 0, entry: { value: 'A', base: 'A' } }],
+        }));
+        const explicit = sanitized_commit_history_replay_request(commit_request({
+            cells: [{
+                ordinal: 0,
+                entry: { value: 'A', base: 'A', writeValue: true },
+            }],
+        }));
+        expect(history_replay_proposal_digest(inferred!))
+            .not.toBe(history_replay_proposal_digest(explicit!));
+    });
+
+    it('separates retained value membership from both save-write intents', () => {
+        const inferred = sanitized_commit_history_replay_request(commit_request({
+            cells: [{ ordinal: 0, entry: { value: 'A', base: 'A' } }],
+        }));
+        const retained = sanitized_commit_history_replay_request(commit_request({
+            cells: [{
+                ordinal: 0,
+                entry: { value: 'A', base: 'A', retainValue: true },
+            }],
+        }));
+        expect(retained?.cells[0]?.entry).toMatchObject({ retainValue: true });
+        expect(history_replay_proposal_digest(inferred!))
+            .not.toBe(history_replay_proposal_digest(retained!));
+    });
+
+    it('separates known plain formatting from legacy-unknown formatting', () => {
+        const unknown = sanitized_commit_history_replay_request(commit_request({
+            cells: [{ ordinal: 0, entry: { value: 'B', base: 'A' } }],
+        }));
+        const known = sanitized_commit_history_replay_request(commit_request({
+            cells: [{
+                ordinal: 0,
+                entry: { value: 'B', base: 'A', formattingKnown: true },
+            }],
+        }));
+        expect(known?.cells[0]?.entry).toMatchObject({ formattingKnown: true });
+        expect(history_replay_proposal_digest(unknown!))
+            .not.toBe(history_replay_proposal_digest(known!));
+    });
+
     it('separates move provenance and formula edit orders', () => {
         const plain = sanitized_commit_history_replay_request(commit_request({
             cells: [{ ordinal: 0, entry: { value: 'typed', base: 'disk' } }],

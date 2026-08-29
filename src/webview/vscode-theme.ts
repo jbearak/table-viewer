@@ -6,7 +6,7 @@ import { DIFF_FALLBACK_COLORS } from './cell-renderer';
  * Builds a Glide `Partial<Theme>` from VS Code's `--vscode-*` CSS variables so
  * the canvas grid matches the active color theme (light/dark/high-contrast).
  *
- * It also derives the two canvas edit tints (unsaved edit / conflict) from the
+ * It also derives the two canvas edit tints (pending edit / externally changed)
  * theme's warning and error colors, so they track the active theme instead of
  * being hard-coded amber and red.
  *
@@ -68,13 +68,13 @@ export function parse_font_size_px(
  *  painted *under cell text*, so legibility has to be identical on every theme
  *  regardless of what alpha (if any) the source variable carried. */
 const DIRTY_TINT_ALPHA = 0.16;
-const CONFLICT_TINT_ALPHA = 0.22;
+const CONFLICT_TINT_ALPHA = 0.18;
 
 /** Alpha the selection fill (`accentLight`) is clamped to, replacing whatever
  *  alpha `--vscode-editor-selectionBackground` carried. The shipped themes emit
  *  it as opaque hex, and Glide's `blend()` returns an opaque color unchanged —
  *  the selection fill would *replace* the cell background instead of tinting
- *  it, hiding cell highlights and the dirty/conflict tints inside a selection.
+ *  it, hiding cell highlights and the edit/file-change tints inside a selection.
  *  Translucency of the selection fill is an invariant of the grid: any cell
  *  background (`themeOverride.bgCell`) must stay readable while selected.
  *  High contrast gets a stronger fill, mirroring highlight-theme.ts. */
@@ -90,7 +90,7 @@ export const SELECTION_BG_FALLBACK_COLOR = '#264f78';
  *  webview) where the source variables may be unset. Both round-trip through
  *  `tint_from_color` to themselves. */
 export const DIRTY_BG_FALLBACK = 'rgba(204, 167, 0, 0.16)';
-export const CONFLICT_BG_FALLBACK = 'rgba(229, 75, 75, 0.22)';
+export const CONFLICT_BG_FALLBACK = 'rgba(0, 122, 204, 0.18)';
 
 const HEX_RE = /^#([0-9a-f]+)$/i;
 const RGB_FN_RE = /^rgba?\(([^)]*)\)$/i;
@@ -151,7 +151,7 @@ export function tint_from_color(color: string, alpha: number, fallback: string):
 export interface GridEditTints {
     /** Canvas fill for a cell holding an unsaved edit. */
     dirtyBg: string;
-    /** Canvas fill for an edit whose underlying cell drifted. */
+    /** Neutral canvas fill for an edit whose file-side cell changed. */
     conflictBg: string;
 }
 
@@ -166,7 +166,7 @@ export function build_edit_tints_from_vars(get: VarGetter): GridEditTints {
             DIRTY_BG_FALLBACK,
         ),
         conflictBg: tint_from_color(
-            v('--vscode-errorForeground', CONFLICT_BG_FALLBACK),
+            v('--vscode-editorInfo-foreground', CONFLICT_BG_FALLBACK),
             CONFLICT_TINT_ALPHA,
             CONFLICT_BG_FALLBACK,
         ),

@@ -8,6 +8,7 @@ import type { MenuItem } from '../webview/context-menu';
 function base() {
     return {
         dirty: false,
+        discard_edit_cell_count: 0,
         has_distinct_copy_selection: false,
         preview_mode: false,
         can_hide_rows: true,
@@ -75,6 +76,16 @@ describe('cell context menu model', () => {
             .toEqual(['Hide 3 rows', 'Hide column']);
         expect(submenu(items, 'Select').map((item) => item.kind === 'separator' ? '' : item.label))
             .toEqual(['Select row', 'Select column', 'Select all']);
+    });
+
+    it('discloses when discard removes a connected move across several cells', () => {
+        const items = cell_context_menu_items({
+            ...base(),
+            dirty: true,
+            discard_edit_cell_count: 3,
+        });
+
+        expect(action(items, 'Discard all pending edits in 3 related cells')).toBeDefined();
     });
 
     it('shows a count-aware Hide n columns for multi-column selections', () => {

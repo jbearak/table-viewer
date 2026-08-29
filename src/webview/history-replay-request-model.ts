@@ -40,7 +40,12 @@ import type {
     HistoryReplayPrepareRefused,
     PrepareHistoryReplayRequest,
 } from '../history-replay-protocol';
-import type { CsvDirtyEntry, WorksheetTarget } from '../types';
+import {
+    dirty_entry_with_observed_file_base,
+    make_observed_file_base,
+    type CsvDirtyEntry,
+    type WorksheetTarget,
+} from '../types';
 
 /**
  * Why a replay did not happen.
@@ -230,7 +235,7 @@ export function build_commit_request(
         }
         // A prepared cell the plan does not write keeps whatever it holds, which
         // on the wire is what its own overlay projects to.
-        const entry = entry_for_unwritten_cell(cell.overlay);
+        const entry = entry_for_unwritten_cell(cell);
         if (entry === undefined) return undefined;
         cells.push({ ordinal: cell.ordinal, entry });
     }
@@ -267,18 +272,28 @@ export function build_commit_request(
  * compare-and-swap accepts, rather than a change.
  */
 function entry_for_unwritten_cell(
-    overlay: HistoryReplayPrepared['cells'][number]['overlay'],
+    cell: HistoryReplayPrepared['cells'][number],
 ): CommitHistoryReplayRequest['cells'][number]['entry'] | undefined {
+    const { overlay } = cell;
     if (overlay.kind === 'absent') return null;
     const dimension = overlay.value;
     const value = dimension.kind === 'untouched' ? dimension.anchor : dimension.value;
     const base = dimension.kind === 'untouched' ? dimension.anchor : dimension.base;
     const link = overlay.hyperlink;
-    return wire_entry_for_destination({
+    const entry: HistoryDirtyEntry = {
         value: value.text,
         base: base.text,
         ...(dimension.kind === 'present' && dimension.basePending
             ? { base_pending: true }
+            : {}),
+        ...(dimension.kind === 'present' && dimension.writeValue === true
+            ? { writeValue: true as const }
+            : {}),
+        ...(dimension.kind === 'present' && dimension.retainValue === true
+            ? { retainValue: true as const }
+            : {}),
+        ...(dimension.kind === 'present' && dimension.formattingKnown === true
+            ? { formattingKnown: true as const }
             : {}),
         ...(dimension.kind === 'present' && dimension.movedFrom !== undefined
             ? { movedFrom: dimension.movedFrom }
@@ -289,7 +304,19 @@ function entry_for_unwritten_cell(
         ...(value.runs !== undefined ? { valueRuns: value.runs } : {}),
         ...(base.runs !== undefined ? { baseRuns: base.runs } : {}),
         ...(link.kind === 'present' ? { link: link.value, baseLink: link.base } : {}),
-    });
+    };
+    if (entry.base_pending === true) return wire_entry_for_destination(entry);
+    if (entry.link !== undefined && cell.persistedHyperlink === undefined) {
+        return wire_entry_for_destination(entry);
+    }
+    return wire_entry_for_destination(dirty_entry_with_observed_file_base(
+        entry,
+        make_observed_file_base(
+            cell.persisted.text,
+            cell.persisted.runs,
+            entry.link !== undefined ? cell.persistedHyperlink : undefined,
+        ),
+    ));
 }
 
 /**
@@ -314,6 +341,9 @@ function wire_entry_for_destination(
         && entry.base === ''
         && entry.link === undefined
         && entry.baseLink === undefined
+        && entry.writeValue === undefined
+        && entry.retainValue === undefined
+        && entry.formattingKnown === undefined
         && entry.movedFrom === undefined
         && entry.valueEditOrder === undefined;
     return plain ? entry.value : undefined;

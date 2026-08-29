@@ -5,6 +5,7 @@ import {
     normalize_rich_text,
     normalize_text_style,
     rich_text_equal,
+    rich_text_formatting_equal,
     rich_text_from_plain,
     rich_text_has_styles,
     rich_text_plain_text,
@@ -88,6 +89,104 @@ describe('rich_text_equal', () => {
         expect(rich_text_equal(
             { runs: [{ text: 'a' }] },
             { runs: [{ text: 'b' }] },
+        )).toBe(false);
+    });
+});
+
+describe('rich_text_formatting_equal', () => {
+    it('ignores text changes and plain-versus-style-free representation', () => {
+        expect(rich_text_formatting_equal(
+            { runs: [{ text: 'Apple' }] },
+            { runs: [{ text: 'Applefff' }] },
+        )).toBe(true);
+        expect(rich_text_formatting_equal(
+            { runs: [{ text: 'Apple' }, { text: '' }] },
+            { runs: [{ text: 'Applefff', style: {} }] },
+        )).toBe(true);
+    });
+
+    it('detects a changed effective style pattern', () => {
+        expect(rich_text_formatting_equal(
+            { runs: [{ text: 'Apple', style: { bold: true } }] },
+            { runs: [{ text: 'Applefff' }] },
+        )).toBe(false);
+        expect(rich_text_formatting_equal(
+            {
+                runs: [
+                    { text: 'Ap', style: { bold: true } },
+                    { text: 'ple' },
+                ],
+            },
+            {
+                runs: [
+                    { text: 'Apple' },
+                    { text: 'fff', style: { bold: true } },
+                ],
+            },
+        )).toBe(false);
+    });
+
+    it('treats plain text edited to or from empty as formatting-neutral', () => {
+        expect(rich_text_formatting_equal(
+            rich_text_from_plain('Apple'),
+            rich_text_from_plain(''),
+        )).toBe(true);
+        expect(rich_text_formatting_equal(
+            rich_text_from_plain(''),
+            rich_text_from_plain('Apple'),
+        )).toBe(true);
+    });
+
+    it('treats styled text edited to or from empty as formatting-neutral', () => {
+        const styled = { runs: [{ text: 'Apple', style: { bold: true as const } }] };
+        expect(rich_text_formatting_equal(styled, rich_text_from_plain(''))).toBe(true);
+        expect(rich_text_formatting_equal(rich_text_from_plain(''), styled)).toBe(true);
+    });
+
+    it('does not treat deleting a styled run as changing retained text formatting', () => {
+        expect(rich_text_formatting_equal(
+            { runs: [
+                { text: 'delete', style: { bold: true } },
+                { text: 'keep' },
+            ] },
+            { runs: [{ text: 'keep' }] },
+        )).toBe(true);
+    });
+
+    it('does not greedily align a deleted repeated character with the wrong style', () => {
+        expect(rich_text_formatting_equal(
+            { runs: [
+                { text: 'A', style: { bold: true } },
+                { text: 'A' },
+            ] },
+            { runs: [{ text: 'A' }] },
+        )).toBe(true);
+        expect(rich_text_formatting_equal(
+            { runs: [{ text: 'A' }] },
+            { runs: [
+                { text: 'A', style: { bold: true } },
+                { text: 'A' },
+            ] },
+        )).toBe(true);
+    });
+
+    it('handles highly skewed changed text without per-character row allocations', () => {
+        expect(rich_text_formatting_equal(
+            rich_text_from_plain('A'.repeat(100_000)),
+            rich_text_from_plain('A'),
+        )).toBe(true);
+    });
+
+    it('detects a formatting boundary moving within unchanged text', () => {
+        expect(rich_text_formatting_equal(
+            { runs: [
+                { text: 'A', style: { bold: true } },
+                { text: 'BC' },
+            ] },
+            { runs: [
+                { text: 'AB', style: { bold: true } },
+                { text: 'C' },
+            ] },
         )).toBe(false);
     });
 });

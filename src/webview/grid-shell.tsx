@@ -30,11 +30,14 @@ import {
 import type { RenderedCell, SheetMeta } from '../data-source/interface';
 import {
     EMPTY_TRANSFORM,
-    dirty_entry_value_changed,
+    dirty_entry_value_dimension_present,
+    dirty_keys_with_move_closure,
+    latest_dirty_value_edit_order,
     type CellHighlightColor,
     type CellHighlightMutation,
     type CellHighlightSelection,
     type CsvDirtyMap,
+    type CsvObservedFileBase,
     type CsvSaveLifecycle,
     type CsvSaveOperation,
     type DisplayRowInterval,
@@ -100,15 +103,19 @@ import {
 } from './cell-renderer';
 
 let last_value_edit_order = 0;
-function next_value_edit_order(): number {
+function next_value_edit_order(after_order = 0): number {
     const clock = Date.now() * 1_000;
-    last_value_edit_order = Math.max(clock, last_value_edit_order + 1);
+    const next = Math.max(clock, last_value_edit_order + 1, after_order + 1);
+    if (!Number.isSafeInteger(next)) {
+        throw new RangeError('Pending edit order exceeds the safe integer range');
+    }
+    last_value_edit_order = next;
     return last_value_edit_order;
 }
 import { is_rich_text_cell, rich_text_cell_renderer } from './rich-text-cell-renderer';
 import { parse_http_external_url } from '../external-url';
 import type { CellHyperlink } from '../cell-content';
-import { HyperlinkDialog } from './hyperlink-dialog';
+import { HyperlinkDialog, type HyperlinkDialogHandle } from './hyperlink-dialog';
 import {
     CELL_TOOLTIP_SHOW_DELAY_MS,
     cell_tooltip_content,
@@ -350,7 +357,7 @@ function dirty_value_overlay_fields(
     'dirty_value' | 'dirty_display' | 'dirty_rich' | 'diff_base'
         | 'formula_result_pending' | 'formula_result'
 > | undefined {
-    if (!dirty_entry_value_changed(dirty)) return undefined;
+    if (!dirty_entry_value_dimension_present(dirty)) return undefined;
     const dirty_runs = dirty.valueRuns?.runs;
     const retained_runs = dirty_runs && dirty_runs.length > 0 ? dirty_runs : undefined;
     const formula_edit = xlsx_editing
@@ -372,7 +379,9 @@ function dirty_value_overlay_fields(
         ...(formula_result_pending ? { formula_result_pending: true as const } : {}),
         ...(presentation?.display !== undefined ? { dirty_display: presentation.display } : {}),
         ...(requires_rich ? { dirty_rich: dirty.valueRuns } : {}),
-        ...(diff_mode && !dirty.base_pending ? { diff_base: dirty.base } : {}),
+        ...(diff_mode && !dirty.base_pending
+            ? { diff_base: dirty.observedBase?.value ?? dirty.base }
+            : {}),
     };
 }
 
@@ -394,7 +403,7 @@ import './glide-data-grid/styles.css';
 
 /**
  * Editing snapshot reported up to {@link App} so it can drive the toolbar dirty
- * indicator, persist pending edits, and surface the conflict banner — all
+ * indicator, persist pending edits, and surface file-change information — all
  * App-level concerns, while the dirty map itself lives next to the loader here.
  */
 export interface EditingStatus {
@@ -413,7 +422,7 @@ export interface EditingStatus {
 
 /**
  * Imperative editing actions GridShell exposes to {@link App} (the toolbar
- * toggle and conflict banner live in App's layout, but the dirty map lives here
+ * toggle and file-change notice live in App's layout, but the dirty map lives here
  * next to the loader). Populated into a ref App provides.
  */
 export interface EditingHandle {
@@ -421,17 +430,23 @@ export interface EditingHandle {
     request_save(): boolean;
     /** Drop every dirty edit. */
     clear_dirty(): void;
-    /** Drop only edits whose underlying cell drifted (conflict resolution). */
+    /** Legacy bulk action: drop edits whose underlying file-side cell changed. */
     discard_conflicted(): void;
     /**
      * Drop exactly the named source-keyed edits. Separate from
-     * {@link discard_conflicted}, whose meaning is defined by
-     * `is_entry_conflicted` and is therefore residency-gated: the keys the *host*
-     * names on a rejected save are precisely the ones that predicate cannot see
-     * (a filtered-out row, an evicted page, a row past the row count), so
-     * overloading it would leave the blocking entry in place.
-     */
+     * {@link discard_conflicted}, which uses renderer observations and is therefore
+     * residency-gated. Keys the host names for a filtered-out row, evicted page, or
+     * removed row use this explicit path instead.
+    */
     discard_keys(keys: readonly string[]): void;
+    /** Whether this mounted view can locate a source-keyed cell. */
+    can_reveal_source_cell(source_row: number, source_column: number): boolean;
+    /** Reveal and select a source-keyed cell, loading its row when its position is derivable. */
+    reveal_source_cell(
+        source_row: number,
+        source_column: number,
+        is_current?: () => boolean,
+    ): Promise<boolean>;
     /** Fence every renderer-side mutation before a host close/reload flush. */
     stop_edit_admission(): void;
     /** Snapshot the current Glide overlay into the source-keyed dirty map. */
@@ -457,6 +472,15 @@ export interface GridFocusHandle {
     has_focus(): boolean;
     /** Focus the mounted Glide grid; false while no DataEditor is available. */
     focus(): boolean;
+}
+
+/** Whether focus belongs to this grid, including Glide's body-level editor portal. */
+function grid_owns_focus(root: HTMLElement | null, active: Element | null): boolean {
+    if (!(active instanceof HTMLElement)) return false;
+    if (root?.contains(active)) return true;
+    const portal = document.getElementById('portal');
+    const overlay = active.closest('.gdg-clip-region');
+    return portal !== null && overlay !== null && portal.contains(overlay);
 }
 
 export interface GridActionsHandle {
@@ -584,6 +608,8 @@ export interface GridShellProps {
     /** How this sheet's cells are edited ('markdown' for xlsx). Default 'plain'. */
     edit_syntax?: EditSyntax;
     edit_session_id?: string;
+    /** Workbook-wide durable order high-water mark, including inactive sheets. */
+    value_edit_order_floor?: number;
     /** App-owned operation survives generation-keyed GridShell remounts. */
     save_operation?: CsvSaveOperation;
     save_lifecycle?: CsvSaveLifecycle;
@@ -612,15 +638,17 @@ export interface GridShellProps {
     gestures_admitted?: () => boolean;
     /**
      * Source-keyed keys the host refused the last save over. Unioned into the
-     * conflict tint so a `baseMismatch` cell is visibly marked even though the
-     * webview's own residency-gated conflict detection cannot flag it. A
+     * informational tint so a `baseMismatch` cell is visibly marked even when the
+     * webview cannot inspect its non-resident row. A
      * `rowsRemoved` key has no cell to tint (its row is past `row_count`), which is
      * why the banner names its row numbers instead.
      */
     host_rejected_keys?: readonly string[];
+    /** Current file sides returned by save-time validation for non-resident edits. */
+    host_observed_bases?: Readonly<Record<string, CsvObservedFileBase>>;
     on_editing_change?: (status: EditingStatus) => void;
     // App provides this ref; GridShell populates it with imperative save/discard
-    // actions so App's toolbar + conflict banner can drive editing that lives here.
+    // actions so App's toolbar + file-change review can drive editing that lives here.
     editing_ref?: MutableRefObject<EditingHandle | null>;
     // App provides this ref; GridShell populates it with a function that measures
     // loaded rows and returns fitted column widths (null when nothing is loaded).
@@ -719,6 +747,7 @@ export function GridShell({
     highlight_in_flight = false,
     edit_syntax = 'plain',
     edit_session_id,
+    value_edit_order_floor = 0,
     save_operation,
     save_lifecycle = { revision: 0, state: 'idle' },
     on_save_request = () => undefined,
@@ -727,6 +756,7 @@ export function GridShell({
     history_store,
     gestures_admitted,
     host_rejected_keys,
+    host_observed_bases,
     on_editing_change,
     editing_ref,
     auto_fit_ref,
@@ -800,6 +830,11 @@ export function GridShell({
     const font_size_px = theme_font_size_px(theme);
     const default_row_height = default_row_height_for_font(font_size_px);
     const grid_ref = useRef<DataEditorRef | null>(null);
+    // Saving folds a link dialog through this handle before snapshotting the
+    // workbook, just as it folds Glide's cell overlay through read_live_edit.
+    const hyperlink_dialog_ref = useRef<HyperlinkDialogHandle | null>(null);
+    const hyperlink_dialog_pin_ref = useRef<symbol | null>(null);
+    const hyperlink_focus_restore_epoch_ref = useRef(0);
     const grid_root_ref = useRef<HTMLDivElement | null>(null);
     const row_resize_ref = useRef<RowResizeOverlayHandle | null>(null);
     const row_resize_preview_ref = useRef<RowResizePreview | null>(null);
@@ -825,18 +860,17 @@ export function GridShell({
         const grid = grid_ref.current;
         if (!grid) return false;
         grid.focus();
-        const active = document.activeElement;
-        return !!active && !!grid_root_ref.current?.contains(active);
+        return grid_owns_focus(grid_root_ref.current, document.activeElement);
     }, []);
 
     useLayoutEffect(() => {
         if (!grid_focus_ref) return;
         const handle: GridFocusHandle = {
             generation,
-            has_focus: () => {
-                const active = document.activeElement;
-                return !!active && !!grid_root_ref.current?.contains(active);
-            },
+            has_focus: () => grid_owns_focus(
+                grid_root_ref.current,
+                document.activeElement,
+            ),
             focus: focus_grid,
         };
         grid_focus_ref.current = handle;
@@ -978,6 +1012,7 @@ export function GridShell({
         get_source_row,
         get_cell_raw_for_source,
         get_cell_for_source,
+        get_display_row_for_source,
         get_compare_status,
         get_compare_base,
         sample_loaded_rows,
@@ -1091,7 +1126,7 @@ export function GridShell({
 
     // Read a cell's persisted raw text from the paged cache for the editing hook.
     // Stabilized against the loader's per-render callback identities; `version` in
-    // the deps makes conflict detection re-run as freshly-loaded pages arrive.
+    // the deps makes file-change observation re-run as freshly-loaded pages arrive.
     // `get_row_ref` is still the copy path's reader (display-keyed, by design).
     const get_row_ref = useRef(get_row);
     get_row_ref.current = get_row;
@@ -1101,7 +1136,7 @@ export function GridShell({
     get_cell_for_source_ref.current = get_cell_for_source;
     // First parameter is a **canonical source row**, not a display row: durable
     // edit keys are source-keyed, and the store hands the row component of a key
-    // straight to this reader (is_entry_conflicted / resolve_pending_bases).
+    // straight to this reader (file-change observation / resolve_pending_bases).
     //
     // The `saved_edits_ref` lookup below is the subtle part. Those keys come from
     // the in-flight save operation's edits, which are source-keyed after this PR,
@@ -1142,6 +1177,13 @@ export function GridShell({
             history: history_store,
         }
     ), [history_store, sheet_index, sheet_meta.name, sheet_meta.worksheetId]);
+    const issue_value_edit_order = useCallback(
+        () => next_value_edit_order(Math.max(
+            value_edit_order_floor,
+            latest_dirty_value_edit_order(store.snapshot()),
+        )),
+        [store, value_edit_order_floor],
+    );
 
     const {
         dirty_cells,
@@ -1166,7 +1208,7 @@ export function GridShell({
                 ? formula_move_retargeter?.(text, sheet_index, after_order) ?? text
                 : text;
         },
-        next_value_edit_order,
+        next_value_edit_order: issue_value_edit_order,
         // Same identity discipline as get_cell_raw: rebinds with `version` so
         // freshly-loaded pages refresh markdown edit text and bases.
         get_cell: useCallback(
@@ -1175,6 +1217,13 @@ export function GridShell({
             [version],
         ),
     });
+    useEffect(() => {
+        if (!host_observed_bases) return;
+        store.observe_file_bases(
+            edit_session_id,
+            new Map(Object.entries(host_observed_bases)),
+        );
+    }, [edit_session_id, host_observed_bases, store]);
     // The paint callback deliberately stays stable across edits. It reads the
     // current recursive invalidation set through this mirror, while the repaint
     // effect below damages only formulas entering or leaving the set.
@@ -1250,9 +1299,9 @@ export function GridShell({
     // already-discarded edit must not keep tinting, and `dirty_cells` is what
     // decides whether a cell is painted with an overlay at all.
     //
-    // `conflicted` reported up to App stays this union too. That is deliberate: a
-    // host-named mismatch *is* a conflict from the user's point of view, and the
-    // alternative (App reconciling two sets) would put the same union in two places.
+    // The legacy `conflicted` field reported up to App stays this union too. It now
+    // means only "pending edits whose file side changed"; retaining the wire-shaped
+    // name keeps this refactor local while the UI uses accurate language.
     const conflicted_keys = useMemo(() => {
         if (!host_rejected_keys || host_rejected_keys.length === 0) {
             return derived_conflicted_keys;
@@ -1538,6 +1587,63 @@ export function GridShell({
         write_grid_selection(selection);
         grid_ref.current?.scrollTo(cell[0], cell[1]);
     }, [merges, write_grid_selection]);
+    const rows_are_projected = transform_state.sort.length > 0
+        || transform_state.filters.length > 0
+        || (transform_state.hiddenRows?.length ?? 0) > 0
+        || transform_state.onlyChangedRows === true;
+    const unloaded_display_row_for_source = useCallback((source_row: number) => {
+        if (rows_are_projected || source_row < 0) return undefined;
+        const header = sheet_meta.excelFirstRowHeader;
+        if (header?.active === true) {
+            const promoted = header.sourceRow ?? 0;
+            if (source_row === promoted) return undefined;
+            const display_row = source_row < promoted ? source_row : source_row - 1;
+            return display_row < row_count ? display_row : undefined;
+        }
+        return source_row < row_count ? source_row : undefined;
+    }, [row_count, rows_are_projected, sheet_meta.excelFirstRowHeader]);
+    const can_reveal_source_cell = useCallback((
+        source_row: number,
+        source_column: number,
+    ): boolean => {
+        if (display_column_for_source(source_column) === undefined) return false;
+        return get_display_row_for_source(source_row) !== undefined
+            || unloaded_display_row_for_source(source_row) !== undefined;
+    }, [
+        display_column_for_source,
+        get_display_row_for_source,
+        unloaded_display_row_for_source,
+    ]);
+    const reveal_source_cell = useCallback(async (
+        source_row: number,
+        source_column: number,
+        is_current?: () => boolean,
+    ): Promise<boolean> => {
+        if (is_current?.() === false) return false;
+        const display_column = display_column_for_source(source_column);
+        if (display_column === undefined) return false;
+        let display_row = get_display_row_for_source(source_row);
+        if (display_row === undefined) {
+            const unloaded_display_row = unloaded_display_row_for_source(source_row);
+            if (unloaded_display_row === undefined) return false;
+            const loaded = await ensure_rows_loaded(unloaded_display_row, unloaded_display_row);
+            if (!loaded) return false;
+            if (is_current?.() === false) return false;
+            display_row = get_display_row_for_source(source_row);
+        }
+        if (display_row === undefined) return false;
+        if (is_current?.() === false) return false;
+        select_active_display_cell([display_column, display_row]);
+        focus_grid();
+        return true;
+    }, [
+        display_column_for_source,
+        ensure_rows_loaded,
+        focus_grid,
+        get_display_row_for_source,
+        select_active_display_cell,
+        unloaded_display_row_for_source,
+    ]);
     // The flash lives in a ref, not state: `get_cell_content` reads it during
     // paint, and a re-render is neither needed nor wanted — the visible cells are
     // damaged explicitly, twice, on entry and at the deadline.
@@ -1839,6 +1945,7 @@ export function GridShell({
         source_column: number;
         edit_session_id: string | undefined;
         pin: symbol;
+        opened_value?: string;
     } | null>(null);
     // Remains raised while an overlay lifetime is revoked, then clears when
     // editing reopens or a newly mounted tracking editor captures admission.
@@ -2030,11 +2137,18 @@ export function GridShell({
         if (edit_admission_is_fenced() || save_in_flight_ref.current || !edit_session_id) {
             return false;
         }
+        // The hyperlink editor owns its draft state. Fold a valid draft into the
+        // shared store before App snapshots every worksheet; an invalid draft
+        // remains visible and blocks the save instead of being silently lost.
+        if (
+            hyperlink_dialog_ref.current
+            && !hyperlink_dialog_ref.current.commit()
+        ) return false;
         const live = read_live_edit();
         if (live && live.value !== live.original) {
             const [source_row, source_column] = live.key.split(':').map(Number);
             if (Number.isInteger(source_row) && Number.isInteger(source_column)) {
-                commit_edit(source_row, source_column, live.value);
+                commit_edit(source_row, source_column, live.value, live.original);
             }
         }
         const operation = on_save_request();
@@ -2167,7 +2281,7 @@ export function GridShell({
             // commit_edit's first parameter is a source row. No conversion here.
             const [source_row, source_column] = live.key.split(':').map(Number);
             if (Number.isInteger(source_row) && Number.isInteger(source_column)) {
-                commit_edit(source_row, source_column, live.value);
+                commit_edit(source_row, source_column, live.value, live.original);
                 // The display row for the same cell, read from the same selection
                 // `read_live_edit` derived `live.key` from and in the same
                 // synchronous block — so the two name one cell in the two spaces,
@@ -2262,6 +2376,8 @@ export function GridShell({
             clear_dirty: guarded_clear_dirty,
             discard_conflicted: guarded_discard_conflicted,
             discard_keys: guarded_discard_keys,
+            can_reveal_source_cell,
+            reveal_source_cell,
             stop_edit_admission() {
                 fenced_edit_activation_ref.current = edit_activation_id;
                 set_fenced_edit_activation(edit_activation_id);
@@ -2280,6 +2396,8 @@ export function GridShell({
         guarded_clear_dirty,
         guarded_discard_conflicted,
         guarded_discard_keys,
+        can_reveal_source_cell,
+        reveal_source_cell,
         edit_activation_id,
         commit_live_edit,
         commit_live_edit_at_close_barrier,
@@ -3084,7 +3202,26 @@ export function GridShell({
             if (gestures_admitted !== undefined && !gestures_admitted()) return true;
 
             const edits: CellValueEdit[] = [];
-            const edit_order = next_value_edit_order();
+            // A cut batch needs one shared explicit order on both its source
+            // clears and destinations. Paste/fill formula intent needs an order
+            // even when its text happens to equal the persisted formula: it was
+            // still chosen after any earlier pending move. Overlay edits remain
+            // lazy so closing an unchanged editor is a genuine no-op.
+            const move_gesture = edit_syntax === 'markdown'
+                && items.some((item) => item.movedFrom !== undefined);
+            const formula_gesture = edit_syntax === 'markdown'
+                && source !== 'edit'
+                && items.some(({ value }) => {
+                    const text = value.kind === GridCellKind.Text
+                        ? value.data ?? ''
+                        : value.kind === GridCellKind.Custom && is_rich_text_cell(value)
+                            ? value.data.edit_value ?? ''
+                            : '';
+                    return xlsx_edit_writes_formula(text, undefined);
+                });
+            const explicit_gesture_order = move_gesture || formula_gesture
+                ? issue_value_edit_order()
+                : undefined;
             const damaged: { cell: Item }[] = [];
             const grown_rows = new Set<number>();
             // Rectangular gestures repeat each display row across every column
@@ -3136,13 +3273,23 @@ export function GridShell({
                     : value.kind === GridCellKind.Custom && is_rich_text_cell(value)
                         ? value.data.edit_value ?? ''
                         : '';
+                const explicitly_ordered = move_gesture
+                    || (
+                        formula_gesture
+                        && xlsx_edit_writes_formula(text, undefined)
+                    );
                 edits.push({
                     source_row,
                     source_col: source_column,
                     value: text,
-                    ...(edit_syntax === 'markdown' && (
-                        movedFrom !== undefined || xlsx_edit_writes_formula(text, undefined)
-                    ) ? { editOrder: edit_order } : {}),
+                    ...(captured_matches && captured.opened_value !== undefined
+                        ? { openedValue: captured.opened_value }
+                        : {}),
+                    ...(
+                        explicit_gesture_order === undefined || !explicitly_ordered
+                            ? {}
+                            : { editOrder: explicit_gesture_order }
+                    ),
                     ...(movedFrom === undefined ? {} : {
                         movedFrom: {
                             source_row: movedFrom[1],
@@ -3206,6 +3353,7 @@ export function GridShell({
             editable_cells_ref,
             edit_session_id_ref,
             gestures_admitted,
+            issue_value_edit_order,
             source_column_for_display,
             commit_source_row,
             save_in_flight_ref,
@@ -3229,6 +3377,13 @@ export function GridShell({
         function TrackingCsvCellEditor(props: CsvCellEditorProps): React.JSX.Element {
             useEffect(() => {
                 capture_open_overlay_row();
+                const opened_value = read_live_edit_ref.current()?.original;
+                if (
+                    opened_value !== undefined
+                    && open_overlay_row_ref.current !== null
+                ) {
+                    open_overlay_row_ref.current.opened_value = opened_value;
+                }
                 refresh_live_uncommitted();
                 return () => {
                     // Ordering matters: on_cells_edited already ran by the time Glide
@@ -3865,48 +4020,105 @@ export function GridShell({
         display_col: number;
         source_col: number;
         source_row: number;
+        edit_session_id: string;
         initial: CellHyperlink | null;
     } | null>(null);
+
+    const release_hyperlink_dialog_pin = useCallback(() => {
+        const pin = hyperlink_dialog_pin_ref.current;
+        if (pin === null) return;
+        hyperlink_dialog_pin_ref.current = null;
+        unpin_rows_ref.current(pin);
+    }, []);
+    useEffect(() => () => release_hyperlink_dialog_pin(), [release_hyperlink_dialog_pin]);
 
     const open_hyperlink_dialog = useCallback(
         (row: number, display_col: number, source_col: number) => {
             const source_row = get_source_row(row);
-            if (source_row === undefined) return;
+            if (source_row === undefined || edit_session_id === undefined) return;
+            release_hyperlink_dialog_pin();
+            hyperlink_dialog_pin_ref.current = pin_rows_ref.current(row, row);
             set_hyperlink_dialog({
                 row,
                 display_col,
                 source_col,
                 source_row,
+                edit_session_id,
                 initial: cell_hyperlink(display_col, row) ?? null,
             });
         },
-        [cell_hyperlink, get_source_row],
+        [
+            cell_hyperlink,
+            edit_session_id,
+            get_source_row,
+            release_hyperlink_dialog_pin,
+        ],
     );
 
     const close_hyperlink_dialog = useCallback(() => {
+        release_hyperlink_dialog_pin();
         set_hyperlink_dialog(null);
         grid_ref.current?.focus();
+    }, [release_hyperlink_dialog_pin]);
+
+    const restore_focus_after_hyperlink_unmount = useCallback(() => {
+        const epoch = ++hyperlink_focus_restore_epoch_ref.current;
+        // Child layout cleanup runs before this commit installs the replacement
+        // session's refs. A microtask observes that committed state without
+        // guessing how long rendering takes.
+        window.queueMicrotask(() => {
+            if (hyperlink_focus_restore_epoch_ref.current !== epoch) return;
+            if (!editable_cells_ref.current) return;
+            const active = document.activeElement;
+            const has_surviving_target = active instanceof HTMLElement
+                && active !== document.body
+                && active !== document.documentElement
+                && active.isConnected;
+            if (!has_surviving_target) focus_grid();
+        });
+    }, [focus_grid]);
+    useEffect(() => () => {
+        hyperlink_focus_restore_epoch_ref.current += 1;
     }, []);
+
+    const hyperlink_dialog_admitted = edit_mode
+        && csv_editable
+        && edit_session_id !== undefined
+        && hyperlink_dialog?.edit_session_id === edit_session_id
+        && !close_barrier_active;
+
+    // A stable GridShell can outlive the edit session that opened this dialog.
+    // Remove the stale draft only when that admission actually ends; temporary
+    // save/highlight locks must preserve it until request_save can fold it.
+    useEffect(() => {
+        if (hyperlink_dialog_admitted) return;
+        release_hyperlink_dialog_pin();
+        set_hyperlink_dialog(null);
+    }, [hyperlink_dialog_admitted, release_hyperlink_dialog_pin]);
 
     const apply_hyperlink = useCallback(
         (next: CellHyperlink | null) => {
             const target = hyperlink_dialog;
-            set_hyperlink_dialog(null);
-            grid_ref.current?.focus();
             // Same admission gate as every other mutation path here. Past the
             // close barrier `post_pending_edits` refuses to publish, so a link
             // committed after it would sit in the store and never reach the
             // host — a silently dropped edit rather than a refused one.
             if (
                 !target
+                || target.edit_session_id !== edit_session_id_ref.current
+                || !editable_cells_ref.current
                 || edit_admission_is_fenced()
                 || save_in_flight_ref.current
-            ) return;
-            commit_hyperlinks([{
+            ) return false;
+            const committed = commit_hyperlinks([{
                 source_row: target.source_row,
                 source_col: target.source_col,
                 value: next,
             }]);
+            if (!committed) return false;
+            release_hyperlink_dialog_pin();
+            set_hyperlink_dialog(null);
+            grid_ref.current?.focus();
             // Damage explicitly: a link change on an already-dirty cell leaves
             // the dirty key set unchanged, so the tint effect below sees no
             // transition and would never repaint the new link presentation.
@@ -3921,6 +4133,7 @@ export function GridShell({
                 merged_ranges,
             ).map(({ cell }) => ({ cell: cell as Item }));
             if (cells.length > 0) grid_ref.current?.updateCells(cells);
+            return true;
         },
         [
             commit_hyperlinks,
@@ -3929,6 +4142,7 @@ export function GridShell({
             get_source_row,
             hyperlink_dialog,
             merged_ranges,
+            release_hyperlink_dialog_pin,
             save_in_flight_ref,
         ],
     );
@@ -4548,6 +4762,16 @@ export function GridShell({
         // than guessing: it is also the case where discard_edit would have no key to
         // remove, so hiding "Discard edit" is the consistent answer.
         const menu_source_row = get_source_row(row);
+        const menu_dirty_key = menu_source_row === undefined
+            ? undefined
+            : cell_key(menu_source_row, source_col);
+        const discard_edit_cell_count = menu_dirty_key !== undefined
+            && dirty_cells.has(menu_dirty_key)
+            ? dirty_keys_with_move_closure(
+                dirty_cells,
+                new Set([menu_dirty_key]),
+            ).size
+            : 0;
         const menu_link_url = external_link_url(display_col, row);
         // Hyperlinks are a workbook concept: offered on the sheets that edit as
         // markdown (Excel), never on CSV/TSV, and only where the cell is
@@ -4570,8 +4794,8 @@ export function GridShell({
                     has_hyperlink: cell_hyperlink(display_col, row) !== undefined,
                 }
                 : {}),
-            dirty: menu_source_row !== undefined
-                && dirty_cells.has(`${menu_source_row}:${source_col}`),
+            dirty: discard_edit_cell_count > 0,
+            discard_edit_cell_count,
             has_distinct_copy_selection: has_explicit_column_selection
                 || has_explicit_row_selection
                 || has_distinct_copy_selection(
@@ -4732,14 +4956,21 @@ export function GridShell({
                     {cell_tooltip.text}
                 </div>
             )}
-            {hyperlink_dialog && (
+            {hyperlink_dialog && hyperlink_dialog_admitted && (
                 <HyperlinkDialog
                     // Remount on a different cell so the draft state starts
                     // from that cell's link rather than the previous one's.
-                    key={`${hyperlink_dialog.source_row}:${hyperlink_dialog.source_col}`}
+                    key={[
+                        hyperlink_dialog.edit_session_id,
+                        hyperlink_dialog.source_row,
+                        hyperlink_dialog.source_col,
+                    ].join(':')}
+                    ref={hyperlink_dialog_ref}
                     initial={hyperlink_dialog.initial}
+                    disabled={!editable_cells}
                     on_commit={apply_hyperlink}
                     on_cancel={close_hyperlink_dialog}
+                    on_focused_unmount={restore_focus_after_hyperlink_unmount}
                 />
             )}
             {context_menu?.kind === 'cell' && (

@@ -47,7 +47,7 @@ import {
     type EditableCellValue,
 } from '../pending-changes';
 import {
-    dirty_entry_value_changed,
+    dirty_entry_value_dimension_present,
     make_dirty_entry,
     move_provenance_equal,
     worksheet_target_matches,
@@ -114,6 +114,12 @@ export interface PresentValueDimension {
     readonly value: HistoryValue;
     readonly base: HistoryValue;
     readonly basePending: boolean;
+    /** Present only for the A -> C on disk, pending A write case. */
+    readonly writeValue?: true;
+    /** Preserve otherwise ambiguous equal-value membership without writing text. */
+    readonly retainValue?: true;
+    /** Absent run sides were observed and therefore mean plain formatting. */
+    readonly formattingKnown?: true;
     readonly movedFrom?: CsvDirtyEntry['movedFrom'];
     readonly valueEditOrder?: number;
 }
@@ -179,13 +185,22 @@ export function value_only_overlay(
     value: HistoryValue,
     base: HistoryValue,
     base_pending = false,
+    write_value?: true,
+    retain_value?: true,
+    formatting_known?: true,
     moved_from?: CsvDirtyEntry['movedFrom'],
     value_edit_order?: number,
 ): PresentCellOverlayState {
     return {
         kind: 'present',
         value: {
-            kind: 'present', value, base, basePending: base_pending,
+            kind: 'present',
+            value,
+            base,
+            basePending: base_pending,
+            ...(write_value === true ? { writeValue: true as const } : {}),
+            ...(retain_value === true ? { retainValue: true as const } : {}),
+            ...(formatting_known === true ? { formattingKnown: true as const } : {}),
             ...(moved_from === undefined ? {} : { movedFrom: moved_from }),
             ...(value_edit_order === undefined ? {} : { valueEditOrder: value_edit_order }),
         },
@@ -211,13 +226,22 @@ export function combined_overlay(
     hyperlink: CellHyperlink | null,
     base_hyperlink: CellHyperlink | null,
     base_pending = false,
+    write_value?: true,
+    retain_value?: true,
+    formatting_known?: true,
     moved_from?: CsvDirtyEntry['movedFrom'],
     value_edit_order?: number,
 ): PresentCellOverlayState {
     return {
         kind: 'present',
         value: {
-            kind: 'present', value, base, basePending: base_pending,
+            kind: 'present',
+            value,
+            base,
+            basePending: base_pending,
+            ...(write_value === true ? { writeValue: true as const } : {}),
+            ...(retain_value === true ? { retainValue: true as const } : {}),
+            ...(formatting_known === true ? { formattingKnown: true as const } : {}),
             ...(moved_from === undefined ? {} : { movedFrom: moved_from }),
             ...(value_edit_order === undefined ? {} : { valueEditOrder: value_edit_order }),
         },
@@ -268,9 +292,13 @@ export function overlay_state_from_dirty_entry(
     const value_untouched = link_present
         && !base_pending
         && value_intent !== 'in-overlay'
+        && entry.retainValue !== true
         && entry.movedFrom === undefined
         && entry.valueEditOrder === undefined
-        && (value_intent === 'link-only' || !dirty_entry_value_changed(entry));
+        && (
+            value_intent === 'link-only'
+            || !dirty_entry_value_dimension_present(entry)
+        );
 
     if (value_untouched) {
         return hyperlink_only_overlay(value, entry.link ?? null, entry.baseLink ?? null);
@@ -282,11 +310,23 @@ export function overlay_state_from_dirty_entry(
             entry.link ?? null,
             entry.baseLink ?? null,
             base_pending,
+            entry.writeValue,
+            entry.retainValue,
+            entry.formattingKnown,
             entry.movedFrom,
             entry.valueEditOrder,
         );
     }
-    return value_only_overlay(value, base, base_pending, entry.movedFrom, entry.valueEditOrder);
+    return value_only_overlay(
+        value,
+        base,
+        base_pending,
+        entry.writeValue,
+        entry.retainValue,
+        entry.formattingKnown,
+        entry.movedFrom,
+        entry.valueEditOrder,
+    );
 }
 
 /** Rebuild the store entry a present overlay state describes. */
@@ -302,8 +342,13 @@ export function dirty_entry_from_overlay_state(
         base.runs,
         state.hyperlink.kind === 'present' ? state.hyperlink.value : undefined,
         state.hyperlink.kind === 'present' ? state.hyperlink.base : undefined,
-        state.value.kind === 'present' ? state.value.movedFrom : undefined,
-        state.value.kind === 'present' ? state.value.valueEditOrder : undefined,
+        state.value.kind === 'present' ? {
+            writeValue: state.value.writeValue,
+            retainValue: state.value.retainValue,
+            formattingKnown: state.value.formattingKnown,
+            movedFrom: state.value.movedFrom,
+            valueEditOrder: state.value.valueEditOrder,
+        } : {},
     );
     const base_pending = state.value.kind === 'present' && state.value.basePending;
     return base_pending ? { ...entry, base_pending: true } : entry;
@@ -326,6 +371,9 @@ function value_dimensions_equal(
     }
     if (right.kind === 'untouched') return false;
     return left.basePending === right.basePending
+        && left.writeValue === right.writeValue
+        && left.retainValue === right.retainValue
+        && left.formattingKnown === right.formattingKnown
         && move_provenance_equal(left.movedFrom, right.movedFrom)
         && left.valueEditOrder === right.valueEditOrder
         && history_values_equal(left.value, right.value)
@@ -545,6 +593,9 @@ function value_metadata_moved(before: CellOverlayState, after: CellOverlayState)
     const right = present_value_dimension(after);
     if (left === undefined || right === undefined) return false;
     return left.basePending !== right.basePending
+        || left.writeValue !== right.writeValue
+        || left.retainValue !== right.retainValue
+        || left.formattingKnown !== right.formattingKnown
         || !move_provenance_equal(left.movedFrom, right.movedFrom)
         || left.valueEditOrder !== right.valueEditOrder
         || !history_values_equal(left.base, right.base);
@@ -866,6 +917,9 @@ function copy_overlay(
             value: value_of(value.value),
             base: value_of(value.base),
             basePending: value.basePending,
+            ...(value.writeValue === true ? { writeValue: true as const } : {}),
+            ...(value.retainValue === true ? { retainValue: true as const } : {}),
+            ...(value.formattingKnown === true ? { formattingKnown: true as const } : {}),
             ...(value.movedFrom === undefined ? {} : {
                 movedFrom: {
                     row: value.movedFrom.row,

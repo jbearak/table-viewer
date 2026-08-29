@@ -99,6 +99,14 @@ describe('overlay_state_from_dirty_entry', () => {
         expect(state.hyperlink.kind).toBe('present');
     });
 
+    it('treats a present original-equal link as an explicit write', () => {
+        const entry = make_dirty_entry('A', 'A', undefined, undefined, LINK, LINK, {
+            observedBase: { value: 'A', link: OTHER_LINK },
+        });
+        expect(dirty_entry_link_changed(entry)).toBe(true);
+        expect(dirty_entry_link_changed(make_dirty_entry('A', 'A'))).toBe(false);
+    });
+
     it('reads an entry with both dimensions as both present', () => {
         const state = present(overlay_state_from_dirty_entry(
             make_dirty_entry('B', 'A', undefined, undefined, LINK, null),
@@ -107,10 +115,24 @@ describe('overlay_state_from_dirty_entry', () => {
         expect(state.hyperlink.kind).toBe('present');
     });
 
+    it('round-trips known plain-formatting provenance', () => {
+        const entry: HistoryDirtyEntry = {
+            value: 'B', base: 'A', formattingKnown: true,
+        };
+        const state = present(overlay_state_from_dirty_entry(entry));
+        expect(state.value).toMatchObject({
+            kind: 'present', formattingKnown: true,
+        });
+        expect(dirty_entry_from_overlay_state(state)).toEqual(entry);
+    });
+
     it('keeps move metadata on unchanged text with a hyperlink change', () => {
         const entry = make_dirty_entry(
             'A', 'A', undefined, undefined, LINK, null,
-            { row: 4, col: 3, order: 9 }, 9,
+            {
+                movedFrom: { row: 4, col: 3, order: 9 },
+                valueEditOrder: 9,
+            },
         );
         const state = present(overlay_state_from_dirty_entry(entry));
 
@@ -137,7 +159,7 @@ describe('overlay_state_from_dirty_entry', () => {
     it('round-trips cut provenance through a value overlay', () => {
         const entry = make_dirty_entry(
             'moved', 'old', undefined, undefined, undefined, undefined,
-            { row: 4, col: 3, order: 1 },
+            { movedFrom: { row: 4, col: 3, order: 1 } },
         );
         const state = present(overlay_state_from_dirty_entry(entry));
         expect(state.value.kind).toBe('present');
@@ -443,6 +465,74 @@ describe('conflict-base metadata', () => {
             persistedValue: '',
         });
         expect(d).toBeDefined();
+    });
+
+    it('records and snapshots equal-value write intent', () => {
+        const before = value_only_overlay(history_value('A'), history_value('A'));
+        const after = value_only_overlay(history_value('A'), history_value('A'), false, true);
+        const recorded = build_cell_history_delta({
+            worksheet: SHEET,
+            sourceRow: 0,
+            sourceColumn: 0,
+            before,
+            after,
+            persistedValue: history_value('C'),
+            persistedHyperlink: null,
+        });
+
+        expect(recorded?.value).toBeDefined();
+        expect(recorded?.afterOverlay).toMatchObject({
+            value: { kind: 'present', writeValue: true },
+        });
+    });
+
+    it('records retained membership separately from save-write intent', () => {
+        const before = value_only_overlay(history_value('A'), history_value('A'));
+        const after = value_only_overlay(
+            history_value('A'),
+            history_value('A'),
+            false,
+            undefined,
+            true,
+        );
+        const recorded = build_cell_history_delta({
+            worksheet: SHEET,
+            sourceRow: 0,
+            sourceColumn: 0,
+            before,
+            after,
+            persistedValue: history_value('A'),
+            persistedHyperlink: null,
+        });
+
+        expect(recorded?.value).toBeDefined();
+        expect(recorded?.afterOverlay).toMatchObject({
+            value: { kind: 'present', retainValue: true },
+        });
+        expect(recorded?.afterOverlay.kind === 'present'
+            && recorded.afterOverlay.value.kind === 'present'
+            && recorded.afterOverlay.value.writeValue).toBeUndefined();
+    });
+
+    it('records formatting provenance changing from legacy-unknown to known', () => {
+        const before = value_only_overlay(history_value('B'), history_value('A'));
+        const after = value_only_overlay(
+            history_value('B'), history_value('A'), false,
+            undefined, undefined, true,
+        );
+        const recorded = build_cell_history_delta({
+            worksheet: SHEET,
+            sourceRow: 0,
+            sourceColumn: 0,
+            before,
+            after,
+            persistedValue: history_value('A'),
+            persistedHyperlink: null,
+        });
+
+        expect(recorded?.afterOverlay).toMatchObject({
+            value: { kind: 'present', formattingKnown: true },
+        });
     });
 });
 

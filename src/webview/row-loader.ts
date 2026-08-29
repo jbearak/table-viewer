@@ -510,6 +510,13 @@ export class RowLoader {
         return this.source_to_page.has(source_row);
     }
 
+    /** Display position of a resident canonical source row. */
+    get_display_row_for_source(source_row: number): number | undefined {
+        const claim = this.source_to_page.get(source_row);
+        if (claim === undefined || !this.pages.has(claim.start)) return undefined;
+        return claim.start + claim.offset;
+    }
+
     clear(): void {
         this.pages.clear();
         this.source_to_page.clear();

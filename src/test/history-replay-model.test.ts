@@ -106,7 +106,8 @@ describe('planning an undo', () => {
             column: 3,
             before: absent_overlay(),
             after: value_only_overlay(
-                value('source'), value('destination'), false, { row: 0, col: 0, order: 1 },
+                value('source'), value('destination'), false,
+                undefined, undefined, undefined, { row: 0, col: 0, order: 1 },
             ),
             persisted: 'destination',
         });
@@ -129,7 +130,8 @@ describe('planning an undo', () => {
             column: 3,
             before: absent_overlay(),
             after: value_only_overlay(
-                value('source'), value('destination'), false, { row: 0, col: 0, order: 1 },
+                value('source'), value('destination'), false,
+                undefined, undefined, undefined, { row: 0, col: 0, order: 1 },
             ),
             persisted: 'destination',
         });
@@ -144,7 +146,8 @@ describe('planning an undo', () => {
 
     it('checks an overlapping move destination after earlier reverse steps restore it', () => {
         const moved = value_only_overlay(
-            value('source'), value('destination'), false, { row: 0, col: 0, order: 1 },
+            value('source'), value('destination'), false,
+            undefined, undefined, undefined, { row: 0, col: 0, order: 1 },
         );
         const move = delta({ before: absent_overlay(), after: moved, row: 2, column: 3 });
         const later_removal = delta({ before: moved, after: absent_overlay(), row: 2, column: 3 });
@@ -678,5 +681,66 @@ describe('links whose own dimension moved', () => {
 
         expect(plan.writes[0]?.entry?.link).toEqual(LINK);
         expect(plan.writes[0]?.entry?.baseLink).toEqual(LINK);
+    });
+});
+
+describe('latest observed file side', () => {
+    it('survives replay independently of the historical overlay', () => {
+        const before = absent_overlay();
+        const after = value_only_overlay(value('pending'), value('original'));
+        const plan = plan_of(
+            [cell(delta({ before, after, persisted: 'original' }))],
+            'redo',
+            overlays({ '0:0:0': before }, undefined, { '0:0:0': 'current file' }),
+        );
+
+        expect(plan.writes[0]?.entry).toEqual({
+            value: 'pending',
+            base: 'original',
+            observedBase: { value: 'current file' },
+        });
+    });
+
+    it('does not overwrite a concurrent change to equal-value write intent', () => {
+        const recorded = value_only_overlay(
+            value('A'),
+            value('A'),
+            false,
+            true,
+        );
+        const current = value_only_overlay(value('A'), value('A'));
+        const result = plan_history_replay(
+            history_action('Edit', [cell(delta({
+                before: absent_overlay(),
+                after: recorded,
+                persisted: 'C',
+            }))]),
+            'undo',
+            overlays({ '0:0:0': current }, undefined, { '0:0:0': 'C' }),
+        );
+
+        expect(result).toMatchObject({ kind: 'refused', reason: 'conflict' });
+    });
+
+    it('restores an older equal sparse entry over styled text without a false observation', () => {
+        const before = value_only_overlay(value('A'), value('A'));
+        const action = history_action('Discard pending edit', [cell(delta({
+            before,
+            after: absent_overlay(),
+            persisted: 'A',
+        }))]);
+        const result = plan_history_replay(action, 'undo', () => ({
+            overlay: absent_overlay(),
+            persisted: history_value('A', {
+                runs: [{ text: 'A', style: { bold: true } }],
+            }),
+        }));
+
+        expect(result).toMatchObject({
+            kind: 'plan',
+            writes: [{ entry: { value: 'A', base: 'A' } }],
+        });
+        if (result.kind !== 'plan') throw new Error('expected replay plan');
+        expect(result.writes[0]?.entry?.observedBase).toBeUndefined();
     });
 });

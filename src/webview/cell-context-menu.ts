@@ -6,6 +6,8 @@ import { hide_columns_menu_item } from './column-context-menu';
 
 export interface CellContextMenuModelProps {
     dirty: boolean;
+    /** Number of connected dirty cells the discard action removes. */
+    discard_edit_cell_count: number;
     has_distinct_copy_selection: boolean;
     preview_mode: boolean;
     can_hide_rows: boolean;
@@ -72,7 +74,14 @@ export function cell_context_menu_items(props: CellContextMenuModelProps): MenuI
         items.push({ label: 'Copy link', on_click: () => on_copy_link() });
     }
     if (props.dirty) {
-        items.push({ label: 'Discard edit', on_click: () => props.on_discard_edit() });
+        items.push({
+            label: props.discard_edit_cell_count > 1
+                ? 'Discard all pending edits in '
+                    + props.discard_edit_cell_count
+                    + ' related cells'
+                : 'Discard edit',
+            on_click: () => props.on_discard_edit(),
+        });
     }
     if (!props.preview_mode) {
         if (items.length > 0) items.push({ kind: 'separator' });

@@ -15,14 +15,14 @@
 import {
     copy_dirty_entry,
     dirty_entries_equal,
-    dirty_entry_value_changed,
+    dirty_entry_value_dimension_present,
+    dirty_entry_with_observed_file_base,
     sanitized_wire_dirty_entry,
     type CsvDirtyEntry,
+    type CsvObservedFileBase,
 } from '../types';
 import {
-    hyperlinks_equal,
     rich_text_equal,
-    type CellHyperlink,
     type RichTextRun,
 } from '../cell-content';
 import { is_plain_record } from '../plain-record';
@@ -30,8 +30,8 @@ import { stage_mutation, type StagedMutation } from './staged-mutation';
 
 export interface DirtyEntry extends CsvDirtyEntry {
     // When true, `base` has not yet been captured against a resident page (an
-    // old-format string edit restored while its page was evicted). Conflict
-    // detection skips such entries until the page loads and `base` is captured.
+    // old-format string edit restored while its page was evicted). File-change
+    // observation skips such entries until the page loads and captures `base`.
     base_pending?: boolean;
 }
 
@@ -44,13 +44,16 @@ export interface DirtyEntry extends CsvDirtyEntry {
  * A loaded but blank cell yields ''; a source row that is NOT resident yields
  * `undefined` — its page was evicted from (or never fetched into) the row-loader
  * LRU, or the row is filtered out of the current view entirely. This distinction
- * is load-bearing: conflict detection treats `undefined` as "unknown", never as a
- * changed value, so a non-resident row can never produce a false conflict. The
- * hook never holds onto the full grid, so editing scales to ~1M rows; conflict
- * detection compares against {@link DirtyEntry.base}, snapshotted at edit-start,
- * so it never depends on a page that may since have been evicted.
+ * is load-bearing: observation treats `undefined` as "unknown", never as a changed
+ * value, so a non-resident row cannot produce a false notice. The hook never holds
+ * the full grid, so editing scales to ~1M rows; the host performs the same check
+ * for non-resident rows at save time.
  */
 export type GetCellRaw = (source_row: number, col: number) => string | undefined;
+export type GetCellBase = (
+    source_row: number,
+    col: number,
+) => CsvObservedFileBase | undefined;
 
 export function clear_saved_dirty_entries(
     dirty: ReadonlyMap<string, DirtyEntry>,
@@ -69,52 +72,14 @@ export function clear_saved_dirty_entries(
         // stale (the save wrote an older link), which the next conflict check
         // surfaces rather than this path guessing.
         else {
-            next.set(key, copy_dirty_entry(entry, { base: value, baseRuns: undefined }));
+            next.set(key, copy_dirty_entry(entry, {
+                base: value,
+                baseRuns: undefined,
+                observedBase: undefined,
+            }));
         }
     }
     return next;
-}
-
-/**
- * A resident cell's current hyperlink, addressed by canonical source row like
- * {@link GetCellRaw}: `null` for a cell that verifiably has none, `undefined`
- * for a row that is not resident. The `undefined` case is "unknown", never a
- * conflict — the same rule the raw reader follows, and deliberately unlike the
- * host's save-time validator, where an unobserved cell fails closed because
- * there the save is about to write it.
- */
-export type GetCellLink = (
-    source_row: number,
-    col: number,
-) => CellHyperlink | null | undefined;
-
-export function is_entry_conflicted(
-    key: string,
-    entry: DirtyEntry,
-    get_cell_raw: GetCellRaw,
-    get_cell_link?: GetCellLink,
-): boolean {
-    // Base not yet captured (old-format restore on a non-resident page): can't
-    // judge a conflict yet, so never flag.
-    if (entry.base_pending) return false;
-    const [r, c] = key.split(':').map(Number);
-    const cur = get_cell_raw(r, c);
-    // `undefined` means the page isn't resident — unknown, not a conflict.
-    if (cur !== undefined && cur !== entry.base) return true;
-    // A pending link edit conflicts on its own base, so a link-only entry —
-    // whose text sides are equal by construction — is still checked. Without
-    // this the cell is neither tinted nor reachable by "Discard conflicted",
-    // and the staleness only surfaces when the host refuses the save.
-    if (entry.link !== undefined && get_cell_link) {
-        const current_link = get_cell_link(r, c);
-        if (
-            current_link !== undefined
-            && !hyperlinks_equal(entry.baseLink ?? null, current_link)
-        ) {
-            return true;
-        }
-    }
-    return false;
 }
 
 export interface EditSessionIdentity {
@@ -147,7 +112,7 @@ export interface EditSessionFormulaInput {
 }
 
 function formula_input(entry: DirtyEntry | undefined): EditSessionFormulaInput | undefined {
-    if (!entry || !dirty_entry_value_changed(entry)) return undefined;
+    if (!entry || !dirty_entry_value_dimension_present(entry)) return undefined;
     return {
         value: entry.value,
         ...(entry.valueRuns !== undefined ? { runs: entry.valueRuns.runs } : {}),
@@ -230,16 +195,20 @@ export interface EditSessionStore {
      */
     replace(session_id: string | undefined, entries: unknown): void;
     /**
-     * Filter in place by an arbitrary predicate. Exists so `discard_conflicted`'s
-     * predicate ({@link is_entry_conflicted} against `get_cell_raw`) stays
-     * outside the store — page residency is the loader's concern, not the
-     * session's.
+     * Filter in place by an arbitrary predicate. File-change callers decide
+     * which entries survive from their host-observed bases before reaching the
+     * store; this map does not infer file state or page residency.
      */
     retain(session_id: string | undefined, keep: (key: string, entry: DirtyEntry) => boolean): void;
     clear_saved(session_id: string | undefined, saved: Readonly<Record<string, string>>): void;
+    /** Record the latest file side without replacing the edit's history base. */
+    observe_file_bases(
+        session_id: string | undefined,
+        bases: ReadonlyMap<string, CsvObservedFileBase>,
+    ): void;
     /** Capture true bases for base_pending entries whose page became resident.
      *  Notifies only when something changed. */
-    resolve_pending_bases(session_id: string | undefined, get_cell_raw: GetCellRaw): void;
+    resolve_pending_bases(session_id: string | undefined, get_cell_base: GetCellBase): void;
     /**
      * Stage a whole set of writes as ONE mutation, held back from the
      * subscribers until the caller says so: every key set or removed, one
@@ -608,6 +577,17 @@ export function create_edit_session_store(
             if (!owns(session_id)) return;
             set_entries_recomputed(clear_saved_dirty_entries(state.entries, saved));
         },
+        observe_file_bases: (session_id, bases) => {
+            if (!owns(session_id) || bases.size === 0) return;
+            const next = new Map(state.entries);
+            for (const [key, observed] of bases) {
+                const entry = next.get(key);
+                if (!entry || entry.base_pending) continue;
+                next.set(key, dirty_entry_with_observed_file_base(entry, observed));
+            }
+            // The pending value did not move, so formula inputs are unchanged.
+            set_entries(next, state.pending_base, false, { kind: 'none' });
+        },
         stage_writes: (session_id, writes) => {
             if (!owns(session_id)) return undefined;
             // The state staged against, so a store that moved for any reason —
@@ -639,7 +619,7 @@ export function create_edit_session_store(
                 () => notify(),
             );
         },
-        resolve_pending_bases: (session_id, get_cell_raw) => {
+        resolve_pending_bases: (session_id, get_cell_base) => {
             if (!owns(session_id)) return;
             let changed = false;
             let still_pending = false;
@@ -647,11 +627,20 @@ export function create_edit_session_store(
             for (const [key, entry] of state.entries) {
                 if (entry.base_pending) {
                     const [r, c] = key.split(':').map(Number);
-                    const cur = get_cell_raw(r, c);
+                    const cur = get_cell_base(r, c);
                     if (cur !== undefined) {
                         next.set(key, copy_dirty_entry(entry, {
-                            base: cur,
-                            baseRuns: undefined,
+                            base: cur.value,
+                            baseRuns: cur.runs,
+                            // A legacy scalar recorded only text. When that
+                            // text already equals the resident rich cell, the
+                            // draft did not express a formatting change; copy
+                            // the captured runs to both sides so save/review do
+                            // not invent one.
+                            valueRuns: entry.value === cur.value
+                                ? cur.runs
+                                : entry.valueRuns,
+                            formattingKnown: true,
                         }));
                         changed = true;
                         continue;

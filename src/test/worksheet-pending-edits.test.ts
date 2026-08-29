@@ -75,6 +75,81 @@ describe('decode_stored_per_file_state — pendingEdits migration', () => {
         })).toThrow();
     });
 
+    it('validates formula move metadata in durable pending edits', () => {
+        const valid = {
+            value: 'moved',
+            base: 'old',
+            observedBase: { value: 'current' },
+            movedFrom: { row: 4, col: 3, order: 9 },
+            valueEditOrder: 10,
+        };
+        expect(decoded_edits({ pendingEdits: { '1:2': valid } }))
+            .toEqual([{ cells: { '1:2': valid } }]);
+
+        for (const metadata of [
+            { movedFrom: { row: -1, col: 3, order: 9 } },
+            { movedFrom: { row: 1, col: 3, order: 9, previous: [{ order: 1 }] } },
+            { valueEditOrder: -1 },
+            { valueEditOrder: 1.5 },
+        ]) {
+            expect(() => decoded_edits({
+                pendingEdits: { '1:2': { ...entry('moved', 'old'), ...metadata } },
+            })).toThrow();
+        }
+    });
+
+    it('rebases exhausted edit orders across worksheets and reserves zero', () => {
+        const decoded = decoded_edits({
+            pendingEdits: [
+                {
+                    sheetName: 'Formulas',
+                    cells: {
+                        '0:0': { value: '=Data!A1', base: '' },
+                        '0:1': {
+                            value: '=Data!A1',
+                            base: '',
+                            valueEditOrder: Number.MAX_SAFE_INTEGER - 1,
+                        },
+                        '0:2': { value: '=Data!A1', base: '', valueEditOrder: 0 },
+                    },
+                },
+                {
+                    sheetName: 'Data',
+                    cells: {
+                        '0:1': {
+                            value: 'moved',
+                            base: 'other',
+                            valueEditOrder: Number.MAX_SAFE_INTEGER,
+                            movedFrom: {
+                                row: 0,
+                                col: 0,
+                                order: Number.MAX_SAFE_INTEGER,
+                                previous: [{
+                                    sourceRow: 0,
+                                    sourceCol: 2,
+                                    destinationRow: 0,
+                                    destinationCol: 0,
+                                    order: Number.MAX_SAFE_INTEGER - 2,
+                                }],
+                            },
+                        },
+                    },
+                },
+            ],
+        });
+
+        expect(decoded?.[0]?.cells['0:0']).not.toHaveProperty('valueEditOrder');
+        expect(decoded?.[0]?.cells['0:1']).toMatchObject({ valueEditOrder: 2 });
+        expect(decoded?.[0]?.cells['0:2']).toMatchObject({ valueEditOrder: 0 });
+        expect(decoded?.[1]?.cells['0:1']).toMatchObject({
+            valueEditOrder: 3,
+            movedFrom: {
+                order: 3,
+                previous: [{ order: 1 }],
+            },
+        });
+    });
+
     it('round-trips through the persisted wrapper', () => {
         // What actually goes to disk. The list is wrapped so `json_type` stays
         // 'object' and the CHECK v0.8.0 installed on existing databases still

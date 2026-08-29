@@ -2,15 +2,11 @@
  * Host-side validation of a save's edit bases against the raw, untransformed
  * source. Pure and vscode-free so it can be unit-tested directly.
  *
- * Why this cannot live in the webview alone. `is_entry_conflicted`
- * (webview/edit-session-store.ts) compares an entry's `base` against
- * `get_cell_raw` and treats `undefined` — "the page holding this source row is
- * not resident" — as unknown rather than as a conflict. That is a statement about
- * page *residency*, not about the file: an edit whose page was evicted, never
- * fetched, or which lies past the current row count can never be flagged there.
- * The host has no residency problem, because it reads the source it parsed, so
- * validation has to happen here as well, at save time, independent of whatever
- * the grid happens to be holding.
+ * Why this cannot live in the webview alone. The renderer observes file changes
+ * through its paged row cache, where `undefined` means the source row is not
+ * resident. That is a statement about page residency, not the file: an edited row
+ * whose page was evicted or never fetched cannot be checked there. The host reads
+ * the parsed source directly, so validation also happens here at save time.
  *
  * Three cases, deliberately kept distinct:
  *
@@ -22,8 +18,8 @@
  *    removed one.
  * 2. **Removed by a real file shrink** (`source_row >= source_row_count`): the
  *    row is gone from the file rather than merely out of view → `removedRows`.
- * 3. **Base mismatch**: the cell is readable and its text is not what the edit
- *    was made against → `conflicts`.
+ * 3. **Base mismatch**: the cell is readable and differs from the last file side
+ *    the renderer observed → `conflicts` (the legacy internal outcome name).
  *
  * A fourth, degenerate case joins (2): a key that does not parse as a pair of
  * non-negative integers. This is the last gate before a raw `write_file`, so it
@@ -39,12 +35,27 @@ import {
     type RichText,
 } from './cell-content';
 import { parse_cell_key } from './cell-key';
-import type { CsvDirtyMap } from './types';
+import {
+    dirty_entry_base_formatting_unknown,
+    dirty_entry_observed_base,
+    make_observed_file_base,
+    type CsvDirtyMap,
+    type CsvObservedFileBase,
+} from './types';
 
 export type BaseValidationOutcome =
     | { readonly type: 'valid' }
-    | { readonly type: 'conflicts'; readonly keys: readonly string[] }
-    | { readonly type: 'removedRows'; readonly keys: readonly string[] };
+    | {
+        readonly type: 'conflicts';
+        readonly keys: readonly string[];
+        readonly observedBases: Readonly<Record<string, CsvObservedFileBase>>;
+    }
+    | {
+        readonly type: 'removedRows';
+        readonly keys: readonly string[];
+        readonly changedKeys?: readonly string[];
+        readonly observedBases?: Readonly<Record<string, CsvObservedFileBase>>;
+    };
 
 /** Formatting halves of a base comparison, texts already known equal. An
  *  absent side means "plain", so a plain-vs-plain cell is equal without
@@ -86,6 +97,7 @@ export function validate_dirty_bases(
 ): BaseValidationOutcome {
     const removed_keys: string[] = [];
     const conflicted_keys: string[] = [];
+    const observed_bases: Record<string, CsvObservedFileBase> = {};
 
     for (const [key, entry] of Object.entries(dirty_edits)) {
         // Fail closed through the shared canonical parser. Numeric coercion would
@@ -110,21 +122,24 @@ export function validate_dirty_bases(
         // contract, where a loaded-but-blank cell is ''. Without this every edit
         // that filled a blank trailing cell would validate as a false conflict.
         const current = read_raw(source_row, col) ?? '';
-        if (current !== entry.base) {
-            conflicted_keys.push(key);
-            continue;
-        }
+        const current_rich = read_rich?.(source_row, col);
+        const current_link = entry.link !== undefined
+            ? read_link?.(source_row, col)
+            : undefined;
+        const expected = dirty_entry_observed_base(entry);
+        let changed = current !== expected.value;
         // Text matches; on a rich source, the formatting must too. A cell the
         // text reader could not observe was already conflicted above (`current`
         // is '' only when the base claims ''), so reading rich for it is moot —
         // undefined from either side of an unobserved cell means "plain".
-        if (
+        if (!changed && (
             read_rich
-            && !base_formatting_equal(entry.baseRuns, read_rich(source_row, col), current)
-        ) {
-            conflicted_keys.push(key);
-            continue;
-        }
+            && (
+                entry.observedBase !== undefined
+                || !dirty_entry_base_formatting_unknown(entry)
+            )
+            && !base_formatting_equal(expected.runs, current_rich, current)
+        )) changed = true;
         // A link change validates its own base independently: the link the
         // edit was made against must still be the cell's link. Fail closed on
         // both ways of not knowing — an unobserved cell (`undefined` from the
@@ -134,20 +149,42 @@ export function validate_dirty_bases(
         // place, so an entry with one and no observer means the two sides
         // disagree about the format, and the safe answer is to refuse rather
         // than write a link nobody checked.
-        if (entry.link !== undefined) {
-            const current_link = read_link?.(source_row, col);
+        if (entry.link !== undefined && !changed) {
             if (
                 current_link === undefined
-                || !hyperlinks_equal(entry.baseLink ?? null, current_link)
+                || !hyperlinks_equal(expected.link ?? null, current_link)
             ) {
-                conflicted_keys.push(key);
+                changed = true;
             }
         }
+        if (!changed) continue;
+        conflicted_keys.push(key);
+        // A missing link reader cannot establish a safe next compare-and-set
+        // base for a pending link edit. Keep the key rejected but omit its
+        // observed side, so a later save still fails closed instead of treating
+        // an unknown link as linkless.
+        if (entry.link !== undefined && current_link === undefined) continue;
+        observed_bases[key] = make_observed_file_base(
+            current,
+            current_rich,
+            entry.link !== undefined ? current_link : undefined,
+        );
     }
 
-    // A removed row outranks a mismatch: it is the more destructive fact, and its
-    // message is the one that tells the user what actually happened to the file.
-    if (removed_keys.length > 0) return { type: 'removedRows', keys: removed_keys };
-    if (conflicted_keys.length > 0) return { type: 'conflicts', keys: conflicted_keys };
+    // Keep both facts from one validation pass. The removed-row message still
+    // leads, but readable cells that changed are reviewed at the same time
+    // instead of appearing only after the user fixes the removed entries and
+    // retries the save.
+    if (removed_keys.length > 0) return {
+        type: 'removedRows',
+        keys: removed_keys,
+        ...(conflicted_keys.length > 0 ? {
+            changedKeys: conflicted_keys,
+            observedBases: observed_bases,
+        } : {}),
+    };
+    if (conflicted_keys.length > 0) {
+        return { type: 'conflicts', keys: conflicted_keys, observedBases: observed_bases };
+    }
     return { type: 'valid' };
 }
