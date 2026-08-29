@@ -2336,7 +2336,7 @@ describe('file coordinator refresh stream', () => {
             mark_listener_started();
             return listener_gate;
         }, factory);
-        const request = first_subscription.request('postSave');
+        const request = first_subscription.request('postSave', 'saved-digest');
         await listener_started;
 
         first_subscription.dispose();
@@ -2403,8 +2403,13 @@ describe('file coordinator refresh stream', () => {
         factory.watchers[0].emit('change');
         await flush_refresh();
         expect(events).toEqual([]);
-        await expect(subscription.request('postSave')).resolves.toMatchObject({
-            event: { refreshRevision: 2, episode: 1, reason: 'postSave' },
+        await expect(subscription.request('postSave', 'saved-digest')).resolves.toMatchObject({
+            event: {
+                refreshRevision: 2,
+                episode: 1,
+                reason: 'postSave',
+                savedDigest: 'saved-digest',
+            },
         });
         absorbed.cancel(); // already consumed by request
         expect(events).toMatchObject([{
@@ -2439,7 +2444,7 @@ describe('file coordinator refresh stream', () => {
         const watcher = factory.watchers[0];
 
         watcher.emit('change');
-        const requested = subscription.request('postSave');
+        const requested = subscription.request('postSave', 'saved-digest');
         watcher.emit('delete');
         await expect(requested).resolves.toMatchObject({
             type: 'completed',
@@ -2466,7 +2471,7 @@ describe('file coordinator refresh stream', () => {
             if (event.reason === 'postSave') return gate;
         }, factory);
 
-        const request = subscription.request('postSave');
+        const request = subscription.request('postSave', 'saved-digest');
         factory.watchers[0].emit('change');
         await flush_refresh();
         expect(events).toMatchObject([
@@ -2500,7 +2505,7 @@ describe('file coordinator refresh stream', () => {
         }, factory);
 
         let request_settled = false;
-        const request = requester.request('postSave').then((result) => {
+        const request = requester.request('postSave', 'saved-digest').then((result) => {
             request_settled = true;
             return result;
         });
@@ -2524,12 +2529,16 @@ describe('file coordinator refresh stream', () => {
         const operation = begin_physical(coordinator, 'digest');
         const before = coordinator.authority();
         const subscription = coordinator.subscribe_refresh(() => {}, factory);
-        await expect(subscription.request('postSave')).resolves.toMatchObject({ type: 'completed' });
+        await expect(subscription.request('postSave', 'saved-digest')).resolves.toMatchObject({
+            type: 'completed',
+        });
         expect(coordinator.operation_is_current(operation)).toBe(true);
         expect(coordinator.authority()).toEqual(before);
 
         subscription.dispose();
-        await expect(subscription.request('postSave')).resolves.toEqual({ type: 'disposed' });
+        await expect(subscription.request('postSave', 'saved-digest')).resolves.toEqual({
+            type: 'disposed',
+        });
         coordinator.cancel(operation);
         coordinator.dispose();
         expect(factory.watchers[0].disposeCalls).toBe(1);
