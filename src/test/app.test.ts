@@ -9617,7 +9617,30 @@ describe('edit mode save exit', () => {
         await enter_edit_mode(post_message);
         const people_edits = { '4:1': { value: 'Bob', base: 'Alice' } };
         const inventory_edits = { '4:1': { value: 'Gadget', base: 'stale' } };
+        seed_mounted_store(people_edits);
+        await click_sheet_tab('Inventory');
+        seed_mounted_store(inventory_edits);
+        await click_sheet_tab('People');
         await report_grid_editing(true, true, [], people_edits);
+        const grid_focus_target = document.createElement('button');
+        document.body.appendChild(grid_focus_target);
+        grid_focus_target.focus();
+        grid_shell_mock.has_grid_focus.mockReturnValue(true);
+        // Cmd/Ctrl+S calls GridShell.request_save directly. Its shared callback
+        // creates the operation while the grid still owns focus, then GridShell
+        // dismisses the overlay and blurs. This deliberately bypasses App's
+        // save-dialog wrapper so the shortcut path cannot regress unnoticed.
+        let operation: CsvSaveOperation | undefined;
+        await act(async () => {
+            operation = (
+                grid_shell_mock.latest_props?.on_save_request as
+                    (() => CsvSaveOperation | undefined)
+            )();
+        });
+        grid_focus_target.blur();
+        grid_shell_mock.has_grid_focus.mockReturnValue(false);
+        expect(document.activeElement).toBe(document.body);
+        expect(operation?.worksheets).toHaveLength(2);
         grid_shell_mock.mount_edits = inventory_edits;
         grid_shell_mock.mount_conflicted = ['4:1'];
         grid_shell_mock.focus_grid.mockClear();
@@ -9627,24 +9650,7 @@ describe('edit mode save exit', () => {
             lifecycle: {
                 revision: 904,
                 state: 'failed',
-                operation: {
-                    editSessionId: 'test-edit-session',
-                    saveRequestId: 'save-sheet-scope',
-                    worksheets: [
-                        {
-                            sheetIndex: 0,
-                            sheetName: 'People',
-                            edits: { '4:1': 'Bob' },
-                            dirtyEdits: people_edits,
-                        },
-                        {
-                            sheetIndex: 1,
-                            sheetName: 'Inventory',
-                            edits: { '4:1': 'Gadget' },
-                            dirtyEdits: inventory_edits,
-                        },
-                    ],
-                },
+                operation: operation!,
             },
             rejection: { reason: 'baseMismatch', worksheetOperationIndex: 1, keys: ['4:1'] },
         });

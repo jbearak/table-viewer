@@ -102,7 +102,7 @@ import {
 import { is_rich_text_cell, rich_text_cell_renderer } from './rich-text-cell-renderer';
 import { parse_http_external_url } from '../external-url';
 import type { CellHyperlink } from '../cell-content';
-import { HyperlinkDialog } from './hyperlink-dialog';
+import { HyperlinkDialog, type HyperlinkDialogHandle } from './hyperlink-dialog';
 import {
     CELL_TOOLTIP_SHOW_DELAY_MS,
     cell_tooltip_content,
@@ -461,6 +461,15 @@ export interface GridFocusHandle {
     focus(): boolean;
 }
 
+/** Whether focus belongs to this grid, including Glide's body-level editor portal. */
+function grid_owns_focus(root: HTMLElement | null, active: Element | null): boolean {
+    if (!(active instanceof HTMLElement)) return false;
+    if (root?.contains(active)) return true;
+    const portal = document.getElementById('portal');
+    const overlay = active.closest('.gdg-clip-region');
+    return portal !== null && overlay !== null && portal.contains(overlay);
+}
+
 export interface GridActionsHandle {
     /** Sheet this handle's grid is mounted for; guards stale-remount races. */
     sheet_index: number;
@@ -798,6 +807,11 @@ export function GridShell({
     const font_size_px = theme_font_size_px(theme);
     const default_row_height = default_row_height_for_font(font_size_px);
     const grid_ref = useRef<DataEditorRef | null>(null);
+    // Saving folds a link dialog through this handle before snapshotting the
+    // workbook, just as it folds Glide's cell overlay through read_live_edit.
+    const hyperlink_dialog_ref = useRef<HyperlinkDialogHandle | null>(null);
+    const hyperlink_dialog_pin_ref = useRef<symbol | null>(null);
+    const hyperlink_focus_restore_epoch_ref = useRef(0);
     const grid_root_ref = useRef<HTMLDivElement | null>(null);
     const row_resize_ref = useRef<RowResizeOverlayHandle | null>(null);
     const row_resize_preview_ref = useRef<RowResizePreview | null>(null);
@@ -823,18 +837,17 @@ export function GridShell({
         const grid = grid_ref.current;
         if (!grid) return false;
         grid.focus();
-        const active = document.activeElement;
-        return !!active && !!grid_root_ref.current?.contains(active);
+        return grid_owns_focus(grid_root_ref.current, document.activeElement);
     }, []);
 
     useLayoutEffect(() => {
         if (!grid_focus_ref) return;
         const handle: GridFocusHandle = {
             generation,
-            has_focus: () => {
-                const active = document.activeElement;
-                return !!active && !!grid_root_ref.current?.contains(active);
-            },
+            has_focus: () => grid_owns_focus(
+                grid_root_ref.current,
+                document.activeElement,
+            ),
             focus: focus_grid,
         };
         grid_focus_ref.current = handle;
@@ -2059,6 +2072,13 @@ export function GridShell({
         if (edit_admission_is_fenced() || save_in_flight_ref.current || !edit_session_id) {
             return false;
         }
+        // The hyperlink editor owns its draft state. Fold a valid draft into the
+        // shared store before App snapshots every worksheet; an invalid draft
+        // remains visible and blocks the save instead of being silently lost.
+        if (
+            hyperlink_dialog_ref.current
+            && !hyperlink_dialog_ref.current.commit()
+        ) return false;
         const live = read_live_edit();
         if (live) {
             const [source_row, source_column] = live.key.split(':').map(Number);
@@ -3837,48 +3857,105 @@ export function GridShell({
         display_col: number;
         source_col: number;
         source_row: number;
+        edit_session_id: string;
         initial: CellHyperlink | null;
     } | null>(null);
+
+    const release_hyperlink_dialog_pin = useCallback(() => {
+        const pin = hyperlink_dialog_pin_ref.current;
+        if (pin === null) return;
+        hyperlink_dialog_pin_ref.current = null;
+        unpin_rows_ref.current(pin);
+    }, []);
+    useEffect(() => () => release_hyperlink_dialog_pin(), [release_hyperlink_dialog_pin]);
 
     const open_hyperlink_dialog = useCallback(
         (row: number, display_col: number, source_col: number) => {
             const source_row = get_source_row(row);
-            if (source_row === undefined) return;
+            if (source_row === undefined || edit_session_id === undefined) return;
+            release_hyperlink_dialog_pin();
+            hyperlink_dialog_pin_ref.current = pin_rows_ref.current(row, row);
             set_hyperlink_dialog({
                 row,
                 display_col,
                 source_col,
                 source_row,
+                edit_session_id,
                 initial: cell_hyperlink(display_col, row) ?? null,
             });
         },
-        [cell_hyperlink, get_source_row],
+        [
+            cell_hyperlink,
+            edit_session_id,
+            get_source_row,
+            release_hyperlink_dialog_pin,
+        ],
     );
 
     const close_hyperlink_dialog = useCallback(() => {
+        release_hyperlink_dialog_pin();
         set_hyperlink_dialog(null);
         grid_ref.current?.focus();
+    }, [release_hyperlink_dialog_pin]);
+
+    const restore_focus_after_hyperlink_unmount = useCallback(() => {
+        const epoch = ++hyperlink_focus_restore_epoch_ref.current;
+        // Child layout cleanup runs before this commit installs the replacement
+        // session's refs. A microtask observes that committed state without
+        // guessing how long rendering takes.
+        window.queueMicrotask(() => {
+            if (hyperlink_focus_restore_epoch_ref.current !== epoch) return;
+            if (!editable_cells_ref.current) return;
+            const active = document.activeElement;
+            const has_surviving_target = active instanceof HTMLElement
+                && active !== document.body
+                && active !== document.documentElement
+                && active.isConnected;
+            if (!has_surviving_target) focus_grid();
+        });
+    }, [focus_grid]);
+    useEffect(() => () => {
+        hyperlink_focus_restore_epoch_ref.current += 1;
     }, []);
+
+    const hyperlink_dialog_admitted = edit_mode
+        && csv_editable
+        && edit_session_id !== undefined
+        && hyperlink_dialog?.edit_session_id === edit_session_id
+        && !close_barrier_active;
+
+    // A stable GridShell can outlive the edit session that opened this dialog.
+    // Remove the stale draft only when that admission actually ends; temporary
+    // save/highlight locks must preserve it until request_save can fold it.
+    useEffect(() => {
+        if (hyperlink_dialog_admitted) return;
+        release_hyperlink_dialog_pin();
+        set_hyperlink_dialog(null);
+    }, [hyperlink_dialog_admitted, release_hyperlink_dialog_pin]);
 
     const apply_hyperlink = useCallback(
         (next: CellHyperlink | null) => {
             const target = hyperlink_dialog;
-            set_hyperlink_dialog(null);
-            grid_ref.current?.focus();
             // Same admission gate as every other mutation path here. Past the
             // close barrier `post_pending_edits` refuses to publish, so a link
             // committed after it would sit in the store and never reach the
             // host — a silently dropped edit rather than a refused one.
             if (
                 !target
+                || target.edit_session_id !== edit_session_id_ref.current
+                || !editable_cells_ref.current
                 || edit_admission_is_fenced()
                 || save_in_flight_ref.current
-            ) return;
-            commit_hyperlinks([{
+            ) return false;
+            const committed = commit_hyperlinks([{
                 source_row: target.source_row,
                 source_col: target.source_col,
                 value: next,
             }]);
+            if (!committed) return false;
+            release_hyperlink_dialog_pin();
+            set_hyperlink_dialog(null);
+            grid_ref.current?.focus();
             // Damage explicitly: a link change on an already-dirty cell leaves
             // the dirty key set unchanged, so the tint effect below sees no
             // transition and would never repaint the new link presentation.
@@ -3893,6 +3970,7 @@ export function GridShell({
                 merged_ranges,
             ).map(({ cell }) => ({ cell: cell as Item }));
             if (cells.length > 0) grid_ref.current?.updateCells(cells);
+            return true;
         },
         [
             commit_hyperlinks,
@@ -3901,6 +3979,7 @@ export function GridShell({
             get_source_row,
             hyperlink_dialog,
             merged_ranges,
+            release_hyperlink_dialog_pin,
             save_in_flight_ref,
         ],
     );
@@ -4700,14 +4779,21 @@ export function GridShell({
                     {cell_tooltip.text}
                 </div>
             )}
-            {hyperlink_dialog && (
+            {hyperlink_dialog && hyperlink_dialog_admitted && (
                 <HyperlinkDialog
                     // Remount on a different cell so the draft state starts
                     // from that cell's link rather than the previous one's.
-                    key={`${hyperlink_dialog.source_row}:${hyperlink_dialog.source_col}`}
+                    key={[
+                        hyperlink_dialog.edit_session_id,
+                        hyperlink_dialog.source_row,
+                        hyperlink_dialog.source_col,
+                    ].join(':')}
+                    ref={hyperlink_dialog_ref}
                     initial={hyperlink_dialog.initial}
+                    disabled={!editable_cells}
                     on_commit={apply_hyperlink}
                     on_cancel={close_hyperlink_dialog}
+                    on_focused_unmount={restore_focus_after_hyperlink_unmount}
                 />
             )}
             {context_menu?.kind === 'cell' && (

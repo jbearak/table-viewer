@@ -1197,6 +1197,14 @@ export function App(): React.JSX.Element {
         requestId: string;
         editSessionId: string;
     } | null>(null);
+    // GridShell blurs the active element once a save is admitted. Remember that
+    // the grid owned focus before that intentional blur so a later rejection can
+    // hand keyboard focus to the worksheet it reveals. Keyed to the operation so
+    // a stale terminal can never consume a newer save's intent.
+    const pending_save_grid_focus_ref = useRef<{
+        editSessionId: string;
+        saveRequestId: string;
+    } | null>(null);
     const save_projection_ref = useRef<CsvSaveProjection>(
         INITIAL_CSV_SAVE_PROJECTION,
     );
@@ -1684,6 +1692,13 @@ export function App(): React.JSX.Element {
         });
         const projection = propose_csv_save(save_projection_ref.current, operation);
         save_projection_ref.current = projection;
+        pending_save_grid_focus_ref.current =
+            grid_focus_ref.current?.has_focus() === true
+                ? {
+                    editSessionId: operation.editSessionId,
+                    saveRequestId: operation.saveRequestId,
+                }
+                : null;
         set_save_operation(operation);
         save_in_flight_ref.current = true;
         host_bridge.postMessage({ type: 'saveCsv', operation });
@@ -1692,6 +1707,7 @@ export function App(): React.JSX.Element {
 
     const reset_save_projection = useCallback(() => {
         save_projection_ref.current = INITIAL_CSV_SAVE_PROJECTION;
+        pending_save_grid_focus_ref.current = null;
         set_save_lifecycle(INITIAL_CSV_SAVE_PROJECTION.authoritative);
         set_save_operation(undefined);
     }, []);
@@ -4842,7 +4858,8 @@ export function App(): React.JSX.Element {
         // request_save() has side effects, so it is evaluated first. If workbook
         // preflight blocks, the active sheet may be clean while a sibling store is
         // still dirty; keep the session open from the registry-wide truth.
-        return editing.request_save()
+        const requested = editing.request_save();
+        return requested
             || edit_session_registry_ref.current!.has_dirty_entries();
     }, []);
 
@@ -4975,6 +4992,12 @@ export function App(): React.JSX.Element {
                         || save_lifecycle_correlation(msg.lifecycle)?.editSessionId
                             === current_session_id;
                 if (!matching) return;
+                const pending_grid_focus = pending_save_grid_focus_ref.current;
+                const restore_rejected_grid_focus = operation !== undefined
+                    && pending_grid_focus?.editSessionId === operation.editSessionId
+                    && pending_grid_focus.saveRequestId === operation.saveRequestId
+                    && !has_surviving_focus_target();
+                pending_save_grid_focus_ref.current = null;
                 pending_exit_ref.current = false;
 
                 // A success or a retry that passed dirty-base validation supersedes
@@ -5046,7 +5069,10 @@ export function App(): React.JSX.Element {
                         rejected_sheet_index !== undefined
                         && rejected_sheet_index !== state_ref.current.activeSheetIndex
                     ) {
-                        if (grid_focus_ref.current?.has_focus() === true) {
+                        if (
+                            grid_focus_ref.current?.has_focus() === true
+                            || restore_rejected_grid_focus
+                        ) {
                             rejected_sheet_grid_focus_ref.current = {
                                 sheet_index: rejected_sheet_index,
                                 generation: generation_ref.current,
@@ -5054,6 +5080,11 @@ export function App(): React.JSX.Element {
                             };
                         }
                         handle_sheet_select(rejected_sheet_index);
+                    } else if (
+                        rejected_sheet_index === state_ref.current.activeSheetIndex
+                        && restore_rejected_grid_focus
+                    ) {
+                        grid_focus_ref.current?.focus();
                     }
                 }
             }

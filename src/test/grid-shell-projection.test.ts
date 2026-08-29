@@ -12,7 +12,10 @@ import type {
 import { matches_filter } from '../table-transform';
 import type { CsvSaveOperation, FilterEntry, SheetTransformState } from '../types';
 import { CsvDataSource } from '../data-source/csv-source';
-import { create_edit_session_store } from '../webview/edit-session-store';
+import {
+    create_edit_session_store,
+    type DirtyEntry,
+} from '../webview/edit-session-store';
 import { create_history_store, type HistoryStore } from '../webview/history-store';
 import {
     LAST_COLUMN_RESIZE_GUTTER_PX,
@@ -939,6 +942,24 @@ describe('GridShell column projection', () => {
         expect(document.activeElement).toBe(
             container!.querySelector('.data-editor-stub'),
         );
+
+        // Glide moves the live cell editor outside the grid tree into #portal.
+        // It is still the grid's focus for save/rejection handoff purposes.
+        const portal = document.createElement('div');
+        portal.id = 'portal';
+        const clip = document.createElement('div');
+        clip.className = 'gdg-clip-region';
+        const editor = document.createElement('textarea');
+        clip.appendChild(editor);
+        portal.appendChild(clip);
+        document.body.appendChild(portal);
+        editor.focus();
+        expect(grid_focus_ref.current?.has_focus()).toBe(true);
+
+        const unrelated = document.createElement('input');
+        document.body.appendChild(unrelated);
+        unrelated.focus();
+        expect(grid_focus_ref.current?.has_focus()).toBe(false);
     });
 
     it('wraps Tab and Shift+Tab through displayed columns', async () => {
@@ -4786,7 +4807,158 @@ describe('GridShell hyperlink dialog admission', () => {
         expect(editing_ref.current!.has_uncommitted_changes()).toBe(true);
     });
 
-    it('refuses a hyperlink once the close barrier is raised', async () => {
+    it('folds a hyperlink draft into a Cmd/Ctrl+S save', async () => {
+        const editing_ref = React.createRef<EditingHandle | null>();
+        const store = create_edit_session_store({ session_id: 'session-1' });
+        let submitted: Record<string, DirtyEntry> = {};
+        const on_save_request = vi.fn((): CsvSaveOperation => {
+            submitted = Object.fromEntries(store.snapshot());
+            return {
+                editSessionId: 'session-1',
+                saveRequestId: 'save-link-draft',
+                worksheets: [{
+                    sheetIndex: 0,
+                    sheetName: 'Sheet1',
+                    edits: Object.fromEntries(
+                        Object.entries(submitted).map(([key, entry]) => [key, entry.value]),
+                    ),
+                    dirtyEdits: submitted,
+                }],
+            };
+        });
+        await render_grid({
+            ...link_props(editing_ref),
+            edit_session: store,
+            on_save_request,
+        });
+        await open_dialog();
+        const dialog_pin = grid_mock.pin_rows.mock.results.at(-1)!.value as symbol;
+        await act(async () => set_input_value(
+            field('hyperlink-target') as HTMLInputElement,
+            'https://shortcut.test/path',
+        ));
+
+        await act(async () => {
+            field('hyperlink-target').dispatchEvent(new KeyboardEvent('keydown', {
+                key: 's',
+                ctrlKey: true,
+                bubbles: true,
+                cancelable: true,
+            }));
+        });
+
+        expect(on_save_request).toHaveBeenCalledOnce();
+        expect(submitted['0:0']).toEqual(expect.objectContaining({
+            link: { kind: 'external', target: 'https://shortcut.test/path' },
+            baseLink: null,
+        }));
+        expect(document.getElementById('hyperlink-target')).toBeNull();
+        expect(grid_mock.unpin_rows).toHaveBeenCalledWith(dialog_pin);
+    });
+
+    it('keeps an invalid hyperlink draft open and blocks Cmd/Ctrl+S', async () => {
+        const editing_ref = React.createRef<EditingHandle | null>();
+        const on_save_request = vi.fn();
+        await render_grid({ ...link_props(editing_ref), on_save_request });
+        await open_dialog();
+        await act(async () => set_input_value(
+            field('hyperlink-target') as HTMLInputElement,
+            'not a web address',
+        ));
+
+        await act(async () => {
+            field('hyperlink-target').dispatchEvent(new KeyboardEvent('keydown', {
+                key: 'S',
+                metaKey: true,
+                bubbles: true,
+                cancelable: true,
+            }));
+        });
+
+        expect(on_save_request).not.toHaveBeenCalled();
+        expect((field('hyperlink-target') as HTMLInputElement).value)
+            .toBe('not a web address');
+    });
+
+    it('keeps a hyperlink draft when history replay refuses the gesture', async () => {
+        const editing_ref = React.createRef<EditingHandle | null>();
+        const store = create_edit_session_store({ session_id: 'session-1' });
+        let gestures_admitted = false;
+        const on_save_request = vi.fn((): CsvSaveOperation => ({
+            editSessionId: 'session-1',
+            saveRequestId: 'save-after-replay',
+            worksheets: [{ sheetIndex: 0, edits: {}, dirtyEdits: {} }],
+        }));
+        await render_grid({
+            ...link_props(editing_ref),
+            edit_session: store,
+            gestures_admitted: () => gestures_admitted,
+            on_save_request,
+        });
+        await open_dialog();
+        await act(async () => set_input_value(
+            field('hyperlink-target') as HTMLInputElement,
+            'https://after-replay.test',
+        ));
+
+        const save_shortcut = () => field('hyperlink-target').dispatchEvent(
+            new KeyboardEvent('keydown', {
+                key: 's',
+                ctrlKey: true,
+                bubbles: true,
+                cancelable: true,
+            }),
+        );
+        await act(async () => { save_shortcut(); });
+        expect(on_save_request).not.toHaveBeenCalled();
+        expect(store.size()).toBe(0);
+        expect(document.getElementById('hyperlink-target')).not.toBeNull();
+
+        gestures_admitted = true;
+        await act(async () => { save_shortcut(); });
+        expect(on_save_request).toHaveBeenCalledOnce();
+        expect(store.get('0:0')?.link).toEqual({
+            kind: 'external',
+            target: 'https://after-replay.test/',
+        });
+        expect(document.getElementById('hyperlink-target')).toBeNull();
+    });
+
+    it('keeps a hyperlink draft when its history row is no longer resident', async () => {
+        const editing_ref = React.createRef<EditingHandle | null>();
+        const store = create_edit_session_store({ session_id: 'session-1' });
+        const on_save_request = vi.fn();
+        await render_grid({
+            ...link_props(editing_ref),
+            edit_session: store,
+            history_store: create_history_store(),
+            on_save_request,
+        });
+        await open_dialog();
+        await act(async () => set_input_value(
+            field('hyperlink-target') as HTMLInputElement,
+            'https://evicted-row.test',
+        ));
+        // The dialog owns the source identity, but history can no longer describe
+        // the persisted side once the row leaves the loader. The gesture must be
+        // refused without turning that refusal into permission to save.
+        grid_mock.source_row_for_display = () => undefined;
+
+        await act(async () => {
+            field('hyperlink-target').dispatchEvent(new KeyboardEvent('keydown', {
+                key: 's',
+                ctrlKey: true,
+                bubbles: true,
+                cancelable: true,
+            }));
+        });
+
+        expect(on_save_request).not.toHaveBeenCalled();
+        expect(store.size()).toBe(0);
+        expect(document.getElementById('hyperlink-target')).not.toBeNull();
+    });
+
+    it('closes a hyperlink once the close barrier is raised', async () => {
         // The barrier goes up while the dialog is already open — the one
         // ordering the menu gate cannot catch. Past it `post_pending_edits`
         // refuses to publish, so a link accepted here would sit in the store
@@ -4796,8 +4968,79 @@ describe('GridShell hyperlink dialog admission', () => {
         await render_grid(link_props(editing_ref));
         await open_dialog();
         await act(async () => editing_ref.current!.stop_edit_admission());
-        await save_link();
+        expect(document.getElementById('hyperlink-target')).toBeNull();
         expect(editing_ref.current!.has_uncommitted_changes()).toBe(false);
+    });
+
+    it('closes a hyperlink draft when the edit session ends', async () => {
+        // A successful save no longer remounts GridShell. The dialog therefore
+        // has to follow the session identity explicitly instead of relying on
+        // unmount to make its now-sessionless Save button disappear.
+        const editing_ref = React.createRef<EditingHandle | null>();
+        const GridShell = await render_grid(link_props(editing_ref));
+        await open_dialog();
+        const dialog_pin = grid_mock.pin_rows.mock.results.at(-1)!.value as symbol;
+        expect(field('hyperlink-target')).not.toBeNull();
+
+        await act(async () => root!.render(React.createElement(GridShell, {
+            ...link_props(editing_ref),
+            edit_mode: false,
+            edit_session_id: undefined,
+        })));
+        expect(document.getElementById('hyperlink-target')).toBeNull();
+        expect(grid_mock.unpin_rows).toHaveBeenCalledWith(dialog_pin);
+        expect(editing_ref.current!.has_uncommitted_changes()).toBe(false);
+
+        // Reusing the same stable mount for a later session must not resurrect
+        // the previous session's draft.
+        await act(async () => root!.render(React.createElement(
+            GridShell,
+            link_props(editing_ref),
+        )));
+        expect(document.getElementById('hyperlink-target')).toBeNull();
+    });
+
+    it('does not carry a hyperlink draft into a replacement edit session', async () => {
+        const editing_ref = React.createRef<EditingHandle | null>();
+        const GridShell = await render_grid(link_props(editing_ref));
+        await open_dialog();
+        const dialog_pin = grid_mock.pin_rows.mock.results.at(-1)!.value as symbol;
+        await act(async () => set_input_value(
+            field('hyperlink-target') as HTMLInputElement,
+            'https://old-session.test',
+        ));
+        field('hyperlink-target').focus();
+        expect(document.activeElement).toBe(field('hyperlink-target'));
+
+        await act(async () => root!.render(React.createElement(GridShell, {
+            ...link_props(editing_ref),
+            edit_session_id: 'session-2',
+            edit_session: create_edit_session_store({ session_id: 'session-2' }),
+        })));
+
+        expect(document.getElementById('hyperlink-target')).toBeNull();
+        expect(grid_mock.unpin_rows).toHaveBeenCalledWith(dialog_pin);
+        expect(editing_ref.current!.has_uncommitted_changes()).toBe(false);
+        await vi.waitUntil(() => document.activeElement
+            === document.querySelector('.data-editor-stub'));
+    });
+
+    it('does not steal focus on session replacement when another control owns it', async () => {
+        const editing_ref = React.createRef<EditingHandle | null>();
+        const GridShell = await render_grid(link_props(editing_ref));
+        await open_dialog();
+        const surviving_target = document.createElement('button');
+        document.body.appendChild(surviving_target);
+        surviving_target.focus();
+
+        await act(async () => root!.render(React.createElement(GridShell, {
+            ...link_props(editing_ref),
+            edit_session_id: 'session-2',
+            edit_session: create_edit_session_store({ session_id: 'session-2' }),
+        })));
+
+        expect(document.getElementById('hyperlink-target')).toBeNull();
+        expect(document.activeElement).toBe(surviving_target);
     });
 });
 

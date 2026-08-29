@@ -567,9 +567,9 @@ export function use_editing(
                 before_overlay: CellOverlayState,
                 persisted: PersistedCellRead,
             ) => PlannedOverlayWrite | undefined,
-        ): void => {
-            if (edits.length === 0) return;
-            if (gestures_admitted !== undefined && !gestures_admitted()) return;
+        ): boolean => {
+            if (edits.length === 0) return false;
+            if (gestures_admitted !== undefined && !gestures_admitted()) return false;
             const writes: StoreWrite[] = [];
             const changes: HistoryChange[] = [];
             // The store as this gesture found it, plus what the gesture has
@@ -626,10 +626,15 @@ export function use_editing(
                 if (change !== undefined) changes.push(change);
             }
 
+            // Every target was invalid or unavailable to the history capture.
+            // Report refusal so a caller holding a draft keeps it open instead
+            // of treating a no-op as a safely committed gesture.
+            if (writes.length === 0) return false;
+
             const staged_writes = active_store.stage_writes(session_id, writes);
             // The session moved on: this hook's writes belong to a session that
             // is no longer current, so nothing lands and nothing is recorded.
-            if (staged_writes === undefined) return;
+            if (staged_writes === undefined) return false;
             // A plain action, deliberately not owned: recording owns as it walks
             // and abandons the walk the moment the hard bound is passed, so an
             // oversized paste it will refuse anyway must reach it unowned.
@@ -637,8 +642,8 @@ export function use_editing(
 
             // Validate both before moving either: committing the edits and then
             // finding the history unrecordable would leave the two out of step.
-            if (!staged_writes.valid()) return;
-            if (staged_record !== undefined && !staged_record.valid()) return;
+            if (!staged_writes.valid()) return false;
+            if (staged_record !== undefined && !staged_record.valid()) return false;
 
             staged_writes.commit();
             // A refusal commits too — its state is the barrier, and by decision
@@ -647,6 +652,7 @@ export function use_editing(
             staged_record?.commit();
             staged_writes.notify();
             staged_record?.notify();
+            return true;
         },
         [active_store, capture, gestures_admitted, read_persisted_cell, session_id],
     );
@@ -681,7 +687,7 @@ export function use_editing(
      * dimension — and the whole entry when no value change remains.
      */
     const commit_hyperlinks = useCallback(
-        (edits: readonly CellHyperlinkEdit[], label = 'Edit hyperlink'): void => {
+        (edits: readonly CellHyperlinkEdit[], label = 'Edit hyperlink'): boolean =>
             run_edit_gesture(edits, label, (edit, before_entry, before_overlay, persisted) =>
                 plan_hyperlink_write(
                     before_entry,
@@ -693,15 +699,13 @@ export function use_editing(
                     persisted.history !== undefined
                         ? persisted.history.hyperlink
                         : get_cell?.(edit.source_row, edit.source_col)?.hyperlink ?? null,
-                ));
-        },
+                )),
         [run_edit_gesture, get_cell],
     );
 
     const commit_hyperlink = useCallback(
-        (source_row: number, source_col: number, next: CellHyperlink | null) => {
-            commit_hyperlinks([{ source_row, source_col, value: next }]);
-        },
+        (source_row: number, source_col: number, next: CellHyperlink | null) =>
+            commit_hyperlinks([{ source_row, source_col, value: next }]),
         [commit_hyperlinks],
     );
 
