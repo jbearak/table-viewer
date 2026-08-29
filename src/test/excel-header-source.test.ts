@@ -111,6 +111,31 @@ class StubSource implements DataSource {
 }
 
 describe('ExcelHeaderDataSource', () => {
+    it('reads canonical rows through a projected legacy base', () => {
+        const base = new StubSource([
+            [cell('canonical-2')],
+            [cell('canonical-0')],
+            [cell('canonical-1')],
+        ], [], 'Sheet1', [2, 0, 1]);
+        const ds = new ExcelHeaderDataSource(base, { Sheet1: 'off' });
+        const row_reads_before = base.read_requests.length;
+        const column_reads_before = base.column_requests.length;
+
+        expect(ds.read_canonical_columns(0, 0, 3, [0])).toEqual({
+            startRow: 0,
+            rows: [
+                [cell('canonical-0')],
+                [cell('canonical-1')],
+                [cell('canonical-2')],
+            ],
+        });
+        expect(base.read_requests).toHaveLength(row_reads_before);
+        expect(base.column_requests.slice(column_reads_before)).toEqual([
+            { start: 1, count: 2, columns: [0] },
+            { start: 0, count: 1, columns: [0] },
+        ]);
+    });
+
     it('auto-detects a text header above typed data', () => {
         const ds = new ExcelHeaderDataSource(new StubSource([
             [cell('Name'), cell('Age'), cell('Active')],

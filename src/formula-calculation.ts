@@ -350,15 +350,16 @@ function* calculate_workbook_formula_steps(
 
         private *power(): CalculationSteps<FormulaValue> {
             let left = yield* this.unary();
-            yield* this.whitespace();
-            if (this.formula[this.offset] !== '^') return left;
-            this.offset += 1;
-            const right = yield* this.power();
-            const a = arithmetic_number(left);
-            const b = arithmetic_number(right);
-            left = arithmetic_error(a) ?? arithmetic_error(b)
-                ?? finite_number((a as number) ** (b as number));
-            return left;
+            while (true) {
+                yield* this.whitespace();
+                if (this.formula[this.offset] !== '^') return left;
+                this.offset += 1;
+                const right = yield* this.unary();
+                const a = arithmetic_number(left);
+                const b = arithmetic_number(right);
+                left = arithmetic_error(a) ?? arithmetic_error(b)
+                    ?? finite_number((a as number) ** (b as number));
+            }
         }
 
         private *unary(): CalculationSteps<FormulaValue> {

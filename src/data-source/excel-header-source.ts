@@ -365,18 +365,46 @@ export class ExcelHeaderDataSource implements DataSource {
                 `sheet index ${sheet_index} out of range (${this.sheets.length} sheets)`,
             );
         }
-        return this.base.read_canonical_columns?.(
-            sheet_index,
-            start_source_row,
-            count,
-            column_indices,
-        ) ?? read_source_columns(
-            this.base,
-            sheet_index,
-            start_source_row,
-            count,
-            column_indices,
-        );
+        if (this.base.read_canonical_columns) {
+            return this.base.read_canonical_columns(
+                sheet_index,
+                start_source_row,
+                count,
+                column_indices,
+            );
+        }
+        const source_row_count = this.base.meta().sheets[sheet_index].sourceRowCount;
+        const start = Math.max(0, Math.min(start_source_row, source_row_count));
+        const available = Math.min(Math.max(0, count), source_row_count - start);
+        const projected_rows = Array.from({ length: available }, (_, offset) => {
+            const source_row = start + offset;
+            const projected = projected_row_for_source(this.base, sheet_index, source_row);
+            if (projected === undefined) {
+                throw new Error(
+                    `canonical source row ${source_row} is excluded by the underlying projection`,
+                );
+            }
+            return projected;
+        });
+        const rows: (RenderedCell | null)[][] = [];
+        for (let position = 0; position < projected_rows.length;) {
+            const projected_start = projected_rows[position];
+            let run_length = 1;
+            while (
+                position + run_length < projected_rows.length
+                && projected_rows[position + run_length] === projected_start + run_length
+            ) run_length += 1;
+            const window = read_source_columns(
+                this.base,
+                sheet_index,
+                projected_start,
+                run_length,
+                column_indices,
+            );
+            rows.push(...window.rows.slice(0, run_length));
+            position += run_length;
+        }
+        return { startRow: start, rows };
     }
 
     /** Predict one sheet's projected metadata without changing live row behavior. */

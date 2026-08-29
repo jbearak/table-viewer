@@ -73,6 +73,17 @@ describe('calculate_workbook_formulas', () => {
         })).toEqual([{ ...target(0, 0, 2), value: '64.1' }]);
     });
 
+    it('evaluates chained powers left to right like Excel', () => {
+        const source = workbook([{ name: 'Sheet1', rows: [[
+            cell('0', { formula: '=2^3^2' }),
+        ]] }]);
+
+        expect(calculate_workbook_formulas(source, {
+            edits: [],
+            targets: [target(0, 0, 0)],
+        })).toEqual([{ ...target(0, 0, 0), value: '64' }]);
+    });
+
     it('streams SUM and AVERAGE ranges and ignores blank and text cells', () => {
         const rows = Array.from({ length: 9_000 }, (_, row) => [
             row === 2 ? cell('', { rawType: 'empty' })

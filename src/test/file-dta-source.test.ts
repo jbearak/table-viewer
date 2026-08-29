@@ -68,6 +68,7 @@ describe('FileDtaDataSource', () => {
                 createHash('sha256').update(fs.readFileSync(fixture)).digest('hex'),
             );
             expect(observed.size).toBe(fs.statSync(fixture).size);
+            expect(observed.mtime).toBe(fs.statSync(fixture).mtime.getTime());
         } finally {
             observed.source.close();
         }

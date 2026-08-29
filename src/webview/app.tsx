@@ -999,21 +999,13 @@ export function App(): React.JSX.Element {
     // Metadata is cloned into every host delivery, but formula topology changes
     // only when the adopted source changes. Key the compiled graph to that fact,
     // plus the document epoch that disambiguates a new file restarting counters.
-    const formula_graph_cache_ref = useRef<{
-        key: string;
-        graph: ReturnType<typeof compile_workbook_formula_graph>;
-    }>();
     const formula_graph_key = `${load_epoch}:${source_generation_ref.current}`;
-    if (
-        formula_graph_cache_ref.current === undefined
-        || formula_graph_cache_ref.current.key !== formula_graph_key
-    ) {
-        formula_graph_cache_ref.current = {
-            key: formula_graph_key,
-            graph: compile_workbook_formula_graph(meta?.sheets ?? []),
-        };
-    }
-    const workbook_formula_graph = formula_graph_cache_ref.current.graph;
+    const workbook_formula_graph = useMemo(
+        () => compile_workbook_formula_graph(meta?.sheets ?? []),
+        // Metadata is cloned between deliveries; this key names source topology.
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+        [formula_graph_key],
+    );
     const source_has_formula_work = (meta?.sheets ?? []).some((sheet) =>
         (sheet.formulaCells?.length ?? 0) > 0
         || (sheet.pendingFormulaCells?.length ?? 0) > 0
@@ -1025,41 +1017,25 @@ export function App(): React.JSX.Element {
         : 'no-formula-work';
     // Changing the text of an already-dirty cell keeps the same dependency
     // roots, so the common typing path avoids retraversing the graph.
-    const formula_impact_cache_ref = useRef<{
-        graph: typeof workbook_formula_graph;
-        roots: string;
-        impact: ReturnType<typeof workbook_formula_graph.invalidatedBy>;
-    }>();
-    if (
-        formula_impact_cache_ref.current === undefined
-        || formula_impact_cache_ref.current.graph !== workbook_formula_graph
-        || formula_impact_cache_ref.current.roots !== dependency_root_signature
-    ) {
-        formula_impact_cache_ref.current = {
-            graph: workbook_formula_graph,
-            roots: dependency_root_signature,
-            impact: too_many_formula_calculation_edits
-                ? all_workbook_formula_cells_impact(meta?.sheets ?? [])
-                : has_formula_work
-                    ? workbook_formula_graph.invalidatedBy(formula_roots)
-                    : all_workbook_formula_cells_impact([]),
-        };
-    }
-    const dependency_formula_impact = formula_impact_cache_ref.current.impact;
+    const dependency_formula_impact = useMemo(
+        () => too_many_formula_calculation_edits
+            ? all_workbook_formula_cells_impact(meta?.sheets ?? [])
+            : has_formula_work
+                ? workbook_formula_graph.invalidatedBy(formula_roots)
+                : all_workbook_formula_cells_impact([]),
+        // The signatures deliberately stand in for cloned metadata and a mutable
+        // edit array; topology and root coordinates are the only graph inputs.
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+        [workbook_formula_graph, dependency_root_signature],
+    );
     const formula_calculation_key = `${formula_graph_key}:`
         + `${formula_calculation_edit_signature}`;
-    const source_pending_formula_targets_cache_ref = useRef<{
-        readonly key: string;
-        readonly targets: ReturnType<typeof pending_workbook_formula_targets>;
-    }>();
-    if (source_pending_formula_targets_cache_ref.current?.key !== formula_graph_key) {
-        source_pending_formula_targets_cache_ref.current = {
-            key: formula_graph_key,
-            targets: pending_workbook_formula_targets(meta?.sheets ?? []),
-        };
-    }
-    const source_pending_formula_targets
-        = source_pending_formula_targets_cache_ref.current.targets;
+    const source_pending_formula_targets = useMemo(
+        () => pending_workbook_formula_targets(meta?.sheets ?? []),
+        // Pending source formulas move only with the adopted source topology.
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+        [formula_graph_key],
+    );
     const formula_calculation_plan = useMemo(() => {
         if (too_many_formula_calculation_edits || !has_formula_work) {
             return {

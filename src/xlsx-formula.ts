@@ -139,6 +139,7 @@ function parse_a1_column_at(value: string, offset: number): ParsedA1Axis | undef
 
 function parse_a1_row_at(value: string, offset: number): ParsedA1Axis | undefined {
     let end = value[offset] === '$' ? offset + 1 : offset;
+    if (end >= value.length) return undefined;
     if (value.charCodeAt(end) < 49 || value.charCodeAt(end) > 57) return undefined;
     let row = 0;
     while (end < value.length) {
@@ -154,7 +155,12 @@ function parse_a1_cell_at(value: string, offset: number): ParsedA1Cell | undefin
     const column = parse_a1_column_at(value, offset);
     if (!column) return undefined;
     const row = parse_a1_row_at(value, column.end);
-    if (!row || identifier_character(value[row.end]) || value[row.end] === '(') return undefined;
+    if (
+        !row
+        || identifier_character(value[row.end])
+        || value[row.end] === '('
+        || value[row.end] === '$'
+    ) return undefined;
     return {
         row: row.value - 1,
         column: column.value - 1,
@@ -166,7 +172,11 @@ function parse_a1_axis_range_at(value: string, offset: number): ParsedA1Range | 
     const first_column = parse_a1_column_at(value, offset);
     if (first_column && value[first_column.end] === ':') {
         const last_column = parse_a1_column_at(value, first_column.end + 1);
-        if (last_column && !identifier_character(value[last_column.end])) {
+        if (
+            last_column
+            && !identifier_character(value[last_column.end])
+            && value[last_column.end] !== '$'
+        ) {
             return {
                 firstRow: 0,
                 firstColumn: Math.min(first_column.value, last_column.value) - 1,
@@ -179,7 +189,11 @@ function parse_a1_axis_range_at(value: string, offset: number): ParsedA1Range | 
     const first_row = parse_a1_row_at(value, offset);
     if (first_row && value[first_row.end] === ':') {
         const last_row = parse_a1_row_at(value, first_row.end + 1);
-        if (last_row && !identifier_character(value[last_row.end])) {
+        if (
+            last_row
+            && !identifier_character(value[last_row.end])
+            && value[last_row.end] !== '$'
+        ) {
             return {
                 firstRow: Math.min(first_row.value, last_row.value) - 1,
                 firstColumn: 0,
@@ -426,7 +440,11 @@ export function translate_a1_formula(
         const column_range = formula.slice(index).match(
             /^(\$?)([A-Za-z]{1,3}):(\$?)([A-Za-z]{1,3})/,
         );
-        if (column_range && !identifier_character(formula[index + column_range[0].length])) {
+        if (
+            column_range
+            && !identifier_character(formula[index + column_range[0].length])
+            && formula[index + column_range[0].length] !== '$'
+        ) {
             const first = column_index(column_range[2]);
             const last = column_index(column_range[4]);
             if (first <= MAX_COLUMN && last <= MAX_COLUMN) {
@@ -445,7 +463,11 @@ export function translate_a1_formula(
         const row_range = formula.slice(index).match(
             /^(\$?)([1-9]\d*):(\$?)([1-9]\d*)/,
         );
-        if (row_range && !identifier_character(formula[index + row_range[0].length])) {
+        if (
+            row_range
+            && !identifier_character(formula[index + row_range[0].length])
+            && formula[index + row_range[0].length] !== '$'
+        ) {
             const first = Number(row_range[2]);
             const last = Number(row_range[4]);
             if (first <= MAX_ROW && last <= MAX_ROW) {
@@ -476,6 +498,7 @@ export function translate_a1_formula(
             || source_row > MAX_ROW
             || identifier_character(next)
             || next === '('
+            || next === '$'
         ) {
             out += char;
             index += 1;

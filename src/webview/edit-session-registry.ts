@@ -373,11 +373,17 @@ export function create_edit_session_registry(
         const existing = formula_edits[position];
         const present = existing !== undefined && compare_formula_edits(existing, wanted) === 0;
         if (change.value === undefined) {
-            if (present) formula_edits.splice(position, 1);
+            if (present) {
+                const next = formula_edits.slice();
+                next.splice(position, 1);
+                formula_edits = next;
+            }
             return;
         }
-        if (present) formula_edits[position] = wanted;
-        else formula_edits.splice(position, 0, wanted);
+        const next = formula_edits.slice();
+        if (present) next[position] = wanted;
+        else next.splice(position, 0, wanted);
+        formula_edits = next;
         if (formula_edits.length > MAX_WORKBOOK_FORMULAS) {
             too_many_formula_edits = true;
             formula_edits = [];

@@ -24,7 +24,7 @@ describe('edit session registry', () => {
         expect(revisions).toEqual([1, 2]);
     });
 
-    it('updates formula inputs in place without revisiting unchanged dirty cells', () => {
+    it('updates formula inputs incrementally without revisiting unchanged dirty cells', () => {
         const { registry } = make_session_ref('session');
         const store = registry.for_sheet(0);
         store.commit('session', '4:2', { value: 'first', base: 'old' });
@@ -40,6 +40,7 @@ describe('edit session registry', () => {
         store.commit('session', '4:2', { value: '=1', base: 'old' });
         const second = registry.formula_projection();
 
+        expect(second.edits).not.toBe(first.edits);
         expect(second.coordinateRevision).toBe(first.coordinateRevision);
         expect(second.calculationRevision).toBeGreaterThan(first.calculationRevision);
         expect(second.hasFormulaEdits).toBe(true);
@@ -49,6 +50,23 @@ describe('edit session registry', () => {
             column: 2,
             value: '=1',
             writesFormula: true,
+        }]);
+    });
+
+    it('keeps an earlier formula projection stable after a later edit', () => {
+        const { registry } = make_session_ref('session');
+        const store = registry.for_sheet(0);
+        store.commit('session', '4:2', { value: 'first', base: 'old' });
+        const first = registry.formula_projection();
+
+        store.commit('session', '4:2', { value: 'second', base: 'old' });
+
+        expect(first.edits).toEqual([{
+            sheetIndex: 0,
+            row: 4,
+            column: 2,
+            value: 'first',
+            writesFormula: false,
         }]);
     });
 

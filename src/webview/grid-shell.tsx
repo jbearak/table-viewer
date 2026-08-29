@@ -130,6 +130,7 @@ import {
     xlsx_edit_writes_formula,
     xlsx_runs_require_inline_string,
 } from '../xlsx-cell-value';
+import { UNKNOWN_XLSX_FORMULA_RESULT } from '../xlsx-formula';
 import {
     type FormulaSheetImpact,
 } from '../formula-dependencies';
@@ -305,7 +306,12 @@ function calculated_formula_display(
     show_formatting: boolean,
     cell: RenderedCell | null | undefined,
 ): string | undefined {
-    if (result === undefined || !show_formatting || !cell?.numberFormat || result.startsWith('??')) {
+    if (
+        result === undefined
+        || !show_formatting
+        || !cell?.numberFormat
+        || result.startsWith(UNKNOWN_XLSX_FORMULA_RESULT)
+    ) {
         return result;
     }
     return format_xlsx_edit_preview(result, cell.numberFormat, {
@@ -1147,6 +1153,63 @@ export function GridShell({
     formula_results_ref.current = formula_results;
     const source_formula_results_ref = useRef(source_formula_results);
     source_formula_results_ref.current = source_formula_results;
+    const calculated_formula_result_for_cell = useCallback((
+        source_row: number,
+        source_column: number,
+        key: string,
+        cell: RenderedCell | null | undefined,
+        known_affected?: boolean,
+    ): string | undefined => {
+        const affected = known_affected ?? pending_formula_impact_ref.current
+            ?.has(source_row, source_column) === true;
+        const raw_result = formula_results_ref.current?.get(key)
+            ?? (affected ? undefined : source_formula_results_ref.current?.get(key));
+        return calculated_formula_display(raw_result, show_formatting, cell);
+    }, [show_formatting]);
+    const value_overlay_for_cell = useCallback((
+        source_row: number,
+        source_column: number,
+        key: string,
+        cell: RenderedCell | null | undefined,
+        dirty: DirtyEntry | undefined,
+    ): Pick<
+        CellEditOverlay,
+        'dirty_value' | 'dirty_display' | 'dirty_rich' | 'diff_base'
+            | 'formula_result_pending' | 'formula_result'
+    > | undefined => {
+        const formula_is_affected = pending_formula_impact_ref.current
+            ?.has(source_row, source_column) === true;
+        const calculated_formula_result = calculated_formula_result_for_cell(
+            source_row,
+            source_column,
+            key,
+            cell,
+            formula_is_affected,
+        );
+        if (dirty) {
+            const dirty_overlay = dirty_value_overlay_fields(
+                dirty,
+                diff_mode,
+                show_formatting,
+                cell,
+                edit_syntax === 'markdown',
+                calculated_formula_result,
+            );
+            if (dirty_overlay) return dirty_overlay;
+        }
+        if (
+            cell?.formula === undefined
+            || (!formula_is_affected && calculated_formula_result === undefined)
+        ) return undefined;
+        return calculated_formula_result === undefined
+            ? { formula_result_pending: true }
+            : { formula_result: calculated_formula_result };
+    }, [
+        calculated_formula_result_for_cell,
+        diff_mode,
+        edit_syntax,
+        show_formatting,
+    ]);
 
     // Tint set = what the webview can derive ∪ what the host named. The union is
     // what everything downstream consumes (the paint callback's ref, the targeted
@@ -2267,6 +2330,11 @@ export function GridShell({
     const cell_tooltip_timer_ref = useRef<number | null>(null);
     const cell_tooltip_el_ref = useRef<HTMLDivElement | null>(null);
     const cell_tooltip_key_ref = useRef<string | null>(null);
+    const cell_tooltip_hover_ref = useRef<{
+        displayColumn: number;
+        row: number;
+        bounds: { x: number; y: number; width: number; height: number };
+    } | null>(null);
 
     const clear_cell_tooltip_timer = useCallback(() => {
         if (cell_tooltip_timer_ref.current !== null) {
@@ -2278,6 +2346,7 @@ export function GridShell({
     const hide_cell_tooltip = useCallback(() => {
         clear_cell_tooltip_timer();
         cell_tooltip_key_ref.current = null;
+        cell_tooltip_hover_ref.current = null;
         set_cell_tooltip(null);
     }, [clear_cell_tooltip_timer]);
     hide_cell_tooltip_ref.current = hide_cell_tooltip;
@@ -2304,34 +2373,28 @@ export function GridShell({
             // can be no edit to show, so fall through to the persisted-cell path
             // below (which reads the same non-resident row and yields '').
             const source_row = get_source_row(row);
-            const dirty = source_row === undefined
+            const key = source_row === undefined
                 ? undefined
-                : store.get(cell_key(source_row, source_column));
+                : cell_key(source_row, source_column);
+            const dirty = key === undefined ? undefined : store.get(key);
 
             // Merged blocks need no special case: the grid's hover hit-test
             // reports the anchor's coordinates for any covered cell, so this is
             // already the cell that holds the content.
             const cells = get_row(row);
             const cell = cells?.[source_column];
-            const overlay = dirty
-                ? dirty_value_overlay_fields(
-                    dirty,
-                    diff_mode,
-                    show_formatting,
-                    cell,
-                    edit_syntax === 'markdown',
-                )
-                : undefined;
+            const overlay = source_row === undefined || key === undefined
+                ? undefined
+                : value_overlay_for_cell(source_row, source_column, key, cell, dirty);
             return displayed_text(cell, show_formatting, overlay);
         },
         [
-            diff_mode,
-            edit_syntax,
             get_row,
             get_source_row,
             show_formatting,
             source_column_for_display,
             store,
+            value_overlay_for_cell,
         ],
     );
 
@@ -2393,6 +2456,11 @@ export function GridShell({
             row: number,
             cell_bounds: { x: number; y: number; width: number; height: number },
         ) => {
+            cell_tooltip_hover_ref.current = {
+                displayColumn: display_column,
+                row,
+                bounds: cell_bounds,
+            };
             // Deliberately a **display**-space key, unlike the dirty-map keys: this
             // is a hover-dedup cache for the cell the pointer is physically over,
             // not an edit identity. Keying it by source row would make two display
@@ -2413,9 +2481,10 @@ export function GridShell({
 
             const source_column = source_column_for_display(display_column);
             const source_row = get_source_row(row);
-            const dirty = source_row !== undefined && source_column !== undefined
-                ? store.get(cell_key(source_row, source_column))
+            const source_key = source_row !== undefined && source_column !== undefined
+                ? cell_key(source_row, source_column)
                 : undefined;
+            const dirty = source_key === undefined ? undefined : store.get(source_key);
             const loaded = source_column === undefined
                 ? null
                 : get_row(row)?.[source_column] ?? null;
@@ -2434,15 +2503,15 @@ export function GridShell({
                 loaded,
                 show_formatting,
                 font_size_px,
-                dirty
-                    ? dirty_value_overlay_fields(
-                        dirty,
-                        diff_mode,
-                        show_formatting,
+                source_row === undefined || source_column === undefined || source_key === undefined
+                    ? undefined
+                    : value_overlay_for_cell(
+                        source_row,
+                        source_column,
+                        source_key,
                         loaded,
-                        edit_syntax === 'markdown',
-                    )
-                    : undefined,
+                        dirty,
+                    ),
                 soft_wrap,
                 diff_colors,
             );
@@ -2524,18 +2593,49 @@ export function GridShell({
             get_cell_height,
             get_cell_width,
             show_formatting,
-            edit_syntax,
-            diff_mode,
             diff_colors,
             source_column_for_display,
             store,
+            value_overlay_for_cell,
         ],
     );
+
+    const tooltip_formula_state_ref = useRef({
+        formulaResults: formula_results,
+        pendingImpact: pending_formula_impact,
+        sourceResults: source_formula_results,
+    });
+    useEffect(() => {
+        const previous = tooltip_formula_state_ref.current;
+        tooltip_formula_state_ref.current = {
+            formulaResults: formula_results,
+            pendingImpact: pending_formula_impact,
+            sourceResults: source_formula_results,
+        };
+        if (
+            previous.formulaResults === formula_results
+            && previous.pendingImpact === pending_formula_impact
+            && previous.sourceResults === source_formula_results
+        ) return;
+        const hovered = cell_tooltip_hover_ref.current;
+        if (!hovered) return;
+        // Formula state can settle without another pointer event. Force the
+        // hovered cell through the same display/overflow path so a pending or
+        // visible tooltip cannot retain text the canvas has already replaced.
+        cell_tooltip_key_ref.current = null;
+        schedule_cell_tooltip(hovered.displayColumn, hovered.row, hovered.bounds);
+    }, [
+        formula_results,
+        pending_formula_impact,
+        schedule_cell_tooltip,
+        source_formula_results,
+    ]);
 
     const schedule_header_tooltip = useCallback((
         display_column: number,
         bounds: { x: number; y: number; width: number; height: number },
     ) => {
+        cell_tooltip_hover_ref.current = null;
         const source_column = source_column_for_display(display_column);
         if (
             sheet_meta.excelFirstRowHeader?.active !== true
@@ -2710,28 +2810,17 @@ export function GridShell({
             const editable = editable_cells && source_row !== undefined;
             const loaded_row = get_row(row);
             const loaded_cell = loaded_row?.[source_column];
-            const formula_is_affected = key !== undefined
-                && source_row !== undefined
-                && pending_formula_impact_ref.current?.has(source_row, source_column) === true;
-            const raw_calculated_formula_result = key === undefined
+            const value_overlay = source_row === undefined || key === undefined
                 ? undefined
-                : formula_results_ref.current?.get(key)
-                    ?? (formula_is_affected
-                        ? undefined
-                        : source_formula_results_ref.current?.get(key));
-            const dependent_formula_affected = dirty === undefined
-                && key !== undefined
-                && source_row !== undefined
-                && loaded_cell?.formula !== undefined
-                && (
-                    formula_is_affected
-                    || raw_calculated_formula_result !== undefined
+                : value_overlay_for_cell(
+                    source_row,
+                    source_column,
+                    key,
+                    loaded_cell,
+                    dirty,
                 );
-            const calculated_formula_result = calculated_formula_display(
-                raw_calculated_formula_result,
-                show_formatting,
-                loaded_cell,
-            );
+            const dependent_formula_affected = dirty === undefined
+                && value_overlay !== undefined;
             // On a markdown sheet the overlay editor must open with markup, not
             // the plain projection: a dirty cell re-opens showing its committed
             // runs, a clean cell its effective rich content. Only computed when
@@ -2789,19 +2878,7 @@ export function GridShell({
                     // and it does reach this branch, via highlight_bg, which is
                     // plain view state independent of edit mode.
                     refused: editable_cells && source_row === undefined,
-                    ...(dirty ? dirty_value_overlay_fields(
-                        dirty,
-                        diff_mode,
-                        show_formatting,
-                        loaded_row?.[source_column],
-                        edit_syntax === 'markdown',
-                        calculated_formula_result,
-                    ) : {}),
-                    ...(dependent_formula_affected
-                        ? calculated_formula_result === undefined
-                            ? { formula_result_pending: true as const }
-                            : { formula_result: calculated_formula_result }
-                        : {}),
+                    ...value_overlay,
                     // Compare's before-text rides the Diff toggle's channel; no
                     // dirty_value, so the "after" side is the cell's own text.
                     ...(compare_base !== undefined ? { diff_base: compare_base } : {}),
@@ -2867,6 +2944,7 @@ export function GridShell({
             diff_colors,
             diff_mode,
             high_contrast,
+            value_overlay_for_cell,
         ],
     );
 

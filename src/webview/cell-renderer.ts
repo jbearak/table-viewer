@@ -194,12 +194,16 @@ function formula_result_lines(
     result: string,
     colors: DiffColors,
 ): RichTextLine[] {
-    return base === UNKNOWN_XLSX_FORMULA_RESULT
-        && result.startsWith(UNKNOWN_XLSX_FORMULA_RESULT)
-        ? [[{ text: result, diff_color: colors.added }]]
-        : base === ''
+    return formula_result_replaces_base(base, result)
         ? [[{ text: result, diff_color: colors.added }]]
         : diff_lines(base, result, 'number', colors);
+}
+
+function formula_result_replaces_base(base: string, result: string): boolean {
+    return base === '' || (
+        base === UNKNOWN_XLSX_FORMULA_RESULT
+        && result.startsWith(UNKNOWN_XLSX_FORMULA_RESULT)
+    );
 }
 
 function persisted_displayed_text(
@@ -250,10 +254,7 @@ export function displayed_text(
     if (overlay?.formula_result !== undefined || overlay?.formula_result_pending) {
         const base = persisted_displayed_text(c, show_formatting);
         const result = overlay.formula_result ?? UNKNOWN_XLSX_FORMULA_RESULT;
-        return base === UNKNOWN_XLSX_FORMULA_RESULT
-            && result.startsWith(UNKNOWN_XLSX_FORMULA_RESULT)
-            ? result
-            : base === ''
+        return formula_result_replaces_base(base, result)
             ? result
             : `${base}${DIFF_ARROW}${result}`;
     }

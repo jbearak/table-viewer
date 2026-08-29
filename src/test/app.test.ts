@@ -5230,6 +5230,45 @@ describe('edit mode save exit', () => {
         ))).toHaveLength(1);
     });
 
+    it('does not mutate a posted formula request when a later edit lands', async () => {
+        const meta = make_meta(['Sheet1'], false);
+        meta.sheets[0].formulaCells = [0, 1];
+        meta.sheets[0].formulaDependencies = [0, 1, 0, 0, 0, 0, 0];
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        await click_button('Edit');
+        await dispatch_host_message({
+            type: 'editSessionResult',
+            granted: true,
+            editSessionId: 'stable-formula-request',
+            sheetIndex: 0,
+            pendingEdits: { '0:0': { value: 'first', base: 'old' } },
+        });
+        const first_request = post_message.mock.calls
+            .map(([message]) => message as WebviewMessage)
+            .reverse()
+            .find((message) => message.type === 'requestFormulaCalculation') as
+            Extract<WebviewMessage, { type: 'requestFormulaCalculation' }>;
+
+        await act(async () => {
+            (grid_shell_mock.latest_props?.edit_session as EditSessionStore).commit(
+                'stable-formula-request',
+                '0:0',
+                { value: 'second', base: 'old' },
+            );
+        });
+
+        expect(first_request.edits).toEqual([{
+            sheetIndex: 0,
+            row: 0,
+            column: 0,
+            value: 'first',
+            writesFormula: false,
+        }]);
+    });
+
     it('calculates formulas whose saved cache is absent after reopen', async () => {
         const meta = make_meta(['Sheet1'], false);
         meta.sheets[0].pendingFormulaCells = [0, 1];

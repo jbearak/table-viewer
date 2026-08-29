@@ -109,6 +109,14 @@ describe('a1_formula_references', () => {
             .toEqual([]);
     });
 
+    it('does not interpret a trailing absolute-row marker as row zero', () => {
+        expect(a1_formula_references('=A$')).toEqual([]);
+        expect(a1_formula_references('=A1$')).toEqual([]);
+        expect(a1_formula_references('=A:B$+1:2$')).toEqual([]);
+        expect(translate_a1_formula('A1$', 1, 1)).toBe('A1$');
+        expect(translate_a1_formula('A:B$+1:2$', 1, 1)).toBe('A:B$+1:2$');
+    });
+
     it('scans malformed maximum-length quoted prefixes in linear time', () => {
         const malformed = `=${"'".repeat(8_192)}`;
         const started = performance.now();

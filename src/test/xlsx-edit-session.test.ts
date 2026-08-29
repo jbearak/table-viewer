@@ -1231,7 +1231,14 @@ describe('xlsx edit sessions', () => {
     });
 
     it('recalculates and reopens the garden-cafe shelf value after a price edit', async () => {
-        bytes = fs.readFileSync('docs/examples/garden-cafe-sample.xlsx');
+        bytes = fs.readFileSync(path.join(
+            __dirname,
+            '..',
+            '..',
+            'docs',
+            'examples',
+            'garden-cafe-sample.xlsx',
+        ));
         const panel = await open_ready_xlsx(file_path);
         await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 4 });
         const session = latest_edit_session(panel)!.editSessionId!;

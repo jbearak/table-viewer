@@ -3330,6 +3330,99 @@ describe('GridShell link-only edits', () => {
             .toBe('9876.5');
     });
 
+    it('uses the painted formula result in the overflow tooltip', async () => {
+        vi.useFakeTimers();
+        await render_grid(props({
+            show_formatting: true,
+            edit_mode: true,
+            csv_editable: true,
+            edit_syntax: 'markdown',
+            column_widths: { 0: 20, 1: 150, 2: 200 },
+            initial_edits: {
+                '0:0': { value: '=1+1', base: 'source-a' },
+            },
+            formula_results: new Map([['0:0', '2']]),
+        }));
+        const cell = (grid_mock.props!.getCellContent as
+            (location: [number, number]) => {
+                data: { lines: Array<Array<{ text: string }>> };
+            })([0, 0]);
+        expect(cell.data.lines.flat().map((part) => part.text).join(''))
+            .toBe('source-a → 2');
+
+        const on_item_hovered = grid_mock.props!.onItemHovered as
+            (args: Record<string, unknown>) => void;
+        await act(async () => {
+            on_item_hovered({
+                kind: 'cell', location: [0, 0], buttons: 0,
+                bounds: { x: 30, y: 10, width: 20, height: 36 },
+                localEventX: 10, localEventY: 18,
+            });
+            await vi.runAllTimersAsync();
+        });
+        expect(container!.querySelector('[role="tooltip"]')?.textContent)
+            .toBe('source-a → 2');
+    });
+
+    it('refreshes a hovered dependent formula when its result settles', async () => {
+        vi.useFakeTimers();
+        grid_mock.get_row.mockImplementation(() => [{
+            raw: '4',
+            formatted: '4',
+            bold: false,
+            italic: false,
+            rawType: 'number' as const,
+            formula: '=B1*2',
+        }, null, null] as any);
+        const impact = {
+            size: 1,
+            has: (row: number, column: number) => row === 0 && column === 0,
+            *keys() { yield '0:0'; },
+            *cells() { yield { row: 0, column: 0 }; },
+        };
+        const initial = props({
+            show_formatting: true,
+            column_widths: { 0: 20, 1: 150, 2: 200 },
+            pending_formula_impact: impact,
+            source_formula_results: new Map([['0:0', '4']]),
+        });
+        const GridShell = await render_grid(initial);
+        const painted_text = () => {
+            const cell = (grid_mock.props!.getCellContent as
+                (location: [number, number]) => {
+                    data: { lines: Array<Array<{ text: string }>> };
+                })([0, 0]);
+            return cell.data.lines.flat().map((part) => part.text).join('');
+        };
+        expect(painted_text()).toBe('4 → ??');
+
+        const on_item_hovered = grid_mock.props!.onItemHovered as
+            (args: Record<string, unknown>) => void;
+        await act(async () => {
+            on_item_hovered({
+                kind: 'cell', location: [0, 0], buttons: 0,
+                bounds: { x: 30, y: 10, width: 20, height: 36 },
+                localEventX: 10, localEventY: 18,
+            });
+            await vi.runAllTimersAsync();
+        });
+        expect(container!.querySelector('[role="tooltip"]')?.textContent)
+            .toBe('4 → ??');
+
+        await act(async () => {
+            root!.render(React.createElement(GridShell, {
+                ...initial,
+                formula_results: new Map([['0:0', '6']]),
+            }));
+        });
+        await act(async () => {
+            await vi.runAllTimersAsync();
+        });
+        expect(painted_text()).toBe('4 → 6');
+        expect(container!.querySelector('[role="tooltip"]')?.textContent)
+            .toBe('4 → 6');
+    });
+
     it('still substitutes the dirty text when the value itself changed', async () => {
         grid_mock.get_row.mockImplementation(() => [
             { raw: '1234.5', formatted: '1,234.50', bold: false, italic: false },
