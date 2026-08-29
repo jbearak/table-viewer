@@ -69,7 +69,9 @@ import { is_valid_hyperlink } from './pending-changes';
 import { sanitize_cell_highlight_color } from './cell-highlights';
 import {
     is_strict_wire_dirty_entry,
+    copy_dirty_entry,
     make_dirty_entry,
+    sanitized_wire_dirty_entry,
     sanitized_wire_worksheet_target,
     type CellHighlightColor,
     type CsvDirtyEntry,
@@ -114,6 +116,8 @@ export interface WirePresentValueDimension {
     readonly value: WireHistoryValue;
     readonly base: WireHistoryValue;
     readonly basePending: boolean;
+    readonly movedFrom?: CsvDirtyEntry['movedFrom'];
+    readonly valueEditOrder?: number;
 }
 
 export interface WireUntouchedHyperlinkDimension {
@@ -448,11 +452,24 @@ function sanitized_wire_value_dimension(
     const present = sanitized_wire_history_value(value.value);
     const base = sanitized_wire_history_value(value.base);
     if (present === undefined || base === undefined) return undefined;
+    const moved_from = value.movedFrom === undefined ? undefined
+        : sanitized_wire_dirty_entry({
+            value: '', base: '', movedFrom: value.movedFrom,
+        })?.movedFrom ?? null;
+    if (moved_from === null) return undefined;
+    const value_edit_order = value.valueEditOrder === undefined
+        ? undefined
+        : is_source_index(value.valueEditOrder)
+            ? value.valueEditOrder
+            : null;
+    if (value_edit_order === null) return undefined;
     return Object.freeze({
         kind: 'present' as const,
         value: present,
         base,
         basePending: value.basePending,
+        ...(moved_from === undefined ? {} : { movedFrom: moved_from }),
+        ...(value_edit_order === undefined ? {} : { valueEditOrder: value_edit_order }),
     });
 }
 
@@ -725,18 +742,11 @@ export function sanitized_commit_history_replay_request(
         // user's styled text with the styling quietly stripped is a wrong undo,
         // and refusing the whole replay leaves history where it was.
         if (!is_strict_wire_dirty_entry(raw.entry)) return undefined;
-        // Copied through `make_dirty_entry` rather than retained: the guard
-        // proves the shape, it does not make the caller's object ours.
+        // The guard proves the shape, but it does not make the caller's object
+        // ours. Copy every dimension, including move and edit-order metadata.
         return Object.freeze({
             ordinal: raw.ordinal,
-            entry: make_dirty_entry(
-                raw.entry.value,
-                raw.entry.base,
-                raw.entry.valueRuns,
-                raw.entry.baseRuns,
-                raw.entry.link,
-                raw.entry.baseLink,
-            ),
+            entry: copy_dirty_entry(raw.entry),
         });
     });
     if (cells === undefined) return undefined;
@@ -794,6 +804,19 @@ export function history_replay_proposal_digest(
                 // runs.
                 'link' in write.entry ? ['set', write.entry.link] : ['absent'],
                 'baseLink' in write.entry ? ['set', write.entry.baseLink] : ['absent'],
+                write.entry.movedFrom === undefined ? null : [
+                    write.entry.movedFrom.row,
+                    write.entry.movedFrom.col,
+                    write.entry.movedFrom.order,
+                    (write.entry.movedFrom.previous ?? []).map((move) => [
+                        move.sourceRow,
+                        move.sourceCol,
+                        move.destinationRow,
+                        move.destinationCol,
+                        move.order,
+                    ]),
+                ],
+                write.entry.valueEditOrder ?? null,
             ],
         ]);
     const highlights = [...request.highlights]

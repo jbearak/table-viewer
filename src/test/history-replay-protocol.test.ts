@@ -420,6 +420,21 @@ describe('sanitized_commit_history_replay_request', () => {
             .toBe('typed');
     });
 
+    it('retains move and edit-order metadata while copying an entry', () => {
+        const entry = {
+            value: 'typed',
+            base: 'disk',
+            movedFrom: { row: 1, col: 2, order: 7 },
+            valueEditOrder: 8,
+        };
+        const parsed = sanitized_commit_history_replay_request(
+            commit_request({ cells: [{ ordinal: 0, entry }] }),
+        );
+
+        expect(parsed?.cells[0].entry).toEqual(entry);
+        expect(parsed?.cells[0].entry).not.toBe(entry);
+    });
+
     it('rejects sparse and duplicate ordinals', () => {
         expect(sanitized_commit_history_replay_request(
             commit_request({ cells: [{ ordinal: 4, entry: null }] }),
@@ -516,6 +531,35 @@ describe('history_replay_proposal_digest', () => {
         expect(cleared).toBeDefined();
         expect(history_replay_proposal_digest(untouched!))
             .not.toBe(history_replay_proposal_digest(cleared!));
+    });
+
+    it('separates move provenance and formula edit orders', () => {
+        const plain = sanitized_commit_history_replay_request(commit_request({
+            cells: [{ ordinal: 0, entry: { value: 'typed', base: 'disk' } }],
+        }));
+        const moved = sanitized_commit_history_replay_request(commit_request({
+            cells: [{
+                ordinal: 0,
+                entry: {
+                    value: 'typed',
+                    base: 'disk',
+                    movedFrom: { row: 1, col: 2, order: 7 },
+                },
+            }],
+        }));
+        const ordered = sanitized_commit_history_replay_request(commit_request({
+            cells: [{
+                ordinal: 0,
+                entry: { value: 'typed', base: 'disk', valueEditOrder: 8 },
+            }],
+        }));
+
+        expect(history_replay_proposal_digest(plain!))
+            .not.toBe(history_replay_proposal_digest(moved!));
+        expect(history_replay_proposal_digest(plain!))
+            .not.toBe(history_replay_proposal_digest(ordered!));
+        expect(history_replay_proposal_digest(moved!))
+            .not.toBe(history_replay_proposal_digest(ordered!));
     });
 
     it('separates a legacy string from an entry whose value equals it', () => {

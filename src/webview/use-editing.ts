@@ -39,6 +39,7 @@ import {
     type EditSyntax,
     type ParsedCellEdit,
 } from '../cell-edit-model';
+import { xlsx_edit_writes_formula } from '../xlsx-cell-value';
 
 // Re-exported so consumers keep importing the edit vocabulary from the hook they
 // already use; the definitions moved to the store because it, not the hook, owns
@@ -115,6 +116,15 @@ export interface UseEditingOptions {
      * not a runtime check's.
      */
     readonly capture?: HistoryCaptureOptions;
+    /** Retarget formula source for the editor without changing disk-relative conflict bases. */
+    readonly formula_edit_text?: (
+        sourceRow: number,
+        sourceColumn: number,
+        text: string,
+        afterOrder?: number,
+    ) => string;
+    /** One workbook-wide order for a formula edit gesture. */
+    readonly next_value_edit_order?: () => number;
 }
 
 /** What capturing an edit into the workbook's history needs. */
@@ -134,6 +144,11 @@ export interface CellValueEdit {
     readonly source_row: number;
     readonly source_col: number;
     readonly value: string;
+    readonly editOrder?: number;
+    readonly movedFrom?: {
+        readonly source_row: number;
+        readonly source_col: number;
+    };
 }
 
 /**
@@ -191,6 +206,7 @@ function plan_value_write(
     input: string,
     base: ParsedCellEdit,
     syntax: EditSyntax,
+    edit?: Pick<CellValueEdit, 'source_row' | 'source_col' | 'editOrder' | 'movedFrom'>,
 ): PlannedOverlayWrite {
     const parsed = parse_cell_edit(input, syntax);
     // A pending link change is its own dimension: a text revert must not
@@ -198,11 +214,31 @@ function plan_value_write(
     const link_dimension = before_entry?.link !== undefined
         ? { link: before_entry.link, baseLink: before_entry.baseLink ?? null }
         : undefined;
+    const moved_from = edit?.movedFrom === undefined
+        ? before_entry?.movedFrom
+        : edit.editOrder === undefined ? before_entry?.movedFrom : {
+            row: edit.movedFrom.source_row,
+            col: edit.movedFrom.source_col,
+            order: edit.editOrder,
+            ...(before_entry?.movedFrom === undefined ? {} : {
+                previous: [
+                    ...(before_entry.movedFrom.previous ?? []),
+                    {
+                        sourceRow: before_entry.movedFrom.row,
+                        sourceCol: before_entry.movedFrom.col,
+                        destinationRow: edit.source_row,
+                        destinationCol: edit.source_col,
+                        order: before_entry.movedFrom.order,
+                    },
+                ],
+            }),
+        };
+    const value_edit_order = edit?.editOrder ?? before_entry?.valueEditOrder;
 
     // Semantic comparison: retyping a bold cell's own `**markup**`, however
     // spelled, is a revert; deleting the `**` is an edit.
     if (cell_edits_equal(parsed, base)) {
-        if (link_dimension === undefined) {
+        if (link_dimension === undefined && moved_from === undefined && value_edit_order === undefined) {
             return { entry: undefined, overlay: absent_overlay() };
         }
         // Text reverted, link still pending: the entry survives as link-only,
@@ -212,9 +248,11 @@ function plan_value_write(
         return planned(
             make_dirty_entry(
                 base.text, base.text, base.rich, base.rich,
-                link_dimension.link, link_dimension.baseLink,
+                link_dimension?.link, link_dimension?.baseLink,
+                moved_from,
+                value_edit_order,
             ),
-            'link-only',
+            link_dimension === undefined ? 'in-overlay' : 'link-only',
         );
     }
 
@@ -224,6 +262,8 @@ function plan_value_write(
         make_dirty_entry(
             parsed.text, base.text, committed_value_runs(parsed, base), base.rich,
             link_dimension?.link, link_dimension?.baseLink,
+            moved_from,
+            value_edit_order,
         ),
         'in-overlay',
     );
@@ -428,20 +468,29 @@ export function use_editing(
                 // A dirty markdown cell re-opens showing its stored runs as
                 // markup, so what the user last committed is what they resume
                 // editing — spelled canonically, which the revert rule accepts.
+                const value = dirty_value_edit_text(dirty_entry, syntax);
                 set_editing_cell({
                     source_row,
                     source_col,
-                    value: dirty_value_edit_text(dirty_entry, syntax),
+                    value: options?.formula_edit_text?.(
+                        source_row,
+                        source_col,
+                        value,
+                        dirty_entry.valueEditOrder ?? 0,
+                    ) ?? value,
                 });
                 return;
             }
+            const value = edit_display_text(edit_base_at(source_row, source_col), syntax);
             set_editing_cell({
                 source_row,
                 source_col,
-                value: edit_display_text(edit_base_at(source_row, source_col), syntax),
+                value: options?.formula_edit_text?.(
+                    source_row, source_col, value,
+                ) ?? value,
             });
         },
-        [edit_base_at, dirty_cells, syntax],
+        [edit_base_at, dirty_cells, options?.formula_edit_text, syntax],
     );
 
     const start_editing = useCallback(
@@ -580,10 +629,27 @@ export function use_editing(
      */
     const commit_edits = useCallback(
         (edits: readonly CellValueEdit[], label = 'Edit cell'): void => {
-            run_edit_gesture(edits, label, (edit, before_entry, _before_overlay, persisted) =>
-                plan_value_write(before_entry, edit.value, persisted.base, syntax));
+            let gesture_order: number | undefined;
+            const next_edit_order = options?.next_value_edit_order;
+            const ordered_edits = next_edit_order === undefined
+                ? edits
+                : edits.map((edit): CellValueEdit => {
+                    if (edit.editOrder !== undefined) return edit;
+                    const parsed = parse_cell_edit(edit.value, syntax);
+                    if (!xlsx_edit_writes_formula(parsed.text, parsed.rich?.runs)) return edit;
+                    gesture_order ??= next_edit_order();
+                    return { ...edit, editOrder: gesture_order };
+                });
+            run_edit_gesture(ordered_edits, label, (edit, before_entry, _before_overlay, persisted) =>
+                plan_value_write(
+                    before_entry,
+                    edit.value,
+                    persisted.base,
+                    syntax,
+                    edit,
+                ));
         },
-        [run_edit_gesture, syntax],
+        [options?.next_value_edit_order, run_edit_gesture, syntax],
     );
 
     /**

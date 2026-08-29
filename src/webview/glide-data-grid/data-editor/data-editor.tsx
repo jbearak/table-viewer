@@ -59,7 +59,16 @@ import { unquote, expandSelection, copyToClipboard, toggleBoolean } from "./data
 import { DataEditorContainer } from "../internal/data-editor-container/data-grid-container.js";
 import { useAutoscroll } from "./use-autoscroll.js";
 import type { CustomRenderer, CellRenderer, InternalCellRenderer } from "../cells/cell-types.js";
-import { decodeHTML, type CopyBuffer } from "./copy-paste.js";
+import {
+    copyBufferContainsCut,
+    cutSourceGridLocations,
+    decodeHTML,
+    getCopyBufferContents,
+    resolveCopyBufferValue,
+    type ClipboardAction,
+    type CopyBuffer,
+    type CutSourceIdentity,
+} from "./copy-paste.js";
 import { useRemAdjuster } from "./use-rem-adjuster.js";
 import { withAlpha } from "../internal/data-grid/color-parser.js";
 import { combineRects, getClosestRect, pointInRect } from "../common/math.js";
@@ -199,6 +208,10 @@ export interface DataEditorProps extends Props, Pick<DataGridSearchProps, "image
      * @group Editing
      */
     readonly onDelete?: (selection: GridSelection) => boolean | GridSelection;
+    /** Reports a workbook-aware paste that was refused before any cells changed. */
+    readonly onClipboardPasteError?: (message: string) => void;
+    /** Changes whenever an outstanding cut must be invalidated. */
+    readonly cutValidationKey?: unknown;
     /**
      * Fork addition: merged cell ranges in cell coordinates (x = column,
      * y = row, width = column span, height = row span). Each range renders as
@@ -803,6 +816,8 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
         onDragStart,
         onMouseMove,
         onPaste,
+        onClipboardPasteError,
+        cutValidationKey,
         copyHeaders = false,
         freezeColumns = 0,
         cellActivationBehavior = "second-click",
@@ -1221,6 +1236,16 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
     const cellYOffset = visibleRegion.y;
 
     const gridRef = React.useRef<DataGridRef | null>(null);
+    // A cut is valid only until the next edit and can be pasted once. The ID is
+    // also embedded in our private HTML payload, so arbitrary clipboard HTML
+    // cannot request source deletion.
+    const pendingCutOperationIdRef = React.useRef<string | undefined>();
+    const pendingClipboardOperationIdRef = React.useRef<string | undefined>();
+    const pendingCutCellsRef = React.useRef<CutSourceIdentity | undefined>();
+    React.useLayoutEffect(() => {
+        pendingCutOperationIdRef.current = undefined;
+        pendingCutCellsRef.current = undefined;
+    }, [cutValidationKey]);
 
     const focus = React.useCallback((immediate?: boolean) => {
         if (immediate === true) {
@@ -1236,6 +1261,8 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
 
     const mangledOnCellsEdited = React.useCallback<NonNullable<typeof onCellsEdited>>(
         (items: readonly EditListItem[], source: CellEditSource) => {
+            pendingCutOperationIdRef.current = undefined;
+            pendingCutCellsRef.current = undefined;
             const mangledItems =
                 rowMarkerOffset === 0
                     ? items
@@ -3636,6 +3663,27 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
                 }
 
                 const [targetCol, targetRow] = target;
+                const destinationSource = getMangledCellContent(target).clipboardData?.source;
+                const cutSources = data === undefined
+                    ? undefined
+                    : cutSourceGridLocations(
+                        data,
+                        destinationSource,
+                        pendingCutOperationIdRef.current,
+                        pendingCutCellsRef.current,
+                    );
+                if (data !== undefined && copyBufferContainsCut(data) && cutSources === undefined) {
+                    onClipboardPasteError?.(
+                        "Cut cells cannot be moved after switching worksheets or changing the table layout. Cut them again in the current view."
+                    );
+                    return;
+                }
+                if (cutSources !== undefined && onPaste === undefined) {
+                    onClipboardPasteError?.(
+                        "This grid accepts pasted ranges as one cell, so it cannot complete a cut move. No cells were changed."
+                    );
+                    return;
+                }
 
                 // Fork addition: covered merge cells are not editable —
                 // reachable here via column/row selections whose first cell
@@ -3643,6 +3691,7 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
                 if (mergedCells?.isCovered(targetCol, targetRow) === true && onPaste === undefined) return;
 
                 const editList: EditListItem[] = [];
+                let cutPasteComplete = true;
                 do {
                     if (onPaste === undefined) {
                         const cellData = getMangledCellContent(target);
@@ -3671,25 +3720,83 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
                     }
 
                     for (const [row, dataRow] of data.entries()) {
-                        if (row + targetRow >= rows) break;
+                        if (row + targetRow >= rows) {
+                            if (cutSources !== undefined) cutPasteComplete = false;
+                            break;
+                        }
                         for (const [col, dataItem] of dataRow.entries()) {
                             const index = [col + targetCol, row + targetRow] as const;
                             const [writeCol, writeRow] = index;
-                            if (writeCol >= mangledCols.length) continue;
-                            if (writeRow >= mangledRows) continue;
+                            if (writeCol >= mangledCols.length || writeRow >= mangledRows) {
+                                if (cutSources !== undefined) cutPasteComplete = false;
+                                continue;
+                            }
                             // Fork addition: covered merge cells are not
                             // editable — only the value landing on the
                             // anchor position writes into a merge.
-                            if (mergedCells?.isCovered(writeCol, writeRow) === true) continue;
+                            if (mergedCells?.isCovered(writeCol, writeRow) === true) {
+                                if (cutSources !== undefined) cutPasteComplete = false;
+                                continue;
+                            }
                             const cellData = getMangledCellContent(index);
-                            const newVal = pasteToCell(cellData, index, dataItem.rawValue, dataItem.formatted);
+                            const rawValue = resolveCopyBufferValue(
+                                dataItem,
+                                cellData.clipboardData,
+                                pendingClipboardOperationIdRef.current,
+                            );
+                            const newVal = pasteToCell(cellData, index, rawValue, dataItem.formatted);
                             if (newVal !== undefined) {
-                                editList.push(newVal);
+                                editList.push(cutSources === undefined
+                                    ? newVal
+                                    : {
+                                        ...newVal,
+                                        movedFrom: dataItem.clipboardData!.location,
+                                    });
+                            } else if (cutSources !== undefined) {
+                                cutPasteComplete = false;
                             }
                         }
                     }
                     // eslint-disable-next-line no-constant-condition
                 } while (false);
+
+                if (cutSources !== undefined && !cutPasteComplete) {
+                    onClipboardPasteError?.(
+                        "The cut range cannot be moved to every destination cell. No cells were changed."
+                    );
+                    return;
+                }
+
+                // A cut is one move gesture. Clear only source cells not covered
+                // by a destination write, and emit the deletions with the paste
+                // so history records one action. Metadata from another sheet or
+                // projection remains a paste and cannot clear this grid.
+                if (cutSources !== undefined && editList.length > 0) {
+                    const destinations = new Set(editList.map(({ location }) => `${location[0]}:${location[1]}`));
+                    const seen = new Set<string>();
+                    const deletions: EditListItem[] = [];
+                    for (const [sourceCol, sourceRow] of cutSources) {
+                        const mangledSourceCol = sourceCol + rowMarkerOffset;
+                        const key = `${mangledSourceCol}:${sourceRow}`;
+                        if (destinations.has(key) || seen.has(key)) continue;
+                        if (mergedCells?.isCovered(mangledSourceCol, sourceRow) === true) continue;
+                        const before = deletions.length;
+                        collectRangeDeletions({
+                            x: mangledSourceCol,
+                            y: sourceRow,
+                            width: 1,
+                            height: 1,
+                        }, deletions, seen);
+                        if (deletions.length !== before + 1) cutPasteComplete = false;
+                    }
+                    if (!cutPasteComplete) {
+                        onClipboardPasteError?.(
+                            "The cut source contains a cell that cannot be cleared. No cells were changed."
+                        );
+                        return;
+                    }
+                    editList.unshift(...deletions);
+                }
 
                 mangledOnCellsEdited(editList, "paste");
 
@@ -3702,6 +3809,7 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
         },
         [
             coercePasteValue,
+            collectRangeDeletions,
             getCellRenderer,
             getMangledCellContent,
             gridSelection,
@@ -3710,6 +3818,7 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
             mangledOnCellsEdited,
             mangledRows,
             onPaste,
+            onClipboardPasteError,
             rowMarkerOffset,
             rows,
             mergedCells,
@@ -3722,7 +3831,7 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
     // promises in rather awkward ways when possible to avoid awaiting. We have to use fallback copy mechanisms when
     // an await has happened.
     const onCopy = React.useCallback(
-        async (e?: ClipboardEvent, ignoreFocus?: boolean) => {
+        async (e?: ClipboardEvent, ignoreFocus?: boolean, action: ClipboardAction = "copy") => {
             if (!keybindings.copy) return;
             const focused =
                 ignoreFocus === true ||
@@ -3731,6 +3840,7 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
 
             const selectedColumns = gridSelection.columns;
             const selectedRows = gridSelection.rows;
+            let operationId: string | undefined;
 
             // Fork addition: covered merge cells copy as blanks (the anchor
             // keeps the content), matching how a spreadsheet pastes a merge.
@@ -3750,6 +3860,9 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
                             data: "",
                             displayData: "",
                             allowOverlay: false,
+                            ...(cell.clipboardData === undefined
+                                ? {}
+                                : { clipboardData: cell.clipboardData }),
                         };
                     })
                 );
@@ -3759,8 +3872,15 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
                 cells: readonly (readonly GridCell[])[],
                 columnIndexes: readonly number[]
             ) => {
-                if (!copyHeaders) {
-                    copyToClipboard(cells, columnIndexes, e);
+                if (operationId === undefined
+                    || pendingClipboardOperationIdRef.current !== operationId) return;
+                if (action === "cut") {
+                    pendingCutCellsRef.current = decodeHTML(getCopyBufferContents(
+                        cells, columnIndexes, action, operationId,
+                    ).textHtml);
+                }
+                if (!copyHeaders || action === "cut") {
+                    copyToClipboard(cells, columnIndexes, e, action, operationId);
                 } else {
                     const headers = columnIndexes.map(index => ({
                         kind: GridCellKind.Text,
@@ -3768,11 +3888,15 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
                         displayData: columnsIn[index].title,
                         allowOverlay: false,
                     })) as GridCell[];
-                    copyToClipboard([headers, ...cells], columnIndexes, e);
+                    copyToClipboard([headers, ...cells], columnIndexes, e, action, operationId);
                 }
             };
 
             if (focused && getCellsForSelection !== undefined) {
+                operationId = globalThis.crypto.randomUUID();
+                pendingClipboardOperationIdRef.current = operationId;
+                pendingCutOperationIdRef.current = action === "cut" ? operationId : undefined;
+                pendingCutCellsRef.current = undefined;
                 if (gridSelection.current !== undefined) {
                     let thunk = getCellsForSelection(gridSelection.current.range, abortControllerRef.current.signal);
                     if (typeof thunk !== "object") {
@@ -3852,25 +3976,9 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
                 canvasRef.current?.contains(document.activeElement) === true;
 
             if (!focused) return;
-            await onCopy(e);
-            if (gridSelection.current !== undefined) {
-                let effectiveSelection: GridSelection = {
-                    current: {
-                        cell: gridSelection.current.cell,
-                        range: gridSelection.current.range,
-                        rangeStack: [],
-                    },
-                    rows: CompactSelection.empty(),
-                    columns: CompactSelection.empty(),
-                };
-                const onDeleteResult = onDelete?.(effectiveSelection);
-                if (onDeleteResult === false) return;
-                effectiveSelection = onDeleteResult === true ? effectiveSelection : onDeleteResult;
-                if (effectiveSelection.current === undefined) return;
-                deleteRange(effectiveSelection.current.range);
-            }
+            await onCopy(e, undefined, "cut");
         },
-        [deleteRange, gridSelection, keybindings.cut, onCopy, onDelete]
+        [keybindings.cut, onCopy]
     );
 
     useEventListener("cut", onCut, safeWindow, false, false);

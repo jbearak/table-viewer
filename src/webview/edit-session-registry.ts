@@ -59,6 +59,7 @@ import { MAX_WORKBOOK_FORMULAS } from '../spreadsheet-safety';
 import type { FormulaCalculationEdit } from '../formula-calculation';
 import { rich_text_equal } from '../cell-content';
 import { xlsx_edit_writes_formula } from '../xlsx-cell-value';
+import type { XlsxFormulaCellMove } from '../xlsx-formula';
 
 export interface EditSessionFormulaProjection {
     readonly edits: readonly FormulaCalculationEdit[];
@@ -66,6 +67,7 @@ export interface EditSessionFormulaProjection {
     readonly calculationRevision: number;
     readonly tooManyEdits: boolean;
     readonly hasFormulaEdits: boolean;
+    readonly moves: readonly XlsxFormulaCellMove[];
 }
 
 export interface EditSessionSaveWorksheet {
@@ -236,6 +238,7 @@ export function create_edit_session_registry(
     let formula_coordinate_revision = 0;
     let formula_calculation_revision = 0;
     let too_many_formula_edits = false;
+    let formula_moves: XlsxFormulaCellMove[] = [];
     const publish = () => {
         revision += 1;
         for (const listener of listeners) listener();
@@ -326,6 +329,38 @@ export function create_edit_session_registry(
             && previous.every((edit, index) => formula_edit_values_equal(edit, next[index]));
         if (!coordinates_equal) formula_coordinate_revision += 1;
         if (!calculations_equal) formula_calculation_revision += 1;
+        formula_moves = current_moves();
+    };
+    const current_moves = (): XlsxFormulaCellMove[] => {
+        const moves = new Map<string, XlsxFormulaCellMove>();
+        for (const [sheetIndex, store] of stores) {
+            for (const [key, entry] of store.snapshot()) {
+                const cell = parse_cell_key(key);
+                const moved = entry.movedFrom;
+                if (!cell || moved === undefined) continue;
+                for (const previous of moved.previous ?? []) {
+                    const move = {
+                        order: previous.order,
+                        sheetIndex,
+                        sourceRow: previous.sourceRow,
+                        sourceColumn: previous.sourceCol,
+                        destinationRow: previous.destinationRow,
+                        destinationColumn: previous.destinationCol,
+                    };
+                    moves.set(JSON.stringify(move), move);
+                }
+                const move = {
+                    order: moved.order,
+                    sheetIndex,
+                    sourceRow: moved.row,
+                    sourceColumn: moved.col,
+                    destinationRow: cell.sourceRow,
+                    destinationColumn: cell.sourceColumn,
+                };
+                moves.set(JSON.stringify(move), move);
+            }
+        }
+        return [...moves.values()].sort((left, right) => (left.order ?? 0) - (right.order ?? 0));
     };
     const apply_formula_change = (
         sheetIndex: number,
@@ -400,6 +435,10 @@ export function create_edit_session_registry(
                     break;
                 }
             }
+            // A store can change move provenance without changing its formula
+            // input (for example, a same-text cut destination). Those changes
+            // deliberately arrive as `none`, but they still invalidate moves.
+            if (change.kind !== 'reset') formula_moves = current_moves();
             publish();
         }));
     };
@@ -425,6 +464,7 @@ export function create_edit_session_registry(
             calculationRevision: formula_calculation_revision,
             tooManyEdits: too_many_formula_edits,
             hasFormulaEdits: formula_edit_count > 0,
+            moves: formula_moves,
         }),
         for_sheet: (sheet_index) => {
             const existing = stores.get(sheet_index);

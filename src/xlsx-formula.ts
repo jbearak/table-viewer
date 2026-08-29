@@ -357,6 +357,234 @@ export interface WorkbookA1FormulaReference {
     readonly lastColumn: number;
 }
 
+/** One same-worksheet cell move, in zero-based workbook coordinates. */
+export interface XlsxFormulaCellMove {
+    /** Moves are applied in gesture order. */
+    readonly order?: number;
+    readonly sheetIndex: number;
+    readonly sourceRow: number;
+    readonly sourceColumn: number;
+    readonly destinationRow: number;
+    readonly destinationColumn: number;
+}
+
+interface XlsxFormulaMoveRectangle {
+    readonly sheetIndex: number;
+    readonly firstRow: number;
+    readonly lastRow: number;
+    readonly firstColumn: number;
+    readonly lastColumn: number;
+    readonly rowDelta: number;
+    readonly columnDelta: number;
+}
+
+function move_rectangles(moves: readonly XlsxFormulaCellMove[]): readonly XlsxFormulaMoveRectangle[] {
+    const by_delta = new Map<string, XlsxFormulaCellMove[]>();
+    for (const move of moves) {
+        const key = `${move.sheetIndex}:${move.destinationRow - move.sourceRow}:${move.destinationColumn - move.sourceColumn}`;
+        const group = by_delta.get(key) ?? [];
+        group.push(move);
+        by_delta.set(key, group);
+    }
+    const rectangles: XlsxFormulaMoveRectangle[] = [];
+    for (const group of by_delta.values()) {
+        let firstRow = group[0].sourceRow;
+        let lastRow = firstRow;
+        let firstColumn = group[0].sourceColumn;
+        let lastColumn = firstColumn;
+        for (const move of group) {
+            firstRow = Math.min(firstRow, move.sourceRow);
+            lastRow = Math.max(lastRow, move.sourceRow);
+            firstColumn = Math.min(firstColumn, move.sourceColumn);
+            lastColumn = Math.max(lastColumn, move.sourceColumn);
+        }
+        const rectangular = (lastRow - firstRow + 1) * (lastColumn - firstColumn + 1) === group.length;
+        if (!rectangular) {
+            for (const move of group) {
+                rectangles.push({
+                    sheetIndex: move.sheetIndex,
+                    firstRow: move.sourceRow,
+                    lastRow: move.sourceRow,
+                    firstColumn: move.sourceColumn,
+                    lastColumn: move.sourceColumn,
+                    rowDelta: move.destinationRow - move.sourceRow,
+                    columnDelta: move.destinationColumn - move.sourceColumn,
+                });
+            }
+            continue;
+        }
+        const first = group[0];
+        rectangles.push({
+            sheetIndex: first.sheetIndex,
+            firstRow,
+            lastRow,
+            firstColumn,
+            lastColumn,
+            rowDelta: first.destinationRow - first.sourceRow,
+            columnDelta: first.destinationColumn - first.sourceColumn,
+        });
+    }
+    return rectangles;
+}
+
+function moved_reference_token(
+    token: string,
+    reference: A1FormulaReference,
+    source_sheet_index: number,
+    rectangles: readonly XlsxFormulaMoveRectangle[],
+): string | undefined {
+    // Whole-row and whole-column references cannot be wholly contained by a
+    // finite cell move, so they do not follow it.
+    const prefix_length = sheet_prefix_at(token, 0).prefix?.length ?? 0;
+    const coordinates = token.slice(prefix_length).match(
+        /^(\$?)([A-Za-z]{1,3})(\$?)([1-9]\d*)(?::(\$?)([A-Za-z]{1,3})(\$?)([1-9]\d*))?$/,
+    );
+    if (!coordinates) return undefined;
+
+    const rectangle = rectangles.find((move) => move.sheetIndex === source_sheet_index
+        && reference.firstRow >= move.firstRow
+        && reference.lastRow <= move.lastRow
+        && reference.firstColumn >= move.firstColumn
+        && reference.lastColumn <= move.lastColumn);
+    if (rectangle === undefined) return undefined;
+    const final_row_delta = rectangle.rowDelta;
+    const final_column_delta = rectangle.columnDelta;
+
+    const shifted = (
+        column_absolute: string,
+        column: string,
+        row_absolute: string,
+        row: string,
+    ): string => `${column_absolute}${column_letters(column_index(column) + final_column_delta)}`
+        + `${row_absolute}${Number(row) + final_row_delta}`;
+    const first = shifted(coordinates[1], coordinates[2], coordinates[3], coordinates[4]);
+    const last = coordinates[5] === undefined
+        ? ''
+        : `:${shifted(coordinates[5], coordinates[6], coordinates[7], coordinates[8])}`;
+    return token.slice(0, prefix_length) + first + last;
+}
+
+/**
+ * Retarget references whose entire referenced cell or range moved.
+ *
+ * Unlike copy translation, `$` markers do not pin a reference during a move:
+ * Excel keeps the markers but changes the address so the reference continues
+ * to identify the moved cells.
+ */
+function retarget_moved_a1_formula_with_map(
+    formula: string,
+    formula_sheet_index: number,
+    sheet_names: readonly string[],
+    rectangles: readonly XlsxFormulaMoveRectangle[],
+): string {
+    if (rectangles.length === 0) return formula;
+    let out = '';
+    let index = 0;
+    let bracket_depth = 0;
+    while (index < formula.length) {
+        const char = formula[index];
+        if (char === '"') {
+            const start = index++;
+            while (index < formula.length) {
+                if (formula[index] !== '"') {
+                    index += 1;
+                    continue;
+                }
+                if (formula[index + 1] === '"') {
+                    index += 2;
+                    continue;
+                }
+                index += 1;
+                break;
+            }
+            out += formula.slice(start, index);
+            continue;
+        }
+        if (char === '[') bracket_depth += 1;
+        if (char === ']' && bracket_depth > 0) bracket_depth -= 1;
+        if (
+            bracket_depth > 0
+            || identifier_character(formula[index - 1])
+            || formula[index - 1] === '!'
+            || formula[index - 1] === ']'
+            || formula[index - 1] === ':'
+        ) {
+            out += char;
+            index += 1;
+            continue;
+        }
+        const parsed = a1_formula_reference_at(formula, index);
+        if (!parsed) {
+            const end = Math.max(index + 1, sheet_prefix_at(formula, index).scannedEnd);
+            out += formula.slice(index, end);
+            index = end;
+            continue;
+        }
+        const source_sheet_index = parsed.reference.sheetName === undefined
+            ? formula_sheet_index
+            : sheet_names.findIndex((name) => name.localeCompare(
+                parsed.reference.sheetName!,
+                undefined,
+                { sensitivity: 'accent' },
+            ) === 0);
+        const token = formula.slice(index, index + parsed.length);
+        out += source_sheet_index < 0
+            ? token
+            : moved_reference_token(token, parsed.reference, source_sheet_index, rectangles) ?? token;
+        index += parsed.length;
+    }
+    return out;
+}
+
+/** Compile a move set once for retargeting every formula in a workbook. */
+export function compile_a1_formula_move_retargeter(
+    sheet_names: readonly string[],
+    cell_moves: readonly XlsxFormulaCellMove[],
+): (
+    formula: string,
+    formula_sheet_index: number,
+    after_order?: number,
+    through_order?: number,
+) => string {
+    const operations = new Map<number, XlsxFormulaCellMove[]>();
+    for (const move of cell_moves) {
+        const order = move.order ?? 0;
+        const operation = operations.get(order) ?? [];
+        operation.push(move);
+        operations.set(order, operation);
+    }
+    const ordered_with_order = [...operations.entries()]
+        .sort(([left], [right]) => left - right)
+        .map(([order, operation]) => ({ order, rectangles: move_rectangles(operation) }));
+    return (
+        formula,
+        formula_sheet_index,
+        after_order = Number.NEGATIVE_INFINITY,
+        through_order = Number.POSITIVE_INFINITY,
+    ) => ordered_with_order.reduce(
+        (current, operation) => operation.order <= after_order || operation.order > through_order
+            ? current : retarget_moved_a1_formula_with_map(
+            current,
+            formula_sheet_index,
+            sheet_names,
+            operation.rectangles,
+        ),
+        formula,
+    );
+}
+
+export function retarget_moved_a1_formula(
+    formula: string,
+    formula_sheet_index: number,
+    sheet_names: readonly string[],
+    cell_moves: readonly XlsxFormulaCellMove[],
+): string {
+    return compile_a1_formula_move_retargeter(sheet_names, cell_moves)(
+        formula,
+        formula_sheet_index,
+    );
+}
+
 /** Resolve supported A1 qualifiers once against the workbook's sheet slots. */
 export function workbook_a1_formula_references(
     formula: string,

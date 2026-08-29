@@ -70,7 +70,7 @@ It also removes other friction from reading tables:
 - **Diffing a spreadsheet in Git shows you a wall of text.** Click a changed `.xlsx`, `.xls`, `.csv`, `.tsv`, or `.dta` file in VS Code's Source Control or Timeline view and Table Viewer opens the comparison as a table: added and deleted rows banded, changed cells showing before and after in place. The desktop app also compares any two files.
 - **Comparing a Git LFS file shows you the pointer, not the table.** An LFS-tracked file is stored in Git as a small pointer naming the real object, so the version you want to compare against is often not on your machine at all. Table Viewer recognizes the pointer on either side of a comparison and offers to download the object.
 
-**Limitations:** Table Viewer is *not* a full spreadsheet editor. You can't create files or sheets, add cells beyond the file's existing bounds, or recalculate formulas.
+**Limitations:** Table Viewer is *not* a full spreadsheet editor. You can't create files or sheets or add cells beyond the file's existing bounds. Formula editing and recalculation intentionally support a documented subset of Excel; see [Excel formula support](docs/excel-formulas.md).
 
 ## Features
 
@@ -153,6 +153,7 @@ It also removes other friction from reading tables:
 
 **Editing (`.xlsx`, CSV, and TSV)**
 - Click the **Edit** button in the toolbar to enter edit mode
+- Edit, copy, cut, and recalculate `.xlsx` formulas within the [documented Excel formula support](docs/excel-formulas.md)
 - Double-click a cell, press **Enter**, or choose **Edit cell** from the right-click menu to edit its value
 - **Enter** confirms and moves to the cell below; **Tab** moves right
 - **Shift+Enter** or **Alt+Enter** inserts a line break within a cell
