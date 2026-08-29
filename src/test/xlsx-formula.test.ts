@@ -4,9 +4,77 @@ import {
     is_xlsx_formula_text,
     local_a1_formula_references,
     retarget_moved_a1_formula,
+    retarget_renamed_structured_formula,
+    structured_formula_reference_at,
+    structured_formula_references,
     translate_a1_formula,
     workbook_a1_formula_references,
 } from '../xlsx-formula';
+
+describe('structured formula references', () => {
+    it('parses local, intersecting, qualified, quoted, and escaped names', () => {
+        expect(structured_formula_reference_at('=[Revenue]', 1)).toEqual({
+            reference: { columnName: 'Revenue', intersection: false },
+            length: 9,
+        });
+        expect(structured_formula_reference_at("='Sales Q1'![@Net '#]", 1)).toEqual({
+            reference: {
+                sheetName: 'Sales Q1',
+                columnName: 'Net #',
+                intersection: true,
+            },
+            length: 20,
+        });
+    });
+
+    it('retargets only references that identify the renamed worksheet column', () => {
+        expect(retarget_renamed_structured_formula(
+            '=SUM([Revenue])+Data![@Revenue]+Other![Revenue]+[[#Data],[Revenue]]',
+            0,
+            ['Data', 'Other'],
+            [{ sheetIndex: 0, oldName: 'Revenue', newName: "Net @ Revenue" }],
+        )).toBe(
+            "=SUM([Net '@ Revenue])+Data![@Net '@ Revenue]+Other![Revenue]"
+            + '+[[#Data],[Revenue]]',
+        );
+    });
+
+    it('retargets escaped brackets without mistaking them for the opening bracket', () => {
+        expect(retarget_renamed_structured_formula(
+            "=SUM([a'[b])+'Sales [Q1'![@a'[b]",
+            0,
+            ['Data', 'Sales [Q1'],
+            [
+                { sheetIndex: 0, oldName: 'a[b', newName: 'Net' },
+                { sheetIndex: 1, oldName: 'a[b', newName: 'Net' },
+            ],
+        )).toBe("=SUM([Net])+'Sales [Q1'![@Net]");
+    });
+
+    it('scans outside strings and rejects nested Excel table specifiers', () => {
+        expect(structured_formula_references(
+            '=SUM([Revenue])+"[@Ignored]"+Data![@Units]+[[#Data],[Revenue]]',
+        )).toEqual([
+            { columnName: 'Revenue', intersection: false },
+            { sheetName: 'Data', columnName: 'Units', intersection: true },
+        ]);
+    });
+
+    it('preserves real Excel table and external-workbook references', () => {
+        const formula = '=Table1[Revenue]+Table1[[#Data],[Revenue]]'
+            + "+[Book.xlsx]Sheet1![Revenue]+'[Revenue]Sales Q1'!A1+SUM([Revenue])";
+        expect(retarget_renamed_structured_formula(
+            formula,
+            0,
+            ['Sheet1'],
+            [{ sheetIndex: 0, oldName: 'Revenue', newName: 'Net' }],
+        )).toBe('=Table1[Revenue]+Table1[[#Data],[Revenue]]'
+            + "+[Book.xlsx]Sheet1![Revenue]+'[Revenue]Sales Q1'!A1+SUM([Net])");
+        expect(structured_formula_references(formula)).toEqual([
+            { columnName: 'Revenue', intersection: false },
+        ]);
+    });
+});
 
 describe('retarget_moved_a1_formula', () => {
     const move = (sourceRow: number, sourceColumn: number, destinationRow: number, destinationColumn: number) => ({

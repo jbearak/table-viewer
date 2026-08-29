@@ -227,6 +227,31 @@ describe('parse_xlsx', () => {
         expect(projected.meta().sheets[0].formulaDependencies).toEqual(expected);
     });
 
+    it('records Header Row references before their column names are projected', async () => {
+        const sheet = `<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <dimension ref="A1:C2"/>
+  <sheetData>
+    <row r="1"><c r="A1" t="inlineStr"><is><t>Revenue</t></is></c></row>
+    <row r="2"><c r="C2"><f>SUM([Revenue])+[@Revenue]</f><v>4</v></c></row>
+  </sheetData>
+</worksheet>`;
+        const bytes = build_test_xlsx(sheet);
+        const { data } = await parse_xlsx(bytes);
+        const streaming = await parse_xlsx_streaming(bytes);
+        const source = await XlsxDataSource.create(bytes);
+
+        const expected = {
+            names: ['Revenue'],
+            references: [1, 2, 0, 0, 0, 1, 2, 0, 1, 0],
+        };
+        expect(data.sheets[0].structuredFormulaReferences).toEqual(expected);
+        expect(streaming.sheets[0].structuredFormulaReferences).toEqual(expected);
+        expect(source.meta().sheets[0].structuredFormulaReferences).toEqual(expected);
+        expect(new ExcelHeaderDataSource(source, { Sheet1: 'on' })
+            .meta().sheets[0].structuredFormulaReferences).toEqual(expected);
+    });
+
     it('records what-if data-table inputs as dependencies of the table master', async () => {
         const sheet = `<?xml version="1.0" encoding="UTF-8"?>
 <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">

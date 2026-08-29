@@ -418,6 +418,110 @@ describe('xlsx edit sessions', () => {
         expect(after.data.sheets[0].rows[1][0]?.raw).toBe(people_before);
     });
 
+    it('renames a promoted header through its canonical source coordinate', async () => {
+        const panel = await open_ready_xlsx(file_path);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 0 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: workbook_request(session, 'rename-header', {
+                sheetIndex: 0,
+                sheetName: 'People',
+                worksheetId: '1',
+                edits: { '0:1': 'Years' },
+                dirtyEdits: { '0:1': { value: 'Years', base: 'Age' } },
+            }),
+        });
+        await wait_for_observable(() => save_results(panel).length > 0);
+
+        expect(save_results(panel).at(-1)).toMatchObject({ success: true });
+        const after = await parse_xlsx(bytes);
+        expect(after.data.sheets[0].rows[0][1]?.raw).toBe('Years');
+    });
+
+    it('writes the same canonical name into the header and its structured formulas', async () => {
+        const file = CFB.read(bytes, { type: 'buffer' });
+        const sheet = CFB.find(file, '/xl/worksheets/sheet1.xml')!;
+        const patched = Buffer.from(
+            Buffer.from(sheet.content as Uint8Array).toString('utf8').replace(
+                '<c r="C2" t="b"><v>1</v></c>',
+                '<c r="C2"><f>SUM([Age])</f><v>55</v></c>',
+            ),
+            'utf8',
+        );
+        sheet.content = patched;
+        sheet.size = patched.length;
+        const written = CFB.write(file, { type: 'buffer', fileType: 'zip', compression: true });
+        bytes = written instanceof Uint8Array
+            ? written
+            : new Uint8Array(written as ArrayBufferLike);
+
+        const panel = await open_ready_xlsx(file_path);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 0 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: workbook_request(session, 'canonical-header', {
+                sheetIndex: 0,
+                sheetName: 'People',
+                worksheetId: '1',
+                edits: { '0:1': '  Net\t Revenue  ' },
+                dirtyEdits: { '0:1': { value: '  Net\t Revenue  ', base: 'Age' } },
+            }),
+        });
+        await wait_for_observable(() => save_results(panel).length > 0);
+
+        expect(save_results(panel).at(-1)).toMatchObject({ success: true });
+        const after = await parse_xlsx(bytes);
+        expect(after.data.sheets[0].rows[0][1]?.raw).toBe('Net Revenue');
+        expect(after.data.sheets[0].rows[1][2]?.formula).toBe('=SUM([Net Revenue])');
+    });
+
+    it('refuses to clear a promoted header through a malformed rename request', async () => {
+        const panel = await open_ready_xlsx(file_path);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 0 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+        const before = bytes;
+
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: workbook_request(session, 'blank-header', {
+                sheetIndex: 0,
+                sheetName: 'People',
+                worksheetId: '1',
+                edits: { '0:1': '   ' },
+                dirtyEdits: { '0:1': { value: '   ', base: 'Age' } },
+            }),
+        });
+        await wait_for_observable(() => save_results(panel).length > 0);
+
+        expect(save_results(panel).at(-1)).toMatchObject({ success: false });
+        expect(bytes).toEqual(before);
+    });
+
+    it('refuses a duplicate promoted header from a malformed rename request', async () => {
+        const panel = await open_ready_xlsx(file_path);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 0 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+        const before = bytes;
+
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: workbook_request(session, 'duplicate-header', {
+                sheetIndex: 0,
+                sheetName: 'People',
+                worksheetId: '1',
+                edits: { '0:1': ' name ' },
+                dirtyEdits: { '0:1': { value: ' name ', base: 'Age' } },
+            }),
+        });
+        await wait_for_observable(() => save_results(panel).length > 0);
+
+        expect(save_results(panel).at(-1)).toMatchObject({ success: false });
+        expect(bytes).toEqual(before);
+    });
+
     it('uses fileReload semantics when a save changes automatic header projection', async () => {
         const panel = await open_ready_xlsx(file_path);
         const initial = latest_snapshot(panel);

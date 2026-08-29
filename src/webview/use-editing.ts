@@ -159,6 +159,8 @@ export interface CellValueEdit {
         readonly source_row: number;
         readonly source_col: number;
     };
+    /** Explicit persisted side for a canonical cell outside display-row space. */
+    readonly persistedCell?: EditableSourceCell | null;
 }
 
 /**
@@ -657,7 +659,24 @@ export function use_editing(
                 if (!Number.isInteger(source_row) || source_row < 0) continue;
                 if (!Number.isInteger(source_col) || source_col < 0) continue;
                 const key = `${source_row}:${source_col}`;
-                const persisted = read_persisted_cell(source_row, source_col);
+                const materialized = 'persistedCell' in edit
+                    ? (edit as unknown as CellValueEdit).persistedCell
+                    : undefined;
+                let persisted: PersistedCellRead;
+                if ('persistedCell' in edit) {
+                    const base = materialized === null || materialized === undefined
+                        ? { text: '' }
+                        : cell_edit_base(materialized);
+                    persisted = {
+                        base,
+                        history: {
+                            value: history_value(base.text, base.rich),
+                            hyperlink: materialized?.hyperlink ?? null,
+                        },
+                    };
+                } else {
+                    persisted = read_persisted_cell(source_row, source_col);
+                }
                 // Capture cannot represent a cell with no persisted side, so
                 // while capturing that cell does not move either — an applied
                 // edit history could not describe would let undo cross an
@@ -738,7 +757,7 @@ export function use_editing(
      * plain projection plus runs when styled.
      */
     const commit_edits = useCallback(
-        (edits: readonly CellValueEdit[], label = 'Edit cell'): void => {
+        (edits: readonly CellValueEdit[], label = 'Edit cell'): boolean => {
             let gesture_order = edits.find((edit) => edit.editOrder !== undefined)?.editOrder;
             const next_edit_order = options?.next_value_edit_order;
             const pending_entries = active_store.snapshot();
@@ -746,7 +765,7 @@ export function use_editing(
                 && next_edit_order !== undefined
                 ? latest_dirty_move_source_orders(pending_entries)
                 : new Map<string, number>();
-            run_edit_gesture(edits, label, (edit, before_entry, _before_overlay, persisted) => {
+            return run_edit_gesture(edits, label, (edit, before_entry, _before_overlay, persisted) => {
                 const parsed = parse_cell_edit(edit.value, syntax);
                 const explicitly_opened = edit.openedValue === undefined
                     ? undefined

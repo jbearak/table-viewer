@@ -67,6 +67,24 @@ export interface A1FormulaReferenceToken {
     readonly length: number;
 }
 
+export interface StructuredFormulaReference {
+    /** Absent for an unqualified reference to the formula's own worksheet. */
+    readonly sheetName?: string;
+    readonly columnName: string;
+    readonly intersection: boolean;
+}
+
+export interface StructuredFormulaReferenceToken {
+    readonly reference: StructuredFormulaReference;
+    readonly length: number;
+}
+
+export interface StructuredFormulaColumnRename {
+    readonly sheetIndex: number;
+    readonly oldName: string;
+    readonly newName: string;
+}
+
 interface SheetPrefix {
     readonly name: string;
     readonly length: number;
@@ -115,6 +133,212 @@ function sheet_prefix_at(value: string, offset: number): SheetPrefixAttempt {
             scannedEnd: end + 1,
         }
         : { scannedEnd: end };
+}
+
+/** Parse one Header Row column reference at an exact formula offset. */
+export function structured_formula_reference_at(
+    formula: string,
+    offset: number,
+): StructuredFormulaReferenceToken | undefined {
+    if (!Number.isInteger(offset) || offset < 0 || offset >= formula.length) return undefined;
+    const prefix = sheet_prefix_at(formula, offset).prefix;
+    let index = offset + (prefix?.length ?? 0);
+    if (formula[index] !== '[') return undefined;
+    index += 1;
+    const intersection = formula[index] === '@';
+    if (intersection) index += 1;
+    let name = '';
+    while (index < formula.length) {
+        const char = formula[index];
+        if (char === ']') {
+            if (name.length === 0) return undefined;
+            index += 1;
+            return {
+                reference: {
+                    ...(prefix ? { sheetName: prefix.name } : {}),
+                    columnName: name,
+                    intersection,
+                },
+                length: index - offset,
+            };
+        }
+        if (char === "'" && /[\[\]#'@]/.test(formula[index + 1] ?? '')) {
+            name += formula[index + 1];
+            index += 2;
+            continue;
+        }
+        if (char === '[' || char === '\r' || char === '\n') return undefined;
+        name += char;
+        index += 1;
+    }
+    return undefined;
+}
+
+/** Find Header Row column references outside formula string literals. */
+export function structured_formula_references(formula: string): StructuredFormulaReference[] {
+    const references: StructuredFormulaReference[] = [];
+    let index = formula.startsWith('=') ? 1 : 0;
+    let bracket_depth = 0;
+    while (index < formula.length) {
+        if (formula[index] === '"') {
+            index += 1;
+            while (index < formula.length) {
+                if (formula[index] !== '"') {
+                    index += 1;
+                    continue;
+                }
+                if (formula[index + 1] === '"') {
+                    index += 2;
+                    continue;
+                }
+                index += 1;
+                break;
+            }
+            continue;
+        }
+        if (bracket_depth > 0) {
+            if (formula[index] === '[') bracket_depth += 1;
+            if (formula[index] === ']') bracket_depth -= 1;
+            index += 1;
+            continue;
+        }
+        if (identifier_character(formula[index - 1]) || formula[index - 1] === ']') {
+            if (formula[index] === '[') bracket_depth = 1;
+            index += 1;
+            continue;
+        }
+        const external_end = external_workbook_reference_end_at(formula, index);
+        if (external_end !== undefined) {
+            index = external_end;
+            continue;
+        }
+        const parsed = structured_formula_reference_at(formula, index);
+        if (!parsed) {
+            if (formula[index] === '[') {
+                bracket_depth = 1;
+                index += 1;
+                continue;
+            }
+            index = Math.max(index + 1, sheet_prefix_at(formula, index).scannedEnd);
+            continue;
+        }
+        references.push(parsed.reference);
+        index += parsed.length;
+    }
+    return references;
+}
+
+/** End of an external-book token such as `[Book.xlsx]Sheet1![Revenue]`. */
+function external_workbook_reference_end_at(
+    formula: string,
+    offset: number,
+): number | undefined {
+    if (formula[offset] !== '[') return undefined;
+    const book_end = formula.indexOf(']', offset + 1);
+    if (book_end < 0 || book_end === offset + 1) return undefined;
+    let index = book_end + 1;
+    const sheet_start = index;
+    while (index < formula.length && formula[index] !== '!') {
+        const char = formula[index];
+        if (char === '[' || char === ']' || char === '"' || /[+*/(),=<>\s]/.test(char)) {
+            return undefined;
+        }
+        index += 1;
+    }
+    if (index === sheet_start || formula[index] !== '!') return undefined;
+    index += 1;
+    const structured = structured_formula_reference_at(formula, index);
+    return structured === undefined ? index : index + structured.length;
+}
+
+function escaped_structured_column_name(name: string): string {
+    return name.replace(/[\[\]#'@]/g, (char) => `'${char}`);
+}
+
+/** Rewrite references to columns renamed through an active Header Row. */
+export function retarget_renamed_structured_formula(
+    formula: string,
+    formula_sheet_index: number,
+    sheet_names: readonly string[],
+    renames: readonly StructuredFormulaColumnRename[],
+): string {
+    if (renames.length === 0) return formula;
+    let out = '';
+    let index = 0;
+    let bracket_depth = 0;
+    while (index < formula.length) {
+        if (formula[index] === '"') {
+            const start = index++;
+            while (index < formula.length) {
+                if (formula[index] !== '"') {
+                    index += 1;
+                    continue;
+                }
+                if (formula[index + 1] === '"') {
+                    index += 2;
+                    continue;
+                }
+                index += 1;
+                break;
+            }
+            out += formula.slice(start, index);
+            continue;
+        }
+        if (bracket_depth > 0) {
+            const char = formula[index];
+            if (char === '[') bracket_depth += 1;
+            if (char === ']') bracket_depth -= 1;
+            out += char;
+            index += 1;
+            continue;
+        }
+        if (identifier_character(formula[index - 1]) || formula[index - 1] === ']') {
+            if (formula[index] === '[') bracket_depth = 1;
+            out += formula[index];
+            index += 1;
+            continue;
+        }
+        const external_end = external_workbook_reference_end_at(formula, index);
+        if (external_end !== undefined) {
+            out += formula.slice(index, external_end);
+            index = external_end;
+            continue;
+        }
+        const parsed = structured_formula_reference_at(formula, index);
+        if (!parsed) {
+            if (formula[index] === '[') {
+                bracket_depth = 1;
+                out += formula[index];
+                index += 1;
+                continue;
+            }
+            const end = Math.max(index + 1, sheet_prefix_at(formula, index).scannedEnd);
+            out += formula.slice(index, end);
+            index = end;
+            continue;
+        }
+        const ref = parsed.reference;
+        const source_sheet = ref.sheetName === undefined
+            ? formula_sheet_index
+            : sheet_names.findIndex((name) => name.localeCompare(
+                ref.sheetName!, undefined, { sensitivity: 'accent' },
+            ) === 0);
+        const rename = renames.find((candidate) => candidate.sheetIndex === source_sheet
+            && candidate.oldName.localeCompare(
+                ref.columnName, undefined, { sensitivity: 'accent' },
+            ) === 0);
+        if (!rename) {
+            out += formula.slice(index, index + parsed.length);
+            index += parsed.length;
+            continue;
+        }
+        const token = formula.slice(index, index + parsed.length);
+        const prefix_length = sheet_prefix_at(formula, index).prefix?.length ?? 0;
+        out += token.slice(0, prefix_length + 1)
+            + `${ref.intersection ? '@' : ''}${escaped_structured_column_name(rename.newName)}]`;
+        index += parsed.length;
+    }
+    return out;
 }
 
 interface ParsedA1Axis {

@@ -10,6 +10,52 @@ import {
 } from '../spreadsheet-safety';
 
 describe('compile_workbook_formula_graph', () => {
+    it('resolves Header Row column and cross-sheet intersection dependencies', () => {
+        const graph = compile_workbook_formula_graph([
+            {
+                formulaCells: [3, 2],
+                structuredFormulaReferences: {
+                    names: ['Revenue'],
+                    references: [3, 2, 1, 0, 0, 3, 2, 1, 1, 0],
+                },
+                sourceRowCount: 5,
+            },
+            {
+                formulaCells: [],
+                sourceRowCount: 5,
+                columnNames: ['Revenue'],
+                excelFirstRowHeader: { active: true, sourceRow: 1 },
+            },
+        ]);
+
+        expect(graph.invalidatedBy([{ sheetIndex: 1, row: 2, column: 0 }])
+            .forSheet(0).has(3, 2)).toBe(true);
+        expect(graph.invalidatedBy([{ sheetIndex: 1, row: 3, column: 0 }])
+            .forSheet(0).has(3, 2)).toBe(true);
+        expect(graph.invalidatedBy([{ sheetIndex: 1, row: 1, column: 0 }]).size).toBe(0);
+    });
+
+    it('skips a full-column reference when the Header Row sheet has no body', () => {
+        const graph = compile_workbook_formula_graph([
+            {
+                formulaCells: [0, 0],
+                structuredFormulaReferences: {
+                    names: ['Revenue'],
+                    references: [0, 0, 1, 0, 0],
+                },
+                sourceRowCount: 1,
+            },
+            {
+                formulaCells: [],
+                sourceRowCount: 1,
+                columnNames: ['Revenue'],
+                excelFirstRowHeader: { active: true, sourceRow: 0 },
+            },
+        ]);
+
+        expect(graph.invalidatedBy([{ sheetIndex: 1, row: 0, column: 0 }]).size).toBe(0);
+    });
+
     it('walks exact references, ranges, and recursive cross-sheet chains', () => {
         const graph = compile_workbook_formula_graph([
             {

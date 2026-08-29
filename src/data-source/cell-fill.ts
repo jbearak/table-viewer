@@ -19,6 +19,7 @@ import { rich_text_has_styles } from '../cell-content';
 import type { CellData, MergeRange } from '../types';
 import type {
     PackedFormulaDependencies,
+    PackedStructuredFormulaReferences,
     PackedFormulaCells,
     PackedPendingFormulaCells,
     RenderedCell,
@@ -60,6 +61,7 @@ export interface StreamingSheet {
     columnCount: number;
     merges: MergeRange[];
     formulaDependencies?: PackedFormulaDependencies;
+    structuredFormulaReferences?: PackedStructuredFormulaReferences;
     formulaCells?: PackedFormulaCells;
     pendingFormulaCells?: PackedPendingFormulaCells;
     fill(sink: CellSink): void;
@@ -151,6 +153,7 @@ export function make_streaming_sheet(
     merges: MergeRange[],
     worksheetId?: string,
     formulaDependencies?: PackedFormulaDependencies,
+    structuredFormulaReferences?: PackedStructuredFormulaReferences,
     formulaCells?: PackedFormulaCells,
     pendingFormulaCells?: PackedPendingFormulaCells,
 ): StreamingSheet {
@@ -162,6 +165,9 @@ export function make_streaming_sheet(
         columnCount: working.col_count,
         merges,
         ...(formulaDependencies?.length ? { formulaDependencies } : {}),
+        ...(structuredFormulaReferences?.references.length
+            ? { structuredFormulaReferences }
+            : {}),
         ...(formulaCells?.length ? { formulaCells } : {}),
         ...(pendingFormulaCells?.length ? { pendingFormulaCells } : {}),
         fill(sink: CellSink): void {

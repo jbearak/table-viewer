@@ -1,4 +1,7 @@
-import type { PackedFormulaDependencies } from './data-source/interface';
+import type {
+    PackedFormulaDependencies,
+    PackedStructuredFormulaReferences,
+} from './data-source/interface';
 import {
     MAX_WORKBOOK_FORMULAS,
     MAX_WORKBOOK_FORMULA_REFERENCES,
@@ -8,6 +11,7 @@ import {
 import { parse_cell_key } from './cell-key';
 import {
     is_xlsx_formula_text,
+    structured_formula_references,
     workbook_a1_formula_references,
 } from './xlsx-formula';
 
@@ -18,6 +22,7 @@ const RANGE_STRIDE = 5;
 const EXACT_STRIDE = 3;
 const COLUMN_TREE_LEAVES = MAX_COLUMN;
 const RANGE_INDEX_BLOCK_SIZE = 32;
+export const STRUCTURED_REFERENCE_STRIDE = 5;
 
 export interface WorkbookCellAddress {
     readonly sheetIndex: number;
@@ -77,6 +82,7 @@ export function assert_safe_workbook_formula_edits(
     sheets: readonly {
         readonly name: string;
         readonly formulaDependencies?: PackedFormulaDependencies;
+        readonly structuredFormulaReferences?: PackedStructuredFormulaReferences;
         readonly formulaCells?: readonly number[];
     }[],
     batches: readonly WorkbookFormulaEditBatch[],
@@ -144,6 +150,16 @@ export function assert_safe_workbook_formula_edits(
                 || dependencies[offset + 4] !== dependencies[offset + 6]
             ) final_range_count += 1;
         }
+        const structured = sheet.structuredFormulaReferences?.references ?? [];
+        if (structured.length % STRUCTURED_REFERENCE_STRIDE !== 0) {
+            throw new Error('Malformed packed structured formula references');
+        }
+        for (let offset = 0; offset < structured.length;
+            offset += STRUCTURED_REFERENCE_STRIDE) {
+            if (edited.has(cell_number(structured[offset], structured[offset + 1]))) continue;
+            final_reference_count += 1;
+            if (structured[offset + 3] === 0) final_range_count += 1;
+        }
     });
     const assert_reference_budgets = (): void => {
         if (final_reference_count > MAX_WORKBOOK_FORMULA_REFERENCES) {
@@ -184,6 +200,9 @@ export function assert_safe_workbook_formula_edits(
                     || reference.firstColumn !== reference.lastColumn
                 ) final_range_count += 1;
             }
+            const structured = structured_formula_references(value);
+            final_reference_count += structured.length;
+            final_range_count += structured.filter((reference) => !reference.intersection).length;
             assert_reference_budgets();
         }
     }
@@ -545,12 +564,77 @@ function validate_formula_cells(packed: readonly number[]): number {
     return packed.length / 2;
 }
 
+interface FormulaDependencySheet {
+    readonly formulaDependencies?: PackedFormulaDependencies;
+    readonly structuredFormulaReferences?: PackedStructuredFormulaReferences;
+    readonly formulaCells?: readonly number[];
+    readonly sourceRowCount?: number;
+    readonly columnNames?: readonly string[];
+    readonly excelFirstRowHeader?: { readonly active: boolean; readonly sourceRow?: number };
+}
+
+function resolved_structured_dependencies(
+    sheets: readonly FormulaDependencySheet[],
+    formula_sheet: number,
+): number[] {
+    const packed = sheets[formula_sheet].structuredFormulaReferences;
+    if (!packed) return [];
+    if (packed.references.length % STRUCTURED_REFERENCE_STRIDE !== 0) {
+        throw new Error('Malformed packed structured formula references');
+    }
+    const dependencies: number[] = [];
+    for (let offset = 0; offset < packed.references.length;
+        offset += STRUCTURED_REFERENCE_STRIDE) {
+        const formula_row = packed.references[offset];
+        const formula_column = packed.references[offset + 1];
+        const source_sheet = packed.references[offset + 2];
+        const intersection = packed.references[offset + 3];
+        const name_index = packed.references[offset + 4];
+        if (
+            !valid_coordinate(formula_row, formula_column)
+            || !Number.isSafeInteger(source_sheet)
+            || source_sheet < 0
+            || source_sheet >= sheets.length
+            || (intersection !== 0 && intersection !== 1)
+            || !Number.isSafeInteger(name_index)
+            || name_index < 0
+            || name_index >= packed.names.length
+        ) throw new Error('Malformed packed structured formula reference');
+        const source = sheets[source_sheet];
+        if (!source.excelFirstRowHeader?.active || !source.columnNames) continue;
+        const matches: number[] = [];
+        for (let column = 0; column < source.columnNames.length; column += 1) {
+            if (source.columnNames[column].localeCompare(
+                packed.names[name_index], undefined, { sensitivity: 'accent' },
+            ) === 0) matches.push(column);
+        }
+        if (matches.length !== 1) continue;
+        const header_row = source.excelFirstRowHeader.sourceRow ?? 0;
+        const source_row_count = source.sourceRowCount ?? 0;
+        const first_row = intersection === 1 ? formula_row : header_row + 1;
+        const last_row = intersection === 1 ? formula_row : source_row_count - 1;
+        if (
+            first_row <= header_row
+            || first_row < 0
+            || last_row < first_row
+            || last_row >= source_row_count
+        ) continue;
+        dependencies.push(
+            formula_row,
+            formula_column,
+            source_sheet,
+            first_row,
+            matches[0],
+            last_row,
+            matches[0],
+        );
+    }
+    return dependencies;
+}
+
 /** Compile the packed topology once for one immutable workbook snapshot. */
 export function compile_workbook_formula_graph(
-    sheets: readonly {
-        readonly formulaDependencies?: PackedFormulaDependencies;
-        readonly formulaCells?: readonly number[];
-    }[],
+    sheets: readonly FormulaDependencySheet[],
 ): WorkbookFormulaGraph {
     const formula_sheets: number[] = [];
     const formula_rows: number[] = [];
@@ -586,7 +670,10 @@ export function compile_workbook_formula_graph(
                 + `(max ${MAX_WORKBOOK_FORMULAS.toLocaleString()})`,
             );
         }
-        const dependencies = sheet.formulaDependencies ?? [];
+        const dependencies = [
+            ...(sheet.formulaDependencies ?? []),
+            ...resolved_structured_dependencies(sheets, formula_sheet),
+        ];
         if (dependencies.length % DEPENDENCY_STRIDE !== 0) {
             throw new Error('Malformed packed formula dependencies');
         }
@@ -814,11 +901,9 @@ export function compile_workbook_formula_graph(
  * changes values without recompiling or retraversing immutable topology.
  */
 export function plan_workbook_formula_recalculation(
-    sheets: readonly {
-        readonly formulaDependencies?: PackedFormulaDependencies;
-        readonly formulaCells?: readonly number[];
+    sheets: readonly (FormulaDependencySheet & {
         readonly pendingFormulaCells?: readonly number[];
-    }[],
+    })[],
     edits: readonly WorkbookFormulaEdit[],
     options: WorkbookFormulaPlanningOptions = {},
 ): WorkbookFormulaPlan {

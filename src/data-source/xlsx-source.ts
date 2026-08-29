@@ -14,6 +14,7 @@ import type {
     ColumnWindow,
     DataSource,
     PackedFormulaDependencies,
+    PackedStructuredFormulaReferences,
     PackedFormulaCells,
     PackedPendingFormulaCells,
     IndexedRows,
@@ -30,6 +31,7 @@ interface SheetEntry {
     merges: MergeRange[];
     hasFormatting: boolean;
     formulaDependencies?: PackedFormulaDependencies;
+    structuredFormulaReferences?: PackedStructuredFormulaReferences;
     formulaCells?: PackedFormulaCells;
     pendingFormulaCells?: PackedPendingFormulaCells;
     store: ColumnarStore;
@@ -56,6 +58,9 @@ export class XlsxDataSource implements DataSource {
                 hasFormatting: s.hasFormatting,
                 ...(s.formulaDependencies?.length
                     ? { formulaDependencies: s.formulaDependencies }
+                    : {}),
+                ...(s.structuredFormulaReferences?.references.length
+                    ? { structuredFormulaReferences: s.structuredFormulaReferences }
                     : {}),
                 ...(s.formulaCells?.length ? { formulaCells: s.formulaCells } : {}),
                 ...(s.pendingFormulaCells?.length
@@ -85,6 +90,9 @@ export class XlsxDataSource implements DataSource {
                 hasFormatting: has_formatting,
                 ...(s.formulaDependencies?.length
                     ? { formulaDependencies: s.formulaDependencies }
+                    : {}),
+                ...(s.structuredFormulaReferences?.references.length
+                    ? { structuredFormulaReferences: s.structuredFormulaReferences }
                     : {}),
                 ...(s.formulaCells?.length ? { formulaCells: s.formulaCells } : {}),
                 ...(s.pendingFormulaCells?.length

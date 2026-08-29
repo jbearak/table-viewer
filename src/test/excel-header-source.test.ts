@@ -408,6 +408,7 @@ describe('ExcelHeaderDataSource', () => {
         const enabled = ds.meta().sheets[0];
         expect(enabled.excelFirstRowHeader).toMatchObject({ mode: 'on', active: true });
         expect(enabled.columnNames).toEqual(['Name', '']);
+        expect(enabled.columnHeaderEditable).toEqual([true, false]);
         expect(enabled.rowCount).toBe(2);
         expect(enabled.merges).toEqual([
             { startRow: 0, startCol: 0, endRow: 1, endCol: 0 },
@@ -466,7 +467,7 @@ describe('ExcelHeaderDataSource', () => {
         const ds = new ExcelHeaderDataSource(new StubSource([
             [cell('Report title'), null],
             [cell('Generated today'), null],
-            [cell('Name'), cell('Age')],
+            [cell('Name', { formula: '=A1' }), cell('Age')],
             [cell('Alice'), cell(30)],
         ], [], 'Sheet1', undefined, '7'));
 
@@ -477,6 +478,7 @@ describe('ExcelHeaderDataSource', () => {
             manualHeaderRow: 2,
             manualHeaderSourceRow: 2,
             manualColumnNames: ['Name', 'Age'],
+            manualHeaderEditTexts: ['=A1', 'Age'],
         });
         expect(Object.isFrozen(input)).toBe(true);
         expect(Object.isFrozen(input.sheets[0].manualColumnNames)).toBe(true);
@@ -502,6 +504,7 @@ describe('ExcelHeaderDataSource', () => {
             'Country label',
             'Selected B',
         ]);
+        expect(input.sheets[0].manualHeaderEditable).toEqual([false, false]);
         expect(base.read_requests.slice(reads_before)).toEqual([
             { start: 2, count: 1 },
             { start: 1, count: 1 },

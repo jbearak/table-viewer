@@ -7,6 +7,7 @@ import {
     UNKNOWN_XLSX_FORMULA_RESULT,
     a1_formula_reference_at,
     is_xlsx_formula_text,
+    structured_formula_reference_at,
 } from './xlsx-formula';
 import { number_format_is_date } from './spreadsheet-format';
 import {
@@ -45,7 +46,12 @@ export type FormulaCalculationError =
     | 'unsupported function'
     | 'parse error'
     | 'cycle'
-    | 'numeric error';
+    | 'numeric error'
+    | 'unknown column'
+    | 'ambiguous column'
+    | 'Header Row is off'
+    | 'row outside worksheet body'
+    | 'range cannot be displayed';
 
 /** A calculation always settles as either a numeric value or a specific failure. */
 export type FormulaCalculationResult = FormulaCalculationAddress & (
@@ -93,6 +99,15 @@ const UNSUPPORTED_FUNCTION: Scalar = Object.freeze({
 });
 const CYCLE: Scalar = Object.freeze({ kind: 'unknown', error: 'cycle' });
 const NUMERIC_ERROR: Scalar = Object.freeze({ kind: 'unknown', error: 'numeric error' });
+const UNKNOWN_COLUMN: Scalar = Object.freeze({ kind: 'unknown', error: 'unknown column' });
+const AMBIGUOUS_COLUMN: Scalar = Object.freeze({ kind: 'unknown', error: 'ambiguous column' });
+const HEADER_ROW_OFF: Scalar = Object.freeze({ kind: 'unknown', error: 'Header Row is off' });
+const ROW_OUTSIDE_BODY: Scalar = Object.freeze({
+    kind: 'unknown', error: 'row outside worksheet body',
+});
+const RANGE_NOT_DISPLAYABLE: Scalar = Object.freeze({
+    kind: 'unknown', error: 'range cannot be displayed',
+});
 const BLANK: Scalar = Object.freeze({ kind: 'blank' });
 
 function address_key(address: FormulaCalculationAddress): string {
@@ -222,6 +237,26 @@ function* calculate_workbook_formula_steps(
     const sheet_names = sheets.map((sheet) => sheet.name);
     const sheet_lookup = new Map(sheet_names.map((name, index) => [name.toUpperCase(), index]));
     const edits = new Map(request.edits.map((edit) => [address_key(edit), edit]));
+    const pending_header_names = new Map<string, string>();
+    const header_name_counts = sheets.map((sheet) => {
+        const counts = new Map<string, number>();
+        for (const name of sheet.columnNames ?? []) {
+            const key = name.toLocaleLowerCase();
+            counts.set(key, (counts.get(key) ?? 0) + 1);
+        }
+        return counts;
+    });
+    for (const edit of request.edits) {
+        const sheet = sheets[edit.sheetIndex];
+        const header_row = sheet?.excelFirstRowHeader?.sourceRow ?? 0;
+        if (
+            sheet?.excelFirstRowHeader?.active === true
+            && edit.row === header_row
+            && edit.column >= 0
+            && edit.column < (sheet.columnNames?.length ?? 0)
+            && !edit.writesFormula
+        ) pending_header_names.set(`${edit.sheetIndex}:${edit.column}`, edit.value.trim());
+    }
     const targets = new Set(request.targets.map(address_key));
     const memo = new Map<string, Scalar>();
     const visiting = new Set<string>();
@@ -283,6 +318,7 @@ function* calculate_workbook_formula_steps(
         constructor(
             private readonly formula: string,
             private readonly formula_sheet_index: number,
+            private readonly formula_row: number,
         ) {}
 
         *parse(): CalculationSteps<Scalar> {
@@ -294,6 +330,9 @@ function* calculate_workbook_formula_steps(
             const value = yield* this.additive();
             yield* this.whitespace();
             if (this.offset !== this.formula.length || value.kind === 'range') {
+                if (this.offset === this.formula.length && value.kind === 'range') {
+                    return RANGE_NOT_DISPLAYABLE;
+                }
                 return value.kind === 'unknown' && value.error === 'unsupported function'
                     ? value
                     : PARSE_ERROR;
@@ -393,6 +432,58 @@ function* calculate_workbook_formula_steps(
                 if (this.formula[this.offset] !== ')') return PARSE_ERROR;
                 this.offset += 1;
                 return value;
+            }
+
+            const structured = structured_formula_reference_at(this.formula, this.offset);
+            if (structured) {
+                this.offset += structured.length;
+                const ref = structured.reference;
+                const source_sheet = ref.sheetName === undefined
+                    ? this.formula_sheet_index
+                    : sheets.findIndex((sheet) => sheet.name.localeCompare(
+                        ref.sheetName!, undefined, { sensitivity: 'accent' },
+                    ) === 0);
+                if (source_sheet < 0) return PARSE_ERROR;
+                const sheet = sheets[source_sheet];
+                if (!sheet.excelFirstRowHeader?.active || !sheet.columnNames) {
+                    return HEADER_ROW_OFF;
+                }
+                const matches: number[] = [];
+                for (let column = 0; column < sheet.columnNames.length; column += 1) {
+                    const original = sheet.columnNames[column];
+                    const pending = pending_header_names.get(`${source_sheet}:${column}`);
+                    const original_is_unique = header_name_counts[source_sheet]
+                        .get(original.toLocaleLowerCase()) === 1;
+                    if (
+                        (pending ?? original).localeCompare(
+                            ref.columnName, undefined, { sensitivity: 'accent' },
+                        ) === 0
+                        || (pending !== undefined && original_is_unique && original.localeCompare(
+                            ref.columnName, undefined, { sensitivity: 'accent' },
+                        ) === 0)
+                    ) matches.push(column);
+                }
+                if (matches.length === 0) return UNKNOWN_COLUMN;
+                if (matches.length > 1) return AMBIGUOUS_COLUMN;
+                const header_row = sheet.excelFirstRowHeader.sourceRow ?? 0;
+                if (ref.intersection) {
+                    if (this.formula_row <= header_row || this.formula_row >= sheet.sourceRowCount) {
+                        return ROW_OUTSIDE_BODY;
+                    }
+                    return yield* evaluate_cell({
+                        sheetIndex: source_sheet,
+                        row: this.formula_row,
+                        column: matches[0],
+                    });
+                }
+                return {
+                    kind: 'range',
+                    sheetIndex: source_sheet,
+                    firstRow: header_row + 1,
+                    firstColumn: matches[0],
+                    lastRow: sheet.sourceRowCount - 1,
+                    lastColumn: matches[0],
+                };
             }
 
             const reference = a1_formula_reference_at(this.formula, this.offset);
@@ -557,7 +648,7 @@ function* calculate_workbook_formula_steps(
             && (edit !== undefined || targets.has(key) || cell?.formulaResultPending === true);
         if (evaluates_formula) {
             visiting.add(key);
-            const value = yield* new Parser(formula, address.sheetIndex).parse();
+            const value = yield* new Parser(formula, address.sheetIndex, address.row).parse();
             visiting.delete(key);
             memo.set(key, value);
             return value;

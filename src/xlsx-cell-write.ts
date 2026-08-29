@@ -33,9 +33,11 @@ import {
 import {
     is_xlsx_formula_text,
     compile_a1_formula_move_retargeter,
+    retarget_renamed_structured_formula,
     translate_a1_formula,
     workbook_a1_formula_references,
     type XlsxFormulaCellMove,
+    type StructuredFormulaColumnRename,
 } from './xlsx-formula';
 import {
     classify_xlsx_cell_value,
@@ -82,6 +84,8 @@ export interface XlsxCellEdit {
     readonly col: number;
     /** The raw text the user typed. Empty string clears the cell's value. */
     readonly value: string;
+    /** Preserve a shared or array formula's group attributes while changing its source. */
+    readonly preserve_formula_group?: boolean;
     /**
      * Styled runs of `value`, present when the edit carries character-level
      * formatting. Concatenated run text must equal `value`. When every run's
@@ -157,6 +161,8 @@ export interface XlsxWriteOptions {
         readonly column: number;
         readonly value: string;
     }[];
+    /** Internal recursion guard after grouped formula follower caches are removed. */
+    readonly formula_group_caches_invalidated?: boolean;
 }
 
 function encode_xml(s: string): string {
@@ -296,6 +302,33 @@ function build_cell_xml(
         case 'string':
             return `<c r="${ref}"${style_attr} t="inlineStr"><is><t xml:space="preserve">${encode_xml(classified.text)}</t></is></c>`;
     }
+}
+
+function build_grouped_formula_cell_xml(
+    xml: Uint8Array,
+    cell: Span,
+    value: string,
+): string {
+    assert_safe_xlsx_formula_text(value);
+    const formula = find_first_element(xml, 'f', cell.inner_start, cell.inner_end);
+    if (!formula || formula.inner_start === formula.end) {
+        throw new Error('Grouped formula cell has no formula source to replace');
+    }
+    const cached = find_first_element(xml, 'v', cell.inner_start, cell.inner_end);
+    const local = xml.subarray(cell.start, cell.end);
+    const splices: Splice[] = [{
+        start: formula.inner_start - cell.start,
+        end: formula.inner_end - cell.start,
+        text: encode_xml(value.slice(1)),
+    }];
+    if (cached) {
+        splices.push({
+            start: cached.start - cell.start,
+            end: cached.end - cell.start,
+            text: '',
+        });
+    }
+    return Buffer.from(apply_utf8_splices(local, splices)).toString('utf8');
 }
 
 /**
@@ -1624,6 +1657,80 @@ export function worksheet_formula_move_edits(
     return edits;
 }
 
+/** Materialize formula edits caused by Header Row column renames. */
+export function worksheet_structured_formula_rename_edits(
+    xml: Uint8Array,
+    sheet_index: number,
+    sheet_names: readonly string[],
+    renames: readonly StructuredFormulaColumnRename[],
+    excluded: ReadonlySet<string>,
+    formula_budget: WorkbookBudget = create_workbook_budget(),
+): XlsxCellEdit[] {
+    const sheet_data = scan_worksheet_structure(xml).sheet_data;
+    if (!sheet_data || renames.length === 0) return [];
+    const state = worksheet_formula_state(
+        xml,
+        sheet_data,
+        sheet_names[sheet_index],
+        sheet_index,
+        sheet_names,
+        formula_budget,
+    );
+    const shared_masters = new Map<string, WorksheetFormulaCell>();
+    for (const formula of state.formulas) {
+        if (
+            formula.type === 'shared'
+            && formula.reference !== null
+            && formula.sharedIndex !== null
+            && formula.text !== ''
+        ) shared_masters.set(formula.sharedIndex, formula);
+    }
+    const edits: XlsxCellEdit[] = [];
+    for (const formula of state.formulas) {
+        const key = `${formula.row}:${formula.col}`;
+        if (excluded.has(key)) continue;
+        let effective: string | undefined;
+        if (formula.type === 'shared' && formula.reference === null) {
+            const master = formula.sharedIndex === null
+                ? undefined
+                : shared_masters.get(formula.sharedIndex);
+            if (master) {
+                effective = '=' + translate_a1_formula(
+                    master.text,
+                    formula.row - master.row,
+                    formula.col - master.col,
+                );
+            }
+        } else if (formula.text !== '') {
+            effective = `=${formula.text}`;
+        }
+        if (effective === undefined) continue;
+        const rewritten = retarget_renamed_structured_formula(
+            effective,
+            sheet_index,
+            sheet_names,
+            renames,
+        );
+        if (rewritten === effective) continue;
+        // Rewriting the shared master updates every follower without detaching
+        // them into copies of the translated formula.
+        if (formula.type === 'shared' && formula.reference === null) continue;
+        if (formula.type === 'dataTable') {
+            throw grouped_formula_error(formula.row, formula.col, 'dataTable');
+        }
+        edits.push({
+            row: formula.row,
+            col: formula.col,
+            value: rewritten,
+            ...(formula.type === 'array'
+                || (formula.type === 'shared' && formula.reference !== null)
+                ? { preserve_formula_group: true }
+                : {}),
+        });
+    }
+    return edits;
+}
+
 /** Remove only cached results for formula cells selected by workbook planning. */
 export function remove_formula_cached_values(
     xml: Uint8Array,
@@ -1721,9 +1828,14 @@ function apply_cell_edits_bytes(
     // Formula caches are rewritten as a separate streaming pass before cell
     // edits retain spans. Group followers may number in the millions; folding
     // them into the ordinary splice list retained several objects per cell.
+    const grouped_formula_edit_keys = new Set(edits.flatMap((edit) => (
+        edit.preserve_formula_group === true ? [`${edit.row}:${edit.col}`] : []
+    )));
     if (
         options.formula_result_invalidations === undefined
         || options.formula_result_invalidations.length > 0
+        || (grouped_formula_edit_keys.size > 0
+            && options.formula_group_caches_invalidated !== true)
     ) {
         assert_writable_sheet_data(xml, structure);
         const direct_invalidated_formula_keys = options.formula_result_invalidations === undefined
@@ -1741,6 +1853,7 @@ function apply_cell_edits_bytes(
             : new Set(options.formula_result_invalidations.map(
                 ({ row, column }) => `${row}:${column}`,
             ));
+        for (const key of grouped_formula_edit_keys) direct_invalidated_formula_keys.add(key);
         const calculated_formula_results = new Map(
             (options.formula_result_updates ?? []).map(
                 ({ row, column, value }) => [`${row}:${column}`, value],
@@ -1755,6 +1868,7 @@ function apply_cell_edits_bytes(
         return apply_cell_edits_bytes(rewritten, edits, {
             ...options,
             formula_result_invalidations: [],
+            formula_group_caches_invalidated: true,
         });
     }
 
@@ -1801,7 +1915,11 @@ function apply_cell_edits_bytes(
     const merged_index = merged_follower_index(merged);
     for (const e of edits) {
         const grouped = grouped_range_index?.kindAt(e.row, e.col) ?? null;
-        if (grouped && !(grouped === 'shared' && is_xlsx_formula_edit(e))) {
+        if (grouped && !(
+            is_xlsx_formula_edit(e)
+            && (grouped === 'shared'
+                || (grouped === 'array' && e.preserve_formula_group === true))
+        )) {
             throw grouped_formula_error(e.row, e.col, grouped);
         }
         // Same sweep, same reason: a merged follower usually has no `<c>` of its
@@ -1865,7 +1983,11 @@ function apply_cell_edits_bytes(
                     cell_span.inner_start,
                     cell_span.inner_end,
                 );
-                if (grouped && !(
+                const preserves_group = grouped
+                    && e.preserve_formula_group === true
+                    && is_xlsx_formula_edit(e)
+                    && grouped.kind !== 'dataTable';
+                if (grouped && !preserves_group && !(
                     grouped.kind === 'shared'
                     && !grouped.shared_master
                     && is_xlsx_formula_edit(e)
@@ -1878,7 +2000,9 @@ function apply_cell_edits_bytes(
                 splices.push({
                     start: cell_span.start,
                     end: cell_span.end,
-                    text: build_cell_xml(
+                    text: preserves_group
+                        ? build_grouped_formula_cell_xml(xml, cell_span, e.value)
+                        : build_cell_xml(
                         e.row,
                         e.col,
                         e,
