@@ -149,6 +149,33 @@ describe('entry_from_wire_overlay', () => {
         });
     });
 
+    it('projects formatting and move metadata together', () => {
+        const overlay: WireCellOverlayState = {
+            kind: 'present',
+            value: {
+                kind: 'present',
+                value: { text: 'new' },
+                base: { text: 'old' },
+                basePending: false,
+                formattingKnown: true,
+                movedFrom: { row: 4, col: 3, order: 7 },
+                valueEditOrder: 8,
+            },
+            hyperlink: { kind: 'untouched' },
+        };
+
+        expect(entry_from_wire_overlay(overlay)).toEqual({
+            kind: 'entry',
+            entry: {
+                value: 'new',
+                base: 'old',
+                formattingKnown: true,
+                movedFrom: { row: 4, col: 3, order: 7 },
+                valueEditOrder: 8,
+            },
+        });
+    });
+
     it('projects a plain base-pending overlay as the bare string it came from', () => {
         // A pending base has exactly one origin in durable state: a bare string,
         // whose base is the empty placeholder and which carries neither runs nor
@@ -178,6 +205,25 @@ describe('entry_from_wire_overlay', () => {
             value: { kind: 'present', value: { text: 'new' }, base: { text: '' }, basePending: true },
             hyperlink: { kind: 'present', value: LINK, base: null },
         })).toEqual({ kind: 'unrepresentable' });
+        for (const metadata of [
+            { writeValue: true as const },
+            { retainValue: true as const },
+            { formattingKnown: true as const },
+            { movedFrom: { row: 1, col: 2, order: 3 } },
+            { valueEditOrder: 3 },
+        ]) {
+            expect(entry_from_wire_overlay({
+                kind: 'present',
+                value: {
+                    kind: 'present',
+                    value: { text: 'new' },
+                    base: { text: '' },
+                    basePending: true,
+                    ...metadata,
+                },
+                hyperlink: { kind: 'untouched' },
+            })).toEqual({ kind: 'unrepresentable' });
+        }
     });
 
     it('distinguishes a cleared link from an untouched one', () => {

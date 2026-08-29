@@ -100,6 +100,66 @@ function refusal_of(
 }
 
 describe('planning an undo', () => {
+    it('restores cut provenance when a move is redone', () => {
+        const destination = delta({
+            row: 2,
+            column: 3,
+            before: absent_overlay(),
+            after: value_only_overlay(
+                value('source'), value('destination'), false,
+                undefined, undefined, undefined, { row: 0, col: 0, order: 1 },
+            ),
+            persisted: 'destination',
+        });
+        const plan = plan_of(
+            [cell(destination)],
+            'redo',
+            overlays(
+                { '0:2:3': absent_overlay() },
+                undefined,
+                { '0:2:3': 'destination' },
+            ),
+        );
+
+        expect(plan.writes[0]?.entry?.movedFrom).toEqual({ row: 0, col: 0, order: 1 });
+    });
+
+    it('refuses to synthesize an unsafe reverse move after save', () => {
+        const destination = delta({
+            row: 2,
+            column: 3,
+            before: absent_overlay(),
+            after: value_only_overlay(
+                value('source'), value('destination'), false,
+                undefined, undefined, undefined, { row: 0, col: 0, order: 1 },
+            ),
+            persisted: 'destination',
+        });
+        const refusal = refusal_of(
+            [cell(destination)],
+            'undo',
+            overlays({ '0:2:3': absent_overlay() }, undefined, { '0:2:3': 'source' }),
+        );
+
+        expect(refusal.reason).toBe('conflict');
+    });
+
+    it('checks an overlapping move destination after earlier reverse steps restore it', () => {
+        const moved = value_only_overlay(
+            value('source'), value('destination'), false,
+            undefined, undefined, undefined, { row: 0, col: 0, order: 1 },
+        );
+        const move = delta({ before: absent_overlay(), after: moved, row: 2, column: 3 });
+        const later_removal = delta({ before: moved, after: absent_overlay(), row: 2, column: 3 });
+        const plan = plan_of(
+            [cell(move), cell(later_removal)],
+            'undo',
+            overlays({ '0:2:3': absent_overlay() }),
+        );
+
+        expect(plan.writes.map((write) => write.entry?.value)).toEqual(['source', undefined]);
+    });
+
     it('restores the entry the cell held before the edit', () => {
         const before = value_only_overlay(value('first'), value('disk'));
         const after = value_only_overlay(value('second'), value('disk'));

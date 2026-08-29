@@ -7073,6 +7073,48 @@ describe('edit mode save exit', () => {
             .toEqual({ '0:0': { value: 'typed', base: 'Alice' } });
     });
 
+    it('recompiles the move retargeter when a worksheet is renamed', async () => {
+        const before = make_meta(['People', 'Inventory'], false);
+        before.sheets[0].worksheetId = 'people-id';
+        before.sheets[1].worksheetId = 'inventory-id';
+        await render_app();
+        await dispatch_host_message(initial_snapshot_message(before, {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        await click_button('Edit');
+        await dispatch_host_message({
+            type: 'editSessionResult',
+            granted: true,
+            editSessionId: 'people-session',
+            sheetIndex: 0,
+        });
+        await act(async () => {
+            (grid_shell_mock.latest_props?.edit_session as EditSessionStore).commit(
+                'people-session',
+                '2:2',
+                {
+                    value: 'moved',
+                    base: '',
+                    movedFrom: { row: 0, col: 0, order: 7 },
+                },
+            );
+        });
+        const retarget = () => grid_shell_mock.latest_props?.formula_move_retargeter as
+            | ((formula: string, sheet_index: number) => string)
+            | undefined;
+        expect(retarget()?.('=People!A1', 1)).toBe('=People!C3');
+
+        const after = make_meta(['Customers', 'Inventory'], false);
+        after.sheets[0].worksheetId = 'people-id';
+        after.sheets[1].worksheetId = 'inventory-id';
+        await dispatch_host_message(refresh_snapshot_message(after, {
+            generation: 1,
+            sourceGeneration: 1,
+        }));
+
+        expect(retarget()?.('=Customers!A1', 1)).toBe('=Customers!C3');
+    });
+
     it("drops the old file's stores when an initial snapshot replaces the document", async () => {
         // The single store was replaced wholesale at every hydration boundary,
         // so nothing stale could outlive one. The registry keeps stores, which
@@ -8795,6 +8837,39 @@ describe('edit mode save exit', () => {
         );
         expect(JSON.parse(grid_stub().getAttribute('data-host-rejected-keys')!))
             .toEqual(['4:1']);
+    });
+
+    it('shows the formula value after pending moves in the file-change review', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['Sheet1'], false), {
+                capabilities: { csvEditable: true, csvEditingSupported: true },
+            }),
+        );
+        await enter_edit_mode(post_message);
+        await act(async () => {
+            (grid_shell_mock.latest_props?.edit_session as EditSessionStore).commit(
+                'test-edit-session',
+                '2:2',
+                {
+                    value: 'moved',
+                    base: '',
+                    movedFrom: { row: 0, col: 0, order: 7 },
+                },
+            );
+        });
+        await report_grid_editing(true, true, ['4:1'], {
+            '4:1': {
+                value: '=A1',
+                base: '=A1',
+                observedBase: { value: '=B1' },
+                valueEditOrder: 0,
+            },
+        });
+
+        await click_button('Review changes');
+        expect(container!.querySelector('.external-change-review')?.textContent)
+            .toContain('Your pending edit=C3');
     });
 
     it('keeps a save rejection when adoption returns to the original file value', async () => {

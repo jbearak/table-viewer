@@ -67,6 +67,16 @@ describe('collect_save_payload', () => {
         if (payload.status !== 'ready') throw new Error('expected ready');
         expect(payload.edits).toEqual({ '0:0': 'current' });
     });
+
+    it('emits a same-value move destination so provenance reaches the writer', () => {
+        const payload = collect_save_payload(new Map([[
+            '2:3',
+            { value: 'same', base: 'same', movedFrom: { row: 0, col: 1, order: 1 } },
+        ]]));
+        if (payload.status !== 'ready') throw new Error('expected ready');
+        expect(payload.edits).toEqual({ '2:3': 'same' });
+        expect(payload.dirtyEdits['2:3']?.movedFrom).toEqual({ row: 0, col: 1, order: 1 });
+    });
 });
 
 describe('collect_save_payload — hyperlink edits', () => {

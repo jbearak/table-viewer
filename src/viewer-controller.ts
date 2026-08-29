@@ -740,7 +740,6 @@ function materialize_replay_cells(
  */
 function plan_xlsx_save(input: SavePlanInput): SavePlan {
     const { source: src } = input;
-
     // Every worksheet is fully planned before bytes are produced. The package
     // writer likewise computes every replacement before mutating the container,
     // so one invalid worksheet rejects the workbook save atomically.
@@ -759,7 +758,16 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
             // to equal `value`, so the plain projection and the rich form cannot
             // disagree by the time they get here.
             const runs = dirty_edits?.[key]?.valueRuns?.runs;
-            cell_edits.push(runs && runs.length > 0 ? { row, col, value, runs } : { row, col, value });
+            const moved_from = dirty_edits?.[key]?.movedFrom;
+            const value_edit_order = dirty_edits?.[key]?.valueEditOrder;
+            cell_edits.push({
+                row,
+                col,
+                value,
+                ...(runs && runs.length > 0 ? { runs } : {}),
+                ...(moved_from === undefined ? {} : { movedFrom: moved_from }),
+                ...(value_edit_order === undefined ? {} : { valueEditOrder: value_edit_order }),
+            });
         }
         // Link edits come from the exact dirty entries, not `edits`: a
         // link-only change carries no text edit at all (see
@@ -858,7 +866,14 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
             edits: calculation_edits,
             targets: formula_plan.targets,
         } satisfies FormulaCalculationRequest;
-        const calculated_results = too_many_calculation_edits
+        // The package writer retargets dependent formula source for a move.
+        // Results calculated here still describe the pre-move source graph, so
+        // none are trustworthy; saving unknown caches is correct and lets the
+        // next calculation use the rewritten formulas.
+        const contains_moves = planned.some((sheet) => sheet.edits.some(
+            (edit) => edit.movedFrom !== undefined,
+        ));
+        const calculated_results = too_many_calculation_edits || contains_moves
             ? []
             : input.cached_formula_calculation?.(formula_request)
                 ?? calculate_workbook_formulas_bounded(src, formula_request);

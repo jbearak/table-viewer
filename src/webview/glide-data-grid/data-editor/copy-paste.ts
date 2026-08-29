@@ -6,6 +6,18 @@ import {
     BooleanEmpty,
     BooleanIndeterminate,
 } from "../internal/data-grid/data-grid-types.js";
+import { translate_a1_formula } from "../../../xlsx-formula.js";
+
+export type ClipboardAction = "copy" | "cut";
+
+export interface ClipboardCellData {
+    readonly source: string;
+    readonly location: readonly [number, number];
+    readonly gridLocation: readonly [number, number];
+    readonly formula?: string;
+    readonly action: ClipboardAction;
+    readonly operationId?: string;
+}
 
 type StringArrayCellBuffer = {
     formatted: string[];
@@ -17,21 +29,67 @@ type BasicCellBuffer = {
     formatted: string;
     rawValue: string | number | boolean | BooleanEmpty | BooleanIndeterminate | undefined;
     format: "string" | "number" | "boolean" | "url";
+    clipboardData?: ClipboardCellData;
 };
-export type CellBuffer = StringArrayCellBuffer | BasicCellBuffer;
+export type CellBuffer = (StringArrayCellBuffer | BasicCellBuffer) & {
+    clipboardData?: ClipboardCellData;
+};
 export type CopyBuffer = CellBuffer[][];
+export type CutSourceIdentity = CopyBuffer;
 
-function convertCellToBuffer(cell: GridCell): CellBuffer {
+const MAX_CLIPBOARD_SOURCE_LENGTH = 512;
+// Excel's 8,192-character limit excludes the normalized leading equals sign.
+const MAX_XLSX_FORMULA_LENGTH = 8_193;
+const MAX_XLSX_COLUMN = 16_383;
+const MAX_XLSX_ROW = 1_048_575;
+
+function validLocation(value: readonly [number, number]): boolean {
+    return Number.isInteger(value[0])
+        && Number.isInteger(value[1])
+        && value[0] >= 0
+        && value[0] <= MAX_XLSX_COLUMN
+        && value[1] >= 0
+        && value[1] <= MAX_XLSX_ROW;
+}
+
+function validClipboardData(value: ClipboardCellData): boolean {
+    return value.source.length > 0
+        && value.source.length <= MAX_CLIPBOARD_SOURCE_LENGTH
+        && validLocation(value.location)
+        && validLocation(value.gridLocation)
+        && (value.action === "copy" || value.action === "cut")
+        && typeof value.operationId === "string"
+        && /^[A-Za-z0-9-]{16,128}$/.test(value.operationId)
+        && (value.formula === undefined || (
+            value.formula.startsWith("=")
+            && value.formula.length > 1
+            && value.formula.length <= MAX_XLSX_FORMULA_LENGTH
+        ));
+}
+
+function convertCellToBuffer(
+    cell: GridCell,
+    action: ClipboardAction,
+    operationId?: string,
+): CellBuffer {
+    const withClipboardData = <T extends CellBuffer>(buffer: T): T => {
+        const clipboardData = cell.clipboardData === undefined
+            ? undefined
+            : { ...cell.clipboardData, action, ...(operationId === undefined ? {} : { operationId }) };
+        return clipboardData !== undefined && validClipboardData(clipboardData)
+            ? { ...buffer, clipboardData }
+            : buffer;
+    };
     if (cell.copyData !== undefined) {
-        return {
+        return withClipboardData({
             formatted: cell.copyData,
             rawValue: cell.copyData,
             format: "string",
-        };
+        });
     }
     switch (cell.kind) {
         case GridCellKind.Boolean:
-            return {
+            return withClipboardData({
                 formatted:
                     cell.data === true
                         ? "TRUE"
@@ -42,63 +100,63 @@ function convertCellToBuffer(cell: GridCell): CellBuffer {
                         : "",
                 rawValue: cell.data,
                 format: "boolean",
-            };
+            });
         case GridCellKind.Custom:
-            return {
+            return withClipboardData({
                 formatted: cell.copyData,
                 rawValue: cell.copyData,
                 format: "string",
-            };
+            });
         case GridCellKind.Image:
         case GridCellKind.Bubble:
-            return {
+            return withClipboardData({
                 formatted: cell.data,
                 rawValue: cell.data,
                 format: "string-array",
-            };
+            });
         case GridCellKind.Drilldown:
-            return {
+            return withClipboardData({
                 formatted: cell.data.map(x => x.text),
                 rawValue: cell.data.map(x => x.text),
                 format: "string-array",
-            };
+            });
         case GridCellKind.Text:
-            return {
+            return withClipboardData({
                 formatted: cell.displayData ?? cell.data,
                 rawValue: cell.data,
                 format: "string",
-            };
+            });
         case GridCellKind.Uri:
-            return {
+            return withClipboardData({
                 formatted: cell.displayData ?? cell.data,
                 rawValue: cell.data,
                 format: "url",
-            };
+            });
         case GridCellKind.Markdown:
         case GridCellKind.RowID:
-            return {
+            return withClipboardData({
                 formatted: cell.data,
                 rawValue: cell.data,
                 format: "string",
-            };
+            });
         case GridCellKind.Number:
-            return {
+            return withClipboardData({
                 formatted: cell.displayData,
                 rawValue: cell.data,
                 format: "number",
-            };
+            });
         case GridCellKind.Loading:
-            return {
+            return withClipboardData({
                 formatted: "#LOADING",
                 rawValue: "",
                 format: "string",
-            };
+            });
         case GridCellKind.Protected:
-            return {
+            return withClipboardData({
                 formatted: "************",
                 rawValue: "",
                 format: "string",
-            };
+            });
         default:
             assertNever(cell);
     }
@@ -106,7 +164,9 @@ function convertCellToBuffer(cell: GridCell): CellBuffer {
 
 function createBufferFromGridCells(
     cells: readonly (readonly GridCell[])[],
-    columnIndexes: readonly number[]
+    columnIndexes: readonly number[],
+    action: ClipboardAction,
+    operationId?: string,
 ): CopyBuffer {
     // Fork fix (upstream bug): columnIndexes maps each CELL in a row to its
     // grid column, but upstream indexed it with the ROW index, so the
@@ -114,13 +174,24 @@ function createBufferFromGridCells(
     // coincidentally-aligned rows.
     const copyBuffer: CopyBuffer = cells.map(row => {
         return row.map((cell, cellIndex) => {
-            if (cell.span !== undefined && cell.span[0] !== columnIndexes[cellIndex])
+            if (cell.span !== undefined && cell.span[0] !== columnIndexes[cellIndex]) {
+                const clipboardData = cell.clipboardData === undefined
+                    ? undefined
+                    : {
+                        ...cell.clipboardData,
+                        action,
+                        ...(operationId === undefined ? {} : { operationId }),
+                    };
                 return {
                     formatted: "",
                     rawValue: "",
                     format: "string",
+                    ...(clipboardData !== undefined && validClipboardData(clipboardData)
+                        ? { clipboardData }
+                        : {}),
                 };
-            return convertCellToBuffer(cell);
+            }
+            return convertCellToBuffer(cell, action, operationId);
         });
     });
     return copyBuffer;
@@ -167,6 +238,27 @@ function formatHtmlAttributeContent(attrText: string): string {
     );
 }
 
+function clipboardHtmlAttributes(cell: CellBuffer): string {
+    const data = cell.clipboardData;
+    if (data === undefined) return "";
+    const fields = [
+        `data-tv-clipboard="1"`,
+        `data-tv-source=${formatHtmlAttributeContent(data.source)}`,
+        `data-tv-column="${data.location[0]}"`,
+        `data-tv-row="${data.location[1]}"`,
+        `data-tv-grid-column="${data.gridLocation[0]}"`,
+        `data-tv-grid-row="${data.gridLocation[1]}"`,
+        `data-tv-action="${data.action}"`,
+    ];
+    if (data.formula !== undefined) {
+        fields.push(`data-tv-formula=${formatHtmlAttributeContent(data.formula)}`);
+    }
+    if (data.operationId !== undefined) {
+        fields.push(`data-tv-operation=${formatHtmlAttributeContent(data.operationId)}`);
+    }
+    return ` ${fields.join(" ")}`;
+}
+
 function restoreHtmlEntities(str: string): string {
     // Unescape all quotes, lt, gt, and other special characters
     return str
@@ -183,14 +275,15 @@ function createHtmlBuffer(copyBuffer: CopyBuffer): string {
         lines.push("<tr>");
         for (const cell of row) {
             const formatStr = `gdg-format="${cell.format}"`;
+            const clipboardAttributes = clipboardHtmlAttributes(cell);
             if (cell.format === "url") {
                 lines.push(
-                    `<td ${formatStr}><a href="${cell.rawValue}">${formatHtmlTextContent(cell.formatted)}</a></td>`
+                    `<td ${formatStr}${clipboardAttributes}><a href="${cell.rawValue}">${formatHtmlTextContent(cell.formatted)}</a></td>`
                 );
             } else {
                 if (cell.format === "string-array") {
                     lines.push(
-                        `<td ${formatStr}><ol>${cell.formatted
+                        `<td ${formatStr}${clipboardAttributes}><ol>${cell.formatted
                             .map(
                                 (x, ind) =>
                                     `<li gdg-raw-value=${formatHtmlAttributeContent(cell.rawValue[ind])}>` +
@@ -203,7 +296,7 @@ function createHtmlBuffer(copyBuffer: CopyBuffer): string {
                     lines.push(
                         `<td gdg-raw-value=${formatHtmlAttributeContent(
                             cell.rawValue?.toString() ?? ""
-                        )} ${formatStr}>${formatHtmlTextContent(cell.formatted)}</td>`
+                        )} ${formatStr}${clipboardAttributes}>${formatHtmlTextContent(cell.formatted)}</td>`
                     );
                 }
             }
@@ -221,18 +314,120 @@ function createHtmlBuffer(copyBuffer: CopyBuffer): string {
 // - An ordered list with each item containing a `gdg-raw-value` attribute with the raw value
 export function getCopyBufferContents(
     cells: readonly (readonly GridCell[])[],
-    columnIndexes: readonly number[]
+    columnIndexes: readonly number[],
+    action: ClipboardAction = "copy",
+    operationId?: string,
 ): {
     readonly textPlain: string;
     readonly textHtml: string;
 } {
-    const copyBuffer = createBufferFromGridCells(cells, columnIndexes);
+    const copyBuffer = createBufferFromGridCells(cells, columnIndexes, action, operationId);
     const textPlain = createTextBuffer(copyBuffer);
     const textHtml = createHtmlBuffer(copyBuffer);
     return {
         textPlain,
         textHtml,
     };
+}
+
+function decodedClipboardData(cell: HTMLTableCellElement): ClipboardCellData | undefined {
+    if (cell.getAttribute("data-tv-clipboard") !== "1") return undefined;
+    const source = cell.getAttribute("data-tv-source") ?? "";
+    const coordinate = (name: string): number | undefined => {
+        const encoded = cell.getAttribute(name);
+        if (encoded === null || !/^\d{1,7}$/.test(encoded)) return undefined;
+        return Number(encoded);
+    };
+    const column = coordinate("data-tv-column");
+    const row = coordinate("data-tv-row");
+    const gridColumn = coordinate("data-tv-grid-column");
+    const gridRow = coordinate("data-tv-grid-row");
+    if (column === undefined || row === undefined || gridColumn === undefined || gridRow === undefined) {
+        return undefined;
+    }
+    const action = cell.getAttribute("data-tv-action");
+    const formula = cell.getAttribute("data-tv-formula") ?? undefined;
+    const operationId = cell.getAttribute("data-tv-operation") ?? undefined;
+    const result: ClipboardCellData = {
+        source,
+        location: [column, row],
+        gridLocation: [gridColumn, gridRow],
+        ...(formula === undefined ? {} : { formula }),
+        action: action as ClipboardAction,
+        ...(operationId === undefined ? {} : { operationId }),
+    };
+    return validClipboardData(result) ? result : undefined;
+}
+
+export function resolveCopyBufferValue(
+    cell: CellBuffer,
+    destination?: Pick<ClipboardCellData, "source" | "location">,
+    expectedOperationId?: string,
+): CellBuffer["rawValue"] {
+    const metadata = cell.clipboardData;
+    if (
+        metadata?.formula === undefined
+        || destination === undefined
+        || metadata.source !== destination.source
+        || metadata.operationId !== expectedOperationId
+    ) return cell.rawValue;
+    if (metadata.action === "cut") return metadata.formula;
+    return translate_a1_formula(
+        metadata.formula,
+        destination.location[1] - metadata.location[1],
+        destination.location[0] - metadata.location[0],
+    );
+}
+
+/**
+ * Return projected source cells only when the entire payload is one valid cut
+ * from the destination's current projection. A copied or cross-sheet payload
+ * must never clear cells in this grid.
+ */
+export function cutSourceGridLocations(
+    buffer: CopyBuffer,
+    destinationSource: string | undefined,
+    expectedOperationId?: string,
+    expectedCells?: CutSourceIdentity,
+): readonly (readonly [number, number])[] | undefined {
+    if (destinationSource === undefined || expectedOperationId === undefined
+        || expectedCells === undefined || buffer.length === 0) return undefined;
+    if (buffer.length !== expectedCells.length
+        || buffer.some((row, index) => row.length !== expectedCells[index]?.length)) return undefined;
+    const locations: Array<readonly [number, number]> = [];
+    const seen = new Set<string>();
+    for (const [row_index, row] of buffer.entries()) {
+        for (const [column_index, cell] of row.entries()) {
+            const metadata = cell.clipboardData;
+            if (
+                metadata === undefined
+                || metadata.action !== "cut"
+                || metadata.source !== destinationSource
+                || metadata.operationId !== expectedOperationId
+            ) return undefined;
+            const key = `${metadata.gridLocation[0]}:${metadata.gridLocation[1]}`;
+            if (seen.has(key)) return undefined;
+            const expected = expectedCells[row_index]?.[column_index];
+            const expected_metadata = expected?.clipboardData;
+            if (expected === undefined || expected_metadata === undefined
+                || expected.format !== cell.format
+                || JSON.stringify(expected.rawValue) !== JSON.stringify(cell.rawValue)
+                || JSON.stringify(expected.formatted) !== JSON.stringify(cell.formatted)
+                || expected_metadata.source !== metadata.source
+                || expected_metadata.formula !== metadata.formula
+                || expected_metadata.location[0] !== metadata.location[0]
+                || expected_metadata.location[1] !== metadata.location[1]
+                || expected_metadata.gridLocation[0] !== metadata.gridLocation[0]
+                || expected_metadata.gridLocation[1] !== metadata.gridLocation[1]) return undefined;
+            seen.add(key);
+            locations.push(metadata.gridLocation);
+        }
+    }
+    return locations.length === 0 ? undefined : locations;
+}
+
+export function copyBufferContainsCut(buffer: CopyBuffer): boolean {
+    return buffer.some(row => row.some(cell => cell.clipboardData?.action === "cut"));
 }
 
 export function decodeHTML(html: string): CopyBuffer | undefined {
@@ -278,12 +473,14 @@ export function decodeHTML(html: string): CopyBuffer | undefined {
 
             const attributeValue = clone.getAttribute("gdg-raw-value");
             const formatValue = (clone.getAttribute("gdg-format") ?? "string") as any; // fix me at some point
+            const clipboardData = decodedClipboardData(clone);
             if (clone.querySelector("a") !== null) {
                 current?.push({
                     // raw value is the href
                     rawValue: clone.querySelector("a")?.getAttribute("href") ?? "",
                     formatted: clone.textContent ?? "",
                     format: formatValue,
+                    ...(clipboardData === undefined ? {} : { clipboardData }),
                 });
             } else if (clone.querySelector("ol") !== null) {
                 const rawValues = clone.querySelectorAll("li");
@@ -291,12 +488,14 @@ export function decodeHTML(html: string): CopyBuffer | undefined {
                     rawValue: [...rawValues].map(x => x.getAttribute("gdg-raw-value") ?? ""),
                     formatted: [...rawValues].map(x => x.textContent ?? ""),
                     format: "string-array",
+                    ...(clipboardData === undefined ? {} : { clipboardData }),
                 });
             } else if (attributeValue !== null) {
                 current?.push({
                     rawValue: restoreHtmlEntities(attributeValue),
                     formatted: clone.textContent ?? "",
                     format: formatValue,
+                    ...(clipboardData === undefined ? {} : { clipboardData }),
                 });
             } else {
                 let textContent = clone.textContent ?? "";
@@ -309,6 +508,7 @@ export function decodeHTML(html: string): CopyBuffer | undefined {
                     rawValue: textContent ?? "",
                     formatted: textContent ?? "",
                     format: formatValue,
+                    ...(clipboardData === undefined ? {} : { clipboardData }),
                 });
             }
         }

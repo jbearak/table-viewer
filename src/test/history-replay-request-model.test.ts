@@ -16,7 +16,10 @@ import {
 } from '../webview/history-stack-model';
 import { create_history_store } from '../webview/history-store';
 import { plan_history_replay, type ReplayPlan } from '../webview/history-replay-model';
-import { read_state_from_prepared_replay } from '../webview/history-replay-wire-model';
+import {
+    read_state_from_prepared_replay,
+    wire_overlay_from_cell_overlay_state,
+} from '../webview/history-replay-wire-model';
 import {
     build_commit_request,
     build_prepare_request,
@@ -59,17 +62,30 @@ function pending_base_change(
     before_text: string,
     after_text: string,
     before_runs?: RichText,
+    before_move?: {
+        readonly movedFrom: { readonly row: number; readonly col: number; readonly order: number };
+        readonly valueEditOrder: number;
+    },
 ): HistoryChange {
-    const pending = (text: string, runs?: RichText) => value_only_overlay(
+    const pending = (
+        text: string,
+        runs?: RichText,
+        move?: typeof before_move,
+    ) => value_only_overlay(
         history_value(text, runs),
         history_value(''),
         true,
+        undefined,
+        undefined,
+        undefined,
+        move?.movedFrom,
+        move?.valueEditOrder,
     );
     const delta = build_cell_history_delta({
         worksheet: SHEET,
         sourceRow: 3,
         sourceColumn: 4,
-        before: pending(before_text, before_runs),
+        before: pending(before_text, before_runs, before_move),
         after: pending(after_text),
         persistedValue: history_value(''),
         persistedHyperlink: null,
@@ -360,6 +376,18 @@ describe('build_commit_request', () => {
             .toBeUndefined();
     });
 
+    it('refuses to collapse base-pending move metadata into a legacy string', () => {
+        const changes = [pending_base_change('typed', 'retyped', undefined, {
+            movedFrom: { row: 1, col: 2, order: 7 },
+            valueEditOrder: 7,
+        })];
+        const request = prepare(changes)!;
+        const prepared = prepared_for(request);
+
+        expect(build_commit_request(prepared, plan_for(changes, prepared), 'm-1', 0))
+            .toBeUndefined();
+    });
+
     it('refuses a planned write the preparation has no ordinal for', () => {
         const changes = [cell_change(0, 0, 'a')];
         const request = prepare(changes)!;
@@ -401,6 +429,37 @@ describe('build_commit_request', () => {
         // action's first — the 'a' cell. It keeps its current overlay's value
         // rather than being reverted by omission.
         expect(commit?.cells[1]?.entry).toMatchObject({ value: 'a', base: 'base' });
+    });
+
+    it('keeps all value metadata on a prepared cell the plan leaves alone', () => {
+        const changes = [cell_change(0, 0, 'a'), cell_change(1, 1, 'b')];
+        const request = prepare(changes)!;
+        const prepared = prepared_for(request);
+        const full = plan_for(changes, prepared);
+        const partial: ReplayPlan = { ...full, writes: full.writes.slice(0, 1) };
+        const overlay = wire_overlay_from_cell_overlay_state(value_only_overlay(
+            history_value('a'), history_value('base'), false,
+            true, undefined, true, { row: 4, col: 3, order: 7 }, 8,
+        ));
+        const enriched: HistoryReplayPrepared = {
+            ...prepared,
+            cells: prepared.cells.map((cell, index) => index === 1 ? {
+                ...cell,
+                overlay,
+                persisted: { text: 'current file' },
+            } : cell),
+        };
+
+        expect(build_commit_request(enriched, partial, 'm-1', 0)?.cells[1]?.entry)
+            .toMatchObject({
+                value: 'a',
+                base: 'base',
+                writeValue: true,
+                formattingKnown: true,
+                observedBase: { value: 'current file' },
+                movedFrom: { row: 4, col: 3, order: 7 },
+                valueEditOrder: 8,
+            });
     });
 });
 

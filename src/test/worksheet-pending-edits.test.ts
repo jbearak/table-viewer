@@ -75,6 +75,29 @@ describe('decode_stored_per_file_state — pendingEdits migration', () => {
         })).toThrow();
     });
 
+    it('validates formula move metadata in durable pending edits', () => {
+        const valid = {
+            value: 'moved',
+            base: 'old',
+            observedBase: { value: 'current' },
+            movedFrom: { row: 4, col: 3, order: 9 },
+            valueEditOrder: 10,
+        };
+        expect(decoded_edits({ pendingEdits: { '1:2': valid } }))
+            .toEqual([{ cells: { '1:2': valid } }]);
+
+        for (const metadata of [
+            { movedFrom: { row: -1, col: 3, order: 9 } },
+            { movedFrom: { row: 1, col: 3, order: 9, previous: [{ order: 1 }] } },
+            { valueEditOrder: -1 },
+            { valueEditOrder: 1.5 },
+        ]) {
+            expect(() => decoded_edits({
+                pendingEdits: { '1:2': { ...entry('moved', 'old'), ...metadata } },
+            })).toThrow();
+        }
+    });
+
     it('round-trips through the persisted wrapper', () => {
         // What actually goes to disk. The list is wrapped so `json_type` stays
         // 'object' and the CHECK v0.8.0 installed on existing databases still

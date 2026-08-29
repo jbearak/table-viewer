@@ -42,6 +42,10 @@ const OVERLAYS: readonly (readonly [string, CellOverlayState])[] = [
     ['value only, base pending', value_only_overlay(
         history_value('typed'), history_value(''), true,
     )],
+    ['value only, combined metadata', value_only_overlay(
+        history_value('A'), history_value('A'), false,
+        true, undefined, true, { row: 3, col: 2, order: 7 }, 8,
+    )],
     ['link only', hyperlink_only_overlay(history_value('disk'), LINK, null)],
     ['link only, cleared', hyperlink_only_overlay(history_value('disk'), null, LINK)],
     ['combined', combined_overlay(

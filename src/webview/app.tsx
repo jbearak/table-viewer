@@ -70,7 +70,8 @@ import {
     displayed_formula_result,
     type FormulaCalculationEdit,
 } from '../formula-calculation';
-import { is_xlsx_formula_text } from '../xlsx-formula';
+import { compile_a1_formula_move_retargeter } from '../xlsx-formula';
+import { xlsx_edit_writes_formula } from '../xlsx-cell-value';
 import {
     classify_snapshot,
     normalize_complete_per_file_state,
@@ -727,6 +728,28 @@ export function App(): React.JSX.Element {
         : `${formula_roots_projection.coordinateRevision}`;
     const formula_calculation_edit_signature
         = formula_roots_projection.calculationRevision;
+    const formula_moves = formula_roots_projection.moves;
+    const has_formula_moves = formula_moves.length > 0;
+    const formula_sheet_names = (meta?.sheets ?? []).map((sheet) => sheet.name);
+    const formula_sheet_name_signature = JSON.stringify(formula_sheet_names);
+    const formula_move_signature = formula_moves.map((move) => [
+        move.order ?? 0,
+        move.sheetIndex,
+        move.sourceRow,
+        move.sourceColumn,
+        move.destinationRow,
+        move.destinationColumn,
+    ].join(':')).join(';');
+    const formula_move_retargeter = useMemo(
+        () => compile_a1_formula_move_retargeter(
+            formula_sheet_names,
+            formula_moves,
+        ),
+        // The signatures name provenance and sheet qualifiers independently of
+        // formula value edits and the arrays allocated by this render.
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+        [load_epoch, formula_move_signature, formula_sheet_name_signature],
+    );
     const too_many_formula_calculation_edits = formula_roots_projection.tooManyEdits;
     const [edit_mode, set_edit_mode_state] = useState(false);
     // Diff toggle (before/after view of dirty cells). Deliberately never reset
@@ -1248,6 +1271,7 @@ export function App(): React.JSX.Element {
         || (sheet.pendingFormulaCells?.length ?? 0) > 0
         || (sheet.formulaDependencies?.length ?? 0) > 0);
     const has_formula_work = source_has_formula_work
+        || has_formula_moves
         || formula_roots_projection.hasFormulaEdits;
     const dependency_root_signature = has_formula_work
         ? formula_root_signature
@@ -1255,7 +1279,9 @@ export function App(): React.JSX.Element {
     // Changing the text of an already-dirty cell keeps the same dependency
     // roots, so the common typing path avoids retraversing the graph.
     const dependency_formula_impact = useMemo(
-        () => too_many_formula_calculation_edits
+        () => has_formula_moves
+            ? all_workbook_formula_cells_impact(meta?.sheets ?? [])
+            : too_many_formula_calculation_edits
             ? all_workbook_formula_cells_impact(meta?.sheets ?? [])
             : has_formula_work
                 ? workbook_formula_graph.invalidatedBy(formula_roots)
@@ -1263,7 +1289,7 @@ export function App(): React.JSX.Element {
         // The signatures deliberately stand in for cloned metadata and a mutable
         // edit array; topology and root coordinates are the only graph inputs.
         // eslint-disable-next-line react-hooks/exhaustive-deps
-        [workbook_formula_graph, dependency_root_signature],
+        [workbook_formula_graph, dependency_root_signature, has_formula_moves],
     );
     const formula_calculation_key = `${formula_graph_key}:`
         + `${formula_calculation_edit_signature}`;
@@ -1274,6 +1300,14 @@ export function App(): React.JSX.Element {
         [formula_graph_key],
     );
     const formula_calculation_plan = useMemo(() => {
+        if (has_formula_moves) {
+            return {
+                sheetCount: meta?.sheets.length ?? 0,
+                impact: dependency_formula_impact,
+                targets: [],
+                formulaLimitExceeded: false,
+            };
+        }
         if (too_many_formula_calculation_edits || !has_formula_work) {
             return {
                 sheetCount: meta?.sheets.length ?? 0,
@@ -1292,6 +1326,7 @@ export function App(): React.JSX.Element {
         formula_calculation_edits,
         formula_calculation_edit_signature,
         has_formula_work,
+        has_formula_moves,
         meta?.sheets.length,
         too_many_formula_calculation_edits,
     ]);
@@ -6196,6 +6231,15 @@ export function App(): React.JSX.Element {
     const external_change_formatting_budget = {
         remaining: EXTERNAL_CHANGE_FORMATTING_COMPARISON_BUDGET,
     };
+    const external_change_pending_value = (entry: CsvDirtyEntry): string => (
+        xlsx_edit_writes_formula(entry.value, entry.valueRuns?.runs)
+            ? formula_move_retargeter(
+                entry.value,
+                active_sheet_index,
+                entry.valueEditOrder ?? 0,
+            )
+            : entry.value
+    );
 
     // The overlay only ever applies to the sheet and the arrangement it was recorded
     // against.
@@ -6239,6 +6283,7 @@ export function App(): React.JSX.Element {
             pending_formula_impact={formula_impact.forSheet(active_sheet_index)}
             formula_results={active_formula_results}
             source_formula_results={active_source_formula_results}
+            formula_move_retargeter={formula_move_retargeter}
             generation={generation}
             row_count={effective_row_count}
             show_formatting={show_formatting}
@@ -6783,7 +6828,9 @@ export function App(): React.JSX.Element {
                                         {value_pending && (
                                             <>
                                                 <span>Your pending edit</span>
-                                                <code>{review_value(entry.value)}</code>
+                                                <code>{review_value(
+                                                    external_change_pending_value(entry)
+                                                )}</code>
                                             </>
                                         )}
                                         {pending_formatting_involved && (
@@ -6931,7 +6978,9 @@ export function App(): React.JSX.Element {
                                         {value_pending && (
                                             <>
                                                 <span>Your pending edit</span>
-                                                <code>{review_value(entry.value)}</code>
+                                                <code>{review_value(
+                                                    external_change_pending_value(entry)
+                                                )}</code>
                                             </>
                                         )}
                                         {pending_formatting_involved && (

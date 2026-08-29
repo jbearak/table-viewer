@@ -44,6 +44,7 @@ import { hyperlinks_equal, type CellHyperlink } from '../cell-content';
 import {
     dirty_entry_with_observed_file_base,
     make_observed_file_base,
+    move_provenance_equal,
     type WorksheetTarget,
 } from '../types';
 
@@ -153,10 +154,34 @@ export function plan_history_replay(
         planned_state.get(cell_address(worksheet, row, column))
             ?? read_state(worksheet, row, column);
 
-    for (const change of action_replay_changes(action, direction)) {
+    const replay_changes = action_replay_changes(action, direction);
+    for (const change of replay_changes) {
         if (change.kind === 'highlight') {
             highlights.push(change.delta);
             continue;
+        }
+        if (direction === 'undo') {
+            const after = overlay_for_direction(change.delta, 'redo');
+            const moved = after.kind === 'present' && after.value.kind === 'present'
+                ? after.value.movedFrom
+                : undefined;
+            const { worksheet, sourceRow, sourceColumn } = change.delta;
+            if (
+                moved !== undefined
+                && read_planned(worksheet, sourceRow, sourceColumn)?.overlay.kind === 'absent'
+            ) {
+                // Once saved, reversing only the address mapping would also
+                // rewrite formulas that already referred to the destination.
+                // Read the evolving plan so an earlier reverse step can restore
+                // an overlapping destination before this check.
+                return {
+                    kind: 'refused',
+                    reason: 'conflict',
+                    worksheet,
+                    sourceRow,
+                    sourceColumn,
+                };
+            }
         }
         const planned = plan_cell_replay(change.delta, direction, read_planned);
         if (planned.kind === 'refused') return planned;
@@ -316,6 +341,8 @@ function value_dimension_matches(
         && current.writeValue === recorded.writeValue
         && current.retainValue === recorded.retainValue
         && current.formattingKnown === recorded.formattingKnown
+        && move_provenance_equal(current.movedFrom, recorded.movedFrom)
+        && current.valueEditOrder === recorded.valueEditOrder
         && history_values_equal(current.value, recorded.value)
         && history_values_equal(current.base, recorded.base);
 }

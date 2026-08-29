@@ -3,9 +3,50 @@ import {
     a1_formula_references,
     is_xlsx_formula_text,
     local_a1_formula_references,
+    retarget_moved_a1_formula,
     translate_a1_formula,
     workbook_a1_formula_references,
 } from '../xlsx-formula';
+
+describe('retarget_moved_a1_formula', () => {
+    const move = (sourceRow: number, sourceColumn: number, destinationRow: number, destinationColumn: number) => ({
+        sheetIndex: 0,
+        sourceRow,
+        sourceColumn,
+        destinationRow,
+        destinationColumn,
+    });
+
+    it('keeps absolute markers while references follow moved cells', () => {
+        expect(retarget_moved_a1_formula(
+            '=$A$1+A1+"A1"+Other!A1',
+            0,
+            ['Data', 'Other'],
+            [move(0, 0, 2, 2)],
+        )).toBe('=$C$3+C3+"A1"+Other!A1');
+    });
+
+    it('retargets a range only when the whole range moved by one delta', () => {
+        const moves = [
+            move(0, 0, 2, 1),
+            move(0, 1, 2, 2),
+            move(1, 0, 3, 1),
+            move(1, 1, 3, 2),
+        ];
+        expect(retarget_moved_a1_formula(
+            '=SUM(A1:B2)+SUM(A1:C2)', 0, ['Data'], moves,
+        )).toBe('=SUM(B3:C4)+SUM(A1:C2)');
+    });
+
+    it('resolves quoted worksheet qualifiers', () => {
+        expect(retarget_moved_a1_formula(
+            "='Sales Q1'!A1+Data!A1",
+            1,
+            ['Sales Q1', 'Data'],
+            [move(0, 0, 1, 0)],
+        )).toBe("='Sales Q1'!A2+Data!A1");
+    });
+});
 
 describe('is_xlsx_formula_text', () => {
     it('requires a leading equals and a formula body', () => {

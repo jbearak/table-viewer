@@ -897,6 +897,12 @@ function validate_edit_cells(value: unknown): Record<string, string | CsvDirtyEn
         if (entry.formattingKnown !== undefined && entry.formattingKnown !== true) {
             invalid_leaf('pendingEdits');
         }
+        if (entry.movedFrom !== undefined && !is_valid_move_provenance(entry.movedFrom)) {
+            invalid_leaf('pendingEdits');
+        }
+        if (entry.valueEditOrder !== undefined && !is_valid_value_edit_order(entry.valueEditOrder)) {
+            invalid_leaf('pendingEdits');
+        }
     }
     return value as Record<string, string | CsvDirtyEntry>;
 }
@@ -1493,6 +1499,15 @@ export interface CsvDirtyEntry {
      * the marker disambiguates only the sparse plain shape.
      */
     readonly formattingKnown?: true;
+    /** Canonical source cell when this value is the destination of a cut move. */
+    readonly movedFrom?: {
+        readonly row: number;
+        readonly col: number;
+        readonly order: number;
+        readonly previous?: readonly CellMoveIntent[];
+    };
+    /** Order of the last explicit value edit to this cell. */
+    readonly valueEditOrder?: number;
 }
 
 /** The latest persisted side of a cell carrying a pending edit. */
@@ -1500,6 +1515,70 @@ export interface CsvObservedFileBase {
     readonly value: string;
     readonly runs?: RichText;
     readonly link?: CellHyperlink | null;
+}
+
+export interface CellMoveIntent {
+    readonly sourceRow: number;
+    readonly sourceCol: number;
+    readonly destinationRow: number;
+    readonly destinationCol: number;
+    readonly order: number;
+}
+
+function sanitized_cell_move_intent(value: unknown): CellMoveIntent | undefined {
+    if (!is_plain_record(value)) return undefined;
+    const coordinates = [value.sourceRow, value.sourceCol, value.destinationRow, value.destinationCol];
+    if (!coordinates.every((coordinate) => Number.isSafeInteger(coordinate) && (coordinate as number) >= 0)) {
+        return undefined;
+    }
+    if ((value.sourceRow as number) >= 1_048_576 || (value.destinationRow as number) >= 1_048_576
+        || (value.sourceCol as number) >= 16_384 || (value.destinationCol as number) >= 16_384
+        || !Number.isSafeInteger(value.order) || (value.order as number) < 0) return undefined;
+    return {
+        sourceRow: value.sourceRow as number,
+        sourceCol: value.sourceCol as number,
+        destinationRow: value.destinationRow as number,
+        destinationCol: value.destinationCol as number,
+        order: value.order as number,
+    };
+}
+
+function is_valid_move_provenance(
+    value: unknown,
+): value is NonNullable<CsvDirtyEntry['movedFrom']> {
+    return is_plain_record(value)
+        && Number.isSafeInteger(value.row)
+        && (value.row as number) >= 0
+        && (value.row as number) < 1_048_576
+        && Number.isSafeInteger(value.col)
+        && (value.col as number) >= 0
+        && (value.col as number) < 16_384
+        && Number.isSafeInteger(value.order)
+        && (value.order as number) >= 0
+        && (
+            value.previous === undefined
+            || Array.isArray(value.previous)
+                && value.previous.every((move) => sanitized_cell_move_intent(move) !== undefined)
+        );
+}
+
+function is_valid_value_edit_order(value: unknown): value is number {
+    return Number.isSafeInteger(value) && (value as number) >= 0;
+}
+
+export function move_provenance_equal(
+    left: CsvDirtyEntry['movedFrom'],
+    right: CsvDirtyEntry['movedFrom'],
+): boolean {
+    if (left?.row !== right?.row || left?.col !== right?.col || left?.order !== right?.order) return false;
+    const left_previous = left?.previous ?? [];
+    const right_previous = right?.previous ?? [];
+    return left_previous.length === right_previous.length && left_previous.every((move, index) => {
+        const other = right_previous[index];
+        return move.sourceRow === other?.sourceRow && move.sourceCol === other.sourceCol
+            && move.destinationRow === other.destinationRow
+            && move.destinationCol === other.destinationCol && move.order === other.order;
+    });
 }
 
 export type CsvDirtyMap = Readonly<Record<string, CsvDirtyEntry>>;
@@ -1522,6 +1601,8 @@ export function make_dirty_entry(
     writeValue?: true,
     retainValue?: true,
     formattingKnown?: true,
+    movedFrom?: CsvDirtyEntry['movedFrom'],
+    valueEditOrder?: number,
 ): CsvDirtyEntry {
     return {
         value,
@@ -1534,6 +1615,8 @@ export function make_dirty_entry(
         ...(writeValue === true ? { writeValue: true as const } : {}),
         ...(retainValue === true ? { retainValue: true as const } : {}),
         ...(formattingKnown === true ? { formattingKnown: true as const } : {}),
+        ...(movedFrom !== undefined ? { movedFrom } : {}),
+        ...(valueEditOrder !== undefined ? { valueEditOrder } : {}),
     };
 }
 
@@ -1563,6 +1646,8 @@ export function copy_dirty_entry(
         merged.writeValue,
         merged.retainValue,
         merged.formattingKnown,
+        merged.movedFrom,
+        merged.valueEditOrder,
     );
 }
 
@@ -1639,6 +1724,8 @@ export function sanitized_dirty_entry(entry: {
     readonly writeValue?: unknown;
     readonly retainValue?: unknown;
     readonly formattingKnown?: unknown;
+    readonly movedFrom?: unknown;
+    readonly valueEditOrder?: unknown;
 }): CsvDirtyEntry {
     const keep = (runs: unknown, text: string): RichText | undefined => (
         is_matching_rich_text(runs, text) ? runs : undefined
@@ -1672,6 +1759,30 @@ export function sanitized_dirty_entry(entry: {
                 : undefined,
         )
         : undefined;
+    const previous_moves = is_plain_record(entry.movedFrom) && Array.isArray(entry.movedFrom.previous)
+        ? entry.movedFrom.previous.map(sanitized_cell_move_intent)
+        : [];
+    const moved_from = is_plain_record(entry.movedFrom)
+        && Number.isSafeInteger(entry.movedFrom.row)
+        && (entry.movedFrom.row as number) >= 0
+        && (entry.movedFrom.row as number) < 1_048_576
+        && Number.isSafeInteger(entry.movedFrom.col)
+        && (entry.movedFrom.col as number) >= 0
+        && (entry.movedFrom.col as number) < 16_384
+        && Number.isSafeInteger(entry.movedFrom.order)
+        && (entry.movedFrom.order as number) >= 0
+        && previous_moves.every((move) => move !== undefined)
+        ? {
+            row: entry.movedFrom.row as number,
+            col: entry.movedFrom.col as number,
+            order: entry.movedFrom.order as number,
+            ...(previous_moves.length === 0 ? {} : { previous: previous_moves as CellMoveIntent[] }),
+        }
+        : undefined;
+    const value_edit_order = Number.isSafeInteger(entry.valueEditOrder)
+        && (entry.valueEditOrder as number) >= 0
+        ? entry.valueEditOrder as number
+        : undefined;
     return make_dirty_entry(
         entry.value,
         entry.base,
@@ -1683,6 +1794,8 @@ export function sanitized_dirty_entry(entry: {
         entry.writeValue === true ? true : undefined,
         entry.retainValue === true ? true : undefined,
         entry.formattingKnown === true ? true : undefined,
+        moved_from,
+        value_edit_order,
     );
 }
 
@@ -1700,6 +1813,10 @@ export function sanitized_wire_dirty_entry(entry: unknown): CsvDirtyEntry | unde
         || typeof entry.value !== 'string'
         || typeof entry.base !== 'string'
     ) return undefined;
+    if (entry.movedFrom !== undefined && !is_valid_move_provenance(entry.movedFrom)) return undefined;
+    if (entry.valueEditOrder !== undefined && !is_valid_value_edit_order(entry.valueEditOrder)) {
+        return undefined;
+    }
     return sanitized_dirty_entry(entry as {
         readonly value: string;
         readonly base: string;
@@ -1711,6 +1828,8 @@ export function sanitized_wire_dirty_entry(entry: unknown): CsvDirtyEntry | unde
         readonly writeValue?: unknown;
         readonly retainValue?: unknown;
         readonly formattingKnown?: unknown;
+        readonly movedFrom?: unknown;
+        readonly valueEditOrder?: unknown;
     });
 }
 
@@ -1733,6 +1852,10 @@ export function is_strict_wire_dirty_entry(value: unknown): value is CsvDirtyEnt
     if (value.writeValue !== undefined && value.writeValue !== true) return false;
     if (value.retainValue !== undefined && value.retainValue !== true) return false;
     if (value.formattingKnown !== undefined && value.formattingKnown !== true) return false;
+    if (value.movedFrom !== undefined && !is_valid_move_provenance(value.movedFrom)) return false;
+    if (value.valueEditOrder !== undefined && !is_valid_value_edit_order(value.valueEditOrder)) {
+        return false;
+    }
 
     const has_link = value.link !== undefined || value.baseLink !== undefined;
     if (has_link && !(
@@ -1815,7 +1938,9 @@ export function dirty_entries_equal(
         && observed_file_bases_equal(left.observedBase, right.observedBase)
         && left.writeValue === right.writeValue
         && left.retainValue === right.retainValue
-        && left.formattingKnown === right.formattingKnown;
+        && left.formattingKnown === right.formattingKnown
+        && move_provenance_equal(left.movedFrom, right.movedFrom)
+        && left.valueEditOrder === right.valueEditOrder;
 }
 
 export function observed_file_bases_equal(
@@ -1844,6 +1969,8 @@ export function dirty_entry_value_dimension_present(entry: CsvDirtyEntry): boole
     return entry.link === undefined
         || entry.retainValue === true
         || entry.writeValue === true
+        || entry.movedFrom !== undefined
+        || entry.valueEditOrder !== undefined
         || changed_from_original;
 }
 
@@ -2072,7 +2199,8 @@ export function save_maps_agree(
     for (const key in dirty_edits) {
         if (!Object.prototype.hasOwnProperty.call(dirty_edits, key)) continue;
         const entry = dirty_edits[key];
-        if (dirty_entry_value_changed(entry)) {
+        if (dirty_entry_value_changed(entry) || entry.movedFrom !== undefined
+            || entry.valueEditOrder !== undefined) {
             expected_edit_count += 1;
             if (
                 !Object.prototype.hasOwnProperty.call(edits, key)

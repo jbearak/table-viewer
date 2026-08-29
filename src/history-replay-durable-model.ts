@@ -118,7 +118,12 @@ export function entry_from_wire_overlay(
         const plain = dimension.value.runs === undefined
             && dimension.base.runs === undefined
             && dimension.base.text === ''
-            && overlay.hyperlink.kind === 'untouched';
+            && overlay.hyperlink.kind === 'untouched'
+            && dimension.writeValue === undefined
+            && dimension.retainValue === undefined
+            && dimension.formattingKnown === undefined
+            && dimension.movedFrom === undefined
+            && dimension.valueEditOrder === undefined;
         return plain
             ? { kind: 'legacy', value: dimension.value.text }
             : { kind: 'unrepresentable' };
@@ -141,6 +146,8 @@ export function entry_from_wire_overlay(
         dimension.kind === 'present' ? dimension.writeValue : undefined,
         dimension.kind === 'present' ? dimension.retainValue : undefined,
         dimension.kind === 'present' ? dimension.formattingKnown : undefined,
+        dimension.kind === 'present' ? dimension.movedFrom : undefined,
+        dimension.kind === 'present' ? dimension.valueEditOrder : undefined,
     );
     return { kind: 'entry', entry };
 }

@@ -238,6 +238,23 @@ describe('validate_dirty_bases formatting', () => {
         expect(outcome).toEqual({ type: 'valid' });
     });
 
+    it('does not treat same-value formula move metadata as a formatting edit', () => {
+        const outcome = validate_dirty_bases(
+            edits({
+                '0:0': {
+                    value: 'a',
+                    base: 'a',
+                    movedFrom: { row: 1, col: 0, order: 7 },
+                    valueEditOrder: 7,
+                },
+            }),
+            2,
+            grid,
+            rich_reader({ '0:0': bold('a') }),
+        );
+        expect(outcome).toEqual({ type: 'valid' });
+    });
+
     it('does not invent a formatting base for an older changed-text draft', () => {
         const outcome = validate_dirty_bases(
             edits({ '0:0': { value: 'B', base: 'a' } }),

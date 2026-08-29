@@ -3183,6 +3183,7 @@ describe('GridShell link-only edits', () => {
                 displayData?: string;
                 data: { lines: Array<Array<{ text: string }>> };
                 copyData: string;
+                clipboardData?: { formula?: string; location: [number, number] };
             }
         )(cell);
 
@@ -3190,11 +3191,19 @@ describe('GridShell link-only edits', () => {
         expect(formula.data.lines.flat().map((part) => part.text).join(''))
             .toBe('$58.50 → ??');
         expect(formula.copyData).toBe('=E5*F5+1');
+        expect(formula.clipboardData).toMatchObject({
+            formula: '=E5*F5+1',
+            location: [0, 0],
+        });
 
         const promoted = get_cell_content([1, 0]);
         expect(promoted.data.lines.flat().map((part) => part.text).join(''))
             .toBe('12 → ??');
         expect(promoted.copyData).toBe('=A1*2');
+        expect(promoted.clipboardData).toMatchObject({
+            formula: '=A1*2',
+            location: [1, 0],
+        });
 
         expect(get_cell_content([2, 0])).toMatchObject({
             kind: 'text',
@@ -3337,8 +3346,20 @@ describe('GridShell link-only edits', () => {
             },
         }));
         const cell = (grid_mock.props!.getCellContent as
-            (location: [number, number]) => { displayData: string })([1, 0]);
+            (location: [number, number]) => {
+                displayData: string;
+                clipboardData?: {
+                    formula?: string;
+                    location: [number, number];
+                    gridLocation: [number, number];
+                };
+            })([1, 0]);
         expect(cell.displayData).toBe('$4.00');
+        expect(cell.clipboardData).toMatchObject({
+            formula: '=A1*2',
+            location: [1, 0],
+            gridLocation: [1, 0],
+        });
     });
 
     it('keeps a CSV value beginning with equals as literal text', async () => {

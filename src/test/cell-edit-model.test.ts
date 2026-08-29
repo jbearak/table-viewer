@@ -216,6 +216,15 @@ describe('sanitized_wire_dirty_entry', () => {
             observedBase: { value: 'now' },
         });
     });
+
+    it('bounds canonical cut provenance at the wire', () => {
+        expect(sanitized_wire_dirty_entry({
+            value: 'x', base: 'y', movedFrom: { row: 4, col: 3, order: 1 },
+        })).toEqual({ value: 'x', base: 'y', movedFrom: { row: 4, col: 3, order: 1 } });
+        expect(sanitized_wire_dirty_entry({
+            value: 'x', base: 'y', movedFrom: { row: -1, col: 3, order: 1 },
+        })).toBeUndefined();
+    });
 });
 
 describe('sanitized_wire_save_maps', () => {
