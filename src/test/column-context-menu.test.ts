@@ -4,6 +4,7 @@ import {
     header_column_can_be_renamed,
 } from '../webview/column-context-menu';
 import { column_rename_error } from '../webview/rename-column-dialog';
+import { committed_column_name } from '../column-name';
 
 function labels(items: ReturnType<typeof column_context_menu_items>): string[] {
     return items.flatMap((item) => item.kind === 'separator' ? [] : [item.label]);
@@ -80,6 +81,7 @@ describe('column context menu model', () => {
         expect(column_rename_error('  UNITS  ', ['Revenue', 'Units'], 0))
             .toBe('Another column already has that name.');
         expect(column_rename_error('Net Revenue', ['Revenue', 'Units'], 0)).toBeUndefined();
+        expect(committed_column_name('  Net\t  Revenue  ')).toBe('Net Revenue');
     });
 
     it('keeps Copy column and Hide column in preview/edit while omitting transforms', () => {

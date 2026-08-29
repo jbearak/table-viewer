@@ -311,7 +311,9 @@ function build_grouped_formula_cell_xml(
 ): string {
     assert_safe_xlsx_formula_text(value);
     const formula = find_first_element(xml, 'f', cell.inner_start, cell.inner_end);
-    if (!formula) throw new Error('Grouped formula cell has no formula element');
+    if (!formula || formula.inner_start === formula.end) {
+        throw new Error('Grouped formula cell has no formula source to replace');
+    }
     const cached = find_first_element(xml, 'v', cell.inner_start, cell.inner_end);
     const local = xml.subarray(cell.start, cell.end);
     const splices: Splice[] = [{

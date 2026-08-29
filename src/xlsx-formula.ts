@@ -333,8 +333,8 @@ export function retarget_renamed_structured_formula(
             continue;
         }
         const token = formula.slice(index, index + parsed.length);
-        const bracket = token.lastIndexOf('[');
-        out += token.slice(0, bracket + 1)
+        const prefix_length = sheet_prefix_at(formula, index).prefix?.length ?? 0;
+        out += token.slice(0, prefix_length + 1)
             + `${ref.intersection ? '@' : ''}${escaped_structured_column_name(rename.newName)}]`;
         index += parsed.length;
     }

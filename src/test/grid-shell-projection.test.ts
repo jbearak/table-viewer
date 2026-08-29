@@ -1806,6 +1806,88 @@ describe('GridShell column projection', () => {
         expect(write_text).toHaveBeenCalledWith('C name\nsource-c');
     });
 
+    it('copies a pending Header Row rename before save', async () => {
+        const write_text = vi.fn(async (_text: string) => {});
+        Object.defineProperty(navigator, 'clipboard', {
+            configurable: true,
+            value: { writeText: write_text },
+        });
+        grid_mock.source_row_for_display = (row) => row + 1;
+        await render_grid(props({
+            edit_mode: true,
+            csv_editable: true,
+            edit_syntax: 'markdown',
+            initial_edits: { '0:2': { value: 'Pending C', base: 'C name' } },
+            sheet_meta: {
+                ...props().sheet_meta,
+                sourceRowCount: 2,
+                columnHeaderEditTexts: ['A name', 'B name', 'C name'],
+                columnHeaderEditable: [true, true, true],
+                excelFirstRowHeader: {
+                    mode: 'on', detected: true, active: true, available: true, sourceRow: 0,
+                },
+            },
+        }));
+        const on_header_context_menu = grid_mock.props!.onHeaderContextMenu as
+            (column: number, event: Record<string, unknown>) => void;
+        await act(async () => on_header_context_menu(1, {
+            preventDefault: vi.fn(),
+            bounds: { x: 100, y: 0, width: 100, height: 36 },
+            localEventX: 20,
+            localEventY: 10,
+        }));
+        await act(async () => Array.from(document.querySelectorAll('button'))
+            .find((button) => button.textContent === 'Copy column')!.click());
+
+        expect(write_text).toHaveBeenCalledWith('Pending C\nsource-c');
+    });
+
+    it('opens a repeat column rename from the pending value', async () => {
+        grid_mock.source_row_for_display = (row) => row + 1;
+        await render_grid(props({
+            edit_mode: true,
+            csv_editable: true,
+            edit_syntax: 'markdown',
+            initial_edits: { '0:2': { value: 'Pending C', base: 'C name' } },
+            sheet_meta: {
+                ...props().sheet_meta,
+                sourceRowCount: 2,
+                columnHeaderEditTexts: ['A name', 'B name', 'C name'],
+                columnHeaderEditable: [true, true, true],
+                excelFirstRowHeader: {
+                    mode: 'on', detected: true, active: true, available: true, sourceRow: 0,
+                },
+            },
+        }));
+        const on_header_context_menu = grid_mock.props!.onHeaderContextMenu as
+            (column: number, event: Record<string, unknown>) => void;
+        await act(async () => on_header_context_menu(1, {
+            preventDefault: vi.fn(),
+            bounds: { x: 100, y: 0, width: 100, height: 36 },
+            localEventX: 20,
+            localEventY: 10,
+        }));
+        await act(async () => Array.from(document.querySelectorAll('button'))
+            .find((button) => button.textContent === 'Rename column…')!.click());
+
+        const input = document.querySelector('#rename-column-name') as HTMLInputElement;
+        expect(input.value).toBe('Pending C');
+        await act(async () => set_input_value(input, '  Final\t  C  '));
+        await act(async () => button('Rename').click());
+
+        await act(async () => on_header_context_menu(1, {
+            preventDefault: vi.fn(),
+            bounds: { x: 100, y: 0, width: 100, height: 36 },
+            localEventX: 20,
+            localEventY: 10,
+        }));
+        await act(async () => button('Rename column…').click());
+        const repeated = document.querySelector('#rename-column-name') as HTMLInputElement;
+        expect(repeated.value).toBe('Final C');
+        await act(async () => set_input_value(repeated, '  Final   C  '));
+        expect(button('Rename').disabled).toBe(true);
+    });
+
     it('copies a committed dirty edit instead of the resident source value', async () => {
         const write_text = vi.fn(async () => {});
         Object.defineProperty(navigator, 'clipboard', {

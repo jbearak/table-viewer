@@ -69,6 +69,7 @@ import { cell_edit_base } from './cell-edit-model';
 import { get_raw_cell_text } from './cell-display';
 import { cell_key, parse_cell_key } from './cell-key';
 import type { CellHyperlink, RichText } from './cell-content';
+import { committed_column_name, normalized_column_name } from './column-name';
 import type { XlsxHyperlinkEdit } from './xlsx-hyperlink-write';
 import type {
     AuthorityFileStateStore,
@@ -782,14 +783,14 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
             const runs = dirty_edits?.[key]?.valueRuns?.runs;
             const moved_from = dirty_edits?.[key]?.movedFrom;
             const value_edit_order = dirty_edits?.[key]?.valueEditOrder;
+            const header_edit = sheet_meta?.excelFirstRowHeader?.active === true
+                && row === header_row;
             cell_edits.push({
                 row,
                 col,
-                value,
-                ...(sheet_meta?.excelFirstRowHeader?.active === true && row === header_row
-                    ? { force_text: true }
-                    : {}),
-                ...(runs && runs.length > 0 ? { runs } : {}),
+                value: header_edit ? committed_column_name(value) : value,
+                ...(header_edit ? { force_text: true } : {}),
+                ...(!header_edit && runs && runs.length > 0 ? { runs } : {}),
                 ...(moved_from === undefined ? {} : { movedFrom: moved_from }),
                 ...(value_edit_order === undefined ? {} : { valueEditOrder: value_edit_order }),
             });
@@ -838,6 +839,31 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
         writesFormula: boolean;
         runs?: XlsxCellEdit['runs'];
     }> = [];
+    for (const worksheet of planned) {
+        const sheet = src.meta().sheets[worksheet.sheetIndex];
+        if (sheet?.excelFirstRowHeader?.active !== true || !sheet.columnNames) continue;
+        const header_row = sheet.excelFirstRowHeader.sourceRow ?? 0;
+        const final_names = [...sheet.columnNames];
+        const changed_columns = new Set<number>();
+        for (const edit of worksheet.edits) {
+            if (edit.row !== header_row || final_names[edit.col] === undefined) continue;
+            const old_name = final_names[edit.col];
+            const new_name = committed_column_name(edit.value);
+            if (new_name === '' && old_name !== '') {
+                throw new Error('A column name cannot be blank.');
+            }
+            final_names[edit.col] = new_name;
+            if (new_name !== old_name) changed_columns.add(edit.col);
+        }
+        for (const column of changed_columns) {
+            const normalized = normalized_column_name(final_names[column]);
+            if (normalized !== '' && final_names.some((name, candidate) => (
+                candidate !== column && normalized_column_name(name) === normalized
+            ))) {
+                throw new Error('Another column already has that name.');
+            }
+        }
+    }
     const structured_column_renames = planned.flatMap((worksheet) => {
         const sheet = src.meta().sheets[worksheet.sheetIndex];
         if (sheet?.excelFirstRowHeader?.active !== true || !sheet.columnNames) return [];
@@ -845,9 +871,14 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
         const header_row = sheet.excelFirstRowHeader.sourceRow ?? 0;
         return worksheet.edits.flatMap((edit) => {
             const old_name = column_names[edit.col];
+            if (edit.row !== header_row || old_name === undefined) return [];
+            const new_name = committed_column_name(edit.value);
+            if (new_name === '') {
+                if (old_name !== '') throw new Error('A column name cannot be blank.');
+                return [];
+            }
             if (
-                edit.row !== header_row
-                || old_name === undefined
+                new_name.localeCompare(old_name, undefined, { sensitivity: 'accent' }) === 0
                 || column_names.filter((name) => name.localeCompare(
                     old_name, undefined, { sensitivity: 'accent' },
                 ) === 0).length !== 1
@@ -855,7 +886,7 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
             return [{
                 sheetIndex: worksheet.sheetIndex,
                 oldName: old_name,
-                newName: edit.value.trim(),
+                newName: new_name,
             }];
         });
     });

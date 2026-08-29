@@ -467,7 +467,7 @@ describe('ExcelHeaderDataSource', () => {
         const ds = new ExcelHeaderDataSource(new StubSource([
             [cell('Report title'), null],
             [cell('Generated today'), null],
-            [cell('Name'), cell('Age')],
+            [cell('Name', { formula: '=A1' }), cell('Age')],
             [cell('Alice'), cell(30)],
         ], [], 'Sheet1', undefined, '7'));
 
@@ -478,6 +478,7 @@ describe('ExcelHeaderDataSource', () => {
             manualHeaderRow: 2,
             manualHeaderSourceRow: 2,
             manualColumnNames: ['Name', 'Age'],
+            manualHeaderEditTexts: ['=A1', 'Age'],
         });
         expect(Object.isFrozen(input)).toBe(true);
         expect(Object.isFrozen(input.sheets[0].manualColumnNames)).toBe(true);

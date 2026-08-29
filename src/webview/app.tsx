@@ -66,7 +66,9 @@ import {
     compile_workbook_formula_graph,
     pending_workbook_formula_targets,
     plan_workbook_formula_recalculation,
+    STRUCTURED_REFERENCE_STRIDE,
 } from '../formula-dependencies';
+import { committed_column_name } from '../column-name';
 import {
     displayed_formula_result,
     type FormulaCalculationAddress,
@@ -788,7 +790,11 @@ export function App(): React.JSX.Element {
                 old_name, undefined, { sensitivity: 'accent' },
             ) === 0).length !== 1
         ) return [];
-        return [{ sheetIndex: edit.sheetIndex, oldName: old_name, newName: edit.value.trim() }];
+        const new_name = committed_column_name(edit.value);
+        if (new_name === '' || new_name.localeCompare(
+            old_name, undefined, { sensitivity: 'accent' },
+        ) === 0) return [];
+        return [{ sheetIndex: edit.sheetIndex, oldName: old_name, newName: new_name }];
     });
     const structured_column_rename_signature = JSON.stringify(structured_column_renames);
     const formula_move_retargeter = useMemo(
@@ -1382,7 +1388,11 @@ export function App(): React.JSX.Element {
             }
             (meta?.sheets ?? []).forEach((sheet, sheetIndex) => {
                 const packed = sheet.structuredFormulaReferences?.references ?? [];
-                for (let offset = 0; offset + 4 < packed.length; offset += 5) {
+                for (
+                    let offset = 0;
+                    offset + STRUCTURED_REFERENCE_STRIDE - 1 < packed.length;
+                    offset += STRUCTURED_REFERENCE_STRIDE
+                ) {
                     const target = {
                         sheetIndex,
                         row: packed[offset],

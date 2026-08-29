@@ -35,6 +35,27 @@ describe('compile_workbook_formula_graph', () => {
         expect(graph.invalidatedBy([{ sheetIndex: 1, row: 1, column: 0 }]).size).toBe(0);
     });
 
+    it('skips a full-column reference when the Header Row sheet has no body', () => {
+        const graph = compile_workbook_formula_graph([
+            {
+                formulaCells: [0, 0],
+                structuredFormulaReferences: {
+                    names: ['Revenue'],
+                    references: [0, 0, 1, 0, 0],
+                },
+                sourceRowCount: 1,
+            },
+            {
+                formulaCells: [],
+                sourceRowCount: 1,
+                columnNames: ['Revenue'],
+                excelFirstRowHeader: { active: true, sourceRow: 0 },
+            },
+        ]);
+
+        expect(graph.invalidatedBy([{ sheetIndex: 1, row: 0, column: 0 }]).size).toBe(0);
+    });
+
     it('walks exact references, ranges, and recursive cross-sheet chains', () => {
         const graph = compile_workbook_formula_graph([
             {

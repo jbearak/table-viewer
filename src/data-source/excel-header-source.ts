@@ -219,6 +219,7 @@ export class ExcelHeaderDataSource implements DataSource {
             sheetIndex: sheet_index,
             projectedRow: projected_row,
             sourceRow: source_row,
+            editTexts: header_row_edit_texts(sheet.physical, row),
             columnNames: manual_row_names(
                 this.base,
                 sheet_index,
@@ -234,6 +235,7 @@ export class ExcelHeaderDataSource implements DataSource {
         projectedRow: number;
         sourceRow: number;
         columnNames: readonly string[];
+        editTexts: readonly string[];
     }): ExcelHeaderPlanningInput {
         return Object.freeze({
             hasFormatting: this.base.meta().hasFormatting,
@@ -261,7 +263,9 @@ export class ExcelHeaderDataSource implements DataSource {
                     manualColumnNames: Object.freeze([...(selected
                         ? selected.columnNames
                         : sheet.manualColumnNames)]),
-                    manualHeaderEditTexts: Object.freeze([...sheet.manualEditTexts]),
+                    manualHeaderEditTexts: Object.freeze([...(selected
+                        ? selected.editTexts
+                        : sheet.manualEditTexts)]),
                     manualHeaderEditable: Object.freeze([...(selected
                         ? header_row_editable_columns(
                             sheet.physical,

@@ -175,6 +175,18 @@ describe('col_index_to_letter', () => {
 });
 
 describe('apply_cell_edits', () => {
+    it('refuses to preserve a self-closing grouped formula with no source', () => {
+        const xml = doc('<row r="1"><c r="A1"><f t="shared" ref="A1:A2" si="0"/></c></row>'
+            + '<row r="2"><c r="A2"><f t="shared" si="0"/></c></row>');
+
+        expect(() => apply_cell_edits(xml, [{
+            row: 0,
+            col: 0,
+            value: '=SUM([Years])',
+            preserve_formula_group: true,
+        }], OPTS)).toThrow(/no formula source to replace/);
+    });
+
     const doc = (body: string) =>
         `<worksheet><dimension ref="A1:C3"/><sheetData>${body}</sheetData><pageMargins/></worksheet>`;
 

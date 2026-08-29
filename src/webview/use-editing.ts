@@ -662,22 +662,21 @@ export function use_editing(
                 const materialized = 'persistedCell' in edit
                     ? (edit as unknown as CellValueEdit).persistedCell
                     : undefined;
-                const persisted = 'persistedCell' in edit
-                    ? {
-                        base: materialized === null || materialized === undefined
-                            ? { text: '' }
-                            : cell_edit_base(materialized),
+                let persisted: PersistedCellRead;
+                if ('persistedCell' in edit) {
+                    const base = materialized === null || materialized === undefined
+                        ? { text: '' }
+                        : cell_edit_base(materialized);
+                    persisted = {
+                        base,
                         history: {
-                            value: materialized === null || materialized === undefined
-                                ? history_value('')
-                                : history_value(
-                                    cell_edit_base(materialized).text,
-                                    cell_edit_base(materialized).rich,
-                                ),
+                            value: history_value(base.text, base.rich),
                             hyperlink: materialized?.hyperlink ?? null,
                         },
-                    }
-                    : read_persisted_cell(source_row, source_col);
+                    };
+                } else {
+                    persisted = read_persisted_cell(source_row, source_col);
+                }
                 // Capture cannot represent a cell with no persisted side, so
                 // while capturing that cell does not move either — an applied
                 // edit history could not describe would let undo cross an

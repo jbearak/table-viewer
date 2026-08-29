@@ -121,6 +121,7 @@ import { parse_http_external_url } from '../external-url';
 import type { CellHyperlink } from '../cell-content';
 import { HyperlinkDialog, type HyperlinkDialogHandle } from './hyperlink-dialog';
 import { RenameColumnDialog } from './rename-column-dialog';
+import { committed_column_name } from '../column-name';
 import {
     CELL_TOOLTIP_SHOW_DELAY_MS,
     cell_tooltip_content,
@@ -1193,8 +1194,17 @@ export function GridShell({
     });
     const header_source_row = sheet_meta.excelFirstRowHeader?.sourceRow ?? 0;
     const effective_column_names = useMemo(() => sheet_meta.columnNames?.map(
-        (name, column) => dirty_cells.get(`${header_source_row}:${column}`)?.value.trim() ?? name,
-    ), [dirty_cells, header_source_row, sheet_meta.columnNames]);
+        (name, column) => {
+            if (sheet_meta.excelFirstRowHeader?.active !== true) return name;
+            const dirty = dirty_cells.get(`${header_source_row}:${column}`);
+            return dirty === undefined ? name : committed_column_name(dirty.value);
+        },
+    ), [
+        dirty_cells,
+        header_source_row,
+        sheet_meta.columnNames,
+        sheet_meta.excelFirstRowHeader?.active,
+    ]);
     const columns = useMemo<GridColumn[]>(
         () => {
             const built = build_grid_columns(
@@ -3877,7 +3887,8 @@ export function GridShell({
         }
         const header = include_header
             ? selection.source_columns.map((source_column) =>
-                sheet_meta.columnNames?.[source_column]
+                effective_column_names?.[source_column]
+                || sheet_meta.columnNames?.[source_column]
                 || columns[display_column_for_source(source_column) ?? -1]?.title
                 || `Column ${source_column + 1}`,
             ).join('\t')
@@ -3888,6 +3899,7 @@ export function GridShell({
     }, [
         columns,
         display_column_for_source,
+        effective_column_names,
         get_source_row,
         merge_index,
         read_live_edit,
@@ -5125,7 +5137,10 @@ export function GridShell({
                                     suppress_menu_restore_ref.current = true;
                                     set_rename_column({
                                         sourceColumn: source_column,
-                                        initial: sheet_meta.columnHeaderEditTexts?.[source_column]
+                                        initial: dirty_cells.get(
+                                            `${header_source_row}:${source_column}`,
+                                        )?.value
+                                            ?? sheet_meta.columnHeaderEditTexts?.[source_column]
                                             ?? effective_column_names?.[source_column]
                                             ?? '',
                                     });

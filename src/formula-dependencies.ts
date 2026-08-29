@@ -22,7 +22,7 @@ const RANGE_STRIDE = 5;
 const EXACT_STRIDE = 3;
 const COLUMN_TREE_LEAVES = MAX_COLUMN;
 const RANGE_INDEX_BLOCK_SIZE = 32;
-const STRUCTURED_REFERENCE_STRIDE = 5;
+export const STRUCTURED_REFERENCE_STRIDE = 5;
 
 export interface WorkbookCellAddress {
     readonly sheetIndex: number;
@@ -613,7 +613,12 @@ function resolved_structured_dependencies(
         const source_row_count = source.sourceRowCount ?? 0;
         const first_row = intersection === 1 ? formula_row : header_row + 1;
         const last_row = intersection === 1 ? formula_row : source_row_count - 1;
-        if (first_row <= header_row || first_row < 0 || last_row >= source_row_count) continue;
+        if (
+            first_row <= header_row
+            || first_row < 0
+            || last_row < first_row
+            || last_row >= source_row_count
+        ) continue;
         dependencies.push(
             formula_row,
             formula_column,

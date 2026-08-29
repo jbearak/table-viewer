@@ -39,6 +39,18 @@ describe('structured formula references', () => {
         );
     });
 
+    it('retargets escaped brackets without mistaking them for the opening bracket', () => {
+        expect(retarget_renamed_structured_formula(
+            "=SUM([a'[b])+'Sales [Q1'![@a'[b]",
+            0,
+            ['Data', 'Sales [Q1'],
+            [
+                { sheetIndex: 0, oldName: 'a[b', newName: 'Net' },
+                { sheetIndex: 1, oldName: 'a[b', newName: 'Net' },
+            ],
+        )).toBe("=SUM([Net])+'Sales [Q1'![@Net]");
+    });
+
     it('scans outside strings and rejects nested Excel table specifiers', () => {
         expect(structured_formula_references(
             '=SUM([Revenue])+"[@Ignored]"+Data![@Units]+[[#Data],[Revenue]]',

@@ -1,9 +1,11 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { use_dismiss } from './use-dismiss';
+import {
+    committed_column_name,
+    normalized_column_name,
+} from '../column-name';
 
-export function normalized_column_name(value: string): string {
-    return value.normalize('NFKC').trim().replace(/\s+/gu, ' ').toLocaleLowerCase();
-}
+export { normalized_column_name } from '../column-name';
 
 export function column_rename_error(
     value: string,
@@ -40,7 +42,9 @@ export function RenameColumnDialog(props: {
         return () => window.clearTimeout(timer);
     }, []);
     const commit = useCallback(() => {
-        if (error === undefined && props.on_commit(value)) props.on_cancel();
+        if (error === undefined && props.on_commit(committed_column_name(value))) {
+            props.on_cancel();
+        }
     }, [error, props, value]);
     return (
         <div
@@ -79,7 +83,9 @@ export function RenameColumnDialog(props: {
                 <button
                     type="button"
                     className="filter-popover-btn filter-popover-btn-primary"
-                    disabled={error !== undefined || value === props.initial}
+                    disabled={error !== undefined
+                        || committed_column_name(value)
+                            === committed_column_name(props.initial)}
                     onClick={commit}
                 >
                     Rename
