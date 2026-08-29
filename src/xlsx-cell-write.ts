@@ -28,9 +28,27 @@ import {
 import { OoxmlRefusalError, type OoxmlRefusalCode } from './ooxml-refusal';
 import { text_styles_equal, type CellTextStyle, type RichTextRun } from './cell-content';
 import {
+    compile_workbook_formula_graph,
+} from './formula-dependencies';
+import {
+    is_xlsx_formula_text,
+    translate_a1_formula,
+    workbook_a1_formula_references,
+} from './xlsx-formula';
+import {
     classify_xlsx_cell_value,
+    xlsx_edit_writes_formula,
     xlsx_runs_require_inline_string,
 } from './xlsx-cell-value';
+import {
+    assert_safe_formula_cells,
+    assert_safe_formula_ranges,
+    assert_safe_formula_references,
+    assert_safe_xlsx_formula_text,
+    assert_safe_xlsx_formula_xml_bytes,
+    create_workbook_budget,
+    type WorkbookBudget,
+} from './spreadsheet-safety';
 
 export { iso_to_serial } from './xlsx-cell-value';
 
@@ -44,13 +62,16 @@ export { iso_to_serial } from './xlsx-cell-value';
  * sparklines, pivot caches, drawing anchors, autofilter state, protection,
  * custom XML) is silently dropped on save. Here, an untouched byte range of the
  * worksheet XML is copied through verbatim, so preservation is a property of the
- * algorithm rather than a checklist we have to keep up to date. Parts other than
- * the edited worksheet are never even read (see `xlsx-package.ts`).
+ * algorithm rather than a checklist we have to keep up to date. Package-level
+ * planning may inspect formula structures on other sheets, but it replaces only
+ * edited worksheets and worksheets whose formula caches became stale.
  *
- * The unit of edit is one `<c>` element. For each edited cell we either splice a
- * replacement `<c>` over the existing one, or synthesize a new `<c>` (and, if
- * needed, a new `<row>`) at the correct sorted position. Everything between
- * splices is untouched original text.
+ * The unit of an explicit edit is one `<c>` element. For each edited cell we
+ * either splice a replacement `<c>` over the existing one, or synthesize a new
+ * `<c>` and, if needed, a new `<row>` at the correct sorted position. Formula
+ * dependents get one narrower change: their stale cached `<v>` is removed while
+ * the formula, style, and surrounding XML stay byte-for-byte intact. Everything
+ * between those splices is untouched original text.
  */
 
 /** A single cell edit, in canonical source coordinates (0-based, unprojected). */
@@ -107,6 +128,19 @@ export interface XlsxWriteOptions {
      * base. Absent reads as '' — correct for default-font workbooks.
      */
     readonly run_font_base?: (xf_index: number) => string;
+    /** Worksheet name used to recognize explicit same-sheet A1 qualifiers. */
+    readonly sheet_name?: string;
+    /** Workbook-planned formula cells whose cached `<v>` result is stale. */
+    readonly formula_result_invalidations?: readonly {
+        readonly row: number;
+        readonly column: number;
+    }[];
+    /** Trustworthy numeric results for invalidated or newly edited formulas. */
+    readonly formula_result_updates?: readonly {
+        readonly row: number;
+        readonly column: number;
+        readonly value: string;
+    }[];
 }
 
 function encode_xml(s: string): string {
@@ -119,6 +153,11 @@ function encode_xml(s: string): string {
             // a character reference is the only spelling that round-trips.
             .replace(/\r/g, '&#13;'),
     );
+}
+
+/** A user-entered XLSX formula. CSV/TSV never call this writer. */
+export function is_xlsx_formula_edit(edit: XlsxCellEdit): boolean {
+    return xlsx_edit_writes_formula(edit.value, edit.runs, edit.force_text === true);
 }
 
 /** Convert a 0-based column index to its letter form (0 → A, 26 → AA). */
@@ -188,10 +227,16 @@ function build_cell_xml(
     options: XlsxWriteOptions,
     was_boolean = false,
     was_iso_date = false,
+    formula_result?: string,
 ): string {
     const { value } = edit;
     const ref = `${col_index_to_letter(col)}${row + 1}`;
     const style_attr = xf_index !== null && xf_index !== 0 ? ` s="${xf_index}"` : '';
+    if (is_xlsx_formula_edit(edit)) {
+        assert_safe_xlsx_formula_text(value);
+        const cached = formula_result === undefined ? '' : `<v>${encode_xml(formula_result)}</v>`;
+        return `<c r="${ref}"${style_attr}><f>${encode_xml(value.slice(1))}</f>${cached}</c>`;
+    }
     // A rich edit whose runs still carry styling beyond the cell's own font is
     // written as a rich inline string — checked ahead of the scalar paths
     // because styled text is text: `**2024-01-15**` must not become a serial.
@@ -311,14 +356,7 @@ export function element_close(
     return { inner, end: end_tag[1] };
 }
 
-/**
- * Formula kinds whose `<f>` governs cells other than its own.
- *
- * `shared` names a definition its followers reference by `si`; `array` and
- * `dataTable` each carry a `ref` spanning a range whose other cells hold only a
- * cached value. Writing a literal into any of them leaves the group pointing at
- * a definition that is gone, so all three are refused the same way.
- */
+/** Formula kinds whose `<f>` can govern cells other than its own. */
 type GroupedFormulaKind = 'shared' | 'array' | 'dataTable';
 
 function is_grouped_formula_kind(value: string | null): value is GroupedFormulaKind {
@@ -337,14 +375,16 @@ interface GroupedRange {
 const CELL_RANGE_RE = /^([A-Z]+)(\d+)(?::([A-Z]+)(\d+))?$/;
 
 /**
- * The `ref` range of every shared/array formula on the sheet.
+ * The `ref` range of every shared formula, array formula, and data table.
  *
  * An array formula writes one `<f t="array" ref="A1:B2">` on its top-left cell;
  * the other cells in that range hold a value and no `<f>` at all. So the
  * per-cell check below cannot see them, and an edit to one would drop a member
- * of the group without ever meeting a formula. A shared master's `ref` spans its
- * followers the same way — those *do* carry an `<f>`, but scanning the range
- * catches them uniformly and costs one pass either way.
+ * of the group without ever meeting a formula. Shared followers do carry an
+ * `<f>`, but the range check also catches sparse or missing follower cells.
+ * A normal formula can override one shared follower without changing the other
+ * members. Literal replacement remains refused here: this writer only detaches
+ * a shared follower when the edit is unambiguously another formula.
  *
  * Kept as bounds rather than expanded into a set of coordinates: a `ref` is
  * whatever the writing application put there, and a whole-column or
@@ -374,58 +414,207 @@ function grouped_formula_ranges(xml: Uint8Array): GroupedRange[] {
     return ranges;
 }
 
+const GROUPED_RANGE_ROW_BASE = 1_048_576;
+const GROUPED_RANGE_LAST_COLUMN = 16_383;
+
+interface GroupedRangeBucket {
+    readonly records: number[];
+    prefixMaxEnd?: Uint32Array;
+}
+
+/** Compact two-dimensional point index for selected grouped-formula ranges. */
+class GroupedFormulaRangeIndex {
+    private readonly buckets = new Map<number, GroupedRangeBucket>();
+    private readonly coveredColumns = new Uint8Array(GROUPED_RANGE_LAST_COLUMN + 1);
+
+    constructor(ranges: readonly GroupedRange[]) {
+        const column_deltas = new Int32Array(GROUPED_RANGE_LAST_COLUMN + 2);
+        for (const range of ranges) {
+            const first_row = Math.max(0, range.start_row);
+            const last_row = Math.min(GROUPED_RANGE_ROW_BASE - 1, range.end_row);
+            if (first_row > last_row) continue;
+            const first_column = Math.max(0, range.start_col);
+            const last_column = Math.min(GROUPED_RANGE_LAST_COLUMN, range.end_col);
+            if (first_column > last_column) continue;
+            column_deltas[first_column] += 1;
+            column_deltas[last_column + 1] -= 1;
+            this.add_columns(
+                1,
+                0,
+                GROUPED_RANGE_LAST_COLUMN,
+                first_column,
+                last_column,
+                first_row,
+                last_row,
+            );
+        }
+        let column_coverage = 0;
+        for (let column = 0; column < this.coveredColumns.length; column += 1) {
+            column_coverage += column_deltas[column];
+            if (column_coverage > 0) this.coveredColumns[column] = 1;
+        }
+        for (const bucket of this.buckets.values()) {
+            bucket.records.sort((left, right) => left - right);
+            const prefix = new Uint32Array(bucket.records.length);
+            let max_end = 0;
+            for (let index = 0; index < bucket.records.length; index += 1) {
+                max_end = Math.max(
+                    max_end,
+                    bucket.records[index] % GROUPED_RANGE_ROW_BASE,
+                );
+                prefix[index] = max_end;
+            }
+            bucket.prefixMaxEnd = prefix;
+        }
+    }
+
+    private add_columns(
+        node: number,
+        first: number,
+        last: number,
+        wanted_first: number,
+        wanted_last: number,
+        first_row: number,
+        last_row: number,
+    ): void {
+        if (wanted_first > wanted_last || wanted_first > last || wanted_last < first) return;
+        if (wanted_first <= first && last <= wanted_last) {
+            const bucket = this.buckets.get(node) ?? { records: [] };
+            bucket.records.push(first_row * GROUPED_RANGE_ROW_BASE + last_row);
+            this.buckets.set(node, bucket);
+            return;
+        }
+        const middle = (first + last) >>> 1;
+        this.add_columns(
+            node * 2,
+            first,
+            middle,
+            wanted_first,
+            wanted_last,
+            first_row,
+            last_row,
+        );
+        this.add_columns(
+            node * 2 + 1,
+            middle + 1,
+            last,
+            wanted_first,
+            wanted_last,
+            first_row,
+            last_row,
+        );
+    }
+
+    private bucket_has(bucket: GroupedRangeBucket | undefined, row: number): boolean {
+        if (!bucket || bucket.records.length === 0) return false;
+        const wanted = row * GROUPED_RANGE_ROW_BASE + GROUPED_RANGE_ROW_BASE - 1;
+        let low = 0;
+        let high = bucket.records.length;
+        while (low < high) {
+            const middle = (low + high) >>> 1;
+            if (bucket.records[middle] <= wanted) low = middle + 1;
+            else high = middle;
+        }
+        return low > 0 && bucket.prefixMaxEnd![low - 1] >= row;
+    }
+
+    has(row: number, column: number): boolean {
+        if (this.coveredColumns[column] !== 1) return false;
+        let node = 1;
+        let first = 0;
+        let last = GROUPED_RANGE_LAST_COLUMN;
+        while (true) {
+            if (this.bucket_has(this.buckets.get(node), row)) return true;
+            if (first === last) return false;
+            const middle = (first + last) >>> 1;
+            if (column <= middle) {
+                node *= 2;
+                last = middle;
+            } else {
+                node = node * 2 + 1;
+                first = middle + 1;
+            }
+        }
+    }
+}
+
+/** Kind-preserving point lookup for edit refusal without ranges × edits scans. */
+class GroupedFormulaKindIndex {
+    private readonly shared: GroupedFormulaRangeIndex | undefined;
+    private readonly array: GroupedFormulaRangeIndex | undefined;
+    private readonly dataTable: GroupedFormulaRangeIndex | undefined;
+
+    constructor(ranges: readonly GroupedRange[]) {
+        const shared: GroupedRange[] = [];
+        const array: GroupedRange[] = [];
+        const data_table: GroupedRange[] = [];
+        for (const range of ranges) {
+            if (range.kind === 'shared') shared.push(range);
+            else if (range.kind === 'array') array.push(range);
+            else data_table.push(range);
+        }
+        this.shared = shared.length > 0 ? new GroupedFormulaRangeIndex(shared) : undefined;
+        this.array = array.length > 0 ? new GroupedFormulaRangeIndex(array) : undefined;
+        this.dataTable = data_table.length > 0
+            ? new GroupedFormulaRangeIndex(data_table)
+            : undefined;
+    }
+
+    kindAt(row: number, column: number): GroupedFormulaKind | null {
+        // Non-detachable groups win for malformed overlapping ranges.
+        if (this.array?.has(row, column)) return 'array';
+        if (this.dataTable?.has(row, column)) return 'dataTable';
+        return this.shared?.has(row, column) ? 'shared' : null;
+    }
+}
+
 /**
- * Why an edit inside a shared or array formula is refused.
+ * Why an edit inside a formula group that cannot be changed locally is refused.
  *
- * Its `<f>` is not local to the cell: a shared master defines the formula its
- * followers reference by `si`, and an array formula's `ref` spans a range.
- * Dropping either leaves the rest of the group pointing at a definition that no
- * longer exists — cells that silently stop calculating, or a workbook Excel
- * offers to repair. Handling those groups properly means rewriting cells the
- * user did not edit, which is the opposite of a surgical save, so this refuses
- * and says why instead of quietly corrupting the sheet.
+ * A shared master defines the formula its followers reference by `si`; array
+ * formulas and data tables govern every cell in their `ref`. Dropping one of
+ * those definitions leaves cells that silently stop calculating, or a workbook
+ * Excel offers to repair.
  */
 function grouped_formula_error(row: number, col: number, kind: GroupedFormulaKind): Error {
     const described = kind === 'array'
         ? 'an array formula'
         : kind === 'dataTable' ? 'a data table' : 'a shared formula';
     return new Error(
-        `Cannot edit ${cell_reference(row, col)}: it is part of ${described}. `
-        + 'Clear the formula in Excel first.',
+        `Cannot edit ${cell_reference(row, col)}: this cell is calculated by ${described}. `
+        + "Edit the formula's input cells instead, or replace the formula in Excel first.",
     );
-}
-
-/** The group kind when `row`/`col` falls inside some group's `ref`. */
-function grouped_range_kind(
-    ranges: readonly GroupedRange[],
-    row: number,
-    col: number,
-): GroupedFormulaKind | null {
-    for (const r of ranges) {
-        if (row >= r.start_row && row <= r.end_row && col >= r.start_col && col <= r.end_col) {
-            return r.kind;
-        }
-    }
-    return null;
 }
 
 /**
  * The group kind when the cell's own `<f>` belongs to a multi-cell group.
  *
- * Both a shared master (`t="shared"` with an `si`) and a shared *follower* (an
- * empty `<f t="shared" si="..."/>`) count: replacing either breaks the group.
+ * Shared masters and followers both count. A follower can safely override its
+ * master with a normal formula; editing the master itself would change or orphan
+ * every follower, so it remains a grouped edit that this writer refuses.
  */
+interface GroupedCellFormula {
+    readonly kind: GroupedFormulaKind;
+    readonly shared_master: boolean;
+}
+
 function grouped_formula_kind(
     xml: Uint8Array,
     from: number,
     to: number,
-): GroupedFormulaKind | null {
+): GroupedCellFormula | null {
     // Only the cell's *live* `<f>`: an array formula quoted in a comment inside an
     // ordinary cell refused a literal edit that was never part of a group.
     const ignorable = ignorable_ranges(xml, from, to);
     for (const tag of live_tags(xml, 'f', from, to, ignorable)) {
         const kind = get_tag_attr(xml, tag.start, tag.end, 't');
-        return is_grouped_formula_kind(kind) ? kind : null;
+        return is_grouped_formula_kind(kind)
+            ? {
+                kind,
+                shared_master: kind === 'shared'
+                    && get_tag_attr(xml, tag.start, tag.end, 'ref') !== null,
+            }
+            : null;
     }
     return null;
 }
@@ -500,20 +689,27 @@ function merged_follower_ranges(xml: Uint8Array): GroupedRange[] {
     return ranges;
 }
 
-/** True when `row`/`col` sits in a merge range but is not its anchor. */
-function is_merged_follower(
+/** Index merge coverage with each top-left anchor removed. */
+function merged_follower_index(
     ranges: readonly GroupedRange[],
-    row: number,
-    col: number,
-): boolean {
-    for (const r of ranges) {
-        if (row < r.start_row || row > r.end_row || col < r.start_col || col > r.end_col) continue;
-        // The anchor is the range's top-left, which is where the reader keeps the
-        // visible value — that cell stays editable.
-        if (row === r.start_row && col === r.start_col) continue;
-        return true;
+): GroupedFormulaRangeIndex | undefined {
+    const followers: GroupedRange[] = [];
+    for (const range of ranges) {
+        if (range.start_col < range.end_col) {
+            followers.push({
+                ...range,
+                start_col: range.start_col + 1,
+                end_row: range.start_row,
+            });
+        }
+        if (range.start_row < range.end_row) {
+            followers.push({
+                ...range,
+                start_row: range.start_row + 1,
+            });
+        }
     }
-    return false;
+    return followers.length > 0 ? new GroupedFormulaRangeIndex(followers) : undefined;
 }
 
 /** `A1`-style reference for a message a user will read. */
@@ -1014,9 +1210,9 @@ function assert_writable_sheet_data(
  * value". That is the distinction `parse_xlsx` draws when it decides whether a
  * `<hyperlink display=…>` supplies the cell's text: it keys every `<c r=…>`
  * into its map as it scans — value or not — and falls back to `display` only
- * for a coordinate with no entry. So a styled-but-empty `<c r="B2" s="3"/>`, or
- * a formula cell with no cached `<v>`, reads as BLANK today, and treating
- * either as display-backed would let a save invent text the user never saw.
+ * for a coordinate with no entry. A styled-but-empty `<c r="B2" s="3"/>` stays
+ * blank. A formula with no cached `<v>` displays `??`. Treating either cell as
+ * display-backed would replace its own state with the hyperlink label.
  *
  * Resolved by the same `scan_rows` cell callback an edit uses, so the answer
  * describes the cell the writer would actually splice.
@@ -1050,6 +1246,290 @@ export function cells_present(
 
 /** One pending splice: replace `[start, end)` with `text`. */
 interface Splice { start: number; end: number; text: string }
+
+interface WorksheetFormulaCell {
+    readonly row: number;
+    readonly col: number;
+    readonly type: string | null;
+    readonly reference: string | null;
+    readonly sharedIndex: string | null;
+    readonly text: string;
+    readonly dataTableInputs: readonly string[];
+}
+
+interface WorksheetFormulaState {
+    readonly dependencies: number[];
+}
+
+type FormulaCacheSpliceVisitor = (start: number, end: number, text: string) => void;
+
+/** Visit cache rewrites in worksheet order without retaining one object per follower. */
+function visit_formula_cache_splices(
+    xml: Uint8Array,
+    sheet_data: Span,
+    wanted: ReadonlySet<string>,
+    values: ReadonlyMap<string, string>,
+    grouped_ranges: readonly GroupedRange[],
+    visit: FormulaCacheSpliceVisitor,
+): void {
+    if (wanted.size === 0) return;
+    const selected_groups = grouped_ranges.filter((range) =>
+        range.kind !== 'shared'
+        && wanted.has(`${range.start_row}:${range.start_col}`));
+    const grouped = selected_groups.length > 0
+        ? new GroupedFormulaRangeIndex(selected_groups)
+        : undefined;
+    scan_rows(xml, sheet_data.inner_start, sheet_data.inner_end, {
+        on_cell: (row, col, cell) => {
+            let formula: Span | null = null;
+            let key: string | undefined;
+            if (grouped?.has(row, col) !== true) {
+                key = `${row}:${col}`;
+                if (!wanted.has(key)) return;
+                formula = find_first_element(
+                    xml,
+                    'f',
+                    cell.inner_start,
+                    cell.inner_end,
+                );
+                if (!formula) return;
+            }
+            key ??= `${row}:${col}`;
+            const replacement = values.get(key);
+            if (replacement !== undefined) {
+                const open_tag = utf8_text(xml, cell.start, cell.inner_start);
+                const numeric_open_tag = remove_attr(open_tag, 't');
+                if (numeric_open_tag !== open_tag) {
+                    visit(cell.start, cell.inner_start, numeric_open_tag);
+                }
+            }
+            const value = find_first_element(xml, 'v', cell.inner_start, cell.inner_end);
+            if (value) {
+                visit(
+                    value.start,
+                    value.end,
+                    replacement === undefined ? '' : `<v>${encode_xml(replacement)}</v>`,
+                );
+                return;
+            }
+            if (replacement === undefined) return;
+            formula ??= find_first_element(xml, 'f', cell.inner_start, cell.inner_end);
+            if (formula) visit(formula.end, formula.end, `<v>${encode_xml(replacement)}</v>`);
+        },
+    });
+}
+
+/** Two-pass cache rewrite: one output buffer and O(group index + update map) heap. */
+function rewrite_formula_cached_values(
+    xml: Uint8Array,
+    sheet_data: Span,
+    wanted: ReadonlySet<string>,
+    values: ReadonlyMap<string, string>,
+    grouped_ranges = grouped_formula_ranges(xml),
+): Uint8Array {
+    let delta = 0;
+    let splice_count = 0;
+    let previous_end = 0;
+    visit_formula_cache_splices(
+        xml,
+        sheet_data,
+        wanted,
+        values,
+        grouped_ranges,
+        (start, end, text) => {
+            if (start < previous_end) throw new RangeError(`Overlapping UTF-8 splice at byte ${start}`);
+            previous_end = end;
+            delta += Buffer.byteLength(text, 'utf8') - (end - start);
+            splice_count += 1;
+        },
+    );
+    if (splice_count === 0) return xml;
+
+    const out = Buffer.allocUnsafe(xml.length + delta);
+    let input_at = 0;
+    let output_at = 0;
+    visit_formula_cache_splices(
+        xml,
+        sheet_data,
+        wanted,
+        values,
+        grouped_ranges,
+        (start, end, text) => {
+            const unchanged = xml.subarray(input_at, start);
+            out.set(unchanged, output_at);
+            output_at += unchanged.length;
+            const replacement = Buffer.from(text, 'utf8');
+            out.set(replacement, output_at);
+            output_at += replacement.length;
+            input_at = end;
+        },
+    );
+    out.set(xml.subarray(input_at), output_at);
+    return out;
+}
+
+/**
+ * Read formula coordinates and workbook-resolved references from the unedited part.
+ * Shared followers borrow and translate their master's text, matching the XLSX
+ * reader so the save and the reopen cannot disagree about their dependencies.
+ */
+function worksheet_formula_state(
+    xml: Uint8Array,
+    sheet_data: Span,
+    sheet_name: string | undefined,
+    sheet_index = 0,
+    sheet_names: readonly string[] = [sheet_name ?? ''],
+    formula_budget: WorkbookBudget = create_workbook_budget(),
+): WorksheetFormulaState {
+    const formulas: WorksheetFormulaCell[] = [];
+    scan_rows(xml, sheet_data.inner_start, sheet_data.inner_end, {
+        on_cell: (row, col, cell) => {
+            const formula = find_first_element(
+                xml,
+                'f',
+                cell.inner_start,
+                cell.inner_end,
+            );
+            if (!formula) return;
+            assert_safe_formula_cells(formula_budget, 1);
+            assert_safe_xlsx_formula_xml_bytes(formula.inner_end - formula.inner_start);
+            const text = decode_xml(utf8_text(
+                xml,
+                formula.inner_start,
+                formula.inner_end,
+            ));
+            if (text !== '') assert_safe_xlsx_formula_text(text);
+            const type = get_tag_attr(xml, formula.start, formula.inner_start, 't');
+            formulas.push({
+                row,
+                col,
+                type,
+                reference: get_tag_attr(xml, formula.start, formula.inner_start, 'ref'),
+                sharedIndex: get_tag_attr(xml, formula.start, formula.inner_start, 'si'),
+                text,
+                dataTableInputs: type === 'dataTable'
+                    ? ['r1', 'r2'].flatMap((attribute) => {
+                        const input = get_tag_attr(
+                            xml,
+                            formula.start,
+                            formula.inner_start,
+                            attribute,
+                        );
+                        return input === null ? [] : [`=${input}`];
+                    })
+                    : [],
+            });
+        },
+    });
+
+    const shared_masters = new Map<
+        string,
+        { readonly row: number; readonly col: number; readonly text: string }
+    >();
+    for (const formula of formulas) {
+        if (
+            formula.type === 'shared'
+            && formula.reference !== null
+            && formula.sharedIndex !== null
+            && formula.text !== ''
+        ) {
+            shared_masters.set(formula.sharedIndex, formula);
+        }
+    }
+
+    const dependencies: number[] = [];
+    for (const formula of formulas) {
+        let effective: string | undefined;
+        if (formula.type === 'shared' && formula.reference === null) {
+            const master = formula.sharedIndex === null
+                ? undefined
+                : shared_masters.get(formula.sharedIndex);
+            if (master) {
+                effective = '=' + translate_a1_formula(
+                    master.text,
+                    formula.row - master.row,
+                    formula.col - master.col,
+                );
+            }
+        } else if (formula.text !== '') {
+            effective = `=${formula.text}`;
+        }
+        for (const formula_text of [
+            ...(effective === undefined ? [] : [effective]),
+            ...formula.dataTableInputs,
+        ]) {
+            assert_safe_xlsx_formula_text(formula_text);
+            for (const reference of workbook_a1_formula_references(
+                formula_text,
+                sheet_index,
+                sheet_names,
+            )) {
+                assert_safe_formula_references(formula_budget, 1);
+                if (
+                    reference.firstRow !== reference.lastRow
+                    || reference.firstColumn !== reference.lastColumn
+                ) assert_safe_formula_ranges(formula_budget, 1);
+                dependencies.push(
+                    formula.row,
+                    formula.col,
+                    reference.sourceSheetIndex,
+                    reference.firstRow,
+                    reference.firstColumn,
+                    reference.lastRow,
+                    reference.lastColumn,
+                );
+            }
+        }
+    }
+    return { dependencies };
+}
+
+/** Read workbook-resolved dependencies without materializing worksheet cells. */
+export function worksheet_formula_dependencies(
+    xml: Uint8Array,
+    sheet_index: number,
+    sheet_names: readonly string[],
+    formula_budget: WorkbookBudget = create_workbook_budget(),
+): readonly number[] {
+    const sheet_data = scan_worksheet_structure(xml).sheet_data;
+    if (!sheet_data) return [];
+    return worksheet_formula_state(
+        xml,
+        sheet_data,
+        sheet_names[sheet_index],
+        sheet_index,
+        sheet_names,
+        formula_budget,
+    ).dependencies;
+}
+
+/** Remove only cached results for formula cells selected by workbook planning. */
+export function remove_formula_cached_values(
+    xml: Uint8Array,
+    cells: readonly { readonly row: number; readonly column: number }[],
+): Uint8Array {
+    return update_formula_cached_values(xml, cells, []);
+}
+
+/** Replace or remove selected formula caches without changing formula source. */
+export function update_formula_cached_values(
+    xml: Uint8Array,
+    cells: readonly { readonly row: number; readonly column: number }[],
+    updates: readonly {
+        readonly row: number;
+        readonly column: number;
+        readonly value: string;
+    }[],
+): Uint8Array {
+    if (cells.length === 0) return xml;
+    const sheet_data = scan_worksheet_structure(xml).sheet_data;
+    if (!sheet_data) return xml;
+    const wanted = new Set(cells.map(({ row, column }) => `${row}:${column}`));
+    const values = new Map(updates.map(
+        ({ row, column, value }) => [`${row}:${column}`, value],
+    ));
+    return rewrite_formula_cached_values(xml, sheet_data, wanted, values);
+}
 
 /**
  * Apply cell edits to one worksheet's XML, returning the new XML.
@@ -1117,6 +1597,46 @@ function apply_cell_edits_bytes(
         return apply_cell_edits_bytes(expanded, edits, options);
     }
 
+    // Formula caches are rewritten as a separate streaming pass before cell
+    // edits retain spans. Group followers may number in the millions; folding
+    // them into the ordinary splice list retained several objects per cell.
+    if (
+        options.formula_result_invalidations === undefined
+        || options.formula_result_invalidations.length > 0
+    ) {
+        assert_writable_sheet_data(xml, structure);
+        const direct_invalidated_formula_keys = options.formula_result_invalidations === undefined
+            ? new Set(compile_workbook_formula_graph([{
+                formulaDependencies: worksheet_formula_state(
+                    xml,
+                    sheet_data,
+                    options.sheet_name,
+                ).dependencies,
+            }]).invalidatedBy(edits.map((edit) => ({
+                sheetIndex: 0,
+                row: edit.row,
+                column: edit.col,
+            }))).forSheet(0).keys())
+            : new Set(options.formula_result_invalidations.map(
+                ({ row, column }) => `${row}:${column}`,
+            ));
+        const calculated_formula_results = new Map(
+            (options.formula_result_updates ?? []).map(
+                ({ row, column, value }) => [`${row}:${column}`, value],
+            ),
+        );
+        const rewritten = rewrite_formula_cached_values(
+            xml,
+            sheet_data,
+            direct_invalidated_formula_keys,
+            calculated_formula_results,
+        );
+        return apply_cell_edits_bytes(rewritten, edits, {
+            ...options,
+            formula_result_invalidations: [],
+        });
+    }
+
     // Group edits by row before scanning, so cell spans are retained only for
     // coordinates this save can touch. The scan still sees every `<c r>` once to
     // validate its owner and to capture edited coordinates without a second pass.
@@ -1141,9 +1661,15 @@ function apply_cell_edits_bytes(
 
     const splices: Splice[] = [];
     const new_rows: Array<{ row: number; text: string }> = [];
-    // Scanned once for the whole sheet, because an array formula's members are
-    // only identifiable from the master's `ref` — see `grouped_formula_ranges`.
+    const calculated_formula_results = new Map(
+        (options.formula_result_updates ?? []).map(
+            ({ row, column, value }) => [`${row}:${column}`, value],
+        ),
+    );
     const grouped_ranges = grouped_formula_ranges(xml);
+    const grouped_range_index = grouped_ranges.length > 0
+        ? new GroupedFormulaKindIndex(grouped_ranges)
+        : undefined;
 
     // Ahead of every row and cell lookup, because a grouped formula's range can
     // cover coordinates that have no `<c>` — and, if the whole row is sparse, no
@@ -1151,12 +1677,15 @@ function apply_cell_edits_bytes(
     // the insertion paths instead and wrote a literal into the middle of an array
     // formula's result range, which is the corruption the refusal exists to stop.
     const merged = merged_follower_ranges(xml);
+    const merged_index = merged_follower_index(merged);
     for (const e of edits) {
-        const grouped = grouped_range_kind(grouped_ranges, e.row, e.col);
-        if (grouped) throw grouped_formula_error(e.row, e.col, grouped);
+        const grouped = grouped_range_index?.kindAt(e.row, e.col) ?? null;
+        if (grouped && !(grouped === 'shared' && is_xlsx_formula_edit(e))) {
+            throw grouped_formula_error(e.row, e.col, grouped);
+        }
         // Same sweep, same reason: a merged follower usually has no `<c>` of its
         // own, so nothing downstream would ever meet it.
-        if (is_merged_follower(merged, e.row, e.col)) {
+        if (merged_index?.has(e.row, e.col)) {
             throw new Error(
                 `Cannot edit ${cell_reference(e.row, e.col)}: it is covered by a merged `
                 + 'cell, which shows the value of its top-left cell. Edit that cell '
@@ -1177,7 +1706,16 @@ function apply_cell_edits_bytes(
             // Whole row absent: synthesize it, with its cells in column order.
             const cells = [...row_edits]
                 .sort((a, b) => a.col - b.col)
-                .map((e) => build_cell_xml(e.row, e.col, e, null, options))
+                .map((e) => build_cell_xml(
+                    e.row,
+                    e.col,
+                    e,
+                    null,
+                    options,
+                    false,
+                    false,
+                    calculated_formula_results.get(`${e.row}:${e.col}`),
+                ))
                 .join('');
             new_rows.push({ row, text: `<row r="${row + 1}">${cells}</row>` });
             continue;
@@ -1198,24 +1736,21 @@ function apply_cell_edits_bytes(
                 // plain `<f>` it carried is dropped with it — the agreed putexcel
                 // behavior, where writing a value replaces the formula.
                 //
-                // A *shared* or *array* formula is different, and refused. Its `<f>`
-                // is not local to the cell: a shared master defines the formula its
-                // followers reference by `si`, and an array formula's `ref` spans a
-                // range of cells. Dropping either leaves the rest of the group
-                // pointing at a definition that no longer exists — cells that
-                // silently stop calculating, or a workbook Excel offers to repair.
-                // Handling those groups properly means rewriting cells the user did
-                // not edit, which is the opposite of a surgical save, so this
-                // refuses and says why instead of quietly corrupting the sheet.
-                // The range sweep above already covered every cell a group's `ref`
-                // names. This catches the one it cannot see: a shared *follower*,
-                // whose `<f t="shared" si="…"/>` carries no `ref` of its own.
+                // Grouped formulas are different. Replacing a master can break
+                // other cells. A shared follower may be detached only by an
+                // explicit formula edit; literals remain refused.
                 const grouped = grouped_formula_kind(
                     xml,
                     cell_span.inner_start,
                     cell_span.inner_end,
                 );
-                if (grouped) throw grouped_formula_error(e.row, e.col, grouped);
+                if (grouped && !(
+                    grouped.kind === 'shared'
+                    && !grouped.shared_master
+                    && is_xlsx_formula_edit(e)
+                )) {
+                    throw grouped_formula_error(e.row, e.col, grouped.kind);
+                }
                 const cell_open_tag = opening_tag_text(xml, cell_span);
                 const xf = existing_style(cell_open_tag);
                 const existing_type = get_attr(cell_open_tag, 't');
@@ -1230,6 +1765,7 @@ function apply_cell_edits_bytes(
                         options,
                         existing_type === 'b',
                         existing_type === 'd',
+                        calculated_formula_results.get(`${e.row}:${e.col}`),
                     ),
                 });
             } else {
@@ -1241,7 +1777,16 @@ function apply_cell_edits_bytes(
                 inserts.push({
                     row: e.row,
                     col: e.col,
-                    text: build_cell_xml(e.row, e.col, e, null, options),
+                    text: build_cell_xml(
+                        e.row,
+                        e.col,
+                        e,
+                        null,
+                        options,
+                        false,
+                        false,
+                        calculated_formula_results.get(`${e.row}:${e.col}`),
+                    ),
                 });
             }
         }

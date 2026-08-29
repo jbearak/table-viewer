@@ -68,10 +68,10 @@ export function is_tag_boundary(code: number | undefined): boolean {
     return code === GREATER_THAN || code === SLASH || is_xml_whitespace(code);
 }
 
-/** Find the `>` closing a tag, skipping `>` inside quoted attribute values. */
-export function find_tag_end(xml: Uint8Array, start: number): number {
+/** Find the `>` closing a tag inside `[start, to)`, skipping quoted values. */
+export function find_tag_end(xml: Uint8Array, start: number, to = xml.length): number {
     let quote = 0;
-    for (let i = start; i < xml.length; i++) {
+    for (let i = start; i < to; i++) {
         const code = xml[i];
         if (quote !== 0) {
             if (code === quote) quote = 0;
@@ -271,50 +271,109 @@ export function opening_tag_text(xml: Uint8Array, span: Span): string {
     return utf8_text(xml, span.start, span.inner_start);
 }
 
-/** Ranges inside `[from, to)` whose contents are text rather than markup. */
-export function ignorable_ranges(xml: Uint8Array, from: number, to: number): Array<[number, number]> {
-    const candidates: Array<{ start: number; open: string; close: string }> = [];
-    const collect = (open: string, close: string): void => {
-        let pos = from;
-        while (pos < to) {
-            const start = index_of_bytes(xml, open, pos, to);
-            if (start === -1 || start >= to) return;
-            candidates.push({ start, open, close });
-            pos = start + open.length;
+export interface IgnorableRangeIndex {
+    readonly length: number;
+    start_at(index: number): number;
+    end_at(index: number): number;
+}
+
+const IGNORABLE_RANGES_PER_CHUNK = 4_096;
+
+class CompactIgnorableRanges implements IgnorableRangeIndex {
+    private readonly chunks: Uint32Array[] = [];
+    private tail: number[] = [];
+    private count = 0;
+
+    get length(): number { return this.count; }
+
+    start_at(index: number): number {
+        const chunk_index = Math.floor(index / IGNORABLE_RANGES_PER_CHUNK);
+        const offset = (index % IGNORABLE_RANGES_PER_CHUNK) * 2;
+        return chunk_index < this.chunks.length
+            ? this.chunks[chunk_index][offset]
+            : this.tail[offset];
+    }
+
+    end_at(index: number): number {
+        const chunk_index = Math.floor(index / IGNORABLE_RANGES_PER_CHUNK);
+        const offset = (index % IGNORABLE_RANGES_PER_CHUNK) * 2 + 1;
+        return chunk_index < this.chunks.length
+            ? this.chunks[chunk_index][offset]
+            : this.tail[offset];
+    }
+
+    append(xml: Uint8Array, start: number, end: number): void {
+        if (this.count > 0) {
+            const previous = this.count - 1;
+            const previous_end = this.end_at(previous);
+            // Every scanner needle begins with `<`, so a gap without one can be
+            // folded into the surrounding ignored ranges without hiding markup.
+            if (start <= previous_end || index_of_bytes(xml, '<', previous_end, start) === -1) {
+                this.set_end(previous, end);
+                return;
+            }
         }
-    };
-    // Three monotonic native searches, not three searches at every `<`: the latter
-    // makes an ordinary worksheet pay JavaScript work once per element and makes a
-    // file full of one ignored construct quadratic for either absent kind.
-    collect('<!--', '-->');
-    collect('<![CDATA[', ']]>');
-    collect('<?', '?>');
-    candidates.sort((a, b) => a.start - b.start);
-    const out: Array<[number, number]> = [];
+        this.tail.push(start, end);
+        this.count++;
+        if (this.tail.length === IGNORABLE_RANGES_PER_CHUNK * 2) {
+            this.chunks.push(Uint32Array.from(this.tail));
+            this.tail = [];
+        }
+    }
+
+    private set_end(index: number, end: number): void {
+        const chunk_index = Math.floor(index / IGNORABLE_RANGES_PER_CHUNK);
+        const offset = (index % IGNORABLE_RANGES_PER_CHUNK) * 2 + 1;
+        if (chunk_index < this.chunks.length) this.chunks[chunk_index][offset] = end;
+        else this.tail[offset] = end;
+    }
+}
+
+/** Ranges inside `[from, to)` whose contents are text rather than markup. */
+export function ignorable_ranges(xml: Uint8Array, from: number, to: number): IgnorableRangeIndex {
+    const cursors = [
+        { open: '<!--', close: '-->', start: index_of_bytes(xml, '<!--', from, to) },
+        { open: '<![CDATA[', close: ']]>', start: index_of_bytes(xml, '<![CDATA[', from, to) },
+        { open: '<?', close: '?>', start: index_of_bytes(xml, '<?', from, to) },
+    ];
+    const out = new CompactIgnorableRanges();
     let resume = from;
-    for (const candidate of candidates) {
-        // An opener quoted inside an earlier ignored range is text, exactly as in
-        // the original one-`<`-at-a-time classifier.
-        if (candidate.start < resume) continue;
+    while (resume < to) {
+        let candidate: typeof cursors[number] | undefined;
+        for (const cursor of cursors) {
+            if (cursor.start === -1) continue;
+            if (!candidate || cursor.start < candidate.start) candidate = cursor;
+        }
+        if (!candidate) break;
         const close_start = index_of_bytes(
             xml,
             candidate.close,
             candidate.start + candidate.open.length,
+            to,
         );
         const end = close_start === -1 ? to : Math.min(to, close_start + candidate.close.length);
-        out.push([candidate.start, end]);
+        out.append(xml, candidate.start, end);
         resume = end;
+
+        // Opener-shaped text inside the ignored range is text. Jump every cursor
+        // directly to `resume` so memory follows emitted ranges, not raw matches.
+        for (const cursor of cursors) {
+            if (cursor.start !== -1 && cursor.start < resume) {
+                cursor.start = index_of_bytes(xml, cursor.open, resume, to);
+            }
+        }
     }
     return out;
 }
 
 /** Where to resume if `at` falls inside an ignorable range. */
-export function ignorable_end(ranges: ReadonlyArray<[number, number]>, at: number): number | undefined {
+export function ignorable_end(ranges: IgnorableRangeIndex, at: number): number | undefined {
     let lo = 0;
     let hi = ranges.length - 1;
     while (lo <= hi) {
         const mid = (lo + hi) >> 1;
-        const [start, end] = ranges[mid];
+        const start = ranges.start_at(mid);
+        const end = ranges.end_at(mid);
         if (at < start) hi = mid - 1;
         else if (at < end) return end;
         else lo = mid + 1;
@@ -335,16 +394,18 @@ export function indexOf_live(
     xml: Uint8Array,
     needle: string,
     from: number,
-    ranges: ReadonlyArray<[number, number]>,
+    ranges: IgnorableRangeIndex,
+    to = xml.length,
 ): number {
     let pos = from;
-    while (true) {
-        const at = index_of_bytes(xml, needle, pos);
+    while (pos < to) {
+        const at = index_of_bytes(xml, needle, pos, to);
         if (at === -1) return -1;
         const skip_to = ignorable_end(ranges, at);
         if (skip_to === undefined) return at;
         pos = skip_to;
     }
+    return -1;
 }
 
 export function index_of_markup(xml: Uint8Array, needle: string, from = 0): number {
@@ -378,14 +439,14 @@ export function* live_tags(
     name: string,
     from: number,
     to: number,
-    ranges: ReadonlyArray<[number, number]>,
+    ranges: IgnorableRangeIndex,
 ): Generator<OpeningTagSpan> {
     let pos = from;
     while (pos < to) {
-        const at = indexOf_live(xml, `<${name}`, pos, ranges);
+        const at = indexOf_live(xml, `<${name}`, pos, ranges, to);
         if (at === -1 || at >= to) return;
         if (!is_tag_boundary(xml[at + name.length + 1])) { pos = at + 1; continue; }
-        const tag_end = find_tag_end(xml, at);
+        const tag_end = find_tag_end(xml, at, to);
         if (tag_end === -1 || tag_end >= to) return;
         yield { start: at, end: tag_end + 1 };
         pos = tag_end + 1;
@@ -411,17 +472,18 @@ export function end_tag_after(
     xml: Uint8Array,
     name: string,
     from: number,
-    ranges: ReadonlyArray<[number, number]>,
+    ranges: IgnorableRangeIndex,
+    to = xml.length,
 ): [number, number] | null {
     let pos = from;
-    while (true) {
-        const at = indexOf_live(xml, `</${name}`, pos, ranges);
+    while (pos < to) {
+        const at = indexOf_live(xml, `</${name}`, pos, ranges, to);
         if (at === -1) return null;
         const after = at + name.length + 2;
-        if (xml[after] === GREATER_THAN) return [at, after + 1];
+        if (after < to && xml[after] === GREATER_THAN) return [at, after + 1];
         let gt = after;
-        while (gt < xml.length && xml[gt] !== GREATER_THAN) gt++;
-        if (gt < xml.length && after < gt) {
+        while (gt < to && xml[gt] !== GREATER_THAN) gt++;
+        if (gt < to && after < gt) {
             let whitespace_only = true;
             for (let i = after; i < gt; i++) {
                 if (!is_xml_whitespace(xml[i])) { whitespace_only = false; break; }
@@ -430,6 +492,7 @@ export function end_tag_after(
         }
         pos = at + 1;
     }
+    return null;
 }
 
 /** The first live `<name>` in `[from, to)`, with exact byte spans. */
@@ -450,8 +513,8 @@ export function find_first_element(
                 inner_end: tag.end,
             };
         }
-        const end_tag = end_tag_after(xml, name, tag.end, ranges);
-        if (end_tag === null || end_tag[1] > to) return null;
+        const end_tag = end_tag_after(xml, name, tag.end, ranges, to);
+        if (end_tag === null) return null;
         return {
             start: tag.start,
             end: end_tag[1],
@@ -514,7 +577,7 @@ function next_cell_start(
     xml: Uint8Array,
     from: number,
     to: number,
-    ranges: ReadonlyArray<[number, number]>,
+    ranges: IgnorableRangeIndex,
 ): number {
     for (let i = from; i + 2 < to; i++) {
         if (xml[i] !== LESS_THAN) continue;
@@ -529,7 +592,7 @@ function cell_end_tag_after(
     xml: Uint8Array,
     from: number,
     to: number,
-    ranges: ReadonlyArray<[number, number]>,
+    ranges: IgnorableRangeIndex,
 ): [number, number] | null {
     for (let i = from; i + 3 < to; i++) {
         if (xml[i] !== LESS_THAN) continue;
@@ -549,14 +612,14 @@ function scan_cell_elements(
     xml: Uint8Array,
     from: number,
     to: number,
-    ranges: ReadonlyArray<[number, number]>,
+    ranges: IgnorableRangeIndex,
     callback: ScannedCellCallback,
 ): void {
     let pos = from;
     while (pos < to) {
         const start = next_cell_start(xml, pos, to, ranges);
         if (start === -1) return;
-        const tag_end = find_tag_end(xml, start);
+        const tag_end = find_tag_end(xml, start, to);
         if (tag_end === -1 || tag_end >= to) return;
         const reference = resolve_cell_reference_bytes(
             xml,
@@ -630,12 +693,12 @@ export function scan_rows(
     const ignorable = ignorable_ranges(xml, from, to);
     let pos = from;
     while (pos < to) {
-        const start = index_of_bytes(xml, '<row', pos);
+        const start = index_of_bytes(xml, '<row', pos, to);
         if (start === -1 || start >= to) break;
         const skip_to = ignorable_end(ignorable, start);
         if (skip_to !== undefined) { pos = skip_to; continue; }
         if (!is_tag_boundary(xml[start + 4])) { pos = start + 1; continue; }
-        const tag_end = find_tag_end(xml, start);
+        const tag_end = find_tag_end(xml, start, to);
         if (tag_end === -1 || tag_end >= to) break;
         const row_index = row_index_from_tag(xml, start, tag_end);
         if (is_self_closing(xml, start, tag_end)) {
@@ -650,7 +713,7 @@ export function scan_rows(
             pos = tag_end + 1;
             continue;
         }
-        const end_tag = end_tag_after(xml, 'row', tag_end + 1, ignorable);
+        const end_tag = end_tag_after(xml, 'row', tag_end + 1, ignorable, to);
         if (end_tag === null || end_tag[1] > to) break;
         const [close, after_close] = end_tag;
         const span = { start, end: after_close, inner_start: tag_end + 1, inner_end: close };

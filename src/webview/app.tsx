@@ -6,6 +6,7 @@ import React, {
     useCallback,
     useMemo,
     useLayoutEffect,
+    useSyncExternalStore,
 } from 'react';
 import {
     EMPTY_TRANSFORM,
@@ -44,6 +45,17 @@ import {
     type WorksheetTarget,
 } from '../types';
 import type { WorkbookMeta } from '../data-source/interface';
+import {
+    all_workbook_formula_cells_impact,
+    compile_workbook_formula_graph,
+    pending_workbook_formula_targets,
+    plan_workbook_formula_recalculation,
+} from '../formula-dependencies';
+import {
+    displayed_formula_result,
+    type FormulaCalculationEdit,
+} from '../formula-calculation';
+import { is_xlsx_formula_text } from '../xlsx-formula';
 import {
     classify_snapshot,
     normalize_complete_per_file_state,
@@ -571,6 +583,20 @@ export function App(): React.JSX.Element {
             () => csv_edit_session_id_ref.current,
         );
     }
+    useSyncExternalStore(
+        edit_session_registry_ref.current.subscribe,
+        edit_session_registry_ref.current.revision,
+        edit_session_registry_ref.current.revision,
+    );
+    const formula_roots_projection = edit_session_registry_ref.current.formula_projection();
+    const formula_calculation_edits = formula_roots_projection.edits;
+    const formula_roots = formula_calculation_edits;
+    const formula_root_signature = formula_roots_projection.tooManyEdits
+        ? 'too-many-edits'
+        : `${formula_roots_projection.coordinateRevision}`;
+    const formula_calculation_edit_signature
+        = formula_roots_projection.calculationRevision;
+    const too_many_formula_calculation_edits = formula_roots_projection.tooManyEdits;
     const [edit_mode, set_edit_mode_state] = useState(false);
     // Diff toggle (before/after view of dirty cells). Deliberately never reset
     // when edit mode exits: the button hides with edit mode, but the choice
@@ -970,6 +996,172 @@ export function App(): React.JSX.Element {
     const restore_abandoned_ref = useRef<boolean[]>([]);
     const generation_ref = useRef(1);
     const source_generation_ref = useRef(1);
+    // Metadata is cloned into every host delivery, but formula topology changes
+    // only when the adopted source changes. Key the compiled graph to that fact,
+    // plus the document epoch that disambiguates a new file restarting counters.
+    const formula_graph_key = `${load_epoch}:${source_generation_ref.current}`;
+    const workbook_formula_graph = useMemo(
+        () => compile_workbook_formula_graph(meta?.sheets ?? []),
+        // Metadata is cloned between deliveries; this key names source topology.
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+        [formula_graph_key],
+    );
+    const source_has_formula_work = (meta?.sheets ?? []).some((sheet) =>
+        (sheet.formulaCells?.length ?? 0) > 0
+        || (sheet.pendingFormulaCells?.length ?? 0) > 0
+        || (sheet.formulaDependencies?.length ?? 0) > 0);
+    const has_formula_work = source_has_formula_work
+        || formula_roots_projection.hasFormulaEdits;
+    const dependency_root_signature = has_formula_work
+        ? formula_root_signature
+        : 'no-formula-work';
+    // Changing the text of an already-dirty cell keeps the same dependency
+    // roots, so the common typing path avoids retraversing the graph.
+    const dependency_formula_impact = useMemo(
+        () => too_many_formula_calculation_edits
+            ? all_workbook_formula_cells_impact(meta?.sheets ?? [])
+            : has_formula_work
+                ? workbook_formula_graph.invalidatedBy(formula_roots)
+                : all_workbook_formula_cells_impact([]),
+        // The signatures deliberately stand in for cloned metadata and a mutable
+        // edit array; topology and root coordinates are the only graph inputs.
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+        [workbook_formula_graph, dependency_root_signature],
+    );
+    const formula_calculation_key = `${formula_graph_key}:`
+        + `${formula_calculation_edit_signature}`;
+    const source_pending_formula_targets = useMemo(
+        () => pending_workbook_formula_targets(meta?.sheets ?? []),
+        // Pending source formulas move only with the adopted source topology.
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+        [formula_graph_key],
+    );
+    const formula_calculation_plan = useMemo(() => {
+        if (too_many_formula_calculation_edits || !has_formula_work) {
+            return {
+                sheetCount: meta?.sheets.length ?? 0,
+                impact: dependency_formula_impact,
+                targets: [],
+                formulaLimitExceeded: too_many_formula_calculation_edits,
+            };
+        }
+        return plan_workbook_formula_recalculation(
+            meta?.sheets ?? [],
+            formula_calculation_edits,
+            { impact: dependency_formula_impact },
+        );
+    }, [
+        dependency_formula_impact,
+        formula_calculation_edits,
+        formula_calculation_edit_signature,
+        has_formula_work,
+        meta?.sheets.length,
+        too_many_formula_calculation_edits,
+    ]);
+    const formula_impact = formula_calculation_plan.impact;
+    const formula_calculation_targets = formula_calculation_plan.targets;
+    const [source_formula_calculation, set_source_formula_calculation] = useState<{
+        readonly graphKey: string;
+        readonly bySheet: readonly ReadonlyMap<string, string>[];
+    }>();
+    const [edit_formula_calculation, set_edit_formula_calculation] = useState<{
+        readonly key: string;
+        readonly bySheet: readonly ReadonlyMap<string, string>[];
+    }>();
+    useEffect(() => {
+        set_source_formula_calculation((current) => current?.graphKey === formula_graph_key
+            ? current
+            : undefined);
+        set_edit_formula_calculation(undefined);
+    }, [formula_graph_key]);
+    const source_formulas_ready = source_pending_formula_targets.length === 0
+        || source_formula_calculation?.graphKey === formula_graph_key;
+    const formula_calculation_sequence_ref = useRef(0);
+    const active_formula_calculation_ref = useRef<{
+        readonly requestId: string;
+        readonly key: string;
+        readonly kind: 'source' | 'edit';
+    }>();
+    useEffect(() => {
+        const kind = source_formulas_ready ? 'edit' : 'source';
+        const targets = kind === 'source'
+            ? source_pending_formula_targets
+            : formula_calculation_targets;
+        const edits = kind === 'source' ? [] : formula_calculation_edits;
+        if (targets.length === 0) {
+            active_formula_calculation_ref.current = undefined;
+            if (kind === 'edit') set_edit_formula_calculation(undefined);
+            return;
+        }
+        formula_calculation_sequence_ref.current += 1;
+        const requestId = `formula-calculation:${load_epoch}:`
+            + `${formula_calculation_sequence_ref.current}`;
+        const sourceGeneration = source_generation_ref.current;
+        active_formula_calculation_ref.current = {
+            requestId,
+            key: kind === 'source' ? formula_graph_key : formula_calculation_key,
+            kind,
+        };
+        host_bridge.postMessage({
+            type: 'requestFormulaCalculation',
+            requestId,
+            sourceGeneration,
+            edits,
+            targets,
+        });
+        return () => {
+            if (active_formula_calculation_ref.current?.requestId === requestId) {
+                host_bridge.postMessage({
+                    type: 'cancelFormulaCalculation',
+                    requestId,
+                    sourceGeneration,
+                });
+                active_formula_calculation_ref.current = undefined;
+            }
+        };
+    }, [
+        formula_calculation_key,
+        formula_calculation_targets,
+        formula_calculation_edits,
+        load_epoch,
+        source_formulas_ready,
+        source_pending_formula_targets,
+    ]);
+    useEffect(() => {
+        const on_message = (event: MessageEvent) => {
+            const msg = event.data as HostMessage;
+            if (msg.type !== 'formulaCalculation') return;
+            const active = active_formula_calculation_ref.current;
+            if (!active || active.requestId !== msg.requestId) return;
+            if (msg.sourceGeneration !== source_generation_ref.current) return;
+            const bySheet = (meta?.sheets ?? []).map(() => new Map<string, string>());
+            for (const result of msg.results) {
+                const sheet = bySheet[result.sheetIndex];
+                if (!sheet) continue;
+                sheet.set(`${result.row}:${result.column}`, displayed_formula_result(result));
+            }
+            if (active.kind === 'source') {
+                set_source_formula_calculation({
+                    graphKey: active.key,
+                    bySheet,
+                });
+            } else {
+                set_edit_formula_calculation({ key: active.key, bySheet });
+            }
+            if (active_formula_calculation_ref.current?.requestId === msg.requestId) {
+                active_formula_calculation_ref.current = undefined;
+            }
+        };
+        window.addEventListener('message', on_message);
+        return () => window.removeEventListener('message', on_message);
+    }, [formula_graph_key, meta?.sheets]);
+    const active_source_formula_results = source_formula_calculation?.graphKey
+        === formula_graph_key
+        ? source_formula_calculation.bySheet[active_sheet_index]
+        : undefined;
+    const active_formula_results = edit_formula_calculation?.key === formula_calculation_key
+        ? edit_formula_calculation.bySheet[active_sheet_index]
+        : undefined;
     const mapping_generations_ref = useRef<number[]>([]);
     const histogram_cache_ref = useRef(new Map<string, FilterHistogramReady>());
     const pending_histogram_ref = useRef<{
@@ -5624,6 +5816,9 @@ export function App(): React.JSX.Element {
             key={`${active_sheet_index}:${current_sheet.worksheetId ?? current_sheet.name}:${load_epoch}:${generation}`}
             sheet_meta={current_sheet}
             sheet_index={active_sheet_index}
+            pending_formula_impact={formula_impact.forSheet(active_sheet_index)}
+            formula_results={active_formula_results}
+            source_formula_results={active_source_formula_results}
             generation={generation}
             row_count={effective_row_count}
             show_formatting={show_formatting}

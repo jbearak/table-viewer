@@ -6,10 +6,21 @@ export const MAX_SHEET_ROWS = 1_000_000;
 export const MAX_SHEET_COLUMNS = 256;
 export const MAX_SHEET_MERGES = 10_000;
 export const MAX_WORKBOOK_CELLS = 50_000_000;
+export const MAX_WORKBOOK_FORMULAS = 100_000;
+export const MAX_WORKBOOK_FORMULA_REFERENCES = 1_000_000;
+export const MAX_WORKBOOK_FORMULA_RANGES = 100_000;
+/** Excel formula body limit, excluding the normalized leading equals sign. */
+export const MAX_XLSX_FORMULA_CHARACTERS = 8_192;
+// Covers UTF-8 plus the standard/numeric XML entity spellings with margin,
+// while bounding allocation before worksheet formula text is decoded.
+export const MAX_XLSX_FORMULA_XML_BYTES = MAX_XLSX_FORMULA_CHARACTERS * 8;
 export const MAX_CSV_ROWS = 1_000_000;
 
 export interface WorkbookBudget {
     total_cells: number;
+    total_formulas: number;
+    total_formula_references: number;
+    total_formula_ranges: number;
 }
 
 export class FileSizeLimitExceededError extends Error {
@@ -25,7 +36,85 @@ export class FileSizeLimitExceededError extends Error {
 }
 
 export function create_workbook_budget(): WorkbookBudget {
-    return { total_cells: 0 };
+    return {
+        total_cells: 0,
+        total_formulas: 0,
+        total_formula_references: 0,
+        total_formula_ranges: 0,
+    };
+}
+
+export function assert_safe_formula_cells(
+    budget: WorkbookBudget,
+    added: number,
+): void {
+    if (
+        !Number.isSafeInteger(added)
+        || added < 0
+        || budget.total_formulas + added > MAX_WORKBOOK_FORMULAS
+    ) {
+        throw new Error(
+            'Workbook has too many formulas to calculate safely '
+            + `(max ${MAX_WORKBOOK_FORMULAS.toLocaleString()})`,
+        );
+    }
+    budget.total_formulas += added;
+}
+
+export function assert_safe_formula_references(
+    budget: WorkbookBudget,
+    added: number,
+): void {
+    if (
+        !Number.isSafeInteger(added)
+        || added < 0
+        || budget.total_formula_references + added > MAX_WORKBOOK_FORMULA_REFERENCES
+    ) {
+        throw new Error(
+            'Workbook has too many formula references to open safely '
+            + `(max ${MAX_WORKBOOK_FORMULA_REFERENCES.toLocaleString()})`,
+        );
+    }
+    budget.total_formula_references += added;
+}
+
+export function assert_safe_formula_ranges(
+    budget: WorkbookBudget,
+    added: number,
+): void {
+    if (
+        !Number.isSafeInteger(added)
+        || added < 0
+        || budget.total_formula_ranges + added > MAX_WORKBOOK_FORMULA_RANGES
+    ) {
+        throw new Error(
+            'Workbook has too many formula ranges to index safely '
+            + `(max ${MAX_WORKBOOK_FORMULA_RANGES.toLocaleString()})`,
+        );
+    }
+    budget.total_formula_ranges += added;
+}
+
+/** Reject formula text that Excel cannot represent before dependency parsing. */
+export function assert_safe_xlsx_formula_text(value: string): void {
+    const body_length = value.startsWith('=') ? value.length - 1 : value.length;
+    if (body_length > MAX_XLSX_FORMULA_CHARACTERS) {
+        throw new Error(
+            'Formula exceeds Excel\'s maximum length '
+            + `(${MAX_XLSX_FORMULA_CHARACTERS.toLocaleString()} characters)`,
+        );
+    }
+}
+
+/** Bound hostile entity-heavy formula markup before UTF-8/XML expansion. */
+export function assert_safe_xlsx_formula_xml_bytes(byte_length: number): void {
+    if (
+        !Number.isSafeInteger(byte_length)
+        || byte_length < 0
+        || byte_length > MAX_XLSX_FORMULA_XML_BYTES
+    ) {
+        throw new Error('Formula XML encoding exceeds the safe length limit');
+    }
 }
 
 export function assert_safe_file_size(size: number, max_mib?: number): void {

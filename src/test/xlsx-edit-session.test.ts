@@ -212,6 +212,32 @@ describe('xlsx edit sessions', () => {
         };
     }
 
+    function with_shared_formula_follower(raw: Uint8Array): Uint8Array {
+        const file = CFB.read(raw, { type: 'buffer' });
+        const sheet = CFB.find(file, '/xl/worksheets/sheet2.xml')!;
+        const before = Buffer.from(sheet.content as Uint8Array).toString('utf8');
+        const patched_text = before
+            .replace(
+                /<c r="A2"[^>]*(?:\/>|>[\s\S]*?<\/c>)/,
+                '<c r="A2"><f t="shared" ref="A2:A3" si="0">B2*2</f><v>1</v></c>',
+            )
+            .replace(
+                /<c r="A3"[^>]*(?:\/>|>[\s\S]*?<\/c>)/,
+                '<c r="A3"><f t="shared" si="0"/><v>2</v></c>',
+            );
+        expect(patched_text).toContain(
+            '<f t="shared" ref="A2:A3" si="0">B2*2</f>',
+        );
+        expect(patched_text).toContain('<c r="A3"><f t="shared" si="0"/><v>2</v></c>');
+        const patched = Buffer.from(patched_text, 'utf8');
+        sheet.content = patched;
+        sheet.size = patched.length;
+        const written = CFB.write(file, { type: 'buffer', fileType: 'zip', compression: true });
+        return written instanceof Uint8Array
+            ? written
+            : new Uint8Array(written as ArrayBufferLike);
+    }
+
     function workbook_request(
         session: string,
         request_id: string,
@@ -445,6 +471,41 @@ describe('xlsx edit sessions', () => {
                 { text: 'bold', style: { bold: true } },
             ],
         });
+    });
+
+    it('admits formula-shaped rich text under the writer\'s text rules', async () => {
+        const panel = await open_ready_xlsx(file_path);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 0 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+        const value = `=${'x'.repeat(8_193)}`;
+
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: {
+                editSessionId: session,
+                saveRequestId: 'save-formula-shaped-rich-text',
+                worksheets: [{
+                    sheetIndex: 0,
+                    sheetName: 'People',
+                    worksheetId: '1',
+                    edits: { '1:0': value },
+                    dirtyEdits: {
+                        '1:0': {
+                            value,
+                            base: 'Alice',
+                            valueRuns: {
+                                runs: [{ text: value, style: { bold: true } }],
+                            },
+                        },
+                    },
+                }],
+            },
+        });
+        await wait_for_observable(() => save_results(panel).length > 0);
+
+        expect(save_results(panel).at(-1)).toMatchObject({ success: true });
+        const after = await parse_xlsx(bytes);
+        expect(after.data.sheets[0].rows[1][0]).toMatchObject({ raw: value });
     });
 
     it('writes a hyperlink-only edit without rewriting the cell', async () => {
@@ -1069,7 +1130,7 @@ describe('xlsx edit sessions', () => {
         await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 1 });
         const session = latest_edit_session(panel)!.editSessionId!;
         const base = String(
-            (await parse_xlsx(bytes)).data.sheets[1].rows[1][0]?.raw ?? '',
+            (await parse_xlsx(bytes)).data.sheets[1].rows[1][0]?.formula ?? '',
         );
 
         await panel.__receive({
@@ -1093,6 +1154,120 @@ describe('xlsx edit sessions', () => {
         expect(save_results(panel).at(-1)).toMatchObject({ success: false });
         expect(save_results(panel).at(-1)).not.toHaveProperty('rejection');
         expect(bytes).toBe(untouched);
+    });
+
+    it('refuses a literal over a shared-formula follower without modifying the file', async () => {
+        bytes = with_shared_formula_follower(read_fixture('basic.xlsx'));
+        const untouched = bytes;
+
+        const panel = await open_ready_xlsx(file_path);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 1 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+        const base = String(
+            (await parse_xlsx(bytes)).data.sheets[1].rows[2][0]?.formula ?? '',
+        );
+
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: {
+                editSessionId: session,
+                saveRequestId: 'save-shared-follower',
+                worksheets: [{
+                    sheetIndex: 1,
+                    sheetName: 'Inventory',
+                    worksheetId: '2',
+                    edits: { '2:0': 'Gadget' },
+                    dirtyEdits: { '2:0': { value: 'Gadget', base } },
+                }],
+            },
+        });
+        await wait_for_observable(() => save_results(panel).length > 0);
+
+        expect(save_results(panel).at(-1)).toMatchObject({ success: false });
+        expect(bytes).toBe(untouched);
+    });
+
+    it('saves a formula edit over a shared-formula follower', async () => {
+        bytes = with_shared_formula_follower(read_fixture('basic.xlsx'));
+        const panel = await open_ready_xlsx(file_path);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 1 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+        const base = String(
+            (await parse_xlsx(bytes)).data.sheets[1].rows[2][0]?.formula ?? '',
+        );
+        expect(base).toBe('=B3*2');
+
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: {
+                editSessionId: session,
+                saveRequestId: 'save-shared-formula-edit',
+                worksheets: [{
+                    sheetIndex: 1,
+                    sheetName: 'Inventory',
+                    worksheetId: '2',
+                    edits: { '2:0': '=B3*3' },
+                    dirtyEdits: { '2:0': { value: '=B3*3', base } },
+                }],
+            },
+        });
+        await wait_for_observable(() => save_results(panel).length > 0);
+
+        expect(save_results(panel).at(-1)).toMatchObject({ success: true });
+        const saved = CFB.read(bytes, { type: 'buffer' });
+        const saved_sheet = Buffer.from(
+            CFB.find(saved, '/xl/worksheets/sheet2.xml')!.content as Uint8Array,
+        ).toString('utf8');
+        expect(saved_sheet).toContain('<c r="A3"><f>B3*3</f><v>73.5</v></c>');
+        expect(saved_sheet).toContain(
+            '<f t="shared" ref="A2:A3" si="0">B2*2</f>',
+        );
+        expect((await parse_xlsx(bytes)).data.sheets[1].rows[2][0])
+            .toMatchObject({
+                formula: '=B3*3',
+                raw: 73.5,
+                formatted: '73.5',
+            });
+    });
+
+    it('recalculates and reopens the garden-cafe shelf value after a price edit', async () => {
+        bytes = fs.readFileSync(path.join(
+            __dirname,
+            '..',
+            '..',
+            'docs',
+            'examples',
+            'garden-cafe-sample.xlsx',
+        ));
+        const panel = await open_ready_xlsx(file_path);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 4 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: {
+                editSessionId: session,
+                saveRequestId: 'garden-cafe-price-edit',
+                worksheets: [{
+                    sheetIndex: 4,
+                    sheetName: 'Berry Corner',
+                    worksheetId: '5',
+                    edits: { '2:5': '5.24' },
+                    dirtyEdits: { '2:5': { value: '5.24', base: '5.25' } },
+                }],
+            },
+        });
+        await wait_for_observable(() => save_results(panel).length > 0);
+
+        expect(save_results(panel).at(-1)).toMatchObject({ success: true });
+        const reopened = (await parse_xlsx(bytes)).data.sheets[4];
+        expect(reopened.rows[2][4]?.raw).toBe(9);
+        expect(reopened.rows[2][5]?.raw).toBe(5.24);
+        expect(reopened.rows[2][8]).toMatchObject({
+            formula: '=E3*F3',
+            raw: 47.16,
+            formatted: '$47.16',
+        });
     });
 
     it('refuses a save whose base no longer matches the cell', async () => {

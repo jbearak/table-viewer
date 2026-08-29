@@ -23,7 +23,7 @@ function file_path_of(resource: ResourceUriLike): string {
 export const node_file_system_port: FileSystemPort = {
     async stat(resource) {
         const stat = await fs.promises.stat(file_path_of(resource));
-        return { size: stat.size, mtime: stat.mtimeMs };
+        return { size: stat.size, mtime: stat.mtime.getTime() };
     },
     read_file(resource) {
         return fs.promises.readFile(file_path_of(resource));

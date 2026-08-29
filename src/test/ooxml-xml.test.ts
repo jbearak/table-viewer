@@ -1,6 +1,12 @@
 import { describe, it, expect } from 'vitest';
 import { get_attr, remove_attr } from '../ooxml-xml';
-import { find_first_element, scan_rows } from '../ooxml-worksheet-scan';
+import {
+    find_first_element,
+    ignorable_end,
+    ignorable_ranges,
+    scan_cells,
+    scan_rows,
+} from '../ooxml-worksheet-scan';
 
 describe('get_attr', () => {
     it('reads a double-quoted attribute', () => {
@@ -45,6 +51,68 @@ describe('remove_attr', () => {
 
 
 describe('worksheet element bounds', () => {
+    it('keeps repeated unterminated child lookups inside each cell span', () => {
+        const count = 10_000;
+        const cases = [
+            { fragment: '<f></c>', finalClose: '</f>' },
+            { fragment: '<!--<f></c>', finalClose: '-->' },
+            { fragment: '<![CDATA[<f></c>', finalClose: ']]>' },
+            { fragment: '<?<f></c>', finalClose: '?>' },
+        ];
+
+        for (const { fragment, finalClose } of cases) {
+            const xml = Buffer.from(fragment.repeat(count) + finalClose, 'utf8');
+            for (let index = 0; index < count; index += 1) {
+                const start = index * fragment.length;
+                expect(find_first_element(xml, 'f', start, start + fragment.length)).toBeNull();
+            }
+        }
+    });
+
+    it('keeps repeated row and cell scans inside their requested spans', () => {
+        const count = 10_000;
+        const rowCases = [
+            { fragment: '<x/>', finalClose: '<row r="1"/>' },
+            { fragment: '<row r="1"', finalClose: '>' },
+            { fragment: '<row r="1">', finalClose: '</row>' },
+        ];
+        for (const { fragment, finalClose } of rowCases) {
+            const xml = Buffer.from(fragment.repeat(count) + finalClose, 'utf8');
+            for (let index = 0; index < count; index += 1) {
+                const start = index * fragment.length;
+                expect(scan_rows(xml, start, start + fragment.length).size).toBe(0);
+            }
+        }
+
+        const cellFragment = '<c r="A1"';
+        const cells = Buffer.from(cellFragment.repeat(count) + '>', 'utf8');
+        for (let index = 0; index < count; index += 1) {
+            const start = index * cellFragment.length;
+            expect(scan_cells(cells, start, start + cellFragment.length).size).toBe(0);
+        }
+    });
+
+    it('retains ranges rather than opener-shaped text inside CDATA', () => {
+        const nestedOpeners = '<![CDATA['.repeat(100_000);
+        const xml = Buffer.from(`<![CDATA[${nestedOpeners}]]><f>1</f>`, 'utf8');
+        const close = xml.indexOf(']]>') + 3;
+
+        const ranges = ignorable_ranges(xml, 0, xml.length);
+        expect(ranges.length).toBe(1);
+        expect(ignorable_end(ranges, 0)).toBe(close);
+        expect(find_first_element(xml, 'f')).toMatchObject({ start: close });
+    });
+
+    it('coalesces dense adjacent ignored ranges', () => {
+        const comments = '<!---->'.repeat(100_000);
+        const xml = Buffer.from(`${comments}<f>1</f>`, 'utf8');
+        const ranges = ignorable_ranges(xml, 0, xml.length);
+
+        expect(ranges.length).toBe(1);
+        expect(ignorable_end(ranges, 0)).toBe(comments.length);
+        expect(find_first_element(xml, 'f')).toMatchObject({ start: comments.length });
+    });
+
     it('does not scan a row that closes beyond sheetData', () => {
         const source = '<worksheet><sheetData><row r="1"></sheetData>'
             + '<c r="A1"><v>outside</v></c></row></worksheet>';

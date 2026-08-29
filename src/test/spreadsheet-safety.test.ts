@@ -2,6 +2,11 @@ import { describe, it, expect } from 'vitest';
 import CFB from 'cfb';
 import { parse_xlsx } from '../parse-xlsx';
 import {
+    assert_safe_formula_cells,
+    assert_safe_formula_ranges,
+    assert_safe_formula_references,
+    assert_safe_xlsx_formula_text,
+    assert_safe_xlsx_formula_xml_bytes,
     assert_safe_file_size,
     assert_safe_sheet_shape,
     create_workbook_budget,
@@ -12,6 +17,11 @@ import {
     MAX_SHEET_ROWS,
     MAX_WORKBOOK_SHEETS,
     MAX_WORKBOOK_CELLS,
+    MAX_WORKBOOK_FORMULAS,
+    MAX_WORKBOOK_FORMULA_REFERENCES,
+    MAX_WORKBOOK_FORMULA_RANGES,
+    MAX_XLSX_FORMULA_CHARACTERS,
+    MAX_XLSX_FORMULA_XML_BYTES,
     MAX_CSV_ROWS,
     assert_safe_sheet_count,
 } from '../spreadsheet-safety';
@@ -133,6 +143,43 @@ describe('spreadsheet safety limits', () => {
         expect(() =>
             assert_safe_sheet_shape(budget, 1, 1, 0)
         ).toThrow('Workbook is too large to render safely');
+    });
+
+    it('bounds formula references across all worksheets', () => {
+        const budget = create_workbook_budget();
+        assert_safe_formula_references(budget, MAX_WORKBOOK_FORMULA_REFERENCES);
+        expect(() => assert_safe_formula_references(budget, 1))
+            .toThrow('Workbook has too many formula references to open safely');
+    });
+
+    it('bounds indexed formula ranges across all worksheets', () => {
+        const budget = create_workbook_budget();
+        assert_safe_formula_ranges(budget, MAX_WORKBOOK_FORMULA_RANGES);
+        expect(() => assert_safe_formula_ranges(budget, 1))
+            .toThrow('Workbook has too many formula ranges to index safely');
+    });
+
+    it('bounds formulas whose expressions contain no references', () => {
+        const budget = create_workbook_budget();
+        assert_safe_formula_cells(budget, MAX_WORKBOOK_FORMULAS);
+        expect(() => assert_safe_formula_cells(budget, 1))
+            .toThrow('Workbook has too many formulas to calculate safely');
+    });
+
+    it('bounds each XLSX formula before dependency parsing', () => {
+        expect(() => assert_safe_xlsx_formula_text(
+            `=${'1'.repeat(MAX_XLSX_FORMULA_CHARACTERS)}`,
+        )).not.toThrow();
+        expect(() => assert_safe_xlsx_formula_text(
+            `=${'1'.repeat(MAX_XLSX_FORMULA_CHARACTERS + 1)}`,
+        )).toThrow('Formula exceeds Excel\'s maximum length');
+    });
+
+    it('bounds formula XML before UTF-8 and entity decoding', () => {
+        expect(() => assert_safe_xlsx_formula_xml_bytes(MAX_XLSX_FORMULA_XML_BYTES))
+            .not.toThrow();
+        expect(() => assert_safe_xlsx_formula_xml_bytes(MAX_XLSX_FORMULA_XML_BYTES + 1))
+            .toThrow('Formula XML encoding exceeds the safe length limit');
     });
 
     it('assert_safe_sheet_shape passes for a 1,000,000-row sheet', () => {

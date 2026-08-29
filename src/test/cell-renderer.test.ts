@@ -162,6 +162,117 @@ describe('build_grid_cell — edit overlay (CSV edit mode)', () => {
         expect((c as { allowOverlay: boolean }).allowOverlay).toBe(true);
     });
 
+    it('opens a formula cell with its formula while displaying its result', () => {
+        const formula_cell = {
+            ...rc('58.5'),
+            formula: '=E5*F5',
+        } as RenderedCell & { formula: string };
+        const c = build_grid_cell(0, [formula_cell], true, { editable: true });
+
+        expect(c).toMatchObject({
+            data: '=E5*F5',
+            displayData: '58.5',
+            allowOverlay: true,
+        });
+    });
+
+    it('shows unknown for a formula with no cached result and still edits the formula', () => {
+        const formula_cell = {
+            ...rc('=A1*2'),
+            formatted: '??',
+            formula: '=A1*2',
+            formulaResultPending: true,
+        } as RenderedCell;
+
+        expect(build_grid_cell(0, [formula_cell], true)).toMatchObject({
+            data: '=A1*2',
+            displayData: '??',
+        });
+        expect(build_grid_cell(0, [formula_cell], false, { editable: true }))
+            .toMatchObject({
+                data: '=A1*2',
+                displayData: '??',
+                allowOverlay: true,
+            });
+    });
+
+    it('shows an unknown result after editing an existing formula', () => {
+        const formula_cell: RenderedCell = {
+            ...rc('58.5'),
+            formatted: '$58.50',
+            rawType: 'number',
+            formula: '=E5*F5',
+        };
+        const c = build_grid_cell(0, [formula_cell], true, {
+            editable: true,
+            dirty_value: '=E5*F5+1',
+            edit_value: '=E5*F5+1',
+            formula_result_pending: true,
+        }) as unknown as {
+            kind: unknown;
+            data: { edit_value?: string; lines: unknown[] };
+            copyData: string;
+        };
+
+        expect(c.kind).toBe(GridCellKind.Custom);
+        expect(c.data.lines).toEqual([[
+            { text: '$58.50', style: { strikethrough: true }, diff_color: 'red' },
+            { text: ' → ' },
+            { text: '??', diff_color: 'green' },
+        ]]);
+        expect(c.data.edit_value).toBe('=E5*F5+1');
+        expect(c.copyData).toBe('=E5*F5+1');
+    });
+
+    it('shows an unknown result after changing a literal cell to a formula', () => {
+        const c = build_grid_cell(0, [rc('12')], true, {
+            editable: true,
+            dirty_value: '=A1*2',
+            edit_value: '=A1*2',
+            formula_result_pending: true,
+        }) as unknown as { kind: unknown; data: { lines: unknown[] } };
+
+        expect(c.kind).toBe(GridCellKind.Custom);
+        expect(c.data.lines).toEqual([[
+            { text: '12', style: { strikethrough: true }, diff_color: 'red' },
+            { text: ' → ' },
+            { text: '??', diff_color: 'green' },
+        ]]);
+    });
+
+    it('shows calculated results and specific calculation failures', () => {
+        const formula_cell: RenderedCell = {
+            ...rc('4'),
+            formatted: '$4.00',
+            rawType: 'number',
+            formula: '=A1*2',
+        };
+        const calculated = build_grid_cell(0, [formula_cell], true, {
+            dirty_value: '=A1*3',
+            formula_result: '$6.00',
+        }) as unknown as { data: { lines: Array<Array<{ text: string }>> } };
+        expect(calculated.data.lines.flat().map((part) => part.text).join(''))
+            .toBe('$4.00 → $6.00');
+
+        const unsupported = build_grid_cell(0, [formula_cell], false, {
+            formula_result: '?? (unsupported function)',
+        }) as unknown as { data: { lines: Array<Array<{ text: string }>> } };
+        expect(unsupported.data.lines.flat().map((part) => part.text).join(''))
+            .toBe('4 → ?? (unsupported function)');
+
+        const reopened = build_grid_cell(0, [{
+            ...formula_cell,
+            raw: '=MEDIAN(A1:A2)',
+            formatted: '??',
+            formula: '=MEDIAN(A1:A2)',
+            formulaResultPending: true,
+        }], false, {
+            formula_result: '?? (unsupported function)',
+        }) as unknown as { data: { lines: Array<Array<{ text: string }>> } };
+        expect(reopened.data.lines.flat().map((part) => part.text).join(''))
+            .toBe('?? (unsupported function)');
+    });
+
     it('stays read-only (allowOverlay false) with no overlay', () => {
         const c = build_grid_cell(1, plain_rows, true);
         expect((c as { allowOverlay: boolean }).allowOverlay).toBe(false);

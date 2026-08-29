@@ -10,6 +10,7 @@ import {
     cleared_display_texts,
 } from '../xlsx-hyperlink-write';
 import type { WorksheetEditRequest, WorksheetEditResult } from './types';
+import { is_xlsx_formula_text } from '../xlsx-formula';
 
 /**
  * Apply cell and hyperlink changes to one worksheet part without knowing about
@@ -70,10 +71,19 @@ export function apply_worksheet_edits(request: WorksheetEditRequest): WorksheetE
         relationships_xml = result.rels_xml;
     }
 
+    const formula_removed = cell_edits.length > 0
+        && formula_count(worksheet_xml) < formula_count(request.worksheet_xml);
     return {
         worksheet_xml,
         relationships_xml,
-        formula_removed: cell_edits.length > 0
-            && formula_count(worksheet_xml) < formula_count(request.worksheet_xml),
+        formula_removed,
+        calculation_chain_stale: cell_edits.length > 0 && (
+            formula_removed
+            || cell_edits.some((edit) => (
+                edit.force_text !== true
+                && edit.runs === undefined
+                && is_xlsx_formula_text(edit.value)
+            ))
+        ),
     };
 }

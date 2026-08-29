@@ -12,6 +12,113 @@ function make_session_ref(initial?: string) {
 }
 
 describe('edit session registry', () => {
+    it('publishes mutations from inactive worksheet stores through one revision', () => {
+        const { registry } = make_session_ref('session');
+        const revisions: number[] = [];
+        const unsubscribe = registry.subscribe(() => revisions.push(registry.revision()));
+
+        registry.for_sheet(1).commit('session', '4:2', { value: 'changed', base: 'old' });
+        registry.for_sheet(0).commit('session', '0:0', { value: 'front', base: 'back' });
+        unsubscribe();
+
+        expect(revisions).toEqual([1, 2]);
+    });
+
+    it('updates formula inputs incrementally without revisiting unchanged dirty cells', () => {
+        const { registry } = make_session_ref('session');
+        const store = registry.for_sheet(0);
+        store.commit('session', '4:2', { value: 'first', base: 'old' });
+        const first = registry.formula_projection();
+
+        expect(first.edits).toEqual([{
+            sheetIndex: 0,
+            row: 4,
+            column: 2,
+            value: 'first',
+            writesFormula: false,
+        }]);
+        store.commit('session', '4:2', { value: '=1', base: 'old' });
+        const second = registry.formula_projection();
+
+        expect(second.edits).not.toBe(first.edits);
+        expect(second.coordinateRevision).toBe(first.coordinateRevision);
+        expect(second.calculationRevision).toBeGreaterThan(first.calculationRevision);
+        expect(second.hasFormulaEdits).toBe(true);
+        expect(second.edits).toEqual([{
+            sheetIndex: 0,
+            row: 4,
+            column: 2,
+            value: '=1',
+            writesFormula: true,
+        }]);
+    });
+
+    it('keeps an earlier formula projection stable after a later edit', () => {
+        const { registry } = make_session_ref('session');
+        const store = registry.for_sheet(0);
+        store.commit('session', '4:2', { value: 'first', base: 'old' });
+        const first = registry.formula_projection();
+
+        store.commit('session', '4:2', { value: 'second', base: 'old' });
+
+        expect(first.edits).toEqual([{
+            sheetIndex: 0,
+            row: 4,
+            column: 2,
+            value: 'first',
+            writesFormula: false,
+        }]);
+    });
+
+    it('classifies formula-shaped rich text by the eventual writer rule', () => {
+        const { registry } = make_session_ref('session');
+        registry.for_sheet(0).commit('session', '0:0', {
+            value: '=1+1',
+            base: 'old',
+            valueRuns: { runs: [{ text: '=1+1', style: { bold: true } }] },
+        });
+
+        expect(registry.formula_projection()).toMatchObject({
+            hasFormulaEdits: false,
+            edits: [{ value: '=1+1', writesFormula: false }],
+        });
+    });
+
+    it('advances rich value inputs but ignores hyperlink-only writes', () => {
+        const { registry } = make_session_ref('session');
+        const store = registry.for_sheet(0);
+        store.commit('session', '0:0', { value: 'changed', base: 'old' });
+        const before = registry.formula_projection();
+
+        store.commit('session', '1:0', {
+            value: 'same',
+            base: 'same',
+            valueRuns: { runs: [{ text: 'same', style: { bold: true } }] },
+        });
+        const after_runs = registry.formula_projection();
+        expect(after_runs.coordinateRevision).toBeGreaterThan(before.coordinateRevision);
+        expect(after_runs.calculationRevision).toBeGreaterThan(before.calculationRevision);
+        expect(after_runs.edits[1]).toMatchObject({
+            sheetIndex: 0,
+            row: 1,
+            column: 0,
+            value: 'same',
+            runs: [{ text: 'same', style: { bold: true } }],
+        });
+
+        store.commit('session', '2:0', {
+            value: 'same',
+            base: 'same',
+            link: { kind: 'external', target: 'https://example.com' },
+            baseLink: null,
+        });
+        const after = registry.formula_projection();
+
+        expect(after.coordinateRevision).toBe(after_runs.coordinateRevision);
+        expect(after.calculationRevision).toBe(after_runs.calculationRevision);
+        expect(after.edits).toEqual(after_runs.edits);
+    });
+
     it('returns the same store for the same sheet across calls', () => {
         const { registry } = make_session_ref('session');
 

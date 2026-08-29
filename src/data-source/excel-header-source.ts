@@ -2,6 +2,8 @@ import type {
     ColumnWindow,
     DataSource,
     ExcelHeaderOverride,
+    PackedFormulaDependencies,
+    PackedPendingFormulaCells,
     IndexedRows,
     RenderedCell,
     RowWindow,
@@ -48,6 +50,9 @@ export interface ExcelHeaderPlanningSheet {
     readonly columnCount: number;
     readonly merges: readonly Readonly<MergeRange>[];
     readonly hasFormatting: boolean;
+    readonly formulaDependencies?: PackedFormulaDependencies;
+    readonly formulaCells?: SheetMeta['formulaCells'];
+    readonly pendingFormulaCells?: PackedPendingFormulaCells;
     readonly columnNames: readonly string[];
     readonly manualColumnNames?: readonly string[];
     readonly manualHeaderRow?: number;
@@ -219,6 +224,9 @@ export class ExcelHeaderDataSource implements DataSource {
                         sheet.physical.merges.map((merge) => Object.freeze({ ...merge })),
                     ),
                     hasFormatting: sheet.physical.hasFormatting,
+                    formulaDependencies: sheet.physical.formulaDependencies,
+                    formulaCells: sheet.physical.formulaCells,
+                    pendingFormulaCells: sheet.physical.pendingFormulaCells,
                     columnNames: Object.freeze([...sheet.firstRowColumnNames]),
                     manualColumnNames: Object.freeze([...(selected
                         ? selected.columnNames
@@ -342,6 +350,59 @@ export class ExcelHeaderDataSource implements DataSource {
                 after_count,
                 column_indices,
             ).rows.slice(0, after_count));
+        }
+        return { startRow: start, rows };
+    }
+
+    read_canonical_columns(
+        sheet_index: number,
+        start_source_row: number,
+        count: number,
+        column_indices: readonly number[],
+    ): ColumnWindow {
+        if (!this.sheets[sheet_index]) {
+            throw new RangeError(
+                `sheet index ${sheet_index} out of range (${this.sheets.length} sheets)`,
+            );
+        }
+        if (this.base.read_canonical_columns) {
+            return this.base.read_canonical_columns(
+                sheet_index,
+                start_source_row,
+                count,
+                column_indices,
+            );
+        }
+        const source_row_count = this.base.meta().sheets[sheet_index].sourceRowCount;
+        const start = Math.max(0, Math.min(start_source_row, source_row_count));
+        const available = Math.min(Math.max(0, count), source_row_count - start);
+        const projected_rows = Array.from({ length: available }, (_, offset) => {
+            const source_row = start + offset;
+            const projected = projected_row_for_source(this.base, sheet_index, source_row);
+            if (projected === undefined) {
+                throw new Error(
+                    `canonical source row ${source_row} is excluded by the underlying projection`,
+                );
+            }
+            return projected;
+        });
+        const rows: (RenderedCell | null)[][] = [];
+        for (let position = 0; position < projected_rows.length;) {
+            const projected_start = projected_rows[position];
+            let run_length = 1;
+            while (
+                position + run_length < projected_rows.length
+                && projected_rows[position + run_length] === projected_start + run_length
+            ) run_length += 1;
+            const window = read_source_columns(
+                this.base,
+                sheet_index,
+                projected_start,
+                run_length,
+                column_indices,
+            );
+            rows.push(...window.rows.slice(0, run_length));
+            position += run_length;
         }
         return { startRow: start, rows };
     }
@@ -477,6 +538,9 @@ function project_sheet(
         columnCount: sheet.physical.columnCount,
         merges: sheet.physical.merges,
         hasFormatting: sheet.physical.hasFormatting,
+        formulaDependencies: sheet.physical.formulaDependencies,
+        formulaCells: sheet.physical.formulaCells,
+        pendingFormulaCells: sheet.physical.pendingFormulaCells,
         columnNames: sheet.firstRowColumnNames,
         manualColumnNames: sheet.manualColumnNames,
         manualHeaderRow: sheet.manualHeaderRow,
@@ -523,6 +587,13 @@ export function project_excel_header_sheet(
             ? project_header_merges(sheet.merges, header_row)
             : sheet.merges.map((merge) => ({ ...merge })),
         hasFormatting: sheet.hasFormatting,
+        ...(sheet.formulaDependencies?.length
+            ? { formulaDependencies: sheet.formulaDependencies }
+            : {}),
+        ...(sheet.formulaCells?.length ? { formulaCells: sheet.formulaCells } : {}),
+        ...(sheet.pendingFormulaCells?.length
+            ? { pendingFormulaCells: sheet.pendingFormulaCells }
+            : {}),
         columnNames: active ? [...column_names] : undefined,
         excelFirstRowHeader: {
             mode: override ?? 'auto',

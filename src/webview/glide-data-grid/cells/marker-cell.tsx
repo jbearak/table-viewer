@@ -4,7 +4,7 @@ import { drawCheckbox } from "../internal/data-grid/render/draw-checkbox.js";
 import type { BaseDrawArgs, InternalCellRenderer, PrepResult } from "./cell-types.js";
 
 export const markerCellRenderer: InternalCellRenderer<MarkerCell> = {
-    getAccessibilityString: c => c.row.toString(),
+    getAccessibilityString: c => c.row?.toString() ?? "",
     kind: InnerGridCellKind.Marker,
     needsHover: true,
     needsHoverPosition: false,
@@ -50,7 +50,7 @@ function deprepMarkerRowCell(args: Pick<BaseDrawArgs, "ctx">) {
 
 function drawMarkerRowCell(
     args: BaseDrawArgs,
-    index: number,
+    index: number | undefined,
     checked: boolean,
     markerKind: "checkbox" | "both" | "number" | "checkbox-visible",
     drawHandle: boolean,
@@ -92,7 +92,7 @@ function drawMarkerRowCell(
         }
         ctx.globalAlpha = 1;
     }
-    if (markerKind === "number" || (markerKind === "both" && !checked)) {
+    if (index !== undefined && (markerKind === "number" || (markerKind === "both" && !checked))) {
         const text = index.toString();
         const fontStyle = theme.markerFontFull;
 

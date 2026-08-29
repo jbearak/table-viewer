@@ -482,9 +482,9 @@ describe('parse_xlsx rich text and hyperlinks', () => {
     });
 
     it('does not overwrite a formula cell that has no cached value', async () => {
-        // `<f>` with no `<v>` has no text of its own, but it is still a `<c>`, so
-        // the reader never showed the display — and promoting would replace a
-        // live formula with a literal.
+        // `<f>` with no `<v>` displays an unknown result, but it is still a `<c>`.
+        // Promoting the hyperlink label into it would replace a live formula with
+        // a literal.
         const sheet = worksheet(`<sheetData><row r="2"><c r="B2"><f>1+1</f></c></row></sheetData>
         <hyperlinks><hyperlink ref="B2" location="Sheet2!A1" display="Go there"/></hyperlinks>`);
         const raw = build_xlsx({ sheet_xml: sheet });

@@ -398,6 +398,156 @@ afterEach(() => {
 });
 
 describe('GridShell cell wrapping', () => {
+    it('shows physical Excel row numbers after header promotion and row reordering', async () => {
+        grid_mock.source_row_for_display = (display_row: number) => [8, 1, 4][display_row];
+        await render_grid(props({
+            sheet_meta: {
+                ...props().sheet_meta,
+                rowCount: 3,
+                sourceRowCount: 100_001,
+                excelFirstRowHeader: {
+                    mode: 'on',
+                    detected: false,
+                    active: true,
+                    available: true,
+                    sourceRow: 0,
+                },
+            },
+            row_count: 3,
+        }));
+
+        const row_markers = grid_mock.props!.rowMarkers as {
+            kind: string;
+            width: number;
+            getRowNumber(row: number): number;
+        };
+        expect(row_markers.kind).toBe('clickable-number');
+        expect(row_markers.width).toBe(48);
+        expect([0, 1, 2].map(row_markers.getRowNumber)).toEqual([9, 2, 5]);
+    });
+
+    it('keeps ordinary row markers for non-Excel sources', async () => {
+        await render_grid(props());
+
+        expect(grid_mock.props!.rowMarkers).toBe('clickable-number');
+    });
+
+    it('uses the promoted physical row while Excel row data is still loading', async () => {
+        grid_mock.source_row_for_display = () => undefined;
+        await render_grid(props({
+            sheet_meta: {
+                ...props().sheet_meta,
+                rowCount: 4,
+                sourceRowCount: 5,
+                excelFirstRowHeader: {
+                    mode: 'on',
+                    detected: false,
+                    active: true,
+                    available: true,
+                    sourceRow: 2,
+                },
+            },
+            row_count: 4,
+        }));
+
+        const get_row_number = (grid_mock.props!.rowMarkers as {
+            getRowNumber(row: number): number;
+        }).getRowNumber;
+        expect([0, 1, 2, 3].map(get_row_number)).toEqual([1, 2, 4, 5]);
+    });
+
+    it('leaves Excel row markers blank until a transformed mapping loads', async () => {
+        grid_mock.source_row_for_display = () => undefined;
+        await render_grid(props({
+            sheet_meta: {
+                ...props().sheet_meta,
+                rowCount: 3,
+                sourceRowCount: 100,
+                excelFirstRowHeader: {
+                    mode: 'on',
+                    detected: false,
+                    active: true,
+                    available: true,
+                    sourceRow: 0,
+                },
+            },
+            row_count: 3,
+            transform_state: {
+                sort: [{ colIndex: 0, direction: 'asc' }],
+                filters: [],
+            },
+        }));
+
+        const get_row_number = (grid_mock.props!.rowMarkers as {
+            getRowNumber(row: number): number | undefined;
+        }).getRowNumber;
+        expect([0, 1, 2].map(get_row_number)).toEqual([
+            undefined,
+            undefined,
+            undefined,
+        ]);
+    });
+
+    it('shows physical Excel letters over promoted column names', async () => {
+        vi.useFakeTimers();
+        const initial = props({
+            sheet_meta: {
+                ...props().sheet_meta,
+                columnNames: ['Name', 'Hidden', 'Price'],
+                excelFirstRowHeader: {
+                    mode: 'on',
+                    detected: false,
+                    active: true,
+                    available: true,
+                    sourceRow: 0,
+                },
+            },
+            column_projection: {
+                visible_to_source: [2, 0],
+                source_to_visible: [1, undefined, 0],
+                hidden_count: 1,
+            },
+        });
+        const GridShell = await render_grid(initial);
+        const on_item_hovered = grid_mock.props!.onItemHovered as
+            (args: Record<string, unknown>) => void;
+
+        await act(async () => {
+            on_item_hovered({
+                kind: 'header', location: [0, -1], buttons: 0,
+                bounds: { x: 30, y: 0, width: 120, height: 36 },
+                localEventX: 60, localEventY: 18,
+            });
+            await vi.runAllTimersAsync();
+        });
+        expect(container!.querySelector('[role="tooltip"]')?.textContent)
+            .toBe('Excel column C');
+
+        await act(async () => {
+            root!.render(React.createElement(GridShell, {
+                ...initial,
+                sheet_meta: {
+                    ...initial.sheet_meta,
+                    excelFirstRowHeader: {
+                        ...initial.sheet_meta.excelFirstRowHeader!,
+                        active: false,
+                    },
+                },
+            }));
+        });
+        const on_inactive_header_hovered = grid_mock.props!.onItemHovered as
+            (args: Record<string, unknown>) => void;
+        await act(async () => {
+            on_inactive_header_hovered({
+                kind: 'header', location: [0, -1], buttons: 0,
+                bounds: { x: 30, y: 0, width: 120, height: 36 },
+                localEventX: 60, localEventY: 18,
+            });
+            await vi.runAllTimersAsync();
+        });
+        expect(container!.querySelector('[role="tooltip"]')).toBeNull();
+    });
+
     it('does not tooltip fitted produce cells when canvas scaling makes bounds fractional', async () => {
         vi.useFakeTimers();
         const canvas_context = vi.spyOn(HTMLCanvasElement.prototype, 'getContext')
@@ -2825,6 +2975,256 @@ describe('GridShell link-only edits', () => {
         expect(content().displayData).toBe('9,876.50');
     });
 
+    it('paints dirty XLSX formulas as cached value to unknown result', async () => {
+        const on_editing_change = vi.fn();
+        grid_mock.get_row.mockImplementation(() => [{
+            raw: '58.5',
+            formatted: '$58.50',
+            bold: false,
+            italic: false,
+            rawType: 'number' as const,
+            formula: '=E5*F5',
+        }, {
+            raw: '12',
+            formatted: '12',
+            bold: false,
+            italic: false,
+            rawType: 'number' as const,
+        }, {
+            raw: '20',
+            formatted: '$20.00',
+            bold: false,
+            italic: false,
+            rawType: 'number' as const,
+            formula: '=A1+B1',
+        }] as any);
+        const initial = props({
+            show_formatting: true,
+            edit_mode: true,
+            csv_editable: true,
+            edit_syntax: 'markdown',
+            on_editing_change,
+            column_projection: {
+                visible_to_source: [0, 1, 2],
+                source_to_visible: [0, 1, 2],
+                hidden_count: 0,
+            },
+            initial_edits: {
+                '0:0': { value: '=E5*F5+1', base: '=E5*F5' },
+                '0:1': { value: '=A1*2', base: '12' },
+                '0:2': { value: '60', base: '=A1+B1' },
+            },
+        });
+        const GridShell = await render_grid(initial);
+        expect(on_editing_change.mock.calls.at(-1)?.[0].conflicted).toEqual([]);
+        const get_cell_content = (cell: [number, number]) => (
+            grid_mock.props!.getCellContent as (cell: [number, number]) => {
+                kind: string;
+                displayData?: string;
+                data: { lines: Array<Array<{ text: string }>> };
+                copyData: string;
+            }
+        )(cell);
+
+        const formula = get_cell_content([0, 0]);
+        expect(formula.data.lines.flat().map((part) => part.text).join(''))
+            .toBe('$58.50 → ??');
+        expect(formula.copyData).toBe('=E5*F5+1');
+
+        const promoted = get_cell_content([1, 0]);
+        expect(promoted.data.lines.flat().map((part) => part.text).join(''))
+            .toBe('12 → ??');
+        expect(promoted.copyData).toBe('=A1*2');
+
+        expect(get_cell_content([2, 0])).toMatchObject({
+            kind: 'text',
+            displayData: '60',
+        });
+
+        await act(async () => {
+            root!.render(React.createElement(GridShell, {
+                ...initial,
+                show_formatting: false,
+            }));
+        });
+        expect(get_cell_content([0, 0]).data.lines
+            .flat().map((part) => part.text).join('')).toBe('58.5 → ??');
+    });
+
+    it('paints recursive formula dependents as cached value to unknown result', async () => {
+        grid_mock.get_row.mockImplementation(() => [{
+            raw: '2',
+            formatted: '2',
+            bold: false,
+            italic: false,
+            rawType: 'number' as const,
+        }, {
+            raw: '4',
+            formatted: '$4.00',
+            bold: false,
+            italic: false,
+            rawType: 'number' as const,
+            formula: '=A1*2',
+            numberFormat: { code: '$0.00' },
+        }, {
+            raw: '12',
+            formatted: '$12.00',
+            bold: false,
+            italic: false,
+            rawType: 'number' as const,
+            formula: '=B1*3',
+            numberFormat: { code: '$0.00' },
+        }, {
+            raw: '99',
+            formatted: '$99.00',
+            bold: false,
+            italic: false,
+            rawType: 'number' as const,
+            formula: '=Z1',
+        }] as any);
+        const initial = props({
+            show_formatting: true,
+            edit_mode: true,
+            csv_editable: true,
+            edit_syntax: 'markdown',
+            sheet_meta: {
+                ...props().sheet_meta,
+                columnCount: 4,
+            },
+            pending_formula_impact: {
+                size: 2,
+                has: (row, column) => row === 0 && (column === 1 || column === 2),
+                *keys() { yield '0:1'; yield '0:2'; },
+                *cells() {
+                    yield { row: 0, column: 1 };
+                    yield { row: 0, column: 2 };
+                },
+            },
+            column_projection: {
+                visible_to_source: [0, 1, 2, 3],
+                source_to_visible: [0, 1, 2, 3],
+                hidden_count: 0,
+            },
+            initial_edits: {
+                '0:0': { value: '3', base: '2' },
+            },
+            source_formula_results: new Map([
+                ['0:1', '4'],
+                ['0:2', '12'],
+            ]),
+        });
+        const GridShell = await render_grid(initial);
+        const get_cell_content = grid_mock.props!.getCellContent as
+            (cell: [number, number]) => {
+                kind: string;
+                displayData?: string;
+                data?: string | { lines: Array<Array<{ text: string }>> };
+            };
+        const text = (column: number) => {
+            const cell = get_cell_content([column, 0]);
+            return typeof cell.data === 'object'
+                ? cell.data.lines.flat().map((part) => part.text).join('')
+                : cell.displayData;
+        };
+
+        expect(text(0)).toBe('3');
+        expect(text(1)).toBe('$4.00 → ??');
+        expect(text(2)).toBe('$12.00 → ??');
+        expect(text(3)).toBe('$99.00');
+
+        await act(async () => {
+            root!.render(React.createElement(GridShell, {
+                ...initial,
+                formula_results: new Map([
+                    ['0:1', '6'],
+                    ['0:2', '?? (unsupported function)'],
+                ]),
+            }));
+        });
+        expect(text(1)).toBe('$4.00 → $6.00');
+        expect(text(2)).toBe('$12.00 → ?? (unsupported function)');
+
+    });
+
+    it('does not invalidate formulas for a hyperlink-only edit', async () => {
+        grid_mock.get_row.mockImplementation(() => [{
+            raw: '2', formatted: '2', bold: false, italic: false,
+        }, {
+            raw: '4', formatted: '$4.00', bold: false, italic: false,
+            formula: '=A1*2',
+        }] as any);
+        await render_grid(props({
+            show_formatting: true,
+            edit_mode: true,
+            csv_editable: true,
+            edit_syntax: 'markdown',
+            sheet_meta: {
+                ...props().sheet_meta,
+                columnCount: 2,
+            },
+            column_projection: {
+                visible_to_source: [0, 1],
+                source_to_visible: [0, 1],
+                hidden_count: 0,
+            },
+            initial_edits: {
+                '0:0': {
+                    value: '2',
+                    base: '2',
+                    link: { kind: 'external', target: 'https://new.test/' },
+                    baseLink: null,
+                },
+            },
+        }));
+        const cell = (grid_mock.props!.getCellContent as
+            (location: [number, number]) => { displayData: string })([1, 0]);
+        expect(cell.displayData).toBe('$4.00');
+    });
+
+    it('keeps a CSV value beginning with equals as literal text', async () => {
+        await render_grid(props({
+            edit_mode: true,
+            csv_editable: true,
+            edit_syntax: 'plain',
+            initial_edits: {
+                '0:0': { value: '=not a formula', base: 'source-a' },
+            },
+        }));
+        const get_cell_content = grid_mock.props!.getCellContent as
+            (cell: [number, number]) => { kind: string; displayData: string };
+        expect(get_cell_content([0, 0])).toMatchObject({
+            kind: 'text',
+            displayData: '=not a formula',
+        });
+    });
+
+    it('keeps formula-shaped XLSX rich text literal even if a result is present', async () => {
+        await render_grid(props({
+            show_formatting: true,
+            edit_mode: true,
+            csv_editable: true,
+            edit_syntax: 'markdown',
+            initial_edits: {
+                '0:0': {
+                    value: '=1+1',
+                    base: 'source-a',
+                    valueRuns: {
+                        runs: [{ text: '=1+1', style: { bold: true } }],
+                    },
+                },
+            },
+            formula_results: new Map([['0:0', '2']]),
+        }));
+        const cell = (grid_mock.props!.getCellContent as
+            (location: [number, number]) => {
+                copyData: string;
+                data: { lines: Array<Array<{ text: string }>> };
+            })([0, 0]);
+
+        expect(cell.copyData).toBe('=1+1');
+        expect(cell.data.lines.flat().map((part) => part.text).join('')).toBe('=1+1');
+    });
+
     it('formats dirty runs that reduce to the cell font as a scalar', async () => {
         grid_mock.get_row.mockImplementation(() => [{
             raw: '1234.5',
@@ -2928,6 +3328,99 @@ describe('GridShell link-only edits', () => {
         });
         expect(container!.querySelector('[role="tooltip"]')?.textContent)
             .toBe('9876.5');
+    });
+
+    it('uses the painted formula result in the overflow tooltip', async () => {
+        vi.useFakeTimers();
+        await render_grid(props({
+            show_formatting: true,
+            edit_mode: true,
+            csv_editable: true,
+            edit_syntax: 'markdown',
+            column_widths: { 0: 20, 1: 150, 2: 200 },
+            initial_edits: {
+                '0:0': { value: '=1+1', base: 'source-a' },
+            },
+            formula_results: new Map([['0:0', '2']]),
+        }));
+        const cell = (grid_mock.props!.getCellContent as
+            (location: [number, number]) => {
+                data: { lines: Array<Array<{ text: string }>> };
+            })([0, 0]);
+        expect(cell.data.lines.flat().map((part) => part.text).join(''))
+            .toBe('source-a → 2');
+
+        const on_item_hovered = grid_mock.props!.onItemHovered as
+            (args: Record<string, unknown>) => void;
+        await act(async () => {
+            on_item_hovered({
+                kind: 'cell', location: [0, 0], buttons: 0,
+                bounds: { x: 30, y: 10, width: 20, height: 36 },
+                localEventX: 10, localEventY: 18,
+            });
+            await vi.runAllTimersAsync();
+        });
+        expect(container!.querySelector('[role="tooltip"]')?.textContent)
+            .toBe('source-a → 2');
+    });
+
+    it('refreshes a hovered dependent formula when its result settles', async () => {
+        vi.useFakeTimers();
+        grid_mock.get_row.mockImplementation(() => [{
+            raw: '4',
+            formatted: '4',
+            bold: false,
+            italic: false,
+            rawType: 'number' as const,
+            formula: '=B1*2',
+        }, null, null] as any);
+        const impact = {
+            size: 1,
+            has: (row: number, column: number) => row === 0 && column === 0,
+            *keys() { yield '0:0'; },
+            *cells() { yield { row: 0, column: 0 }; },
+        };
+        const initial = props({
+            show_formatting: true,
+            column_widths: { 0: 20, 1: 150, 2: 200 },
+            pending_formula_impact: impact,
+            source_formula_results: new Map([['0:0', '4']]),
+        });
+        const GridShell = await render_grid(initial);
+        const painted_text = () => {
+            const cell = (grid_mock.props!.getCellContent as
+                (location: [number, number]) => {
+                    data: { lines: Array<Array<{ text: string }>> };
+                })([0, 0]);
+            return cell.data.lines.flat().map((part) => part.text).join('');
+        };
+        expect(painted_text()).toBe('4 → ??');
+
+        const on_item_hovered = grid_mock.props!.onItemHovered as
+            (args: Record<string, unknown>) => void;
+        await act(async () => {
+            on_item_hovered({
+                kind: 'cell', location: [0, 0], buttons: 0,
+                bounds: { x: 30, y: 10, width: 20, height: 36 },
+                localEventX: 10, localEventY: 18,
+            });
+            await vi.runAllTimersAsync();
+        });
+        expect(container!.querySelector('[role="tooltip"]')?.textContent)
+            .toBe('4 → ??');
+
+        await act(async () => {
+            root!.render(React.createElement(GridShell, {
+                ...initial,
+                formula_results: new Map([['0:0', '6']]),
+            }));
+        });
+        await act(async () => {
+            await vi.runAllTimersAsync();
+        });
+        expect(painted_text()).toBe('4 → 6');
+        expect(container!.querySelector('[role="tooltip"]')?.textContent)
+            .toBe('4 → 6');
     });
 
     it('still substitutes the dirty text when the value itself changed', async () => {

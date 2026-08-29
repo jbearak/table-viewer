@@ -1571,7 +1571,7 @@ describe('node file system port', () => {
             await node_file_system_port.write_file(resource, new TextEncoder().encode('a,b\n'));
             const stat = await node_file_system_port.stat(resource);
             expect(stat.size).toBe(4);
-            expect(stat.mtime).toBeGreaterThan(0);
+            expect(stat.mtime).toBe(fs.statSync(file).mtime.getTime());
             const bytes = await node_file_system_port.read_file(resource);
             expect(new TextDecoder().decode(bytes)).toBe('a,b\n');
             await expect(node_file_system_port.stat({ ...resource, scheme: 'untitled' }))

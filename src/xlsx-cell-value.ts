@@ -1,5 +1,6 @@
 import { text_styles_equal, type CellTextStyle, type RichTextRun } from './cell-content';
 import type { DateMode } from './spreadsheet-format';
+import { is_xlsx_formula_text } from './xlsx-formula';
 
 const MS_PER_DAY = 86400000;
 const EXCEL_1900_EPOCH_MS = Date.UTC(1899, 11, 31);
@@ -45,6 +46,15 @@ export function iso_to_serial(text: string, datemode: DateMode): number | null {
  */
 const NUMBER_RE = /^[+-]?((0|[1-9]\d*)(\.\d*)?|\.\d+)([eE][+-]?\d+)?$/;
 const MAX_EXACT_DIGITS = 15;
+
+/** Exact value/runs rule used when an XLSX edit chooses formula storage. */
+export function xlsx_edit_writes_formula(
+    value: string,
+    runs: readonly RichTextRun[] | undefined,
+    force_text = false,
+): boolean {
+    return !force_text && runs === undefined && is_xlsx_formula_text(value);
+}
 
 function significant_digits(text: string): number {
     const mantissa = text.replace(/[eE][+-]?\d+$/, '').replace(/[+-]/, '').replace('.', '');

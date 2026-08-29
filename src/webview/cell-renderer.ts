@@ -9,6 +9,7 @@ import {
     type RichTextSegment,
 } from './rich-text-layout';
 import { choose_diff_mode, word_diff } from './word-diff';
+import { UNKNOWN_XLSX_FORMULA_RESULT } from '../xlsx-formula';
 
 /**
  * Cell-content construction for the Glide grid. Pure (no canvas, no Glide
@@ -70,6 +71,10 @@ export interface CellEditOverlay {
     /** Parsed rich value of a dirty Markdown edit. This is the paint authority
      * while the workbook has not yet been saved and reloaded. */
     dirty_rich?: RichText;
+    /** The dirty XLSX value is a formula whose calculated result is unknown. */
+    formula_result_pending?: true;
+    /** Newly calculated display text for a dirty or transitively affected formula. */
+    formula_result?: string;
     /** themeOverride background tint for dirty / conflicted cells. */
     bg?: string;
     /** The "before" text to diff against the cell's current text. The Diff
@@ -184,6 +189,31 @@ export function diff_lines(
     return lines;
 }
 
+function formula_result_lines(
+    base: string,
+    result: string,
+    colors: DiffColors,
+): RichTextLine[] {
+    return formula_result_replaces_base(base, result)
+        ? [[{ text: result, diff_color: colors.added }]]
+        : diff_lines(base, result, 'number', colors);
+}
+
+function formula_result_replaces_base(base: string, result: string): boolean {
+    return base === '' || (
+        base === UNKNOWN_XLSX_FORMULA_RESULT
+        && result.startsWith(UNKNOWN_XLSX_FORMULA_RESULT)
+    );
+}
+
+function persisted_displayed_text(
+    c: RenderedCell | null | undefined,
+    show_formatting: boolean,
+): string {
+    if (c?.formulaResultPending) return UNKNOWN_XLSX_FORMULA_RESULT;
+    return show_formatting ? c?.formatted ?? '' : c?.raw ?? '';
+}
+
 /** Visual lines for a compare-deleted cell: the whole text struck through in
  *  the deletion color, split on hard breaks like every other rich cell. */
 function deleted_lines(text: string, colors: DiffColors): RichTextLine[] {
@@ -221,12 +251,19 @@ export function displayed_text(
     show_formatting: boolean,
     overlay: CellEditOverlay | undefined,
 ): string {
+    if (overlay?.formula_result !== undefined || overlay?.formula_result_pending) {
+        const base = persisted_displayed_text(c, show_formatting);
+        const result = overlay.formula_result ?? UNKNOWN_XLSX_FORMULA_RESULT;
+        return formula_result_replaces_base(base, result)
+            ? result
+            : `${base}${DIFF_ARROW}${result}`;
+    }
     if (overlay?.dirty_value !== undefined) {
         return show_formatting && overlay.diff_base === undefined
             ? overlay.dirty_display ?? overlay.dirty_value
             : overlay.dirty_value;
     }
-    return show_formatting ? c?.formatted ?? '' : (c?.raw ?? '');
+    return persisted_displayed_text(c, show_formatting);
 }
 
 function rich_cell(
@@ -243,7 +280,9 @@ function rich_cell(
     // and participate in the cache key instead — a compare page's word diffs
     // must not be recomputed every frame.
     const can_cache = overlay?.dirty_rich === undefined
-        && overlay?.dirty_value === undefined;
+        && overlay?.dirty_value === undefined
+        && !overlay?.formula_result_pending
+        && overlay?.formula_result === undefined;
     const cached = can_cache ? rich_cell_cache.get(c) : undefined;
     let cell = cached !== undefined
         && cached.cell.data.font_size_px === font_size_px
@@ -287,6 +326,12 @@ function rich_cell(
         // removed original, struck through whole in the deletion color.
         const lines = overlay?.compare_deleted
             ? deleted_lines(display, diff_colors)
+            : overlay?.formula_result !== undefined || overlay?.formula_result_pending
+            ? formula_result_lines(
+                persisted_displayed_text(c, show_formatting),
+                overlay.formula_result ?? UNKNOWN_XLSX_FORMULA_RESULT,
+                diff_colors,
+            )
             : overlay?.diff_base !== undefined
             ? diff_lines(overlay.diff_base, display, c.rawType, diff_colors)
             : rich_text_lines(
@@ -372,6 +417,8 @@ export function rich_cell_display_data(
     if (
         !(c && renders_rich(c, show_formatting))
         && !(show_formatting && overlay?.dirty_rich !== undefined)
+        && !overlay?.formula_result_pending
+        && overlay?.formula_result === undefined
         && overlay?.diff_base === undefined
         && !overlay?.compare_deleted
     ) return undefined;
@@ -475,6 +522,15 @@ export function build_grid_cell(
 ): GridCell {
     const c = cells?.[col];
     if (!c && !overlay) return BLANK;
+    // A formula cell paints its cached result, but editing is an operation on
+    // the formula itself. Supplying edit_value leaves displayData and copyData
+    // on the result while Glide's overlay opens with the leading `=` formula.
+    const effective_overlay = c?.formula !== undefined
+        && overlay?.editable
+        && overlay.dirty_value === undefined
+        && overlay.edit_value === undefined
+        ? { ...overlay, edit_value: c.formula }
+        : overlay;
     // Rich *text styling* is a Formatting-on display concern, like bold/italic
     // on the Text path; the hyperlink presentation (link color, underline,
     // pointer) is semantic and survives the toggle. Either way the rich
@@ -487,6 +543,8 @@ export function build_grid_cell(
     if (
         (c && renders_rich(c, show_formatting))
         || (show_formatting && overlay?.dirty_rich !== undefined)
+        || overlay?.formula_result_pending
+        || overlay?.formula_result !== undefined
         // Diff mode paints mixed colors and strikethrough, which only the
         // rich renderer can draw — regardless of the Formatting toggle.
         || overlay?.diff_base !== undefined
@@ -495,12 +553,12 @@ export function build_grid_cell(
         return rich_cell(
             c ?? EMPTY_CELL,
             show_formatting,
-            overlay,
+            effective_overlay,
             font_size_px,
             soft_wrap,
             link_modifier_held,
             diff_colors,
         );
     }
-    return text_cell(c ?? EMPTY_CELL, show_formatting, overlay, font_size_px, soft_wrap);
+    return text_cell(c ?? EMPTY_CELL, show_formatting, effective_overlay, font_size_px, soft_wrap);
 }

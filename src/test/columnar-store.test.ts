@@ -89,6 +89,7 @@ describe('ColumnarStore', () => {
         b.set(0, 1, {
             raw: '2024-01-15T00:00:00Z', formatted: '2024-01-15T00:00:00Z',
             bold: false, italic: false, rawType: 'date',
+            numericRaw: 45_306,
             numberFormat: { code: 'm/d/yyyy', date1904: true },
             xlsxIsoDate: true,
         });
@@ -99,6 +100,7 @@ describe('ColumnarStore', () => {
         expect(row[0]?.numberFormat).toEqual({ code: '0.00' });
         expect(row[1]?.numberFormat).toEqual({ code: 'm/d/yyyy', date1904: true });
         expect(row[1]?.xlsxIsoDate).toBe(true);
+        expect(row[1]?.numericRaw).toBe(45_306);
         expect(row[2] && 'numberFormat' in row[2]).toBe(false);
         expect(row[2] && 'xlsxIsoDate' in row[2]).toBe(false);
     });

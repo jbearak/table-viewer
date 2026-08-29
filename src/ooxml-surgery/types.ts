@@ -16,7 +16,10 @@ export interface WorksheetEditResult {
     readonly worksheet_xml: Uint8Array;
     /** Replacement relationships text, or null when that part is unchanged. */
     readonly relationships_xml: string | null;
+    /** True when an edit removed at least one worksheet formula. */
     readonly formula_removed: boolean;
+    /** True when calcChain no longer describes the worksheet formulas. */
+    readonly calculation_chain_stale: boolean;
 }
 
 export type {

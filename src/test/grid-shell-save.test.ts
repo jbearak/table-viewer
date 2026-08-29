@@ -108,6 +108,12 @@ vi.mock('../webview/use-row-loader', () => ({
             const raw = source_row_text(source_row)[col];
             return raw === undefined ? '' : String(raw);
         },
+        get_cell_for_source: (source_row: number, col: number) => {
+            if (resident_display_row(source_row) === undefined) return undefined;
+            const raw = source_row_text(source_row)[col];
+            if (raw === undefined) return null;
+            return { raw, formatted: raw, bold: false, italic: false };
+        },
         has_source_row: (source_row: number) => resident_display_row(source_row) !== undefined,
         sample_loaded_rows: () => [],
         version: 0,

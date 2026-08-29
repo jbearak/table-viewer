@@ -10,7 +10,16 @@
 
 import { parse_xlsx_streaming } from '../parse-xlsx';
 import { ColumnarStore } from './columnar-store';
-import type { ColumnWindow, DataSource, IndexedRows, RowWindow, WorkbookMeta } from './interface';
+import type {
+    ColumnWindow,
+    DataSource,
+    PackedFormulaDependencies,
+    PackedFormulaCells,
+    PackedPendingFormulaCells,
+    IndexedRows,
+    RowWindow,
+    WorkbookMeta,
+} from './interface';
 import type { MergeRange } from '../types';
 
 interface SheetEntry {
@@ -20,6 +29,9 @@ interface SheetEntry {
     columnCount: number;
     merges: MergeRange[];
     hasFormatting: boolean;
+    formulaDependencies?: PackedFormulaDependencies;
+    formulaCells?: PackedFormulaCells;
+    pendingFormulaCells?: PackedPendingFormulaCells;
     store: ColumnarStore;
 }
 
@@ -42,6 +54,13 @@ export class XlsxDataSource implements DataSource {
                 columnCount: s.columnCount,
                 merges: s.merges,
                 hasFormatting: s.hasFormatting,
+                ...(s.formulaDependencies?.length
+                    ? { formulaDependencies: s.formulaDependencies }
+                    : {}),
+                ...(s.formulaCells?.length ? { formulaCells: s.formulaCells } : {}),
+                ...(s.pendingFormulaCells?.length
+                    ? { pendingFormulaCells: s.pendingFormulaCells }
+                    : {}),
             })),
         };
     }
@@ -64,6 +83,13 @@ export class XlsxDataSource implements DataSource {
                 merges: s.merges,
                 // workbook-level flag; parse_xlsx exposes no per-sheet formatting granularity
                 hasFormatting: has_formatting,
+                ...(s.formulaDependencies?.length
+                    ? { formulaDependencies: s.formulaDependencies }
+                    : {}),
+                ...(s.formulaCells?.length ? { formulaCells: s.formulaCells } : {}),
+                ...(s.pendingFormulaCells?.length
+                    ? { pendingFormulaCells: s.pendingFormulaCells }
+                    : {}),
                 store: b.build(),
             };
         });

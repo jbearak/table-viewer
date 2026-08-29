@@ -17,7 +17,12 @@
 import { get_raw_cell_text } from '../cell-display';
 import { rich_text_has_styles } from '../cell-content';
 import type { CellData, MergeRange } from '../types';
-import type { RenderedCell } from './interface';
+import type {
+    PackedFormulaDependencies,
+    PackedFormulaCells,
+    PackedPendingFormulaCells,
+    RenderedCell,
+} from './interface';
 
 /**
  * The sparse working set for one parsed worksheet, before densification.
@@ -54,6 +59,9 @@ export interface StreamingSheet {
     rowCount: number;
     columnCount: number;
     merges: MergeRange[];
+    formulaDependencies?: PackedFormulaDependencies;
+    formulaCells?: PackedFormulaCells;
+    pendingFormulaCells?: PackedPendingFormulaCells;
     fill(sink: CellSink): void;
 }
 
@@ -100,12 +108,19 @@ function fill_store(working: WorkingSet, sink: CellSink): void {
             const rendered: RenderedCell = {
                 raw: cell.raw === null ? '' : String(cell.raw),
                 formatted: cell.formatted,
+                ...(cell.formula !== undefined ? { formula: cell.formula } : {}),
+                ...(cell.formulaResultPending ? { formulaResultPending: true as const } : {}),
+                ...(cell.numericRaw !== undefined
+                    ? { numericRaw: cell.numericRaw }
+                    : {}),
                 bold: cell.bold,
                 italic: cell.italic,
                 rawType: cell.raw === null
                     ? 'empty'
                     : cell.rawType === 'date'
                         ? 'date'
+                    : cell.rawType === 'error'
+                        ? 'error'
                     : typeof cell.raw === 'number'
                         ? 'number'
                         : typeof cell.raw === 'boolean'
@@ -135,6 +150,9 @@ export function make_streaming_sheet(
     working: WorkingSet,
     merges: MergeRange[],
     worksheetId?: string,
+    formulaDependencies?: PackedFormulaDependencies,
+    formulaCells?: PackedFormulaCells,
+    pendingFormulaCells?: PackedPendingFormulaCells,
 ): StreamingSheet {
     let pending: WorkingSet | null = working;
     return {
@@ -143,6 +161,9 @@ export function make_streaming_sheet(
         rowCount: working.row_count,
         columnCount: working.col_count,
         merges,
+        ...(formulaDependencies?.length ? { formulaDependencies } : {}),
+        ...(formulaCells?.length ? { formulaCells } : {}),
+        ...(pendingFormulaCells?.length ? { pendingFormulaCells } : {}),
         fill(sink: CellSink): void {
             if (!pending) throw new Error('StreamingSheet.fill called after its working-set was released');
             fill_store(pending, sink);

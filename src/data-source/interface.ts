@@ -37,10 +37,16 @@ export interface RenderedCell extends
     DeferredIdentityFields {
     raw: string | null;       // null = empty cell
     formatted: string;        // display text (== raw for CSV)
+    /** Effective A1 formula, including the leading `=` used by the editor. */
+    formula?: string;
+    /** The formula has no cached result that Table Viewer can display. */
+    formulaResultPending?: true;
+    /** Underlying finite numeric scalar when display-safe `raw` is text. */
+    numericRaw?: number;
     bold: boolean;
     italic: boolean;
     /** Original scalar category retained for correct numeric sorting. */
-    rawType?: 'string' | 'number' | 'boolean' | 'date' | 'empty';
+    rawType?: 'string' | 'number' | 'boolean' | 'date' | 'error' | 'empty';
     /** Internal identity used by comparisons when display-safe `raw` is lossy. */
     comparisonKey?: string;
     /** Canonical filter identity when display-safe `raw` is lossy. Matching and
@@ -65,6 +71,23 @@ export interface ColumnFilterMetadata {
     /** User-facing label for one canonical nonblank raw value, when attached. */
     valueLabel?(raw: string): string | undefined;
 }
+
+/**
+ * Formula references packed seven numbers at a time on the worksheet that owns
+ * the formula:
+ * `[formulaRow, formulaColumn, sourceSheetIndex,
+ * firstRow, firstColumn, lastRow, lastColumn]`.
+ * Coordinates use canonical physical source space. One flat array per sheet
+ * avoids an object or inner-array allocation for every reference.
+ */
+export type PackedFormulaDependencies = readonly number[];
+/**
+ * All formula coordinates, packed `[row, column]` in strictly increasing
+ * row-major order. Pairs are unique; graph compilation validates this seam.
+ */
+export type PackedFormulaCells = readonly number[];
+/** Formula cells with no trustworthy cached result, packed `[row, column]`. */
+export type PackedPendingFormulaCells = readonly number[];
 
 export interface RowWindow {
     startRow: number;                 // 0-based, absolute
@@ -128,6 +151,12 @@ export interface SheetMeta {
     estimatedRowBytes?: number;
     merges: MergeRange[];             // from types.ts (rowSpan + colSpan)
     hasFormatting: boolean;
+    /** Workbook-resolved A1 references used to invalidate cached formula results. */
+    formulaDependencies?: PackedFormulaDependencies;
+    /** Every formula coordinate, including formulas with no references. */
+    formulaCells?: PackedFormulaCells;
+    /** Formula coordinates whose source file has no result cache. */
+    pendingFormulaCells?: PackedPendingFormulaCells;
     /** Per-column header titles. Length === columnCount; a blank entry means
      *  "no name" and the renderer falls back to the column letter. */
     columnNames?: string[];
@@ -183,6 +212,17 @@ export interface DataSource {
     read_columns?(
         sheet_index: number,
         start_row: number,
+        count: number,
+        column_indices: readonly number[],
+    ): ColumnWindow;
+    /**
+     * Read canonical physical source rows without applying a row projection.
+     * Formula coordinates use this space. Projection adapters such as promoted
+     * Excel headers implement it by delegating to their underlying source.
+     */
+    read_canonical_columns?(
+        sheet_index: number,
+        start_source_row: number,
         count: number,
         column_indices: readonly number[],
     ): ColumnWindow;

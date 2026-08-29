@@ -806,7 +806,7 @@ export class FileDtaDataSource implements DataSource {
             source: this,
             digest: '',
             size: descriptor.size,
-            mtime: descriptor.mtimeMs,
+            mtime: descriptor.mtime.getTime(),
         };
     }
 
@@ -826,7 +826,7 @@ export class FileDtaDataSource implements DataSource {
             source: this,
             digest,
             size: after.size,
-            mtime: after.mtimeMs,
+            mtime: after.mtime.getTime(),
         };
     }
 

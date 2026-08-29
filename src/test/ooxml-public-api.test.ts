@@ -43,6 +43,7 @@ describe('OOXML surgery public API', () => {
         expect(result).toMatchObject({
             relationships_xml: null,
             formula_removed: false,
+            calculation_chain_stale: false,
         });
 
         // Compile-time checks keep the supporting structural types reachable
@@ -63,5 +64,21 @@ describe('OOXML surgery public API', () => {
             cell_edits: [{ row: 0, col: 0, value: '2' }],
             write_options: { datemode: 0, is_date_style: () => false },
         })).toThrow(ooxml_surgery.OoxmlRefusalError);
+    });
+
+    it('marks the calculation chain stale when a formula changes', () => {
+        const result = ooxml_surgery.apply_worksheet_edits({
+            worksheet_xml: Buffer.from(
+                '<worksheet><sheetData><row r="1"><c r="A1"><f>1+1</f><v>2</v></c></row></sheetData></worksheet>',
+            ),
+            relationships_xml: null,
+            cell_edits: [{ row: 0, col: 0, value: '=1+2' }],
+            write_options: { datemode: 0, is_date_style: () => false },
+        });
+
+        expect(Buffer.from(result.worksheet_xml).toString('utf8'))
+            .toContain('<c r="A1"><f>1+2</f></c>');
+        expect(result.formula_removed).toBe(false);
+        expect(result.calculation_chain_stale).toBe(true);
     });
 });
