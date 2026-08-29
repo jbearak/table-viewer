@@ -353,6 +353,8 @@ a new line char ""more quotes"" plus a tab  ."	https://google.com`)
 
     afterEach(() => {
         vi.clearAllTimers();
+        vi.useRealTimers();
+        vi.restoreAllMocks();
         cleanup();
     });
 
@@ -4112,20 +4114,232 @@ a new line char ""more quotes"" plus a tab  ."	https://google.com`)
             clientY: 16,
         });
         fireEvent.mouseMove(canvas, {
+            clientX: 360,
+            clientY: 16,
+            buttons: 1,
+        });
+        expect(widthPadder?.style.width).toBe("368px");
+
+        fireEvent.mouseMove(canvas, {
             clientX: 250,
             clientY: 16,
             buttons: 1,
         });
 
-        // The column is now 100px wide, but the original 318px scroll range
-        // remains so a right-aligned scroller cannot cancel the pointer delta.
-        expect(widthPadder?.style.width).toBe("318px");
+        // The column is now 100px wide, but the peak 368px scroll range remains
+        // so reversing an edge-scrolled drag cannot cancel the pointer delta.
+        expect(widthPadder?.style.width).toBe("368px");
 
         fireEvent.mouseUp(canvas, {
             clientX: 250,
             clientY: 16,
         });
         expect(widthPadder?.style.width).toBe("258px");
+    });
+
+    test("Resize Last Column keeps growing while held at the viewport edge", async () => {
+        vi.useFakeTimers();
+        const widths: number[] = [];
+        const resizeEnd = vi.fn();
+        const columns: SizedGridColumn[] = [
+            { title: "A", width: 500 },
+            { title: "B", width: 494 },
+        ];
+        const ResizeHarness: React.FC = () => {
+            const [currentColumns, setCurrentColumns] = React.useState(columns);
+            return (
+                <EventedDataEditor
+                    {...basicProps}
+                    columns={currentColumns}
+                    overscrollX={32}
+                    maxColumnWidth={2000}
+                    onColumnResize={(_, width, index) => {
+                        widths.push(width);
+                        setCurrentColumns(current =>
+                            current.map((column, at) => (at === index ? { ...column, width } : column))
+                        );
+                    }}
+                    onColumnResizeEnd={resizeEnd}
+                />
+            );
+        };
+
+        render(<ResizeHarness />, { wrapper: Context });
+        const scroller = prep();
+        expect(scroller).not.toBeNull();
+        const cancelAnimationFrame = vi.spyOn(window, "cancelAnimationFrame");
+        const canvas = screen.getByTestId("data-grid-canvas");
+
+        fireEvent.mouseDown(canvas, {
+            clientX: 994,
+            clientY: 16,
+        });
+        fireEvent.mouseMove(canvas, {
+            clientX: 999,
+            clientY: 16,
+            buttons: 1,
+        });
+
+        // Cross the entire fixed runway. This proves the stationary pointer is
+        // being serviced by repeated edge-scroll frames, not just one tick.
+        await vi.waitFor(() => {
+            expect(scroller?.scrollLeft).toBeGreaterThan(32);
+            expect(widths.at(-1)).toBeGreaterThan(531);
+        });
+
+        fireEvent.keyDown(window, { key: "Escape" });
+        expect(resizeEnd).toHaveBeenCalledTimes(1);
+        expect(cancelAnimationFrame).toHaveBeenCalledTimes(1);
+        cancelAnimationFrame.mockRestore();
+    });
+
+    test("Resize Last Column stops polling when a controlled width does not advance", () => {
+        vi.useFakeTimers();
+        const resizeEnd = vi.fn();
+        render(
+            <EventedDataEditor
+                {...basicProps}
+                columns={[
+                    { title: "A", width: 500 },
+                    { title: "B", width: 494 },
+                ]}
+                overscrollX={32}
+                maxColumnWidth={2000}
+                onColumnResizeEnd={resizeEnd}
+            />,
+            { wrapper: Context }
+        );
+        const scroller = prep();
+        expect(scroller).not.toBeNull();
+        const canvas = screen.getByTestId("data-grid-canvas");
+
+        let scrollLeft = 0;
+        Object.defineProperty(scroller, "scrollLeft", {
+            configurable: true,
+            get: () => scrollLeft,
+            set: value => {
+                scrollLeft = Math.min(4, Number(value));
+            },
+        });
+        const frames: FrameRequestCallback[] = [];
+        const requestAnimationFrame = vi.spyOn(window, "requestAnimationFrame").mockImplementation(callback => {
+            frames.push(callback);
+            return frames.length;
+        });
+
+        fireEvent.mouseDown(canvas, { clientX: 994, clientY: 16 });
+        fireEvent.mouseMove(canvas, { clientX: 999, clientY: 16, buttons: 1 });
+        let timestamp = 0;
+        for (let frameCount = 0; frameCount < 5 && frames.length > 0; frameCount++) {
+            const frame = frames.shift();
+            act(() => frame?.(timestamp += 1000 / 60));
+        }
+
+        expect(frames).toHaveLength(0);
+        expect(requestAnimationFrame).toHaveBeenCalledTimes(2);
+        expect(scrollLeft).toBe(4);
+        fireEvent.mouseUp(canvas, { clientX: 999, clientY: 16 });
+        expect(resizeEnd).toHaveBeenCalledWith(expect.anything(), 503, 1, 503);
+        requestAnimationFrame.mockRestore();
+    });
+
+    test.each(["mouseup", "blur", "pointercancel"] as const)(
+        "Resize Last Column commits once and cancels edge scrolling on %s",
+        interruption => {
+            vi.useFakeTimers();
+            const resizeEnd = vi.fn();
+            render(
+                <EventedDataEditor
+                    {...basicProps}
+                    columns={[
+                        { title: "A", width: 500 },
+                        { title: "B", width: 494 },
+                    ]}
+                    overscrollX={32}
+                    onColumnResize={vi.fn()}
+                    onColumnResizeEnd={resizeEnd}
+                />,
+                { wrapper: Context }
+            );
+            prep();
+            const cancelAnimationFrame = vi.spyOn(window, "cancelAnimationFrame");
+            const canvas = screen.getByTestId("data-grid-canvas");
+            fireEvent.mouseDown(canvas, { clientX: 994, clientY: 16 });
+            fireEvent.mouseMove(canvas, { clientX: 999, clientY: 16, buttons: 1 });
+
+            if (interruption === "mouseup") {
+                fireEvent.mouseUp(canvas, { clientX: 999, clientY: 16 });
+            } else {
+                window.dispatchEvent(new Event(interruption));
+                window.dispatchEvent(new Event(interruption));
+            }
+
+            expect(resizeEnd).toHaveBeenCalledTimes(1);
+            expect(cancelAnimationFrame).toHaveBeenCalled();
+            cancelAnimationFrame.mockRestore();
+        }
+    );
+
+    test.each([0, 2])(
+        "Resize Last Column commits when a later move reports buttons=%i without the primary button",
+        buttons => {
+            vi.useFakeTimers();
+            const resizeEnd = vi.fn();
+            render(
+                <EventedDataEditor
+                    {...basicProps}
+                    columns={[
+                        { title: "A", width: 500 },
+                        { title: "B", width: 494 },
+                    ]}
+                    overscrollX={32}
+                    onColumnResize={vi.fn()}
+                    onColumnResizeEnd={resizeEnd}
+                />,
+                { wrapper: Context }
+            );
+            prep();
+            const cancelAnimationFrame = vi.spyOn(window, "cancelAnimationFrame");
+            const canvas = screen.getByTestId("data-grid-canvas");
+            fireEvent.mouseDown(canvas, { clientX: 994, clientY: 16 });
+            fireEvent.mouseMove(canvas, { clientX: 999, clientY: 16, buttons: 1 });
+
+            fireEvent.mouseMove(window, { clientX: 999, clientY: 16, buttons });
+            fireEvent.mouseMove(window, { clientX: 999, clientY: 16, buttons });
+
+            expect(resizeEnd).toHaveBeenCalledTimes(1);
+            expect(cancelAnimationFrame).toHaveBeenCalled();
+            cancelAnimationFrame.mockRestore();
+        }
+    );
+
+    test("Resize Last Column cancels edge scrolling on unmount", () => {
+        vi.useFakeTimers();
+        const resizeEnd = vi.fn();
+        const view = render(
+            <EventedDataEditor
+                {...basicProps}
+                columns={[
+                    { title: "A", width: 500 },
+                    { title: "B", width: 494 },
+                ]}
+                overscrollX={32}
+                onColumnResize={vi.fn()}
+                onColumnResizeEnd={resizeEnd}
+            />,
+            { wrapper: Context }
+        );
+        prep();
+        const cancelAnimationFrame = vi.spyOn(window, "cancelAnimationFrame");
+        const canvas = screen.getByTestId("data-grid-canvas");
+        fireEvent.mouseDown(canvas, { clientX: 994, clientY: 16 });
+        fireEvent.mouseMove(canvas, { clientX: 999, clientY: 16, buttons: 1 });
+
+        view.unmount();
+
+        expect(cancelAnimationFrame).toHaveBeenCalled();
+        expect(resizeEnd).not.toHaveBeenCalled();
+        cancelAnimationFrame.mockRestore();
     });
 
     test("Drag reorder row", async () => {

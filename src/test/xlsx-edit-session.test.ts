@@ -90,10 +90,33 @@ function latest_snapshot(panel: { __messages: unknown[] }) {
         identity: unknown;
         generation: number;
         sourceGeneration: number;
+        presentation: 'initial' | 'refresh';
+        reason: string;
         capabilities: { csvEditSessionId?: string };
-        meta: { sheets: { name: string; worksheetId?: string }[] };
+        meta: { sheets: {
+            name: string;
+            worksheetId?: string;
+            rowCount: number;
+            excelFirstRowHeader?: { active: boolean; sourceRow?: number };
+        }[] };
         state?: PerFileState;
     };
+}
+
+function refresh_snapshots(panel: { __messages: unknown[] }) {
+    return panel.__messages.flatMap((message) => {
+        if (
+            typeof message !== 'object'
+            || message === null
+            || (message as { type?: unknown }).type !== 'workbookSnapshot'
+        ) return [];
+        const snapshot = (message as { snapshot: ReturnType<typeof latest_snapshot> }).snapshot;
+        return snapshot.presentation === 'refresh' ? [snapshot] : [];
+    });
+}
+
+function source_refresh_snapshots(panel: { __messages: unknown[] }) {
+    return refresh_snapshots(panel).filter((snapshot) => snapshot.reason !== 'other');
 }
 
 /** Open, and acknowledge the first snapshot: a save refuses until the webview
@@ -353,6 +376,73 @@ describe('xlsx edit sessions', () => {
         // The sibling worksheet is untouched, which is the whole point of the
         // worksheet being the edited object.
         expect(after.data.sheets[0].rows[1][0]?.raw).toBe(people_before);
+    });
+
+    it('uses fileReload semantics when a save changes automatic header projection', async () => {
+        const panel = await open_ready_xlsx(file_path);
+        const initial = latest_snapshot(panel);
+        expect(initial.meta.sheets[0]).toMatchObject({
+            rowCount: 2,
+            excelFirstRowHeader: { active: true },
+        });
+        await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 0 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+        const edits = {
+            '1:1': 'thirty',
+            '1:2': 'yes',
+            '1:3': 'unknown',
+            '2:1': 'twenty-five',
+            '2:2': 'no',
+            '2:3': 'unknown',
+        };
+        const dirtyEdits = {
+            '1:1': { value: 'thirty', base: '30' },
+            '1:2': { value: 'yes', base: 'true' },
+            '1:3': { value: 'unknown', base: '2024-01-15T00:00:00.000Z' },
+            '2:1': { value: 'twenty-five', base: '25' },
+            '2:2': { value: 'no', base: 'false' },
+            '2:3': { value: 'unknown', base: '2023-06-01T00:00:00.000Z' },
+        };
+
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: workbook_request(session, 'header-projection-change', {
+                sheetIndex: 0,
+                sheetName: 'People',
+                worksheetId: '1',
+                edits,
+                dirtyEdits,
+            }),
+        });
+        await wait_for_observable(() => source_refresh_snapshots(panel).length > 0);
+
+        expect(save_results(panel).at(-1)).toMatchObject({ success: true });
+        expect(source_refresh_snapshots(panel)).toHaveLength(1);
+        expect(source_refresh_snapshots(panel)[0].reason).toBe('fileReload');
+        expect(source_refresh_snapshots(panel)[0].meta.sheets[0]).toMatchObject({
+            rowCount: 3,
+            excelFirstRowHeader: { active: false },
+        });
+    });
+
+    it('uses save semantics when the XLSX row projection stays stable', async () => {
+        const panel = await open_ready_xlsx(file_path);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 0 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: workbook_request(session, 'stable-header-projection', save_worksheet()),
+        });
+        await wait_for_observable(() => source_refresh_snapshots(panel).length > 0);
+
+        expect(save_results(panel).at(-1)).toMatchObject({ success: true });
+        expect(source_refresh_snapshots(panel)).toHaveLength(1);
+        expect(source_refresh_snapshots(panel)[0].reason).toBe('save');
+        expect(source_refresh_snapshots(panel)[0].meta.sheets[0]).toMatchObject({
+            rowCount: 2,
+            excelFirstRowHeader: { active: true },
+        });
     });
 
     it('saves and exits the first of two editing files after an auto-grown row height', async () => {

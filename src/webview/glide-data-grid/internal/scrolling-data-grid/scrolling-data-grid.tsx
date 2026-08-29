@@ -107,8 +107,18 @@ const GridScroller: React.FunctionComponent<ScrollingDataGridProps> = p => {
 
     const scrollContentWidth = nonGrowWidth + Math.max(0, overscrollX ?? 0);
     const [resizeScrollWidthFloor, setResizeScrollWidthFloor] = React.useState<number>();
+    const [resizingFinalColumn, setResizingFinalColumn] = React.useState(false);
     const hasColumnResize =
         onColumnResize !== undefined || onColumnResizeStart !== undefined || onColumnResizeEnd !== undefined;
+
+    // Edge scrolling can take the final column well past its starting width.
+    // Keep the largest scroll range reached for the rest of the drag, so a
+    // reversal does not let the browser clamp scrollLeft and detach the border
+    // from the pointer.
+    React.useLayoutEffect(() => {
+        if (!resizingFinalColumn) return;
+        setResizeScrollWidthFloor(current => Math.max(current ?? 0, scrollContentWidth));
+    }, [resizingFinalColumn, scrollContentWidth]);
 
     const onColumnResizeStartLocked = React.useCallback<
         NonNullable<DataGridDndProps["onColumnResizeStart"]>
@@ -121,6 +131,7 @@ const GridScroller: React.FunctionComponent<ScrollingDataGridProps> = p => {
             // the final border stays under the pointer.
             if (colIndex === columns.length - 1) {
                 setResizeScrollWidthFloor(scrollContentWidth);
+                setResizingFinalColumn(true);
             }
             onColumnResizeStart?.(column, newSize, colIndex, newSizeWithGrow);
         },
@@ -131,6 +142,7 @@ const GridScroller: React.FunctionComponent<ScrollingDataGridProps> = p => {
         NonNullable<DataGridDndProps["onColumnResizeEnd"]>
     >(
         (column, newSize, colIndex, newSizeWithGrow) => {
+            setResizingFinalColumn(false);
             setResizeScrollWidthFloor(undefined);
             onColumnResizeEnd?.(column, newSize, colIndex, newSizeWithGrow);
         },

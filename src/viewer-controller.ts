@@ -13,6 +13,7 @@ import type {
 import {
     projected_row_for_source,
     read_source_rows_indexed,
+    source_row_projection_signature,
 } from './data-source/interface';
 import {
     InvalidPersistedTransformError,
@@ -5285,6 +5286,32 @@ export function attach_viewer(
                 === source_observation?.comparisonDigest;
     }
 
+    function source_row_projections_match(
+        previous: DataSource | undefined,
+        next: DataSource,
+    ): boolean {
+        if (!previous) return false;
+        const previous_sheets = previous.meta().sheets;
+        const next_sheets = next.meta().sheets;
+        if (previous_sheets.length !== next_sheets.length) return false;
+        return previous_sheets.every((sheet, sheet_index) => {
+            const next_sheet = next_sheets[sheet_index];
+            if (!next_sheet) return false;
+            const previous_signature = source_row_projection_signature(
+                previous,
+                sheet_index,
+            );
+            const next_signature = source_row_projection_signature(next, sheet_index);
+            return previous_signature !== undefined
+                && previous_signature === next_signature
+                && sheet.name === next_sheet.name
+                && sheet.worksheetId === next_sheet.worksheetId
+                && sheet.rowCount === next_sheet.rowCount
+                && sheet.sourceRowCount === next_sheet.sourceRowCount
+                && sheet.columnCount === next_sheet.columnCount;
+        });
+    }
+
     function dispose_unadopted_candidate(candidate: SourceCandidate | undefined): void {
         if (!candidate) return;
         try {
@@ -5379,11 +5406,23 @@ export function attach_viewer(
                         return inactive_refresh_result();
                     }
                     if (committed.type === 'committed') {
+                        // A postSave episode may absorb watcher work that arrived
+                        // during the checked-write reservation. The digest proves
+                        // this candidate is the save's own bytes, while the source
+                        // signatures prove those bytes did not change display-row
+                        // identity. Absorbed external bytes, compare alignments and
+                        // changed header projections retain reload semantics.
+                        const adoption_reason = request.refreshEvent?.reason === 'postSave'
+                            && request.refreshEvent.savedDigest
+                                === candidate.observation.digest
+                            && source_row_projections_match(source, candidate.borrow())
+                            ? 'save'
+                            : reason;
                         const adopted = adopt_committed_candidate(
                             candidate,
                             committed,
                             request.seq,
-                            reason,
+                            adoption_reason,
                             editing_supported ? await read_file_state() : undefined,
                             request.refreshEvent,
                         );
@@ -6333,7 +6372,7 @@ export function attach_viewer(
         });
         notify_edit_state();
 
-        void refresh_subscription.request('postSave').catch((error) => {
+        void refresh_subscription.request('postSave', saved_digest).catch((error) => {
             if (disposed) return;
             log_sanitized_failure('Post-save refresh request failed (file was written)', error);
             show_owner_warning(

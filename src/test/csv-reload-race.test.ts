@@ -1994,6 +1994,87 @@ describe('CSV reload races', () => {
         vi.useRealTimers();
     });
 
+    it('keeps a compare peer on fileReload semantics after a save changes alignment', async () => {
+        const file_path = '/tmp/compare-post-save.csv';
+        const original_path = '/tmp/compare-post-save-original.csv';
+        let modified = enc.encode('h\na\nc\n');
+        const original = enc.encode('h\na\nb\nc\n');
+        vscode_mock.__setStatImplementation(async (resource) => {
+            const content = resource.fsPath === original_path ? original : modified;
+            return { size: content.byteLength, mtime: 1 };
+        });
+        vscode_mock.__setReadFileImplementation(async (resource) => (
+            resource.fsPath === original_path ? original : modified
+        ));
+        vscode_mock.__setWriteFileImplementation(async (_resource, content) => {
+            modified = new Uint8Array(content);
+        });
+
+        const shared_store = state_store();
+        const owner = open_csv_table(uri(file_path), shared_store);
+        const compare = vscode_mock.window.createWebviewPanel('tableViewer.editor', 'compare');
+        const compare_controller = attach_viewer(
+            compare as unknown as Parameters<typeof attach_viewer>[0],
+            uri(file_path),
+            shared_store,
+            csv_table_profile(),
+            fake_viewer_host,
+            { compare: { originalUri: uri(original_path) } },
+        );
+        compare.onDidDispose(() => compare_controller.dispose());
+        await owner.__receive({ type: 'ready' });
+        await compare.__receive({ type: 'ready' });
+        await vi.waitFor(() => expect(initial_snapshots(compare)).toHaveLength(1));
+        const initial_compare = initial_snapshots(compare)[0];
+        expect(initial_compare.meta.sheets[0].rowCount).toBe(3);
+        await compare.__receive({
+            type: 'requestRows',
+            sheetIndex: 0,
+            startRow: 0,
+            count: 3,
+            requestId: 'alignment-before-save',
+            generation: initial_compare.generation,
+            sourceGeneration: initial_compare.sourceGeneration,
+        });
+        await vi.waitFor(() => expect(compare.__messages).toContainEqual(
+            expect.objectContaining({
+                type: 'compareDiff',
+                requestId: 'alignment-before-save',
+                rowStatus: ['same', 'deleted', 'same'],
+            }),
+        ));
+        await owner.__receive({ type: 'requestEditSession' });
+
+        await owner.__receive({ type: 'saveCsv', edits: { '0:0': 'b' } });
+        await vi.waitFor(() => {
+            expect(source_refresh_snapshots(owner)).toHaveLength(1);
+            expect(source_refresh_snapshots(compare)).toHaveLength(1);
+        });
+
+        expect(source_refresh_snapshots(owner)).toMatchObject([{ reason: 'save' }]);
+        expect(source_refresh_snapshots(compare)).toMatchObject([{
+            reason: 'fileReload',
+            meta: { sheets: [{ rowCount: 3 }] },
+        }]);
+        const refreshed_compare = source_refresh_snapshots(compare)[0];
+        await compare.__receive({
+            type: 'requestRows',
+            sheetIndex: 0,
+            startRow: 0,
+            count: 3,
+            requestId: 'alignment-after-save',
+            generation: refreshed_compare.generation,
+            sourceGeneration: refreshed_compare.sourceGeneration,
+        });
+        await vi.waitFor(() => expect(compare.__messages).toContainEqual(
+            expect.objectContaining({
+                type: 'compareDiff',
+                requestId: 'alignment-after-save',
+                rowStatus: ['deleted', 'same', 'same'],
+            }),
+        ));
+    });
+
     it('absorbs a watcher queued synchronously by writeFile into postSave', async () => {
         const file_path = '/tmp/synchronous-own-watcher.csv';
         let bytes = enc.encode('h\na\n');
@@ -2019,8 +2100,52 @@ describe('CSV reload races', () => {
         await flush_promises();
 
         expect(builds).toBe(2);
-        expect(source_refresh_snapshots(panel)).toHaveLength(1);
+        expect(source_refresh_snapshots(panel)).toMatchObject([{
+            reason: 'save',
+        }]);
         expect(panel.__messages).toContainEqual(expect.objectContaining({ type: 'saveResult', success: true }));
+    });
+
+    it('keeps absorbed external bytes on fileReload semantics', async () => {
+        const file_path = '/tmp/absorbed-external-write.csv';
+        let bytes = enc.encode('h\na\n');
+        let mtime = 1;
+        vscode_mock.__setStatImplementation(async () => ({
+            size: bytes.byteLength,
+            mtime,
+        }));
+        vscode_mock.__setReadFileImplementation(async () => bytes);
+        const panel = open_csv_table(uri(file_path));
+        await panel.__receive({ type: 'ready' });
+        await panel.__receive({ type: 'requestEditSession' });
+        vscode_mock.__setWriteFileImplementation(async (_uri, content) => {
+            bytes = new Uint8Array(content);
+            void vscode_mock.__getActiveWatchers()[0].__fireChange();
+            bytes = enc.encode('h\nexternal\n');
+            mtime = 2;
+        });
+
+        await panel.__receive({ type: 'saveCsv', edits: { '0:0': 'saved' } });
+        await vi.waitFor(() => expect(source_refresh_snapshots(panel)).toHaveLength(1));
+
+        expect(source_refresh_snapshots(panel)).toMatchObject([{
+            reason: 'fileReload',
+        }]);
+        const latest = workbook_snapshots(panel).at(-1)!;
+        await panel.__receive({
+            type: 'requestRows',
+            sheetIndex: 0,
+            startRow: 0,
+            count: 1,
+            requestId: 'absorbed-external-wins',
+            generation: latest.generation,
+            sourceGeneration: latest.sourceGeneration,
+        });
+        expect(panel.__messages).toContainEqual(expect.objectContaining({
+            type: 'rowData',
+            requestId: 'absorbed-external-wins',
+            rows: [[expect.objectContaining({ raw: 'external' })]],
+        }));
     });
 
     it('deduplicates a delayed own watcher only for panels that ACKed postSave', async () => {

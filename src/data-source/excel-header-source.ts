@@ -15,6 +15,7 @@ import {
     read_source_columns,
     read_source_row_indices,
     read_source_rows_indexed,
+    source_row_projection_signature,
 } from './interface';
 import type { MergeRange } from '../types';
 import { sanitize_excel_header_overrides } from '../types';
@@ -164,6 +165,18 @@ export class ExcelHeaderDataSource implements DataSource {
         if (header_row === undefined) return base_row;
         if (base_row === header_row) return undefined;
         return base_row < header_row ? base_row : base_row - 1;
+    }
+
+    row_projection_signature(sheet_index: number): string | undefined {
+        const projection = this.sheets[sheet_index];
+        if (!projection) return undefined;
+        const base_signature = source_row_projection_signature(this.base, sheet_index);
+        if (base_signature === undefined) return undefined;
+        return JSON.stringify([
+            'excel-header:v1',
+            base_signature,
+            active_header_row(projection, projection.override) ?? null,
+        ]);
     }
 
     /** Immutable facts used by pure state planning and CAS conflict retries. */

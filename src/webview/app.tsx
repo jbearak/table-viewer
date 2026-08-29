@@ -574,6 +574,13 @@ export function App(): React.JSX.Element {
     // so the row loader remounts clean; a new file can otherwise collide with the
     // previous one's generation (both start at 1) and surface stale cached pages.
     const [load_epoch, set_load_epoch] = useState(0);
+    // Most generation changes replace the grid because transforms and external
+    // reloads can change row identity under selection and open UI. A successful
+    // save over a natural view only replaces the backing pages, so keep that
+    // grid mounted and let the generation-aware row loader refresh its cache in
+    // place. A transformed view still remounts because source adoption replaces
+    // its display-row mapping before the transform is restored.
+    const [grid_mount_epoch, set_grid_mount_epoch] = useState(0);
     const [active_sheet_index, set_active_sheet_index] = useState(0);
     // Per sheet, not per workbook (#154). Formatting is a view setting like the rest
     // of the right-hand toolbar group, and reading one sheet raw while another stays
@@ -669,9 +676,8 @@ export function App(): React.JSX.Element {
     }, [update_pending_auto_fit_sheets]);
     const [truncation_message, set_truncation_message] = useState<string | null>(null);
     const [preview_mode, set_preview_mode] = useState(false);
-    // GridShell is keyed by generation because a new data view needs a fresh
-    // loader. Keep the live pixel offsets above that boundary so a save refresh
-    // replaces the data without replacing the user's place in the worksheet.
+    // Keep live pixel offsets above GridShell's remount boundary so transforms,
+    // external reloads, and worksheet switches preserve the user's place.
     const grid_scroll_positions_ref = useRef<Map<string, ScrollPosition>>(new Map());
     const [csv_editable, set_csv_editable] = useState(false);
     const [csv_editing_supported, set_csv_editing_supported] = useState(false);
@@ -939,9 +945,23 @@ export function App(): React.JSX.Element {
     // an incoming snapshot either matches the basis, and the record stands whole, or
     // it does not, and the record is replaced whole by the natural view that
     // snapshot describes.
-    const [sheet_views, set_sheet_views] = useState<
+    const [sheet_views, set_sheet_views_state] = useState<
         (SheetViewRecord | undefined)[]
     >([]);
+    // Host messages can arrive before React commits the state update from the
+    // previous message. Keep the installed-view record synchronous so a save
+    // snapshot can decide whether preserving GridShell would retain display-row
+    // state across a mapping change.
+    const sheet_views_ref = useRef<(SheetViewRecord | undefined)[]>([]);
+    const set_sheet_views = useCallback((
+        update: (
+            previous: (SheetViewRecord | undefined)[],
+        ) => (SheetViewRecord | undefined)[],
+    ) => {
+        const next = update(sheet_views_ref.current);
+        sheet_views_ref.current = next;
+        set_sheet_views_state(next);
+    }, []);
     const [pending_transforms, set_pending_transforms] = useState<boolean[]>([]);
     const [pending_transform_labels, set_pending_transform_labels] = useState<string[]>([]);
     const [pending_excel_header, set_pending_excel_header] = useState<string | null>(null);
@@ -2084,13 +2104,10 @@ export function App(): React.JSX.Element {
                     // overlay, so a snapshot that remounts nothing has nothing to
                     // rescue and folding for it commits a value the user never
                     // confirmed, past the point where Escape could take it back. The
-                    // predicate is GridShell's remount key: `generation` (still the
-                    // previous one here), `load_epoch` — which only an 'initial'
-                    // snapshot bumps — and the active sheet, which a refresh can move
-                    // only by clamping to a shrunken sheet list. A same-basis refresh
-                    // is the common case by far, since every edit commit during an
-                    // owned session and every sibling touch of durable state delivers
-                    // one.
+                    // predicate matches GridShell's remount key: an initial load,
+                    // a generation change that cannot refresh in place, or the
+                    // active sheet changing. A save over a natural view is the
+                    // exception because its display rows keep their identities.
                     const previous_sheets = meta_ref.current?.sheets ?? [];
                     const next_sheets = snapshot.meta.sheets;
                     const sheets_moved = previous_sheets.length !== next_sheets.length
@@ -2110,9 +2127,15 @@ export function App(): React.JSX.Element {
                     const active_sheet_changed = previous_active_sheet?.worksheetId !== undefined
                         ? previous_active_sheet.worksheetId !== next_active_sheet?.worksheetId
                         : previous_active_sheet?.name !== next_active_sheet?.name;
+                    const save_refresh_keeps_grid_mounted =
+                        snapshot.reason === 'save'
+                        && sheet_views_ref.current[active_sheet_index]?.permuted === false;
+                    const generation_remounts_the_grid =
+                        !save_refresh_keeps_grid_mounted
+                        && snapshot.generation !== generation_ref.current;
                     const remounts_the_grid =
                         snapshot.presentation === 'initial'
-                        || snapshot.generation !== generation_ref.current
+                        || generation_remounts_the_grid
                         || next_active_sheet_index !== active_sheet_index
                         || active_sheet_changed;
                     if (active_sheet_changed) {
@@ -2520,6 +2543,9 @@ export function App(): React.JSX.Element {
                     }
                     const view_generation_changed =
                         generation_ref.current !== snapshot.generation;
+                    if (view_generation_changed && !save_refresh_keeps_grid_mounted) {
+                        set_grid_mount_epoch((epoch) => epoch + 1);
+                    }
                     const previous_mapping_generations = mapping_generations_ref.current;
                     const changed_mapping_indices = new Set<number>();
                     const mapping_count = Math.max(
@@ -3231,6 +3257,7 @@ export function App(): React.JSX.Element {
                 // projection, including authoritative absence".
                 if (view.basis.generation !== generation_ref.current) {
                     editing_ref.current?.commit_live_edit();
+                    set_grid_mount_epoch((epoch) => epoch + 1);
                 }
                 const origin = pending_transform_origins_ref.current[msg.sheetIndex];
                 pending_transform_request_ids_ref.current[msg.sheetIndex] = undefined;
@@ -3431,6 +3458,7 @@ export function App(): React.JSX.Element {
         persist_immediate,
         queue_preview_scroll,
         reset_save_projection,
+        set_sheet_views,
         update_pending_auto_fit_sheets,
     ]);
 
@@ -6174,7 +6202,7 @@ export function App(): React.JSX.Element {
 
     const grid = (
         <GridShell
-            key={`${active_sheet_index}:${current_sheet.worksheetId ?? current_sheet.name}:${load_epoch}:${generation}`}
+            key={`${active_sheet_index}:${current_sheet.worksheetId ?? current_sheet.name}:${load_epoch}:${grid_mount_epoch}`}
             sheet_meta={current_sheet}
             sheet_index={active_sheet_index}
             pending_formula_impact={formula_impact.forSheet(active_sheet_index)}
