@@ -907,6 +907,63 @@ function validate_edit_cells(value: unknown): Record<string, string | CsvDirtyEn
     return value as Record<string, string | CsvDirtyEntry>;
 }
 
+// Leave enough safe-integer space for later ordered gestures. Orders compare
+// across worksheets, so exhausted values must be rebased over the complete
+// workbook leaf rather than independently inside each sheet's edit store.
+const VALUE_EDIT_ORDER_REBASE_THRESHOLD = Number.MAX_SAFE_INTEGER - 1_000_000_000;
+
+function rebase_pending_edit_orders(
+    slots: (WorksheetPendingEdits | undefined)[],
+): (WorksheetPendingEdits | undefined)[] {
+    const orders = new Set<number>();
+    let latest = 0;
+    const add = (order: number | undefined): void => {
+        if (order === undefined) return;
+        orders.add(order);
+        latest = Math.max(latest, order);
+    };
+    for (const slot of slots) {
+        if (!slot) continue;
+        for (const entry of Object.values(slot.cells)) {
+            if (typeof entry === 'string') continue;
+            add(entry.valueEditOrder);
+            add(entry.movedFrom?.order);
+            for (const previous of entry.movedFrom?.previous ?? []) add(previous.order);
+        }
+    }
+    if (latest < VALUE_EDIT_ORDER_REBASE_THRESHOLD) return slots;
+
+    const replacements = new Map<number, number>([[0, 0]]);
+    [...orders]
+        .filter((order) => order > 0)
+        .sort((left, right) => left - right)
+        .forEach((order, index) => replacements.set(order, index + 1));
+    return slots.map((slot) => {
+        if (!slot) return undefined;
+        const cells = Object.fromEntries(Object.entries(slot.cells).map(([key, entry]) => {
+            if (typeof entry === 'string') return [key, entry];
+            const moved_from = entry.movedFrom === undefined ? undefined : {
+                ...entry.movedFrom,
+                order: replacements.get(entry.movedFrom.order)!,
+                ...(entry.movedFrom.previous === undefined ? {} : {
+                    previous: entry.movedFrom.previous.map((move) => ({
+                        ...move,
+                        order: replacements.get(move.order)!,
+                    })),
+                }),
+            };
+            return [key, {
+                ...entry,
+                ...(moved_from === undefined ? {} : { movedFrom: moved_from }),
+                ...(entry.valueEditOrder === undefined ? {} : {
+                    valueEditOrder: replacements.get(entry.valueEditOrder)!,
+                }),
+            }];
+        }));
+        return { ...slot, cells };
+    });
+}
+
 /**
  * Decode `pendingEdits` in any of its persisted shapes.
  *
@@ -933,7 +990,9 @@ function decode_pending_edits(value: unknown): (WorksheetPendingEdits | undefine
             return decode_pending_edits(value.sheets);
         }
         const cells = validate_edit_cells(value);
-        return Object.keys(cells).length === 0 ? undefined : [{ cells }];
+        return Object.keys(cells).length === 0
+            ? undefined
+            : rebase_pending_edit_orders([{ cells }]);
     }
     if (!Array.isArray(value)) invalid_leaf('pendingEdits');
 
@@ -958,7 +1017,7 @@ function decode_pending_edits(value: unknown): (WorksheetPendingEdits | undefine
     // Trailing empties carry no information; trimming keeps the persisted array
     // from growing once and never shrinking as sheets are saved.
     while (slots.length > 0 && slots[slots.length - 1] === undefined) slots.pop();
-    return slots.length === 0 ? undefined : slots;
+    return slots.length === 0 ? undefined : rebase_pending_edit_orders(slots);
 }
 
 /**
@@ -1692,7 +1751,7 @@ function sanitized_cell_move_intent(value: unknown): CellMoveIntent | undefined 
     }
     if ((value.sourceRow as number) >= 1_048_576 || (value.destinationRow as number) >= 1_048_576
         || (value.sourceCol as number) >= 16_384 || (value.destinationCol as number) >= 16_384
-        || !Number.isSafeInteger(value.order) || (value.order as number) < 0) return undefined;
+        || !is_valid_value_edit_order(value.order)) return undefined;
     return {
         sourceRow: value.sourceRow as number,
         sourceCol: value.sourceCol as number,
@@ -1712,8 +1771,7 @@ function is_valid_move_provenance(
         && Number.isSafeInteger(value.col)
         && (value.col as number) >= 0
         && (value.col as number) < 16_384
-        && Number.isSafeInteger(value.order)
-        && (value.order as number) >= 0
+        && is_valid_value_edit_order(value.order)
         && (
             value.previous === undefined
             || Array.isArray(value.previous)
@@ -1936,8 +1994,7 @@ export function sanitized_dirty_entry(entry: {
         && Number.isSafeInteger(entry.movedFrom.col)
         && (entry.movedFrom.col as number) >= 0
         && (entry.movedFrom.col as number) < 16_384
-        && Number.isSafeInteger(entry.movedFrom.order)
-        && (entry.movedFrom.order as number) >= 0
+        && is_valid_value_edit_order(entry.movedFrom.order)
         && previous_moves.every((move) => move !== undefined)
         ? {
             row: entry.movedFrom.row as number,
@@ -1946,8 +2003,7 @@ export function sanitized_dirty_entry(entry: {
             ...(previous_moves.length === 0 ? {} : { previous: previous_moves as CellMoveIntent[] }),
         }
         : undefined;
-    const value_edit_order = Number.isSafeInteger(entry.valueEditOrder)
-        && (entry.valueEditOrder as number) >= 0
+    const value_edit_order = is_valid_value_edit_order(entry.valueEditOrder)
         ? entry.valueEditOrder as number
         : undefined;
     return make_dirty_entry(

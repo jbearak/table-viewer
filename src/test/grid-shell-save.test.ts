@@ -8,7 +8,9 @@ import type {
     CsvObservedFileBase,
     CsvSaveLifecycle,
     CsvSaveOperation,
+    PerFileState,
 } from '../types';
+import { decode_stored_per_file_state } from '../types';
 import type { EditingHandle } from '../webview/grid-shell';
 import {
     create_edit_session_store,
@@ -1322,12 +1324,14 @@ describe('GridShell edits across a generation bump', () => {
 // the assertions would prove nothing.
 describe('GridShell source-keyed save payloads', () => {
     // Display row 0 shows source row 5 — what a sort or a filter produces.
-    function permute_display_0_to_source_5() {
+    function permute_display_0_to_source_5(
+        source_row_5 = ['five-a', 'five-b', 'five-c'],
+    ) {
         grid_mock.source_row_for_display = (display_row: number) => (
             display_row === 0 ? 5 : display_row + 100
         );
         grid_mock.text_for_source_row = (source_row: number) => (
-            source_row === 5 ? ['five-a', 'five-b', 'five-c'] : ['', '', '']
+            source_row === 5 ? source_row_5 : ['', '', '']
         );
     }
 
@@ -1418,10 +1422,7 @@ describe('GridShell source-keyed save payloads', () => {
     });
 
     it('commit_live_edit preserves a deliberate choice made against a retargeted formula', async () => {
-        permute_display_0_to_source_5();
-        grid_mock.text_for_source_row = (source_row: number) => (
-            source_row === 5 ? ['=A1', 'five-b', 'five-c'] : ['', '', '']
-        );
+        permute_display_0_to_source_5(['=A1', 'five-b', 'five-c']);
         grid_mock.formula_for_source_cell = (source_row, column) => (
             source_row === 5 && column === 0 ? '=A1' : undefined
         );
@@ -1449,7 +1450,7 @@ describe('GridShell source-keyed save payloads', () => {
     });
 });
 
-describe('GridShell host-rejected save keys', () => {
+describe('GridShell edit order and move provenance', () => {
     it('gives a cut source and destination the same move order', async () => {
         const store = create_edit_session_store({ session_id: 'session-1' });
         await render_grid({
@@ -1588,6 +1589,48 @@ describe('GridShell host-rejected save keys', () => {
         expect(store.get('0:2')?.valueEditOrder).toBeGreaterThan(workbook_floor);
     });
 
+    it.each([
+        Number.MAX_SAFE_INTEGER,
+        Number.MAX_SAFE_INTEGER - 1,
+    ])('rebases hydrated edit order %s before issuing another', async (hydrated_order) => {
+        grid_mock.text_for_source_row = () => ['restored', 'middle', '=A1'];
+        const state = decode_stored_per_file_state({
+            pendingEdits: [{
+                cells: {
+                    '0:0': {
+                        value: 'restored',
+                        base: 'base',
+                        valueEditOrder: hydrated_order,
+                    },
+                },
+            }],
+        }) as PerFileState;
+        const store = create_edit_session_store(
+            { session_id: 'session-1' },
+            state.pendingEdits?.[0]?.cells,
+        );
+        await render_grid({
+            visible_to_source: [0, 1, 2],
+            source_to_visible: [0, 1, 2],
+            hidden_count: 0,
+        }, {
+            edit_session: store,
+            edit_syntax: 'markdown',
+        });
+        const restored_order = store.get('0:0')?.valueEditOrder;
+        expect(store.get('0:0')).toMatchObject({ value: 'restored', base: 'base' });
+        expect(restored_order).toEqual(expect.any(Number));
+        expect(restored_order).toBeLessThan(hydrated_order);
+
+        await act(async () => {
+            grid_mock.props!.onCellsEdited!([
+                { location: [2, 0], value: { kind: 'text', data: '=A1' } },
+            ], 'paste');
+        });
+
+        expect(store.get('0:2')?.valueEditOrder).toBeGreaterThan(restored_order!);
+    });
+
     it('discard_keys removes both halves of a pending move', async () => {
         const store = create_edit_session_store({ session_id: 'session-1' });
         store.install(
@@ -1611,7 +1654,9 @@ describe('GridShell host-rejected save keys', () => {
 
         expect(Object.fromEntries(store.snapshot())).toEqual({});
     });
+});
 
+describe('GridShell host-rejected save keys', () => {
     it('discard_keys drops a host-named edit that discard_conflicted retains', async () => {
         // Display row 0 shows source row 5, and source row 5's text still matches
         // the edit's base, so is_entry_conflicted is false for it — the residency /

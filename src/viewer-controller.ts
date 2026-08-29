@@ -8387,8 +8387,7 @@ export function attach_viewer(
                 // queueing.
                 if (
                     save_blocks_history_replay()
-                    || replay_preparation_in_flight
-                    || replay_leases.current(Date.now()) !== undefined
+                    || history_replay_blocks_save()
                 ) {
                     refuse('busy');
                     return;
