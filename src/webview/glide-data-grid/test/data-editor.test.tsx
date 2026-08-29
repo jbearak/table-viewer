@@ -4182,8 +4182,10 @@ a new line char ""more quotes"" plus a tab  ."	https://google.com`)
 
         // Cross the entire fixed runway. This proves the stationary pointer is
         // being serviced by repeated edge-scroll frames, not just one tick.
-        await vi.waitFor(() => expect(scroller?.scrollLeft).toBeGreaterThan(32));
-        expect(widths.at(-1)).toBeGreaterThan(531);
+        await vi.waitFor(() => {
+            expect(scroller?.scrollLeft).toBeGreaterThan(32);
+            expect(widths.at(-1)).toBeGreaterThan(531);
+        });
 
         fireEvent.keyDown(window, { key: "Escape" });
         expect(resizeEnd).toHaveBeenCalledTimes(1);
@@ -4277,6 +4279,36 @@ a new line char ""more quotes"" plus a tab  ."	https://google.com`)
             cancelAnimationFrame.mockRestore();
         }
     );
+
+    test("Resize Last Column commits when a later move reports the primary button released", () => {
+        vi.useFakeTimers();
+        const resizeEnd = vi.fn();
+        render(
+            <EventedDataEditor
+                {...basicProps}
+                columns={[
+                    { title: "A", width: 500 },
+                    { title: "B", width: 494 },
+                ]}
+                overscrollX={32}
+                onColumnResize={vi.fn()}
+                onColumnResizeEnd={resizeEnd}
+            />,
+            { wrapper: Context }
+        );
+        prep();
+        const cancelAnimationFrame = vi.spyOn(window, "cancelAnimationFrame");
+        const canvas = screen.getByTestId("data-grid-canvas");
+        fireEvent.mouseDown(canvas, { clientX: 994, clientY: 16 });
+        fireEvent.mouseMove(canvas, { clientX: 999, clientY: 16, buttons: 1 });
+
+        fireEvent.mouseMove(window, { clientX: 999, clientY: 16, buttons: 0 });
+        fireEvent.mouseMove(window, { clientX: 999, clientY: 16, buttons: 0 });
+
+        expect(resizeEnd).toHaveBeenCalledTimes(1);
+        expect(cancelAnimationFrame).toHaveBeenCalled();
+        cancelAnimationFrame.mockRestore();
+    });
 
     test("Resize Last Column cancels edge scrolling on unmount", () => {
         vi.useFakeTimers();

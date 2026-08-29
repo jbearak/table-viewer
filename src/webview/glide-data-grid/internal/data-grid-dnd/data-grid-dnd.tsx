@@ -191,6 +191,33 @@ const DataGridDnd: React.FunctionComponent<DataGridDndProps> = p => {
         resizeEdgeScrollLastTimeRef.current = undefined;
     }, []);
 
+    const fanOutSelectedColumnResize = React.useCallback(
+        (
+            currentResizeCol: number,
+            rawWidth: number,
+            callback: DataGridDndProps["onColumnResize"]
+        ) => {
+            if (callback === undefined) return;
+            for (const selected of selectedColumns) {
+                if (selected === currentResizeCol) continue;
+                const selectedColumn = columns[selected];
+                const selectedSize = offsetColumnSize(
+                    selectedColumn,
+                    rawWidth,
+                    minColumnWidth,
+                    maxColumnWidth
+                );
+                callback(
+                    selectedColumn,
+                    selectedSize,
+                    selected,
+                    selectedSize + (selectedColumn.growOffset ?? 0)
+                );
+            }
+        },
+        [columns, maxColumnWidth, minColumnWidth, selectedColumns]
+    );
+
     const applyColumnResizeAtPointer = React.useCallback((pointerX: number) => {
         const colIndex = resizeColRef.current;
         const startX = resizeColStartXRef.current;
@@ -211,27 +238,13 @@ const DataGridDnd: React.FunctionComponent<DataGridDndProps> = p => {
         lastResizeWidthRef.current = rawWidth;
 
         if (selectedColumns?.first() === colIndex) {
-            for (const selected of selectedColumns) {
-                if (selected === colIndex) continue;
-                const selectedColumn = columns[selected];
-                const selectedSize = offsetColumnSize(
-                    selectedColumn,
-                    rawWidth,
-                    minColumnWidth,
-                    maxColumnWidth
-                );
-                onColumnResize?.(
-                    selectedColumn,
-                    selectedSize,
-                    selected,
-                    selectedSize + (selectedColumn.growOffset ?? 0)
-                );
-            }
+            fanOutSelectedColumnResize(colIndex, rawWidth, onColumnResize);
         }
     }, [
         canvasRef,
         columns,
         eventTargetRef,
+        fanOutSelectedColumnResize,
         maxColumnWidth,
         minColumnWidth,
         onColumnResize,
@@ -246,42 +259,49 @@ const DataGridDnd: React.FunctionComponent<DataGridDndProps> = p => {
         });
     }, []);
 
-    resizeEdgeScrollTickRef.current = timestamp => {
-        const colIndex = resizeColRef.current;
-        const pointerX = resizePointerXRef.current;
-        const scroller = eventTargetRef?.current;
-        if (colIndex === undefined || pointerX === undefined || scroller == null) return;
-        if (colIndex !== columns.length - 1) return;
+    const resizeEdgeScrollTick = React.useCallback(
+        (timestamp: number) => {
+            const colIndex = resizeColRef.current;
+            const pointerX = resizePointerXRef.current;
+            const scroller = eventTargetRef?.current;
+            if (colIndex === undefined || pointerX === undefined || scroller == null) return;
+            if (colIndex !== columns.length - 1) return;
 
-        const previousTimestamp = resizeEdgeScrollLastTimeRef.current;
-        resizeEdgeScrollLastTimeRef.current = timestamp;
-        const frameDistance = columnResizeEdgeScrollDistance(
-            pointerX,
-            scroller.getBoundingClientRect().right,
-            previousTimestamp === undefined ? 1000 / 60 : timestamp - previousTimestamp
-        );
+            const previousTimestamp = resizeEdgeScrollLastTimeRef.current;
+            resizeEdgeScrollLastTimeRef.current = timestamp;
+            const frameDistance = columnResizeEdgeScrollDistance(
+                pointerX,
+                scroller.getBoundingClientRect().right,
+                previousTimestamp === undefined ? 1000 / 60 : timestamp - previousTimestamp
+            );
 
-        const column = columns[colIndex];
-        const maximumRawWidth = maxColumnWidth + (column.growOffset ?? 0);
-        const distance = columnResizeEdgeScrollDistanceBeforeMax(
-            frameDistance,
-            lastResizeWidthRef.current,
-            maximumRawWidth
-        );
-        if (distance === 0) return;
+            const column = columns[colIndex];
+            const maximumRawWidth = maxColumnWidth + (column.growOffset ?? 0);
+            const distance = columnResizeEdgeScrollDistanceBeforeMax(
+                frameDistance,
+                lastResizeWidthRef.current,
+                maximumRawWidth
+            );
+            if (distance === 0) return;
 
-        const before = scroller.scrollLeft;
-        scroller.scrollLeft = before + distance;
-        if (scroller.scrollLeft !== before) {
-            applyColumnResizeAtPointer(pointerX);
-            scheduleResizeEdgeScroll();
-        } else {
-            // A controlled grid may not have applied the preceding width yet,
-            // or may intentionally ignore it. Stop the hot loop; a later
-            // columns update restarts edge scrolling below.
-            resizeEdgeScrollLastTimeRef.current = undefined;
-        }
-    };
+            const before = scroller.scrollLeft;
+            scroller.scrollLeft = before + distance;
+            if (scroller.scrollLeft !== before) {
+                applyColumnResizeAtPointer(pointerX);
+                scheduleResizeEdgeScroll();
+            } else {
+                // A controlled grid may not have applied the preceding width yet,
+                // or may intentionally ignore it. Stop the hot loop; a later
+                // columns update restarts edge scrolling below.
+                resizeEdgeScrollLastTimeRef.current = undefined;
+            }
+        },
+        [applyColumnResizeAtPointer, columns, eventTargetRef, maxColumnWidth, scheduleResizeEdgeScroll]
+    );
+
+    React.useEffect(() => {
+        resizeEdgeScrollTickRef.current = resizeEdgeScrollTick;
+    }, [resizeEdgeScrollTick]);
 
     React.useEffect(() => {
         const colIndex = resizeColRef.current;
@@ -413,53 +433,30 @@ const DataGridDnd: React.FunctionComponent<DataGridDndProps> = p => {
         // If the column is in the selection, the selection may contain extra
         // columns. Re-send the last resize to all of them before the end event.
         if (selectedColumns?.hasIndex(currentResizeCol) === true) {
-            for (const selected of selectedColumns) {
-                if (selected === currentResizeCol) continue;
-                const selectedColumn = columns[selected];
-                const selectedSize = offsetColumnSize(
-                    selectedColumn,
-                    lastResizeWidthRef.current,
-                    minColumnWidth,
-                    maxColumnWidth
-                );
-                onColumnResize?.(
-                    selectedColumn,
-                    selectedSize,
-                    selected,
-                    selectedSize + (selectedColumn.growOffset ?? 0)
-                );
-            }
+            fanOutSelectedColumnResize(currentResizeCol, lastResizeWidthRef.current, onColumnResize);
         }
 
         const column = columns[currentResizeCol];
         const size = offsetColumnSize(column, lastResizeWidthRef.current, minColumnWidth, maxColumnWidth);
         onColumnResizeEnd?.(column, size, currentResizeCol, size + (column.growOffset ?? 0));
         if (selectedColumns.hasIndex(currentResizeCol)) {
-            for (const selected of selectedColumns) {
-                if (selected === currentResizeCol) continue;
-                const selectedColumn = columns[selected];
-                const selectedSize = offsetColumnSize(
-                    selectedColumn,
-                    lastResizeWidthRef.current,
-                    minColumnWidth,
-                    maxColumnWidth
-                );
-                onColumnResizeEnd?.(
-                    selectedColumn,
-                    selectedSize,
-                    selected,
-                    selectedSize + (selectedColumn.growOffset ?? 0)
-                );
-            }
+            fanOutSelectedColumnResize(currentResizeCol, lastResizeWidthRef.current, onColumnResizeEnd);
         }
     }, [
         columns,
+        fanOutSelectedColumnResize,
         maxColumnWidth,
         minColumnWidth,
         onColumnResize,
         onColumnResizeEnd,
         selectedColumns,
     ]);
+
+    const finishInterruptedResize = React.useCallback(() => {
+        if (resizeColRef.current === undefined) return;
+        finishColumnResize();
+        clearAll();
+    }, [clearAll, finishColumnResize]);
 
     const onMouseUpImpl = React.useCallback(
         (args: GridMouseEventArgs, isOutside: boolean) => {
@@ -489,11 +486,6 @@ const DataGridDnd: React.FunctionComponent<DataGridDndProps> = p => {
     );
 
     React.useEffect(() => {
-        const finishInterruptedResize = () => {
-            if (resizeColRef.current === undefined) return;
-            finishColumnResize();
-            clearAll();
-        };
         const finishResizeOnEscape = (event: KeyboardEvent) => {
             if (event.key === "Escape") finishInterruptedResize();
         };
@@ -505,7 +497,7 @@ const DataGridDnd: React.FunctionComponent<DataGridDndProps> = p => {
             window.removeEventListener("pointercancel", finishInterruptedResize);
             window.removeEventListener("keydown", finishResizeOnEscape);
         };
-    }, [clearAll, finishColumnResize]);
+    }, [finishInterruptedResize]);
 
     const dragOffset = React.useMemo(() => {
         if (dragCol === undefined || dropCol === undefined) return undefined;
@@ -522,6 +514,12 @@ const DataGridDnd: React.FunctionComponent<DataGridDndProps> = p => {
     const onMouseMove = React.useCallback(
         (event: MouseEvent) => {
             const canvas = canvasRef?.current;
+            // A release outside the webview may not deliver mouseup. The first
+            // later move still reports the current primary-button state.
+            if (resizeColRef.current !== undefined && event.buttons === 0) {
+                finishInterruptedResize();
+                return;
+            }
             if (dragCol !== undefined && dragStartX !== undefined) {
                 const diff = Math.abs(event.clientX - dragStartX);
                 if (diff > 20) {
@@ -557,6 +555,7 @@ const DataGridDnd: React.FunctionComponent<DataGridDndProps> = p => {
             canvasRef,
             applyColumnResizeAtPointer,
             eventTargetRef,
+            finishInterruptedResize,
             scheduleResizeEdgeScroll,
             stopResizeEdgeScroll,
         ]
