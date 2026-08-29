@@ -3,6 +3,7 @@ import {
     update_formula_cached_values,
     worksheet_formula_dependencies,
     worksheet_formula_move_edits,
+    worksheet_structured_formula_rename_edits,
     is_xlsx_formula_edit,
     worksheet_content_cells,
     type XlsxCellEdit,
@@ -14,6 +15,8 @@ import {
 import type { FormulaCalculationResult } from './formula-calculation';
 import {
     compile_a1_formula_move_retargeter,
+    retarget_renamed_structured_formula,
+    type StructuredFormulaColumnRename,
     type XlsxFormulaCellMove,
 } from './xlsx-formula';
 import type { PackedFormulaDependencies } from './data-source/interface';
@@ -353,6 +356,7 @@ export interface XlsxWorkbookWriteOptions {
     }[];
     /** Opaque cache plan precomputed for this exact edit set. */
     readonly formulaWritePlan?: XlsxFormulaWritePlan;
+    readonly structuredColumnRenames?: readonly StructuredFormulaColumnRename[];
 }
 
 /**
@@ -550,6 +554,50 @@ export function write_xlsx_workbook_cell_edits(
                 sheet_index,
                 sheet_names,
                 moves,
+                excluded,
+                formula_budget,
+            );
+            if (derived.length === 0) continue;
+            active_by_index.set(sheet_index, {
+                sheetIndex: sheet_index,
+                edits: [...(current?.edits ?? []), ...derived],
+                ...(current?.link_edits === undefined ? {} : { link_edits: current.link_edits }),
+            });
+        }
+        active = [...active_by_index.values()].sort(
+            (left, right) => left.sheetIndex - right.sheetIndex,
+        );
+    }
+    const structured_renames = options?.structuredColumnRenames ?? [];
+    if (structured_renames.length > 0) {
+        active = active.map((worksheet) => ({
+            ...worksheet,
+            edits: worksheet.edits.map((edit) => !is_xlsx_formula_edit(edit) ? edit : ({
+                ...edit,
+                value: retarget_renamed_structured_formula(
+                    edit.value,
+                    worksheet.sheetIndex,
+                    sheet_names,
+                    structured_renames,
+                ),
+            })),
+        }));
+        const formula_budget = create_workbook_budget();
+        const active_by_index = new Map(active.map((entry) => [entry.sheetIndex, entry]));
+        for (let sheet_index = 0; sheet_index < parts.length; sheet_index += 1) {
+            const content = read_worksheet_bytes(
+                sheet_index,
+                'Could not read a worksheet to rename a column',
+            );
+            const current = active_by_index.get(sheet_index);
+            const excluded = new Set((current?.edits ?? []).map(
+                (edit) => `${edit.row}:${edit.col}`,
+            ));
+            const derived = worksheet_structured_formula_rename_edits(
+                worksheet_scan_input(content),
+                sheet_index,
+                sheet_names,
+                structured_renames,
                 excluded,
                 formula_budget,
             );

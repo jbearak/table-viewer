@@ -5,6 +5,18 @@ import {
     type MenuSeparator,
 } from './context-menu';
 import type { SortDirection } from '../types';
+import type { SheetMeta } from '../data-source/interface';
+
+/** Merged children can inherit a displayed header but are not editable cells. */
+export function header_column_can_be_renamed(sheet: SheetMeta, column: number): boolean {
+    if (sheet.excelFirstRowHeader?.active !== true) return false;
+    if (sheet.columnHeaderEditable !== undefined) {
+        return sheet.columnHeaderEditable[column] === true;
+    }
+    const edit_text = sheet.columnHeaderEditTexts?.[column];
+    const displayed_name = sheet.columnNames?.[column];
+    return edit_text !== undefined && (edit_text !== '' || displayed_name === '');
+}
 
 export interface ColumnContextMenuProps {
     x: number;
@@ -19,6 +31,8 @@ export interface ColumnContextMenuProps {
     any_filtered: boolean;
     on_copy: () => void;
     on_hide: () => void;
+    on_rename?: () => void;
+    rename_disabled?: boolean;
     on_sort: (direction: SortDirection, append: boolean) => void;
     on_clear_column_sort: () => void;
     on_clear_all_sorts: () => void;
@@ -36,6 +50,11 @@ export function column_context_menu_items(
         { label: 'Copy column', on_click: () => props.on_copy() },
         { label: 'Hide column', on_click: () => props.on_hide() },
     ];
+    if (props.on_rename) items.push({
+        label: 'Rename column…',
+        on_click: props.on_rename,
+        disabled: props.rename_disabled,
+    });
     if (!props.transform_sections) return items;
     items.push(
         { kind: 'separator' },

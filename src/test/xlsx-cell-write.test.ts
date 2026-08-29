@@ -1872,6 +1872,64 @@ describe('widen_dimension', () => {
 });
 
 describe('write_xlsx_cell_edits', () => {
+    it('rewrites local and qualified formulas when a Header Row column is renamed', async () => {
+        const raw = patched_basic([
+            [
+                '/xl/worksheets/sheet1.xml',
+                '<c r="C2" t="b"><v>1</v></c>',
+                '<c r="C2"><f>SUM([Age])</f><v>55</v></c>',
+            ],
+            [
+                '/xl/worksheets/sheet2.xml',
+                '<c r="C2"><v>100</v></c>',
+                '<c r="C2"><f>people![Age]</f><v>55</v></c>',
+            ],
+        ]);
+
+        const out = write_xlsx_workbook_cell_edits(raw, [{
+            sheetIndex: 0,
+            edits: [{ row: 0, col: 1, value: 'Years', force_text: true }],
+        }], {
+            structuredColumnRenames: [{ sheetIndex: 0, oldName: 'Age', newName: 'Years' }],
+        });
+        const { data } = await parse_xlsx(out);
+
+        expect(data.sheets[0].rows[0][1]?.raw).toBe('Years');
+        expect(data.sheets[0].rows[1][2]?.formula).toBe('=SUM([Years])');
+        expect(data.sheets[1].rows[1][2]?.formula).toBe('=people![Years]');
+    });
+
+    it('preserves shared and array formula groups while renaming their column reference', () => {
+        const raw = patched_basic([
+            [
+                '/xl/worksheets/sheet1.xml',
+                '<c r="C2" t="b"><v>1</v></c>',
+                '<c r="C2"><f t="shared" ref="C2:C3" si="0">SUM([Age])</f><v>55</v></c>'
+                    + '<c r="C3"><f t="shared" si="0"/><v>66</v></c>',
+            ],
+            [
+                '/xl/worksheets/sheet2.xml',
+                '<c r="C2"><v>100</v></c>',
+                '<c r="C2"><f t="array" ref="C2:C3">people![Age]</f><v>55</v></c>'
+                    + '<c r="C3"><v>66</v></c>',
+            ],
+        ]);
+
+        const out = write_xlsx_workbook_cell_edits(raw, [{
+            sheetIndex: 0,
+            edits: [{ row: 0, col: 1, value: 'Years', force_text: true }],
+        }], {
+            structuredColumnRenames: [{ sheetIndex: 0, oldName: 'Age', newName: 'Years' }],
+        });
+        const shared = part(out, '/xl/worksheets/sheet1.xml')?.toString('utf8') ?? '';
+        const array = part(out, '/xl/worksheets/sheet2.xml')?.toString('utf8') ?? '';
+
+        expect(shared).toContain('<f t="shared" ref="C2:C3" si="0">SUM([Years])</f>');
+        expect(shared).toContain('<f t="shared" si="0"/>');
+        expect(array).toContain('<f t="array" ref="C2:C3">people![Years]</f>');
+        expect(array).not.toContain('<c r="C3"><v>66</v></c>');
+    });
+
     it('reopens saved formula dependents as unknown instead of stale cached values', async () => {
         const raw = patched_parts([[
             '/xl/worksheets/sheet1.xml',

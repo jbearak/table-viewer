@@ -45,6 +45,7 @@ import {
 import { parse_relationships, rels_path_for_part, type OoxmlRelationship } from './ooxml-relationships';
 import {
     workbook_a1_formula_references,
+    structured_formula_references,
     translate_a1_formula,
     UNKNOWN_XLSX_FORMULA_RESULT,
 } from './xlsx-formula';
@@ -397,6 +398,8 @@ function parse_dimension(xml: Uint8Array): { row_count: number; col_count: numbe
 interface WorksheetWorking extends WorkingSet {
     merges: MergeRange[];
     formula_dependencies: number[];
+    structured_formula_names: string[];
+    structured_formula_references: number[];
     formula_cells: number[];
     pending_formula_cells: number[];
 }
@@ -564,6 +567,9 @@ function parse_worksheet_core(
     const cells = new Map<string, CellData>();
     const opaque_formula_cells = new Set<string>();
     const formula_dependencies: number[] = [];
+    const structured_formula_names: string[] = [];
+    const structured_formula_name_indices = new Map<string, number>();
+    const packed_structured_formula_references: number[] = [];
     const formula_cells: number[] = [];
     const pending_formula_cells: number[] = [];
     let max_row = 0;
@@ -833,6 +839,31 @@ function parse_worksheet_core(
                                 reference.lastColumn,
                             );
                         }
+                        for (const reference of structured_formula_references(formula_text)) {
+                            const source_sheet_index = reference.sheetName === undefined
+                                ? sheet_index
+                                : sheet_names.findIndex((name) => name.localeCompare(
+                                    reference.sheetName!, undefined, { sensitivity: 'accent' },
+                                ) === 0);
+                            if (source_sheet_index < 0) continue;
+                            let name_index = structured_formula_name_indices.get(
+                                reference.columnName,
+                            );
+                            if (name_index === undefined) {
+                                name_index = structured_formula_names.length;
+                                structured_formula_names.push(reference.columnName);
+                                structured_formula_name_indices.set(reference.columnName, name_index);
+                            }
+                            assert_safe_formula_references(budget, 1);
+                            if (!reference.intersection) assert_safe_formula_ranges(budget, 1);
+                            packed_structured_formula_references.push(
+                                row,
+                                col,
+                                source_sheet_index,
+                                reference.intersection ? 1 : 0,
+                                name_index,
+                            );
+                        }
                     }
                 }
                 const cell: CellData = {
@@ -953,6 +984,8 @@ function parse_worksheet_core(
             merged_cells,
             merges: [],
             formula_dependencies,
+            structured_formula_names,
+            structured_formula_references: packed_structured_formula_references,
             formula_cells,
             pending_formula_cells,
             row_count: 0,
@@ -994,6 +1027,8 @@ function parse_worksheet_core(
         merged_cells,
         merges: normalized_merges,
         formula_dependencies,
+        structured_formula_names,
+        structured_formula_references: packed_structured_formula_references,
         formula_cells,
         pending_formula_cells,
         row_count,
@@ -1134,6 +1169,12 @@ export async function parse_xlsx(buffer: Uint8Array): Promise<{ data: WorkbookDa
             ...(working.formula_dependencies.length
                 ? { formulaDependencies: working.formula_dependencies }
                 : {}),
+            ...(working.structured_formula_references.length ? {
+                structuredFormulaReferences: {
+                    names: working.structured_formula_names,
+                    references: working.structured_formula_references,
+                },
+            } : {}),
             ...(working.formula_cells.length
                 ? { formulaCells: working.formula_cells }
                 : {}),
@@ -1193,6 +1234,10 @@ export async function parse_xlsx_streaming(buffer: Uint8Array): Promise<Streamin
             working.merges,
             entry.worksheetId,
             working.formula_dependencies,
+            working.structured_formula_references.length ? {
+                names: working.structured_formula_names,
+                references: working.structured_formula_references,
+            } : undefined,
             working.formula_cells,
             working.pending_formula_cells,
         ));

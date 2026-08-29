@@ -1,5 +1,9 @@
 import { describe, expect, it, vi } from 'vitest';
-import { column_context_menu_items } from '../webview/column-context-menu';
+import {
+    column_context_menu_items,
+    header_column_can_be_renamed,
+} from '../webview/column-context-menu';
+import { column_rename_error } from '../webview/rename-column-dialog';
 
 function labels(items: ReturnType<typeof column_context_menu_items>): string[] {
     return items.flatMap((item) => item.kind === 'separator' ? [] : [item.label]);
@@ -27,6 +31,57 @@ function base() {
 }
 
 describe('column context menu model', () => {
+    it('does not rename a header inherited from a merged anchor', () => {
+        const sheet = {
+            name: 'Sheet1', rowCount: 2, sourceRowCount: 3, columnCount: 2,
+            merges: [], hasFormatting: false,
+            columnNames: ['Group', 'Direct'],
+            columnHeaderEditTexts: ['', 'Direct'],
+            columnHeaderEditable: [false, true],
+            excelFirstRowHeader: {
+                mode: 'on' as const, detected: false, active: true, available: true, sourceRow: 1,
+            },
+        };
+        expect(header_column_can_be_renamed(sheet, 0)).toBe(false);
+        expect(header_column_can_be_renamed(sheet, 1)).toBe(true);
+        expect(header_column_can_be_renamed({
+            ...sheet,
+            columnNames: ['', 'Direct'],
+            columnHeaderEditable: [false, true],
+        }, 0)).toBe(false);
+
+        const items = column_context_menu_items({
+            ...base(),
+            on_rename: vi.fn(),
+            rename_disabled: !header_column_can_be_renamed(sheet, 0),
+        });
+        const rename = items.find((item) => item.kind !== 'separator'
+            && item.label === 'Rename column…');
+        expect(rename && rename.kind !== 'separator' ? rename.disabled : undefined).toBe(true);
+    });
+
+    it('offers a column rename only when the caller admits it', () => {
+        const on_rename = vi.fn();
+        const items = column_context_menu_items({
+            ...base(),
+            transform_sections: false,
+            on_rename,
+        });
+        expect(labels(items)).toEqual(['Copy column', 'Hide column', 'Rename column…']);
+        const rename = items.find((item) => item.kind !== 'separator'
+            && item.label === 'Rename column…');
+        if (!rename || rename.kind === 'separator') throw new Error('missing rename action');
+        rename.on_click({} as never);
+        expect(on_rename).toHaveBeenCalledOnce();
+    });
+
+    it('validates renamed headers with the same normalized uniqueness rule', () => {
+        expect(column_rename_error('', ['Revenue', 'Units'], 0)).toBe('Enter a column name.');
+        expect(column_rename_error('  UNITS  ', ['Revenue', 'Units'], 0))
+            .toBe('Another column already has that name.');
+        expect(column_rename_error('Net Revenue', ['Revenue', 'Units'], 0)).toBeUndefined();
+    });
+
     it('keeps Copy column and Hide column in preview/edit while omitting transforms', () => {
         const props = { ...base(), transform_sections: false };
         expect(labels(column_context_menu_items(props))).toEqual(['Copy column', 'Hide column']);

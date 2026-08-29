@@ -1466,6 +1466,25 @@ describe('use_editing — history capture', () => {
         expect(undo_stack()[0].action.changes).toHaveLength(1);
     });
 
+    it('records an explicitly materialized cell outside the resident projection', async () => {
+        await render_capturing();
+        await act(async () => {
+            expect(hook_result!.commit_edits([{
+                source_row: 99,
+                source_col: 2,
+                value: 'Net Revenue',
+                persistedCell: { raw: 'Revenue', bold: true },
+            }], 'Rename column')).toBe(true);
+        });
+
+        expect(hook_result!.dirty_cells.get('99:2')).toMatchObject({
+            base: 'Revenue',
+            value: 'Net Revenue',
+        });
+        expect(undo_stack()[0].action.label).toBe('Rename column');
+        expect(undo_stack()[0].action.changes).toHaveLength(1);
+    });
+
     it('ignores negative and fractional coordinates', async () => {
         await render_capturing();
         await act(async () => {

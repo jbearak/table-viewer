@@ -408,6 +408,7 @@ describe('ExcelHeaderDataSource', () => {
         const enabled = ds.meta().sheets[0];
         expect(enabled.excelFirstRowHeader).toMatchObject({ mode: 'on', active: true });
         expect(enabled.columnNames).toEqual(['Name', '']);
+        expect(enabled.columnHeaderEditable).toEqual([true, false]);
         expect(enabled.rowCount).toBe(2);
         expect(enabled.merges).toEqual([
             { startRow: 0, startCol: 0, endRow: 1, endCol: 0 },
@@ -502,6 +503,7 @@ describe('ExcelHeaderDataSource', () => {
             'Country label',
             'Selected B',
         ]);
+        expect(input.sheets[0].manualHeaderEditable).toEqual([false, false]);
         expect(base.read_requests.slice(reads_before)).toEqual([
             { start: 2, count: 1 },
             { start: 1, count: 1 },

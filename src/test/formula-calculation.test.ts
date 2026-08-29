@@ -28,7 +28,12 @@ function cell(
 }
 
 function workbook(
-    sheets: readonly { name: string; rows: (RenderedCell | null)[][] }[],
+    sheets: readonly {
+        name: string;
+        rows: (RenderedCell | null)[][];
+        headerRow?: number;
+        columnNames?: string[];
+    }[],
 ): DataSource {
     const meta: WorkbookMeta = {
         hasFormatting: false,
@@ -39,6 +44,16 @@ function workbook(
             columnCount: Math.max(0, ...sheet.rows.map((row) => row.length)),
             merges: [],
             hasFormatting: false,
+            ...(sheet.columnNames ? {
+                columnNames: sheet.columnNames,
+                excelFirstRowHeader: {
+                    mode: 'on' as const,
+                    detected: false,
+                    active: true,
+                    available: true,
+                    sourceRow: sheet.headerRow ?? 0,
+                },
+            } : {}),
         })),
     };
     return {
@@ -61,6 +76,66 @@ const target = (sheetIndex: number, row: number, column: number): FormulaCalcula
 });
 
 describe('calculate_workbook_formulas', () => {
+    it('calculates Header Row column ranges and row intersections', () => {
+        const source = workbook([{ name: 'Data', columnNames: ['Revenue', 'Units'], rows: [
+            [cell('Revenue', { rawType: 'string' }), cell('Units', { rawType: 'string' })],
+            [cell('10'), cell('2'), cell('0', { formula: '=SUM([Revenue])+[@Units]' })],
+            [cell('20'), cell('3')],
+        ] }]);
+
+        expect(calculate_workbook_formulas(source, {
+            edits: [],
+            targets: [target(0, 1, 2)],
+        })).toEqual([{ ...target(0, 1, 2), value: '32' }]);
+    });
+
+    it('resolves qualified worksheet columns and the target physical row', () => {
+        const source = workbook([
+            { name: 'Output', rows: [[], [cell('0', { formula: "='Sales Q1'![@Revenue]" })]] },
+            { name: 'Sales Q1', columnNames: ['Revenue'], rows: [
+                [cell('Revenue', { rawType: 'string' })], [cell('7')],
+            ] },
+        ]);
+
+        expect(calculate_workbook_formulas(source, {
+            edits: [],
+            targets: [target(0, 1, 0)],
+        })).toEqual([{ ...target(0, 1, 0), value: '7' }]);
+    });
+
+    it('resolves both old and pending names during an unsaved column rename', () => {
+        const source = workbook([{ name: 'Data', columnNames: ['Revenue', 'Formula'], rows: [
+            [cell('Revenue', { rawType: 'string' }), cell('Formula', { rawType: 'string' })],
+            [cell('5'), cell('0', { formula: '=SUM([Revenue])+SUM([Net Revenue])' })],
+        ] }]);
+
+        expect(calculate_workbook_formulas(source, {
+            edits: [{
+                ...target(0, 0, 0),
+                value: 'Net Revenue',
+                writesFormula: false,
+            }],
+            targets: [target(0, 1, 1)],
+        })).toEqual([{ ...target(0, 1, 1), value: '10' }]);
+    });
+
+    it('reports precise Header Row reference failures', () => {
+        const source = workbook([{ name: 'Data', columnNames: ['Revenue', 'Revenue'], rows: [
+            [cell('Revenue'), cell('Revenue'), cell('0', { formula: '=[Revenue]' })],
+            [cell('1'), cell('2')],
+        ] }]);
+        expect(calculate_workbook_formulas(source, {
+            edits: [
+                { ...target(0, 0, 2), value: '=[Missing]', writesFormula: true },
+                { ...target(0, 1, 0), value: '=[Revenue]', writesFormula: true },
+            ],
+            targets: [target(0, 0, 2), target(0, 1, 0)],
+        })).toEqual([
+            { ...target(0, 0, 2), error: 'unknown column' },
+            { ...target(0, 1, 0), error: 'ambiguous column' },
+        ]);
+    });
+
     it('calculates arithmetic with precedence, unary operators, powers, and percentages', () => {
         const source = workbook([{ name: 'Sheet1', rows: [[
             cell('2'),

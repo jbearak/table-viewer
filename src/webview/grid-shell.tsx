@@ -63,7 +63,11 @@ import {
     cell_context_menu_items,
     has_distinct_copy_selection,
 } from './cell-context-menu';
-import { ColumnContextMenu, MultiColumnContextMenu } from './column-context-menu';
+import {
+    ColumnContextMenu,
+    header_column_can_be_renamed,
+    MultiColumnContextMenu,
+} from './column-context-menu';
 import {
     grid_selection_contains_column,
     header_drag_columns,
@@ -116,6 +120,7 @@ import { is_rich_text_cell, rich_text_cell_renderer } from './rich-text-cell-ren
 import { parse_http_external_url } from '../external-url';
 import type { CellHyperlink } from '../cell-content';
 import { HyperlinkDialog, type HyperlinkDialogHandle } from './hyperlink-dialog';
+import { RenameColumnDialog } from './rename-column-dialog';
 import {
     CELL_TOOLTIP_SHOW_DELAY_MS,
     cell_tooltip_content,
@@ -919,37 +924,6 @@ export function GridShell({
         display_rows: DisplayRowInterval[];
     }) | null>(null);
 
-    const columns = useMemo<GridColumn[]>(
-        () => {
-            const built = build_grid_columns(
-                visible_source_columns,
-                column_widths,
-                sheet_meta.columnNames,
-            );
-            if (!compare_changed_column_names?.length) return built;
-            // Promoted headers live outside the row space, so a header-only
-            // change never reaches the per-cell diff; annotate the title with
-            // the original name instead.
-            const base_by_col = new Map(compare_changed_column_names
-                .map(({ col, base }) => [col, base]));
-            return built.map((column, display_index) => {
-                const source_column = visible_source_columns[display_index];
-                const base = source_column === undefined
-                    ? undefined
-                    : base_by_col.get(source_column);
-                return base === undefined
-                    ? column
-                    : { ...column, title: `${column.title} (was: ${base || 'blank'})` };
-            });
-        },
-        [
-            visible_source_columns,
-            column_widths,
-            sheet_meta.columnNames,
-            compare_changed_column_names,
-        ],
-    );
-
     const sort_metadata = useMemo(
         () => header_sort_metadata(transform_state.sort),
         [transform_state.sort],
@@ -1217,6 +1191,57 @@ export function GridShell({
             [version],
         ),
     });
+    const header_source_row = sheet_meta.excelFirstRowHeader?.sourceRow ?? 0;
+    const effective_column_names = useMemo(() => sheet_meta.columnNames?.map(
+        (name, column) => dirty_cells.get(`${header_source_row}:${column}`)?.value.trim() ?? name,
+    ), [dirty_cells, header_source_row, sheet_meta.columnNames]);
+    const columns = useMemo<GridColumn[]>(
+        () => {
+            const built = build_grid_columns(
+                visible_source_columns,
+                column_widths,
+                effective_column_names,
+            );
+            if (!compare_changed_column_names?.length) return built;
+            const base_by_col = new Map(compare_changed_column_names
+                .map(({ col, base }) => [col, base]));
+            return built.map((column, display_index) => {
+                const source_column = visible_source_columns[display_index];
+                const base = source_column === undefined
+                    ? undefined
+                    : base_by_col.get(source_column);
+                return base === undefined
+                    ? column
+                    : { ...column, title: `${column.title} (was: ${base || 'blank'})` };
+            });
+        },
+        [
+            visible_source_columns,
+            column_widths,
+            effective_column_names,
+            compare_changed_column_names,
+        ],
+    );
+    const [rename_column, set_rename_column] = useState<{
+        sourceColumn: number;
+        initial: string;
+    } | null>(null);
+    const apply_column_rename = useCallback((value: string): boolean => {
+        if (!rename_column) return false;
+        const source_column = rename_column.sourceColumn;
+        return commit_edits([{
+            source_row: header_source_row,
+            source_col: source_column,
+            value,
+            openedValue: rename_column.initial,
+            persistedCell: {
+                raw: sheet_meta.columnHeaderEditTexts?.[source_column]
+                    ?? rename_column.initial,
+                bold: false,
+                italic: false,
+            },
+        }], 'Rename column');
+    }, [commit_edits, header_source_row, rename_column, sheet_meta]);
     useEffect(() => {
         if (!host_observed_bases) return;
         store.observe_file_bases(
@@ -4973,6 +4998,18 @@ export function GridShell({
                     on_focused_unmount={restore_focus_after_hyperlink_unmount}
                 />
             )}
+            {rename_column && (
+                <RenameColumnDialog
+                    initial={rename_column.initial}
+                    column_names={effective_column_names ?? []}
+                    source_column={rename_column.sourceColumn}
+                    on_commit={apply_column_rename}
+                    on_cancel={() => {
+                        set_rename_column(null);
+                        window.setTimeout(() => grid_ref.current?.focus(), 0);
+                    }}
+                />
+            )}
             {context_menu?.kind === 'cell' && (
                 <ContextMenu
                     x={context_menu.x}
@@ -5076,6 +5113,25 @@ export function GridShell({
                             height: row_count,
                         }, true)}
                         on_hide={() => hide_source_column(source_column)}
+                        {...(editable_cells
+                            && edit_syntax === 'markdown'
+                            && sheet_meta.excelFirstRowHeader?.active === true
+                            ? {
+                                rename_disabled: !header_column_can_be_renamed(
+                                    sheet_meta,
+                                    source_column,
+                                ),
+                                on_rename: () => {
+                                    suppress_menu_restore_ref.current = true;
+                                    set_rename_column({
+                                        sourceColumn: source_column,
+                                        initial: sheet_meta.columnHeaderEditTexts?.[source_column]
+                                            ?? effective_column_names?.[source_column]
+                                            ?? '',
+                                    });
+                                },
+                            }
+                            : {})}
                         on_sort={(direction, append) =>
                             apply_column_sort(source_column, direction, append)}
                         on_clear_column_sort={() => on_transform_change({

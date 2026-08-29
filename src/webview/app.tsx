@@ -69,9 +69,13 @@ import {
 } from '../formula-dependencies';
 import {
     displayed_formula_result,
+    type FormulaCalculationAddress,
     type FormulaCalculationEdit,
 } from '../formula-calculation';
-import { compile_a1_formula_move_retargeter } from '../xlsx-formula';
+import {
+    compile_a1_formula_move_retargeter,
+    retarget_renamed_structured_formula,
+} from '../xlsx-formula';
 import { xlsx_edit_writes_formula } from '../xlsx-cell-value';
 import {
     classify_snapshot,
@@ -730,7 +734,29 @@ export function App(): React.JSX.Element {
     );
     const formula_roots_projection = edit_session_registry_ref.current.formula_projection();
     const value_edit_order_floor = edit_session_registry_ref.current.value_edit_order_floor();
-    const formula_calculation_edits = formula_roots_projection.edits;
+    const formula_header_coordinate_signature = JSON.stringify((meta?.sheets ?? []).map(
+        (sheet) => [
+            sheet.excelFirstRowHeader?.active === true,
+            sheet.excelFirstRowHeader?.sourceRow ?? 0,
+        ],
+    ));
+    const formula_calculation_edits = useMemo(
+        () => formula_roots_projection.edits.map((edit) => {
+            const sheet = meta?.sheets[edit.sheetIndex];
+            const header_row = sheet?.excelFirstRowHeader?.sourceRow ?? 0;
+            return sheet?.excelFirstRowHeader?.active === true && edit.row === header_row
+                ? { ...edit, writesFormula: false }
+                : edit;
+        }),
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+        [formula_roots_projection.calculationRevision, formula_header_coordinate_signature],
+    );
+    const header_calculation_edits = useMemo(() => formula_calculation_edits.filter((edit) => {
+        const sheet = meta?.sheets[edit.sheetIndex];
+        return sheet?.excelFirstRowHeader?.active === true
+            && edit.row === (sheet.excelFirstRowHeader.sourceRow ?? 0);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    }), [formula_calculation_edits, formula_header_coordinate_signature]);
     const formula_roots = formula_calculation_edits;
     const formula_root_signature = formula_roots_projection.tooManyEdits
         ? 'too-many-edits'
@@ -749,15 +775,45 @@ export function App(): React.JSX.Element {
         move.destinationRow,
         move.destinationColumn,
     ].join(':')).join(';');
+    const structured_column_renames = formula_calculation_edits.flatMap((edit) => {
+        const sheet = meta?.sheets[edit.sheetIndex];
+        const header_row = sheet?.excelFirstRowHeader?.sourceRow ?? 0;
+        const old_name = sheet?.columnNames?.[edit.column];
+        if (
+            sheet?.excelFirstRowHeader?.active !== true
+            || edit.row !== header_row
+            || edit.writesFormula
+            || old_name === undefined
+            || sheet.columnNames?.filter((name) => name.localeCompare(
+                old_name, undefined, { sensitivity: 'accent' },
+            ) === 0).length !== 1
+        ) return [];
+        return [{ sheetIndex: edit.sheetIndex, oldName: old_name, newName: edit.value.trim() }];
+    });
+    const structured_column_rename_signature = JSON.stringify(structured_column_renames);
     const formula_move_retargeter = useMemo(
-        () => compile_a1_formula_move_retargeter(
-            formula_sheet_names,
-            formula_moves,
-        ),
+        () => {
+            const retarget_a1 = compile_a1_formula_move_retargeter(
+                formula_sheet_names,
+                formula_moves,
+            );
+            return (formula: string, formulaSheetIndex: number, afterOrder?: number) =>
+                retarget_renamed_structured_formula(
+                    retarget_a1(formula, formulaSheetIndex, afterOrder),
+                    formulaSheetIndex,
+                    formula_sheet_names,
+                    structured_column_renames,
+                );
+        },
         // The signatures name provenance and sheet qualifiers independently of
         // formula value edits and the arrays allocated by this render.
         // eslint-disable-next-line react-hooks/exhaustive-deps
-        [load_epoch, formula_move_signature, formula_sheet_name_signature],
+        [
+            load_epoch,
+            formula_move_signature,
+            formula_sheet_name_signature,
+            structured_column_rename_signature,
+        ],
     );
     const too_many_formula_calculation_edits = formula_roots_projection.tooManyEdits;
     const [edit_mode, set_edit_mode_state] = useState(false);
@@ -1270,7 +1326,20 @@ export function App(): React.JSX.Element {
     // Metadata is cloned into every host delivery, but formula topology changes
     // only when the adopted source changes. Key the compiled graph to that fact,
     // plus the document epoch that disambiguates a new file restarting counters.
-    const formula_graph_key = `${load_epoch}:${source_generation_ref.current}`;
+    const header_formula_signature = (meta?.sheets ?? []).map((sheet) => [
+        sheet.excelFirstRowHeader?.active === true,
+        sheet.excelFirstRowHeader?.sourceRow ?? null,
+        sheet.columnNames ?? null,
+    ]);
+    const pending_header_formula_signature = formula_calculation_edits.flatMap((edit) => {
+        const sheet = meta?.sheets[edit.sheetIndex];
+        const header_row = sheet?.excelFirstRowHeader?.sourceRow ?? 0;
+        return sheet?.excelFirstRowHeader?.active === true && edit.row === header_row
+            ? [[edit.sheetIndex, edit.column, edit.value]]
+            : [];
+    });
+    const formula_graph_key = `${load_epoch}:${source_generation_ref.current}:`
+        + JSON.stringify([header_formula_signature, pending_header_formula_signature]);
     const workbook_formula_graph = useMemo(
         () => compile_workbook_formula_graph(meta?.sheets ?? []),
         // Metadata is cloned between deliveries; this key names source topology.
@@ -1280,7 +1349,8 @@ export function App(): React.JSX.Element {
     const source_has_formula_work = (meta?.sheets ?? []).some((sheet) =>
         (sheet.formulaCells?.length ?? 0) > 0
         || (sheet.pendingFormulaCells?.length ?? 0) > 0
-        || (sheet.formulaDependencies?.length ?? 0) > 0);
+        || (sheet.formulaDependencies?.length ?? 0) > 0
+        || (sheet.structuredFormulaReferences?.references.length ?? 0) > 0);
     const has_formula_work = source_has_formula_work
         || has_formula_moves
         || formula_roots_projection.hasFormulaEdits;
@@ -1305,7 +1375,24 @@ export function App(): React.JSX.Element {
     const formula_calculation_key = `${formula_graph_key}:`
         + `${formula_calculation_edit_signature}`;
     const source_pending_formula_targets = useMemo(
-        () => pending_workbook_formula_targets(meta?.sheets ?? []),
+        () => {
+            const targets = new Map<string, FormulaCalculationAddress>();
+            for (const target of pending_workbook_formula_targets(meta?.sheets ?? [])) {
+                targets.set(`${target.sheetIndex}:${target.row}:${target.column}`, target);
+            }
+            (meta?.sheets ?? []).forEach((sheet, sheetIndex) => {
+                const packed = sheet.structuredFormulaReferences?.references ?? [];
+                for (let offset = 0; offset + 4 < packed.length; offset += 5) {
+                    const target = {
+                        sheetIndex,
+                        row: packed[offset],
+                        column: packed[offset + 1],
+                    };
+                    targets.set(`${sheetIndex}:${target.row}:${target.column}`, target);
+                }
+            });
+            return [...targets.values()];
+        },
         // Pending source formulas move only with the adopted source topology.
         // eslint-disable-next-line react-hooks/exhaustive-deps
         [formula_graph_key],
@@ -1370,7 +1457,7 @@ export function App(): React.JSX.Element {
         const targets = kind === 'source'
             ? source_pending_formula_targets
             : formula_calculation_targets;
-        const edits = kind === 'source' ? [] : formula_calculation_edits;
+        const edits = kind === 'source' ? header_calculation_edits : formula_calculation_edits;
         if (targets.length === 0) {
             active_formula_calculation_ref.current = undefined;
             if (kind === 'edit') set_edit_formula_calculation(undefined);
@@ -1406,6 +1493,7 @@ export function App(): React.JSX.Element {
         formula_calculation_key,
         formula_calculation_targets,
         formula_calculation_edits,
+        header_calculation_edits,
         load_epoch,
         source_formulas_ready,
         source_pending_formula_targets,
@@ -5677,10 +5765,21 @@ export function App(): React.JSX.Element {
     const current_schema = current_sheet
         ? transform_schema_for_sheet(current_sheet)
         : '';
+    const current_header_row = current_sheet?.excelFirstRowHeader?.sourceRow ?? 0;
+    const current_pending_header_names = Array.from(
+        { length: current_sheet?.columnCount ?? 0 },
+        (_, index) => edit_session_registry_ref.current!
+            .for_sheet(active_sheet_index)
+            .get(`${current_header_row}:${index}`)?.value.trim(),
+    );
+    const current_pending_header_signature = JSON.stringify(current_pending_header_names);
     const column_names = useMemo(() => Array.from(
         { length: current_sheet?.columnCount ?? 0 },
-        (_, index) => current_sheet?.columnNames?.[index] || column_letter(index),
-    ), [current_schema]);
+        (_, index) => current_pending_header_names[index]
+            || current_sheet?.columnNames?.[index]
+            || column_letter(index),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    ), [current_schema, current_pending_header_signature]);
     const duplicate_column_names = useMemo(() => {
         const seen = new Set<string>();
         const duplicates = new Set<string>();

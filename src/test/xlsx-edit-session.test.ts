@@ -418,6 +418,28 @@ describe('xlsx edit sessions', () => {
         expect(after.data.sheets[0].rows[1][0]?.raw).toBe(people_before);
     });
 
+    it('renames a promoted header through its canonical source coordinate', async () => {
+        const panel = await open_ready_xlsx(file_path);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 0 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: workbook_request(session, 'rename-header', {
+                sheetIndex: 0,
+                sheetName: 'People',
+                worksheetId: '1',
+                edits: { '0:1': 'Years' },
+                dirtyEdits: { '0:1': { value: 'Years', base: 'Age' } },
+            }),
+        });
+        await wait_for_observable(() => save_results(panel).length > 0);
+
+        expect(save_results(panel).at(-1)).toMatchObject({ success: true });
+        const after = await parse_xlsx(bytes);
+        expect(after.data.sheets[0].rows[0][1]?.raw).toBe('Years');
+    });
+
     it('uses fileReload semantics when a save changes automatic header projection', async () => {
         const panel = await open_ready_xlsx(file_path);
         const initial = latest_snapshot(panel);

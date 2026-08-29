@@ -3,6 +3,7 @@ import type {
     WorkbookMeta,
     RenderedCell,
     PackedFormulaDependencies,
+    PackedStructuredFormulaReferences,
     PackedFormulaCells,
     PackedPendingFormulaCells,
 } from './data-source/interface';
@@ -57,6 +58,7 @@ export interface SheetData {
     columnCount: number;
     rowCount: number;
     formulaDependencies?: PackedFormulaDependencies;
+    structuredFormulaReferences?: PackedStructuredFormulaReferences;
     formulaCells?: PackedFormulaCells;
     pendingFormulaCells?: PackedPendingFormulaCells;
 }

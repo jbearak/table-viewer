@@ -82,6 +82,15 @@ export interface ColumnFilterMetadata {
  */
 export type PackedFormulaDependencies = readonly number[];
 /**
+ * Header Row references use an interned name table plus records packed five
+ * numbers at a time: `[formulaRow, formulaColumn, sourceSheetIndex,
+ * intersectionFlag, nameIndex]`.
+ */
+export interface PackedStructuredFormulaReferences {
+    readonly names: readonly string[];
+    readonly references: readonly number[];
+}
+/**
  * All formula coordinates, packed `[row, column]` in strictly increasing
  * row-major order. Pairs are unique; graph compilation validates this seam.
  */
@@ -153,6 +162,7 @@ export interface SheetMeta {
     hasFormatting: boolean;
     /** Workbook-resolved A1 references used to invalidate cached formula results. */
     formulaDependencies?: PackedFormulaDependencies;
+    structuredFormulaReferences?: PackedStructuredFormulaReferences;
     /** Every formula coordinate, including formulas with no references. */
     formulaCells?: PackedFormulaCells;
     /** Formula coordinates whose source file has no result cache. */
@@ -160,6 +170,10 @@ export interface SheetMeta {
     /** Per-column header titles. Length === columnCount; a blank entry means
      *  "no name" and the renderer falls back to the column letter. */
     columnNames?: string[];
+    /** Editable source text for the promoted header cells. */
+    columnHeaderEditTexts?: string[];
+    /** Whether each promoted header coordinate is a merge anchor or an ordinary cell. */
+    columnHeaderEditable?: boolean[];
     /** Present only for Excel sheets that support first-row header projection. */
     excelFirstRowHeader?: ExcelFirstRowHeaderMeta;
 }

@@ -81,6 +81,7 @@ It also removes other friction from reading tables:
 - `.xlsx` rich-text runs and whole-cell bold, italic, underline, and strikethrough styling
 - `.xlsx` hyperlinks, with destination information on hover and open/copy actions for external links
 - Conservatively detects Excel column-name rows, with remembered per-sheet controls for promoting the first non-hidden row or a chosen row, including column names inherited from simple two-row vertical merges
+- Uses an active Excel Header Row as a logical table for formulas such as `=SUM([Revenue])` and `=[@Revenue]*2`, without requiring an Excel table region
 - Hover briefly over horizontally truncated or vertically clipped cell content to see the displayed value in a tooltip
 - Stable, multi-column sorting with missing values kept last
 - Per-column filters for text, comparisons, ranges, distinct-value checklists, and empty/non-empty values

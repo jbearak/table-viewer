@@ -3,6 +3,7 @@ import type {
     DataSource,
     ExcelHeaderOverride,
     PackedFormulaDependencies,
+    PackedStructuredFormulaReferences,
     PackedPendingFormulaCells,
     IndexedRows,
     RenderedCell,
@@ -27,7 +28,11 @@ const HEADER_MAX_LENGTH = 80;
 interface SheetProjection {
     physical: SheetMeta;
     firstRowColumnNames: string[];
+    firstRowEditTexts: string[];
+    firstRowEditable: boolean[];
     manualColumnNames: string[];
+    manualEditTexts: string[];
+    manualEditable: boolean[];
     manualHeaderRow?: number;
     manualHeaderSourceRow?: number;
     detected: boolean;
@@ -52,10 +57,15 @@ export interface ExcelHeaderPlanningSheet {
     readonly merges: readonly Readonly<MergeRange>[];
     readonly hasFormatting: boolean;
     readonly formulaDependencies?: PackedFormulaDependencies;
+    readonly structuredFormulaReferences?: PackedStructuredFormulaReferences;
     readonly formulaCells?: SheetMeta['formulaCells'];
     readonly pendingFormulaCells?: PackedPendingFormulaCells;
     readonly columnNames: readonly string[];
+    readonly columnHeaderEditTexts?: readonly string[];
+    readonly columnHeaderEditable?: readonly boolean[];
     readonly manualColumnNames?: readonly string[];
+    readonly manualHeaderEditTexts?: readonly string[];
+    readonly manualHeaderEditable?: readonly boolean[];
     readonly manualHeaderRow?: number;
     readonly manualHeaderSourceRow?: number;
     readonly detected: boolean;
@@ -105,7 +115,11 @@ export class ExcelHeaderDataSource implements DataSource {
             const projection: SheetProjection = {
                 physical: sheet,
                 firstRowColumnNames: first_row_names(sheet, first_row),
+                firstRowEditTexts: header_row_edit_texts(sheet, first_row),
+                firstRowEditable: header_row_editable_columns(sheet, 0),
                 manualColumnNames: [],
+                manualEditTexts: [],
+                manualEditable: [],
                 detected,
                 override: override_for(sanitized, sheet.name),
             };
@@ -238,12 +252,22 @@ export class ExcelHeaderDataSource implements DataSource {
                     ),
                     hasFormatting: sheet.physical.hasFormatting,
                     formulaDependencies: sheet.physical.formulaDependencies,
+                    structuredFormulaReferences: sheet.physical.structuredFormulaReferences,
                     formulaCells: sheet.physical.formulaCells,
                     pendingFormulaCells: sheet.physical.pendingFormulaCells,
                     columnNames: Object.freeze([...sheet.firstRowColumnNames]),
+                    columnHeaderEditTexts: Object.freeze([...sheet.firstRowEditTexts]),
+                    columnHeaderEditable: Object.freeze([...sheet.firstRowEditable]),
                     manualColumnNames: Object.freeze([...(selected
                         ? selected.columnNames
                         : sheet.manualColumnNames)]),
+                    manualHeaderEditTexts: Object.freeze([...sheet.manualEditTexts]),
+                    manualHeaderEditable: Object.freeze([...(selected
+                        ? header_row_editable_columns(
+                            sheet.physical,
+                            selected.projectedRow,
+                        )
+                        : sheet.manualEditable)]),
                     manualHeaderRow: selected?.projectedRow ?? sheet.manualHeaderRow,
                     manualHeaderSourceRow: selected?.sourceRow
                         ?? sheet.manualHeaderSourceRow,
@@ -518,6 +542,10 @@ export class ExcelHeaderDataSource implements DataSource {
                 row,
                 candidate.projectedRow === 1 ? cached_first_row : undefined,
             );
+        projection.manualEditTexts = header_row_edit_texts(projection.physical, row);
+        projection.manualEditable = candidate === undefined
+            ? []
+            : header_row_editable_columns(projection.physical, candidate.projectedRow);
     }
 }
 
@@ -552,10 +580,15 @@ function project_sheet(
         merges: sheet.physical.merges,
         hasFormatting: sheet.physical.hasFormatting,
         formulaDependencies: sheet.physical.formulaDependencies,
+        structuredFormulaReferences: sheet.physical.structuredFormulaReferences,
         formulaCells: sheet.physical.formulaCells,
         pendingFormulaCells: sheet.physical.pendingFormulaCells,
         columnNames: sheet.firstRowColumnNames,
+        columnHeaderEditTexts: sheet.firstRowEditTexts,
+        columnHeaderEditable: sheet.firstRowEditable,
         manualColumnNames: sheet.manualColumnNames,
+        manualHeaderEditTexts: sheet.manualEditTexts,
+        manualHeaderEditable: sheet.manualEditable,
         manualHeaderRow: sheet.manualHeaderRow,
         manualHeaderSourceRow: sheet.manualHeaderSourceRow,
         detected: sheet.detected,
@@ -590,6 +623,12 @@ export function project_excel_header_sheet(
     const column_names = override === 'on'
         ? sheet.manualColumnNames ?? sheet.columnNames
         : sheet.columnNames;
+    const edit_texts = override === 'on'
+        ? sheet.manualHeaderEditTexts ?? sheet.columnHeaderEditTexts
+        : sheet.columnHeaderEditTexts;
+    const editable = override === 'on'
+        ? sheet.manualHeaderEditable ?? sheet.columnHeaderEditable
+        : sheet.columnHeaderEditable;
     return {
         name: sheet.name,
         worksheetId: sheet.worksheetId,
@@ -603,11 +642,16 @@ export function project_excel_header_sheet(
         ...(sheet.formulaDependencies?.length
             ? { formulaDependencies: sheet.formulaDependencies }
             : {}),
+        ...(sheet.structuredFormulaReferences?.references.length
+            ? { structuredFormulaReferences: sheet.structuredFormulaReferences }
+            : {}),
         ...(sheet.formulaCells?.length ? { formulaCells: sheet.formulaCells } : {}),
         ...(sheet.pendingFormulaCells?.length
             ? { pendingFormulaCells: sheet.pendingFormulaCells }
             : {}),
         columnNames: active ? [...column_names] : undefined,
+        columnHeaderEditTexts: active && edit_texts ? [...edit_texts] : undefined,
+        columnHeaderEditable: active && editable ? [...editable] : undefined,
         excelFirstRowHeader: {
             mode: override ?? 'auto',
             detected: sheet.detected,
@@ -841,6 +885,27 @@ function first_row_names(
 ): string[] {
     return Array.from({ length: sheet.columnCount }, (_, column) => (
         header_text(row?.[column] ?? null)
+    ));
+}
+
+function header_row_edit_texts(
+    sheet: SheetMeta,
+    row: readonly (RenderedCell | null)[] | undefined,
+): string[] {
+    return Array.from({ length: sheet.columnCount }, (_, column) => {
+        const cell = row?.[column];
+        if (!cell) return '';
+        return cell.formula ?? cell.raw ?? '';
+    });
+}
+
+function header_row_editable_columns(sheet: SheetMeta, row: number): boolean[] {
+    return Array.from({ length: sheet.columnCount }, (_, column) => !sheet.merges.some(
+        (merge) => row >= merge.startRow
+            && row <= merge.endRow
+            && column >= merge.startCol
+            && column <= merge.endCol
+            && (row !== merge.startRow || column !== merge.startCol),
     ));
 }
 

@@ -7,6 +7,7 @@ import {
 import { ExcelHeaderDataSource } from './data-source/excel-header-source';
 import type {
     DataSource,
+    RenderedCell,
     SheetMeta,
     WorkbookMeta,
 } from './data-source/interface';
@@ -635,15 +636,36 @@ function harvest_source_bases(
     // re-walk the source's row mapping once per column for no new information.
     const cols_by_source_row = group_cell_keys_by_source_row(wanted_bases);
     const by_projected_row = new Map<number, { source_row: number; cols: number[] }>();
+    const canonical_only = new Map<number, number[]>();
     for (const [source_row, cols] of cols_by_source_row) {
         const projected = projected_row_for_source(src, sheet_index, source_row);
-        if (projected === undefined) continue;
+        if (projected === undefined) {
+            canonical_only.set(source_row, cols);
+            continue;
+        }
         const entry = by_projected_row.get(projected);
         // Two source rows projecting to one row is not expected, but merging
         // rather than overwriting keeps every requested column observable.
         if (entry) entry.cols.push(...cols);
         else by_projected_row.set(projected, { source_row, cols });
     }
+    const record_row = (
+        source_row: number,
+        cols: readonly number[],
+        row: readonly (RenderedCell | null | undefined)[],
+    ): void => {
+        for (const col of cols) {
+            const cell = row[col];
+            if (cell === undefined) continue;
+            const cell_key = `${source_row}:${col}`;
+            observed_bases.set(cell_key, cell === null ? '' : cell_edit_base(cell).text);
+            if (cell !== null) {
+                const rich = cell_edit_base(cell).rich;
+                if (rich) observed_rich.set(cell_key, rich);
+            }
+            observed_links.set(cell_key, cell?.hyperlink ?? null);
+        }
+    };
     const projected_rows = [...by_projected_row.keys()].sort((a, b) => a - b);
     for (let start = 0; start < projected_rows.length; start += SAVE_WINDOW) {
         const batch = projected_rows.slice(start, start + SAVE_WINDOW);
@@ -651,21 +673,19 @@ function harvest_source_bases(
         batch.forEach((projected, offset) => {
             const entry = by_projected_row.get(projected)!;
             const row = rows[offset] ?? [];
-            for (const col of entry.cols) {
-                const cell = row[col];
-                if (cell === undefined) continue;
-                const cell_key = `${entry.source_row}:${col}`;
-                observed_bases.set(
-                    cell_key,
-                    cell === null ? '' : cell_edit_base(cell).text,
-                );
-                if (cell !== null) {
-                    const rich = cell_edit_base(cell).rich;
-                    if (rich) observed_rich.set(cell_key, rich);
-                }
-                observed_links.set(cell_key, cell?.hyperlink ?? null);
-            }
+            record_row(entry.source_row, entry.cols, row);
         });
+    }
+    if (src.read_canonical_columns) {
+        for (const [source_row, cols] of canonical_only) {
+            const unique_cols = [...new Set(cols)].sort((left, right) => left - right);
+            const row = src.read_canonical_columns(
+                sheet_index, source_row, 1, unique_cols,
+            ).rows[0] ?? [];
+            const expanded: (RenderedCell | null | undefined)[] = [];
+            unique_cols.forEach((column, index) => { expanded[column] = row[index]; });
+            record_row(source_row, unique_cols, expanded);
+        }
     }
     return { texts: observed_bases, rich: observed_rich, links: observed_links };
 }
@@ -750,6 +770,8 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
             links: observed_links,
         } = harvest_source_bases(src, sheet_index, wanted_bases);
         const cell_edits: XlsxCellEdit[] = [];
+        const sheet_meta = src.meta().sheets[sheet_index];
+        const header_row = sheet_meta?.excelFirstRowHeader?.sourceRow ?? 0;
         for (const [key, value] of Object.entries(edits)) {
             const [row, col] = key.split(':').map(Number);
             if (!Number.isInteger(row) || !Number.isInteger(col)) continue;
@@ -764,6 +786,9 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
                 row,
                 col,
                 value,
+                ...(sheet_meta?.excelFirstRowHeader?.active === true && row === header_row
+                    ? { force_text: true }
+                    : {}),
                 ...(runs && runs.length > 0 ? { runs } : {}),
                 ...(moved_from === undefined ? {} : { movedFrom: moved_from }),
                 ...(value_edit_order === undefined ? {} : { valueEditOrder: value_edit_order }),
@@ -813,6 +838,27 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
         writesFormula: boolean;
         runs?: XlsxCellEdit['runs'];
     }> = [];
+    const structured_column_renames = planned.flatMap((worksheet) => {
+        const sheet = src.meta().sheets[worksheet.sheetIndex];
+        if (sheet?.excelFirstRowHeader?.active !== true || !sheet.columnNames) return [];
+        const column_names = sheet.columnNames;
+        const header_row = sheet.excelFirstRowHeader.sourceRow ?? 0;
+        return worksheet.edits.flatMap((edit) => {
+            const old_name = column_names[edit.col];
+            if (
+                edit.row !== header_row
+                || old_name === undefined
+                || column_names.filter((name) => name.localeCompare(
+                    old_name, undefined, { sensitivity: 'accent' },
+                ) === 0).length !== 1
+            ) return [];
+            return [{
+                sheetIndex: worksheet.sheetIndex,
+                oldName: old_name,
+                newName: edit.value.trim(),
+            }];
+        });
+    });
     let too_many_calculation_edits = false;
     calculation_scan: for (const sheet of planned) {
         for (const edit of sheet.edits) {
@@ -843,6 +889,13 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
                 sheetIndex: sheet_index,
                 values: edits,
                 isFormulaValue: (key: string, value: string) => {
+                    const cell = parse_cell_key(key);
+                    const sheet = sheets[sheet_index];
+                    if (
+                        cell
+                        && sheet?.excelFirstRowHeader?.active === true
+                        && cell.sourceRow === (sheet.excelFirstRowHeader.sourceRow ?? 0)
+                    ) return false;
                     const runs = dirty_edits?.[key]?.valueRuns?.runs;
                     return xlsx_edit_writes_formula(
                         value,
@@ -851,7 +904,7 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
                 },
             })),
         );
-        const formula_plan = too_many_calculation_edits
+        const formula_plan = too_many_calculation_edits || structured_column_renames.length > 0
             ? {
                 sheetCount: sheets.length,
                 impact: all_workbook_formula_cells_impact(sheets),
@@ -873,7 +926,9 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
         const contains_moves = planned.some((sheet) => sheet.edits.some(
             (edit) => edit.movedFrom !== undefined,
         ));
-        const calculated_results = too_many_calculation_edits || contains_moves
+        const calculated_results = too_many_calculation_edits
+            || contains_moves
+            || structured_column_renames.length > 0
             ? []
             : input.cached_formula_calculation?.(formula_request)
                 ?? calculate_workbook_formulas_bounded(src, formula_request);
@@ -889,7 +944,12 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
         produce: (raw) => write_xlsx_workbook_cell_edits(
             raw,
             planned,
-            formula_write_plan ? { formulaWritePlan: formula_write_plan } : undefined,
+            formula_write_plan || structured_column_renames.length > 0 ? {
+                ...(formula_write_plan ? { formulaWritePlan: formula_write_plan } : {}),
+                ...(structured_column_renames.length > 0
+                    ? { structuredColumnRenames: structured_column_renames }
+                    : {}),
+            } : undefined,
         ),
     };
 }
