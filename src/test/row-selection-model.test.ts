@@ -33,6 +33,19 @@ describe('marker_drag_rows', () => {
     });
 });
 
+describe('CompactSelection ranges', () => {
+    it('returns owned tuples that cannot mutate the selection', () => {
+        const selection = CompactSelection.fromSingleSelection([2, 5]);
+        const ranges = selection.toRanges() as [number, number][];
+
+        ranges[0][0] = 99;
+        ranges.push([100, 101]);
+
+        expect(selection.toArray()).toEqual([2, 3, 4]);
+        expect(selection.toRanges()).toEqual([[2, 5]]);
+    });
+});
+
 describe('marker_drag_state_for_selection', () => {
     it('anchors on the newly added row after a plain click', () => {
         const state = marker_drag_state_for_selection(

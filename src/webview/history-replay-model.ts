@@ -156,6 +156,10 @@ export function plan_history_replay(
 
     const replay_changes = action_replay_changes(action, direction);
     for (const change of replay_changes) {
+        // Structural-only actions are replayed synchronously against the
+        // session-owned PendingRowStore. They never enter the source-cell lease.
+        if (change.kind === 'rowAppend' || change.kind === 'tailRemoval'
+            || change.kind === 'pendingRows') continue;
         if (change.kind === 'highlight') {
             highlights.push(change.delta);
             continue;
@@ -343,6 +347,8 @@ function value_dimension_matches(
         && current.formattingKnown === recorded.formattingKnown
         && move_provenance_equal(current.movedFrom, recorded.movedFrom)
         && current.valueEditOrder === recorded.valueEditOrder
+        && JSON.stringify(current.formulaReferenceBases ?? [])
+            === JSON.stringify(recorded.formulaReferenceBases ?? [])
         && history_values_equal(current.value, recorded.value)
         && history_values_equal(current.base, recorded.base);
 }

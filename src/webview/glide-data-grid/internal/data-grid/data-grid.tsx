@@ -70,6 +70,7 @@ export interface DataGridProps {
     readonly translateY: number | undefined;
 
     readonly accessibilityHeight: number;
+    readonly getRowAccessibilityLabel?: (row: number) => string | undefined;
 
     readonly freezeColumns: number;
     readonly freezeTrailingRows: number;
@@ -318,6 +319,7 @@ const DataGrid: React.ForwardRefRenderFunction<DataGridRef, DataGridProps> = (p,
         width,
         height,
         accessibilityHeight,
+        getRowAccessibilityLabel,
         columns,
         cellXOffset: cellXOffsetReal,
         cellYOffset,
@@ -1720,7 +1722,14 @@ const DataGrid: React.ForwardRefRenderFunction<DataGridRef, DataGridProps> = (p,
             const range = selection.current?.range;
 
             const visibleCols = effectiveCols.map(c => c.sourceIndex);
-            const visibleRows = makeRange(cellYOffset, Math.min(rows, cellYOffset + accessibilityHeight));
+            const ordinaryRows = makeRange(
+                cellYOffset,
+                Math.min(rows, cellYOffset + accessibilityHeight)
+            );
+            const frozenRows = freezeTrailingRows <= 0
+                ? []
+                : makeRange(Math.max(0, rows - freezeTrailingRows), rows);
+            const visibleRows = [...new Set([...ordinaryRows, ...frozenRows])];
 
             // Maintain focus within grid if we own it but focused cell is outside visible viewport
             // and not rendered. Fork addition: a focused merge anchor counts
@@ -1768,6 +1777,7 @@ const DataGrid: React.ForwardRefRenderFunction<DataGridRef, DataGridProps> = (p,
                         {visibleRows.map(row => (
                             <tr
                                 role="row"
+                                aria-label={getRowAccessibilityLabel?.(row)}
                                 aria-selected={selection.rows.hasIndex(row)}
                                 key={row}
                                 aria-rowindex={row + 2}>
@@ -1890,6 +1900,7 @@ const DataGrid: React.ForwardRefRenderFunction<DataGridRef, DataGridProps> = (p,
             rows,
             cellYOffset,
             accessibilityHeight,
+            getRowAccessibilityLabel,
             selection,
             focusElement,
             getCellContent,
@@ -1898,6 +1909,7 @@ const DataGrid: React.ForwardRefRenderFunction<DataGridRef, DataGridProps> = (p,
             getBoundsForItem,
             onCellFocused,
             mergedCells,
+            freezeTrailingRows,
         ],
         200
     );

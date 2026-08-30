@@ -15,8 +15,14 @@ import {
     type CsvSaveWorksheetOperation,
     type SheetPendingEditCells,
     type TerminalCsvSaveLifecycle,
+    type WorksheetPendingEdits,
     type WorksheetTarget,
 } from '../types';
+import {
+    EMPTY_PENDING_STRUCTURAL_CHANGES,
+    own_pending_structural_changes,
+    type PendingStructuralChanges,
+} from '../pending-changes';
 
 export { save_lifecycle_correlation } from '../types';
 import { is_plain_record } from '../plain-record';
@@ -123,6 +129,41 @@ interface SanitizedWorksheetTargetMember {
     readonly target: WorksheetTarget;
 }
 
+const STRUCTURAL_CHANGE_KEYS = new Set([
+    'formatTemplates',
+    'appendedRows',
+    'tailRemovals',
+    'appendBasis',
+    'conflicts',
+]);
+
+function sanitized_structural_changes(value: unknown): PendingStructuralChanges | undefined {
+    if (value === undefined) return EMPTY_PENDING_STRUCTURAL_CHANGES;
+    if (
+        !is_plain_record(value)
+        || Object.keys(value).some((key) => !STRUCTURAL_CHANGE_KEYS.has(key))
+        || value.formatTemplates === undefined
+        || value.appendedRows === undefined
+        || value.tailRemovals === undefined
+        || value.conflicts === undefined
+    ) return undefined;
+    try {
+        return own_pending_structural_changes(value);
+    } catch {
+        return undefined;
+    }
+}
+
+function structural_changes_equal(left: unknown, right: unknown): boolean {
+    const owned_left = sanitized_structural_changes(left);
+    if (owned_left === undefined) return false;
+    const owned_right = left === right
+        ? owned_left
+        : sanitized_structural_changes(right);
+    return owned_right !== undefined
+        && JSON.stringify(owned_left) === JSON.stringify(owned_right);
+}
+
 function sanitized_operation_worksheet_targets(
     operation: unknown,
 ): readonly SanitizedWorksheetTargetMember[] | undefined {
@@ -167,7 +208,15 @@ function sanitized_operation_worksheet(
         member.source.dirtyEdits,
     );
     if (!maps) return undefined;
-    return Object.freeze({ ...member.target, ...maps });
+    const structural = sanitized_structural_changes(member.source.structuralChanges);
+    if (structural === undefined) return undefined;
+    return Object.freeze({
+        ...member.target,
+        ...maps,
+        ...(member.source.structuralChanges === undefined
+            ? {}
+            : { structuralChanges: structural }),
+    });
 }
 
 function worksheet_operations_equal(left: unknown, right: unknown): boolean {
@@ -185,33 +234,36 @@ function worksheet_operations_equal(left: unknown, right: unknown): boolean {
     ) return false;
 
     const edits = equal_string_records(left.edits, right.edits);
-    if (
-        edits
+    let maps_equal = edits !== undefined
         && strict_dirty_maps_equal_and_agree(
             left.dirtyEdits,
             right.dirtyEdits,
             edits.left,
             edits.count,
-        )
-    ) return true;
-
-    // Save ingress intentionally drops malformed optional rich/link metadata and
-    // writes the safe plain projection. Compare that rare malformed proposal by
-    // the same canonical form so the normalized success can release its lock;
-    // required fields and cross-map disagreement still fail the decoder.
-    const safe_left = sanitized_wire_save_maps(left.edits, left.dirtyEdits);
-    const safe_right = left === right
-        ? safe_left
-        : sanitized_wire_save_maps(right.edits, right.dirtyEdits);
-    if (!safe_left || !safe_right) return false;
-    const safe_edits = equal_string_records(safe_left.edits, safe_right.edits);
-    return safe_edits !== undefined
-        && strict_dirty_maps_equal_and_agree(
-            safe_left.dirtyEdits,
-            safe_right.dirtyEdits,
-            safe_edits.left,
-            safe_edits.count,
         );
+    if (!maps_equal) {
+        // Save ingress intentionally drops malformed optional rich/link metadata and
+        // writes the safe plain projection. Compare that rare malformed proposal by
+        // the same canonical form so the normalized success can release its lock;
+        // required fields and cross-map disagreement still fail the decoder.
+        const safe_left = sanitized_wire_save_maps(left.edits, left.dirtyEdits);
+        const safe_right = left === right
+            ? safe_left
+            : sanitized_wire_save_maps(right.edits, right.dirtyEdits);
+        if (!safe_left || !safe_right) return false;
+        const safe_edits = equal_string_records(safe_left.edits, safe_right.edits);
+        maps_equal = safe_edits !== undefined
+            && strict_dirty_maps_equal_and_agree(
+                safe_left.dirtyEdits,
+                safe_right.dirtyEdits,
+                safe_edits.left,
+                safe_edits.count,
+            );
+    }
+    return maps_equal && structural_changes_equal(
+        left.structuralChanges,
+        right.structuralChanges,
+    );
 }
 
 export function save_operation_worksheets(
@@ -335,6 +387,48 @@ export function remove_operation_owned_pending_edits(
     return remaining > 0 ? retained : undefined;
 }
 
+export function remove_operation_owned_pending_structural_changes(
+    pending_changes: PendingStructuralChanges | WorksheetPendingEdits | undefined,
+    worksheet: CsvSaveWorksheetOperation,
+): PendingStructuralChanges | undefined {
+    const owned = worksheet.structuralChanges;
+    if (pending_changes === undefined) return undefined;
+    const pending = own_pending_structural_changes(pending_changes);
+    if (owned === undefined) return pending;
+    const pending_row_ids = new Set(owned.appendedRows.map((row) => row.id));
+    const removed_source_rows = new Set(
+        owned.tailRemovals.map((removal) => removal.sourceRow),
+    );
+    // GridShell raises its save fence synchronously with capturing the operation,
+    // so this pending identity cannot acquire a newer user edit while the save
+    // runs. The receipt therefore settles the admitted append by ID. Retaining a
+    // same-ID row here would represent the already-written row as another append.
+    const appended_rows = pending.appendedRows.filter(
+        (row) => !pending_row_ids.has(row.id),
+    );
+    const tail_removals = pending.tailRemovals.filter(
+        (removal) => !removed_source_rows.has(removal.sourceRow),
+    );
+    if (
+        appended_rows.length === pending.appendedRows.length
+        && tail_removals.length === pending.tailRemovals.length
+    ) return pending;
+    const retained_template_ids = new Set(
+        appended_rows.map((row) => row.formatTemplateId),
+    );
+    return own_pending_structural_changes({
+        ...pending,
+        formatTemplates: pending.formatTemplates.filter(
+            (template) => retained_template_ids.has(template.id),
+        ),
+        appendedRows: appended_rows,
+        tailRemovals: tail_removals,
+        appendBasis: appended_rows.length === 0
+            ? undefined
+            : pending.appendBasis,
+    });
+}
+
 export function propose_csv_save(
     current: CsvSaveProjection,
     operation: CsvSaveOperation,
@@ -406,6 +500,43 @@ export function resolve_csv_save_hydration_from_worksheets(
     }
     return remove_operation_owned_pending_edits(
         pending_edits,
+        authoritative_worksheet,
+    );
+}
+
+export function resolve_csv_save_structural_hydration_from_worksheets(
+    projection: Pick<CsvSaveProjection, 'authoritative' | 'operation'>,
+    edit_session_id: string | undefined,
+    pending_changes: PendingStructuralChanges | WorksheetPendingEdits | undefined,
+    proposed_worksheet: CsvSaveWorksheetOperation | undefined,
+    authoritative_worksheet: CsvSaveWorksheetOperation | undefined,
+): PendingStructuralChanges | undefined {
+    const pending = pending_changes === undefined
+        ? undefined
+        : own_pending_structural_changes(pending_changes);
+    if (
+        projection.operation?.editSessionId === edit_session_id
+        && proposed_worksheet
+    ) return proposed_worksheet.structuralChanges ?? EMPTY_PENDING_STRUCTURAL_CHANGES;
+
+    const lifecycle = projection.authoritative;
+    if (
+        lifecycle.state === 'idle'
+        || is_malformed_save_lifecycle(lifecycle)
+        || !authoritative_worksheet
+    ) return pending;
+    if (lifecycle.state === 'active' || lifecycle.state === 'failed') {
+        return lifecycle.operation.editSessionId === edit_session_id
+            ? authoritative_worksheet.structuralChanges
+                ?? EMPTY_PENDING_STRUCTURAL_CHANGES
+            : pending;
+    }
+    if (
+        edit_session_id !== undefined
+        && lifecycle.operation.editSessionId !== edit_session_id
+    ) return pending;
+    return remove_operation_owned_pending_structural_changes(
+        pending,
         authoritative_worksheet,
     );
 }

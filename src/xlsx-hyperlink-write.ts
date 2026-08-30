@@ -23,26 +23,28 @@
 
 import {
     encode_xml_attr,
-    find_tag_end,
     get_attr,
-    index_of_markup,
-    is_self_closing,
-    is_tag_boundary,
-    iter_elements,
-    iter_elements_markup,
-    last_index_of_markup,
 } from './ooxml-xml';
 import {
-    find_element_section as find_worksheet_section,
+    direct_child_elements,
+    find_first_element_by_local_name,
     find_tag_end as find_worksheet_tag_end,
-    index_of_markup as index_of_worksheet_markup,
-    is_tag_boundary as is_worksheet_tag_boundary,
-    last_index_of_markup as last_index_of_worksheet_markup,
+    opening_tag_text,
     utf8_text,
+    type QualifiedElementSpan,
 } from './ooxml-worksheet-scan';
-import { parse_relationships } from './ooxml-relationships';
+import {
+    parse_relationships,
+    scan_relationships_document,
+    STRICT_PACKAGE_RELATIONSHIPS_NS,
+    TRANSITIONAL_PACKAGE_RELATIONSHIPS_NS,
+} from './ooxml-relationships';
 import type { CellHyperlink } from './cell-content';
-import { apply_utf8_splices, col_index_to_letter } from './xlsx-cell-write';
+import {
+    apply_utf8_splices,
+    col_index_to_letter,
+    writable_worksheet_sheet_data,
+} from './xlsx-cell-write';
 
 /** One cell's link edit, in canonical source coordinates (0-based). */
 export interface XlsxHyperlinkEdit {
@@ -62,10 +64,125 @@ export interface HyperlinkWriteResult<T extends Uint8Array | string = Uint8Array
     readonly rels_xml: string | null;
 }
 
-const HYPERLINK_REL_TYPE
+const TRANSITIONAL_HYPERLINK_REL_TYPE
     = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink';
-const RELS_NS = 'http://schemas.openxmlformats.org/package/2006/relationships';
+const STRICT_HYPERLINK_REL_TYPE
+    = 'http://purl.oclc.org/ooxml/officeDocument/relationships/hyperlink';
 const OFFICE_R_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
+const STRICT_OFFICE_R_NS = 'http://purl.oclc.org/ooxml/officeDocument/relationships';
+const SPREADSHEET_NS = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';
+const STRICT_SPREADSHEET_NS = 'http://purl.oclc.org/ooxml/spreadsheetml/main';
+
+function local_name(name: string): string {
+    return name.slice(name.lastIndexOf(':') + 1);
+}
+
+function qname_prefix(name: string): string {
+    const colon = name.indexOf(':');
+    return colon === -1 ? '' : name.slice(0, colon);
+}
+
+interface ParsedAttribute {
+    readonly name: string;
+    readonly value: string;
+}
+
+function opening_attributes(open: string): ParsedAttribute[] {
+    const out: ParsedAttribute[] = [];
+    let cursor = 1;
+    while (cursor < open.length && !/[\s/>]/.test(open[cursor])) cursor += 1;
+    while (cursor < open.length) {
+        while (/\s/.test(open[cursor] ?? '')) cursor += 1;
+        if (cursor >= open.length || open[cursor] === '/' || open[cursor] === '>') break;
+        const start = cursor;
+        while (cursor < open.length && !/[\s=/>]/.test(open[cursor])) cursor += 1;
+        const name = open.slice(start, cursor);
+        while (/\s/.test(open[cursor] ?? '')) cursor += 1;
+        if (open[cursor] !== '=') break;
+        cursor += 1;
+        while (/\s/.test(open[cursor] ?? '')) cursor += 1;
+        const quote = open[cursor];
+        if (quote !== '"' && quote !== "'") break;
+        const value_start = ++cursor;
+        const value_end = open.indexOf(quote, value_start);
+        if (value_end === -1) break;
+        const encoded_value = open.slice(value_start, value_end);
+        out.push({
+            name,
+            value: get_attr(`<e ${name}=${quote}${encoded_value}${quote}/>`, name) ?? '',
+        });
+        cursor = value_end + 1;
+    }
+    return out;
+}
+
+function namespace_bindings(
+    xml: Uint8Array,
+    elements: readonly QualifiedElementSpan[],
+): Map<string, string> {
+    const bindings = new Map<string, string>();
+    for (const element of elements) {
+        for (const attr of opening_attributes(opening_tag_text(xml, element.element))) {
+            if (attr.name === 'xmlns') bindings.set('', attr.value);
+            else if (attr.name.startsWith('xmlns:')) bindings.set(attr.name.slice(6), attr.value);
+        }
+    }
+    return bindings;
+}
+
+function element_namespace(
+    xml: Uint8Array,
+    element: QualifiedElementSpan,
+    ancestors: readonly QualifiedElementSpan[],
+): string | undefined {
+    const prefix = qname_prefix(element.name);
+    return namespace_bindings(xml, [...ancestors, element]).get(prefix);
+}
+
+function is_spreadsheet_namespace(namespace: string | undefined): boolean {
+    return namespace === SPREADSHEET_NS || namespace === STRICT_SPREADSHEET_NS;
+}
+
+function is_spreadsheet_element(
+    xml: Uint8Array,
+    element: QualifiedElementSpan,
+    ancestors: readonly QualifiedElementSpan[],
+    implicit_namespace?: string,
+): boolean {
+    const namespace = element_namespace(xml, element, ancestors);
+    return is_spreadsheet_namespace(namespace)
+        || (namespace === undefined
+            && qname_prefix(element.name) === ''
+            && is_spreadsheet_namespace(implicit_namespace));
+}
+
+interface WorksheetMarkup {
+    readonly root: QualifiedElementSpan;
+    readonly prefix: string;
+    readonly namespace: string;
+    readonly implicitNamespace?: string;
+}
+
+function worksheet_markup_names(xml: Uint8Array, require_writable = true): WorksheetMarkup {
+    if (require_writable) writable_worksheet_sheet_data(xml);
+    const root = find_first_element_by_local_name(xml, 'worksheet');
+    if (!root) throw new Error('Worksheet has no worksheet element');
+    const namespace = element_namespace(xml, root, []);
+    // Minimal test fixtures historically omit the namespace entirely. Treat an
+    // unqualified namespace-free root as SpreadsheetML, but never do that for a
+    // qualified or explicitly foreign root.
+    const effective = namespace ?? (qname_prefix(root.name) === '' ? SPREADSHEET_NS : undefined);
+    if (!is_spreadsheet_namespace(effective)) throw new Error('Worksheet root is not SpreadsheetML');
+    const raw_prefix = qname_prefix(root.name);
+    return {
+        root,
+        prefix: raw_prefix === '' ? '' : `${raw_prefix}:`,
+        namespace: effective!,
+        ...(namespace === undefined && raw_prefix === ''
+            ? { implicitNamespace: effective! }
+            : {}),
+    };
+}
 
 
 /** `0,0` → `A1`. */
@@ -73,7 +190,7 @@ function cell_ref(row: number, col: number): string {
     return `${col_index_to_letter(col)}${row + 1}`;
 }
 
-interface ExistingHyperlink {
+export interface ScannedWorksheetHyperlink {
     /** The verbatim element text — the whole element, including a close tag
      *  when the source spelled it as a container. An untouched link is
      *  re-emitted byte-for-byte from this, so re-emitting only the open tag
@@ -89,38 +206,80 @@ interface ExistingHyperlink {
      * visible text of a cell whose value dimension was never touched.
      */
     readonly display: string | null;
+    readonly location: string | null;
+    readonly tooltip: string | null;
 }
 
-/** Every `<hyperlink>` element of the current section, in document order. */
-function existing_hyperlinks(section_inner: string): ExistingHyperlink[] {
-    const found: ExistingHyperlink[] = [];
-    // Markup-aware: a commented-out `<hyperlink>` is not an element the sheet
-    // declares, so it must not be re-emitted as live markup. Ignored content
-    // *inside* a live element still comes through verbatim in `inner` — an
-    // untouched link's vendor `extLst` CDATA has to survive the rebuild.
-    iter_elements_markup(section_inner, 'hyperlink', (open_tag, inner) => {
-        const ref = get_attr(open_tag, 'ref');
-        if (!ref) return;
+interface HyperlinkSection {
+    readonly root: QualifiedElementSpan;
+    readonly section: QualifiedElementSpan;
+}
+
+function worksheet_hyperlink_section(xml: Uint8Array): HyperlinkSection | undefined {
+    const { root, implicitNamespace } = worksheet_markup_names(xml, false);
+    const section = direct_child_elements(xml, root.element).find((candidate) =>
+        local_name(candidate.name) === 'hyperlinks'
+        && is_spreadsheet_element(xml, candidate, [root], implicitNamespace));
+    return section === undefined ? undefined : { root, section };
+}
+
+function namespaced_relationship_id(
+    open: string,
+    bindings: ReadonlyMap<string, string>,
+): string | null {
+    for (const attr of opening_attributes(open)) {
+        if (local_name(attr.name) !== 'id') continue;
+        const prefix = qname_prefix(attr.name);
+        if (prefix === '') continue;
+        const namespace = bindings.get(prefix);
+        if (namespace === OFFICE_R_NS || namespace === STRICT_OFFICE_R_NS) return attr.value;
+    }
+    return null;
+}
+
+/** Reader/writer-shared scan of the authoritative SpreadsheetML hyperlink section. */
+export function scan_worksheet_hyperlinks(
+    source: Uint8Array | string,
+): readonly ScannedWorksheetHyperlink[] {
+    const xml = typeof source === 'string' ? Buffer.from(source, 'utf8') : source;
+    const located = worksheet_hyperlink_section(xml);
+    if (located === undefined) return [];
+    const { root, section } = located;
+    const root_namespace = worksheet_markup_names(xml, false).implicitNamespace;
+    const found: ScannedWorksheetHyperlink[] = [];
+    for (const child of direct_child_elements(xml, section.element)) {
+        if (local_name(child.name) !== 'hyperlink'
+            || !is_spreadsheet_element(
+                xml,
+                child,
+                [root, section],
+                root_namespace,
+            )) continue;
+        const open = opening_tag_text(xml, child.element);
+        const ref = get_attr(open, 'ref');
+        if (!ref) continue;
+        const bindings = namespace_bindings(xml, [root, section, child]);
         found.push({
-            element: is_self_closing(open_tag, 0, open_tag.length - 1)
-                ? open_tag
-                : `${open_tag}${inner}</hyperlink>`,
-            r_id: get_attr(open_tag, 'r:id'),
+            element: utf8_text(xml, child.element.start, child.element.end),
+            r_id: namespaced_relationship_id(open, bindings),
             ref,
-            display: get_attr(open_tag, 'display'),
+            display: get_attr(open, 'display'),
+            location: get_attr(open, 'location'),
+            tooltip: get_attr(open, 'tooltip'),
         });
-    });
+    }
     return found;
 }
 
 /**
- * CT_Worksheet elements that FOLLOW `hyperlinks` in the schema sequence. A new
- * section is inserted immediately before the first of these present (all are
- * optional), and after `</sheetData>` at the latest — every element between
- * sheetData and hyperlinks is optional too, so "before the first follower" is
- * the one correct position whatever subset the sheet carries.
+ * CT_Worksheet schema order. A new section is inserted after the last present
+ * predecessor or before the first present successor.
  */
-const AFTER_HYPERLINKS = [
+const WORKSHEET_CHILD_ORDER = [
+    'sheetPr', 'dimension', 'sheetViews', 'sheetFormatPr', 'cols', 'sheetData',
+    'sheetCalcPr', 'sheetProtection', 'protectedRanges', 'scenarios', 'autoFilter',
+    'sortState', 'dataConsolidate', 'customSheetViews', 'mergeCells', 'phoneticPr',
+    'conditionalFormatting', 'dataValidations', 'hyperlinks',
     'printOptions', 'pageMargins', 'pageSetup', 'headerFooter', 'rowBreaks',
     'colBreaks', 'customProperties', 'cellWatches', 'ignoredErrors',
     'smartTags', 'drawing', 'legacyDrawing', 'legacyDrawingHF', 'picture',
@@ -128,50 +287,65 @@ const AFTER_HYPERLINKS = [
 ] as const;
 
 /** The byte offset in `xml` where a new `<hyperlinks>` section belongs. */
-function hyperlink_section_insert_pos(xml: Uint8Array): number {
-    for (const tag of AFTER_HYPERLINKS) {
-        const open = `<${tag}`;
-        let pos = 0;
-        while (true) {
-            const start = index_of_worksheet_markup(xml, open, pos);
-            if (start === -1) break;
-            if (!is_worksheet_tag_boundary(xml[start + open.length])) {
-                pos = start + 1;
-                continue;
-            }
-            return start;
-        }
+function hyperlink_section_insert_pos(xml: Uint8Array, root: QualifiedElementSpan): number {
+    const hyperlink_index = WORKSHEET_CHILD_ORDER.indexOf('hyperlinks');
+    const root_namespace = worksheet_markup_names(xml, false).implicitNamespace;
+    let after_predecessor: number | undefined;
+    for (const child of direct_child_elements(xml, root.element)) {
+        if (!is_spreadsheet_element(
+            xml,
+            child,
+            [root],
+            root_namespace,
+        )) continue;
+        const index = WORKSHEET_CHILD_ORDER.indexOf(
+            local_name(child.name) as typeof WORKSHEET_CHILD_ORDER[number],
+        );
+        if (index === -1) continue;
+        if (index > hyperlink_index) return child.element.start;
+        if (index < hyperlink_index) after_predecessor = child.element.end;
     }
-    const close_sheet_data = last_index_of_worksheet_markup(xml, '</sheetData>');
-    if (close_sheet_data !== -1) return close_sheet_data + '</sheetData>'.length;
-    // A wholly empty sheet writes <sheetData/>; insert right after it.
-    const empty_sheet_data = index_of_worksheet_markup(xml, '<sheetData/>');
-    if (empty_sheet_data !== -1) return empty_sheet_data + '<sheetData/>'.length;
-    throw new Error('Worksheet has no sheetData element');
+    if (after_predecessor === undefined) throw new Error('Worksheet has no sheetData element');
+    return after_predecessor;
 }
 
-/** Namespace insertion point, or null when the worksheet already declares it. */
-function r_namespace_insert_pos(xml: Uint8Array): number | null {
-    const start = index_of_worksheet_markup(xml, '<worksheet');
-    if (start === -1) throw new Error('Worksheet has no worksheet element');
-    const tag_end = find_worksheet_tag_end(xml, start);
+function relationship_prefix(
+    xml: Uint8Array,
+    root: QualifiedElementSpan,
+    section: QualifiedElementSpan | undefined,
+    spreadsheet_namespace: string,
+): { readonly prefix: string; readonly declaration?: { at: number; text: string } } {
+    const bindings = namespace_bindings(xml, section === undefined ? [root] : [root, section]);
+    for (const [prefix, namespace] of bindings) {
+        if (prefix !== '' && (namespace === OFFICE_R_NS || namespace === STRICT_OFFICE_R_NS)) {
+            return { prefix };
+        }
+    }
+    let prefix = 'r';
+    let suffix = 1;
+    while (bindings.has(prefix)) prefix = `r${suffix++}`;
+    const tag_end = find_worksheet_tag_end(xml, root.element.start, root.element.inner_start);
     if (tag_end === -1) throw new Error('Worksheet has no worksheet element');
-    if (utf8_text(xml, start, tag_end + 1).includes('xmlns:r=')) return null;
-    return xml[tag_end - 1] === 0x2f ? tag_end - 1 : tag_end;
+    const namespace = spreadsheet_namespace === STRICT_SPREADSHEET_NS
+        ? STRICT_OFFICE_R_NS : OFFICE_R_NS;
+    return {
+        prefix,
+        declaration: {
+            at: xml[tag_end - 1] === 0x2f ? tag_end - 1 : tag_end,
+            text: ` xmlns:${prefix}="${namespace}"`,
+        },
+    };
 }
 
 /** All relationship IDs of a `.rels` document (any type — new IDs must avoid
  *  every existing one, not just hyperlinks). */
 function all_rel_ids(rels_xml: string): Set<string> {
     const ids = new Set<string>();
-    // Deliberately NOT markup-aware, unlike parse_relationships: this set only
-    // says which ids a new one must avoid, and steering clear of an id that
-    // exists solely in a comment costs nothing while colliding with one could
-    // resurrect it if the comment is ever restored.
-    iter_elements(rels_xml, 'Relationship', (open_tag) => {
-        const id = get_attr(open_tag, 'Id');
+    const document = scan_relationships_document(rels_xml);
+    for (const relationship of document?.relationships ?? []) {
+        const id = get_attr(relationship.openTag, 'Id');
         if (id) ids.add(id);
-    });
+    }
     return ids;
 }
 
@@ -184,65 +358,66 @@ function fresh_rel_id(used: Set<string>): string {
     return id;
 }
 
-const EMPTY_RELS = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Relationships xmlns="${RELS_NS}"/>`;
+function empty_relationships(namespace: string): string {
+    return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n`
+        + `<Relationships xmlns="${namespace}"/>`;
+}
+
+function relationship_element_name(rels_xml: string): string {
+    const document = scan_relationships_document(rels_xml);
+    if (document === undefined) throw new Error('Malformed relationships part');
+    const existing = document.relationships[0]?.name;
+    if (existing !== undefined) {
+        const prefix = qname_prefix(existing);
+        const declaration = prefix === '' ? 'xmlns' : `xmlns:${prefix}`;
+        return get_attr(document.rootOpenTag, declaration) === document.namespace
+            ? existing
+            : `${existing} ${declaration}="${document.namespace}"`;
+    }
+    const prefix = qname_prefix(document.root.name);
+    return prefix === '' ? 'Relationship' : `${prefix}:Relationship`;
+}
 
 /** Append `<Relationship>` elements to a `.rels` document, self-closing-root
  *  aware. `additions` are pre-serialized elements. */
 function append_relationships(rels_xml: string, additions: readonly string[]): string {
     if (additions.length === 0) return rels_xml;
-    const close = '</Relationships>';
-    const close_pos = last_index_of_markup(rels_xml, close);
-    if (close_pos !== -1) {
-        return rels_xml.slice(0, close_pos) + additions.join('') + rels_xml.slice(close_pos);
+    const document = scan_relationships_document(rels_xml);
+    if (document === undefined) throw new Error('Malformed relationships part');
+    const bytes = Buffer.from(rels_xml, 'utf8');
+    const text = additions.join('');
+    if (document.root.element.inner_start !== document.root.element.end) {
+        return utf8_text(apply_utf8_splices(bytes, [{
+            start: document.root.element.inner_end,
+            end: document.root.element.inner_end,
+            text,
+        }]));
     }
-    // Self-closing root: <Relationships …/>
-    const start = index_of_markup(rels_xml, '<Relationships');
-    const tag_end = start === -1 ? -1 : find_tag_end(rels_xml, start);
-    if (start === -1 || tag_end === -1 || rels_xml[tag_end - 1] !== '/') {
-        throw new Error('Malformed relationships part');
-    }
-    return `${rels_xml.slice(0, tag_end - 1)}>${additions.join('')}${close}${rels_xml.slice(tag_end + 1)}`;
+    const expanded = document.rootOpenTag.replace(/\/\s*>$/, '>');
+    return utf8_text(apply_utf8_splices(bytes, [{
+        start: document.root.element.start,
+        end: document.root.element.end,
+        text: `${expanded}${text}</${document.root.name}>`,
+    }]));
 }
 
 /** Remove the `<Relationship>` elements whose Id is in `ids`, verbatim
  *  otherwise. */
 function remove_relationships(rels_xml: string, ids: ReadonlySet<string>): string {
     if (ids.size === 0) return rels_xml;
-    let out = rels_xml;
-    // Right-to-left splices so earlier ranges stay valid.
-    const ranges: Array<{ start: number; end: number }> = [];
-    const open = '<Relationship';
-    let pos = 0;
-    while (true) {
-        // Markup-aware: a `<Relationship>` that only exists inside a comment
-        // must not be spliced. Editing ignored content would leave the live
-        // rel in place, so the sheet would point at a target we believe we
-        // retired. Scanning a stripped copy is not an option here — these are
-        // offsets into the text we return, and stripping would also delete the
-        // part's `<?xml …?>` declaration.
-        const start = index_of_markup(out, open, pos);
-        if (start === -1) break;
-        if (!is_tag_boundary(out[start + open.length])) {
-            pos = start + 1;
-            continue;
-        }
-        const tag_end = find_tag_end(out, start);
-        if (tag_end === -1) break;
-        const open_tag = out.substring(start, tag_end + 1);
-        const id = get_attr(open_tag, 'Id');
-        let end = tag_end + 1;
-        if (!is_self_closing(out, start, tag_end)) {
-            const close_pos = index_of_markup(out, '</Relationship>', tag_end);
-            if (close_pos === -1) break;
-            end = close_pos + '</Relationship>'.length;
-        }
-        if (id && ids.has(id)) ranges.push({ start, end });
-        pos = end;
-    }
-    for (let i = ranges.length - 1; i >= 0; i--) {
-        out = out.slice(0, ranges[i].start) + out.slice(ranges[i].end);
-    }
-    return out;
+    const document = scan_relationships_document(rels_xml);
+    if (document === undefined) return rels_xml;
+    return utf8_text(apply_utf8_splices(
+        Buffer.from(rels_xml, 'utf8'),
+        document.relationships.flatMap((relationship) => {
+            const id = get_attr(relationship.openTag, 'Id');
+            return id !== null && ids.has(id) ? [{
+                start: relationship.element.start,
+                end: relationship.element.end,
+                text: '',
+            }] : [];
+        }),
+    ));
 }
 
 /** The `display` text a clear edit is about to delete along with its element. */
@@ -281,9 +456,6 @@ export function cleared_display_texts(
     // A set-only batch can never delete a display, so it never pays for the
     // section scan below.
     if (!any_clear) return [];
-    const section = find_worksheet_section(sheet_xml, 'hyperlinks');
-    if (!section) return [];
-    const section_inner = utf8_text(sheet_xml, section.inner_start, section.inner_end);
     const out: ClearedDisplay[] = [];
     // FIRST element per ref wins, because that is the one whose text the reader
     // shows: parse-xlsx synthesizes the cell from the first `<hyperlink>` it
@@ -293,7 +465,7 @@ export function cleared_display_texts(
     // when the first element carried no display at all. Nothing forbids two
     // elements naming one ref, so this is not a hypothetical shape.
     const seen = new Set<string>();
-    for (const link of existing_hyperlinks(section_inner)) {
+    for (const link of scan_worksheet_hyperlinks(sheet_xml)) {
         if (seen.has(link.ref)) continue;
         seen.add(link.ref);
         const edit = by_ref.get(link.ref);
@@ -358,6 +530,8 @@ export function apply_hyperlink_edits(
     }
     const return_text = typeof source === 'string';
     const sheet_xml = return_text ? Buffer.from(source, 'utf8') : source;
+    const markup = worksheet_markup_names(sheet_xml);
+    const q = (name: string): string => `${markup.prefix}${name}`;
     // Last edit wins per cell ref.
     const by_ref = canonical_link_edits(edits, () => {
         throw new Error('Invalid hyperlink edit coordinates');
@@ -365,16 +539,36 @@ export function apply_hyperlink_edits(
 
     // Same locator the reader uses, so the two cannot disagree about which
     // `<hyperlinks>` section is the live one.
-    const section = find_worksheet_section(sheet_xml, 'hyperlinks');
-    const current = section
-        ? existing_hyperlinks(utf8_text(sheet_xml, section.inner_start, section.inner_end))
-        : [];
+    const located_section = worksheet_hyperlink_section(sheet_xml);
+    const section = located_section?.section;
+    const current = scan_worksheet_hyperlinks(sheet_xml);
+    const section_prefix = section === undefined
+        ? markup.prefix
+        : qname_prefix(section.name) === '' ? '' : `${qname_prefix(section.name)}:`;
+    const hyperlink_name = `${section_prefix}hyperlink`;
+    const relationship_name = relationship_prefix(
+        sheet_xml,
+        markup.root,
+        section,
+        markup.namespace,
+    );
 
     // Relationship bookkeeping. Only *hyperlink* rels may ever be removed, and
     // only when no surviving element still references them — a drawing rel
     // sharing the file must never be collateral.
     const rels = rels_xml === null ? new Map() : parse_relationships(rels_xml);
     const used_ids = rels_xml === null ? new Set<string>() : all_rel_ids(rels_xml);
+    const base_rels = rels_xml ?? empty_relationships(
+        markup.namespace === STRICT_SPREADSHEET_NS
+            ? STRICT_PACKAGE_RELATIONSHIPS_NS
+            : TRANSITIONAL_PACKAGE_RELATIONSHIPS_NS,
+    );
+    const relationship_element = [...by_ref.values()].some(
+        (edit) => edit.link?.kind === 'external',
+    ) ? relationship_element_name(base_rels) : 'Relationship';
+    const hyperlink_relationship_type = markup.namespace === STRICT_SPREADSHEET_NS
+        ? STRICT_HYPERLINK_REL_TYPE
+        : TRANSITIONAL_HYPERLINK_REL_TYPE;
 
     // Build the new element list: untouched elements verbatim (order kept),
     // replaced/added ones serialized fresh in edit order after them.
@@ -406,16 +600,19 @@ export function apply_hyperlink_edits(
             const tooltip = edit.link.tooltip !== undefined
                 ? ` tooltip="${encode_xml_attr(edit.link.tooltip)}"` : '';
             added.push(
-                `<hyperlink ref="${ref}" location="${encode_xml_attr(edit.link.location)}"`
+                `<${hyperlink_name} ref="${ref}" location="${encode_xml_attr(edit.link.location)}"`
                 + `${display}${tooltip}/>`,
             );
         } else {
             const r_id = fresh_rel_id(used_ids);
             const tooltip = edit.link.tooltip !== undefined
                 ? ` tooltip="${encode_xml_attr(edit.link.tooltip)}"` : '';
-            added.push(`<hyperlink ref="${ref}" r:id="${r_id}"${display}${tooltip}/>`);
+            added.push(
+                `<${hyperlink_name} ref="${ref}" ${relationship_name.prefix}:id="${r_id}"`
+                + `${display}${tooltip}/>`,
+            );
             new_rel_elements.push(
-                `<Relationship Id="${r_id}" Type="${HYPERLINK_REL_TYPE}" `
+                `<${relationship_element} Id="${r_id}" Type="${hyperlink_relationship_type}" `
                 + `Target="${encode_xml_attr(edit.link.target)}" TargetMode="External"/>`,
             );
             kept_r_ids.add(r_id);
@@ -428,37 +625,53 @@ export function apply_hyperlink_edits(
     for (const r_id of displaced_r_ids) {
         if (kept_r_ids.has(r_id)) continue;
         const rel = rels.get(r_id);
-        if (rel && rel.type === HYPERLINK_REL_TYPE) removed_rel_ids.add(r_id);
+        if (rel && (
+            rel.type === TRANSITIONAL_HYPERLINK_REL_TYPE
+            || rel.type === STRICT_HYPERLINK_REL_TYPE
+        )) removed_rel_ids.add(r_id);
     }
 
     // Splice the worksheet once, even when adding both a section and `xmlns:r`.
     const elements = [...kept, ...added];
     const sheet_splices: Array<{ start: number; end: number; text: string }> = [];
     if (elements.length === 0) {
-        if (section) sheet_splices.push({ start: section.start, end: section.end, text: '' });
+        if (section) sheet_splices.push({
+            start: section.element.start,
+            end: section.element.end,
+            text: '',
+        });
     } else {
-        const section_text = `<hyperlinks>${elements.join('')}</hyperlinks>`;
         if (section) {
-            sheet_splices.push({ start: section.start, end: section.end, text: section_text });
+            const opening = opening_tag_text(sheet_xml, section.element);
+            const expanded = opening.replace(/\/\s*>$/, '>');
+            const closing = section.element.inner_start === section.element.end
+                ? `</${section.name}>`
+                : utf8_text(sheet_xml, section.element.inner_end, section.element.end);
+            sheet_splices.push({
+                start: section.element.start,
+                end: section.element.end,
+                text: `${expanded}${elements.join('')}${closing}`,
+            });
         } else {
-            const at = hyperlink_section_insert_pos(sheet_xml);
+            const section_text = `<${q('hyperlinks')}>${elements.join('')}</${q('hyperlinks')}>`;
+            const at = hyperlink_section_insert_pos(sheet_xml, markup.root);
             sheet_splices.push({ start: at, end: at, text: section_text });
         }
     }
-    if (new_rel_elements.length > 0) {
-        const at = r_namespace_insert_pos(sheet_xml);
-        if (at !== null) {
-            sheet_splices.push({ start: at, end: at, text: ` xmlns:r="${OFFICE_R_NS}"` });
-        }
+    if (new_rel_elements.length > 0 && relationship_name.declaration !== undefined) {
+        sheet_splices.push({
+            start: relationship_name.declaration.at,
+            end: relationship_name.declaration.at,
+            text: relationship_name.declaration.text,
+        });
     }
     const updated_sheet = apply_utf8_splices(sheet_xml, sheet_splices);
 
     // Splice the rels.
     let updated_rels: string | null = null;
     if (new_rel_elements.length > 0 || removed_rel_ids.size > 0) {
-        const base = rels_xml ?? EMPTY_RELS;
         updated_rels = append_relationships(
-            remove_relationships(base, removed_rel_ids),
+            remove_relationships(base_rels, removed_rel_ids),
             new_rel_elements,
         );
     }

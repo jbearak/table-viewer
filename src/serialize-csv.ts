@@ -143,3 +143,13 @@ function quote_field(value: string, delimiter: string): string {
     }
     return value;
 }
+
+/** Serialize one explicit full-width appended record, including its terminator. */
+export function serialize_delimited_values(
+    values: readonly string[],
+    delimiter: ',' | '\t',
+    line_ending: '\r\n' | '\r' | '\n' = '\n',
+): string {
+    return values.map((value) => quote_field(value, delimiter)).join(delimiter)
+        + line_ending;
+}

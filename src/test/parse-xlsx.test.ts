@@ -11,6 +11,8 @@ import {
 import { ColumnarStore } from '../data-source/columnar-store';
 import { XlsxDataSource } from '../data-source/xlsx-source';
 import { ExcelHeaderDataSource } from '../data-source/excel-header-source';
+import { write_xlsx_workbook_cell_edits } from '../xlsx-package';
+import type { CellData } from '../types';
 
 const FIXTURES = path.join(__dirname, 'fixtures');
 
@@ -70,6 +72,29 @@ function build_test_xlsx(sheet_xml: string, opts?: { styles_xml?: string; sst_xm
 }
 
 describe('parse_xlsx', () => {
+    it('ignores a foreign sheetData lookalike before the authoritative direct child on read and save', async () => {
+        const sheet = `<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:ext="urn:vendor">
+  <ext:sheetData><ext:row r="1"><ext:c r="A1"><ext:v>decoy</ext:v></ext:c></ext:row></ext:sheetData>
+  <sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>real</t></is></c></row></sheetData>
+</worksheet>`;
+        const raw = build_test_xlsx(sheet);
+        expect(((await parse_xlsx(raw)).data.sheets[0].rows[0][0] as CellData).raw)
+            .toBe('real');
+
+        const written = write_xlsx_workbook_cell_edits(raw, [{
+            sheetIndex: 0,
+            edits: [{ row: 0, col: 0, value: 'changed' }],
+        }]);
+        expect(((await parse_xlsx(written)).data.sheets[0].rows[0][0] as CellData).raw)
+            .toBe('changed');
+        const package_after = CFB.read(written, { type: 'buffer' });
+        const worksheet_after = Buffer.from(
+            CFB.find(package_after, '/xl/worksheets/sheet1.xml')!.content as Uint8Array,
+        ).toString('utf8');
+        expect(worksheet_after).toContain('<ext:v>decoy</ext:v>');
+    });
+
     it('rejects an overlong source formula before dependency parsing', async () => {
         const formula = "'".repeat(8_193);
         const sheet = `<?xml version="1.0" encoding="UTF-8"?>
@@ -556,6 +581,28 @@ describe('parse_xlsx', () => {
             expect(empty).toBeDefined();
             expect(empty!.rowCount).toBe(0);
             expect(empty!.columnCount).toBe(0);
+        });
+
+        it('retains numbered blank rows and dimension columns without cells', async () => {
+            const sheet = `<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <dimension ref="A1:C7"/>
+  <sheetData><row r="4"/><row r="7"/></sheetData>
+</worksheet>`;
+            const bytes = build_test_xlsx(sheet);
+
+            const parsed = await parse_xlsx(bytes);
+            expect(parsed.data.sheets[0]).toMatchObject({
+                rowCount: 7,
+                columnCount: 3,
+            });
+            expect(parsed.data.sheets[0].rows).toHaveLength(7);
+
+            const streaming = await parse_xlsx_streaming(bytes);
+            expect(streaming.sheets[0]).toMatchObject({
+                rowCount: 7,
+                columnCount: 3,
+            });
         });
 
         it('parses filled sheet alongside empty sheet', async () => {

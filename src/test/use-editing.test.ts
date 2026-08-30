@@ -1300,6 +1300,38 @@ describe('use_editing — history capture', () => {
         expect(hook_result!.dirty_cells.size).toBe(3);
     });
 
+    it('records source and structural paste arms in one history action', async () => {
+        await render_capturing();
+        await act(async () => {
+            hook_result!.commit_edits(
+                [{ source_row: 0, source_col: 0, value: 'A' }],
+                'Paste 2 cells',
+                [{
+                    kind: 'rowAppend',
+                    delta: {
+                        worksheet: SHEET,
+                        pendingRowId: 'pending-row-1',
+                        before: null,
+                        after: {
+                            id: 'pending-row-1',
+                            cells: { 0: { value: 'B', valueEditOrder: 1 } },
+                            formatTemplateId: 'plain',
+                            createdOrder: 1,
+                        },
+                        beforeIndex: null,
+                        afterIndex: 0,
+                        formatTemplates: [{ id: 'plain', format: { kind: 'none' } }],
+                    },
+                }],
+            );
+        });
+
+        expect(undo_stack()).toHaveLength(1);
+        expect(undo_stack()[0].action.label).toBe('Paste 2 cells');
+        expect(undo_stack()[0].action.changes.map((change) => change.kind))
+            .toEqual(['cell', 'rowAppend']);
+    });
+
     it('publishes a whole batch as one notification from each store', async () => {
         await render_capturing();
         // Subscribed below React, so every intermediate map a per-cell loop
@@ -1414,6 +1446,7 @@ describe('use_editing — history capture', () => {
                 destinationRow: 0,
                 destinationCol: 0,
                 order: 1,
+                destinationRowIdentity: { kind: 'source', sourceRow: 0 },
             }],
         });
     });

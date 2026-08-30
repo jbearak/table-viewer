@@ -47,6 +47,26 @@ describe('open supported formats', () => {
         assert.ok(opened, 'expected a tableViewer.editor custom tab for basic.tsv');
     });
 
+    it('does not claim TSX source files as TSV workbooks', async () => {
+        const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'table-viewer-tsx-'));
+        const target = vscode.Uri.file(path.join(directory, 'component.tsx'));
+        try {
+            await fs.writeFile(target.fsPath, 'export const Cell = () => <span>value</span>;\n');
+            await vscode.commands.executeCommand('vscode.open', target);
+            const opened_as_text = await wait_for(() => all_tabs().some((tab) =>
+                tab.input instanceof vscode.TabInputText
+                && tab.input.uri.fsPath === target.fsPath));
+            assert.ok(opened_as_text, 'expected component.tsx to open as source text');
+            assert.strictEqual(
+                has_custom_tab('tableViewer.editor'),
+                false,
+                'Table Viewer must not treat .tsx as the supported .tsv format',
+            );
+        } finally {
+            await fs.rm(directory, { recursive: true, force: true });
+        }
+    });
+
     it('discovers the table editor for every selector alternative and letter case', async () => {
         const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'table-viewer-selector-'));
         const cases = [

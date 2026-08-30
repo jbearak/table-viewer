@@ -1129,6 +1129,132 @@ a new line char ""more quotes"" plus a tab  ."	https://google.com`)
         );
     });
 
+    test("Enter appends when finishing the last data row", async () => {
+        const appendSpy = vi.fn();
+        vi.useFakeTimers();
+        render(
+            <EventedDataEditor
+                {...basicProps}
+                rows={2}
+                onRowAppended={appendSpy}
+                gridSelection={{
+                    columns: CompactSelection.empty(),
+                    rows: CompactSelection.empty(),
+                    current: {
+                        cell: [1, 1],
+                        range: { x: 1, y: 1, width: 1, height: 1 },
+                        rangeStack: [],
+                    },
+                }}
+            />,
+            { wrapper: Context }
+        );
+        prep();
+        const canvas = screen.getByTestId("data-grid-canvas");
+        fireEvent.keyDown(canvas, { keyCode: 74, key: "j" });
+        const overlay = await screen.findByDisplayValue("j");
+
+        vi.useFakeTimers();
+        fireEvent.keyDown(overlay, { key: "Enter" });
+        act(() => {
+            vi.runAllTimers();
+        });
+
+        expect(appendSpy).toHaveBeenCalledOnce();
+    });
+
+    test("Enter honors a per-column append target when row markers are visible", async () => {
+        const appendSpy = vi.fn();
+        const selectionSpy = vi.fn();
+        const columns = basicProps.columns.map((column, index) => index === 1
+            ? { ...column, trailingRowOptions: { targetColumn: 0 } }
+            : column);
+        vi.useFakeTimers();
+        render(
+            <DataEditor
+                {...basicProps}
+                columns={columns}
+                rows={2}
+                rowMarkers="both"
+                onRowAppended={async () => {
+                    appendSpy();
+                    return { row: 2, ready: () => true };
+                }}
+                onGridSelectionChange={selectionSpy}
+                gridSelection={{
+                    columns: CompactSelection.empty(),
+                    rows: CompactSelection.empty(),
+                    current: {
+                        cell: [1, 1],
+                        range: { x: 1, y: 1, width: 1, height: 1 },
+                        rangeStack: [],
+                    },
+                }}
+            />,
+            { wrapper: Context }
+        );
+        prep();
+        const canvas = screen.getByTestId("data-grid-canvas");
+        fireEvent.keyDown(canvas, { keyCode: 74, key: "j" });
+        const overlay = await screen.findByDisplayValue("j");
+
+        vi.useFakeTimers();
+        await act(async () => {
+            fireEvent.keyDown(overlay, { key: "Enter" });
+            await Promise.resolve();
+            vi.runAllTimers();
+        });
+
+        expect(appendSpy).toHaveBeenCalledOnce();
+        expect(selectionSpy).toHaveBeenCalledWith(expect.objectContaining({
+            current: expect.objectContaining({ cell: [0, 2] }),
+        }));
+    });
+
+    test("activating the trailing row honors a per-column target with row markers", async () => {
+        const appendSpy = vi.fn();
+        const selectionSpy = vi.fn();
+        const columns = basicProps.columns.map((column, index) => index === 1
+            ? { ...column, trailingRowOptions: { targetColumn: 0 } }
+            : column);
+        vi.useFakeTimers();
+        render(
+            <DataEditor
+                {...basicProps}
+                columns={columns}
+                rows={2}
+                rowMarkers="both"
+                onRowAppended={async () => {
+                    appendSpy();
+                    return { row: 2, ready: () => true };
+                }}
+                onGridSelectionChange={selectionSpy}
+                gridSelection={{
+                    columns: CompactSelection.empty(),
+                    rows: CompactSelection.empty(),
+                    current: {
+                        cell: [1, 2],
+                        range: { x: 1, y: 2, width: 1, height: 1 },
+                        rangeStack: [],
+                    },
+                }}
+            />,
+            { wrapper: Context }
+        );
+        prep();
+        vi.useFakeTimers();
+        fireEvent.keyDown(screen.getByTestId("data-grid-canvas"), { key: "Enter" });
+        await act(async () => {
+            await Promise.resolve();
+            vi.runAllTimers();
+        });
+
+        expect(appendSpy).toHaveBeenCalledOnce();
+        expect(selectionSpy).toHaveBeenCalledWith(expect.objectContaining({
+            current: expect.objectContaining({ cell: [0, 2] }),
+        }));
+    });
+
     test("Does not edit when validation fails", async () => {
         const spy = vi.fn();
         vi.useFakeTimers();
@@ -1159,6 +1285,40 @@ a new line char ""more quotes"" plus a tab  ."	https://google.com`)
         });
 
         expect(spy).not.toBeCalled();
+    });
+
+    test("Keeps the overlay and selection when a batch edit is refused", async () => {
+        const editSpy = vi.fn(() => "refused" as const);
+        const finishedSpy = vi.fn();
+        const selectionSpy = vi.fn();
+        vi.useFakeTimers();
+        render(
+            <EventedDataEditor
+                {...basicProps}
+                onCellsEdited={editSpy}
+                onFinishedEditing={finishedSpy}
+                onGridSelectionChange={selectionSpy}
+            />,
+            { wrapper: Context }
+        );
+        prep();
+        const canvas = screen.getByTestId("data-grid-canvas");
+        sendClick(canvas, {
+            clientX: 300,
+            clientY: 36 + 32 + 16,
+        });
+        fireEvent.keyDown(canvas, { keyCode: 74, key: "j" });
+        const overlay = await screen.findByDisplayValue("j");
+        selectionSpy.mockClear();
+
+        vi.useFakeTimers();
+        fireEvent.keyDown(overlay, { key: "Enter" });
+        act(() => { vi.runAllTimers(); });
+
+        expect(editSpy).toHaveBeenCalledWith(expect.anything(), "edit");
+        expect(document.body.contains(overlay)).toBe(true);
+        expect(finishedSpy).not.toHaveBeenCalled();
+        expect(selectionSpy).not.toHaveBeenCalled();
     });
 
     test("Emits header click", async () => {
@@ -2749,6 +2909,358 @@ a new line char ""more quotes"" plus a tab  ."	https://google.com`)
         await drainEventLoop();
     });
 
+    test("rolls back admitted paste rows when the coordinate topology changes", async () => {
+        vi.useFakeTimers();
+        let resolveAdmission!: (value: { topologyKey: unknown; rollback: () => void }) => void;
+        const rollback = vi.fn();
+        const admit = vi.fn(() => new Promise<{
+            topologyKey: unknown;
+            rollback: () => void;
+        }>((resolve) => {
+            resolveAdmission = resolve;
+        }));
+        const editSpy = vi.fn(() => true);
+        const pasteError = vi.fn();
+        const rendered = render(
+            <EventedDataEditor
+                {...basicProps}
+                rows={3}
+                pasteTopologyKey="topology-1"
+                onPaste={true}
+                onPasteRowsNeeded={admit}
+                onCellsEdited={editSpy}
+                onClipboardPasteError={pasteError}
+            />,
+            { wrapper: Context }
+        );
+        prep(false);
+        vi.useRealTimers();
+        const canvas = screen.getByTestId("data-grid-canvas");
+        vi.spyOn(document, "activeElement", "get").mockImplementation(() => canvas);
+        sendClick(canvas, {
+            clientX: 140,
+            clientY: 36 + 32 * 2 + 16,
+        });
+
+        fireEvent.paste(window);
+        await vi.waitFor(() => expect(admit).toHaveBeenCalled());
+        rendered.rerender(
+            <EventedDataEditor
+                {...basicProps}
+                rows={3}
+                pasteTopologyKey="topology-2"
+                onPaste={true}
+                onPasteRowsNeeded={admit}
+                onCellsEdited={editSpy}
+                onClipboardPasteError={pasteError}
+            />
+        );
+        resolveAdmission({ topologyKey: 'topology-self', rollback });
+
+        await vi.waitFor(() => expect(rollback).toHaveBeenCalledTimes(1));
+        expect(editSpy).not.toHaveBeenCalled();
+        expect(pasteError).toHaveBeenCalledWith(expect.stringContaining("layout changed"));
+    });
+
+    test("a queued paste samples topology after the preceding paste completes", async () => {
+        vi.useFakeTimers();
+        let resolveAdmission!: (value: { topologyKey: unknown; rollback: () => void }) => void;
+        const rollback = vi.fn();
+        const admit = vi.fn(() => new Promise<{
+            topologyKey: unknown;
+            rollback: () => void;
+        }>((resolve) => {
+            resolveAdmission = resolve;
+        }));
+        const editSpy = vi.fn((
+            _edits: readonly EditListItem[],
+            _source: string,
+        ) => true);
+        const pasteError = vi.fn();
+        Object.assign(navigator, {
+            clipboard: { readText: vi.fn(async () => "one\ntwo") },
+        });
+        const selection = {
+            columns: CompactSelection.empty(),
+            rows: CompactSelection.empty(),
+            current: {
+                cell: [0, 2] as Item,
+                range: { x: 0, y: 2, width: 1, height: 1 },
+                rangeStack: [],
+            },
+        };
+        const nextSelection = {
+            columns: CompactSelection.empty(),
+            rows: CompactSelection.empty(),
+            current: {
+                cell: [1, 0] as Item,
+                range: { x: 1, y: 0, width: 1, height: 1 },
+                rangeStack: [],
+            },
+        };
+        const rendered = render(
+            <DataEditor
+                {...basicProps}
+                rows={3}
+                pasteTopologyKey="topology-1"
+                gridSelection={selection}
+                onPaste={true}
+                onPasteRowsNeeded={admit}
+                onCellsEdited={editSpy}
+                onClipboardPasteError={pasteError}
+            />,
+            { wrapper: Context }
+        );
+        prep(false);
+        vi.useRealTimers();
+        const canvas = screen.getByTestId("data-grid-canvas");
+        vi.spyOn(document, "activeElement", "get").mockImplementation(() => canvas);
+
+        fireEvent.paste(window);
+        fireEvent.paste(window);
+        await vi.waitFor(() => expect(admit).toHaveBeenCalledOnce());
+        rendered.rerender(
+            <DataEditor
+                {...basicProps}
+                rows={4}
+                pasteTopologyKey="topology-2"
+                gridSelection={nextSelection}
+                onPaste={true}
+                onPasteRowsNeeded={admit}
+                onCellsEdited={editSpy}
+                onClipboardPasteError={pasteError}
+            />
+        );
+        resolveAdmission({ topologyKey: "topology-2", rollback });
+
+        await vi.waitFor(() => expect(editSpy).toHaveBeenCalledTimes(2));
+        expect(editSpy.mock.calls[1]?.[0]).toEqual([
+            expect.objectContaining({ location: [1, 0] }),
+            expect.objectContaining({ location: [1, 1] }),
+        ]);
+        expect(pasteError).not.toHaveBeenCalled();
+        expect(rollback).not.toHaveBeenCalled();
+    });
+
+    test("a delayed paste reads cell metadata only from the committed projection", async () => {
+        vi.useFakeTimers();
+        let resolveAdmission!: (value: { topologyKey: unknown; rollback: () => void }) => void;
+        const rollback = vi.fn();
+        const admit = vi.fn(() => new Promise<{
+            topologyKey: unknown;
+            rollback: () => void;
+        }>((resolve) => {
+            resolveAdmission = resolve;
+        }));
+        const editSpy = vi.fn((
+            _edits: readonly EditListItem[],
+            _source: string,
+        ) => true);
+        const pasteError = vi.fn();
+        Object.assign(navigator, {
+            clipboard: { readText: vi.fn(async () => "one\ntwo") },
+        });
+        const selection = {
+            columns: CompactSelection.empty(),
+            rows: CompactSelection.empty(),
+            current: {
+                cell: [0, 2] as Item,
+                range: { x: 0, y: 2, width: 1, height: 1 },
+                rangeStack: [],
+            },
+        };
+        const cell = (sourceRowOffset: number) => ([col, row]: Item): GridCell => ({
+            kind: GridCellKind.Text,
+            data: `${col}, ${row}`,
+            displayData: `${col}, ${row}`,
+            allowOverlay: true,
+            clipboardData: {
+                source: "sheet",
+                location: [col, row],
+                gridLocation: [col, row],
+                rowIdentity: { kind: "source", sourceRow: row + sourceRowOffset },
+            },
+        });
+        const committedCell = cell(100);
+        const abandonedCell = cell(900);
+        const never = new Promise<void>(() => undefined);
+        const suspended = vi.fn();
+        let installAdmittedRows!: () => void;
+        let interruptProjection!: () => void;
+        function Suspend(): React.JSX.Element {
+            suspended();
+            throw never;
+        }
+        function Harness(): React.JSX.Element {
+            const [phase, setPhase] = React.useState<"initial" | "admitted" | "interrupted">(
+                "initial"
+            );
+            installAdmittedRows = () => setPhase("admitted");
+            interruptProjection = () => setPhase("interrupted");
+            const admitted = phase !== "initial";
+            return (
+                <React.Suspense fallback={null}>
+                    <DataEditor
+                        {...basicProps}
+                        rows={phase === "interrupted" ? 2 : admitted ? 4 : 3}
+                        pasteTopologyKey={admitted ? "topology-2" : "topology-1"}
+                        gridSelection={selection}
+                        getCellContent={phase === "interrupted" ? abandonedCell : committedCell}
+                        onPaste={true}
+                        onPasteRowsNeeded={admit}
+                        onCellsEdited={editSpy}
+                        onClipboardPasteError={pasteError}
+                    />
+                    {phase === "interrupted" ? <Suspend /> : null}
+                </React.Suspense>
+            );
+        }
+        render(<Harness />, { wrapper: Context });
+        prep(false);
+        vi.useRealTimers();
+        const canvas = screen.getByTestId("data-grid-canvas");
+        vi.spyOn(document, "activeElement", "get").mockImplementation(() => canvas);
+
+        fireEvent.paste(window);
+        await vi.waitFor(() => expect(admit).toHaveBeenCalledOnce());
+        await act(async () => installAdmittedRows());
+        await act(async () => {
+            React.startTransition(() => interruptProjection());
+        });
+        expect(suspended).toHaveBeenCalled();
+        resolveAdmission({ topologyKey: "topology-2", rollback });
+
+        await vi.waitFor(() => expect(editSpy).toHaveBeenCalledOnce());
+        expect(editSpy.mock.calls[0]?.[0]).toEqual([
+            expect.objectContaining({
+                location: [0, 2],
+                targetRowIdentity: { kind: "source", sourceRow: 102 },
+            }),
+            expect.objectContaining({
+                location: [0, 3],
+                targetRowIdentity: { kind: "source", sourceRow: 103 },
+            }),
+        ]);
+        expect(pasteError).not.toHaveBeenCalled();
+        expect(rollback).not.toHaveBeenCalled();
+    });
+
+    test("refuses a delayed clipboard read after pending-row topology changes", async () => {
+        vi.useFakeTimers();
+        let resolveRead!: (value: string) => void;
+        Object.assign(navigator, {
+            clipboard: {
+                read: undefined,
+                readText: vi.fn(() => new Promise<string>((resolve) => {
+                    resolveRead = resolve;
+                })),
+            },
+        });
+        const editSpy = vi.fn(() => true);
+        const admit = vi.fn(async () => false);
+        const pasteError = vi.fn();
+        const rendered = render(
+            <EventedDataEditor
+                {...basicProps}
+                pasteTopologyKey="pending-a,pending-b"
+                onPaste={true}
+                onPasteRowsNeeded={admit}
+                onCellsEdited={editSpy}
+                onClipboardPasteError={pasteError}
+            />,
+            { wrapper: Context }
+        );
+        prep(false);
+        vi.useRealTimers();
+        const canvas = screen.getByTestId("data-grid-canvas");
+        vi.spyOn(document, "activeElement", "get").mockImplementation(() => canvas);
+        sendClick(canvas, { clientX: 140, clientY: 36 + 32 * 2 + 16 });
+
+        fireEvent.paste(window);
+        await vi.waitFor(() => expect(navigator.clipboard.readText).toHaveBeenCalled());
+        rendered.rerender(
+            <EventedDataEditor
+                {...basicProps}
+                pasteTopologyKey="pending-b"
+                onPaste={true}
+                onPasteRowsNeeded={admit}
+                onCellsEdited={editSpy}
+                onClipboardPasteError={pasteError}
+            />
+        );
+        resolveRead("one\ntwo");
+
+        await vi.waitFor(() => expect(pasteError).toHaveBeenCalledWith(
+            expect.stringContaining("layout changed")
+        ));
+        expect(admit).not.toHaveBeenCalled();
+        expect(editSpy).not.toHaveBeenCalled();
+    });
+
+    test("keeps an admitted trailing row for an empty plain-text paste", async () => {
+        vi.useFakeTimers();
+        let resolveAdmission!: (value: { topologyKey: unknown; rollback: () => void }) => void;
+        const rollback = vi.fn();
+        const admit = vi.fn(() => new Promise<{
+            topologyKey: unknown;
+            rollback: () => void;
+        }>((resolve) => {
+            resolveAdmission = resolve;
+        }));
+        const editSpy = vi.fn(() => true);
+        Object.assign(navigator, {
+            clipboard: { readText: vi.fn(async () => "") },
+        });
+        const trailingSelection = {
+            columns: CompactSelection.empty(),
+            rows: CompactSelection.empty(),
+            current: {
+                cell: [0, 3] as Item,
+                range: { x: 0, y: 3, width: 1, height: 1 },
+                rangeStack: [],
+            },
+        };
+        const rendered = render(
+            <EventedDataEditor
+                {...basicProps}
+                rows={3}
+                onRowAppended={async () => undefined}
+                pasteTopologyKey="stable-topology"
+                gridSelection={trailingSelection}
+                onPaste={true}
+                onPasteRowsNeeded={admit}
+                onCellsEdited={editSpy}
+            />,
+            { wrapper: Context }
+        );
+        prep(false);
+        vi.useRealTimers();
+        const canvas = screen.getByTestId("data-grid-canvas");
+        vi.spyOn(document, "activeElement", "get").mockImplementation(() => canvas);
+
+        fireEvent.paste(window);
+        await vi.waitFor(() => expect(admit).toHaveBeenCalledWith(1, 'stable-topology'));
+        rendered.rerender(
+            <EventedDataEditor
+                {...basicProps}
+                rows={4}
+                onRowAppended={async () => undefined}
+                pasteTopologyKey="admitted-topology"
+                gridSelection={trailingSelection}
+                onPaste={true}
+                onPasteRowsNeeded={admit}
+                onCellsEdited={editSpy}
+            />
+        );
+        resolveAdmission({ topologyKey: 'admitted-topology', rollback });
+
+        await vi.waitFor(() => expect(editSpy).toHaveBeenCalledOnce());
+        // Blank-on-blank is a cell no-op. The owner still receives the batch so
+        // it can record the admitted structural row as the paste gesture.
+        expect(editSpy).toHaveBeenCalledWith([], "paste");
+        expect(rollback).not.toHaveBeenCalled();
+    });
+
     test("Cut cell", async () => {
         const spy = vi.fn();
         const editSpy = vi.fn();
@@ -2792,6 +3304,7 @@ a new line char ""more quotes"" plus a tab  ."	https://google.com`)
                 source,
                 location: [col, row] as const,
                 gridLocation: [col, row] as const,
+                rowIdentity: { kind: "source" as const, sourceRow: row + 100 },
                 ...(col === 1 && row === 2 ? { formula: "=A1+B1" } : {}),
             };
             return {
@@ -2852,18 +3365,30 @@ a new line char ""more quotes"" plus a tab  ."	https://google.com`)
 
         expect(editSpy).toHaveBeenCalledOnce();
         expect(editSpy).toHaveBeenCalledWith([
-            { location: [1, 2], value: expect.objectContaining({ data: "" }) },
-            { location: [2, 2], value: expect.objectContaining({ data: "" }) },
-            {
+            expect.objectContaining({
+                location: [1, 2],
+                targetRowIdentity: { kind: "source", sourceRow: 102 },
+                value: expect.objectContaining({ data: "" }),
+            }),
+            expect.objectContaining({
+                location: [2, 2],
+                targetRowIdentity: { kind: "source", sourceRow: 102 },
+                value: expect.objectContaining({ data: "" }),
+            }),
+            expect.objectContaining({
                 location: [1, 3],
                 value: expect.objectContaining({ data: "=A1+B1" }),
                 movedFrom: [1, 2],
-            },
-            {
+                movedFromRowIdentity: { kind: "source", sourceRow: 102 },
+                targetRowIdentity: { kind: "source", sourceRow: 103 },
+            }),
+            expect.objectContaining({
                 location: [2, 3],
                 value: expect.objectContaining({ data: "2, 2" }),
                 movedFrom: [2, 2],
-            },
+                movedFromRowIdentity: { kind: "source", sourceRow: 102 },
+                targetRowIdentity: { kind: "source", sourceRow: 103 },
+            }),
         ], "paste");
 
         fireEvent.paste(window);
@@ -2871,6 +3396,75 @@ a new line char ""more quotes"" plus a tab  ."	https://google.com`)
             "This cut is no longer active. Cut the cells again."
         ));
         expect(editSpy).toHaveBeenCalledOnce();
+    });
+
+    test("refuses a cut after its owner reports a newer source payload", async () => {
+        const source = "workbook-1/sheet-1/projection-1";
+        const cell = ([col, row]: Item): GridCell => ({
+            kind: GridCellKind.Text,
+            data: `${col}, ${row}`,
+            displayData: `${col}, ${row}`,
+            allowOverlay: true,
+            clipboardData: {
+                source,
+                location: [col, row],
+                gridLocation: [col, row],
+                rowIdentity: { kind: "source", sourceRow: row + 100 },
+            },
+        });
+        const editSpy = vi.fn(() => true);
+        const errorSpy = vi.fn();
+        vi.useFakeTimers();
+        const rendered = render(
+            <EventedDataEditor
+                {...basicProps}
+                getCellContent={cell}
+                onPaste={true}
+                cutValidationKey="payload-1"
+                onCellsEdited={editSpy}
+                onClipboardPasteError={errorSpy}
+            />,
+            { wrapper: Context }
+        );
+        prep(false);
+        const canvas = screen.getByTestId("data-grid-canvas");
+        vi.spyOn(document, "activeElement", "get").mockImplementation(() => canvas);
+        sendClick(canvas, { clientX: 300, clientY: 36 + 32 * 2 + 16 });
+        const copied = new Map<string, string>();
+        fireEvent.cut(window, {
+            clipboardData: {
+                types: [],
+                setData: (type: string, value: string) => copied.set(type, value),
+            },
+        });
+        await vi.waitFor(() => expect(copied.get("text/html")).toContain("data-tv-operation"));
+        rendered.rerender(
+            <EventedDataEditor
+                {...basicProps}
+                getCellContent={cell}
+                onPaste={true}
+                cutValidationKey="payload-2"
+                onCellsEdited={editSpy}
+                onClipboardPasteError={errorSpy}
+            />
+        );
+        const html = copied.get("text/html")!;
+        Object.assign(navigator, {
+            clipboard: {
+                read: vi.fn(async () => [{
+                    types: ["text/html"],
+                    getType: vi.fn(async () => new Blob([html], { type: "text/html" })),
+                }]),
+            },
+        });
+        sendClick(canvas, { clientX: 300, clientY: 36 + 32 * 3 + 16 });
+
+        fireEvent.paste(window);
+        vi.useRealTimers();
+        await vi.waitFor(() => expect(errorSpy).toHaveBeenCalledWith(
+            "This cut is no longer active. Cut the cells again."
+        ));
+        expect(editSpy).not.toHaveBeenCalled();
     });
 
     test("cut paste clears a merged source through its anchor", async () => {
@@ -2940,17 +3534,17 @@ a new line char ""more quotes"" plus a tab  ."	https://google.com`)
 
         expect(errorSpy).not.toHaveBeenCalled();
         expect(editSpy).toHaveBeenCalledWith([
-            { location: [1, 2], value: expect.objectContaining({ data: "" }) },
-            {
+            expect.objectContaining({ location: [1, 2], value: expect.objectContaining({ data: "" }) }),
+            expect.objectContaining({
                 location: [1, 3],
                 value: expect.objectContaining({ data: "1, 2" }),
                 movedFrom: [1, 2],
-            },
-            {
+            }),
+            expect.objectContaining({
                 location: [2, 3],
                 value: expect.objectContaining({ data: "" }),
                 movedFrom: [2, 2],
-            },
+            }),
         ], "paste");
     });
 

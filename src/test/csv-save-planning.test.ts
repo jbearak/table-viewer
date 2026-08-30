@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 import type {
     DataSource,
@@ -23,6 +24,7 @@ class RecordingSource implements DataSource {
         line_ending: '\r\n' | '\r' | '\n' = '\n',
         private readonly column_count = 1,
         private readonly max_rows_per_read = Number.POSITIVE_INFINITY,
+        private readonly value_for_row: (row: number) => string = (row) => `row ${row}`,
     ) {
         this.lineEnding = line_ending;
     }
@@ -53,7 +55,7 @@ class RecordingSource implements DataSource {
             startRow: start,
             rows: Array.from(
                 { length: Math.max(0, end - start) },
-                (_, offset) => [cell(`row ${start + offset}`)],
+                (_, offset) => [cell(this.value_for_row(start + offset))],
             ),
         };
     }
@@ -91,6 +93,75 @@ function save_input(
 }
 
 describe('plan_csv_save window encoding', () => {
+    it('accepts only an unchanged saved append suffix for removal', () => {
+        const source = new RecordingSource(1, []);
+        const sheet = source.meta().sheets[0]!;
+        const appended = {
+            id: 'pending-row',
+            cells: { 0: { value: 'row 1', valueEditOrder: 1 } },
+            formatTemplateId: 'plain',
+            createdOrder: 1,
+        };
+        const first = plan_csv_save({
+            source,
+            file_path: '/tmp/windowed.csv',
+            worksheets: [{
+                sheet_index: 0,
+                edits: {},
+                wanted_bases: new Set(),
+                structural_changes: {
+                    formatTemplates: [{ id: 'plain', format: { kind: 'none' } }],
+                    appendedRows: [appended],
+                    tailRemovals: [],
+                    appendBasis: {
+                        sourceRowCount: sheet.sourceRowCount,
+                        columnCount: sheet.columnCount,
+                        schemaFingerprint: `sha256:${createHash('sha256').update(JSON.stringify({
+                            columnCount: sheet.columnCount,
+                            columnNames: sheet.columnNames ?? null,
+                        })).digest('hex')}`,
+                    },
+                    conflicts: [],
+                },
+            }],
+        });
+        const assignment = first.receipt?.appendedRows[0];
+        expect(assignment).toBeDefined();
+        const removal = {
+            appendHistoryId: 'pending-row',
+            sourceRow: 1,
+            savedFingerprint: assignment!.savedFingerprint,
+            savedRow: { cells: appended.cells, format: { kind: 'none' as const } },
+        };
+        const remove_input = (source: DataSource): SavePlanInput => ({
+            source,
+            file_path: '/tmp/windowed.csv',
+            worksheets: [{
+                sheet_index: 0,
+                edits: {},
+                wanted_bases: new Set(),
+                structural_changes: {
+                    formatTemplates: [],
+                    appendedRows: [],
+                    tailRemovals: [removal],
+                    conflicts: [],
+                },
+            }],
+        });
+
+        expect(() => plan_csv_save(remove_input(new RecordingSource(2, []))))
+            .not.toThrow();
+        expect(() => plan_csv_save(remove_input(new RecordingSource(
+            2,
+            [],
+            undefined,
+            '\n',
+            1,
+            Number.POSITIVE_INFINITY,
+            (row) => row === 1 ? 'changed' : `row ${row}`,
+        )))).toThrow('changed after it was saved');
+    });
+
     it('encodes each 10,000-row window before reading the next', () => {
         const events: string[] = [];
         const source = new RecordingSource(10_001, events, 'Name', '\r\n', 3);

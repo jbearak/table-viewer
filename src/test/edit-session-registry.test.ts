@@ -127,6 +127,148 @@ describe('edit session registry', () => {
         }]);
     });
 
+    it('does not rebuild source formula edits for a pending-row keystroke', () => {
+        const { registry } = make_session_ref('session');
+        registry.for_sheet(0).commit('session', '4:2', { value: '=1', base: 'old' });
+        const pending = registry.pending_rows_for_sheet(0);
+        pending.append_rows(
+            'session',
+            ['pending-row-1'],
+            { id: 'plain', format: { kind: 'none' } },
+            1,
+        );
+        const first = registry.formula_projection();
+
+        pending.set_cell('session', 'pending-row-1', 0, {
+            value: '=A1',
+            valueEditOrder: 2,
+        });
+        const second = registry.formula_projection();
+
+        expect(second.edits).toBe(first.edits);
+        expect(second.moves).toBe(first.moves);
+        expect(second.coordinateRevision).toBe(first.coordinateRevision);
+        expect(second.calculationRevision).toBe(first.calculationRevision);
+        expect(second.structuralRevision).toBeGreaterThan(first.structuralRevision);
+        expect(second.pendingEdits).toEqual([{
+            sheetIndex: 0,
+            pendingRowId: 'pending-row-1',
+            pendingRowIndex: 0,
+            column: 0,
+            value: '=A1',
+            writesFormula: true,
+        }]);
+    });
+
+    it('reindexes cached pending formula inputs after a structural removal', () => {
+        const { registry } = make_session_ref('session');
+        const pending = registry.pending_rows_for_sheet(0);
+        pending.append_rows(
+            'session',
+            ['pending-row-1', 'pending-row-2', 'pending-row-3'],
+            { id: 'plain', format: { kind: 'none' } },
+            1,
+        );
+        pending.set_cell('session', 'pending-row-3', 2, { value: '=A1' });
+        expect(registry.formula_projection().pendingEdits[0].pendingRowIndex).toBe(2);
+
+        pending.remove_rows('session', new Set(['pending-row-1']));
+
+        expect(registry.formula_projection().pendingEdits).toMatchObject([{
+            pendingRowId: 'pending-row-3',
+            pendingRowIndex: 1,
+            column: 2,
+        }]);
+    });
+
+    it('keeps pending-row cut provenance stable when earlier pending rows move', () => {
+        const { registry } = make_session_ref('session');
+        const pending = registry.pending_rows_for_sheet(0);
+        pending.install({ session_id: 'session' }, {
+            formatTemplates: [{ id: 'plain', format: { kind: 'none' } }],
+            appendedRows: [
+                { id: 'earlier', cells: {}, formatTemplateId: 'plain', createdOrder: 1 },
+                {
+                    id: 'source',
+                    cells: {},
+                    formatTemplateId: 'plain',
+                    createdOrder: 2,
+                },
+                {
+                    id: 'destination',
+                    cells: {
+                        1: {
+                            value: 'moved',
+                            movedFrom: {
+                                row: 11,
+                                col: 0,
+                                order: 7,
+                                rowIdentity: { kind: 'pending', pendingRowId: 'source' },
+                            },
+                        },
+                    },
+                    formatTemplateId: 'plain',
+                    createdOrder: 3,
+                },
+            ],
+            tailRemovals: [],
+            appendBasis: {
+                sourceRowCount: 10,
+                columnCount: 2,
+                schemaFingerprint: 'schema',
+            },
+            conflicts: [],
+        });
+        expect(registry.formula_projection().moves).toEqual([{
+            sheetIndex: 0,
+            sourceRow: 11,
+            sourceColumn: 0,
+            destinationRow: 12,
+            destinationColumn: 1,
+            order: 7,
+        }]);
+
+        pending.remove_rows('session', new Set(['earlier']));
+        expect(registry.formula_projection().moves).toEqual([{
+            sheetIndex: 0,
+            sourceRow: 10,
+            sourceColumn: 0,
+            destinationRow: 11,
+            destinationColumn: 1,
+            order: 7,
+        }]);
+    });
+
+    it('omits pending-row moves until their physical start is known', () => {
+        const { registry } = make_session_ref('session');
+        const pending = registry.pending_rows_for_sheet(0);
+        pending.append_rows(
+            'session',
+            ['source', 'destination'],
+            { id: 'plain', format: { kind: 'none' } },
+            1,
+        );
+        pending.set_cell('session', 'destination', 1, {
+            value: 'moved',
+            movedFrom: {
+                row: 0,
+                col: 0,
+                order: 7,
+                rowIdentity: { kind: 'pending', pendingRowId: 'source' },
+            },
+        });
+
+        expect(registry.formula_projection().moves).toEqual([]);
+        expect(registry.formula_projection([10]).moves).toEqual([{
+            sheetIndex: 0,
+            sourceRow: 10,
+            sourceColumn: 0,
+            destinationRow: 11,
+            destinationColumn: 1,
+            order: 7,
+        }]);
+    });
+
     it('keeps an earlier formula projection stable after a later edit', () => {
         const { registry } = make_session_ref('session');
         const store = registry.for_sheet(0);
@@ -456,6 +598,60 @@ describe('edit session registry', () => {
         expect(registry.has_dirty_entries()).toBe(true);
 
         registry.retire_parked();
+        expect(registry.has_dirty_entries()).toBe(false);
+    });
+
+    it('treats a blank Pending Appended Row as dirty and includes it in save preflight', () => {
+        const { registry } = make_session_ref('s');
+        registry.pending_rows_for_sheet(1).append_rows(
+            's',
+            ['pending-row-1'],
+            { id: 'plain', format: { kind: 'none' } },
+            1,
+        );
+
+        expect(registry.has_dirty_entries()).toBe(true);
+        expect(registry.collect_dirty_worksheets([
+            { name: 'Source' },
+            { name: 'Append', worksheetId: 'sheet-2' },
+        ])).toEqual({
+            status: 'ready',
+            worksheets: [{
+                target: { sheetIndex: 1, sheetName: 'Append', worksheetId: 'sheet-2' },
+                edits: {},
+                dirtyEdits: {},
+                structuralChanges: {
+                    formatTemplates: [{ id: 'plain', format: { kind: 'none' } }],
+                    appendedRows: [{
+                        id: 'pending-row-1',
+                        cells: {},
+                        formatTemplateId: 'plain',
+                        createdOrder: 1,
+                    }],
+                    tailRemovals: [],
+                    conflicts: [],
+                },
+            }],
+        });
+    });
+
+    it('stages structural rows in the workbook discard transaction', () => {
+        const { registry } = make_session_ref('s');
+        registry.pending_rows_for_sheet(0).append_rows(
+            's',
+            ['pending-row-1'],
+            { id: 'plain', format: { kind: 'none' } },
+            1,
+        );
+        const staged = registry.stage_discard('s', [{ name: 'Data' }]);
+        expect(staged?.structuralWorksheets?.[0]).toMatchObject({
+            target: { sheetIndex: 0, sheetName: 'Data' },
+            changes: { appendedRows: [{ id: 'pending-row-1' }] },
+        });
+        expect(registry.has_dirty_entries()).toBe(true);
+        expect(staged?.mutations.every((mutation) => mutation.valid())).toBe(true);
+        staged?.mutations.forEach((mutation) => mutation.commit());
+        staged?.mutations.forEach((mutation) => mutation.notify());
         expect(registry.has_dirty_entries()).toBe(false);
     });
 

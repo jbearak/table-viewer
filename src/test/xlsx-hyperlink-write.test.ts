@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'fs';
 import CFB from 'cfb';
-import { apply_hyperlink_edits } from '../xlsx-hyperlink-write';
+import { apply_hyperlink_edits, scan_worksheet_hyperlinks } from '../xlsx-hyperlink-write';
 import { parse_relationships } from '../ooxml-relationships';
 import { write_xlsx_workbook_cell_edits } from '../xlsx-package';
 import { parse_xlsx } from '../parse-xlsx';
@@ -9,7 +9,12 @@ import type { CellData } from '../types';
 
 const NS = 'xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"';
 const R_NS = 'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"';
+const OFFICE_R_NS_FOR_TEST = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
 const HYPERLINK_TYPE = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink';
+const STRICT_SPREADSHEET_NS = 'http://purl.oclc.org/ooxml/spreadsheetml/main';
+const STRICT_OFFICE_R_NS = 'http://purl.oclc.org/ooxml/officeDocument/relationships';
+const STRICT_PACKAGE_R_NS = 'http://purl.oclc.org/ooxml/package/relationships';
+const STRICT_HYPERLINK_TYPE = `${STRICT_OFFICE_R_NS}/hyperlink`;
 
 function sheet(inner: string, ns = `${NS} ${R_NS}`): string {
     return `<?xml version="1.0"?><worksheet ${ns}>${inner}</worksheet>`;
@@ -76,6 +81,112 @@ describe('apply_hyperlink_edits', () => {
         ]);
         expect(out.sheet_xml.indexOf('<hyperlinks>'))
             .toBeLessThan(out.sheet_xml.indexOf('<pageMargins'));
+    });
+
+    it('inserts after the last schema predecessor when no follower exists', () => {
+        const xml = sheet(
+            '<sheetData/><mergeCells count="1"><mergeCell ref="A1:B1"/></mergeCells>',
+        );
+        const out = apply_hyperlink_edits(xml, null, [
+            { row: 0, col: 0, link: internal('A2') },
+        ]);
+        expect(out.sheet_xml.indexOf('<hyperlinks>'))
+            .toBeGreaterThan(out.sheet_xml.indexOf('</mergeCells>'));
+    });
+
+    it('reads and writes a consistently prefixed worksheet with a non-r relationship prefix', () => {
+        const xml = '<?xml version="1.0"?>'
+            + `<s:worksheet xmlns:s="${NS.slice(7, -1)}" xmlns:rel="${OFFICE_R_NS_FOR_TEST}">`
+            + '<s:sheetData/><s:hyperlinks><s:hyperlink ref="A1" rel:id="rId1"/></s:hyperlinks>'
+            + '</s:worksheet>';
+        const rels_xml = rels(
+            `<Relationship Id="rId1" Type="${HYPERLINK_TYPE}" Target="https://old.example" TargetMode="External"/>`,
+        );
+        const out = apply_hyperlink_edits(xml, rels_xml, [
+            { row: 0, col: 0, link: external('https://new.example') },
+        ]);
+        expect(out.sheet_xml).toContain('<s:hyperlinks>');
+        expect(out.sheet_xml).toMatch(/<s:hyperlink ref="A1" rel:id="rId\d+"\/>/);
+        expect(scan_worksheet_hyperlinks(out.sheet_xml)).toHaveLength(1);
+    });
+
+    it('creates and retires Strict hyperlink relationships without changing dialect', () => {
+        const xml = sheet(
+            '<sheetData/><hyperlinks><hyperlink ref="A1" r:id="rId1"/></hyperlinks>',
+            `xmlns="${STRICT_SPREADSHEET_NS}" xmlns:r="${STRICT_OFFICE_R_NS}"`,
+        );
+        const strict_rels = `<?xml version="1.0"?><Relationships xmlns="${STRICT_PACKAGE_R_NS}">`
+            + `<Relationship Id="rId1" Type="${STRICT_HYPERLINK_TYPE}" `
+            + 'Target="https://old.example" TargetMode="External"/></Relationships>';
+        const replaced = apply_hyperlink_edits(xml, strict_rels, [
+            { row: 0, col: 0, link: external('https://new.example') },
+        ]);
+        const parsed = parse_relationships(replaced.rels_xml!);
+        expect(parsed.has('rId1')).toBe(false);
+        expect([...parsed.values()]).toEqual([{
+            type: STRICT_HYPERLINK_TYPE,
+            target: 'https://new.example',
+            external: true,
+        }]);
+
+        const created = apply_hyperlink_edits(
+            sheet('<sheetData/>', `xmlns="${STRICT_SPREADSHEET_NS}"`),
+            null,
+            [{ row: 0, col: 0, link: external('https://strict.example') }],
+        );
+        expect(created.rels_xml).toContain(`xmlns="${STRICT_PACKAGE_R_NS}"`);
+        expect([...parse_relationships(created.rels_xml!).values()][0]?.type)
+            .toBe(STRICT_HYPERLINK_TYPE);
+        expect(created.sheet_xml).toContain(`xmlns:r="${STRICT_OFFICE_R_NS}"`);
+    });
+
+    it.each([
+        `<p:Relationships xmlns:p="http://schemas.openxmlformats.org/package/2006/relationships">`
+            + '<p:Relationship Id="rId1" Type="drawing" Target="drawing.xml"/>'
+            + '</p:Relationships>',
+        '<p:Relationships xmlns:p="http://schemas.openxmlformats.org/package/2006/relationships"/>',
+    ])('preserves prefixed relationship roots and children (%s)', (relationships) => {
+        const out = apply_hyperlink_edits(sheet('<sheetData/>'), relationships, [
+            { row: 0, col: 0, link: external('https://prefixed.example') },
+        ]);
+        expect(out.rels_xml).toMatch(/^<p:Relationships\b/);
+        expect(out.rels_xml).toContain('<p:Relationship ');
+        expect(out.rels_xml).toContain('</p:Relationships>');
+        expect([...parse_relationships(out.rels_xml!).values()])
+            .toContainEqual(expect.objectContaining({ target: 'https://prefixed.example' }));
+    });
+
+    it('preserves a section-local prefix and scans mixed legal child prefixes', () => {
+        const xml = '<?xml version="1.0"?>'
+            + `<s:worksheet xmlns:s="${NS.slice(7, -1)}">`
+            + '<s:sheetData/>'
+            + `<h:hyperlinks xmlns:h="${NS.slice(7, -1)}">`
+            + '<h:hyperlink ref="A1" location="Old!A1"/>'
+            + '<s:hyperlink ref="B1" location="Keep!B1"/>'
+            + '</h:hyperlinks></s:worksheet>';
+        const out = apply_hyperlink_edits(xml, null, [
+            { row: 0, col: 0, link: internal('New!A1') },
+        ]);
+        expect(out.sheet_xml).toContain(`<h:hyperlinks xmlns:h="${NS.slice(7, -1)}">`);
+        expect(out.sheet_xml).toContain('<h:hyperlink ref="A1" location="New!A1"/>');
+        expect(out.sheet_xml).toContain('<s:hyperlink ref="B1" location="Keep!B1"/>');
+        expect(scan_worksheet_hyperlinks(out.sheet_xml).map((link) => link.ref))
+            .toEqual(['B1', 'A1']);
+    });
+
+    it('repeats a child-local relationship prefix on an appended sibling', () => {
+        const namespace = 'http://schemas.openxmlformats.org/package/2006/relationships';
+        const relationships = `<Relationships xmlns="${namespace}">`
+            + `<p:Relationship xmlns:p="${namespace}" Id="rId1" Type="drawing" `
+            + 'Target="drawing.xml"/></Relationships>';
+        const out = apply_hyperlink_edits(sheet('<sheetData/>'), relationships, [
+            { row: 0, col: 0, link: external('https://child-prefix.example') },
+        ]);
+        expect(out.rels_xml).toContain(
+            `<p:Relationship xmlns:p="${namespace}" Id="rId2"`,
+        );
+        expect([...parse_relationships(out.rels_xml!).values()])
+            .toContainEqual(expect.objectContaining({ target: 'https://child-prefix.example' }));
     });
 
     it('replaces an existing external link, retiring its orphaned relationship', () => {

@@ -14,6 +14,7 @@ import {
 } from './table-diff-uris';
 import { build_vscode_webview_html, vscode_viewer_host } from './vscode-host-ports';
 import { generate_nonce } from './webview-html';
+import type { HostMessage, WebviewMessage } from './types';
 
 export const TABLE_VIEW_TYPE = 'tableViewer.editor';
 
@@ -27,6 +28,48 @@ class TableViewerDocument implements vscode.CustomDocument {
 
 export interface TableViewerEditorProviderOptions {
     readonly replaceNativeDiff?: (tab: vscode.Tab, diff: TableDiffUris) => void;
+    readonly integrationTests?: boolean;
+}
+
+export interface TableViewerIntegrationSession {
+    messages(): readonly HostMessage[];
+    receivedMessages(): readonly WebviewMessage[];
+    receive(message: WebviewMessage): Promise<void>;
+}
+
+class ControllerIntegrationSession implements TableViewerIntegrationSession {
+    readonly #messages: HostMessage[] = [];
+    readonly #received_messages: WebviewMessage[] = [];
+    #receive: ((message: WebviewMessage) => Promise<void>) | undefined;
+
+    readonly port = {
+        on_host_message: (message: HostMessage): void => {
+            this.#messages.push(message);
+        },
+        on_webview_message: (message: WebviewMessage): void => {
+            this.#received_messages.push(message);
+        },
+        register_webview_message_receiver: (
+            receiver: (message: WebviewMessage) => Promise<void>,
+        ): void => {
+            this.#receive = receiver;
+        },
+    };
+
+    messages(): readonly HostMessage[] {
+        return [...this.#messages];
+    }
+
+    receivedMessages(): readonly WebviewMessage[] {
+        return [...this.#received_messages];
+    }
+
+    async receive(message: WebviewMessage): Promise<void> {
+        if (this.#receive === undefined) {
+            throw new Error('The Table Viewer integration session is not ready.');
+        }
+        await this.#receive(message);
+    }
 }
 
 interface NativeDiffCandidate {
@@ -41,6 +84,7 @@ export class TableViewerEditorProvider
     readonly #panels = new Map<ViewerController, vscode.WebviewPanel>();
     readonly #resources = new Map<ViewerController, string>();
     readonly #compare_documents = new Map<ViewerController, string>();
+    readonly #integration_sessions = new Map<ViewerController, ControllerIntegrationSession>();
     readonly #workbook_opens = new Map<string, Promise<void>>();
     readonly #table_diff_opens = new Map<string, Promise<void>>();
     readonly #native_diff_candidates = new WeakMap<vscode.Tab, NativeDiffCandidate>();
@@ -62,6 +106,7 @@ export class TableViewerEditorProvider
         this.#panels.delete(controller);
         this.#resources.delete(controller);
         this.#compare_documents.delete(controller);
+        this.#integration_sessions.delete(controller);
         controller.dispose();
         const drain = controller.drain();
         this.#drains.add(drain);
@@ -200,6 +245,11 @@ export class TableViewerEditorProvider
         return controller.select_sheet(sheet_name);
     }
 
+    integrationSession(uri: vscode.Uri): TableViewerIntegrationSession | undefined {
+        const controller = this.#normal_controller_for(create_resource_identity(uri).key);
+        return controller === undefined ? undefined : this.#integration_sessions.get(controller);
+    }
+
     /** Open one durable comparison document, or reveal its retained panel. */
     async openTableDiff(
         diff: TableDiffUris,
@@ -330,6 +380,9 @@ export class TableViewerEditorProvider
             webview_panel.webview, this.extension_uri, generate_nonce());
 
         const resource = create_resource_identity(source_uri).key;
+        const integration_session = this.options.integrationTests
+            ? new ControllerIntegrationSession()
+            : undefined;
         const controller = attach_viewer(
             webview_panel,
             source_uri,
@@ -338,12 +391,18 @@ export class TableViewerEditorProvider
             vscode_viewer_host,
             {
                 requestClose: () => this.#close_panel(webview_panel),
+                ...(integration_session === undefined
+                    ? {}
+                    : { integrationTestPort: integration_session.port }),
                 ...options,
             },
         );
         this.#controllers.add(controller);
         this.#panels.set(controller, webview_panel);
         this.#resources.set(controller, resource);
+        if (integration_session !== undefined) {
+            this.#integration_sessions.set(controller, integration_session);
+        }
         webview_panel.onDidDispose(() => this.#dispose_controller(controller));
         return controller;
     }
@@ -357,6 +416,7 @@ export interface TableViewerRegistration extends vscode.Disposable {
         viewColumn?: vscode.ViewColumn,
     ): Promise<void>;
     openWorkingTreeFile(uri: vscode.Uri): Promise<void>;
+    integrationSession(uri: vscode.Uri): TableViewerIntegrationSession | undefined;
 }
 
 export function register_table_viewer(
@@ -401,6 +461,7 @@ export function register_table_viewer(
         openWorkbookAtSheet: (uri, sheetName) => provider.openWorkbookAtSheet(uri, sheetName),
         openTableDiff: (diff, viewColumn) => provider.openTableDiff(diff, viewColumn),
         openWorkingTreeFile: (uri) => provider.openWorkingTreeFile(uri),
+        integrationSession: (uri) => provider.integrationSession(uri),
     };
     context.subscriptions.push(registration);
     return registration;

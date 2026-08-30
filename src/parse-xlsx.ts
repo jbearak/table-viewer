@@ -57,11 +57,9 @@ import {
     get_attr,
     get_text,
     iter_elements,
-    iter_elements_markup,
 } from './ooxml-xml';
 import {
     element_content,
-    find_element_section,
     find_first_element,
     find_tag_end,
     get_tag_attr,
@@ -74,6 +72,8 @@ import {
     utf8_text,
     worksheet_scan_input,
 } from './ooxml-worksheet-scan';
+import { worksheet_sheet_data_element } from './xlsx-cell-write';
+import { scan_worksheet_hyperlinks } from './xlsx-hyperlink-write';
 
 // --- ZIP / Entry Access ---
 
@@ -577,7 +577,7 @@ function parse_worksheet_core(
 
     const number_format_for = create_number_format_resolver(xfs, format_map, datemode);
 
-    const sheet_data = find_first_element(xml, 'sheetData');
+    const sheet_data = worksheet_sheet_data_element(xml);
     if (sheet_data) {
         const shared_formulas = new Map<
             string,
@@ -600,24 +600,10 @@ function parse_worksheet_core(
             sheet_data.inner_start,
             sheet_data.inner_end,
         ) !== -1;
-        if (has_shared_value) {
-            const formula_ignorable = ignorable_ranges(
-                xml,
-                sheet_data.inner_start,
-                sheet_data.inner_end,
-            );
-            for (const tag of live_tags(
-                xml,
-                'f',
-                sheet_data.inner_start,
-                sheet_data.inner_end,
-                formula_ignorable,
-            )) {
-                if (get_tag_attr(xml, tag.start, tag.end, 't') !== 'shared') continue;
-                has_shared_formula = true;
-                break;
-            }
-        }
+        // A consistently prefixed worksheet spells this `<x:f>`. The row/cell
+        // scanner below already resolves those elements by local name, so the
+        // cheap string gate is enough to decide whether to run the master pass.
+        if (has_shared_value) has_shared_formula = true;
         if (has_shared_formula) {
             scan_rows(xml, sheet_data.inner_start, sheet_data.inner_end, {
                 on_cell: (row, col, cell_span) => {
@@ -654,8 +640,10 @@ function parse_worksheet_core(
                 },
             });
         }
-        scan_rows(xml, sheet_data.inner_start, sheet_data.inner_end, {
+        const live_cell_starts: number[] = [];
+        const physical_rows = scan_rows(xml, sheet_data.inner_start, sheet_data.inner_end, {
             on_cell: (row, col, cell_span) => {
+                live_cell_starts.push(cell_span.start);
                 if (row + 1 > max_row) max_row = row + 1;
                 if (col + 1 > max_col) max_col = col + 1;
 
@@ -898,6 +886,27 @@ function parse_worksheet_core(
                 }
             },
         });
+        // Numbered empty rows are structural worksheet rows. They have no cell
+        // callback, but an appended blank row must survive reload and continue
+        // to define the physical tail of a non-zero-width worksheet.
+        const lower_bound_cell = (wanted: number): number => {
+            let low = 0;
+            let high = live_cell_starts.length;
+            while (low < high) {
+                const middle = (low + high) >>> 1;
+                if (live_cell_starts[middle] < wanted) low = middle + 1;
+                else high = middle;
+            }
+            return low;
+        };
+        for (const [row, owners] of physical_rows) {
+            const has_blank_owner = owners.some((owner) => {
+                const first = lower_bound_cell(owner.inner_start);
+                return first >= live_cell_starts.length
+                    || live_cell_starts[first] >= owner.inner_end;
+            });
+            if (has_blank_owner && row + 1 > max_row) max_row = row + 1;
+        }
     }
 
     // Attach hyperlinks. Excel's model is one link per cell; refs that are
@@ -909,35 +918,27 @@ function parse_worksheet_core(
     // a link Excel does not — and, worse, disagree with the writer, which
     // locates the live section the same way. The section is small, unlike the
     // `<sheetData>` bodies iter_elements usually walks, so this is free here.
-    const hyperlinks_section = find_element_section(xml, 'hyperlinks');
-    if (hyperlinks_section) {
-        const hyperlinks_inner = utf8_text(
-            xml,
-            hyperlinks_section.inner_start,
-            hyperlinks_section.inner_end,
-        );
-        iter_elements_markup(hyperlinks_inner, 'hyperlink', (open_tag) => {
-            const ref = get_attr(open_tag, 'ref');
-            if (!ref) return;
+    for (const scanned_link of scan_worksheet_hyperlinks(xml)) {
+            const ref = scanned_link.ref;
             const cell_ref = parse_cell_ref(ref);
-            if (!cell_ref) return; // range ref or malformed — skipped in v1
-            const tooltip = get_attr(open_tag, 'tooltip') ?? undefined;
+            if (!cell_ref) continue; // range ref or malformed — skipped in v1
+            const tooltip = scanned_link.tooltip ?? undefined;
             let hyperlink: CellHyperlink;
-            const r_id = get_attr(open_tag, 'r:id');
+            const r_id = scanned_link.r_id;
             if (r_id !== null) {
                 const rel = sheet_rels.get(r_id);
                 // Untrusted input: only follow actual hyperlink relationships
                 // (an r:id could point at an image/OLE rel), and only external
                 // ones — a package-internal hyperlink target is malformed.
-                if (!rel || !rel.external || !rel.type.endsWith('/hyperlink')) return;
+                if (!rel || !rel.external || !rel.type.endsWith('/hyperlink')) continue;
                 // The optional location attribute is a fragment within the
                 // external target (e.g. a bookmark); append it Excel-style.
-                const location = get_attr(open_tag, 'location');
+                const location = scanned_link.location;
                 const target = location ? `${rel.target}#${location}` : rel.target;
                 hyperlink = { kind: 'external', target, ...(tooltip !== undefined ? { tooltip } : {}) };
             } else {
-                const location = get_attr(open_tag, 'location');
-                if (!location) return;
+                const location = scanned_link.location;
+                if (!location) continue;
                 hyperlink = { kind: 'internal', location, ...(tooltip !== undefined ? { tooltip } : {}) };
             }
             const { row, col } = cell_ref;
@@ -955,7 +956,7 @@ function parse_worksheet_core(
                 }
                 // The optional display attribute is the link's text when the
                 // cell has no value of its own.
-                const display = get_attr(open_tag, 'display');
+                const display = scanned_link.display;
                 const cell: CellData = display !== null && display !== ''
                     ? { raw: display, formatted: display, bold: false, italic: false, hyperlink }
                     : { raw: null, formatted: '', bold: false, italic: false, hyperlink };
@@ -963,7 +964,6 @@ function parse_worksheet_core(
                 if (row + 1 > max_row) max_row = row + 1;
                 if (col + 1 > max_col) max_col = col + 1;
             }
-        });
     }
 
     const sorted_formula_cells: number[] = [];
@@ -977,25 +977,15 @@ function parse_worksheet_core(
         formula_cells.push(Math.floor(number / 16_384), number % 16_384);
     }
 
-    // If no cells were found, the sheet is empty regardless of what dimension says
-    if (cells.size === 0) {
-        return {
-            cells,
-            merged_cells,
-            merges: [],
-            formula_dependencies,
-            structured_formula_names,
-            structured_formula_references: packed_structured_formula_references,
-            formula_cells,
-            pending_formula_cells,
-            row_count: 0,
-            col_count: 0,
-        };
-    }
-
-    // Use dimension if available and non-degenerate, otherwise fall back to observed max
-    const row_count = dim && dim.row_count > 0 ? Math.max(dim.row_count, max_row) : max_row;
-    const col_count = dim && dim.col_count > 0 ? Math.max(dim.col_count, max_col) : max_col;
+    // A dimension alone does not create rows, but numbered blank `<row>` elements
+    // do. Columns still follow the dimension when a cell-free sheet declares one.
+    const has_physical_rows = cells.size > 0 || max_row > 0;
+    const row_count = !has_physical_rows
+        ? 0
+        : dim && dim.row_count > 0 ? Math.max(dim.row_count, max_row) : max_row;
+    const col_count = !has_physical_rows
+        ? 0
+        : dim && dim.col_count > 0 ? Math.max(dim.col_count, max_col) : max_col;
 
     // Validate final shape (catches cells beyond dimension and merge count)
     assert_safe_sheet_shape(budget, row_count, col_count, merges.length);

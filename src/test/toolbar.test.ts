@@ -872,7 +872,7 @@ describe('Toolbar scope menus', () => {
         const restore = Array.from(
             document.querySelectorAll<HTMLButtonElement>('[role="menuitem"]'),
         ).find((item) => item.textContent?.startsWith('Restore'));
-        expect(restore?.disabled).toBe(true);
+        expect(restore?.getAttribute('aria-disabled')).toBe('true');
     });
 
     it('runs the chosen scope action, closes, and reports completion', async () => {

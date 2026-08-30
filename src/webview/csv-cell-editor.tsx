@@ -18,7 +18,7 @@ type Movement = readonly [-1 | 0 | 1, -1 | 0 | 1];
 export interface CsvCellEditorProps {
     value: GridCell;
     onChange: (newValue: GridCell) => void;
-    onFinishedEditing: (newValue?: GridCell, movement?: Movement) => void;
+    onFinishedEditing: (newValue?: GridCell, movement?: Movement) => boolean | void;
     onCommitNavigation?: (navigation: EditorCommitNavigation) => void;
     initialValue?: string;
 }
@@ -94,10 +94,10 @@ export function CsvCellEditor({
 
     const commit = (navigation: EditorCommitNavigation) => {
         const live = input_ref.current?.value ?? text;
-        onCommitNavigation?.(navigation);
         // GridShell owns post-commit selection, including row wrapping. Glide only
         // commits the value and closes its overlay.
-        onFinishedEditing(with_text(value, live), [0, 0]);
+        if (onFinishedEditing(with_text(value, live), [0, 0]) === false) return;
+        onCommitNavigation?.(navigation);
     };
 
     const handle_key_down = (

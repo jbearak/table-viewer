@@ -503,6 +503,52 @@ describe('CSV save lifecycle projection', () => {
         expect(csv_save_operations_equal(workbook, changed)).toBe(false);
     });
 
+    it('retains structural changes as part of canonical operation identity', () => {
+        const structural = {
+            formatTemplates: [{ id: 'plain', format: { kind: 'none' as const } }],
+            appendedRows: [{
+                id: 'pending-row-1',
+                cells: {},
+                formatTemplateId: 'plain',
+                createdOrder: 1,
+            }],
+            tailRemovals: [],
+            appendBasis: {
+                sourceRowCount: 1,
+                provisionalStartRow: 1,
+                provisionalRowCount: 1,
+                columnCount: 1,
+                schemaFingerprint: 'schema',
+            },
+            conflicts: [],
+        };
+        const with_structural = operation('structural', 'edit-session', [{
+            ...worksheet('saved'),
+            structuralChanges: structural,
+        }]);
+        const changed = operation('structural', 'edit-session', [{
+            ...worksheet('saved'),
+            structuralChanges: {
+                ...structural,
+                appendedRows: [{
+                    ...structural.appendedRows[0],
+                    id: 'pending-row-2',
+                }],
+            },
+        }]);
+
+        expect(save_operation_worksheet(with_structural, 0, undefined, undefined)
+            ?.structuralChanges).toEqual(structural);
+        expect(csv_save_operations_equal(
+            with_structural,
+            operation('structural', 'edit-session', [{
+                ...worksheet('saved'),
+                structuralChanges: structuredClone(structural),
+            }]),
+        )).toBe(true);
+        expect(csv_save_operations_equal(with_structural, changed)).toBe(false);
+    });
+
     it('treats runs as part of operation identity and tombstone matching', () => {
         const bold = { runs: [{ text: 'saved', style: { bold: true as const } }] };
         const plain_ws = worksheet('saved');

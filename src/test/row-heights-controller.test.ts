@@ -113,6 +113,7 @@ async function resize_sheet(
     sheetIndex: number,
     rows: Array<{ start: number; end: number }>,
     height: number,
+    requestId?: string,
 ): Promise<void> {
     await panel.__receive({
         type: 'setRowHeights',
@@ -121,6 +122,7 @@ async function resize_sheet(
         height,
         generation: basis.generation,
         sourceGeneration: basis.sourceGeneration,
+        ...(requestId === undefined ? {} : { requestId }),
     } satisfies Extract<WebviewMessage, { type: 'setRowHeights' }>);
 }
 
@@ -163,6 +165,24 @@ beforeEach(() => {
 });
 
 describe('the setRowHeights host handler', () => {
+    it('correlates success and refusal for an atomic mixed-row resize', async () => {
+        const state = versioned_state_store();
+        const panel = open_csv_table(state.store);
+        const initial = await ready(panel);
+
+        await resize_sheet(panel, initial, 0, [{ start: 0, end: 0 }], 44, 'mixed-ok');
+        await vi.waitFor(() => expect(messages_of(panel, 'rowHeightsChanged'))
+            .toContainEqual(expect.objectContaining({
+                requestId: 'mixed-ok', applied: true, sheetIndex: 0,
+            })));
+
+        await resize_sheet(panel, initial, 0, [{ start: 0, end: 10_000 }], 48, 'mixed-no');
+        await vi.waitFor(() => expect(messages_of(panel, 'rowHeightsChanged'))
+            .toContainEqual(expect.objectContaining({
+                requestId: 'mixed-no', applied: false, sheetIndex: 0,
+            })));
+    });
+
     it('delivers a first resize after sparse persisted heights were decoded from JSON', async () => {
         // JSON spells sparse array slots as `null`. The durable decoder accepts that
         // representation, so runtime normalization must turn the slots back into

@@ -6,7 +6,7 @@ The corpus deliberately does **not** expose scanner spans, byte offsets, namespa
 
 ## Version pins
 
-Corpus revision `1.0.0` is recorded independently in four places so an implementation cannot claim compatibility accidentally:
+Corpus revision `1.1.0` is recorded independently in four places so an implementation cannot claim compatibility accidentally:
 
 - `VERSION`
 - `manifest.json` → `corpus_version`
@@ -77,6 +77,7 @@ The five refusal codes are exactly:
 | `prefixed-namespace-declaration-is-accepted` | An unused prefixed declaration does not rebind unprefixed worksheet elements. |
 | `maximum-cell-reference` | `XFD1048576` is accepted at the exact format boundary. |
 | `date-style-context-is-data` | Data-only style context can drive date-to-serial writing. |
+| `supported-prefixed-sheet-data` | A direct prefixed SpreadsheetML body is edited with matching qualified names. |
 
 ### Structured refusals
 
@@ -84,7 +85,6 @@ The five refusal codes are exactly:
 |---|---|
 | `cross-dialect-descendant` | A descendant that switches SpreadsheetML dialect refuses as foreign. |
 | `foreign-root` | A genuinely foreign worksheet root refuses. |
-| `supported-prefixed-sheet-data` | A direct prefixed body explains absence only when its QName resolves to a supported dialect. |
 | `mc-alternate-content-inside-sheet-data` | Exact expanded-name MC content inside the authoritative body refuses. |
 | `mc-wrapper-with-sheet-data-candidate` | A direct MC wrapper with no body refuses only when its subtree contains a SpreadsheetML body candidate. |
 | `missing-cell-reference` | A missing `r` has its own refusal code. |

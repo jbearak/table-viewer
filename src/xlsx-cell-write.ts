@@ -7,7 +7,9 @@ import {
     strip_illegal_xml_chars,
 } from './ooxml-xml';
 import {
+    direct_child_elements,
     find_first_element,
+    find_first_element_by_local_name,
     find_tag_end,
     get_tag_attr,
     ignorable_ranges,
@@ -23,6 +25,7 @@ import {
     starts_with_bytes,
     utf8_text,
     type ScanRowsOptions,
+    type QualifiedElementSpan,
     type Span,
 } from './ooxml-worksheet-scan';
 import { OoxmlRefusalError, type OoxmlRefusalCode } from './ooxml-refusal';
@@ -219,15 +222,21 @@ function build_run_xml(
     run: RichTextRun,
     cell_style: CellTextStyle | undefined,
     font_base: string,
+    namespace_prefix: string,
 ): string {
-    const text = `<t xml:space="preserve">${encode_xml(run.text)}</t>`;
-    if (text_styles_equal(run.style, cell_style)) return `<r>${text}</r>`;
-    const props = font_base
-        + (run.style?.bold ? '<b/>' : '')
-        + (run.style?.italic ? '<i/>' : '')
-        + (run.style?.strikethrough ? '<strike/>' : '')
-        + (run.style?.underline ? '<u/>' : '');
-    return `<r><rPr>${props}</rPr>${text}</r>`;
+    const q = (name: string): string => `${namespace_prefix}${name}`;
+    const text = `<${q('t')} xml:space="preserve">${encode_xml(run.text)}</${q('t')}>`;
+    if (text_styles_equal(run.style, cell_style)) return `<${q('r')}>${text}</${q('r')}>`;
+    const base = namespace_prefix === '' ? font_base : font_base.replace(
+        /<(\/?)([A-Za-z_][\w.-]*)(?=[\s/>])/g,
+        `<$1${namespace_prefix}$2`,
+    );
+    const props = base
+        + (run.style?.bold ? `<${q('b')}/>` : '')
+        + (run.style?.italic ? `<${q('i')}/>` : '')
+        + (run.style?.strikethrough ? `<${q('strike')}/>` : '')
+        + (run.style?.underline ? `<${q('u')}/>` : '');
+    return `<${q('r')}><${q('rPr')}>${props}</${q('rPr')}>${text}</${q('r')}>`;
 }
 
 /**
@@ -250,14 +259,18 @@ function build_cell_xml(
     was_boolean = false,
     was_iso_date = false,
     formula_result?: string,
+    namespace_prefix = '',
 ): string {
     const { value } = edit;
     const ref = `${col_index_to_letter(col)}${row + 1}`;
+    const q = (name: string): string => `${namespace_prefix}${name}`;
     const style_attr = xf_index !== null && xf_index !== 0 ? ` s="${xf_index}"` : '';
     if (is_xlsx_formula_edit(edit)) {
         assert_safe_xlsx_formula_text(value);
-        const cached = formula_result === undefined ? '' : `<v>${encode_xml(formula_result)}</v>`;
-        return `<c r="${ref}"${style_attr}><f>${encode_xml(value.slice(1))}</f>${cached}</c>`;
+        const cached = formula_result === undefined
+            ? ''
+            : `<${q('v')}>${encode_xml(formula_result)}</${q('v')}>`;
+        return `<${q('c')} r="${ref}"${style_attr}><${q('f')}>${encode_xml(value.slice(1))}</${q('f')}>${cached}</${q('c')}>`;
     }
     // A rich edit whose runs still carry styling beyond the cell's own font is
     // written as a rich inline string — checked ahead of the scalar paths
@@ -270,9 +283,9 @@ function build_cell_xml(
         if (xlsx_runs_require_inline_string(edit.runs, cell_style)) {
             const font_base = options.run_font_base?.(xf_index ?? 0) ?? '';
             const runs = edit.runs
-                .map((run) => build_run_xml(run, cell_style, font_base))
+                .map((run) => build_run_xml(run, cell_style, font_base, namespace_prefix))
                 .join('');
-            return `<c r="${ref}"${style_attr} t="inlineStr"><is>${runs}</is></c>`;
+            return `<${q('c')} r="${ref}"${style_attr} t="inlineStr"><${q('is')}>${runs}</${q('is')}></${q('c')}>`;
         }
     }
     // Text the file already held, not something a user typed: stored as-is,
@@ -280,7 +293,7 @@ function build_cell_xml(
     // still clears the cell rather than writing an empty string, which is what
     // the classification would have done with it anyway.
     if (edit.force_text && value !== '') {
-        return `<c r="${ref}"${style_attr} t="inlineStr"><is><t xml:space="preserve">${encode_xml(value)}</t></is></c>`;
+        return `<${q('c')} r="${ref}"${style_attr} t="inlineStr"><${q('is')}><${q('t')} xml:space="preserve">${encode_xml(value)}</${q('t')}></${q('is')}></${q('c')}>`;
     }
     const classified = classify_xlsx_cell_value(value, {
         datemode: options.datemode,
@@ -292,15 +305,15 @@ function build_cell_xml(
         case 'empty':
             // Retain a styled-but-valueless `<c>` so clearing a value does not
             // clear the cell's formatting, borders, or fill.
-            return `<c r="${ref}"${style_attr}/>`;
+            return `<${q('c')} r="${ref}"${style_attr}/>`;
         case 'number':
-            return `<c r="${ref}"${style_attr}><v>${classified.text}</v></c>`;
+            return `<${q('c')} r="${ref}"${style_attr}><${q('v')}>${classified.text}</${q('v')}></${q('c')}>`;
         case 'boolean':
-            return `<c r="${ref}"${style_attr} t="b"><v>${classified.text}</v></c>`;
+            return `<${q('c')} r="${ref}"${style_attr} t="b"><${q('v')}>${classified.text}</${q('v')}></${q('c')}>`;
         case 'iso-date':
-            return `<c r="${ref}"${style_attr} t="d"><v>${encode_xml(classified.text)}</v></c>`;
+            return `<${q('c')} r="${ref}"${style_attr} t="d"><${q('v')}>${encode_xml(classified.text)}</${q('v')}></${q('c')}>`;
         case 'string':
-            return `<c r="${ref}"${style_attr} t="inlineStr"><is><t xml:space="preserve">${encode_xml(classified.text)}</t></is></c>`;
+            return `<${q('c')} r="${ref}"${style_attr} t="inlineStr"><${q('is')}><${q('t')} xml:space="preserve">${encode_xml(classified.text)}</${q('t')}></${q('is')}></${q('c')}>`;
     }
 }
 
@@ -947,6 +960,7 @@ const MARKUP_COMPATIBILITY_NS
 
 interface WorksheetStructure {
     readonly sheet_data: Span | null;
+    readonly dimension: { readonly name: string; readonly element: Span } | null;
     /** Earliest structural refusal when an authoritative sheetData exists. */
     readonly refusal?: RefusalCandidate;
     /** Earliest explanatory refusal when no authoritative sheetData exists. */
@@ -1013,6 +1027,7 @@ function scan_worksheet_structure(xml: Uint8Array): WorksheetStructure {
     let saw_sheet_data = false;
     let worksheet_namespace = SPREADSHEETML_NS;
     let sheet_data: Span | null = null;
+    let dimension: WorksheetStructure['dimension'] = null;
     let refusal: RefusalCandidate | undefined;
     let missing_sheet_data_refusal: RefusalCandidate | undefined;
 
@@ -1082,8 +1097,11 @@ function scan_worksheet_structure(xml: Uint8Array): WorksheetStructure {
         const direct_worksheet_child = parent?.worksheet_document === true;
         const authoritative_sheet_data = !saw_sheet_data
             && direct_worksheet_child
-            && prefix === undefined
-            && local_name === 'sheetData';
+            && local_name === 'sheetData'
+            // A bound SpreadsheetML prefix is semantically identical to the
+            // default namespace. A foreign prefixed lookalike is an extension,
+            // while an unprefixed foreign body remains an authoritative refusal.
+            && (prefix === undefined || is_spreadsheetml_namespace(namespace));
         const inside_sheet_data = authoritative_sheet_data
             || parent?.inside_sheet_data === true;
         const exact_alternate_content = local_name === 'AlternateContent'
@@ -1091,11 +1109,28 @@ function scan_worksheet_structure(xml: Uint8Array): WorksheetStructure {
         const missing_sheet_data_alternate = direct_worksheet_child
             && exact_alternate_content;
 
+        if (
+            dimension === null
+            && direct_worksheet_child
+            && local_name === 'dimension'
+            && namespace === worksheet_namespace
+        ) {
+            dimension = {
+                name: qname,
+                element: {
+                    start,
+                    end: tag_end + 1,
+                    inner_start: tag_end + 1,
+                    inner_end: tag_end + 1,
+                },
+            };
+        }
+
         if (!saw_document_element) {
             saw_document_element = true;
             if (worksheet_document) {
                 worksheet_namespace = namespace;
-                if (prefix !== undefined) {
+                if (prefix !== undefined && namespace === '') {
                     consider('both', start, 0, 'namespace-prefixed-worksheet-element');
                 }
                 if (
@@ -1128,18 +1163,8 @@ function scan_worksheet_structure(xml: Uint8Array): WorksheetStructure {
                     sheet_data.inner_end,
                 )
             ) {
-                return { sheet_data, refusal, missing_sheet_data_refusal };
+                return { sheet_data, dimension, refusal, missing_sheet_data_refusal };
             }
-        } else if (
-            !saw_sheet_data
-            && direct_worksheet_child
-            && prefix !== undefined
-            && local_name === 'sheetData'
-            && is_spreadsheetml_namespace(namespace)
-        ) {
-            // This explains a missing literal worksheet body only when it occupies
-            // the real structural slot and is genuinely SpreadsheetML.
-            consider('missing-sheet-data', start, 0, 'namespace-prefixed-worksheet-element');
         }
 
         if (
@@ -1150,12 +1175,12 @@ function scan_worksheet_structure(xml: Uint8Array): WorksheetStructure {
                 || local_name === 'f'
                 || local_name === 'is'
                 || local_name === 'v')
+            && namespace === ''
         ) {
             consider('sheet-data', start, 0, 'namespace-prefixed-worksheet-element');
         }
         if (
             inside_sheet_data
-            && prefix === undefined
             && (local_name === 'row' || local_name === 'c' || local_name === 'f')
             && (
                 namespace !== worksheet_namespace
@@ -1199,7 +1224,12 @@ function scan_worksheet_structure(xml: Uint8Array): WorksheetStructure {
         pos = tag_end + 1;
     }
 
-    return { sheet_data, refusal, missing_sheet_data_refusal };
+    return { sheet_data, dimension, refusal, missing_sheet_data_refusal };
+}
+
+/** Locate the authoritative direct SpreadsheetML worksheet sheetData child. */
+export function worksheet_sheet_data_element(xml: Uint8Array): Span | null {
+    return scan_worksheet_structure(xml).sheet_data;
 }
 
 /**
@@ -1249,6 +1279,46 @@ function assert_writable_sheet_data(
     });
     if (first !== undefined) throw new OoxmlRefusalError(first.code, first.coordinate);
     return rows;
+}
+
+/** Namespace-validated worksheet body used by both cell and structural surgery. */
+export function writable_worksheet_sheet_data(xml: Uint8Array): {
+    readonly name: string;
+    readonly element: Span;
+    readonly rows: Map<number, Span[]>;
+} {
+    const structure = scan_worksheet_structure(xml);
+    const element = structure.sheet_data;
+    if (element === null) {
+        const first = structure.missing_sheet_data_refusal;
+        if (first !== undefined) throw new OoxmlRefusalError(first.code);
+        throw new Error('Worksheet XML has no <sheetData> element');
+    }
+    const rows = assert_writable_sheet_data(xml, structure);
+    const opening = utf8_text(xml, element.start, element.inner_start);
+    const name = /^<([^\s/>]+)/.exec(opening)?.[1];
+    if (!name) throw new Error('Worksheet XML has an invalid <sheetData> element');
+    return { name, element, rows };
+}
+
+function spreadsheetml_dimension(xml: Uint8Array): Span | null {
+    const located = scan_worksheet_structure(xml).dimension?.element;
+    if (located !== undefined) return located;
+    // `widen_dimension` is also a small public XML helper and historically
+    // accepts fragments without a worksheet document. Keep that fragment
+    // contract while real worksheet documents use expanded-name resolution.
+    if (
+        index_of_bytes(xml, '<worksheet') !== -1
+        || index_of_bytes(xml, ':worksheet') !== -1
+    ) return null;
+    const literal = live_tags(
+        xml,
+        'dimension',
+        0,
+        xml.length,
+        ignorable_ranges(xml, 0, xml.length),
+    ).next();
+    return literal.done ? null : { ...literal.value, inner_start: literal.value.end, inner_end: literal.value.end };
 }
 
 /**
@@ -1336,6 +1406,50 @@ interface WorksheetFormulaState {
 
 type FormulaCacheSpliceVisitor = (start: number, end: number, text: string) => void;
 
+function span_qname(xml: Uint8Array, span: Span, fallback: string): string {
+    const opening = utf8_text(xml, span.start, span.inner_start);
+    return /^<([^\s/>]+)/.exec(opening)?.[1] ?? fallback;
+}
+
+function element_namespace_in_path(
+    xml: Uint8Array,
+    path: readonly Span[],
+): string {
+    let default_namespace: string | undefined;
+    const bindings = new Map<string, string>();
+    for (const [index, element] of path.entries()) {
+        const declarations = namespace_declarations(opening_tag_text(xml, element));
+        if (declarations.default_namespace !== undefined) {
+            default_namespace = declarations.default_namespace;
+        } else if (index === 0 && default_namespace === undefined) {
+            const root_name = span_qname(xml, element, 'worksheet');
+            if (!root_name.includes(':')) default_namespace = SPREADSHEETML_NS;
+        }
+        for (const binding of declarations.bindings) {
+            bindings.set(binding.prefix, binding.namespace);
+        }
+    }
+    const name = span_qname(xml, path[path.length - 1], '');
+    const colon = name.indexOf(':');
+    return colon === -1
+        ? default_namespace ?? ''
+        : bindings.get(name.slice(0, colon)) ?? '';
+}
+
+function direct_spreadsheet_child(
+    xml: Uint8Array,
+    path: readonly Span[],
+    local_name: string,
+): QualifiedElementSpan | undefined {
+    const parent = path[path.length - 1];
+    return direct_child_elements(xml, parent).find((child) =>
+        child.name.slice(child.name.lastIndexOf(':') + 1) === local_name
+        && is_spreadsheetml_namespace(element_namespace_in_path(
+            xml,
+            [...path, child.element],
+        )));
+}
+
 /** Visit cache rewrites in worksheet order without retaining one object per follower. */
 function visit_formula_cache_splices(
     xml: Uint8Array,
@@ -1346,6 +1460,8 @@ function visit_formula_cache_splices(
     visit: FormulaCacheSpliceVisitor,
 ): void {
     if (wanted.size === 0) return;
+    const worksheet = find_first_element_by_local_name(xml, 'worksheet');
+    if (worksheet === null) return;
     const selected_groups = grouped_ranges.filter((range) =>
         range.kind !== 'shared'
         && wanted.has(`${range.start_row}:${range.start_col}`));
@@ -1353,18 +1469,14 @@ function visit_formula_cache_splices(
         ? new GroupedFormulaRangeIndex(selected_groups)
         : undefined;
     scan_rows(xml, sheet_data.inner_start, sheet_data.inner_end, {
-        on_cell: (row, col, cell) => {
+        on_cell: (row, col, cell, owner) => {
+            const path = [worksheet.element, sheet_data, owner, cell];
             let formula: Span | null = null;
             let key: string | undefined;
             if (grouped?.has(row, col) !== true) {
                 key = `${row}:${col}`;
                 if (!wanted.has(key)) return;
-                formula = find_first_element(
-                    xml,
-                    'f',
-                    cell.inner_start,
-                    cell.inner_end,
-                );
+                formula = direct_spreadsheet_child(xml, path, 'f')?.element ?? null;
                 if (!formula) return;
             }
             key ??= `${row}:${col}`;
@@ -1376,18 +1488,36 @@ function visit_formula_cache_splices(
                     visit(cell.start, cell.inner_start, numeric_open_tag);
                 }
             }
-            const value = find_first_element(xml, 'v', cell.inner_start, cell.inner_end);
+            const value = direct_spreadsheet_child(xml, path, 'v')?.element;
             if (value) {
-                visit(
-                    value.start,
-                    value.end,
-                    replacement === undefined ? '' : `<v>${encode_xml(replacement)}</v>`,
-                );
+                if (replacement === undefined) {
+                    visit(value.start, value.end, '');
+                } else if (value.inner_start === value.end) {
+                    const value_name = span_qname(xml, value, 'v');
+                    const opening = utf8_text(xml, value.start, value.end)
+                        .replace(/\/\s*>$/, '>');
+                    visit(
+                        value.start,
+                        value.end,
+                        `${opening}${encode_xml(replacement)}</${value_name}>`,
+                    );
+                } else {
+                    visit(value.inner_start, value.inner_end, encode_xml(replacement));
+                }
                 return;
             }
             if (replacement === undefined) return;
-            formula ??= find_first_element(xml, 'f', cell.inner_start, cell.inner_end);
-            if (formula) visit(formula.end, formula.end, `<v>${encode_xml(replacement)}</v>`);
+            formula ??= direct_spreadsheet_child(xml, path, 'f')?.element ?? null;
+            if (formula) {
+                const cell_name = span_qname(xml, cell, 'c');
+                const colon = cell_name.indexOf(':');
+                const value_name = colon === -1 ? 'v' : `${cell_name.slice(0, colon)}:v`;
+                visit(
+                    formula.end,
+                    formula.end,
+                    `<${value_name}>${encode_xml(replacement)}</${value_name}>`,
+                );
+            }
         },
     });
 }
@@ -1805,6 +1935,11 @@ function apply_cell_edits_bytes(
         start: element_start,
         end: element_end,
     } = sheet_data;
+    const sheet_data_open = utf8_text(xml, element_start, sheet_data.inner_start);
+    const sheet_data_name = /^<([^\s/>]+)/.exec(sheet_data_open)?.[1] ?? 'sheetData';
+    const namespace_prefix = sheet_data_name.includes(':')
+        ? `${sheet_data_name.slice(0, sheet_data_name.indexOf(':'))}:`
+        : '';
     const self_closing = sheet_data.inner_start === sheet_data.end;
 
     // An empty `<sheetData/>` has nowhere to splice into, so expand it to a pair
@@ -1820,7 +1955,7 @@ function apply_cell_edits_bytes(
         const expanded = apply_utf8_splices(xml, [{
             start: element_start,
             end: element_end,
-            text: `${open_tag}</sheetData>`,
+            text: `${open_tag}</${sheet_data_name}>`,
         }]);
         return apply_cell_edits_bytes(expanded, edits, options);
     }
@@ -1954,9 +2089,13 @@ function apply_cell_edits_bytes(
                     false,
                     false,
                     calculated_formula_results.get(`${e.row}:${e.col}`),
+                    namespace_prefix,
                 ))
                 .join('');
-            new_rows.push({ row, text: `<row r="${row + 1}">${cells}</row>` });
+            new_rows.push({
+                row,
+                text: `<${namespace_prefix}row r="${row + 1}">${cells}</${namespace_prefix}row>`,
+            });
             continue;
         }
 
@@ -2011,6 +2150,7 @@ function apply_cell_edits_bytes(
                         existing_type === 'b',
                         existing_type === 'd',
                         calculated_formula_results.get(`${e.row}:${e.col}`),
+                        namespace_prefix,
                     ),
                 });
             } else {
@@ -2031,6 +2171,7 @@ function apply_cell_edits_bytes(
                         false,
                         false,
                         calculated_formula_results.get(`${e.row}:${e.col}`),
+                        namespace_prefix,
                     ),
                 });
             }
@@ -2063,11 +2204,13 @@ function apply_cell_edits_bytes(
             // attributes; computing an offset from `'</row>'.length` here would
             // splice into the middle of the opening tag and emit malformed XML.
             const open_tag = drop_spans ? remove_attr(row_open_tag, 'spans') : row_open_tag;
-            const attributes = open_tag.slice('<row'.length, open_tag.length - '/>'.length);
+            const row_name = /^<([^\s/>]+)/.exec(open_tag)?.[1]
+                ?? `${namespace_prefix}row`;
+            const attributes = open_tag.slice(row_name.length + 1, open_tag.length - 2);
             splices.push({
                 start: row_span.start,
                 end: row_span.end,
-                text: `<row${attributes}>${inserts.map((i) => i.text).join('')}</row>`,
+                text: `<${row_name}${attributes}>${inserts.map((i) => i.text).join('')}</${row_name}>`,
             });
             continue;
         }
@@ -2202,15 +2345,9 @@ export function widen_dimension(
     const xml = return_text ? Buffer.from(source, 'utf8') : source;
     // The live one: widening a commented-out `<dimension>` left the real extent
     // stale, which is what `<dimension>` is maintained here to prevent.
-    const found = live_tags(
-        xml,
-        'dimension',
-        0,
-        xml.length,
-        ignorable_ranges(xml, 0, xml.length),
-    ).next();
-    if (found.done) return source;
-    const { start, end } = found.value;
+    const found = spreadsheetml_dimension(xml);
+    if (found === null) return source;
+    const { start, end } = found;
     const open_tag = utf8_text(xml, start, end);
     const m = get_attr(open_tag, 'ref')?.match(CELL_RANGE_RE);
     if (!m) return source;
@@ -2237,4 +2374,39 @@ export function widen_dimension(
         text: replace_attr_value(open_tag, 'ref', ref),
     }]);
     return return_text ? utf8_text(updated) : updated;
+}
+
+/**
+ * Set the worksheet's prospective bottom row after a validated tail rewrite.
+ * Column extent only widens; row extent may shrink because the caller has
+ * already proved every removed row is the physical suffix.
+ */
+export function set_dimension_row_extent(
+    source: Uint8Array,
+    last_row: number,
+    last_col: number,
+): Uint8Array {
+    if (!Number.isSafeInteger(last_row) || last_row < 0
+        || !Number.isSafeInteger(last_col) || last_col < 0) return source;
+    const found = spreadsheetml_dimension(source);
+    if (found === null) return source;
+    const { start, end } = found;
+    const open_tag = utf8_text(source, start, end);
+    const match = get_attr(open_tag, 'ref')?.match(CELL_RANGE_RE);
+    if (!match) return source;
+    const start_col = letter_to_index(match[1]);
+    const start_row = Number(match[2]) - 1;
+    const current_end_col = match[3] === undefined
+        ? start_col
+        : letter_to_index(match[3]);
+    const end_col = Math.max(current_end_col, last_col);
+    const end_row = Math.max(start_row, last_row);
+    const ref = `${col_index_to_letter(start_col)}${start_row + 1}:`
+        + `${col_index_to_letter(end_col)}${end_row + 1}`;
+    if (get_attr(open_tag, 'ref') === ref) return source;
+    return apply_utf8_splices(source, [{
+        start,
+        end,
+        text: replace_attr_value(open_tag, 'ref', ref),
+    }]);
 }

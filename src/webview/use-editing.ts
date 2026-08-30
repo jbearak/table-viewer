@@ -34,6 +34,7 @@ import {
 } from './history-cell-state-model';
 import type { HistoryChange } from './history-stack-model';
 import type { HistoryStore } from './history-store';
+import type { PendingFormulaReferenceBasis } from '../pending-changes';
 import { hyperlinks_equal, type CellHyperlink } from '../cell-content';
 import {
     cell_edit_base,
@@ -47,6 +48,11 @@ import {
     type ParsedCellEdit,
 } from '../cell-edit-model';
 import { xlsx_edit_writes_formula } from '../xlsx-cell-value';
+import type { RowIdentity } from '../pending-changes';
+import {
+    commit_staged_transaction,
+    type StagedMutation,
+} from './staged-mutation';
 
 // Re-exported so consumers keep importing the edit vocabulary from the hook they
 // already use; the definitions moved to the store because it, not the hook, owns
@@ -130,6 +136,9 @@ export interface UseEditingOptions {
         text: string,
         afterOrder?: number,
     ) => string;
+    readonly formula_reference_bases?: (
+        value: string,
+    ) => readonly PendingFormulaReferenceBasis[];
     /** One workbook-wide order for a formula edit gesture. */
     readonly next_value_edit_order?: () => number;
 }
@@ -158,10 +167,13 @@ export interface CellValueEdit {
     readonly movedFrom?: {
         readonly source_row: number;
         readonly source_col: number;
+        readonly row_identity?: RowIdentity;
     };
     /** Explicit persisted side for a canonical cell outside display-row space. */
     readonly persistedCell?: EditableSourceCell | null;
 }
+
+export type EditGestureResult = 'committed' | 'noop' | 'refused';
 
 /**
  * A cell's persisted side, read once and answering for both consumers of it —
@@ -237,6 +249,7 @@ function plan_value_write(
     persisted_formatting_known: boolean,
     syntax: EditSyntax,
     edit?: Pick<CellValueEdit, 'source_row' | 'source_col' | 'editOrder' | 'movedFrom'>,
+    formula_reference_bases?: readonly PendingFormulaReferenceBasis[],
 ): PlannedOverlayWrite {
     const parsed = parse_cell_edit(input, syntax);
     // A pending link change is its own dimension: a text revert must not
@@ -250,6 +263,9 @@ function plan_value_write(
             row: edit.movedFrom.source_row,
             col: edit.movedFrom.source_col,
             order: edit.editOrder,
+            ...(edit.movedFrom.row_identity === undefined ? {} : {
+                rowIdentity: edit.movedFrom.row_identity,
+            }),
             ...(before_entry?.movedFrom === undefined ? {} : {
                 previous: [
                     ...(before_entry.movedFrom.previous ?? []),
@@ -259,6 +275,13 @@ function plan_value_write(
                         destinationRow: edit.source_row,
                         destinationCol: edit.source_col,
                         order: before_entry.movedFrom.order,
+                        ...(before_entry.movedFrom.rowIdentity === undefined ? {} : {
+                            sourceRowIdentity: before_entry.movedFrom.rowIdentity,
+                        }),
+                        destinationRowIdentity: {
+                            kind: 'source' as const,
+                            sourceRow: edit.source_row,
+                        },
                     },
                 ],
             }),
@@ -344,6 +367,7 @@ function plan_value_write(
                 formattingKnown: formatting_known,
                 movedFrom: moved_from,
                 valueEditOrder: value_edit_order,
+                formulaReferenceBases: formula_reference_bases,
             },
         ),
         persisted,
@@ -636,15 +660,17 @@ export function use_editing(
         <T extends { readonly source_row: number; readonly source_col: number }>(
             edits: readonly T[],
             label: string,
+            additional_history_changes: readonly HistoryChange[],
             plan: (
                 edit: T,
                 before_entry: DirtyEntry | undefined,
                 before_overlay: CellOverlayState,
                 persisted: PersistedCellRead,
             ) => PlannedOverlayWrite | undefined,
-        ): boolean => {
-            if (edits.length === 0) return false;
-            if (gestures_admitted !== undefined && !gestures_admitted()) return false;
+            additional_mutations: readonly StagedMutation[] = [],
+        ): EditGestureResult => {
+            if (edits.length === 0) return 'noop';
+            if (gestures_admitted !== undefined && !gestures_admitted()) return 'refused';
             const writes: StoreWrite[] = [];
             const changes: HistoryChange[] = [];
             // The store as this gesture found it, plus what the gesture has
@@ -718,33 +744,35 @@ export function use_editing(
                 if (change !== undefined) changes.push(change);
             }
 
-            // Every target was invalid or unavailable to the history capture.
-            // Report refusal so a caller holding a draft keeps it open instead
-            // of treating a no-op as a safely committed gesture.
-            if (writes.length === 0) return false;
+            // Every target was invalid or unavailable. Report a no-op so callers
+            // keep any draft open without treating the gesture as a busy refusal.
+            if (writes.length === 0) return 'noop';
 
             const staged_writes = active_store.stage_writes(session_id, writes);
             // The session moved on: this hook's writes belong to a session that
             // is no longer current, so nothing lands and nothing is recorded.
-            if (staged_writes === undefined) return false;
+            if (staged_writes === undefined) return 'refused';
             // A plain action, deliberately not owned: recording owns as it walks
             // and abandons the walk the moment the hard bound is passed, so an
             // oversized paste it will refuse anyway must reach it unowned.
-            const staged_record = capture?.history.stage_record({ label, changes });
+            const staged_record = capture?.history.stage_record({
+                label,
+                changes: [...changes, ...additional_history_changes],
+            });
 
             // Validate both before moving either: committing the edits and then
             // finding the history unrecordable would leave the two out of step.
-            if (!staged_writes.valid()) return false;
-            if (staged_record !== undefined && !staged_record.valid()) return false;
-
-            staged_writes.commit();
-            // A refusal commits too — its state is the barrier, and by decision
-            // an oversized gesture stays applied with the history cleared behind
-            // it rather than being rejected.
-            staged_record?.commit();
-            staged_writes.notify();
-            staged_record?.notify();
-            return true;
+            const mutations = [
+                staged_writes,
+                ...additional_mutations,
+                ...(staged_record === undefined ? [] : [staged_record]),
+            ];
+            if (mutations.some((mutation) => !mutation.valid())) return 'refused';
+            // A history refusal commits too: its state is the barrier, and by
+            // decision an oversized gesture stays applied with history cleared
+            // behind it rather than being rejected.
+            commit_staged_transaction(mutations);
+            return 'committed';
         },
         [active_store, capture, gestures_admitted, read_persisted_cell, session_id],
     );
@@ -756,8 +784,13 @@ export function use_editing(
      * text means the same thing as its persisted content, otherwise stores the
      * plain projection plus runs when styled.
      */
-    const commit_edits = useCallback(
-        (edits: readonly CellValueEdit[], label = 'Edit cell'): boolean => {
+    const commit_edits_result = useCallback(
+        (
+            edits: readonly CellValueEdit[],
+            label = 'Edit cell',
+            additional_history_changes: readonly HistoryChange[] = [],
+            additional_mutations: readonly StagedMutation[] = [],
+        ): EditGestureResult => {
             let gesture_order = edits.find((edit) => edit.editOrder !== undefined)?.editOrder;
             const next_edit_order = options?.next_value_edit_order;
             const pending_entries = active_store.snapshot();
@@ -765,70 +798,108 @@ export function use_editing(
                 && next_edit_order !== undefined
                 ? latest_dirty_move_source_orders(pending_entries)
                 : new Map<string, number>();
-            return run_edit_gesture(edits, label, (edit, before_entry, _before_overlay, persisted) => {
-                const parsed = parse_cell_edit(edit.value, syntax);
-                const explicitly_opened = edit.openedValue === undefined
-                    ? undefined
-                    : parse_cell_edit(edit.openedValue, syntax);
-                // Overlay finishes are reported even when their text never
-                // changed. This remains a no-op when pending moves made the
-                // effective formula shown by the editor differ from disk.
-                if (
-                    explicitly_opened !== undefined
-                    && cell_edits_equal(parsed, explicitly_opened)
-                ) return undefined;
-                let ordered_edit = edit;
-                if (edit.editOrder === undefined && next_edit_order !== undefined) {
-                    const current = before_entry === undefined
-                        ? persisted.base
-                        : { text: before_entry.value, rich: before_entry.valueRuns };
-                    const opened = explicitly_opened ?? current;
-                    const source_key = [edit.source_row, edit.source_col].join(':');
-                    const pending_move_source_order = pending_move_source_orders.get(source_key);
-                    const value_changed = !cell_edits_equal(parsed, opened);
-                    const opened_was_retargeted = edit.openedValue !== undefined
-                        && !cell_edits_equal(opened, current);
-                    const value_survives = !cell_edits_equal(parsed, persisted.base)
-                        || pending_move_source_order !== undefined
-                        || opened_was_retargeted;
-                    // Glide finishes an overlay even when its text never changed.
-                    // Such a close is a no-op, not a new formula decision. A
-                    // genuinely changed formula still receives the gesture's
-                    // shared order so pending moves apply on the correct side of
-                    // that edit. A reused move source also needs a later order:
-                    // its final nonblank value was written after the cut cleared
-                    // it, not evidence that the cut was malformed.
+            return run_edit_gesture(
+                edits,
+                label,
+                additional_history_changes,
+                (edit, before_entry, _before_overlay, persisted) => {
+                    const parsed = parse_cell_edit(edit.value, syntax);
+                    const explicitly_opened = edit.openedValue === undefined
+                        ? undefined
+                        : parse_cell_edit(edit.openedValue, syntax);
+                    // Overlay finishes are reported even when their text never
+                    // changed. This remains a no-op when pending moves made the
+                    // effective formula shown by the editor differ from disk.
                     if (
-                        syntax === 'markdown'
-                        && value_changed
-                        && value_survives
-                        && (
-                            xlsx_edit_writes_formula(parsed.text, parsed.rich?.runs)
+                        explicitly_opened !== undefined
+                        && cell_edits_equal(parsed, explicitly_opened)
+                    ) return undefined;
+                    let ordered_edit = edit;
+                    if (edit.editOrder === undefined && next_edit_order !== undefined) {
+                        const current = before_entry === undefined
+                            ? persisted.base
+                            : { text: before_entry.value, rich: before_entry.valueRuns };
+                        const opened = explicitly_opened ?? current;
+                        const source_key = [edit.source_row, edit.source_col].join(':');
+                        const pending_move_source_order = pending_move_source_orders.get(source_key);
+                        const value_changed = !cell_edits_equal(parsed, opened);
+                        const opened_was_retargeted = edit.openedValue !== undefined
+                            && !cell_edits_equal(opened, current);
+                        const value_survives = !cell_edits_equal(parsed, persisted.base)
                             || pending_move_source_order !== undefined
-                        )
-                    ) {
-                        gesture_order ??= next_edit_order();
-                        ordered_edit = { ...edit, editOrder: gesture_order };
+                            || opened_was_retargeted;
+                        // Glide finishes an overlay even when its text never changed.
+                        // Such a close is a no-op, not a new formula decision. A
+                        // genuinely changed formula still receives the gesture's
+                        // shared order so pending moves apply on the correct side of
+                        // that edit. A reused move source also needs a later order:
+                        // its final nonblank value was written after the cut cleared
+                        // it, not evidence that the cut was malformed.
+                        if (
+                            syntax === 'markdown'
+                            && value_changed
+                            && value_survives
+                            && (
+                                xlsx_edit_writes_formula(parsed.text, parsed.rich?.runs)
+                                || pending_move_source_order !== undefined
+                            )
+                        ) {
+                            gesture_order ??= next_edit_order();
+                            ordered_edit = { ...edit, editOrder: gesture_order };
+                        }
                     }
-                }
-                return plan_value_write(
-                    before_entry,
-                    ordered_edit.value,
-                    persisted.base,
-                    persisted.history !== undefined
-                        ? persisted.history.hyperlink
-                        : get_cell?.(
-                            ordered_edit.source_row,
-                            ordered_edit.source_col,
-                        )?.hyperlink ?? null,
-                    persisted.history !== undefined,
-                    syntax,
-                    ordered_edit,
-                );
-            });
+                    return plan_value_write(
+                        before_entry,
+                        ordered_edit.value,
+                        persisted.base,
+                        persisted.history !== undefined
+                            ? persisted.history.hyperlink
+                            : get_cell?.(
+                                ordered_edit.source_row,
+                                ordered_edit.source_col,
+                            )?.hyperlink ?? null,
+                        persisted.history !== undefined,
+                        syntax,
+                        ordered_edit,
+                        xlsx_edit_writes_formula(parsed.text, parsed.rich?.runs)
+                            ? options?.formula_reference_bases?.(parsed.text)
+                            : undefined,
+                    );
+                },
+                additional_mutations,
+            );
         },
-        [active_store, get_cell, options?.next_value_edit_order, run_edit_gesture, syntax],
+        [
+            active_store,
+            get_cell,
+            options?.formula_reference_bases,
+            options?.next_value_edit_order,
+            run_edit_gesture,
+            syntax,
+        ],
     );
+    const commit_edits = useCallback((
+        edits: readonly CellValueEdit[],
+        label = 'Edit cell',
+        additional_history_changes: readonly HistoryChange[] = [],
+        additional_mutations: readonly StagedMutation[] = [],
+    ): boolean => commit_edits_result(
+        edits,
+        label,
+        additional_history_changes,
+        additional_mutations,
+    ) === 'committed', [commit_edits_result]);
+
+    const can_capture_edits = useCallback((edits: readonly CellValueEdit[]): boolean => (
+        capture === undefined || edits.every((edit) => (
+            Number.isInteger(edit.source_row)
+            && edit.source_row >= 0
+            && Number.isInteger(edit.source_col)
+            && edit.source_col >= 0
+            && ('persistedCell' in edit
+                || read_persisted_cell(edit.source_row, edit.source_col).history !== undefined)
+        ))
+    ), [capture, read_persisted_cell]);
 
     /**
      * Commit whole-cell hyperlink changes (dialog output): a link to set, or
@@ -837,7 +908,12 @@ export function use_editing(
      */
     const commit_hyperlinks = useCallback(
         (edits: readonly CellHyperlinkEdit[], label = 'Edit hyperlink'): boolean =>
-            run_edit_gesture(edits, label, (edit, before_entry, before_overlay, persisted) =>
+            run_edit_gesture(edits, label, [], (
+                edit,
+                before_entry,
+                before_overlay,
+                persisted,
+            ) =>
                 plan_hyperlink_write(
                     before_entry,
                     before_overlay,
@@ -848,7 +924,7 @@ export function use_editing(
                     persisted.history !== undefined
                         ? persisted.history.hyperlink
                         : get_cell?.(edit.source_row, edit.source_col)?.hyperlink ?? null,
-                )),
+                )) === 'committed',
         [run_edit_gesture, get_cell],
     );
 
@@ -884,18 +960,23 @@ export function use_editing(
             source_col: number,
             new_value: string,
             opened_value?: string,
-        ) => {
-            set_editing_cell((prev) =>
-                prev && prev.source_row === source_row && prev.source_col === source_col
-                    ? null
-                    : prev,
-            );
-            commit_edits([{
+            additional_history_changes: readonly HistoryChange[] = [],
+            additional_mutations: readonly StagedMutation[] = [],
+        ): boolean => {
+            const committed = commit_edits([{
                 source_row,
                 source_col,
                 value: new_value,
                 ...(opened_value === undefined ? {} : { openedValue: opened_value }),
-            }]);
+            }], 'Edit cell', additional_history_changes, additional_mutations);
+            if (committed) {
+                set_editing_cell((prev) =>
+                    prev && prev.source_row === source_row && prev.source_col === source_col
+                        ? null
+                        : prev,
+                );
+            }
+            return committed;
         },
         [commit_edits],
     );
@@ -1054,6 +1135,8 @@ export function use_editing(
         confirm_edit,
         commit_edit,
         commit_edits,
+        commit_edits_result,
+        can_capture_edits,
         commit_hyperlink,
         commit_hyperlinks,
         cancel_edit,

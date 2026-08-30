@@ -19,6 +19,22 @@ _Avoid_: Table header
 Every physical row after the active Header Row through the worksheet's last existing row. Hidden rows, filtered rows, and display sorting do not change the body.
 _Avoid_: Visible rows, displayed rows
 
+**Appended Row**:
+A new Worksheet body row placed after every existing body row without shifting any existing row.
+_Avoid_: Added row, inserted row
+
+**Pending Appended Row**:
+An Appended Row held in an editing session that is not yet part of the workbook on disk.
+_Avoid_: Unsaved physical row, temporary row
+
+**Pending Change**:
+An unsaved change owned by an editing session: a cell change, a Pending Appended Row, or a Pending Tail Removal.
+_Avoid_: Pending edit, dirty edit
+
+**Pending Tail Removal**:
+The pending removal, through Undo, of an unchanged physical worksheet suffix previously created by a recorded Append Row.
+_Avoid_: Deleted row, row deletion
+
 **Column reference**:
 A case-insensitive formula reference such as `[Revenue]` that names one column of the worksheet body. Blank and duplicate column names cannot be referenced.
 _Avoid_: Table reference

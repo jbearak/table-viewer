@@ -16,9 +16,20 @@ import { MAX_PERSISTED_ROW_HEIGHTS, transform_schema_for_sheet } from '../types'
 import type { WorkbookMeta } from '../data-source/interface';
 import type { WorkbookSnapshot } from '../viewer-snapshot';
 import type { EditSessionStore } from '../webview/edit-session-store';
-import type { GridShellProps } from '../webview/grid-shell';
+import type { AppendRowsAdmission, GridShellProps } from '../webview/grid-shell';
 import { find_button } from './helpers/dom-interaction';
 import { sheet_edits } from './pending-edits-helper';
+import {
+    MAX_PENDING_CHANGES_ENCODED_BYTES,
+    MAX_PENDING_USER_CHANGES_ENCODED_BYTES,
+    type PendingStructuralConflict,
+} from '../pending-changes';
+import {
+    absent_overlay,
+    build_cell_history_delta,
+    history_value,
+    value_only_overlay,
+} from '../webview/history-cell-state-model';
 
 const grid_shell_mock = vi.hoisted(() => ({
     is_dirty: false,
@@ -37,12 +48,20 @@ const grid_shell_mock = vi.hoisted(() => ({
         _column: number,
         _is_current?: () => boolean,
     ) => true),
+    reveal_pending_row: vi.fn(() => true),
+    remove_pending_rows: vi.fn(() => true),
+    reveal_tail_removal: vi.fn(() => true),
+    cancel_tail_removals: vi.fn(() => true),
     commit_live_edit: vi.fn(),
     commit_live_edit_at_close_barrier: vi.fn(),
     flush_live_edit: vi.fn(),
     stop_edit_admission: vi.fn(),
     focus_grid: vi.fn(),
     has_grid_focus: vi.fn(() => true),
+    pending_active_cell: vi.fn(() => undefined as {
+        pendingRowId: string;
+        sourceColumn: number;
+    } | undefined),
     select_all: vi.fn(),
     copy_sheet: vi.fn(async () => {}),
     copy_selection: vi.fn(),
@@ -143,6 +162,7 @@ vi.mock('../webview/grid-shell', () => ({
                     grid_shell_mock.focus_grid();
                     return true;
                 },
+                pending_active_cell: () => grid_shell_mock.pending_active_cell(),
             };
             props.grid_focus_ref.current = handle;
             return () => {
@@ -208,6 +228,10 @@ vi.mock('../webview/grid-shell', () => ({
                 discard_conflicted: grid_shell_mock.discard_conflicted,
                 discard_keys: grid_shell_mock.discard_keys,
                 can_reveal_source_cell: grid_shell_mock.can_reveal_source_cell,
+                reveal_pending_row: grid_shell_mock.reveal_pending_row,
+                remove_pending_rows: grid_shell_mock.remove_pending_rows,
+                reveal_tail_removal: grid_shell_mock.reveal_tail_removal,
+                cancel_tail_removals: grid_shell_mock.cancel_tail_removals,
                 reveal_source_cell: grid_shell_mock.reveal_source_cell,
                 stop_edit_admission: grid_shell_mock.stop_edit_admission,
                 commit_live_edit: grid_shell_mock.commit_live_edit,
@@ -950,6 +974,14 @@ function cleanup() {
     grid_shell_mock.can_reveal_source_cell.mockReturnValue(true);
     grid_shell_mock.reveal_source_cell.mockReset();
     grid_shell_mock.reveal_source_cell.mockResolvedValue(true);
+    grid_shell_mock.reveal_pending_row.mockReset();
+    grid_shell_mock.reveal_pending_row.mockReturnValue(true);
+    grid_shell_mock.remove_pending_rows.mockReset();
+    grid_shell_mock.remove_pending_rows.mockReturnValue(true);
+    grid_shell_mock.reveal_tail_removal.mockReset();
+    grid_shell_mock.reveal_tail_removal.mockReturnValue(true);
+    grid_shell_mock.cancel_tail_removals.mockReset();
+    grid_shell_mock.cancel_tail_removals.mockReturnValue(true);
     grid_shell_mock.commit_live_edit.mockReset();
     grid_shell_mock.commit_live_edit_at_close_barrier.mockReset();
     grid_shell_mock.flush_live_edit.mockReset();
@@ -957,6 +989,8 @@ function cleanup() {
     grid_shell_mock.focus_grid.mockReset();
     grid_shell_mock.has_grid_focus.mockReset();
     grid_shell_mock.has_grid_focus.mockReturnValue(true);
+    grid_shell_mock.pending_active_cell.mockReset();
+    grid_shell_mock.pending_active_cell.mockReturnValue(undefined);
     grid_shell_mock.select_all.mockReset();
     grid_shell_mock.copy_sheet.mockReset();
     grid_shell_mock.copy_selection.mockReset();
@@ -1128,6 +1162,115 @@ describe('cell highlight clear-all wiring', () => {
         expect(status_id).not.toBeNull();
         expect(document.getElementById(status_id!)?.textContent)
             .toBe('Cell highlights updated.');
+    });
+
+    it('refuses clear-all while append admission owns the gesture slot', async () => {
+        const { post_message } = await render_app();
+        const meta = make_meta(['Sheet1'], false);
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        await enter_edit_mode(post_message, 'append-session');
+        post_message.mockClear();
+        grid_shell_mock.commit_live_edit.mockClear();
+
+        const request_append = grid_shell_mock.latest_props!.on_append_rows as
+            (count: number) => Promise<unknown>;
+        let completion!: Promise<unknown>;
+        await act(async () => { completion = request_append(1); });
+        await vi.waitUntil(() => post_message.mock.calls.some(
+            ([message]) => message?.type === 'requestAppendRows',
+        ));
+        const request = post_message.mock.calls
+            .map(([message]) => message)
+            .find((message) => message?.type === 'requestAppendRows');
+        expect(grid_shell_mock.latest_props!.append_in_flight).toBe(true);
+
+        await click_button('Highlight');
+        await click_button('Clear all highlights');
+        expect(post_message.mock.calls.some(
+            ([message]) => message?.type === 'clearAllCellHighlights',
+        )).toBe(false);
+        expect(grid_shell_mock.commit_live_edit).not.toHaveBeenCalled();
+
+        await dispatch_host_message({
+            type: 'appendRowsResult',
+            requestId: request.requestId,
+            sourceGeneration: 1,
+            granted: true,
+            rowIds: ['pending-a'],
+            formatTemplate: { id: 'plain', format: { kind: 'none' } },
+            appendBasis: {
+                sourceRowCount: 1,
+                provisionalStartRow: 1,
+                columnCount: 1,
+                schemaFingerprint: transform_schema_for_sheet(meta.sheets[0]),
+            },
+        });
+        await expect(completion).resolves.toEqual(expect.objectContaining({
+            rowIds: ['pending-a'],
+        }));
+        const admission = await completion as AppendRowsAdmission;
+        admission.settle(false);
+        expect(post_message).toHaveBeenCalledWith({
+            type: 'settleRowAdmission',
+            requestId: request.requestId,
+            editSessionId: 'append-session',
+            accepted: false,
+        });
+        expect(grid_shell_mock.latest_props!.append_in_flight).toBe(false);
+    });
+
+    it('cancels an outstanding append when the document is replaced', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1'], false), {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        await enter_edit_mode(post_message, 'old-session');
+        const request_append = grid_shell_mock.latest_props!.on_append_rows as
+            (count: number) => Promise<unknown>;
+        let completion!: Promise<unknown>;
+        await act(async () => { completion = request_append(1); });
+        await vi.waitUntil(() => post_message.mock.calls.some(
+            ([message]) => message?.type === 'requestAppendRows',
+        ));
+        const request = post_message.mock.calls
+            .map(([message]) => message)
+            .find((message) => message?.type === 'requestAppendRows');
+        post_message.mockClear();
+
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Replacement'], false), {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+
+        await expect(completion).resolves.toBeUndefined();
+        expect(post_message).toHaveBeenCalledWith({
+            type: 'settleRowAdmission',
+            requestId: request.requestId,
+            editSessionId: 'old-session',
+            accepted: false,
+        });
+        expect(grid_shell_mock.latest_props!.append_in_flight).toBe(false);
+        expect(grid_stub().getAttribute('data-gestures-admitted')).toBe('true');
+
+        // A late success belongs to the cancelled old document and cannot
+        // revive the caller or re-lock the replacement grid.
+        await dispatch_host_message({
+            type: 'appendRowsResult',
+            requestId: request.requestId,
+            sourceGeneration: request.sourceGeneration,
+            granted: true,
+            rowIds: ['late-row'],
+            formatTemplate: { id: 'plain', format: { kind: 'none' } },
+            appendBasis: {
+                sourceRowCount: 1,
+                provisionalStartRow: 1,
+                columnCount: 1,
+                schemaFingerprint: transform_schema_for_sheet(make_meta(['Sheet1']).sheets[0]),
+            },
+        });
+        expect(grid_shell_mock.latest_props!.append_in_flight).toBe(false);
+        expect(grid_stub().getAttribute('data-gestures-admitted')).toBe('true');
     });
 });
 
@@ -1949,7 +2092,10 @@ describe('Excel first-row header toggle', () => {
         const items = Array.from(
             document.querySelectorAll<HTMLButtonElement>('[role="menuitem"]'),
         );
-        expect(items.map((item) => [item.textContent, item.disabled])).toEqual([
+        expect(items.map((item) => [
+            item.textContent,
+            item.getAttribute('aria-disabled') === 'true',
+        ])).toEqual([
             ['Use first row as header on all 2 sheets', true],
             ['Show first row as data on all 2 sheets', false],
         ]);
@@ -2310,7 +2456,9 @@ describe('Excel first-row header toggle', () => {
             document.querySelectorAll<HTMLButtonElement>('[role="menuitem"]'),
         );
         expect(scope_items).toHaveLength(2);
-        expect(scope_items.every((item) => item.disabled)).toBe(true);
+        expect(scope_items.every(
+            (item) => item.getAttribute('aria-disabled') === 'true',
+        )).toBe(true);
         await click_menu_item('Show first row as data on all 2 sheets');
 
         const unhide = get_button('Unhide all');
@@ -2654,7 +2802,7 @@ describe('Excel first-row header toggle', () => {
         await open_scope_menu('Header row scope');
         expect(Array.from(
             document.querySelectorAll<HTMLButtonElement>('[role="menuitem"]'),
-        ).every((item) => item.disabled)).toBe(true);
+        ).every((item) => item.getAttribute('aria-disabled') === 'true')).toBe(true);
 
         post_message.mockClear();
         await act(async () => {
@@ -4477,7 +4625,7 @@ describe('auto-fit state', () => {
 
         await open_scope_menu('Auto-fit scope');
         const restore = get_menu_item('Restore original widths on all 2 sheets');
-        expect(restore.disabled).toBe(true);
+        expect(restore.getAttribute('aria-disabled')).toBe('true');
         expect(grid_shell_mock.latest_props?.on_auto_fit_sample_change).toBeUndefined();
     });
 
@@ -5199,6 +5347,100 @@ describe('edit mode save exit', () => {
         expect(grid_stub().getAttribute('data-mount-id')).toBe(first_mount_id);
     });
 
+    it('keeps structural conflicts visible with direct row-review actions', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1'], false), {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        await click_button('Edit');
+        await dispatch_host_message({
+            type: 'editSessionResult',
+            granted: true,
+            editSessionId: 'conflict-session',
+            sheetIndex: 0,
+            pendingChanges: {
+                sheetIndex: 0,
+                sheetName: 'Sheet1',
+                cells: {},
+                formatTemplates: [{ id: 'plain', format: { kind: 'none' } }],
+                appendedRows: [{
+                    id: 'pending-row-1',
+                    cells: {},
+                    formatTemplateId: 'plain',
+                    createdOrder: 1,
+                }],
+                tailRemovals: [],
+                appendBasis: {
+                    sourceRowCount: 1,
+                    columnCount: 1,
+                    schemaFingerprint: 'old-schema',
+                },
+                conflicts: [{
+                    reason: 'ambiguousColumns',
+                    pendingRowIds: ['pending-row-1'],
+                    tailRemovalIds: [],
+                }],
+            },
+        });
+
+        expect(document.querySelector('[role="alert"][aria-label="Pending rows that need review"]'))
+            .not.toBeNull();
+        expect(document.body.textContent).toContain('Column identities no longer match.');
+        await click_button('Go to affected row');
+        expect(grid_shell_mock.reveal_pending_row).toHaveBeenCalledWith('pending-row-1');
+        await click_button('Remove affected pending rows');
+        expect(grid_shell_mock.remove_pending_rows).toHaveBeenCalledWith(['pending-row-1']);
+        expect(post_message).toHaveBeenCalledWith(expect.objectContaining({
+            type: 'retainedSavedAppendAuthoritiesChanged',
+        }));
+    });
+
+    it('offers tail-removal recovery and resurfaces a dismissed notice on Save', async () => {
+        await render_app();
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1'], false), {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        await click_button('Edit');
+        await dispatch_host_message({
+            type: 'editSessionResult',
+            granted: true,
+            editSessionId: 'tail-conflict-session',
+            sheetIndex: 0,
+            pendingChanges: {
+                sheetIndex: 0,
+                sheetName: 'Sheet1',
+                cells: {},
+                formatTemplates: [],
+                appendedRows: [],
+                tailRemovals: [{
+                    appendHistoryId: 'saved-append-1',
+                    sourceRow: 0,
+                    savedFingerprint: 'fingerprint',
+                    savedRow: { cells: {}, format: { kind: 'none' } },
+                }],
+                conflicts: [{
+                    reason: 'savedSuffixChanged',
+                    pendingRowIds: [],
+                    tailRemovalIds: ['saved-append-1'],
+                }],
+            },
+        });
+
+        await click_button('Go to affected row');
+        expect(grid_shell_mock.reveal_tail_removal).toHaveBeenCalledWith('saved-append-1');
+        await click_button('Cancel affected row removals');
+        expect(grid_shell_mock.cancel_tail_removals).toHaveBeenCalledWith(['saved-append-1']);
+
+        await click_button('Dismiss notice');
+        expect(document.querySelector('[aria-label="Pending rows that need review"]')).toBeNull();
+        await act(async () => {
+            const props = grid_shell_mock.latest_props as unknown as GridShellProps;
+            props.on_save_request?.();
+        });
+        expect(document.querySelector('[aria-label="Pending rows that need review"]'))
+            .not.toBeNull();
+    });
+
     it('projects recursive formula invalidations across worksheet switches', async () => {
         const meta = make_meta(['People', 'Inventory'], false);
         meta.sheets[0].formulaDependencies = [
@@ -5803,6 +6045,281 @@ describe('edit mode save exit', () => {
             sheetName: 'People',
             edits: { '0:0': { value: 'Newest', base: 'Alice' } },
         }));
+    });
+
+    it('hydrates active and sibling structural-only slots from the initial snapshot', async () => {
+        const meta = make_meta(['People', 'Inventory'], false);
+        const conflict: PendingStructuralConflict = {
+            reason: 'ambiguousPendingFormula',
+            pendingRowIds: [],
+            tailRemovalIds: [],
+            formulaCells: [{
+                rowIdentity: { kind: 'source', sourceRow: 0 },
+                sourceColumn: 0,
+            }],
+        };
+        await render_app();
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: {
+                csvEditable: true,
+                csvEditingSupported: true,
+                csvEditSessionId: 'restored-structural-session',
+            },
+            state: {
+                pendingEdits: [{
+                    sheetName: 'People',
+                    cells: {},
+                    formatTemplates: [{ id: 'plain', format: { kind: 'none' } }],
+                    appendedRows: [{
+                        id: 'blank-restored-row',
+                        cells: {},
+                        formatTemplateId: 'plain',
+                        createdOrder: 1,
+                    }],
+                    tailRemovals: [],
+                    appendBasis: {
+                        sourceRowCount: 1,
+                        provisionalStartRow: 1,
+                        provisionalRowCount: 1,
+                        columnCount: 1,
+                        schemaFingerprint: transform_schema_for_sheet(meta.sheets[0]),
+                    },
+                    conflicts: [],
+                }, {
+                    sheetName: 'Inventory',
+                    cells: {},
+                    formatTemplates: [],
+                    appendedRows: [],
+                    tailRemovals: [],
+                    conflicts: [conflict],
+                }],
+            },
+        }));
+
+        const active = (grid_shell_mock.latest_props as unknown as GridShellProps)
+            .pending_row_store!;
+        expect(active.snapshot().appendedRows.map((row) => row.id))
+            .toEqual(['blank-restored-row']);
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+
+        await click_sheet_tab('Inventory');
+        const sibling = (grid_shell_mock.latest_props as unknown as GridShellProps)
+            .pending_row_store!;
+        expect(sibling.snapshot().conflicts).toEqual([conflict]);
+        await click_sheet_tab('People');
+        expect((grid_shell_mock.latest_props as unknown as GridShellProps)
+            .pending_row_store!.snapshot().appendedRows.map((row) => row.id))
+            .toEqual(['blank-restored-row']);
+    });
+
+    it('installs host-reconciled structural rows on an active-session refresh', async () => {
+        const meta = make_meta(['People'], false);
+        const capabilities = {
+            csvEditable: true,
+            csvEditingSupported: true,
+            csvEditSessionId: 'structural-session',
+        };
+        const structural_slot = (value: string) => ({
+            sheetName: 'People',
+            cells: {},
+            formatTemplates: [{ id: 'plain', format: { kind: 'none' as const } }],
+            appendedRows: [{
+                id: 'pending-row',
+                cells: { 0: { value } },
+                formatTemplateId: 'plain',
+                createdOrder: 1,
+            }],
+            tailRemovals: [],
+            appendBasis: {
+                sourceRowCount: 3,
+                provisionalStartRow: 3,
+                columnCount: 3,
+                schemaFingerprint: transform_schema_for_sheet(meta.sheets[0]),
+            },
+            conflicts: [],
+        });
+        await render_app();
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        await click_button('Edit');
+        await dispatch_host_message({
+            type: 'editSessionResult',
+            granted: true,
+            editSessionId: 'structural-session',
+            sheetIndex: 0,
+            pendingChanges: {
+                sheetIndex: 0,
+                ...structural_slot('before reconciliation'),
+            },
+        });
+        const pending_store = () => (grid_shell_mock.latest_props!
+            .pending_row_store as GridShellProps['pending_row_store'])!;
+        expect(pending_store().snapshot().appendedRows[0].cells[0]?.value)
+            .toBe('before reconciliation');
+        await dispatch_host_message(refresh_snapshot_message(meta, {
+            capabilities,
+            state: { pendingEdits: [structural_slot('host reconciled')] },
+        }));
+
+        expect(pending_store().snapshot().appendedRows[0].cells[0]?.value)
+            .toBe('host reconciled');
+    });
+
+    it('keeps both local stores unchanged when a fieldwise refresh merge exceeds the envelope', async () => {
+        const meta = make_meta(['People'], false);
+        const capabilities = {
+            csvEditable: true,
+            csvEditingSupported: true,
+            csvEditSessionId: 'aggregate-session',
+        };
+        const basis = {
+            sourceRowCount: 3,
+            provisionalStartRow: 3,
+            provisionalRowCount: 1,
+            columnCount: 3,
+            schemaFingerprint: transform_schema_for_sheet(meta.sheets[0]),
+        };
+        const slot = (value: string) => ({
+            sheetName: 'People',
+            cells: {},
+            formatTemplates: [{ id: 'plain', format: { kind: 'none' as const } }],
+            appendedRows: [{
+                id: 'pending-row',
+                cells: { 0: { value, valueEditOrder: 1 } },
+                formatTemplateId: 'plain',
+                createdOrder: 1,
+            }],
+            tailRemovals: [],
+            appendBasis: basis,
+            conflicts: [],
+        });
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        await click_button('Edit');
+        await dispatch_host_message({
+            type: 'editSessionResult',
+            granted: true,
+            editSessionId: 'aggregate-session',
+            sheetIndex: 0,
+            pendingChanges: { sheetIndex: 0, ...slot('before') },
+        });
+        const props = grid_shell_mock.latest_props as unknown as GridShellProps;
+        const pending_store = props.pending_row_store!;
+        const cell_store = props.edit_session!;
+        await act(async () => {
+            expect(pending_store.set_cell(
+                'aggregate-session',
+                'pending-row',
+                0,
+                { value: 'published-local', valueEditOrder: 2 },
+            )).toBe(true);
+        });
+        const { pending_changes_durability } = await import('../webview/host-bridge');
+        pending_changes_durability.publish('aggregate-session', {
+            sheetIndex: 0,
+            sheetName: 'People',
+            cells: {},
+            ...pending_store.snapshot(),
+        }, 1, true);
+        const large_local = 'l'.repeat(4_300_000);
+        await act(async () => {
+            cell_store.commit('aggregate-session', '0:0', {
+                value: large_local,
+                base: '',
+            });
+        });
+        post_message.mockClear();
+
+        const large_authoritative = 'a'.repeat(4_300_000);
+        await dispatch_host_message(refresh_snapshot_message(meta, {
+            capabilities,
+            state: { pendingEdits: [slot(large_authoritative)] },
+        }));
+
+        expect(cell_store.get('0:0')?.value).toBe(large_local);
+        expect(pending_store.snapshot().appendedRows[0].cells[0]?.value)
+            .toBe('published-local');
+        expect(post_message).toHaveBeenCalledWith({
+            type: 'showWarning',
+            message: 'Newer pending changes could not be merged because the worksheet reached its size limit.',
+        });
+    });
+
+    it('adopts a host conflict from a refresh before structural acknowledgement without echoing it', async () => {
+        const meta = make_meta(['People'], false);
+        const capabilities = {
+            csvEditable: true,
+            csvEditingSupported: true,
+            csvEditSessionId: 'structural-session',
+        };
+        const slot = (conflicts: readonly PendingStructuralConflict[] = []) => ({
+            sheetName: 'People',
+            cells: {},
+            formatTemplates: [{ id: 'plain', format: { kind: 'none' as const } }],
+            appendedRows: [{
+                id: 'pending-row',
+                cells: { 0: { value: 'local' } },
+                formatTemplateId: 'plain',
+                createdOrder: 1,
+            }],
+            tailRemovals: [],
+            appendBasis: {
+                sourceRowCount: 3,
+                provisionalStartRow: 3,
+                provisionalRowCount: 1,
+                columnCount: 3,
+                schemaFingerprint: transform_schema_for_sheet(meta.sheets[0]),
+            },
+            conflicts,
+        });
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        await click_button('Edit');
+        await dispatch_host_message({
+            type: 'editSessionResult',
+            granted: true,
+            editSessionId: 'structural-session',
+            sheetIndex: 0,
+            pendingChanges: { sheetIndex: 0, ...slot() },
+        });
+        const pending_store = () => (grid_shell_mock.latest_props!
+            .pending_row_store as GridShellProps['pending_row_store'])!;
+        await act(async () => {
+            expect(pending_store().set_cell(
+                'structural-session',
+                'pending-row',
+                0,
+                { value: 'local', valueEditOrder: 2 },
+            )).toBe(true);
+        });
+        await dispatch_host_message({
+            type: 'requestPendingChangesFlush',
+            requestId: 'structural-before-refresh',
+        });
+        await vi.waitUntil(() => post_message.mock.calls.some(
+            ([message]) => message?.type === 'pendingChangesChanged',
+        ));
+        post_message.mockClear();
+
+        const conflict: PendingStructuralConflict = {
+            reason: 'ambiguousPendingFormula',
+            pendingRowIds: ['pending-row'],
+            tailRemovalIds: [],
+        };
+        await dispatch_host_message(refresh_snapshot_message(meta, {
+            capabilities,
+            state: { pendingEdits: [slot([conflict])] },
+        }));
+
+        expect(pending_store().snapshot().conflicts).toEqual([conflict]);
+        expect(post_message.mock.calls.filter(
+            ([message]) => message?.type === 'pendingChangesChanged',
+        )).toHaveLength(0);
     });
 
     it('folds the active editor before a deletion-shaped rename drops its store', async () => {
@@ -8371,6 +8888,191 @@ describe('edit mode save exit', () => {
 
         expect(latest_store_edits()).toEqual(newer);
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+    });
+
+    for (const save_order of ['snapshot-first', 'result-first'] as const) {
+    it(`clears saved appended rows before leaving edit mode (${save_order})`, async () => {
+        grid_shell_mock.has_uncommitted_changes = true;
+        grid_shell_mock.pending_active_cell.mockReturnValue({
+            pendingRowId: 'pending-row-1',
+            sourceColumn: 0,
+        });
+
+        const { post_message } = await render_app();
+        const meta = make_meta(['Welcome', 'Fruit Stand'], false);
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        await click_sheet_tab('Fruit Stand');
+        await click_button('Edit');
+        await dispatch_host_message({
+            type: 'editSessionResult',
+            granted: true,
+            editSessionId: 'append-session',
+            sheetIndex: 1,
+            pendingChanges: {
+                sheetIndex: 1,
+                sheetName: 'Fruit Stand',
+                cells: {},
+                formatTemplates: [{ id: 'plain', format: { kind: 'none' } }],
+                appendedRows: [{
+                    id: 'pending-row-1',
+                    cells: {},
+                    formatTemplateId: 'plain',
+                    createdOrder: 1,
+                }],
+                tailRemovals: [],
+                appendBasis: {
+                    sourceRowCount: 1,
+                    provisionalStartRow: 1,
+                    provisionalRowCount: 1,
+                    columnCount: 1,
+                    schemaFingerprint: transform_schema_for_sheet(meta.sheets[1]),
+                },
+                conflicts: [],
+            },
+        });
+        const pending_rows = () => (grid_shell_mock.latest_props!
+            .pending_row_store as GridShellProps['pending_row_store'])!;
+        expect(pending_rows().snapshot().appendedRows.map((row) => row.id))
+            .toEqual(['pending-row-1']);
+
+        post_message.mockClear();
+        await click_button('Edit');
+        await dispatch_host_message({ type: 'saveDialogResult', choice: 'save' });
+        const operation = grid_shell_mock.latest_props?.save_operation as CsvSaveOperation;
+        expect(operation.worksheets[0].structuralChanges?.appendedRows.map((row) => row.id))
+            .toEqual(['pending-row-1']);
+
+        const lifecycle = {
+            revision: 1,
+            state: 'succeeded' as const,
+            operation,
+        };
+        const grown = make_meta(['Welcome', 'Fruit Stand'], false);
+        grown.sheets[1] = {
+            ...grown.sheets[1],
+            rowCount: 2,
+            sourceRowCount: 2,
+        };
+        const refresh = refresh_snapshot_message(grown, {
+            state: {
+                pendingEdits: [undefined, {
+                    sheetName: 'Fruit Stand',
+                    cells: {},
+                    formatTemplates: [{ id: 'plain', format: { kind: 'none' } }],
+                    appendedRows: [{
+                        id: 'pending-row-1',
+                        cells: {},
+                        formatTemplateId: 'plain',
+                        createdOrder: 1,
+                    }],
+                    tailRemovals: [],
+                    appendBasis: {
+                        sourceRowCount: 1,
+                        provisionalStartRow: 1,
+                        provisionalRowCount: 1,
+                        columnCount: 1,
+                        schemaFingerprint: transform_schema_for_sheet(meta.sheets[1]),
+                    },
+                    conflicts: [],
+                }],
+            },
+            capabilities: {
+                csvEditable: false,
+                csvEditingSupported: true,
+                csvSaveLifecycle: lifecycle,
+            },
+        });
+        const result = {
+            type: 'saveResult',
+            success: true as const,
+            lifecycle,
+            receipt: {
+                appendedRows: [{
+                    sheetIndex: 1,
+                    sheetName: 'Fruit Stand',
+                    pendingRowId: 'pending-row-1',
+                    sourceRow: 1,
+                    savedFingerprint: 'saved-row-fingerprint',
+                }],
+                removedSourceRows: [],
+            },
+        } as const;
+        if (save_order === 'snapshot-first') {
+            await dispatch_host_message(refresh);
+            await dispatch_host_message(result);
+        } else {
+            await dispatch_host_message(result);
+            await dispatch_host_message(refresh);
+        }
+
+        expect(pending_rows().snapshot().appendedRows).toEqual([]);
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
+        expect(get_button('Edit').classList.contains('has-unsaved')).toBe(false);
+        expect(grid_shell_mock.latest_props?.saved_row_focus).toMatchObject({
+            sheetIndex: 1,
+            sourceRow: 1,
+            sourceColumn: 0,
+        });
+    });
+    }
+
+    it('does not restore saved appended rows from an initial recovery snapshot', async () => {
+        await render_app();
+        const meta = make_meta(['Sheet1'], false);
+        const operation: CsvSaveOperation = {
+            editSessionId: 'recovered-session',
+            saveRequestId: 'recovered-save',
+            worksheets: [{
+                sheetIndex: 0,
+                sheetName: 'Sheet1',
+                edits: {},
+                dirtyEdits: {},
+                structuralChanges: {
+                    formatTemplates: [{ id: 'plain', format: { kind: 'none' } }],
+                    appendedRows: [{
+                        id: 'saved-pending-row',
+                        cells: {},
+                        formatTemplateId: 'plain',
+                        createdOrder: 1,
+                    }],
+                    tailRemovals: [],
+                    appendBasis: {
+                        sourceRowCount: 1,
+                        provisionalStartRow: 1,
+                        provisionalRowCount: 1,
+                        columnCount: 1,
+                        schemaFingerprint: transform_schema_for_sheet(meta.sheets[0]),
+                    },
+                    conflicts: [],
+                },
+            }],
+        };
+
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            state: {
+                pendingEdits: [{
+                    sheetName: 'Sheet1',
+                    cells: {},
+                    ...operation.worksheets[0].structuralChanges!,
+                }],
+            },
+            capabilities: {
+                csvEditable: false,
+                csvEditingSupported: true,
+                csvSaveLifecycle: {
+                    revision: 1,
+                    state: 'succeeded',
+                    operation,
+                },
+            },
+        }));
+
+        const pending_rows = grid_shell_mock.latest_props!
+            .pending_row_store as GridShellProps['pending_row_store'];
+        expect(pending_rows?.snapshot().appendedRows).toEqual([]);
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
     });
 
     it('honors an authoritative success while local editing status is stale', async () => {
@@ -11762,6 +12464,73 @@ describe('edit session store hydration', () => {
         });
     });
 
+    it('carries a pending-row selection across an external source-growth remount', async () => {
+        const { post_message } = await render_app();
+        const meta = make_meta(['Sheet1'], false);
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        await enter_edit_mode(post_message);
+        const pending_store = grid_shell_mock.latest_props?.pending_row_store as {
+            append_rows: (...args: unknown[]) => boolean;
+        };
+        const template = { id: 'plain', format: { kind: 'none' as const } };
+        const basis = {
+            sourceRowCount: 1,
+            provisionalStartRow: 1,
+            provisionalRowCount: 1,
+            columnCount: 1,
+            schemaFingerprint: 'schema',
+        };
+        await act(async () => {
+            expect(pending_store.append_rows(
+                'test-edit-session', ['pending-a'], template, 1, basis,
+            )).toBe(true);
+        });
+        grid_shell_mock.pending_active_cell.mockReturnValue({
+            pendingRowId: 'pending-a',
+            sourceColumn: 0,
+        });
+
+        const grown = make_meta(['Sheet1'], false);
+        grown.sheets[0] = {
+            ...grown.sheets[0],
+            rowCount: 2,
+            sourceRowCount: 2,
+        };
+        await dispatch_host_message(refresh_snapshot_message(grown, {
+            generation: 2,
+            sourceGeneration: 2,
+            capabilities: {
+                csvEditable: true,
+                csvEditingSupported: true,
+                csvEditSessionId: 'test-edit-session',
+            },
+            state: {
+                pendingEdits: [{
+                    cells: {},
+                    formatTemplates: [template],
+                    appendedRows: [{
+                        id: 'pending-a',
+                        cells: {},
+                        formatTemplateId: 'plain',
+                        createdOrder: 1,
+                    }],
+                    tailRemovals: [],
+                    appendBasis: basis,
+                    conflicts: [],
+                }],
+            },
+        }));
+
+        expect(grid_shell_mock.latest_props?.pending_row_focus).toMatchObject({
+            sheetIndex: 0,
+            pendingRowId: 'pending-a',
+            sourceColumn: 0,
+            restoreFocus: true,
+        });
+    });
+
     it('accepts a commit after a refresh re-stamps the session without installing', async () => {
         // set_csv_edit_session_id runs on every applied snapshot, but the install is
         // gated on refresh_editing_current_session. When the id moves and nothing
@@ -14634,6 +15403,683 @@ describe('undo and redo, from the keyboard and the desktop menu', () => {
         });
     }
 
+    it('binds a mixed saved-row restoration grant to its replay request', async () => {
+        const { post_message } = await render_app();
+        const meta = make_meta(['Sheet1'], false);
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        await enter_edit_mode(post_message, 'restore-replay-session');
+        const props = grid_shell_mock.latest_props as unknown as GridShellProps;
+        props.edit_session!.commit('restore-replay-session', '0:0', {
+            value: 'edited',
+            base: 'Alice',
+        });
+        const cell_delta = build_cell_history_delta({
+            worksheet: { sheetIndex: 0, sheetName: 'Sheet1' },
+            sourceRow: 0,
+            sourceColumn: 0,
+            before: absent_overlay(),
+            after: value_only_overlay(history_value('edited'), history_value('Alice')),
+            persistedValue: history_value('Alice'),
+            persistedHyperlink: null,
+        });
+        expect(cell_delta).toBeDefined();
+        const format_template = { id: 'restored-template', format: { kind: 'none' as const } };
+        const restored_row = {
+            id: 'saved-row-id',
+            cells: { 0: { value: 'saved' } },
+            formatTemplateId: format_template.id,
+            createdOrder: 1,
+        };
+        const record = props.history_store!.stage_record({
+            label: 'Remove saved row and edit cell',
+            changes: [{ kind: 'cell' as const, delta: cell_delta! }, {
+                kind: 'rowAppend' as const,
+                delta: {
+                    worksheet: { sheetIndex: 0, sheetName: 'Sheet1' },
+                    pendingRowId: restored_row.id,
+                    before: restored_row,
+                    after: null,
+                    beforeIndex: 0,
+                    afterIndex: null,
+                    formatTemplates: [format_template],
+                    restoredFromSavedRemoval: true as const,
+                },
+            }],
+        });
+        expect(record.valid()).toBe(true);
+        expect(record.commit()).toBe(true);
+        record.notify();
+        post_message.mockClear();
+
+        await undo_via_menu();
+        await vi.waitUntil(() => sent(post_message, 'requestRestoreSavedRows') !== undefined);
+        const restoration = sent(post_message, 'requestRestoreSavedRows');
+        await dispatch_host_message({
+            type: 'restoreSavedRowsResult',
+            requestId: restoration.requestId,
+            sourceGeneration: restoration.sourceGeneration,
+            granted: true,
+            appendHistoryIds: ['saved-row-id'],
+            appendBasis: {
+                sourceRowCount: 1,
+                provisionalStartRow: 1,
+                provisionalRowCount: 1,
+                columnCount: 1,
+                schemaFingerprint: transform_schema_for_sheet(meta.sheets[0]),
+            },
+        });
+        await vi.waitUntil(() => sent(post_message, 'prepareHistoryReplay') !== undefined);
+        const prepare = sent(post_message, 'prepareHistoryReplay');
+        expect(prepare.request.rowAdmissionRequestIds).toEqual([restoration.requestId]);
+        expect(prepare.request.cells).toHaveLength(1);
+        expect(prepare.request.structures).toHaveLength(1);
+        expect(prepare.request.structures[0].desired.appendBasis).toMatchObject({
+            provisionalStartRow: 1,
+        });
+
+        await refuse_prepare(post_message, 'conflict');
+        await vi.waitUntil(() => post_message.mock.calls.some(([message]) => (
+            message?.type === 'settleRowAdmission'
+            && message.requestId === restoration.requestId
+        )));
+        expect(post_message).toHaveBeenCalledWith({
+            type: 'settleRowAdmission',
+            requestId: restoration.requestId,
+            editSessionId: 'restore-replay-session',
+            accepted: false,
+        });
+    });
+
+    it('cancels a saved-row restoration when the document is replaced', async () => {
+        const { post_message } = await render_app();
+        const meta = make_meta(['Sheet1'], false);
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        await enter_edit_mode(post_message, 'restore-old-session');
+        const props = grid_shell_mock.latest_props as unknown as GridShellProps;
+        const template = { id: 'restored-template', format: { kind: 'none' as const } };
+        const row = {
+            id: 'saved-row-id',
+            cells: {},
+            formatTemplateId: template.id,
+            createdOrder: 1,
+        };
+        const record = props.history_store!.stage_record({
+            label: 'Remove saved row',
+            changes: [{
+                kind: 'rowAppend',
+                delta: {
+                    worksheet: { sheetIndex: 0, sheetName: 'Sheet1' },
+                    pendingRowId: row.id,
+                    before: row,
+                    after: null,
+                    beforeIndex: 0,
+                    afterIndex: null,
+                    formatTemplates: [template],
+                    restoredFromSavedRemoval: true,
+                },
+            }],
+        });
+        expect(record.commit()).toBe(true);
+        record.notify();
+        post_message.mockClear();
+
+        await undo_via_menu();
+        await vi.waitUntil(() => sent(post_message, 'requestRestoreSavedRows') !== undefined);
+        const restoration = sent(post_message, 'requestRestoreSavedRows');
+        post_message.mockClear();
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Replacement'], false), {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+
+        expect(post_message).toHaveBeenCalledWith({
+            type: 'settleRowAdmission',
+            requestId: restoration.requestId,
+            editSessionId: 'restore-old-session',
+            accepted: false,
+        });
+        await vi.waitUntil(() => grid_stub().getAttribute('data-gestures-admitted') === 'true');
+        await dispatch_host_message({
+            type: 'restoreSavedRowsResult',
+            requestId: restoration.requestId,
+            sourceGeneration: restoration.sourceGeneration,
+            granted: true,
+            appendHistoryIds: ['saved-row-id'],
+            appendBasis: {
+                sourceRowCount: 1,
+                provisionalStartRow: 1,
+                provisionalRowCount: 1,
+                columnCount: 1,
+                schemaFingerprint: transform_schema_for_sheet(meta.sheets[0]),
+            },
+        });
+        expect(grid_stub().getAttribute('data-gestures-admitted')).toBe('true');
+        expect(sent(post_message, 'showWarning')).toBeUndefined();
+    });
+
+    it('cancels tail-removal validation when the document is replaced', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1'], false), {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        await enter_edit_mode(post_message, 'validation-old-session');
+        const props = grid_shell_mock.latest_props as unknown as GridShellProps;
+        const removal = {
+            appendHistoryId: 'saved-row-id',
+            sourceRow: 0,
+            savedFingerprint: 'fingerprint',
+            savedRow: { cells: {}, format: { kind: 'none' as const } },
+        };
+        const record = props.history_store!.stage_record({
+            label: 'Cancel row removal',
+            changes: [{
+                kind: 'tailRemoval',
+                delta: {
+                    worksheet: { sheetIndex: 0, sheetName: 'Sheet1' },
+                    appendHistoryId: removal.appendHistoryId,
+                    before: removal,
+                    after: null,
+                    beforeIndex: 0,
+                    afterIndex: null,
+                },
+            }],
+        });
+        expect(record.commit()).toBe(true);
+        record.notify();
+        post_message.mockClear();
+
+        await undo_via_menu();
+        await vi.waitUntil(() => sent(post_message, 'validateTailRemovalReplay') !== undefined);
+        const validation = sent(post_message, 'validateTailRemovalReplay');
+        post_message.mockClear();
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Replacement'], false), {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+
+        await vi.waitUntil(() => grid_stub().getAttribute('data-gestures-admitted') === 'true');
+        await dispatch_host_message({
+            type: 'tailRemovalReplayValidated',
+            requestId: validation.requestId,
+            sourceGeneration: validation.sourceGeneration,
+            valid: true,
+        });
+        expect(grid_stub().getAttribute('data-gestures-admitted')).toBe('true');
+        expect(sent(post_message, 'prepareHistoryReplay')).toBeUndefined();
+        expect(sent(post_message, 'showWarning')).toBeUndefined();
+    });
+
+    it('routes structural-only undo and redo through the host transaction', async () => {
+        const { post_message } = await render_app();
+        const meta = make_meta(['Sheet1', 'Sheet2'], false);
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        await enter_edit_mode(post_message, 'structural-replay-session');
+        const props = grid_shell_mock.latest_props as unknown as GridShellProps;
+        const pending_store = props.pending_row_store!;
+        const before = pending_store.snapshot();
+        const template = { id: 'plain', format: { kind: 'none' as const } };
+        const basis = {
+            sourceRowCount: 1,
+            provisionalStartRow: 1,
+            provisionalRowCount: 1,
+            columnCount: 1,
+            schemaFingerprint: transform_schema_for_sheet(meta.sheets[0]),
+        };
+        await act(async () => {
+            expect(pending_store.append_rows(
+                'structural-replay-session',
+                ['pending-a'],
+                template,
+                1,
+                basis,
+            )).toBe(true);
+        });
+        const after = pending_store.snapshot();
+        const appended = after.appendedRows[0];
+        const record = props.history_store!.stage_record({
+            label: 'Append row',
+            changes: [{
+                kind: 'rowAppend',
+                delta: {
+                    worksheet: { sheetIndex: 0, sheetName: 'Sheet1' },
+                    pendingRowId: appended.id,
+                    before: null,
+                    after: appended,
+                    beforeIndex: null,
+                    afterIndex: 0,
+                    formatTemplates: [template],
+                },
+            }, {
+                kind: 'pendingRows',
+                delta: {
+                    worksheet: { sheetIndex: 0, sheetName: 'Sheet1' },
+                    before: { ...after, appendBasis: undefined },
+                    after,
+                },
+            }],
+        });
+        expect(record.commit()).toBe(true);
+        record.notify();
+        await click_sheet_tab('Sheet2');
+        expect(grid_stub().getAttribute('data-sheet-index')).toBe('1');
+        const sibling_pending_store = (grid_shell_mock.latest_props as unknown as GridShellProps)
+            .pending_row_store!;
+        const sibling_before = {
+            formatTemplates: [],
+            appendedRows: [],
+            tailRemovals: [],
+            conflicts: [{
+                reason: 'ambiguousPendingFormula' as const,
+                pendingRowIds: [],
+                tailRemovalIds: [],
+                formulaCells: [{
+                    rowIdentity: { kind: 'source' as const, sourceRow: 0 },
+                    sourceColumn: 0,
+                }],
+            }],
+        };
+        expect(sibling_pending_store.install(
+            { session_id: 'structural-replay-session' },
+            sibling_before,
+        )).toBe(true);
+        post_message.mockClear();
+
+        await undo_via_menu();
+        await vi.waitUntil(() => sent(post_message, 'prepareHistoryReplay') !== undefined);
+        const undo_prepare = sent(post_message, 'prepareHistoryReplay');
+        expect(undo_prepare.request.cells).toEqual([]);
+        expect(undo_prepare.request.structures).toHaveLength(1);
+        expect(undo_prepare.request.structures[0].desired.appendedRows).toEqual([]);
+        expect(pending_store.snapshot()).toEqual(after);
+        await dispatch_host_message({
+            type: 'historyReplayPrepared',
+            prepared: {
+                requestId: undo_prepare.request.requestId,
+                replayId: undo_prepare.request.replayId,
+                leaseId: 'structural-undo-lease',
+                focusSheetIndex: 0,
+                focus: undo_prepare.request.focus,
+                cells: [],
+                structures: undo_prepare.request.structures.map((structure: object) => ({
+                    ...structure,
+                    resolvedSheetIndex: 0,
+                })),
+            },
+        });
+        const undo_commit = sent(post_message, 'commitHistoryReplay');
+        expect(undo_commit.request.structures).toEqual([{ ordinal: 0 }]);
+        grid_shell_mock.focus_grid.mockClear();
+        await dispatch_host_message({
+            type: 'historyReplayCommitted',
+            committed: {
+                requestId: undo_commit.request.requestId,
+                replayId: undo_commit.request.replayId,
+                leaseId: undo_commit.request.leaseId,
+                mutationId: undo_commit.request.mutationId,
+                sourceGeneration: 1,
+                cells: [],
+                structures: [
+                    ...undo_prepare.request.structures.map((structure: object) => ({
+                        ...structure,
+                        resolvedSheetIndex: 0,
+                    })),
+                    {
+                        ordinal: 1,
+                        resolvedSheetIndex: 1,
+                        expectedConflicts: sibling_before.conflicts,
+                        desiredConflicts: [],
+                        hostDerived: true,
+                    },
+                ],
+                focusSheetIndex: 0,
+                focus: undo_prepare.request.focus,
+                displayFocus: null,
+            },
+        });
+        expect(pending_store.snapshot().appendedRows).toEqual([]);
+        expect(pending_store.snapshot().appendBasis).toBeUndefined();
+        expect(sibling_pending_store.snapshot().conflicts).toEqual([]);
+        expect(sent(post_message, 'showWarning')).toBeUndefined();
+        expect(grid_stub().getAttribute('data-sheet-index')).toBe('0');
+        expect(grid_shell_mock.focus_grid).toHaveBeenCalledOnce();
+
+        const published_empty = sent(post_message, 'pendingChangesChanged');
+        if (published_empty !== undefined) {
+            await dispatch_host_message({
+                type: 'pendingChangesAcknowledged',
+                editSessionId: 'structural-replay-session',
+                sequence: published_empty.sequence,
+            });
+        }
+        const grown = make_meta(['Sheet1', 'Sheet2'], false);
+        grown.sheets[0] = {
+            ...grown.sheets[0],
+            rowCount: grown.sheets[0].rowCount + 1,
+            sourceRowCount: grown.sheets[0].sourceRowCount + 1,
+        };
+        await dispatch_host_message(refresh_snapshot_message(grown, {
+            generation: 2,
+            sourceGeneration: 2,
+            capabilities: {
+                csvEditable: true,
+                csvEditingSupported: true,
+                csvEditSessionId: 'structural-replay-session',
+            },
+            state: {},
+        }));
+        post_message.mockClear();
+
+        await press('z', { shiftKey: true });
+        await vi.waitUntil(() => sent(post_message, 'prepareHistoryReplay') !== undefined);
+        const redo_prepare = sent(post_message, 'prepareHistoryReplay');
+        expect(redo_prepare.request.structures[0].desired.appendedRows)
+            .toEqual([appended]);
+        expect(redo_prepare.request.structures[0].desired.appendBasis).toEqual(basis);
+        expect(pending_store.snapshot().appendedRows).toEqual([]);
+        await refuse_prepare(post_message, 'conflict');
+        expect(pending_store.snapshot().appendedRows).toEqual([]);
+        const history = (grid_shell_mock.latest_props as unknown as GridShellProps)
+            .history_store!.snapshot();
+        expect(history.undoStack).toEqual([]);
+        expect(history.redoStack.map((entry) => entry.action.label))
+            .toEqual(['Append row']);
+        expect(before.appendedRows).toEqual([]);
+    });
+
+    it('stages a near-cap cell-to-row replay from one validated worksheet envelope', async () => {
+        const { post_message } = await render_app();
+        const meta = make_meta(['Sheet1'], false);
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        await enter_edit_mode(post_message, 'aggregate-replay-session');
+        const props = grid_shell_mock.latest_props as unknown as GridShellProps;
+        const cell_store = props.edit_session!;
+        const pending_store = props.pending_row_store!;
+        const template = { id: 'plain', format: { kind: 'none' as const } };
+        const basis = {
+            sourceRowCount: 1,
+            provisionalStartRow: 1,
+            provisionalRowCount: 1,
+            columnCount: 1,
+            schemaFingerprint: transform_schema_for_sheet(meta.sheets[0]),
+        };
+        const current_cell = 'c'.repeat(4_250_000);
+        const desired_cell = 'd'.repeat(4_000_000);
+        const current_row_value = 'r'.repeat(4_000_000);
+        const desired_row_value = 's'.repeat(4_250_000);
+        const structural = (value: string) => ({
+            formatTemplates: [template],
+            appendedRows: [{
+                id: 'pending-a',
+                cells: { 0: { value } },
+                formatTemplateId: template.id,
+                createdOrder: 1,
+            }],
+            tailRemovals: [],
+            appendBasis: basis,
+            conflicts: [],
+        });
+        const current_structural = structural(current_row_value);
+        const desired_structural = structural(desired_row_value);
+        expect(pending_store.install(
+            { session_id: 'aggregate-replay-session' },
+            current_structural,
+        )).toBe(true);
+        cell_store.commit('aggregate-replay-session', '0:0', {
+            value: current_cell,
+            base: 'base',
+        });
+        // Install the same coupled validators as the real GridShell. The old
+        // replay path tested each staged half against this still-current other
+        // half and rejected the structural stage even though the final envelope
+        // itself was below the cap.
+        pending_store.set_envelope_context(
+            { sheetIndex: 0, sheetName: 'Sheet1' },
+            () => {
+                const cells = Object.fromEntries(cell_store.snapshot());
+                return {
+                    cells,
+                    encodedBytes: new TextEncoder().encode(JSON.stringify(cells)).byteLength,
+                };
+            },
+        );
+        cell_store.set_write_validator((entries) =>
+            pending_store.envelope_fits(Object.fromEntries(entries)), () => {});
+
+        const delta = build_cell_history_delta({
+            worksheet: { sheetIndex: 0, sheetName: 'Sheet1' },
+            sourceRow: 0,
+            sourceColumn: 0,
+            before: value_only_overlay(
+                history_value(desired_cell),
+                history_value('base'),
+            ),
+            after: value_only_overlay(
+                history_value(current_cell),
+                history_value('base'),
+            ),
+            persistedValue: history_value('base'),
+            persistedHyperlink: null,
+        });
+        expect(delta).toBeDefined();
+        const record = props.history_store!.stage_record({
+            label: 'Move content between cells and rows',
+            changes: [{ kind: 'cell', delta: delta! }, {
+                kind: 'pendingRows',
+                delta: {
+                    worksheet: { sheetIndex: 0, sheetName: 'Sheet1' },
+                    before: desired_structural,
+                    after: current_structural,
+                },
+            }],
+        });
+        expect(record.valid()).toBe(true);
+        expect(record.commit()).toBe(true);
+        record.notify();
+        post_message.mockClear();
+
+        await undo_via_menu();
+        await vi.waitUntil(() => sent(post_message, 'prepareHistoryReplay') !== undefined);
+        const prepare = sent(post_message, 'prepareHistoryReplay');
+        await dispatch_host_message({
+            type: 'historyReplayPrepared',
+            prepared: {
+                requestId: prepare.request.requestId,
+                replayId: prepare.request.replayId,
+                leaseId: 'aggregate-replay-lease',
+                focusSheetIndex: 0,
+                focus: prepare.request.focus,
+                cells: prepare.request.cells.map((cell: Record<string, unknown>) => ({
+                    ...cell,
+                    resolvedSheetIndex: 0,
+                    persisted: { text: 'base' },
+                    persistedHyperlink: null,
+                })),
+                structures: prepare.request.structures.map(
+                    (change: Record<string, unknown>) => ({
+                        ...change,
+                        resolvedSheetIndex: 0,
+                    }),
+                ),
+            },
+        });
+        const commit = sent(post_message, 'commitHistoryReplay');
+        await dispatch_host_message({
+            type: 'historyReplayCommitted',
+            committed: {
+                requestId: commit.request.requestId,
+                replayId: commit.request.replayId,
+                leaseId: commit.request.leaseId,
+                mutationId: commit.request.mutationId,
+                sourceGeneration: 1,
+                cells: commit.request.cells.map((write: { ordinal: number; entry: unknown }) => ({
+                    ordinal: write.ordinal,
+                    resolvedSheetIndex: 0,
+                    key: '0:0',
+                    entry: write.entry,
+                })),
+                structures: prepare.request.structures.map(
+                    (change: Record<string, unknown>) => ({
+                        ...change,
+                        resolvedSheetIndex: 0,
+                    }),
+                ),
+                focusSheetIndex: 0,
+                focus: prepare.request.focus,
+                displayFocus: {
+                    displayRowStart: 0,
+                    displayRowEnd: 0,
+                    mappingGeneration: 1,
+                },
+            },
+        });
+
+        expect(cell_store.get('0:0')?.value).toBe(desired_cell);
+        expect(pending_store.snapshot().appendedRows[0].cells[0]?.value)
+            .toBe(desired_row_value);
+        expect(props.history_store!.snapshot().redoStack).toHaveLength(1);
+        expect(sent(post_message, 'showWarning')).toBeUndefined();
+    });
+
+    it('measures a near-cap restored legacy draft in its durable string form', async () => {
+        const { post_message } = await render_app();
+        const meta = make_meta(['Sheet1'], false);
+        meta.sheets[0] = {
+            ...meta.sheets[0],
+            rowCount: 128,
+            sourceRowCount: 128,
+        };
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        await enter_edit_mode(post_message, 'legacy-replay-session');
+        const props = grid_shell_mock.latest_props as unknown as GridShellProps;
+        const empty_structural = props.pending_row_store!.snapshot();
+        const wire_cells: Record<string, string> = Object.fromEntries(
+            Array.from({ length: 128 }, (_, row) => [`${row}:0`, '']),
+        );
+        const wire_envelope = {
+            sheetIndex: 0,
+            sheetName: 'Sheet1',
+            cells: wire_cells,
+            ...empty_structural,
+        };
+        const empty_values_bytes = new TextEncoder().encode(
+            JSON.stringify(wire_envelope),
+        ).byteLength;
+        const value_bytes = MAX_PENDING_USER_CHANGES_ENCODED_BYTES - empty_values_bytes;
+        const common_length = Math.floor(value_bytes / 128);
+        const remainder = value_bytes % 128;
+        const values = Array.from({ length: 128 }, (_, row) =>
+            'x'.repeat(common_length + (row < remainder ? 1 : 0)));
+        values.forEach((value, row) => { wire_cells[`${row}:0`] = value; });
+        expect(new TextEncoder().encode(JSON.stringify(wire_envelope)).byteLength)
+            .toBe(MAX_PENDING_USER_CHANGES_ENCODED_BYTES);
+        expect(new TextEncoder().encode(JSON.stringify({
+            ...wire_envelope,
+            cells: Object.fromEntries(values.map((value, row) => [
+                `${row}:0`,
+                { value, base: '', base_pending: true },
+            ])),
+        })).byteLength).toBeGreaterThan(MAX_PENDING_CHANGES_ENCODED_BYTES);
+
+        const changes = values.map((value, row) => {
+            const delta = build_cell_history_delta({
+                worksheet: { sheetIndex: 0, sheetName: 'Sheet1' },
+                sourceRow: row,
+                sourceColumn: 0,
+                before: value_only_overlay(history_value(value), history_value(''), true),
+                after: absent_overlay(),
+                persistedValue: history_value('base'),
+                persistedHyperlink: null,
+            });
+            if (delta === undefined) throw new Error('legacy replay delta was elided');
+            return { kind: 'cell' as const, delta };
+        });
+        const record = props.history_store!.stage_record({
+            label: 'Discard legacy draft',
+            changes,
+        });
+        expect(record.valid()).toBe(true);
+        expect(record.commit()).toBe(true);
+        record.notify();
+        post_message.mockClear();
+
+        await undo_via_menu();
+        await vi.waitUntil(() => sent(post_message, 'prepareHistoryReplay') !== undefined);
+        const prepare = sent(post_message, 'prepareHistoryReplay');
+        await dispatch_host_message({
+            type: 'historyReplayPrepared',
+            prepared: {
+                requestId: prepare.request.requestId,
+                replayId: prepare.request.replayId,
+                leaseId: 'legacy-replay-lease',
+                focusSheetIndex: 0,
+                focus: prepare.request.focus,
+                cells: prepare.request.cells.map((cell: Record<string, unknown>) => ({
+                    ...cell,
+                    resolvedSheetIndex: 0,
+                    persisted: { text: 'base' },
+                    persistedHyperlink: null,
+                })),
+            },
+        });
+        const commit = sent(post_message, 'commitHistoryReplay');
+        const committed_entries = commit.request.cells.map(
+            (cell: { entry: unknown }) => cell.entry,
+        );
+        expect(committed_entries).toHaveLength(values.length);
+        expect(committed_entries.every((entry: unknown) => typeof entry === 'string'))
+            .toBe(true);
+        expect(committed_entries.reduce(
+            (total: number, entry: unknown) => total + (entry as string).length,
+            0,
+        )).toBe(values.reduce((total, entry) => total + entry.length, 0));
+        await dispatch_host_message({
+            type: 'historyReplayCommitted',
+            committed: {
+                requestId: commit.request.requestId,
+                replayId: commit.request.replayId,
+                leaseId: commit.request.leaseId,
+                mutationId: commit.request.mutationId,
+                sourceGeneration: 1,
+                cells: commit.request.cells.map((write: {
+                    ordinal: number;
+                    entry: string;
+                }) => {
+                    const prepared_cell = prepare.request.cells.find(
+                        (cell: { ordinal: number }) => cell.ordinal === write.ordinal,
+                    );
+                    return {
+                        ordinal: write.ordinal,
+                        resolvedSheetIndex: 0,
+                        key: `${prepared_cell.sourceRow}:0`,
+                        entry: write.entry,
+                    };
+                }),
+                focusSheetIndex: 0,
+                focus: prepare.request.focus,
+                displayFocus: {
+                    displayRowStart: 0,
+                    displayRowEnd: 0,
+                    mappingGeneration: 1,
+                },
+            },
+        });
+
+        expect(props.edit_session!.size()).toBe(128);
+        expect(props.edit_session!.get('127:0')).toMatchObject({
+            value: values[127], base: '', base_pending: true,
+        });
+        expect(props.history_store!.snapshot().redoStack).toHaveLength(1);
+        expect(sent(post_message, 'showWarning')).toBeUndefined();
+    });
+
     it('asks the host to replay, from the menu and from the keyboard alike', async () => {
         const { post_message } = await render_app();
         await record_highlight(post_message);
@@ -14809,7 +16255,7 @@ describe('undo and redo, from the keyboard and the desktop menu', () => {
             .toBe('The change was redone, but the affected cells are hidden by the current view.');
     });
 
-    it('shows the replayed sheet once the save dialog it waited behind closes', async () => {
+    it('shows only the newest replay destination after a blocked sheet switch', async () => {
         // A cross-sheet replay while a Save/Discard dialog is open. The switch is
         // refused at the time — answering that dialog against the wrong worksheet
         // is the worse bug — and if nothing retries it, the focus request outlives
@@ -14835,14 +16281,27 @@ describe('undo and redo, from the keyboard and the desktop menu', () => {
         expect(grid_stub().getAttribute('data-sheet-index')).toBe('0');
         expect(JSON.parse(grid_stub().getAttribute('data-history-focus')!).sheetIndex).toBe(1);
 
-        // Cancel, deliberately: it is the answer that changes nothing else, so a
-        // switch that happens after it can only be the deferred one.
+        // A newer replay lands back on the sheet that is still mounted. It owns
+        // the complete destination and must supersede the older deferred switch.
+        post_message.mockClear();
+        await press('z', { shiftKey: true });
+        await complete_replay(post_message, {
+            focusSheetIndex: 0,
+            displayFocus: { displayRowStart: 7, displayRowEnd: 7, mappingGeneration: 1 },
+        });
+        expect(JSON.parse(grid_stub().getAttribute('data-history-focus')!)).toMatchObject({
+            sheetIndex: 0,
+            displayRowStart: 7,
+        });
+
+        // Cancel changes nothing else. The first replay's sheet must not surface
+        // now that the later replay replaced its pending focus plan.
         await dispatch_host_message({ type: 'saveDialogResult', choice: 'cancel' });
 
-        expect(grid_stub().getAttribute('data-sheet-index')).toBe('1');
+        expect(grid_stub().getAttribute('data-sheet-index')).toBe('0');
         const focus = JSON.parse(grid_stub().getAttribute('data-history-focus')!);
-        expect(focus.sheetIndex).toBe(1);
-        expect(focus.displayRowStart).toBe(5);
+        expect(focus.sheetIndex).toBe(0);
+        expect(focus.displayRowStart).toBe(7);
     });
 
     it('forgets a waiting sheet switch when the document is replaced', async () => {
@@ -14871,6 +16330,73 @@ describe('undo and redo, from the keyboard and the desktop menu', () => {
         );
 
         expect(grid_stub().getAttribute('data-sheet-index')).toBe('0');
+        expect(grid_stub().getAttribute('data-history-focus')).toBe('null');
+        await click_sheet_tab('Sheet2');
+        expect(grid_stub().getAttribute('data-history-focus')).toBe('null');
+    });
+
+    it('drops an older waiting destination when a newer committed replay diverges', async () => {
+        // A committed terminal supersedes the whole earlier focus plan even when
+        // its local transaction cannot land. Otherwise dismissing the dialog can
+        // make the stale cross-sheet destination fire after the view has already
+        // warned that it diverged from the file.
+        const { post_message } = await render_app();
+        await record_highlight(post_message, {
+            snapshot_extra: {
+                capabilities: { csvEditable: true, csvEditingSupported: true },
+            },
+        });
+        await enter_edit_mode(post_message);
+        seed_mounted_store();
+        await click_button('Edit');
+        expect(sent(post_message, 'showSaveDialog')).toBeDefined();
+
+        await undo_via_menu();
+        await complete_replay(post_message, {
+            focusSheetIndex: 1,
+            displayFocus: { displayRowStart: 5, displayRowEnd: 5, mappingGeneration: 1 },
+        });
+        expect(grid_stub().getAttribute('data-sheet-index')).toBe('0');
+        expect(JSON.parse(grid_stub().getAttribute('data-history-focus')!).sheetIndex).toBe(1);
+
+        post_message.mockClear();
+        await press('z', { shiftKey: true });
+        const prepare = sent(post_message, 'prepareHistoryReplay');
+        await dispatch_host_message({
+            type: 'historyReplayPrepared',
+            prepared: {
+                requestId: prepare.request.requestId,
+                replayId: prepare.request.replayId,
+                leaseId: 'lease-2',
+                focusSheetIndex: 0,
+                focus: prepare.request.focus,
+                cells: [],
+            },
+        });
+        const commit = sent(post_message, 'commitHistoryReplay');
+        (grid_shell_mock.latest_props!.edit_session as EditSessionStore)
+            .install({ session_id: 'moved-on' });
+        post_message.mockClear();
+        await dispatch_host_message({
+            type: 'historyReplayCommitted',
+            committed: {
+                requestId: commit.request.requestId,
+                replayId: commit.request.replayId,
+                leaseId: commit.request.leaseId,
+                mutationId: commit.request.mutationId,
+                sourceGeneration: 1,
+                cells: [{ ordinal: 0, resolvedSheetIndex: 0, key: '3:2', entry: null }],
+                focusSheetIndex: 0,
+                focus: prepare.request.focus,
+                displayFocus: { displayRowStart: 7, displayRowEnd: 7, mappingGeneration: 1 },
+            },
+        });
+
+        expect(sent(post_message, 'showWarning').message).toContain('could not be updated');
+        expect(grid_stub().getAttribute('data-history-focus')).toBe('null');
+        await dispatch_host_message({ type: 'saveDialogResult', choice: 'cancel' });
+        expect(grid_stub().getAttribute('data-sheet-index')).toBe('0');
+        expect(grid_stub().getAttribute('data-history-focus')).toBe('null');
     });
 
     it('shows the replayed sheet when the session is revoked from under the dialog', async () => {

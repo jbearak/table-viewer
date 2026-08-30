@@ -16,6 +16,10 @@ import {
     create_edit_session_store,
     type EditSessionStore,
 } from '../webview/edit-session-store';
+import {
+    create_pending_row_store,
+    type PendingRowStore,
+} from '../webview/pending-row-store';
 
 const grid_mock = vi.hoisted(() => ({
     props: null as null | {
@@ -26,7 +30,7 @@ const grid_mock = vi.hoisted(() => ({
                 movedFrom?: [number, number];
             }[],
             source: string,
-        ) => boolean | void;
+        ) => boolean | 'refused' | void;
         onGridSelectionChange?: (selection: unknown) => void;
         getCellContent?: (cell: [number, number]) => {
             data?: string;
@@ -60,8 +64,23 @@ const grid_mock = vi.hoisted(() => ({
 
 vi.mock('../webview/glide-data-grid', () => {
     const React = require('react') as typeof import('react');
+    const empty_selection = {
+        length: 0,
+        toArray: () => [],
+        toRanges: () => [],
+        first: () => undefined,
+        last: () => undefined,
+        hasIndex: () => false,
+        equals: (other: unknown) => other === empty_selection,
+        add: () => empty_selection,
+        remove: () => empty_selection,
+        *[Symbol.iterator]() {},
+    };
     return {
-        CompactSelection: { empty: () => ({}) },
+        CompactSelection: {
+            empty: () => empty_selection,
+            fromSingleSelection: () => empty_selection,
+        },
         DataEditor: React.forwardRef((props: unknown, ref: React.ForwardedRef<unknown>) => {
             grid_mock.props = props as typeof grid_mock.props;
             React.useImperativeHandle(ref, () => ({
@@ -200,6 +219,7 @@ async function render_grid(
         save_lifecycle?: CsvSaveLifecycle;
         initial_edits?: Record<string, string | CsvDirtyEntry>;
         edit_session?: EditSessionStore;
+        pending_row_store?: PendingRowStore;
         use_fallback_store?: boolean;
         host_rejected_keys?: readonly string[];
         host_observed_bases?: Readonly<Record<string, CsvObservedFileBase>>;
@@ -264,6 +284,7 @@ async function render_grid(
         },
         sheet_index: 0,
         generation: 1,
+        source_generation: 1,
         show_formatting: false,
         edit_activation_id: 1,
         column_projection,
@@ -532,6 +553,39 @@ describe('GridShell CSV save', () => {
         post_message.mockClear();
         expect(await request_save(editing_ref)).toBe(false);
         expect(save_messages(post_message)).toEqual([]);
+    });
+
+    it('blocks pending-row edits while a save is in flight', async () => {
+        const pending_rows = create_pending_row_store({ session_id: 'session-1' });
+        expect(pending_rows.append_rows(
+            'session-1',
+            ['pending-row-1'],
+            { id: 'plain', format: { kind: 'none' } },
+            1,
+            {
+                sourceRowCount: 1,
+                provisionalStartRow: 1,
+                provisionalRowCount: 1,
+                columnCount: 3,
+                schemaFingerprint: 'schema',
+            },
+        )).toBe(true);
+        const { editing_ref } = await render_grid(undefined, {
+            initial_edits: { '0:0': { value: 'first', base: 'base' } },
+            pending_row_store: pending_rows,
+        });
+
+        expect(await request_save(editing_ref)).toBe(true);
+        let result: boolean | 'refused' | void;
+        await act(async () => {
+            result = grid_mock.props!.onCellsEdited!(
+                [{ location: [0, 1], value: { kind: 'text', data: 'newer' } }],
+                'edit',
+            );
+        });
+
+        expect(result!).toBe('refused');
+        expect(pending_rows.snapshot().appendedRows[0].cells).toEqual({});
     });
 
     it('stops offering an editor while a highlight gesture awaits the host', async () => {

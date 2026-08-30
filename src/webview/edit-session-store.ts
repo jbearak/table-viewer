@@ -146,6 +146,11 @@ export interface EditSessionStore {
     /** Read imperatively, never subscribed: the base-capture effect's early
      *  return must cost one field read (get_cell_raw rebinds every page load). */
     has_pending_base(): boolean;
+    /** Install a worksheet-envelope admission check for local write gestures. */
+    set_write_validator(
+        validator: (entries: ReadonlyMap<string, DirtyEntry>) => boolean,
+        on_refused: () => void,
+    ): () => void;
 
     // identity boundary
     /**
@@ -248,6 +253,8 @@ export interface EditSessionStore {
     stage_writes(
         session_id: string | undefined,
         writes: Iterable<StoreWrite>,
+        /** The caller already validated the complete worksheet envelope. */
+        envelope_prevalidated?: boolean,
     ): StagedWrites | undefined;
     /**
      * Stage emptying the whole map, held back exactly as {@link stage_writes} is.
@@ -372,6 +379,10 @@ export function create_edit_session_store(
 ): EditSessionStore {
     let stamp: EditSessionIdentity | null = identity ?? null;
     let state = normalize(edits) ?? { entries: new Map<string, DirtyEntry>(), pending_base: false };
+    let write_validator: {
+        readonly validate: (entries: ReadonlyMap<string, DirtyEntry>) => boolean;
+        readonly on_refused: () => void;
+    } | undefined;
     const listeners = new Set<(change: EditSessionFormulaChange) => void>();
     const RESET_FORMULA_INPUTS = { kind: 'reset' } as const;
 
@@ -502,6 +513,13 @@ export function create_edit_session_store(
         get: (key: string) => state.entries.get(key),
         size: () => state.entries.size,
         has_pending_base: () => state.pending_base,
+        set_write_validator: (validator, on_refused) => {
+            const installed = { validate: validator, on_refused };
+            write_validator = installed;
+            return () => {
+                if (write_validator === installed) write_validator = undefined;
+            };
+        },
 
         install: (next_identity, next_edits) => {
             stamp = next_identity;
@@ -588,13 +606,19 @@ export function create_edit_session_store(
             // The pending value did not move, so formula inputs are unchanged.
             set_entries(next, state.pending_base, false, { kind: 'none' });
         },
-        stage_writes: (session_id, writes) => {
+        stage_writes: (session_id, writes, envelope_prevalidated = false) => {
             if (!owns(session_id)) return undefined;
             // The state staged against, so a store that moved for any reason —
             // an install, a keystroke, a save landing — invalidates the staging
             // rather than silently rebasing it onto a map it never saw.
             const staged_from = state;
             const next = staged_state(writes);
+            if (!envelope_prevalidated
+                && write_validator !== undefined
+                && !write_validator.validate(next.entries)) {
+                write_validator.on_refused();
+                return undefined;
+            }
             return stage_mutation(
                 () => state === staged_from && owns(session_id),
                 () => {

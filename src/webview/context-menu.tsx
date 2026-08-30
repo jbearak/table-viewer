@@ -60,9 +60,9 @@ function MenuLevel({
     const menu_ref = useRef<HTMLDivElement>(null);
     const trigger_refs = useRef(new Map<number, HTMLButtonElement>());
     const submenu_id_prefix = useId();
-    const enabled_indexes = items.flatMap((item, index) =>
-        item.kind !== 'separator' && !item.disabled ? [index] : []);
-    const [active_index, set_active_index] = useState(enabled_indexes[0] ?? -1);
+    const focusable_indexes = items.flatMap((item, index) =>
+        item.kind !== 'separator' ? [index] : []);
+    const [active_index, set_active_index] = useState(focusable_indexes[0] ?? -1);
     const [open_submenu_index, set_open_submenu_index] = useState<number | null>(null);
     const [submenu_position, set_submenu_position] = useState({ left: 0, top: 0 });
 
@@ -99,11 +99,15 @@ function MenuLevel({
     }, [open_submenu_index]);
 
     const move_focus = (direction: 1 | -1 | 'first' | 'last') => {
-        if (enabled_indexes.length === 0) return;
-        if (direction === 'first') return focus_index(enabled_indexes[0]);
-        if (direction === 'last') return focus_index(enabled_indexes[enabled_indexes.length - 1]);
-        const current = Math.max(0, enabled_indexes.indexOf(active_index));
-        focus_index(enabled_indexes[(current + direction + enabled_indexes.length) % enabled_indexes.length]);
+        if (focusable_indexes.length === 0) return;
+        if (direction === 'first') return focus_index(focusable_indexes[0]);
+        if (direction === 'last') {
+            return focus_index(focusable_indexes[focusable_indexes.length - 1]);
+        }
+        const current = Math.max(0, focusable_indexes.indexOf(active_index));
+        focus_index(focusable_indexes[
+            (current + direction + focusable_indexes.length) % focusable_indexes.length
+        ]);
     };
 
     const open_submenu = (index: number, focus_child: boolean) => {
@@ -120,7 +124,7 @@ function MenuLevel({
     };
 
     const hover_item = (index: number) => {
-        if (!enabled_indexes.includes(index)) {
+        if (!focusable_indexes.includes(index)) {
             set_open_submenu_index(null);
             return;
         }
@@ -199,8 +203,8 @@ function MenuLevel({
                                 aria-haspopup="menu"
                                 aria-expanded={is_open}
                                 aria-controls={submenu_id}
-                                disabled={item.disabled}
-                                tabIndex={!item.disabled && active_index === index ? 0 : -1}
+                                aria-disabled={item.disabled === true ? 'true' : undefined}
+                                tabIndex={active_index === index ? 0 : -1}
                                 onFocus={() => set_active_index(index)}
                                 onPointerEnter={() => hover_item(index)}
                                 onMouseEnter={() => hover_item(index)}
@@ -240,8 +244,8 @@ function MenuLevel({
                         className={`context-menu-item${item.checked ? ' active' : ''}`}
                         role={item.checked === undefined ? 'menuitem' : 'menuitemcheckbox'}
                         aria-checked={item.checked}
-                        disabled={item.disabled}
-                        tabIndex={!item.disabled && active_index === index ? 0 : -1}
+                        aria-disabled={item.disabled === true ? 'true' : undefined}
+                        tabIndex={active_index === index ? 0 : -1}
                         onFocus={() => set_active_index(index)}
                         onPointerEnter={() => hover_item(index)}
                         onMouseEnter={() => hover_item(index)}

@@ -132,6 +132,20 @@ describe("data-grid", () => {
         cleanup();
     });
 
+    test("includes frozen trailing rows in the accessibility tree", () => {
+        render(
+            <DataGrid
+                {...basicProps}
+                cellYOffset={20}
+                accessibilityHeight={5}
+                freezeTrailingRows={1}
+            />
+        );
+
+        expect(screen.getByTestId("glide-cell-0-20")).toBeTruthy();
+        expect(screen.getByTestId("glide-cell-0-999")).toBeTruthy();
+    });
+
     test("Emits mouse down", () => {
         const spy = vi.fn();
         render(<DataGrid {...basicProps} onMouseDown={spy} />);

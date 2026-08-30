@@ -42,7 +42,8 @@ import {
     type FormulaCalculationRequest,
     type FormulaCalculationResult,
 } from './formula-calculation';
-import { MAX_WORKBOOK_FORMULAS } from './spreadsheet-safety';
+import { MAX_SHEET_ROWS, MAX_WORKBOOK_FORMULAS } from './spreadsheet-safety';
+import { MAX_PENDING_APPENDED_ROWS } from './pending-changes';
 
 const MAX_CACHED_FORMULA_RESULT_BYTES = 16 * 1024 * 1024;
 const CACHED_FORMULA_RESULT_OVERHEAD = 128;
@@ -918,6 +919,20 @@ export class ViewerPanelCore {
         if (
             msg.targets.length > MAX_WORKBOOK_FORMULAS
             || msg.edits.length > MAX_WORKBOOK_FORMULAS
+            || (msg.removedRows?.length ?? 0) > MAX_PENDING_APPENDED_ROWS
+            || (msg.prospectiveRowCounts !== undefined && (
+                msg.prospectiveRowCounts.length !== this.source.meta().sheets.length
+                || msg.prospectiveRowCounts.some((count) => !Number.isSafeInteger(count)
+                    || count < 0
+                    || count > MAX_SHEET_ROWS)
+            ))
+            || msg.removedRows?.some(({ sheetIndex, row }) =>
+                !Number.isSafeInteger(sheetIndex)
+                || sheetIndex < 0
+                || sheetIndex >= this.source.meta().sheets.length
+                || !Number.isSafeInteger(row)
+                || row < 0
+                || row >= this.source.meta().sheets[sheetIndex].sourceRowCount)
         ) {
             await this.post({
                 type: 'formulaCalculation',
@@ -941,6 +956,10 @@ export class ViewerPanelCore {
                 {
                     edits: msg.edits,
                     targets: msg.targets,
+                    ...(msg.prospectiveRowCounts === undefined
+                        ? {}
+                        : { prospectiveRowCounts: msg.prospectiveRowCounts }),
+                    ...(msg.removedRows === undefined ? {} : { removedRows: msg.removedRows }),
                 },
                 {
                     isCancelled: () => this.disposed

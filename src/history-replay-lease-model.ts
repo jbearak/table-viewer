@@ -158,6 +158,10 @@ export interface HistoryReplayLeaseRegistry<TPayload, TResult> {
 }
 
 export function create_history_replay_lease_registry<TPayload, TResult>(
+    on_issued_lease_dropped: (
+        lease: IssuedHistoryReplayLease<TPayload>,
+        reason: 'expired' | 'abandoned' | 'invalidated' | 'cleared',
+    ) => void = () => {},
 ): HistoryReplayLeaseRegistry<TPayload, TResult> {
     let live: IssuedHistoryReplayLease<TPayload> | CommittingHistoryReplayLease<TPayload> | undefined;
     const settled = new Map<string, SettledHistoryReplay<TResult>>();
@@ -166,11 +170,22 @@ export function create_history_replay_lease_registry<TPayload, TResult>(
         lease?.state === 'issued' && now >= lease.expiresAt
     );
 
+    const drop_issued = (
+        lease: IssuedHistoryReplayLease<TPayload>,
+        reason: 'expired' | 'abandoned' | 'invalidated' | 'cleared',
+    ): void => {
+        if (live !== lease) return;
+        live = undefined;
+        on_issued_lease_dropped(lease, reason);
+    };
+
     const collect = (now: number): void => {
         // Only an ISSUED lease expires. A committing one is mid-write: expiring
         // it would leave a mutation running with nothing to record its answer
         // against, and the answer is what a lost acknowledgement recovers.
-        if (expired(live, now)) live = undefined;
+        if (live?.state === 'issued' && expired(live, now)) {
+            drop_issued(live, 'expired');
+        }
         for (const [id, record] of settled) {
             if (now - record.settledAt >= HISTORY_REPLAY_TERMINAL_RETENTION_MS) {
                 settled.delete(id);
@@ -182,6 +197,13 @@ export function create_history_replay_lease_registry<TPayload, TResult>(
         issue: (identity, payload, now) => {
             collect(now);
             if (live !== undefined) return undefined;
+            // A new preparation is proof that the renderer progressed past the
+            // previous terminal: history cannot ask for the next move until it
+            // applied that answer. Retaining older answers after this point buys
+            // no recovery and lets a sequence of near-cap replays accumulate for
+            // the full five-minute age window. At most the latest settled result
+            // and one live payload are therefore retained.
+            settled.clear();
             const lease: IssuedHistoryReplayLease<TPayload> = Object.freeze({
                 state: 'issued' as const,
                 leaseId: identity.leaseId,
@@ -267,17 +289,20 @@ export function create_history_replay_lease_registry<TPayload, TResult>(
         },
 
         abandon: (leaseId) => {
-            if (live?.state === 'issued' && live.leaseId === leaseId) live = undefined;
+            if (live?.state === 'issued' && live.leaseId === leaseId) {
+                drop_issued(live, 'abandoned');
+            }
         },
 
         invalidate: () => {
-            if (live?.state === 'issued') live = undefined;
+            if (live?.state === 'issued') drop_issued(live, 'invalidated');
         },
 
         collect,
 
         clear: () => {
-            live = undefined;
+            if (live?.state === 'issued') drop_issued(live, 'cleared');
+            else live = undefined;
             settled.clear();
         },
     };

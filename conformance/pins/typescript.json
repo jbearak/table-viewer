@@ -1,5 +1,5 @@
 {
   "implementation": "@jbearak/ooxml-surgery",
   "api_version": 1,
-  "corpus_version": "1.0.0"
+  "corpus_version": "1.1.0"
 }

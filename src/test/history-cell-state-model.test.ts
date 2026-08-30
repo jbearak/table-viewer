@@ -534,6 +534,41 @@ describe('conflict-base metadata', () => {
             value: { kind: 'present', formattingKnown: true },
         });
     });
+
+    it('records formula-reference provenance as value metadata', () => {
+        const bases = [{
+            targetSheetIndex: 0,
+            targetSheetName: 'Data',
+            targetWorksheetId: 'rId1',
+            provisionalStartRow: 4,
+            provisionalRowCount: 1,
+        }] as const;
+        const before = value_only_overlay(history_value('=A5'), history_value(''));
+        const after = value_only_overlay(
+            history_value('=A5'),
+            history_value(''),
+            false,
+            undefined,
+            undefined,
+            true,
+            undefined,
+            2,
+            bases,
+        );
+        const recorded = build_cell_history_delta({
+            worksheet: SHEET,
+            sourceRow: 0,
+            sourceColumn: 0,
+            before,
+            after,
+            persistedValue: history_value(''),
+            persistedHyperlink: null,
+        });
+
+        expect(recorded?.afterOverlay).toMatchObject({
+            value: { kind: 'present', formulaReferenceBases: bases },
+        });
+    });
 });
 
 describe('link added to an existing value entry', () => {

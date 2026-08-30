@@ -305,6 +305,10 @@ export function isRectangleEqual(a: Rectangle | undefined, b: Rectangle | undefi
 
 export type CellActiviationBehavior = "double-click" | "single-click" | "second-click";
 
+export type ClipboardRowIdentity =
+    | { readonly kind: "source"; readonly sourceRow: number }
+    | { readonly kind: "pending"; readonly pendingRowId: string };
+
 /** @category Cells */
 export interface BaseGridCell {
     readonly allowOverlay: boolean;
@@ -326,6 +330,10 @@ export interface BaseGridCell {
         readonly location: Item;
         /** Coordinates in the current grid projection, column then row. */
         readonly gridLocation: Item;
+        /** Projection guard used only when a stable row identity is unavailable. */
+        readonly projectionGeneration?: number;
+        /** Stable row identity for cut provenance across source rebases. */
+        readonly rowIdentity?: ClipboardRowIdentity;
         readonly formula?: string;
     };
     readonly activationBehaviorOverride?: CellActiviationBehavior;
@@ -387,7 +395,10 @@ export type SelectionRange = number | readonly [number, number];
 /** @category Renderers */
 export type ProvideEditorComponent<T extends InnerGridCell> = React.FunctionComponent<{
     readonly onChange: (newValue: T) => void;
-    readonly onFinishedEditing: (newValue?: T, movement?: readonly [-1 | 0 | 1, -1 | 0 | 1]) => void;
+    readonly onFinishedEditing: (
+        newValue?: T,
+        movement?: readonly [-1 | 0 | 1, -1 | 0 | 1],
+    ) => boolean | void;
     readonly isHighlighted: boolean;
     readonly value: T;
     readonly initialValue?: string;
@@ -502,6 +513,9 @@ export type EditListItem = {
     value: EditableGridCell;
     /** Canonical source location when this write is a cut destination. */
     movedFrom?: Item;
+    movedFromRowIdentity?: ClipboardRowIdentity;
+    targetRowIdentity?: ClipboardRowIdentity;
+    targetSourceColumn?: number;
 };
 
 /**
@@ -676,6 +690,11 @@ export class CompactSelection {
             }
         }
         return result;
+    }
+
+    /** The compact half-open ranges without expanding a large selection. */
+    public toRanges(): CompactSelectionRanges {
+        return this.items.map(([start, end]) => [start, end]);
     }
 
     get length(): number {
