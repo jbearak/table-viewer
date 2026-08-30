@@ -299,6 +299,58 @@ function estimate_string_bytes(text: string): number {
     return text.length * 2;
 }
 
+function json_string_code_units(text: string): number {
+    let units = 2;
+    for (let index = 0; index < text.length; index += 1) {
+        const code = text.charCodeAt(index);
+        if (code === 0x22 || code === 0x5c || code === 0x08 || code === 0x09
+            || code === 0x0a || code === 0x0c || code === 0x0d) {
+            units += 2;
+        } else if (code < 0x20) {
+            units += 6;
+        } else if (code >= 0xd800 && code <= 0xdbff) {
+            const low = text.charCodeAt(index + 1);
+            if (low >= 0xdc00 && low <= 0xdfff) {
+                units += 2;
+                index += 1;
+            } else {
+                units += 6;
+            }
+        } else if (code >= 0xdc00 && code <= 0xdfff) {
+            units += 6;
+        } else {
+            units += 1;
+        }
+    }
+    return units;
+}
+
+/** JSON.stringify(...).length without allocating the encoded string. */
+function json_code_units(value: unknown, array_slot = false): number {
+    if (value === null) return 4;
+    if (typeof value === 'string') return json_string_code_units(value);
+    if (typeof value === 'boolean') return value ? 4 : 5;
+    if (typeof value === 'number') return Number.isFinite(value) ? String(value).length : 4;
+    if (value === undefined) return array_slot ? 4 : 0;
+    if (typeof value !== 'object') return array_slot ? 4 : 0;
+    let units = 2;
+    if (Array.isArray(value)) {
+        for (let index = 0; index < value.length; index += 1) {
+            if (index > 0) units += 1;
+            units += json_code_units(value[index], true);
+        }
+        return units;
+    }
+    let written = 0;
+    for (const [key, child] of Object.entries(value)) {
+        if (child === undefined) continue;
+        if (written > 0) units += 1;
+        units += json_string_code_units(key) + 1 + json_code_units(child);
+        written += 1;
+    }
+    return units;
+}
+
 interface ActionCharger {
     value: (value: HistoryValue) => number;
     link: (link: CellHyperlink | null) => number;
@@ -367,7 +419,7 @@ function action_charger(): ActionCharger {
         worksheet: (worksheet) => once(worksheet, (target) =>
             string_bytes(target.sheetName ?? '') + string_bytes(target.worksheetId ?? '')),
         structural: (value) => once(value, (payload) =>
-            estimate_string_bytes(JSON.stringify(payload))),
+            json_code_units(payload) * 2),
     };
 }
 
@@ -413,10 +465,10 @@ function estimate_cell_delta_bytes(delta: CellHistoryDelta, charge: ActionCharge
 
 function estimate_change_bytes(change: HistoryChange, charge: ActionCharger): number {
     const structural_bytes = change.kind === 'rowAppend'
-        ? estimate_string_bytes(JSON.stringify({
+        ? json_code_units({
             ...change.delta,
             formatTemplates: [],
-        })) + change.delta.formatTemplates.reduce(
+        }) * 2 + change.delta.formatTemplates.reduce(
             (total, template) => total + charge.structural(template),
             0,
         )
@@ -905,11 +957,15 @@ function saved_row_cell_overlay(
     const base_link = pending_cell_link(persisted);
     const value_changed = !history_values_equal(value, base);
     const link_changed = !hyperlinks_equal(link, base_link);
-    const value_metadata_changed = JSON.stringify(historical?.movedFrom)
-        !== JSON.stringify(persisted?.movedFrom)
+    const value_metadata_changed = !structural_values_equal(
+        historical?.movedFrom,
+        persisted?.movedFrom,
+    )
         || historical?.valueEditOrder !== persisted?.valueEditOrder
-        || JSON.stringify(historical?.formulaReferenceBases ?? [])
-            !== JSON.stringify(persisted?.formulaReferenceBases ?? []);
+        || !structural_values_equal(
+            historical?.formulaReferenceBases ?? [],
+            persisted?.formulaReferenceBases ?? [],
+        );
     const value_dimension_changed = value_changed || value_metadata_changed;
     if (!value_dimension_changed && !link_changed) return absent_overlay();
     if (value_dimension_changed && link_changed) {
@@ -1199,90 +1255,134 @@ function structural_snapshot_without(
     };
 }
 
-function expand_saved_pending_snapshot(
+function* expand_saved_pending_snapshot(
     change: Extract<HistoryChange, { kind: 'pendingRows' }>,
     assignments: ReadonlyMap<string, SavedHistoryRowAssignment>,
-): HistoryChange[] {
+): IterableIterator<HistoryChange> {
     const worksheet_key = worksheet_target_key(change.delta.worksheet);
-    const ids = new Set<string>();
-    for (const row of [...change.delta.before.appendedRows, ...change.delta.after.appendedRows]) {
-        const assignment = assignments.get(row.id);
-        if (assignment !== undefined
-            && worksheet_target_key(assignment.worksheet) === worksheet_key) ids.add(row.id);
+    const before_rows = change.delta.before.appendedRows;
+    const after_rows = change.delta.after.appendedRows;
+    const templates = new Map<string, PendingRowFormatTemplate>();
+    for (const template of change.delta.before.formatTemplates) templates.set(template.id, template);
+    for (const template of change.delta.after.formatTemplates) {
+        if (!templates.has(template.id)) templates.set(template.id, template);
     }
-    if (ids.size === 0) return [change];
-    const row_changes: HistoryChange[] = [];
-    for (const id of ids) {
-        const before = change.delta.before.appendedRows.find((row) => row.id === id) ?? null;
-        const after = change.delta.after.appendedRows.find((row) => row.id === id) ?? null;
-        if (JSON.stringify(before) === JSON.stringify(after)) continue;
+    const matched_after_ids = new Set<string>();
+    const expanded_ids = new Set<string>();
+    const row_change = (
+        before: PendingAppendedRow | null,
+        after: PendingAppendedRow | null,
+        beforeIndex: number | null,
+        afterIndex: number | null,
+    ): HistoryChange | undefined => {
+        const id = before?.id ?? after?.id;
+        if (id === undefined) return undefined;
+        const assignment = assignments.get(id);
+        if (assignment === undefined
+            || worksheet_target_key(assignment.worksheet) !== worksheet_key) return undefined;
+        expanded_ids.add(id);
+        if (structural_values_equal(before, after)) return undefined;
         const template_ids = new Set([
             before?.formatTemplateId,
             after?.formatTemplateId,
         ].filter((value): value is string => value !== undefined));
-        const templates = [
-            ...change.delta.before.formatTemplates,
-            ...change.delta.after.formatTemplates,
-        ].filter((template, index, all) => template_ids.has(template.id)
-            && all.findIndex((candidate) => candidate.id === template.id) === index);
-        row_changes.push({
+        const used_templates = [...template_ids].flatMap((template_id) => {
+            const template = templates.get(template_id);
+            return template === undefined ? [] : [template];
+        });
+        return {
             kind: 'rowAppend',
             delta: {
                 worksheet: change.delta.worksheet,
                 pendingRowId: id,
                 before,
                 after,
-                beforeIndex: before === null
-                    ? null
-                    : change.delta.before.appendedRows.findIndex((row) => row.id === id),
-                afterIndex: after === null
-                    ? null
-                    : change.delta.after.appendedRows.findIndex((row) => row.id === id),
-                formatTemplates: templates,
+                beforeIndex,
+                afterIndex,
+                formatTemplates: used_templates,
             },
-        });
+        };
+    };
+    let after_cursor = 0;
+    for (const [before_index, before] of before_rows.entries()) {
+        while (after_cursor < after_rows.length
+            && after_rows[after_cursor].createdOrder < before.createdOrder) after_cursor += 1;
+        const after_index = after_rows[after_cursor]?.id === before.id ? after_cursor : -1;
+        const after = after_index < 0 ? null : after_rows[after_index];
+        if (after !== null) matched_after_ids.add(after.id);
+        const expanded = row_change(
+            before,
+            after,
+            before_index,
+            after_index < 0 ? null : after_index,
+        );
+        if (expanded !== undefined) yield expanded;
     }
-    const before = structural_snapshot_without(change.delta.before, ids, new Set());
-    const after = structural_snapshot_without(change.delta.after, ids, new Set());
-    return [
-        ...row_changes,
-        ...(JSON.stringify(before) === JSON.stringify(after) ? [] : [{
+    for (const [after_index, after] of after_rows.entries()) {
+        if (matched_after_ids.has(after.id)) continue;
+        const expanded = row_change(null, after, null, after_index);
+        if (expanded !== undefined) yield expanded;
+    }
+    if (expanded_ids.size === 0) {
+        yield change;
+        return;
+    }
+    const before = structural_snapshot_without(change.delta.before, expanded_ids, new Set());
+    const after = structural_snapshot_without(change.delta.after, expanded_ids, new Set());
+    if (!structural_values_equal(before, after)) {
+        yield {
             kind: 'pendingRows' as const,
             delta: { worksheet: change.delta.worksheet, before, after },
-        }]),
-    ];
+        };
+    }
+}
+
+function rekey_output_meter(label: string, hardMaxBytes: number): () => void {
+    let floor = estimate_string_bytes(barrier_label(label));
+    return () => {
+        floor += CHANGE_OVERHEAD_BYTES;
+        if (floor > hardMaxBytes) throw new BudgetExhausted();
+    };
 }
 
 function rekey_saved_action(
     action: HistoryAction,
     assignments: ReadonlyMap<string, SavedHistoryRowAssignment>,
+    retain_change: () => void,
 ): HistoryAction {
     const tail_changes: Extract<HistoryChange, { kind: 'tailRemoval' }>[] = [];
     const other_changes: HistoryChange[] = [];
-    const expanded_changes = action.changes.flatMap((change) => (
-        change.kind === 'pendingRows'
-            ? expand_saved_pending_snapshot(change, assignments)
-            : [change]
-    )).map((change) => rekey_change_provenance(change, assignments));
-    for (const change of expanded_changes) {
-        if (change.kind !== 'rowAppend') {
-            other_changes.push(change);
+    const expanded_changes = function* (): IterableIterator<HistoryChange> {
+        for (const change of action.changes) {
+            if (change.kind === 'pendingRows') {
+                yield* expand_saved_pending_snapshot(change, assignments);
+            } else {
+                yield change;
+            }
+        }
+    };
+    for (const raw_change of expanded_changes()) {
+        if (raw_change.kind !== 'rowAppend') {
+            retain_change();
+            other_changes.push(rekey_change_provenance(raw_change, assignments));
             continue;
         }
-        const assignment = assignments.get(change.delta.pendingRowId);
+        const assignment = assignments.get(raw_change.delta.pendingRowId);
         if (assignment === undefined) {
-            other_changes.push(change);
+            retain_change();
+            other_changes.push(rekey_change_provenance(raw_change, assignments));
             continue;
         }
-        if ((change.delta.before === null) !== (change.delta.after === null)) {
+        if ((raw_change.delta.before === null) !== (raw_change.delta.after === null)) {
+            retain_change();
             const removal = saved_tail_removal(assignment, assignments);
             tail_changes.push({
                 kind: 'tailRemoval',
                 delta: {
                     worksheet: assignment.worksheet,
                     appendHistoryId: removal.appendHistoryId,
-                    before: change.delta.before === null ? removal : null,
-                    after: change.delta.after === null ? removal : null,
+                    before: raw_change.delta.before === null ? removal : null,
+                    after: raw_change.delta.after === null ? removal : null,
                     // Saved removals join whatever safe suffix earlier undos have
                     // already staged, so their insertion index is resolved by
                     // source coordinate at replay time.
@@ -1291,8 +1391,16 @@ function rekey_saved_action(
                 },
             });
         }
-        other_changes.push(...saved_row_cell_changes(change.delta, assignment, assignments));
-        other_changes.push(...saved_row_highlight_changes(change.delta, assignment));
+        const cell_changes = saved_row_cell_changes(raw_change.delta, assignment, assignments);
+        for (const change of cell_changes) {
+            retain_change();
+            other_changes.push(change);
+        }
+        const highlight_changes = saved_row_highlight_changes(raw_change.delta, assignment);
+        for (const change of highlight_changes) {
+            retain_change();
+            other_changes.push(change);
+        }
     }
     // A forward transition that removes tail-removal records must walk from the
     // highest source coordinate down; adding them walks low-to-high. Undo reverses
@@ -1324,26 +1432,42 @@ export function rekey_saved_appended_row_history(
 ): HistoryStackState {
     if (saved.length === 0) return state;
     const assignments = new Map(saved.map((row) => [row.pendingRowId, row]));
-    let oversized = false;
-    const rekey_stack = (entries: readonly HistoryEntry[]): readonly HistoryEntry[] =>
-        entries.flatMap((entry) => {
-            const action = rekey_saved_action(entry.action, assignments);
-            if (action.changes.length === 0) return [];
-            const measured = own_and_measure(action, bounds.hardMaxBytes);
-            if (measured === undefined) {
-                oversized = true;
-                return [];
+    const rekey_stack = (
+        entries: readonly HistoryEntry[],
+    ): readonly HistoryEntry[] | undefined => {
+        const rekeyed: HistoryEntry[] = [];
+        for (const entry of entries) {
+            let action: HistoryAction;
+            try {
+                action = rekey_saved_action(
+                    entry.action,
+                    assignments,
+                    rekey_output_meter(entry.action.label, bounds.hardMaxBytes),
+                );
+            } catch (error) {
+                if (!(error instanceof BudgetExhausted)) throw error;
+                return undefined;
             }
-            return [{
+            if (action.changes.length === 0) continue;
+            const measured = own_and_measure(action, bounds.hardMaxBytes);
+            if (measured === undefined) return undefined;
+            rekeyed.push({
                 ...measured,
                 id: entry.id,
                 moves: entry.moves,
                 epoch: entry.epoch,
-            }];
-        });
+            });
+        }
+        return rekeyed;
+    };
     const undoStack = rekey_stack(state.undoStack);
+    if (undoStack === undefined) {
+        return refused(state, 'Save appended rows', bounds.hardMaxBytes).state;
+    }
     const redoStack = rekey_stack(state.redoStack);
-    if (oversized) return refused(state, 'Save appended rows', bounds.hardMaxBytes).state;
+    if (redoStack === undefined) {
+        return refused(state, 'Save appended rows', bounds.hardMaxBytes).state;
+    }
     return bound_rekeyed_history({ ...state, undoStack, redoStack }, bounds);
 }
 
@@ -1354,31 +1478,31 @@ export interface SavedTailRemovalCommit {
 
 function expand_committed_pending_snapshot(
     change: Extract<HistoryChange, { kind: 'pendingRows' }>,
-    committed: readonly SavedTailRemovalCommit[],
+    committed_ids_by_sheet: ReadonlyMap<string, ReadonlySet<string>>,
 ): HistoryChange[] {
     const worksheet_key = worksheet_target_key(change.delta.worksheet);
-    const ids = new Set(committed
-        .filter((item) => worksheet_target_key(item.worksheet) === worksheet_key)
-        .map((item) => item.removal.appendHistoryId));
+    const ids = committed_ids_by_sheet.get(worksheet_key) ?? new Set<string>();
+    const before_removals = new Map(change.delta.before.tailRemovals.map((removal, index) => [
+        removal.appendHistoryId,
+        { removal, index },
+    ]));
+    const after_removals = new Map(change.delta.after.tailRemovals.map((removal, index) => [
+        removal.appendHistoryId,
+        { removal, index },
+    ]));
     const present_ids = new Set([...ids].filter((id) => {
-        const before = change.delta.before.tailRemovals.find(
-            (removal) => removal.appendHistoryId === id,
-        ) ?? null;
-        const after = change.delta.after.tailRemovals.find(
-            (removal) => removal.appendHistoryId === id,
-        ) ?? null;
-        return JSON.stringify(before) !== JSON.stringify(after);
+        const before = before_removals.get(id)?.removal ?? null;
+        const after = after_removals.get(id)?.removal ?? null;
+        return !structural_values_equal(before, after);
     }));
     if (present_ids.size === 0) return [change];
     const removal_changes: HistoryChange[] = [];
     for (const id of present_ids) {
-        const before = change.delta.before.tailRemovals.find(
-            (removal) => removal.appendHistoryId === id,
-        ) ?? null;
-        const after = change.delta.after.tailRemovals.find(
-            (removal) => removal.appendHistoryId === id,
-        ) ?? null;
-        if (JSON.stringify(before) === JSON.stringify(after)) continue;
+        const before_entry = before_removals.get(id);
+        const after_entry = after_removals.get(id);
+        const before = before_entry?.removal ?? null;
+        const after = after_entry?.removal ?? null;
+        if (structural_values_equal(before, after)) continue;
         removal_changes.push({
             kind: 'tailRemoval',
             delta: {
@@ -1386,16 +1510,8 @@ function expand_committed_pending_snapshot(
                 appendHistoryId: id,
                 before,
                 after,
-                beforeIndex: before === null
-                    ? null
-                    : change.delta.before.tailRemovals.findIndex(
-                        (removal) => removal.appendHistoryId === id,
-                    ),
-                afterIndex: after === null
-                    ? null
-                    : change.delta.after.tailRemovals.findIndex(
-                        (removal) => removal.appendHistoryId === id,
-                    ),
+                beforeIndex: before_entry?.index ?? null,
+                afterIndex: after_entry?.index ?? null,
             },
         });
     }
@@ -1403,7 +1519,7 @@ function expand_committed_pending_snapshot(
     const after = structural_snapshot_without(change.delta.after, new Set(), present_ids);
     return [
         ...removal_changes,
-        ...(JSON.stringify(before) === JSON.stringify(after) ? [] : [{
+        ...(structural_values_equal(before, after) ? [] : [{
             kind: 'pendingRows' as const,
             delta: { worksheet: change.delta.worksheet, before, after },
         }]),
@@ -1461,6 +1577,134 @@ export function rekey_committed_tail_removal_history(
     bounds: HistoryBounds = DEFAULT_HISTORY_BOUNDS,
 ): HistoryStackState {
     if (committed.length === 0) return state;
+    const committed_rows = committed.map((item) => {
+        const worksheet = item.worksheet;
+        const removal = item.removal;
+        return {
+            worksheet,
+            removal,
+            worksheetKey: worksheet_target_key(worksheet),
+            appendHistoryId: removal.appendHistoryId,
+            sourceRow: removal.sourceRow,
+        };
+    });
+    const committed_ids_by_sheet = new Map<string, Set<string>>();
+    const committed_ids_by_source = new Map<string, Set<string>>();
+    for (const item of committed_rows) {
+        const ids = committed_ids_by_sheet.get(item.worksheetKey) ?? new Set<string>();
+        ids.add(item.appendHistoryId);
+        committed_ids_by_sheet.set(item.worksheetKey, ids);
+        const source_key = `${item.worksheetKey}\u0000${item.sourceRow}`;
+        const source_ids = committed_ids_by_source.get(source_key) ?? new Set<string>();
+        source_ids.add(item.appendHistoryId);
+        committed_ids_by_source.set(source_key, source_ids);
+    }
+    const visit_committed_pending_transitions = (
+        change: Extract<HistoryChange, { kind: 'pendingRows' }>,
+        visit: (id: string) => void,
+    ): void => {
+        const ids = committed_ids_by_sheet.get(worksheet_target_key(change.delta.worksheet));
+        if (ids === undefined) return;
+        const before = change.delta.before.tailRemovals;
+        const after = change.delta.after.tailRemovals;
+        let before_index = 0;
+        let after_index = 0;
+        while (before_index < before.length || after_index < after.length) {
+            const prior = before[before_index];
+            const next = after[after_index];
+            if (prior !== undefined && next !== undefined
+                && prior.sourceRow === next.sourceRow) {
+                if (prior.appendHistoryId === next.appendHistoryId) {
+                    if (ids.has(prior.appendHistoryId)
+                        && !structural_values_equal(prior, next)) visit(prior.appendHistoryId);
+                } else {
+                    if (ids.has(prior.appendHistoryId)) visit(prior.appendHistoryId);
+                    if (ids.has(next.appendHistoryId)) visit(next.appendHistoryId);
+                }
+                before_index += 1;
+                after_index += 1;
+            } else if (next === undefined
+                || (prior !== undefined && prior.sourceRow < next.sourceRow)) {
+                if (ids.has(prior.appendHistoryId)) visit(prior.appendHistoryId);
+                before_index += 1;
+            } else {
+                if (ids.has(next.appendHistoryId)) visit(next.appendHistoryId);
+                after_index += 1;
+            }
+        }
+    };
+    const preflight_history = (): boolean => {
+        try {
+            const entries = [...state.undoStack, ...state.redoStack];
+            const meters = new Map<object, {
+                readonly retain: () => void;
+                readonly seen: Set<string>;
+            }>();
+            const meter_for = (entry: HistoryEntry) => {
+                let meter = meters.get(entry.id);
+                if (meter === undefined) {
+                    meter = {
+                        retain: rekey_output_meter(entry.action.label, bounds.hardMaxBytes),
+                        seen: new Set(),
+                    };
+                    meters.set(entry.id, meter);
+                }
+                return meter;
+            };
+            const transitioning_keys = new Set<string>();
+            for (const entry of entries) {
+                const retain_replacement = (key: string): void => {
+                    transitioning_keys.add(key);
+                    const meter = meter_for(entry);
+                    if (meter.seen.has(key)) return;
+                    meter.seen.add(key);
+                    meter.retain();
+                };
+                for (const change of entry.action.changes) {
+                    const worksheet_key = worksheet_target_key(change.delta.worksheet);
+                    if (change.kind === 'pendingRows') {
+                        visit_committed_pending_transitions(
+                            change,
+                            (id) => retain_replacement(`${worksheet_key}\u0000${id}`),
+                        );
+                    } else if (change.kind === 'tailRemoval') {
+                        const ids = committed_ids_by_sheet.get(worksheet_key);
+                        if (ids?.has(change.delta.appendHistoryId)
+                            && !structural_values_equal(
+                                change.delta.before,
+                                change.delta.after,
+                            )) {
+                            retain_replacement(
+                                `${worksheet_key}\u0000${change.delta.appendHistoryId}`,
+                            );
+                        }
+                    }
+                }
+            }
+            for (const entry of entries) {
+                for (const change of entry.action.changes) {
+                    if (change.kind !== 'cell' && change.kind !== 'highlight') continue;
+                    const worksheet_key = worksheet_target_key(change.delta.worksheet);
+                    const meter = meter_for(entry);
+                    for (const id of committed_ids_by_source.get(
+                        `${worksheet_key}\u0000${change.delta.sourceRow}`,
+                    ) ?? []) {
+                        const key = `${worksheet_key}\u0000${id}`;
+                        if (!transitioning_keys.has(key) || meter.seen.has(key)) continue;
+                        meter.seen.add(key);
+                        meter.retain();
+                    }
+                }
+            }
+            return true;
+        } catch (error) {
+            if (!(error instanceof BudgetExhausted)) throw error;
+            return false;
+        }
+    };
+    if (!preflight_history()) {
+        return refused(state, 'Remove appended rows', bounds.hardMaxBytes).state;
+    }
     const expand_stack = (entries: readonly HistoryEntry[]): readonly HistoryEntry[] =>
         entries.map((entry) => ({
             ...entry,
@@ -1468,7 +1712,7 @@ export function rekey_committed_tail_removal_history(
                 ...entry.action,
                 changes: entry.action.changes.flatMap((change) => (
                     change.kind === 'pendingRows'
-                        ? expand_committed_pending_snapshot(change, committed)
+                        ? expand_committed_pending_snapshot(change, committed_ids_by_sheet)
                         : [change]
                 )),
             },
@@ -1482,39 +1726,95 @@ export function rekey_committed_tail_removal_history(
         ...expanded_state.undoStack,
         ...[...expanded_state.redoStack].reverse(),
     ];
-    const formats = new Map<string, PendingRowFormatTemplate>();
+    interface IndexedHistoryChange {
+        readonly entry: HistoryEntry;
+        readonly index: number;
+        readonly sequence: number;
+        readonly change: HistoryChange;
+    }
+    const tail_changes_by_id = new Map<string, IndexedHistoryChange[]>();
+    const row_changes_by_source = new Map<string, IndexedHistoryChange[]>();
+    let sequence = 0;
+    const index_change = (
+        index: Map<string, IndexedHistoryChange[]>,
+        key: string,
+        item: IndexedHistoryChange,
+    ): void => {
+        const values = index.get(key) ?? [];
+        values.push(item);
+        index.set(key, values);
+    };
+    for (const [index, entry] of chronological.entries()) {
+        for (const change of entry.action.changes) {
+            const worksheet_key = worksheet_target_key(change.delta.worksheet);
+            const item = { entry, index, sequence: sequence++, change };
+            if (change.kind === 'tailRemoval') {
+                index_change(
+                    tail_changes_by_id,
+                    `${worksheet_key}\u0000${change.delta.appendHistoryId}`,
+                    item,
+                );
+            } else if (change.kind === 'cell' || change.kind === 'highlight') {
+                index_change(
+                    row_changes_by_source,
+                    `${worksheet_key}\u0000${change.delta.sourceRow}`,
+                    item,
+                );
+            }
+        }
+    }
+    const formats = new Map<number, PendingRowFormatTemplate[]>();
+    const formats_by_identity = new WeakMap<object, PendingRowFormatTemplate>();
     const replacements = new Map<object, Array<{
         readonly key: string;
         readonly sourceRow: number;
-        readonly change: Extract<HistoryChange, { kind: 'rowAppend' }>;
+        readonly change: () => Extract<HistoryChange, { kind: 'rowAppend' }>;
     }>>();
     const consumed = new Map<object, Set<HistoryChange>>();
+    const replacement_floors = new Map<object, number>();
 
-    for (const committed_row of committed) {
-        const { worksheet, removal } = committed_row;
-        const worksheet_key = worksheet_target_key(worksheet);
-        const relevant = chronological.flatMap((entry, index) => entry.action.changes.flatMap(
-            (change) => {
-                const same_sheet = worksheet_target_key(change.delta.worksheet) === worksheet_key;
-                const matches = same_sheet && (
-                    (change.kind === 'tailRemoval'
-                        && change.delta.appendHistoryId === removal.appendHistoryId)
-                    || ((change.kind === 'cell' || change.kind === 'highlight')
-                        && change.delta.sourceRow === removal.sourceRow)
-                );
-                return matches ? [{ entry, index, change }] : [];
-            },
-        ));
+    for (const committed_row of committed_rows) {
+        const {
+            worksheet,
+            removal,
+            worksheetKey: worksheet_key,
+            appendHistoryId: append_history_id,
+            sourceRow: source_row,
+        } = committed_row;
+        const relevant = [
+            ...(tail_changes_by_id.get(
+                `${worksheet_key}\u0000${append_history_id}`,
+            ) ?? []),
+            ...(row_changes_by_source.get(`${worksheet_key}\u0000${source_row}`) ?? []),
+        ].sort((left, right) => (left.index - right.index) || (left.sequence - right.sequence));
         if (!relevant.some(({ change }) => change.kind === 'tailRemoval')) continue;
+        for (const index of new Set(relevant.map((item) => item.index))) {
+            const entry = chronological[index];
+            const floor = (replacement_floors.get(entry.id)
+                ?? estimate_string_bytes(barrier_label(entry.action.label)))
+                + CHANGE_OVERHEAD_BYTES;
+            if (floor > bounds.hardMaxBytes) {
+                return refused(state, 'Remove appended rows', bounds.hardMaxBytes).state;
+            }
+            replacement_floors.set(entry.id, floor);
+        }
 
-        const format_key = JSON.stringify(removal.savedRow.format);
-        let template = formats.get(format_key);
+        const format = removal.savedRow.format;
+        let template = formats_by_identity.get(format);
         if (template === undefined) {
-            template = Object.freeze({
-                id: `restored-format:${removal.appendHistoryId}`,
-                format: removal.savedRow.format,
-            });
-            formats.set(format_key, template);
+            const format_hash = structural_value_hash(format);
+            const candidates = formats.get(format_hash) ?? [];
+            template = candidates.find((candidate) =>
+                structural_values_equal(candidate.format, format));
+            if (template === undefined) {
+                template = Object.freeze({
+                    id: `restored-format:${append_history_id}`,
+                    format,
+                });
+                candidates.push(template);
+                formats.set(format_hash, candidates);
+            }
+            formats_by_identity.set(format, template);
         }
         const cell_transitions = new Map<number, Array<{
             index: number;
@@ -1564,9 +1864,15 @@ export function rekey_committed_tail_removal_history(
             boundary: number,
             fallback: T,
         ): T => {
-            const prior = [...transitions].reverse().find((entry) => entry.index < boundary);
-            if (prior !== undefined) return prior.after;
-            return transitions.find((entry) => entry.index >= boundary)?.before ?? fallback;
+            let low = 0;
+            let high = transitions.length;
+            while (low < high) {
+                const middle = (low + high) >>> 1;
+                if (transitions[middle].index < boundary) low = middle + 1;
+                else high = middle;
+            }
+            if (low > 0) return transitions[low - 1].after;
+            return transitions[low]?.before ?? fallback;
         };
         const row_at = (boundary: number): PendingAppendedRow | null => {
             if (!side_at(existence, boundary, true)) return null;
@@ -1594,10 +1900,10 @@ export function rekey_committed_tail_removal_history(
                 else highlights[column] = color;
             }
             return {
-                id: removal.appendHistoryId,
+                id: append_history_id,
                 cells,
                 formatTemplateId: template!.id,
-                createdOrder: removal.sourceRow,
+                createdOrder: source_row,
                 ...(removal.savedRow.viewerRowHeight === undefined
                     ? {}
                     : { viewerRowHeight: removal.savedRow.viewerRowHeight }),
@@ -1608,13 +1914,13 @@ export function rekey_committed_tail_removal_history(
             const entry = chronological[index];
             const list = replacements.get(entry.id) ?? [];
             list.push({
-                key: `${worksheet_key}\u0000${removal.appendHistoryId}`,
-                sourceRow: removal.sourceRow,
-                change: {
+                key: `${worksheet_key}\u0000${append_history_id}`,
+                sourceRow: source_row,
+                change: () => ({
                     kind: 'rowAppend',
                     delta: {
                         worksheet,
-                        pendingRowId: removal.appendHistoryId,
+                        pendingRowId: append_history_id,
                         before: row_at(index),
                         after: row_at(index + 1),
                         beforeIndex: null,
@@ -1622,37 +1928,66 @@ export function rekey_committed_tail_removal_history(
                         formatTemplates: [template],
                         restoredFromSavedRemoval: true,
                     },
-                },
+                }),
             });
             replacements.set(entry.id, list);
         }
     }
 
-    let oversized = false;
-    const rekey_stack = (entries: readonly HistoryEntry[]): readonly HistoryEntry[] =>
-        entries.flatMap((entry) => {
+    const rekey_stack = (
+        entries: readonly HistoryEntry[],
+    ): readonly HistoryEntry[] | undefined => {
+        const rekeyed: HistoryEntry[] = [];
+        for (const entry of entries) {
             const replacement = replacements.get(entry.id);
-            if (replacement === undefined) return [entry];
+            if (replacement === undefined) {
+                rekeyed.push(entry);
+                continue;
+            }
             const removed = consumed.get(entry.id) ?? new Set();
+            const retain_change = rekey_output_meter(
+                entry.action.label,
+                bounds.hardMaxBytes,
+            );
+            const changes: HistoryChange[] = [];
+            try {
+                for (const descriptor of replacement
+                    .sort((left, right) => left.sourceRow - right.sourceRow)) {
+                    retain_change();
+                    changes.push(descriptor.change());
+                }
+                for (const change of entry.action.changes) {
+                    if (removed.has(change)) continue;
+                    retain_change();
+                    changes.push(change);
+                }
+            } catch (error) {
+                if (!(error instanceof BudgetExhausted)) throw error;
+                return undefined;
+            }
             const action: HistoryAction = {
                 label: entry.action.label,
-                changes: [
-                    ...replacement
-                        .sort((left, right) => left.sourceRow - right.sourceRow)
-                        .map(({ change }) => change),
-                    ...entry.action.changes.filter((change) => !removed.has(change)),
-                ],
+                changes,
             };
             const measured = own_and_measure(action, bounds.hardMaxBytes);
-            if (measured === undefined) {
-                oversized = true;
-                return [];
-            }
-            return [{ ...measured, id: entry.id, moves: entry.moves, epoch: entry.epoch }];
-        });
+            if (measured === undefined) return undefined;
+            rekeyed.push({
+                ...measured,
+                id: entry.id,
+                moves: entry.moves,
+                epoch: entry.epoch,
+            });
+        }
+        return rekeyed;
+    };
     const undoStack = rekey_stack(expanded_state.undoStack);
+    if (undoStack === undefined) {
+        return refused(state, 'Remove appended rows', bounds.hardMaxBytes).state;
+    }
     const redoStack = rekey_stack(expanded_state.redoStack);
-    if (oversized) return refused(state, 'Remove appended rows', bounds.hardMaxBytes).state;
+    if (redoStack === undefined) {
+        return refused(state, 'Remove appended rows', bounds.hardMaxBytes).state;
+    }
     return bound_rekeyed_history({ ...state, undoStack, redoStack }, bounds);
 }
 
@@ -2225,7 +2560,113 @@ export function action_is_single_worksheet(action: HistoryAction): boolean {
  * there is least of it.
  */
 interface StructuralHistoryOwner {
-    readonly templates: Map<string, PendingRowFormatTemplate>;
+    readonly templates: Map<string, PendingRowFormatTemplate[]>;
+}
+
+function mix_structural_hash(hash: number, value: number): number {
+    return Math.imul(hash ^ value, 0x01000193) >>> 0;
+}
+
+/** Allocation-free fingerprint; equality is still checked inside collision buckets. */
+function structural_value_hash(value: unknown): number {
+    if (value === null) return 0x42108421;
+    if (value === undefined) return 0x10204081;
+    if (typeof value === 'boolean') return value ? 0x51ed270b : 0x51ed270a;
+    if (typeof value === 'number') {
+        const whole = Math.trunc(value);
+        const fraction = Math.trunc((value - whole) * 0x7fffffff);
+        return mix_structural_hash(0x4e554d42, (whole ^ fraction) >>> 0);
+    }
+    if (typeof value === 'string') {
+        let hash = 0x53545200;
+        for (let index = 0; index < value.length; index += 1) {
+            hash = mix_structural_hash(hash, value.charCodeAt(index));
+        }
+        return hash;
+    }
+    if (typeof value !== 'object') return 0x7f4a7c15;
+    if (Array.isArray(value)) {
+        let hash = mix_structural_hash(0x41525200, value.length);
+        for (const child of value) hash = mix_structural_hash(hash, structural_value_hash(child));
+        return hash;
+    }
+    let xor = 0;
+    let sum = 0;
+    let count = 0;
+    for (const key in value) {
+        if (!Object.hasOwn(value, key)) continue;
+        const pair = mix_structural_hash(
+            structural_value_hash(key),
+            structural_value_hash((value as Record<string, unknown>)[key]),
+        );
+        xor ^= pair;
+        sum = (sum + Math.imul(pair, 0x9e3779b1)) >>> 0;
+        count += 1;
+    }
+    return mix_structural_hash(mix_structural_hash(0x4f424a00, xor), sum ^ count);
+}
+
+function structural_values_equal(left: unknown, right: unknown): boolean {
+    if (left === right) return true;
+    if (typeof left !== 'object' || left === null
+        || typeof right !== 'object' || right === null) return false;
+    if (Array.isArray(left) || Array.isArray(right)) {
+        if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) {
+            return false;
+        }
+        for (let index = 0; index < left.length; index += 1) {
+            if (!structural_values_equal(left[index], right[index])) return false;
+        }
+        return true;
+    }
+    let left_count = 0;
+    let right_count = 0;
+    for (const key in left) {
+        if (!Object.hasOwn(left, key)) continue;
+        left_count += 1;
+        if (!Object.hasOwn(right, key)
+            || !structural_values_equal(
+                (left as Record<string, unknown>)[key],
+                (right as Record<string, unknown>)[key],
+            )) return false;
+    }
+    for (const key in right) {
+        if (Object.hasOwn(right, key)) right_count += 1;
+    }
+    return left_count === right_count;
+}
+
+/** Snapshot structural input once, without retaining caller-owned string views. */
+function snapshot_structural_input<T>(value: T, ancestors = new Set<object>()): T {
+    if (typeof value === 'string') return materialized_string(value) as T;
+    if (typeof value !== 'object' || value === null) return value;
+    if (ancestors.has(value)) throw new TypeError('Structural history cannot contain cycles');
+    ancestors.add(value);
+    if (Array.isArray(value)) {
+        const copied = value.map((entry) => snapshot_structural_input(entry, ancestors));
+        ancestors.delete(value);
+        return Object.freeze(copied) as T;
+    }
+    const copied: Record<string, unknown> = {};
+    for (const [key, child] of Object.entries(value)) {
+        copied[key] = snapshot_structural_input(child, ancestors);
+    }
+    ancestors.delete(value);
+    return Object.freeze(copied) as T;
+}
+
+function own_structural_template(
+    value: PendingRowFormatTemplate,
+    structural_owner: StructuralHistoryOwner,
+): PendingRowFormatTemplate {
+    const normalized = own_pending_row_format_template(snapshot_structural_input(value));
+    const candidates = structural_owner.templates.get(normalized.id) ?? [];
+    const retained = candidates.find((candidate) =>
+        structural_values_equal(candidate.format, normalized.format));
+    if (retained !== undefined) return retained;
+    candidates.push(normalized);
+    structural_owner.templates.set(normalized.id, candidates);
+    return normalized;
 }
 
 function own_history_change(
@@ -2243,21 +2684,8 @@ function own_history_change(
         });
     }
     if (change.kind === 'rowAppend') {
-        const copied = JSON.parse(JSON.stringify({
-            before: change.delta.before,
-            after: change.delta.after,
-        })) as {
-            before: PendingAppendedRow | null;
-            after: PendingAppendedRow | null;
-        };
-        const owned_templates = change.delta.formatTemplates.map((template) => {
-            const key = `${template.id}\u0000${JSON.stringify(template.format)}`;
-            const retained = structural_owner.templates.get(key);
-            if (retained !== undefined) return retained;
-            const owned = own_pending_row_format_template(JSON.parse(JSON.stringify(template)));
-            structural_owner.templates.set(key, owned);
-            return owned;
-        });
+        const owned_templates = change.delta.formatTemplates.map((template) =>
+            own_structural_template(template, structural_owner));
         const own_row = (row: PendingAppendedRow | null): PendingAppendedRow | null => {
             if (row === null) return null;
             const template = owned_templates.find(
@@ -2268,11 +2696,11 @@ function own_history_change(
             }
             return own_pending_structural_changes({
                 formatTemplates: [template],
-                appendedRows: [row],
+                appendedRows: [snapshot_structural_input(row)],
             }).appendedRows[0];
         };
-        const before = own_row(copied.before);
-        const after = own_row(copied.after);
+        const before = own_row(change.delta.before);
+        const after = own_row(change.delta.after);
         const formats_by_id = new Map<string, PendingRowFormatTemplate>();
         for (const row of [before, after]) {
             if (row === null || formats_by_id.has(row.formatTemplateId)) continue;
@@ -2306,37 +2734,32 @@ function own_history_change(
         });
     }
     if (change.kind === 'pendingRows') {
-        const copied = JSON.parse(JSON.stringify({
-            before: change.delta.before,
-            after: change.delta.after,
-        })) as {
-            before: PendingStructuralChanges;
-            after: PendingStructuralChanges;
-        };
         return Object.freeze({
             kind: 'pendingRows',
             delta: Object.freeze({
                 worksheet: owner.own_worksheet_target(change.delta.worksheet),
-                before: own_pending_structural_changes(copied.before),
-                after: own_pending_structural_changes(copied.after),
+                before: own_pending_structural_changes(
+                    snapshot_structural_input(change.delta.before),
+                ),
+                after: own_pending_structural_changes(
+                    snapshot_structural_input(change.delta.after),
+                ),
             }),
         });
     }
-    const copied = JSON.parse(JSON.stringify({
-        before: change.delta.before,
-        after: change.delta.after,
-    })) as { before: PendingTailRemoval | null; after: PendingTailRemoval | null };
     const own_removal = (removal: PendingTailRemoval | null): PendingTailRemoval | null => {
         if (removal === null) return null;
-        return own_pending_structural_changes({ tailRemovals: [removal] }).tailRemovals[0];
+        return own_pending_structural_changes({
+            tailRemovals: [snapshot_structural_input(removal)],
+        }).tailRemovals[0];
     };
     return Object.freeze({
         kind: 'tailRemoval',
         delta: Object.freeze({
             worksheet: owner.own_worksheet_target(change.delta.worksheet),
             appendHistoryId: owner.own_string(change.delta.appendHistoryId),
-            before: own_removal(copied.before),
-            after: own_removal(copied.after),
+            before: own_removal(change.delta.before),
+            after: own_removal(change.delta.after),
             beforeIndex: change.delta.beforeIndex,
             afterIndex: change.delta.afterIndex,
         }),

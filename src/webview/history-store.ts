@@ -22,6 +22,7 @@
 
 import {
     commit_history_move,
+    DEFAULT_HISTORY_BOUNDS,
     empty_history_stack,
     record_history_action,
     rekey_saved_appended_row_history,
@@ -69,6 +70,17 @@ export interface StagedHistoryMove extends StagedMutation {
     readonly outcome: CommitOutcome;
 }
 
+export type HistoryRekeyOutcome =
+    | {
+        readonly kind: 'rekeyed';
+        readonly changed: boolean;
+    }
+    | {
+        readonly kind: 'unrecordable';
+        readonly reason: 'action-too-large';
+        readonly hardMaxBytes: number;
+    };
+
 export interface HistoryStore {
     /** Copy-on-write, so it is a valid `useSyncExternalStore` getSnapshot. */
     snapshot(): HistoryStackState;
@@ -103,10 +115,23 @@ export interface HistoryStore {
         entry: HistoryEntry,
         bounds?: HistoryBounds,
     ): StagedHistoryMove;
-    /** Advance temporary appended-row identities after the host's save receipt. */
-    rekey_saved_rows(rows: readonly SavedHistoryRowAssignment[]): void;
-    /** Turn tail removals written by Save into host-admitted row restorations. */
-    rekey_saved_removals(rows: readonly SavedTailRemovalCommit[]): void;
+    /**
+     * Advance temporary appended-row identities after the host's save receipt.
+     * A rekey can enlarge an entry, so the caller supplies the active history
+     * bounds and receives an explicit refusal if the rebuilt entry cannot fit.
+     */
+    rekey_saved_rows(
+        rows: readonly SavedHistoryRowAssignment[],
+        bounds?: HistoryBounds,
+    ): HistoryRekeyOutcome;
+    /**
+     * Turn tail removals written by Save into host-admitted row restorations,
+     * reporting when the rebuilt history cannot be retained within the bounds.
+     */
+    rekey_saved_removals(
+        rows: readonly SavedTailRemovalCommit[],
+        bounds?: HistoryBounds,
+    ): HistoryRekeyOutcome;
     /**
      * Empty the history. For a different document replacing this one, where any
      * surviving action would be another file's edits waiting to be replayed
@@ -167,18 +192,34 @@ export function create_history_store(initial?: HistoryStackState): HistoryStore 
             return { outcome, ...staged };
         },
 
-        rekey_saved_rows: (rows) => {
-            const next = rekey_saved_appended_row_history(state, rows);
-            if (next === state) return;
+        rekey_saved_rows: (rows, bounds = DEFAULT_HISTORY_BOUNDS) => {
+            const previous = state;
+            const next = rekey_saved_appended_row_history(previous, rows, bounds);
+            if (next === previous) return { kind: 'rekeyed', changed: false };
             state = next;
             notify();
+            return next.epoch !== previous.epoch
+                ? {
+                    kind: 'unrecordable',
+                    reason: 'action-too-large',
+                    hardMaxBytes: bounds.hardMaxBytes,
+                }
+                : { kind: 'rekeyed', changed: true };
         },
 
-        rekey_saved_removals: (rows) => {
-            const next = rekey_committed_tail_removal_history(state, rows);
-            if (next === state) return;
+        rekey_saved_removals: (rows, bounds = DEFAULT_HISTORY_BOUNDS) => {
+            const previous = state;
+            const next = rekey_committed_tail_removal_history(previous, rows, bounds);
+            if (next === previous) return { kind: 'rekeyed', changed: false };
             state = next;
             notify();
+            return next.epoch !== previous.epoch
+                ? {
+                    kind: 'unrecordable',
+                    reason: 'action-too-large',
+                    hardMaxBytes: bounds.hardMaxBytes,
+                }
+                : { kind: 'rekeyed', changed: true };
         },
 
         clear: () => {

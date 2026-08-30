@@ -107,6 +107,24 @@ interface StyleElement {
     readonly inner: string;
 }
 
+type CanonicalOpenToken = readonly [
+    'open',
+    string,
+    readonly (readonly [string, string])[],
+    boolean,
+];
+
+interface AppendStyleTables {
+    readonly present: boolean;
+    readonly xfs: readonly StyleElement[];
+    readonly fonts: readonly StyleElement[];
+    readonly fills: readonly StyleElement[];
+    readonly borders: readonly StyleElement[];
+    readonly base_xfs: readonly StyleElement[];
+    readonly number_formats: ReadonlyMap<number, StyleElement>;
+    readonly root_token?: CanonicalOpenToken;
+}
+
 function style_elements(styles: string, section_name: string, element_name: string): StyleElement[] {
     const section = get_text(styles, section_name);
     if (section === null) return [];
@@ -199,8 +217,44 @@ function canonical_style_markup(
     return tokens;
 }
 
+function parse_append_style_tables(styles: string | null): AppendStyleTables {
+    if (styles === null) {
+        return {
+            present: false,
+            xfs: [],
+            fonts: [],
+            fills: [],
+            borders: [],
+            base_xfs: [],
+            number_formats: new Map(),
+        };
+    }
+    const number_formats = new Map<number, StyleElement>();
+    for (const element of style_elements(styles, 'numFmts', 'numFmt')) {
+        const id = Number(get_xml_attr(element.open, 'numFmtId'));
+        if (Number.isSafeInteger(id) && id >= 0) number_formats.set(id, element);
+    }
+    const root_start = styles.search(/<(?:[A-Za-z_][\w.-]*:)?styleSheet(?:\s|\/?>)/);
+    const root_end = root_start === -1 ? -1 : find_tag_end(styles, root_start);
+    const root_token = root_start === -1 || root_end === -1
+        ? undefined
+        : canonical_style_markup(styles.slice(root_start, root_end + 1)).find(
+            (entry) => Array.isArray(entry) && entry[0] === 'open',
+        ) as CanonicalOpenToken | undefined;
+    return {
+        present: true,
+        xfs: style_elements(styles, 'cellXfs', 'xf'),
+        fonts: style_elements(styles, 'fonts', 'font'),
+        fills: style_elements(styles, 'fills', 'fill'),
+        borders: style_elements(styles, 'borders', 'border'),
+        base_xfs: style_elements(styles, 'cellStyleXfs', 'xf'),
+        number_formats,
+        ...(root_token === undefined ? {} : { root_token }),
+    };
+}
+
 function append_style_dependency_fingerprint(
-    styles: string | null,
+    tables: AppendStyleTables,
     cell_style_indexes: readonly (number | null)[],
     row_style_index?: number,
 ): string {
@@ -209,18 +263,8 @@ function append_style_dependency_fingerprint(
         ...(row_style_index === undefined ? [] : [row_style_index]),
     ])]
         .sort((left, right) => left - right);
-    if (styles === null) {
+    if (!tables.present) {
         return `sha256:${createHash('sha256').update(JSON.stringify({ selected })).digest('hex')}`;
-    }
-    const xfs = style_elements(styles, 'cellXfs', 'xf');
-    const fonts = style_elements(styles, 'fonts', 'font');
-    const fills = style_elements(styles, 'fills', 'fill');
-    const borders = style_elements(styles, 'borders', 'border');
-    const base_xfs = style_elements(styles, 'cellStyleXfs', 'xf');
-    const number_formats = new Map<number, StyleElement>();
-    for (const element of style_elements(styles, 'numFmts', 'numFmt')) {
-        const id = Number(get_xml_attr(element.open, 'numFmtId'));
-        if (Number.isSafeInteger(id) && id >= 0) number_formats.set(id, element);
     }
     const used_prefixes = new Set<string>();
     const canonical = (element: StyleElement | undefined): readonly unknown[] | null =>
@@ -240,16 +284,16 @@ function append_style_dependency_fingerprint(
         const number_format = reference('numFmtId');
         return {
             xf: canonical(xf),
-            font: [font, canonical(fonts[font])],
-            fill: [fill, canonical(fills[fill])],
-            border: [border, canonical(borders[border])],
+            font: [font, canonical(tables.fonts[font])],
+            fill: [fill, canonical(tables.fills[fill])],
+            border: [border, canonical(tables.borders[border])],
             numberFormat: number_format < 164
                 ? ['builtin', number_format]
-                : [number_format, canonical(number_formats.get(number_format))],
+                : [number_format, canonical(tables.number_formats.get(number_format))],
         };
     };
     const dependency = selected.map((index) => {
-        const xf = xfs[index];
+        const xf = tables.xfs[index];
         if (xf === undefined) return { index, missing: true };
         const direct = xf_dependencies(xf) as Record<string, unknown>;
         const base = referenced(xf, 'xfId');
@@ -259,26 +303,18 @@ function append_style_dependency_fingerprint(
             // A cell XF inherits from cellStyleXfs. Fingerprinting the base tag
             // alone misses its own font/fill/border/custom-format references, so
             // include the same transitive dependency closure used for the cell XF.
-            base: [base, xf_dependencies(base_xfs[base])],
+            base: [base, xf_dependencies(tables.base_xfs[base])],
         };
     });
-    const root_start = styles.search(/<(?:[A-Za-z_][\w.-]*:)?styleSheet(?:\s|\/?>)/);
-    const root_end = root_start === -1 ? -1 : find_tag_end(styles, root_start);
     let root: unknown = null;
-    if (root_start !== -1 && root_end !== -1) {
-        const root_tokens = canonical_style_markup(styles.slice(root_start, root_end + 1));
-        const token = root_tokens.find((entry) => Array.isArray(entry) && entry[0] === 'open') as
-            | readonly ['open', string, readonly (readonly [string, string])[], boolean]
-            | undefined;
-        if (token !== undefined) {
-            const colon = token[1].indexOf(':');
-            used_prefixes.add(colon === -1 ? '' : token[1].slice(0, colon));
-            const namespaces = token[2].filter(([name]) => name === 'xmlns'
+    if (tables.root_token !== undefined) {
+        const colon = tables.root_token[1].indexOf(':');
+        used_prefixes.add(colon === -1 ? '' : tables.root_token[1].slice(0, colon));
+        const namespaces = tables.root_token[2].filter(([name]) => name === 'xmlns'
                 ? used_prefixes.has('')
                 : name.startsWith('xmlns:')
                     && used_prefixes.has(name.slice('xmlns:'.length)));
-            root = [token[1], namespaces];
-        }
+        root = [tables.root_token[1], namespaces];
     }
     return `sha256:${createHash('sha256').update(JSON.stringify({ root, dependency })).digest('hex')}`;
 }
@@ -313,7 +349,9 @@ export function xlsx_append_style_dependency_fingerprint(
     }
     const styles = read_part_bytes(zip, '/xl/styles.xml');
     return append_style_dependency_fingerprint(
-        styles === null ? null : Buffer.from(styles).toString('utf8'),
+        parse_append_style_tables(
+            styles === null ? null : Buffer.from(styles).toString('utf8'),
+        ),
         cell_style_indexes,
         row_style_index,
     );
@@ -334,10 +372,11 @@ export function create_xlsx_append_style_dependency_fingerprinter(
     }
     const styles = read_part_bytes(zip, '/xl/styles.xml');
     const styles_text = styles === null ? null : Buffer.from(styles).toString('utf8');
+    const style_tables = parse_append_style_tables(styles_text);
     return (cell_style_indexes, row_style_index) => {
         assert_valid_append_style_request(cell_style_indexes, row_style_index);
         return append_style_dependency_fingerprint(
-            styles_text,
+            style_tables,
             cell_style_indexes,
             row_style_index,
         );
@@ -510,13 +549,14 @@ export function capture_xlsx_append_row_format(
                 },
             };
         })();
+    const append_style_tables = parse_append_style_tables(styles_text);
     const styleFingerprint = append_style_dependency_fingerprint(
-        styles_text,
+        append_style_tables,
         cellStyleIndexes,
         rowStyleIndex,
     );
     const cellStyleFingerprints = cellStyleIndexes.map((style) =>
-        append_style_dependency_fingerprint(styles_text, [style], rowStyleIndex));
+        append_style_dependency_fingerprint(append_style_tables, [style], rowStyleIndex));
     return Object.freeze({
         kind: 'xlsx',
         templateSourceRow,

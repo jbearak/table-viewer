@@ -63,6 +63,9 @@ import { xlsx_edit_writes_formula } from '../xlsx-cell-value';
 import type { XlsxFormulaCellMove } from '../xlsx-formula';
 import {
     has_pending_structural_changes,
+    type PendingAppendedRow,
+    type PendingCellMoveProvenance,
+    type RowIdentity,
     type PendingStructuralChanges,
 } from '../pending-changes';
 import {
@@ -291,6 +294,27 @@ export function create_edit_session_registry(
     let too_many_formula_edits = false;
     let formula_moves: XlsxFormulaCellMove[] = [];
     let source_row_counts: readonly number[] = [];
+    interface MoveContribution {
+        readonly moved: PendingCellMoveProvenance;
+        readonly destinationRow: number;
+        readonly destinationRowIdentity?: RowIdentity;
+        readonly destinationColumn: number;
+    }
+    interface PendingMoveProjection {
+        readonly rows: Map<string, readonly MoveContribution[]>;
+        readonly indexById: Map<string, number>;
+        readonly appendBasisSourceRowCount: number | undefined;
+        readonly tailRemovalCount: number;
+    }
+    const source_move_contributions = new Map<EditSessionStore, Map<string, MoveContribution>>();
+    const source_move_orders = new Map<EditSessionStore, Map<string, number>>();
+    const pending_move_projections = new Map<PendingRowStore, PendingMoveProjection>();
+    const resolved_move_contributions = new Map<string, readonly XlsxFormulaCellMove[]>();
+    const move_contribution_ids_by_sheet = new Map<number, Set<string>>();
+    const active_formula_moves = new Map<string, {
+        readonly move: XlsxFormulaCellMove;
+        references: number;
+    }>();
     type RelativePendingFormulaEdit = Omit<PendingFormulaCalculationEdit, 'sheetIndex'>;
     const pending_formula_rows = new Map<
         PendingRowStore,
@@ -437,49 +461,146 @@ export function create_edit_session_registry(
             && previous.every((edit, index) => formula_edit_values_equal(edit, next[index]));
         if (!coordinates_equal) formula_coordinate_revision += 1;
         if (!calculations_equal) formula_calculation_revision += 1;
-        refresh_formula_moves();
     };
-    const current_moves = (): XlsxFormulaCellMove[] => {
+    const source_move_contribution = (
+        key: string,
+        entry: DirtyEntry | undefined,
+    ): MoveContribution | undefined => {
+        const cell = parse_cell_key(key);
+        if (!cell || entry?.movedFrom === undefined) return undefined;
+        return {
+            moved: entry.movedFrom,
+            destinationRow: cell.sourceRow,
+            destinationColumn: cell.sourceColumn,
+        };
+    };
+    const source_move_projection = (
+        store: EditSessionStore,
+    ): Map<string, MoveContribution> => {
+        const contributions = new Map<string, MoveContribution>();
+        const order = new Map<string, number>();
+        for (const [key, entry] of store.snapshot()) {
+            const contribution = source_move_contribution(key, entry);
+            if (contribution === undefined) continue;
+            contributions.set(key, contribution);
+            order.set(key, store.insertion_order(key) ?? order.size);
+        }
+        source_move_orders.set(store, order);
+        return contributions;
+    };
+    const pending_row_move_projection = (
+        row: PendingAppendedRow,
+    ): readonly MoveContribution[] => Object.entries(row.cells).flatMap(([column, cell]) =>
+        cell.movedFrom === undefined ? [] : [{
+            moved: cell.movedFrom,
+            destinationRow: 0,
+            destinationRowIdentity: { kind: 'pending' as const, pendingRowId: row.id },
+            destinationColumn: Number(column),
+        }]);
+    const pending_move_projection = (store: PendingRowStore): PendingMoveProjection => {
+        const structural = store.snapshot();
+        return {
+            rows: new Map(structural.appendedRows.map((row) => [
+                row.id,
+                pending_row_move_projection(row),
+            ])),
+            indexById: new Map(structural.appendedRows.map((row, index) => [row.id, index])),
+            appendBasisSourceRowCount: structural.appendBasis?.sourceRowCount,
+            tailRemovalCount: structural.tailRemovals.length,
+        };
+    };
+    const move_key = (move: XlsxFormulaCellMove): string => JSON.stringify(move);
+    const compare_moves = (left: XlsxFormulaCellMove, right: XlsxFormulaCellMove): number =>
+        (left.order ?? 0) - (right.order ?? 0);
+    const replace_resolved_move_contribution = (
+        sheetIndex: number,
+        contributionId: string,
+        next: readonly XlsxFormulaCellMove[],
+    ): void => {
+        const previous = resolved_move_contributions.get(contributionId) ?? [];
+        if (previous.length === next.length
+            && previous.every((move, index) => move_key(move) === move_key(next[index]))) return;
+        const output = formula_moves.slice();
+        let needs_canonical_order = false;
+        for (const move of previous) {
+            const key = move_key(move);
+            const active = active_formula_moves.get(key);
+            if (active === undefined) continue;
+            active.references -= 1;
+            if (active.references > 0) continue;
+            active_formula_moves.delete(key);
+            const index = output.findIndex((candidate) => move_key(candidate) === key);
+            if (index >= 0) output.splice(index, 1);
+        }
+        for (const move of next) {
+            const key = move_key(move);
+            const active = active_formula_moves.get(key);
+            if (active !== undefined) {
+                active.references += 1;
+                continue;
+            }
+            if (output.some((candidate) => (candidate.order ?? 0) === (move.order ?? 0))) {
+                needs_canonical_order = true;
+            }
+            active_formula_moves.set(key, { move, references: 1 });
+            let low = 0;
+            let high = output.length;
+            while (low < high) {
+                const middle = (low + high) >>> 1;
+                if (compare_moves(output[middle], move) <= 0) low = middle + 1;
+                else high = middle;
+            }
+            output.splice(low, 0, move);
+        }
+        if (next.length === 0) {
+            resolved_move_contributions.delete(contributionId);
+            move_contribution_ids_by_sheet.get(sheetIndex)?.delete(contributionId);
+        } else {
+            resolved_move_contributions.set(contributionId, next);
+            const ids = move_contribution_ids_by_sheet.get(sheetIndex) ?? new Set<string>();
+            ids.add(contributionId);
+            move_contribution_ids_by_sheet.set(sheetIndex, ids);
+        }
+        formula_moves = output;
+        if (needs_canonical_order) rebuild_formula_moves_from_contributions();
+    };
+    const resolved_moves = (
+        sheetIndex: number,
+        contribution: MoveContribution,
+    ): readonly XlsxFormulaCellMove[] => {
         const moves = new Map<string, XlsxFormulaCellMove>();
-        const pending_layout = new Map([...pending_stores].map(([sheetIndex, store]) => {
-            const structural = store.snapshot();
-            const source_count = source_row_counts[sheetIndex]
-                ?? structural.appendBasis?.sourceRowCount;
-            return [sheetIndex, {
-                structural,
-                indexById: new Map(structural.appendedRows.map((row, index) => [row.id, index])),
-                start: source_count === undefined
-                    ? undefined
-                    : source_count - structural.tailRemovals.length,
-            }] as const;
-        }));
+        const pending_store = pending_stores.get(sheetIndex);
+        const pending = pending_store === undefined
+            ? undefined
+            : pending_move_projections.get(pending_store);
+        const source_count = source_row_counts[sheetIndex]
+            ?? pending?.appendBasisSourceRowCount;
+        const start = source_count === undefined || pending === undefined
+            ? undefined
+            : source_count - pending.tailRemovalCount;
         const physical_row = (
-            sheetIndex: number,
-            identity: import('../pending-changes').RowIdentity | undefined,
+            identity: RowIdentity | undefined,
             fallback: number,
         ): number | undefined => {
             if (identity === undefined) return fallback;
             if (identity.kind === 'source') return identity.sourceRow;
-            const layout = pending_layout.get(sheetIndex);
-            const index = layout?.indexById.get(identity.pendingRowId);
-            if (index === undefined || layout?.start === undefined) return undefined;
-            return layout.start + index;
+            const index = pending?.indexById.get(identity.pendingRowId);
+            if (index === undefined || start === undefined) return undefined;
+            return start + index;
         };
         const add_move = (
-            sheetIndex: number,
-            moved: NonNullable<DirtyEntry['movedFrom']> | undefined,
-            destinationRow: number,
-            destinationColumn: number,
+            contribution: MoveContribution,
         ): void => {
-            if (moved === undefined) return;
+            const { moved, destinationRow, destinationRowIdentity, destinationColumn }
+                = contribution;
+            const resolved_destination = physical_row(destinationRowIdentity, destinationRow);
+            if (resolved_destination === undefined) return;
             for (const previous of moved.previous ?? []) {
                 const source_row = physical_row(
-                    sheetIndex,
                     previous.sourceRowIdentity,
                     previous.sourceRow,
                 );
                 const destination_row = physical_row(
-                    sheetIndex,
                     previous.destinationRowIdentity,
                     previous.destinationRow,
                 );
@@ -494,56 +615,108 @@ export function create_edit_session_registry(
                 };
                 moves.set(JSON.stringify(move), move);
             }
-            const source_row = physical_row(sheetIndex, moved.rowIdentity, moved.row);
+            const source_row = physical_row(moved.rowIdentity, moved.row);
             if (source_row === undefined) return;
             const move = {
                 order: moved.order,
                 sheetIndex,
                 sourceRow: source_row,
                 sourceColumn: moved.col,
-                destinationRow,
+                destinationRow: resolved_destination,
                 destinationColumn,
             };
             moves.set(JSON.stringify(move), move);
         };
+        add_move(contribution);
+        return [...moves.values()];
+    };
+    const source_contribution_id = (sheetIndex: number, key: string): string =>
+        `${sheetIndex}\u0000source\u0000${key}`;
+    const pending_contribution_id = (sheetIndex: number, rowId: string): string =>
+        `${sheetIndex}\u0000pending\u0000${rowId}`;
+    const clear_resolved_moves_for_sheet = (sheetIndex: number): void => {
+        for (const id of move_contribution_ids_by_sheet.get(sheetIndex) ?? []) {
+            resolved_move_contributions.delete(id);
+        }
+        move_contribution_ids_by_sheet.delete(sheetIndex);
+    };
+    const rebuild_formula_moves_from_contributions = (): void => {
+        active_formula_moves.clear();
+        for (const moves of resolved_move_contributions.values()) {
+            for (const move of moves) {
+                const key = move_key(move);
+                const active = active_formula_moves.get(key);
+                if (active === undefined) {
+                    active_formula_moves.set(key, { move, references: 1 });
+                } else {
+                    active.references += 1;
+                }
+            }
+        }
+        const canonical = new Map<string, XlsxFormulaCellMove>();
         for (const [sheetIndex, store] of stores) {
-            for (const [key, entry] of store.snapshot()) {
-                const cell = parse_cell_key(key);
-                if (!cell) continue;
-                add_move(
-                    sheetIndex,
-                    entry.movedFrom,
-                    cell.sourceRow,
-                    cell.sourceColumn,
-                );
+            const ordered_keys = [...(source_move_orders.get(store) ?? [])]
+                .sort((left, right) => left[1] - right[1]);
+            for (const [key] of ordered_keys) {
+                for (const move of resolved_move_contributions.get(
+                    source_contribution_id(sheetIndex, key),
+                ) ?? []) canonical.set(move_key(move), move);
             }
         }
         for (const [sheetIndex, store] of pending_stores) {
-            const structural = store.snapshot();
-            const start = pending_layout.get(sheetIndex)?.start;
-            if (start === undefined) continue;
-            structural.appendedRows.forEach((row, index) => {
-                for (const [column, cell] of Object.entries(row.cells)) {
-                    add_move(sheetIndex, cell.movedFrom, start + index, Number(column));
-                }
-            });
+            for (const rowId of pending_move_projections.get(store)?.rows.keys() ?? []) {
+                for (const move of resolved_move_contributions.get(
+                    pending_contribution_id(sheetIndex, rowId),
+                ) ?? []) canonical.set(move_key(move), move);
+            }
         }
-        return [...moves.values()].sort((left, right) => (left.order ?? 0) - (right.order ?? 0));
+        formula_moves = [...canonical.values()].sort(compare_moves);
     };
-    const refresh_formula_moves = (): void => {
-        const next = current_moves();
-        const unchanged = next.length === formula_moves.length
-            && next.every((move, index) => {
-                const current = formula_moves[index];
-                return current !== undefined
-                    && move.sheetIndex === current.sheetIndex
-                    && move.sourceRow === current.sourceRow
-                    && move.sourceColumn === current.sourceColumn
-                    && move.destinationRow === current.destinationRow
-                    && move.destinationColumn === current.destinationColumn
-                    && move.order === current.order;
-            });
-        if (!unchanged) formula_moves = next;
+    const refresh_formula_moves_for_sheet = (sheetIndex: number, rebuild = true): void => {
+        clear_resolved_moves_for_sheet(sheetIndex);
+        const ids = new Set<string>();
+        const source_store = stores.get(sheetIndex);
+        for (const [key, contribution] of source_store === undefined
+            ? []
+            : source_move_contributions.get(source_store) ?? []) {
+            const id = source_contribution_id(sheetIndex, key);
+            const moves = resolved_moves(sheetIndex, contribution);
+            if (moves.length === 0) continue;
+            resolved_move_contributions.set(id, moves);
+            ids.add(id);
+        }
+        const pending_store = pending_stores.get(sheetIndex);
+        const pending = pending_store === undefined
+            ? undefined
+            : pending_move_projections.get(pending_store);
+        for (const [rowId, row] of pending?.rows ?? []) {
+            const id = pending_contribution_id(sheetIndex, rowId);
+            const moves = row.flatMap((contribution) => resolved_moves(sheetIndex, contribution));
+            if (moves.length === 0) continue;
+            resolved_move_contributions.set(id, moves);
+            ids.add(id);
+        }
+        if (ids.size > 0) move_contribution_ids_by_sheet.set(sheetIndex, ids);
+        if (rebuild) rebuild_formula_moves_from_contributions();
+    };
+    const rebuild_all_formula_move_projections = (): void => {
+        source_move_contributions.clear();
+        source_move_orders.clear();
+        for (const store of stores.values()) {
+            source_move_contributions.set(store, source_move_projection(store));
+        }
+        pending_move_projections.clear();
+        for (const store of pending_stores.values()) {
+            pending_move_projections.set(store, pending_move_projection(store));
+        }
+        resolved_move_contributions.clear();
+        move_contribution_ids_by_sheet.clear();
+        active_formula_moves.clear();
+        formula_moves = [];
+        for (const sheetIndex of new Set([...stores.keys(), ...pending_stores.keys()])) {
+            refresh_formula_moves_for_sheet(sheetIndex, false);
+        }
+        rebuild_formula_moves_from_contributions();
     };
     const apply_formula_change = (
         sheetIndex: number,
@@ -610,22 +783,60 @@ export function create_edit_session_registry(
     const watch = (store: EditSessionStore) => {
         if (subscriptions.has(store)) return;
         subscriptions.set(store, store.subscribe((change) => {
-            value_edit_order_floor = Math.max(
-                value_edit_order_floor,
-                latest_dirty_value_edit_order(store.snapshot()),
-            );
-            if (change.kind === 'reset') rebuild_formula_projection();
-            else if (change.kind === 'entry') {
-                for (const [sheetIndex, candidate] of stores) {
-                    if (candidate !== store) continue;
+            let changed_sheet_index: number | undefined;
+            for (const [sheetIndex, candidate] of stores) {
+                if (candidate !== store) continue;
+                changed_sheet_index = sheetIndex;
+                if (change.kind === 'entry') {
                     apply_formula_change(sheetIndex, change);
-                    break;
+                }
+                break;
+            }
+            if (change.kind === 'reset') {
+                value_edit_order_floor = Math.max(
+                    value_edit_order_floor,
+                    latest_dirty_value_edit_order(store.snapshot()),
+                );
+                rebuild_formula_projection();
+                source_move_contributions.set(store, source_move_projection(store));
+                if (changed_sheet_index !== undefined) {
+                    refresh_formula_moves_for_sheet(changed_sheet_index);
+                }
+            } else if (change.key !== undefined) {
+                const entry = store.get(change.key);
+                if (entry !== undefined) {
+                    value_edit_order_floor = Math.max(
+                        value_edit_order_floor,
+                        latest_dirty_value_edit_order([[change.key, entry]]),
+                    );
+                }
+                const cached = source_move_contributions.get(store) ?? new Map();
+                const order = source_move_orders.get(store) ?? new Map<string, number>();
+                const contribution = source_move_contribution(change.key, entry);
+                if (entry === undefined) {
+                    cached.delete(change.key);
+                    order.delete(change.key);
+                } else if (contribution === undefined) {
+                    cached.delete(change.key);
+                } else {
+                    cached.set(change.key, contribution);
+                    order.set(
+                        change.key,
+                        store.insertion_order(change.key) ?? order.size,
+                    );
+                }
+                source_move_contributions.set(store, cached);
+                source_move_orders.set(store, order);
+                if (changed_sheet_index !== undefined) {
+                    replace_resolved_move_contribution(
+                        changed_sheet_index,
+                        source_contribution_id(changed_sheet_index, change.key),
+                        contribution === undefined
+                            ? []
+                            : resolved_moves(changed_sheet_index, contribution),
+                    );
                 }
             }
-            // A store can change move provenance without changing its formula
-            // input (for example, a same-text cut destination). Those changes
-            // deliberately arrive as `none`, but they still invalidate moves.
-            if (change.kind !== 'reset') refresh_formula_moves();
             publish();
         }));
     };
@@ -636,12 +847,20 @@ export function create_edit_session_registry(
             if (retained.has(store)) continue;
             unsubscribe();
             subscriptions.delete(store);
+            source_move_contributions.delete(store);
+            source_move_orders.delete(store);
         }
     };
     const watch_pending = (store: PendingRowStore) => {
         if (pending_subscriptions.has(store)) return;
         pending_subscriptions.set(store, store.subscribe((change) => {
             structural_formula_revision += 1;
+            let changed_sheet_index: number | undefined;
+            for (const [sheetIndex, candidate] of pending_stores) {
+                if (candidate !== store) continue;
+                changed_sheet_index = sheetIndex;
+                break;
+            }
             const rows = change.kind === 'rows'
                 ? change.rows
                 : store.snapshot().appendedRows;
@@ -656,6 +875,7 @@ export function create_edit_session_registry(
             }
             if (change.kind === 'reset') {
                 rebuild_pending_formula_store(store);
+                pending_move_projections.set(store, pending_move_projection(store));
             } else {
                 let cached = pending_formula_rows.get(store);
                 if (cached === undefined) {
@@ -668,10 +888,25 @@ export function create_edit_session_registry(
                     else cached.set(row.id, edits);
                 }
                 rebuild_pending_formula_output();
+                const current = pending_move_projections.get(store)
+                    ?? pending_move_projection(store);
+                for (const row of change.rows) {
+                    const contributions = pending_row_move_projection(row);
+                    current.rows.set(row.id, contributions);
+                    if (changed_sheet_index !== undefined) {
+                        replace_resolved_move_contribution(
+                            changed_sheet_index,
+                            pending_contribution_id(changed_sheet_index, row.id),
+                            contributions.flatMap((contribution) =>
+                                resolved_moves(changed_sheet_index!, contribution)),
+                        );
+                    }
+                }
+                pending_move_projections.set(store, current);
             }
-            // Stable cut provenance can originate in or target a pending row.
-            // Rebuild only the move set; ordinary formula edits remain cached.
-            refresh_formula_moves();
+            if (change.kind === 'reset' && changed_sheet_index !== undefined) {
+                refresh_formula_moves_for_sheet(changed_sheet_index);
+            }
             publish();
         }));
     };
@@ -683,6 +918,7 @@ export function create_edit_session_registry(
             unsubscribe();
             pending_subscriptions.delete(store);
             pending_formula_rows.delete(store);
+            pending_move_projections.delete(store);
         }
         rebuild_pending_formula_output();
     };
@@ -698,8 +934,16 @@ export function create_edit_session_registry(
                 && (next_source_row_counts.length !== source_row_counts.length
                     || next_source_row_counts.some((count, index) =>
                         count !== source_row_counts[index]))) {
+                const previous = source_row_counts;
                 source_row_counts = Object.freeze([...next_source_row_counts]);
-                refresh_formula_moves();
+                let refreshed = false;
+                for (let index = 0; index < Math.max(previous.length, source_row_counts.length); index += 1) {
+                    if (previous[index] !== source_row_counts[index]) {
+                        refresh_formula_moves_for_sheet(index, false);
+                        refreshed = true;
+                    }
+                }
+                if (refreshed) rebuild_formula_moves_from_contributions();
             }
             return ({
             edits: formula_edits,
@@ -720,6 +964,8 @@ export function create_edit_session_registry(
                 session_id: current_session_id(),
             });
             stores.set(sheet_index, created);
+            source_move_contributions.set(created, new Map());
+            source_move_orders.set(created, new Map());
             watch(created);
             return created;
         },
@@ -728,6 +974,12 @@ export function create_edit_session_registry(
             if (existing) return existing;
             const created = create_pending_row_store({ session_id: current_session_id() });
             pending_stores.set(sheet_index, created);
+            pending_move_projections.set(created, {
+                rows: new Map(),
+                indexById: new Map(),
+                appendBasisSourceRowCount: undefined,
+                tailRemovalCount: 0,
+            });
             watch_pending(created);
             return created;
         },
@@ -834,6 +1086,7 @@ export function create_edit_session_registry(
             unwatch_detached_pending();
             rebuild_formula_projection();
             rebuild_pending_formula_output();
+            rebuild_all_formula_move_projections();
             publish();
             return {
                 locallyRetainedIndices: locally_retained_indices,
@@ -961,6 +1214,7 @@ export function create_edit_session_registry(
             unwatch_detached_pending();
             rebuild_pending_formula_output();
             rebuild_formula_projection();
+            rebuild_all_formula_move_projections();
             publish();
         },
         stage_discard: (session_id, sheets) => {

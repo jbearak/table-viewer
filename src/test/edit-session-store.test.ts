@@ -27,6 +27,24 @@ function count_notifications(store: ReturnType<typeof create_edit_session_store>
 }
 
 describe('edit session store', () => {
+    it('does not reuse a live insertion rank after a value-equal reconcile', () => {
+        const store = create_edit_session_store({ session_id: 'session' });
+        store.commit('session', '0:0', { value: 'A', base: 'old' });
+        store.commit('session', '1:0', { value: 'B', base: 'old' });
+        store.commit('session', '2:0', { value: 'C', base: 'old' });
+        store.remove('session', '1:0');
+        store.reconcile(
+            { session_id: 'session' },
+            Object.fromEntries(store.snapshot()),
+        );
+
+        store.commit('session', '3:0', { value: 'D', base: 'old' });
+
+        expect(store.insertion_order('3:0')).toBeGreaterThan(
+            store.insertion_order('2:0') ?? -1,
+        );
+    });
+
     it('install replaces the map and stamps the identity', () => {
         const store = create_edit_session_store(
             { session_id: 'first' },
@@ -860,6 +878,30 @@ describe('edit session store', () => {
     });
 
     describe('stage_writes', () => {
+        it('keeps staged insertion ranks aligned with Map order', () => {
+            const store = create_edit_session_store({ session_id: 's' });
+            const staged = store.stage_writes('s', [
+                { key: '0:0', entry: { value: 'A1', base: 'old' } },
+                { key: '1:0', entry: { value: 'B', base: 'old' } },
+                { key: '0:0', entry: { value: 'A2', base: 'old' } },
+            ]);
+            staged?.commit();
+
+            expect(store.insertion_order('0:0')).toBeLessThan(
+                store.insertion_order('1:0') ?? -1,
+            );
+
+            const reordered = store.stage_writes('s', [
+                { key: '0:0', entry: undefined },
+                { key: '0:0', entry: { value: 'A3', base: 'old' } },
+            ]);
+            reordered?.commit();
+
+            expect(store.insertion_order('0:0')).toBeGreaterThan(
+                store.insertion_order('1:0') ?? Number.MAX_SAFE_INTEGER,
+            );
+        });
+
         it('does not publish until the commit', () => {
             const store = create_edit_session_store({ session_id: 's' }, {});
             const notifications = count_notifications(store);

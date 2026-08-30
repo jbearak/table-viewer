@@ -12,7 +12,10 @@ import {
     type HistoryBounds,
     type HistoryChange,
     type HistoryEntry,
+    type SavedHistoryRowAssignment,
+    type SavedTailRemovalCommit,
 } from '../webview/history-stack-model';
+import type { PendingTailRemoval } from '../pending-changes';
 import { create_history_store } from '../webview/history-store';
 import { create_edit_session_store } from '../webview/edit-session-store';
 import { commit_staged_transaction, type StagedMutation } from '../webview/staged-mutation';
@@ -218,6 +221,74 @@ describe('create_history_store', () => {
         const store = create_history_store(seed.snapshot());
         expect(store.snapshot().undoStack).toHaveLength(1);
     });
+
+    it('passes caller bounds through saved-row rekeys and reports refusal', () => {
+        const store = create_history_store();
+        store.stage_record({
+            label: 'Append row',
+            changes: [{
+                kind: 'rowAppend',
+                delta: {
+                    worksheet: SHEET,
+                    pendingRowId: 'pending-a',
+                    before: null,
+                    after: {
+                        id: 'pending-a',
+                        cells: { 0: { value: 'saved' } },
+                        formatTemplateId: 'plain',
+                        createdOrder: 1,
+                    },
+                    beforeIndex: null,
+                    afterIndex: 0,
+                    formatTemplates: [{ id: 'plain', format: { kind: 'none' } }],
+                },
+            }],
+        }).commit();
+        const saved: SavedHistoryRowAssignment[] = [{
+            worksheet: SHEET,
+            pendingRowId: 'pending-a',
+            sourceRow: 8,
+            savedFingerprint: 'fingerprint',
+            savedRow: { cells: { 0: { value: 'saved' } }, format: { kind: 'none' } },
+        }];
+        expect(store.rekey_saved_rows(saved, TINY)).toMatchObject({
+            kind: 'unrecordable',
+            reason: 'action-too-large',
+            hardMaxBytes: 1,
+        });
+        expect(store.snapshot().barrier?.reason).toBe('action-too-large');
+    });
+
+    it('passes caller bounds through committed-removal rekeys and reports refusal', () => {
+        const removal: PendingTailRemoval = {
+            appendHistoryId: 'saved-a',
+            sourceRow: 8,
+            savedFingerprint: 'fingerprint',
+            savedRow: { cells: { 0: { value: 'saved' } }, format: { kind: 'none' } },
+        };
+        const store = create_history_store();
+        store.stage_record({
+            label: 'Remove appended row',
+            changes: [{
+                kind: 'tailRemoval',
+                delta: {
+                    worksheet: SHEET,
+                    appendHistoryId: removal.appendHistoryId,
+                    before: removal,
+                    after: null,
+                    beforeIndex: 0,
+                    afterIndex: null,
+                },
+            }],
+        }).commit();
+        const committed: SavedTailRemovalCommit[] = [{ worksheet: SHEET, removal }];
+        expect(store.rekey_saved_removals(committed, TINY)).toMatchObject({
+            kind: 'unrecordable',
+            reason: 'action-too-large',
+            hardMaxBytes: 1,
+        });
+        expect(store.snapshot().barrier?.reason).toBe('action-too-large');
+    });
 });
 
 describe('create_history_store — stage_move', () => {
@@ -388,4 +459,3 @@ describe('commit_staged_transaction', () => {
         expect(history.snapshot().redoStack).toHaveLength(0);
     });
 });
-
