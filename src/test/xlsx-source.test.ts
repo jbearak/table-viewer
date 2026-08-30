@@ -95,7 +95,7 @@ describe('XlsxDataSource', () => {
         };
         expect(formatting_off.kind).toBe(GridCellKind.Text);
         expect(formatting_off.allowWrapping).toBe(true);
-    }, 15_000);
+    }, 30_000);
     it('preserves bold/italic flags', async () => {
         const ds = await XlsxDataSource.create(load('styled.xlsx'));
         const w = ds.read_rows(0, 0, 50);

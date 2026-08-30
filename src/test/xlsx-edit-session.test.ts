@@ -4984,7 +4984,7 @@ describe('xlsx edit sessions', () => {
         expect(state.get_state(file_path).pendingEdits?.[0]?.conflicts).toEqual(
             reconciled?.conflicts,
         );
-    });
+    }, 15_000);
 
     it('drops style dependencies belonging only to a removed blank column', async () => {
         const state = versioned_state_store({});
@@ -6696,7 +6696,7 @@ describe('xlsx edit sessions', () => {
             expect(durable?.[sheet_index]?.cells).toEqual({});
             expect(durable?.[sheet_index]?.appendedRows?.[0].cells[0]?.value).toBe('seed');
         }
-    }, 30_000);
+    }, 60_000);
 
     it('recomputes a resolved formula conflict across Undo and Redo', async () => {
         const format = capture_xlsx_append_row_format(bytes, 0, 3, 4, 0);

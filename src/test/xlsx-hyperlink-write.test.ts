@@ -182,8 +182,8 @@ describe('apply_hyperlink_edits', () => {
         const out = apply_hyperlink_edits(sheet('<sheetData/>'), relationships, [
             { row: 0, col: 0, link: external('https://child-prefix.example') },
         ]);
-        expect(out.rels_xml).toMatch(
-            new RegExp(`<p:Relationship xmlns:p="${namespace}" Id="rId2"`),
+        expect(out.rels_xml).toContain(
+            `<p:Relationship xmlns:p="${namespace}" Id="rId2"`,
         );
         expect([...parse_relationships(out.rels_xml!).values()])
             .toContainEqual(expect.objectContaining({ target: 'https://child-prefix.example' }));
