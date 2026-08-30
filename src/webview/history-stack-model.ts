@@ -2375,7 +2375,10 @@ export function history_action(label: string, changes: readonly HistoryChange[])
  * reasoning from "no highlights" would answer wrongly for the mixed case.
  */
 export function action_has_cell_changes(action: HistoryAction): boolean {
-    return action.changes.some((change) => change.kind === 'cell');
+    return action.changes.some((change) => change.kind === 'cell'
+        || change.kind === 'rowAppend'
+        || change.kind === 'tailRemoval'
+        || change.kind === 'pendingRows');
 }
 
 /**

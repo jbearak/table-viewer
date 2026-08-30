@@ -274,11 +274,10 @@ export interface HistoryReplayDisplayFocus {
  */
 export interface PrepareHistoryReplayRequest extends HistoryReplayCorrelation {
     /**
-     * May be EMPTY: highlight-only and structural-only gestures write no
-     * session-owned pending-edit cells. Such a replay also needs no edit session,
-     * which is why the host decides that requirement from this list's length
-     * rather than from a renderer-supplied claim. A request is invalid only when
-     * all three replay arms are empty.
+     * May be EMPTY: a highlight-only gesture writes no pending-edit state. Such a
+     * replay also needs no edit session, which is why the host decides that
+     * requirement from this list's length rather than from a renderer-supplied
+     * claim. What is never valid is a request with neither cells nor highlights.
      */
     readonly cells: readonly HistoryReplayCellInput[];
     readonly highlights: readonly HistoryReplayHighlightInput[];
@@ -842,15 +841,14 @@ export function sanitized_prepare_history_replay_request(
  * anything the renderer asserts — a claim of "highlights only" would otherwise be
  * a way to write pending edits with no session behind them.
  *
- * Cells, never the absence of highlights or structures: one chronological
- * history means a single action can carry all three, and only its cell arm
- * writes session-owned pending edits. Structural changes use the separately
- * leased row-admission path.
+ * Cells, never the absence of highlights: one chronological history means a
+ * single action can carry both kinds, and a mixed request writes pending edits
+ * and so still requires a session.
  */
 export function replay_request_requires_edit_session(
     request: PrepareHistoryReplayRequest,
 ): boolean {
-    return request.cells.length > 0;
+    return request.cells.length > 0 || (request.structures?.length ?? 0) > 0;
 }
 
 export function sanitized_commit_history_replay_request(

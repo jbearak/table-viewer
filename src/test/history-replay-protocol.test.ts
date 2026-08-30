@@ -6,7 +6,6 @@ import {
 } from '../history-limits';
 import {
     history_replay_proposal_digest,
-    replay_request_requires_edit_session,
     sanitized_abandon_history_replay_request,
     sanitized_commit_history_replay_request,
     sanitized_prepare_history_replay_request,
@@ -294,7 +293,7 @@ describe('sanitized_prepare_history_replay_request', () => {
         expect(parsed?.highlights).toHaveLength(1);
     });
 
-    it('rejects a request with no cell, highlight, or structural arm', () => {
+    it('rejects a request with neither cells nor highlights', () => {
         // Nothing to prepare is not a replay; it would take a lease authorizing
         // nothing.
         expect(sanitized_prepare_history_replay_request(
@@ -326,12 +325,6 @@ describe('sanitized_prepare_history_replay_request', () => {
             desired,
         }]);
         expect(Object.isFrozen(parsed?.structures?.[0].desired)).toBe(true);
-        expect(replay_request_requires_edit_session(parsed!)).toBe(false);
-    });
-
-    it('requires an edit session only when the replay writes cells', () => {
-        const parsed = sanitized_prepare_history_replay_request(prepare_request());
-        expect(replay_request_requires_edit_session(parsed!)).toBe(true);
     });
 
     it('owns bounded unique row-admission correlations', () => {

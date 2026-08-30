@@ -98,7 +98,7 @@ describe('action_requires_edit_session', () => {
         expect(action_requires_edit_session({ label: 'Edit', changes: [cell] })).toBe(true);
     });
 
-    it('is false for a structural gesture', () => {
+    it('is true for a structural gesture', () => {
         const structural: HistoryChange = {
             kind: 'pendingRows',
             delta: {
@@ -118,7 +118,7 @@ describe('action_requires_edit_session', () => {
             },
         };
         expect(action_requires_edit_session({ label: 'Rows', changes: [structural] }))
-            .toBe(false);
+            .toBe(true);
     });
 
     it('is true for a MIXED gesture, decided on the cell and not the highlight', () => {

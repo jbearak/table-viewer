@@ -12210,11 +12210,11 @@ export function attach_viewer(
                     return;
                 }
                 // A replay carrying cell writes mutates session-owned pending-edit
-                // state. Highlights are durable workbook state, and structures use
-                // their own row-admission lease, so neither arm alone requires edit
-                // mode. The session requirement therefore follows the cells — read
-                // through the shared derivation, so this gate and the lease binding
-                // below cannot disagree about what it admitted.
+                // state; one carrying only highlights mutates durable workbook
+                // state, which the ordinary highlight commands change with no
+                // session and outside edit mode. So the session requirement follows
+                // the cells — read through the shared derivation, so this gate and
+                // the lease binding below cannot disagree about what it admitted.
                 const requires_edit_session = replay_request_requires_edit_session(request);
                 if (profile.previewMode === true) {
                     refuse('unavailable');
@@ -12461,11 +12461,12 @@ export function attach_viewer(
         const expected_digest = session.acknowledged_physical_digest();
         const expected_authority = source_authority.authorityRevision;
         const expected_physical_revision = source_authority.physicalRevision;
-        // Bound only for a replay that writes pending-edit cells. A non-cell lease
-        // must be independent of the edit session in BOTH directions: it cannot
-        // require one, and it must not be invalidated by one starting or ending
-        // underneath it. The same derivation the admission gate used keeps the
-        // lease from binding under assumptions the gate did not apply.
+        // Bound only for a replay that writes pending edits. A highlight-only
+        // lease must be independent of the edit session in BOTH directions: it
+        // cannot require one, and it must not be invalidated by one starting or
+        // ending underneath it — highlights are not session state. The same
+        // derivation the admission gate used, so the lease cannot bind under
+        // assumptions the gate did not apply.
         const requires_edit_session = replay_request_requires_edit_session(request);
         const edit_session = requires_edit_session ? active_edit_session_id : undefined;
         const bound_source_generation = replay_core?.source_generation;
@@ -12506,7 +12507,7 @@ export function attach_viewer(
             )
             // Every term above is unconditional — the document, source, adoption,
             // authority and digest identities bind every lease. Only the session
-            // terms are conditional, and a non-cell lease is still
+            // terms are conditional, and a highlight-only lease is still
             // self-invalidating without them.
             && (
                 !requires_edit_session

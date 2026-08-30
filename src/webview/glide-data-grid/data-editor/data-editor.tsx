@@ -1850,26 +1850,25 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
     );
 
     const getCustomNewRowTargetColumn = React.useCallback(
-        (col: number): number | undefined => {
+        (mangledCol: number): number | undefined => {
+            const col = mangledCol - rowMarkerOffset;
             const customTargetColumn =
                 columns[col]?.trailingRowOptions?.targetColumn ?? trailingRowOptions?.targetColumn;
 
             if (typeof customTargetColumn === "number") {
-                const customTargetOffset = hasRowMarkers ? 1 : 0;
-                return customTargetColumn + customTargetOffset;
+                return customTargetColumn + rowMarkerOffset;
             }
 
             if (typeof customTargetColumn === "object") {
                 const maybeIndex = columnsIn.indexOf(customTargetColumn);
                 if (maybeIndex >= 0) {
-                    const customTargetOffset = hasRowMarkers ? 1 : 0;
-                    return maybeIndex + customTargetOffset;
+                    return maybeIndex + rowMarkerOffset;
                 }
             }
 
             return undefined;
         },
-        [columns, columnsIn, hasRowMarkers, trailingRowOptions?.targetColumn]
+        [columns, columnsIn, rowMarkerOffset, trailingRowOptions?.targetColumn]
     );
 
     const lastSelectedRowRef = React.useRef<number>();
@@ -3143,9 +3142,7 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
                     gridSelection.current.cell[1] === rows - 1;
                 if (entersPastLastDataRow) {
                     const selectedColumn = gridSelection.current.cell[0];
-                    const customTargetColumn = getCustomNewRowTargetColumn(
-                        selectedColumn - rowMarkerOffset
-                    );
+                    const customTargetColumn = getCustomNewRowTargetColumn(selectedColumn);
                     void appendRow(customTargetColumn ?? selectedColumn);
                     onFinishedEditing?.(newValue, movement);
                     return true;
@@ -3174,7 +3171,6 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
             mangledCols.length,
             showTrailingBlankRow,
             rows,
-            rowMarkerOffset,
             getCustomNewRowTargetColumn,
             appendRow,
         ]
@@ -3990,6 +3986,20 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
             mergedCells,
         ]
     );
+    // Publish the callback and topology together only after React commits. A
+    // concurrent render may be interrupted after producing new closures; letting
+    // the queue observe one of those beside the last committed topology would
+    // combine two different coordinate systems.
+    const pasteExecutionRef = React.useRef({
+        perform: performPasteInternal,
+        topologyKey: pasteTopologyKey,
+    });
+    React.useLayoutEffect(() => {
+        pasteExecutionRef.current = {
+            perform: performPasteInternal,
+            topologyKey: pasteTopologyKey,
+        };
+    }, [performPasteInternal, pasteTopologyKey]);
 
     // A paste can cross asynchronous clipboard reads and host-backed row
     // admission. Serialize the whole gesture so the next paste samples the
@@ -4010,14 +4020,13 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
         }
         const queued = pasteTailRef.current
             .catch(() => undefined)
-            .then(() => performPasteInternal(
-                e,
-                captured,
-                pasteTopologyKeyRef.current
-            ));
+            .then(() => {
+                const execution = pasteExecutionRef.current;
+                return execution.perform(e, captured, execution.topologyKey);
+            });
         pasteTailRef.current = queued;
         return queued;
-    }, [performPasteInternal]);
+    }, []);
 
     useEventListener("paste", onPasteInternal, safeWindow, false, true);
 

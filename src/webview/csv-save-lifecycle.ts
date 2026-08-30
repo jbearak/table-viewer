@@ -391,27 +391,20 @@ export function remove_operation_owned_pending_structural_changes(
     pending_changes: PendingStructuralChanges | WorksheetPendingEdits | undefined,
     worksheet: CsvSaveWorksheetOperation,
 ): PendingStructuralChanges | undefined {
-    const owned = worksheet.structuralChanges === undefined
-        ? undefined
-        : own_pending_structural_changes(worksheet.structuralChanges);
+    const owned = worksheet.structuralChanges;
     if (pending_changes === undefined) return undefined;
     const pending = own_pending_structural_changes(pending_changes);
     if (owned === undefined) return pending;
-    const saved_rows_by_id = new Map(
-        owned.appendedRows.map((row) => [row.id, JSON.stringify(row)] as const),
-    );
+    const pending_row_ids = new Set(owned.appendedRows.map((row) => row.id));
     const removed_source_rows = new Set(
         owned.tailRemovals.map((removal) => removal.sourceRow),
     );
+    // GridShell raises its save fence synchronously with capturing the operation,
+    // so this pending identity cannot acquire a newer user edit while the save
+    // runs. The receipt therefore settles the admitted append by ID. Retaining a
+    // same-ID row here would represent the already-written row as another append.
     const appended_rows = pending.appendedRows.filter(
-        (row) => {
-            const saved = saved_rows_by_id.get(row.id);
-            // The row ID names the admitted append, not the version of its
-            // content. A user can keep editing that row while the captured save
-            // is in flight, so tombstone only the exact canonical snapshot the
-            // operation owned.
-            return saved === undefined || JSON.stringify(row) !== saved;
-        },
+        (row) => !pending_row_ids.has(row.id),
     );
     const tail_removals = pending.tailRemovals.filter(
         (removal) => !removed_source_rows.has(removal.sourceRow),

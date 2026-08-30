@@ -1211,6 +1211,50 @@ a new line char ""more quotes"" plus a tab  ."	https://google.com`)
         }));
     });
 
+    test("activating the trailing row honors a per-column target with row markers", async () => {
+        const appendSpy = vi.fn();
+        const selectionSpy = vi.fn();
+        const columns = basicProps.columns.map((column, index) => index === 1
+            ? { ...column, trailingRowOptions: { targetColumn: 0 } }
+            : column);
+        vi.useFakeTimers();
+        render(
+            <DataEditor
+                {...basicProps}
+                columns={columns}
+                rows={2}
+                rowMarkers="both"
+                onRowAppended={async () => {
+                    appendSpy();
+                    return { row: 2, ready: () => true };
+                }}
+                onGridSelectionChange={selectionSpy}
+                gridSelection={{
+                    columns: CompactSelection.empty(),
+                    rows: CompactSelection.empty(),
+                    current: {
+                        cell: [1, 2],
+                        range: { x: 1, y: 2, width: 1, height: 1 },
+                        rangeStack: [],
+                    },
+                }}
+            />,
+            { wrapper: Context }
+        );
+        prep();
+        vi.useFakeTimers();
+        fireEvent.keyDown(screen.getByTestId("data-grid-canvas"), { key: "Enter" });
+        await act(async () => {
+            await Promise.resolve();
+            vi.runAllTimers();
+        });
+
+        expect(appendSpy).toHaveBeenCalledOnce();
+        expect(selectionSpy).toHaveBeenCalledWith(expect.objectContaining({
+            current: expect.objectContaining({ cell: [0, 2] }),
+        }));
+    });
+
     test("Does not edit when validation fails", async () => {
         const spy = vi.fn();
         vi.useFakeTimers();
@@ -2928,7 +2972,10 @@ a new line char ""more quotes"" plus a tab  ."	https://google.com`)
         }>((resolve) => {
             resolveAdmission = resolve;
         }));
-        const editSpy = vi.fn(() => true);
+        const editSpy = vi.fn((
+            _edits: readonly EditListItem[],
+            _source: string,
+        ) => true);
         const pasteError = vi.fn();
         Object.assign(navigator, {
             clipboard: { readText: vi.fn(async () => "one\ntwo") },
@@ -2942,8 +2989,17 @@ a new line char ""more quotes"" plus a tab  ."	https://google.com`)
                 rangeStack: [],
             },
         };
+        const nextSelection = {
+            columns: CompactSelection.empty(),
+            rows: CompactSelection.empty(),
+            current: {
+                cell: [1, 0] as Item,
+                range: { x: 1, y: 0, width: 1, height: 1 },
+                rangeStack: [],
+            },
+        };
         const rendered = render(
-            <EventedDataEditor
+            <DataEditor
                 {...basicProps}
                 rows={3}
                 pasteTopologyKey="topology-1"
@@ -2964,11 +3020,11 @@ a new line char ""more quotes"" plus a tab  ."	https://google.com`)
         fireEvent.paste(window);
         await vi.waitFor(() => expect(admit).toHaveBeenCalledOnce());
         rendered.rerender(
-            <EventedDataEditor
+            <DataEditor
                 {...basicProps}
                 rows={4}
                 pasteTopologyKey="topology-2"
-                gridSelection={selection}
+                gridSelection={nextSelection}
                 onPaste={true}
                 onPasteRowsNeeded={admit}
                 onCellsEdited={editSpy}
@@ -2978,6 +3034,10 @@ a new line char ""more quotes"" plus a tab  ."	https://google.com`)
         resolveAdmission({ topologyKey: "topology-2", rollback });
 
         await vi.waitFor(() => expect(editSpy).toHaveBeenCalledTimes(2));
+        expect(editSpy.mock.calls[1]?.[0]).toEqual([
+            expect.objectContaining({ location: [1, 0] }),
+            expect.objectContaining({ location: [1, 1] }),
+        ]);
         expect(pasteError).not.toHaveBeenCalled();
         expect(rollback).not.toHaveBeenCalled();
     });

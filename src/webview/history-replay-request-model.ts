@@ -100,13 +100,13 @@ export interface ReplayRequestSources {
  * highlight change does not — highlights are durable workbook state, governed by
  * file authority and digest currency, and changeable outside edit mode entirely.
  *
- * Structural changes use their own leased row-admission path and, like
- * highlights, can replay outside edit mode. The one renderer-side statement of
- * that rule lives here rather than with the stack because it is replay policy
- * over a structural fact the stack reports ({@link action_has_cell_changes}) —
- * the same rule the host reaches independently from the sanitized request's own
- * `cells.length`. Two derivations of one rule, deliberately: the host must never
- * take the renderer's word for it.
+ * The one renderer-side statement of that rule, and it lives here rather than
+ * with the stack because it is replay policy over a structural fact the stack
+ * reports ({@link action_has_cell_changes}) — the same rule the host reaches
+ * independently from the sanitized request's own `cells.length`. Two derivations
+ * of one rule, deliberately: the host must never take the renderer's word for
+ * it, or a claim of "highlights only" would be a way to write pending edits with
+ * no session behind them.
  */
 export function action_requires_edit_session(action: HistoryEntry['action']): boolean {
     return action_has_cell_changes(action);
@@ -196,10 +196,9 @@ export function build_prepare_request(
             0,
         );
     }
-    // Highlight-only and structural-only actions have no cells and remain
-    // replayable: neither writes session-owned pending-edit cells. What no request
-    // can be is empty of all three arms — there would be nothing for the host to
-    // verify or apply.
+    // A highlight-only action has no cells, and is replayable: highlights are
+    // durable workbook state, not session-owned pending edits. What no request can
+    // be is empty of both — there would be nothing for the host to verify or apply.
     if (
         focus === undefined
         || (cells.length === 0 && highlights.length === 0 && structures.length === 0)

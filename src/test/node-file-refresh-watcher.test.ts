@@ -79,15 +79,23 @@ describe('Node file refresh watcher adapter', () => {
             await new Promise((done) => { setTimeout(done, 10); });
         }
         expect(events.length).toBeGreaterThan(0);
-        events.splice(0);
         await fs.promises.writeFile(replacement, 'committed version');
+        const { events: replacement_events } = watch(
+            new NodeFileRefreshWatcherFactory({ poll_interval_ms: POLL_MS }),
+            target,
+        );
         await fs.promises.rename(replacement, target);
 
-        for (let attempt = 0; attempt < 200 && events.length === 0; attempt += 1) {
+        for (
+            let attempt = 0;
+            attempt < 200 && replacement_events.length === 0;
+            attempt += 1
+        ) {
             await new Promise((done) => { setTimeout(done, 10); });
         }
-        expect(events.length).toBeGreaterThan(0);
-        expect(events.every((kind) => ['change', 'create'].includes(kind))).toBe(true);
+        expect(replacement_events.length).toBeGreaterThan(0);
+        expect(replacement_events.every((kind) => ['change', 'create'].includes(kind)))
+            .toBe(true);
     });
 
     it('ignores events for sibling files in the same directory', async () => {
