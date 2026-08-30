@@ -7105,6 +7105,31 @@ describe('GridShell append composer', () => {
         ]);
     });
 
+    it('stages composed rows as one publication carrying their values', async () => {
+        await render_grid(composer_props({
+            pending_row_store: create_pending_row_store({ session_id: 'session-1' }),
+        }));
+        await open_composer();
+        await act(async () => set_input_value(
+            field('append-composer-0-0') as HTMLInputElement,
+            'seeded',
+        ));
+        grid_mock.post_message.mockClear();
+        await act(async () => { button('Stage row').click(); });
+
+        // Appending blank and then writing the values was two store mutations,
+        // so the host saw the row blank before it saw it filled — a flicker in
+        // the grid and a second structural payload left outstanding behind it.
+        const structural = () => grid_mock.post_message.mock.calls
+            .map((call) => call[0])
+            .filter((message) => message?.type === 'pendingChangesChanged');
+        await vi.waitUntil(() => structural().length > 0);
+        expect(structural()).toHaveLength(1);
+        const [published] = structural();
+        expect(published.changes.appendedRows).toHaveLength(1);
+        expect(published.changes.appendedRows[0].cells['0']?.value).toBe('seeded');
+    });
+
     it('stands the quick-add controls down while the composer is open', async () => {
         await render_grid(composer_props({
             pending_row_store: create_pending_row_store({ session_id: 'session-1' }),

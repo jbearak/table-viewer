@@ -54,6 +54,14 @@ export interface PendingRowStore {
         format_template: PendingRowFormatTemplate,
         first_created_order: number,
         append_basis?: PendingAppendBasis,
+        /**
+         * Cells the new rows carry from birth, one entry per `row_ids` index,
+         * keyed by source column. A caller that already knows a row's values —
+         * the guided composer — seeds them here rather than writing them after
+         * the append: two mutations are two notifications, and subscribers see
+         * the row blank before they see it filled.
+         */
+        initial_cells?: readonly Readonly<Record<number, PendingRowCell>>[],
     ): boolean;
     set_cell(
         session_id: string | undefined,
@@ -459,6 +467,7 @@ export function create_pending_row_store(
             format_template,
             first_created_order,
             append_basis,
+            initial_cells,
         ) => {
             if (
                 row_ids.length === 0
@@ -490,7 +499,7 @@ export function create_pending_row_store(
                     : advance_pending_append_basis(state.appendBasis, append_basis);
             const rows = row_ids.map((id, index): PendingAppendedRow => ({
                 id,
-                cells: {},
+                cells: { ...(initial_cells?.[index] ?? {}) },
                 formatTemplateId: format_template.id,
                 createdOrder: first_created_order + index,
             }));

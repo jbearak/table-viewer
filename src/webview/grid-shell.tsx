@@ -3580,6 +3580,13 @@ export function GridShell({
         count: number,
         record_history = true,
         still_current: () => boolean = () => true,
+        /**
+         * Values the rows carry from birth, one entry per row, keyed by source
+         * column. Seeding them into the append keeps the gesture to a single
+         * store mutation, so the host sees one structural payload rather than a
+         * blank row followed by a filled one.
+         */
+        seed_cells?: readonly Readonly<Record<number, PendingRowCell>>[],
     ) => {
         // Capture the activation before joining the serialization tail. The
         // first request's busy affordance may render while a second gesture is
@@ -3638,6 +3645,7 @@ export function GridShell({
                 admitted.formatTemplate,
                 issue_value_edit_order(),
                 admitted.appendBasis,
+                seed_cells,
             );
             if (!added) {
                 admitted.settle(false);
@@ -3850,47 +3858,42 @@ export function GridShell({
         rows: readonly (readonly string[])[],
     ): Promise<boolean> => {
         if (rows.length === 0) return false;
-        const appended = await admit_pending_rows(rows.length, false);
-        if (appended === undefined) return false;
-        const edits: {
-            readonly pendingRowId: string;
-            readonly sourceColumn: number;
-            readonly cell: PendingRowCell | undefined;
-        }[] = [];
-        rows.forEach((values, row_index) => {
-            const pending_row_id = appended.rowIds[row_index];
-            if (pending_row_id === undefined) return;
+        // Built before admission so the rows can be appended already carrying
+        // their values. Writing them afterwards was two store mutations and so
+        // two structural publications: the row reached the host blank, then
+        // again filled, which the grid showed as a flicker and which left the
+        // second payload outstanding.
+        const seed_cells = rows.map((values) => {
+            const cells: Record<number, PendingRowCell> = {};
             values.forEach((raw, display_column) => {
                 const source_column = visible_source_columns[display_column];
                 if (source_column === undefined) return;
                 const parsed = parse_cell_edit(raw, edit_syntax);
                 // A blank field is not an edit: appended rows start empty, so
-                // writing `undefined` would only churn the envelope.
+                // writing one would only churn the envelope.
                 if (parsed.text === '' && parsed.rich === undefined) return;
-                edits.push({
-                    pendingRowId: pending_row_id,
-                    sourceColumn: source_column,
-                    cell: {
-                        value: parsed.text,
-                        ...(parsed.rich === undefined ? {} : { valueRuns: parsed.rich }),
-                        valueEditOrder: issue_value_edit_order(),
-                        ...(edit_syntax === 'markdown'
-                            && formula_reference_bases !== undefined
-                            && xlsx_edit_writes_formula(parsed.text, parsed.rich?.runs)
-                            ? { formulaReferenceBases: formula_reference_bases(parsed.text) }
-                            : {}),
-                    },
-                });
+                cells[source_column] = {
+                    value: parsed.text,
+                    ...(parsed.rich === undefined ? {} : { valueRuns: parsed.rich }),
+                    valueEditOrder: issue_value_edit_order(),
+                    ...(edit_syntax === 'markdown'
+                        && formula_reference_bases !== undefined
+                        && xlsx_edit_writes_formula(parsed.text, parsed.rich?.runs)
+                        ? { formulaReferenceBases: formula_reference_bases(parsed.text) }
+                        : {}),
+                };
             });
+            return cells;
         });
-        if (edits.length > 0 && !pending_store.set_cells(edit_session_id, edits)) {
-            // The rows themselves are staged and stay staged; only the values
-            // were refused, so the gesture below still has something to record.
-            host_bridge.postMessage({
-                type: 'showWarning',
-                message: 'The composed values are too large to keep as pending changes.',
-            });
-        }
+        const appended = await admit_pending_rows(
+            rows.length,
+            false,
+            () => true,
+            seed_cells,
+        );
+        // An envelope too large to hold the composed values now refuses the
+        // whole gesture rather than staging blank rows beside a warning.
+        if (appended === undefined) return false;
         record_pending_row_gesture(
             rows.length === 1 ? 'Compose row' : `Compose ${rows.length} rows`,
             appended.before,
