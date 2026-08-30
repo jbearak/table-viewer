@@ -81,9 +81,9 @@ one-million-row worksheet limit. Never clip the block or apply only a prefix.
 ### Pending-row display
 
 Source rows retain their current frozen edit-session projection. Pending
-Appended Rows appear in an added-row band after them, separated by a "Pending
-rows" divider. They use the existing added-row tint derived from
-`diff_added_fg` and `COMPARE_BAND_ALPHA`.
+Appended Rows appear in an added-row band after them, separated by a two-pixel
+boundary line without a text badge. They use the existing added-row tint
+derived from `diff_added_fg` and `COMPARE_BAND_ALPHA`.
 
 Pending rows show their intended physical row numbers:
 
