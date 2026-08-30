@@ -884,6 +884,71 @@ describe('xlsx edit sessions', () => {
         });
     });
 
+    it('reloads an externally restored XLSX after saving an appended row', async () => {
+        const original = new Uint8Array(bytes);
+        const panel = await open_ready_xlsx(file_path);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'edit', sheetIndex: 0 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+        const initial = latest_snapshot(panel);
+        await panel.__receive({
+            type: 'requestAppendRows',
+            requestId: 'append-before-restore',
+            editSessionId: session,
+            worksheet: { sheetIndex: 0, sheetName: 'People', worksheetId: '1' },
+            sourceGeneration: initial.sourceGeneration,
+            count: 1,
+        });
+        const admission = panel.__messages.find((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { type?: unknown }).type === 'appendRowsResult'
+            && (message as { requestId?: unknown }).requestId === 'append-before-restore'
+        )) as Extract<import('../types').HostMessage, { type: 'appendRowsResult' }>;
+        expect(admission.granted, admission.reason).toBe(true);
+        await panel.__receive({
+            type: 'settleRowAdmission',
+            requestId: 'append-before-restore',
+            editSessionId: session,
+            accepted: true,
+        });
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: workbook_request(session, 'save-before-restore', save_worksheet({
+                edits: {},
+                dirtyEdits: {},
+                structuralChanges: {
+                    formatTemplates: [admission.formatTemplate!],
+                    appendedRows: [{
+                        id: admission.rowIds![0],
+                        cells: {},
+                        formatTemplateId: admission.formatTemplate!.id,
+                        createdOrder: 1,
+                    }],
+                    tailRemovals: [],
+                    appendBasis: admission.appendBasis!,
+                    conflicts: [],
+                },
+            })),
+        });
+        await wait_for_observable(() => source_refresh_snapshots(panel).length > 0);
+        expect(source_refresh_snapshots(panel).at(-1)!.meta.sheets[0].rowCount).toBe(3);
+
+        // This models `git reset --hard`: the file is replaced outside the app.
+        // Keep the mtime deliberately unchanged so the watcher/reload pipeline
+        // cannot depend on timestamp luck.
+        bytes = original;
+        await vscode_mock.__getActiveWatchers()[0].__fireChange();
+        await wait_for_observable(() => source_refresh_snapshots(panel).some(
+            (snapshot) => snapshot.reason === 'fileReload'
+                && snapshot.meta.sheets[0].rowCount === 2,
+        ));
+
+        expect(latest_snapshot(panel).meta.sheets[0]).toMatchObject({
+            rowCount: 2,
+            sourceRowCount: 3,
+        });
+    });
+
     it('saves and exits the first of two editing files after an auto-grown row height', async () => {
         // A sparse per-sheet array is persisted with JSON nulls. Editing a long
         // value can auto-grow a row before the save-on-exit request arrives, so

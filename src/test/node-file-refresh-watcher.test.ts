@@ -65,6 +65,31 @@ describe('Node file refresh watcher adapter', () => {
             .toBe(true);
     });
 
+    it('emits an event when an external tool replaces the watched file', async () => {
+        const target = path.join(temp_dir, 'restored.xlsx');
+        const replacement = path.join(temp_dir, 'git-checkout.xlsx');
+        await fs.promises.writeFile(target, 'locally changed');
+        const { events } = watch(
+            new NodeFileRefreshWatcherFactory({ poll_interval_ms: POLL_MS }),
+            target,
+        );
+
+        for (let attempt = 0; attempt < 100 && events.length === 0; attempt += 1) {
+            await fs.promises.appendFile(target, '.');
+            await new Promise((done) => { setTimeout(done, 10); });
+        }
+        expect(events.length).toBeGreaterThan(0);
+        events.splice(0);
+        await fs.promises.writeFile(replacement, 'committed version');
+        await fs.promises.rename(replacement, target);
+
+        for (let attempt = 0; attempt < 100 && events.length === 0; attempt += 1) {
+            await new Promise((done) => { setTimeout(done, 10); });
+        }
+        expect(events.length).toBeGreaterThan(0);
+        expect(events.every((kind) => ['change', 'create'].includes(kind))).toBe(true);
+    });
+
     it('ignores events for sibling files in the same directory', async () => {
         const target = path.join(temp_dir, 'target.csv');
         const sibling = path.join(temp_dir, 'sibling.csv');

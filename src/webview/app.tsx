@@ -36,6 +36,7 @@ import {
     dirty_move_component_sizes,
     type CsvDirtyEntry,
     type CsvObservedFileBase,
+    type PendingChangesSaveReceipt,
     type CsvSaveLifecycle,
     type CsvSaveOperation,
     type CsvSaveWorksheetOperation,
@@ -146,6 +147,7 @@ import {
     reduce_csv_save_projection,
     remove_operation_owned_pending_edits,
     resolve_csv_save_hydration_from_worksheets,
+    resolve_csv_save_structural_hydration_from_worksheets,
     save_lifecycle_correlation,
     save_operation_worksheets,
     terminal_csv_save_settles_operation,
@@ -1561,6 +1563,7 @@ export function App(): React.JSX.Element {
     const save_projection_ref = useRef<CsvSaveProjection>(
         INITIAL_CSV_SAVE_PROJECTION,
     );
+    const processed_save_receipts_ref = useRef(new Set<string>());
     const meta_ref = useRef<WorkbookMeta | null>(null);
     const pending_transform_request_ids_ref = useRef<(string | undefined)[]>([]);
     const pending_transform_states_ref = useRef<(SheetTransformState | undefined)[]>([]);
@@ -2185,6 +2188,7 @@ export function App(): React.JSX.Element {
 
     const reset_save_projection = useCallback(() => {
         save_projection_ref.current = INITIAL_CSV_SAVE_PROJECTION;
+        processed_save_receipts_ref.current.clear();
         pending_save_grid_focus_ref.current = null;
         set_save_lifecycle(INITIAL_CSV_SAVE_PROJECTION.authoritative);
         set_save_operation(undefined);
@@ -2300,6 +2304,19 @@ export function App(): React.JSX.Element {
                     ? worksheet.dirtyEdits
                     : remove_operation_owned_pending_edits(pending, worksheet);
                 install_edit_session(hydrated, current_session_id, sheet_index);
+                if (disposition === 'tombstone' && worksheet.structuralChanges) {
+                    const structural_store = edit_session_registry_ref.current!
+                        .pending_rows_for_sheet(sheet_index);
+                    structural_store.clear_saved(
+                        operation.editSessionId,
+                        new Set(worksheet.structuralChanges.appendedRows.map(
+                            (row) => row.id,
+                        )),
+                        new Set(worksheet.structuralChanges.tailRemovals.map(
+                            (removal) => removal.sourceRow,
+                        )),
+                    );
+                }
             }
         };
         if (incoming.state === 'active') {
@@ -2349,6 +2366,160 @@ export function App(): React.JSX.Element {
         }
         return { previous, next, changed: true };
     }, [install_edit_session, set_csv_edit_session_id, set_edit_mode]);
+
+    const apply_save_receipt = useCallback((
+        operation: CsvSaveOperation,
+        receipt: PendingChangesSaveReceipt,
+        lifecycle_revision: number,
+    ): boolean => {
+        const file_id = last_applied_snapshot_ref.current?.authority.fileId ?? '';
+        const receipt_key = JSON.stringify([
+            file_id,
+            lifecycle_revision,
+            operation.editSessionId,
+            operation.saveRequestId,
+        ]);
+        if (processed_save_receipts_ref.current.has(receipt_key)) return false;
+
+        const sheets = meta_ref.current?.sheets ?? [];
+        const operation_worksheets = save_operation_worksheets(operation);
+        const saved_history_rows = receipt.appendedRows.flatMap((assignment) => {
+            const sheet_index = worksheet_target_index(sheets, assignment);
+            if (sheet_index === undefined) return [];
+            const structural = edit_session_registry_ref.current!
+                .pending_rows_for_sheet(sheet_index)
+                .snapshot();
+            const submitted = operation_worksheets.find(
+                (worksheet) => worksheet_target_index(sheets, worksheet) === sheet_index,
+            )?.structuralChanges;
+            const row = structural.appendedRows.find(
+                (candidate) => candidate.id === assignment.pendingRowId,
+            ) ?? submitted?.appendedRows.find(
+                (candidate) => candidate.id === assignment.pendingRowId,
+            );
+            const format = row === undefined
+                ? undefined
+                : structural.formatTemplates.find(
+                    (template) => template.id === row.formatTemplateId,
+                )?.format ?? submitted?.formatTemplates.find(
+                    (template) => template.id === row.formatTemplateId,
+                )?.format;
+            if (row === undefined || format === undefined) return [];
+            return [{
+                worksheet: {
+                    sheetIndex: assignment.sheetIndex,
+                    ...(assignment.sheetName === undefined
+                        ? {}
+                        : { sheetName: assignment.sheetName }),
+                    ...(assignment.worksheetId === undefined
+                        ? {}
+                        : { worksheetId: assignment.worksheetId }),
+                },
+                pendingRowId: assignment.pendingRowId,
+                sourceRow: assignment.sourceRow,
+                savedFingerprint: assignment.savedFingerprint,
+                savedRow: assignment.savedRow ?? {
+                    cells: assignment.savedCells ?? row.cells,
+                    format,
+                    ...(row.viewerRowHeight === undefined
+                        ? {}
+                        : { viewerRowHeight: row.viewerRowHeight }),
+                    ...(row.highlights === undefined
+                        ? {}
+                        : { highlights: row.highlights }),
+                },
+            }];
+        });
+        history_store_ref.current!.rekey_saved_rows(saved_history_rows);
+        const committed_removals = receipt.removedSourceRows.flatMap((removed) => {
+            const sheet_index = worksheet_target_index(sheets, removed);
+            if (sheet_index === undefined) return [];
+            const removed_rows = new Set(removed.sourceRows);
+            const structural = edit_session_registry_ref.current!
+                .pending_rows_for_sheet(sheet_index)
+                .snapshot();
+            const submitted = operation_worksheets.find(
+                (worksheet) => worksheet_target_index(sheets, worksheet) === sheet_index,
+            )?.structuralChanges;
+            const removals = [
+                ...structural.tailRemovals,
+                ...(submitted?.tailRemovals ?? []),
+            ];
+            const seen = new Set<string>();
+            return removals
+                .filter((removal) => {
+                    if (
+                        !removed_rows.has(removal.sourceRow)
+                        || seen.has(removal.appendHistoryId)
+                    ) return false;
+                    seen.add(removal.appendHistoryId);
+                    return true;
+                })
+                .map((removal) => ({
+                    worksheet: {
+                        sheetIndex: removed.sheetIndex,
+                        ...(removed.sheetName === undefined
+                            ? {}
+                            : { sheetName: removed.sheetName }),
+                        ...(removed.worksheetId === undefined
+                            ? {}
+                            : { worksheetId: removed.worksheetId }),
+                    },
+                    removal,
+                }));
+        });
+        history_store_ref.current!.rekey_saved_removals(committed_removals);
+        const pending_focus = pending_save_grid_focus_ref.current?.pendingCell;
+        if (pending_focus !== undefined) {
+            const assignment = receipt.appendedRows.find(
+                (candidate) => candidate.pendingRowId === pending_focus.pendingRowId,
+            );
+            const sheet_index = assignment === undefined
+                ? undefined
+                : worksheet_target_index(sheets, assignment);
+            if (assignment !== undefined && sheet_index !== undefined) {
+                set_saved_row_focus({
+                    sequence: ++saved_row_focus_sequence_ref.current,
+                    sheetIndex: sheet_index,
+                    sourceRow: assignment.sourceRow,
+                    sourceColumn: pending_focus.sourceColumn,
+                    restoreFocus: pending_save_grid_focus_ref.current?.restoreFocus === true,
+                });
+            }
+        }
+        for (const [sheet_index] of sheets.entries()) {
+            const pending_ids = new Set(
+                receipt.appendedRows
+                    .filter((assignment) => worksheet_target_index(
+                        sheets,
+                        assignment,
+                    ) === sheet_index)
+                    .map((assignment) => assignment.pendingRowId),
+            );
+            const removed_rows = new Set(
+                receipt.removedSourceRows
+                    .filter((removal) => worksheet_target_index(
+                        sheets,
+                        removal,
+                    ) === sheet_index)
+                    .flatMap((removal) => removal.sourceRows),
+            );
+            if (pending_ids.size === 0 && removed_rows.size === 0) continue;
+            edit_session_registry_ref.current!.pending_rows_for_sheet(sheet_index).clear_saved(
+                operation.editSessionId,
+                pending_ids,
+                removed_rows,
+            );
+        }
+
+        processed_save_receipts_ref.current.add(receipt_key);
+        while (processed_save_receipts_ref.current.size > 128) {
+            const oldest = processed_save_receipts_ref.current.values().next().value;
+            if (oldest === undefined) break;
+            processed_save_receipts_ref.current.delete(oldest);
+        }
+        return true;
+    }, []);
 
     useEffect(() => {
         auto_fit_active_ref.current = auto_fit_active;
@@ -2782,6 +2953,16 @@ export function App(): React.JSX.Element {
                         hydration_projection,
                         snapshot_edit_session_id,
                         pending_edits,
+                        proposed_worksheet_by_sheet.get(sheet_index),
+                        authoritative_worksheet_by_sheet.get(sheet_index),
+                    );
+                    const hydrate_snapshot_structural_changes = (
+                        sheet_index: number,
+                        pending_changes: ReturnType<typeof pending_changes_for_sheet>,
+                    ) => resolve_csv_save_structural_hydration_from_worksheets(
+                        hydration_projection,
+                        snapshot_edit_session_id,
+                        pending_changes,
                         proposed_worksheet_by_sheet.get(sheet_index),
                         authoritative_worksheet_by_sheet.get(sheet_index),
                     );
@@ -3250,11 +3431,14 @@ export function App(): React.JSX.Element {
                             }
                             if (!locally_retained_structural_sheet_indices.has(sheet_index)) {
                                 const sheet = next_sheets[sheet_index];
-                                const slot = pending_changes_for_sheet(
-                                    refresh_authoritative_state?.pendingEdits,
+                                const slot = hydrate_snapshot_structural_changes(
                                     sheet_index,
-                                    sheet?.name,
-                                    sheet?.worksheetId,
+                                    pending_changes_for_sheet(
+                                        refresh_authoritative_state?.pendingEdits,
+                                        sheet_index,
+                                        sheet?.name,
+                                        sheet?.worksheetId,
+                                    ),
                                 );
                                 edit_session_registry_ref.current!
                                     .pending_rows_for_sheet(sheet_index)
@@ -3544,11 +3728,14 @@ export function App(): React.JSX.Element {
                                 restored_sheet?.worksheetId,
                             ),
                         );
-                        const restored_pending_changes = pending_changes_for_sheet(
-                            normalized.pendingEdits,
+                        const restored_pending_changes = hydrate_snapshot_structural_changes(
                             snapshot_edit_sheet_index,
-                            restored_sheet?.name,
-                            restored_sheet?.worksheetId,
+                            pending_changes_for_sheet(
+                                normalized.pendingEdits,
+                                snapshot_edit_sheet_index,
+                                restored_sheet?.name,
+                                restored_sheet?.worksheetId,
+                            ),
                         );
                         const restored_has_structural_changes =
                             (restored_pending_changes?.formatTemplates?.length ?? 0) > 0
@@ -3589,11 +3776,14 @@ export function App(): React.JSX.Element {
                                     sheet?.worksheetId,
                                 ),
                             );
-                            const changes = pending_changes_for_sheet(
-                                normalized.pendingEdits,
+                            const changes = hydrate_snapshot_structural_changes(
                                 index,
-                                sheet?.name,
-                                sheet?.worksheetId,
+                                pending_changes_for_sheet(
+                                    normalized.pendingEdits,
+                                    index,
+                                    sheet?.name,
+                                    sheet?.worksheetId,
+                                ),
                             );
                             if (!cells && changes === undefined) return;
                             edit_session_registry_ref.current!
@@ -6313,142 +6503,44 @@ export function App(): React.JSX.Element {
                 }
                 // 'cancel' → stay in edit mode, keep edits.
             } else if (msg.type === 'saveResult') {
-                const operation = save_projection_ref.current.operation;
+                const proposed_operation = save_projection_ref.current.operation;
                 const transition = apply_save_lifecycle(msg.lifecycle);
                 // Lifecycle revision is the ordering authority for the whole result,
                 // not just its projection. A stale terminal must not clear or replace
                 // the verdict installed by a later accepted result.
-                if (!transition.changed) return;
+                const authoritative = transition.next.authoritative;
+                const receipt_operation = msg.lifecycle.state === 'succeeded'
+                    && msg.receipt !== undefined
+                    && authoritative.state === 'succeeded'
+                    && authoritative.revision === msg.lifecycle.revision
+                    && csv_save_operations_equal(
+                        authoritative.operation,
+                        msg.lifecycle.operation,
+                    )
+                    ? proposed_operation !== undefined
+                        && terminal_csv_save_settles_operation(
+                            msg.lifecycle,
+                            proposed_operation,
+                        )
+                        ? proposed_operation
+                        : msg.lifecycle.operation
+                    : undefined;
+                const receipt_applied = receipt_operation !== undefined
+                    && msg.receipt !== undefined
+                    && apply_save_receipt(
+                        receipt_operation,
+                        msg.receipt,
+                        msg.lifecycle.revision,
+                    );
+                if (!transition.changed && !receipt_applied) return;
+                const operation = proposed_operation ?? receipt_operation;
                 const current_session_id = csv_edit_session_id_ref.current;
-                const matching = operation
+                const matching = receipt_applied || (operation
                     ? terminal_csv_save_settles_operation(msg.lifecycle, operation)
                     : current_session_id === undefined
                         || save_lifecycle_correlation(msg.lifecycle)?.editSessionId
-                            === current_session_id;
+                            === current_session_id);
                 if (!matching) return;
-                if (
-                    msg.lifecycle.state === 'succeeded'
-                    && msg.receipt !== undefined
-                    && operation !== undefined
-                ) {
-                    const sheets = meta_ref.current?.sheets ?? [];
-                    const saved_history_rows = msg.receipt.appendedRows.flatMap(
-                        (assignment) => {
-                            const sheet_index = worksheet_target_index(sheets, assignment);
-                            if (sheet_index === undefined) return [];
-                            const structural = edit_session_registry_ref.current!
-                                .pending_rows_for_sheet(sheet_index)
-                                .snapshot();
-                            const row = structural.appendedRows.find(
-                                (candidate) => candidate.id === assignment.pendingRowId,
-                            );
-                            const format = row === undefined
-                                ? undefined
-                                : structural.formatTemplates.find(
-                                    (template) => template.id === row.formatTemplateId,
-                                )?.format;
-                            if (row === undefined || format === undefined) return [];
-                            return [{
-                                worksheet: {
-                                    sheetIndex: assignment.sheetIndex,
-                                    ...(assignment.sheetName === undefined
-                                        ? {}
-                                        : { sheetName: assignment.sheetName }),
-                                    ...(assignment.worksheetId === undefined
-                                        ? {}
-                                        : { worksheetId: assignment.worksheetId }),
-                                },
-                                pendingRowId: assignment.pendingRowId,
-                                sourceRow: assignment.sourceRow,
-                                savedFingerprint: assignment.savedFingerprint,
-                                savedRow: assignment.savedRow ?? {
-                                    cells: assignment.savedCells ?? row.cells,
-                                    format,
-                                    ...(row.viewerRowHeight === undefined
-                                        ? {}
-                                        : { viewerRowHeight: row.viewerRowHeight }),
-                                    ...(row.highlights === undefined
-                                        ? {}
-                                        : { highlights: row.highlights }),
-                                },
-                            }];
-                        },
-                    );
-                    // History must stop naming temporary row IDs before those IDs
-                    // disappear from the live stores below. The receipt is the
-                    // host's proof of their physical source identities.
-                    history_store_ref.current!.rekey_saved_rows(saved_history_rows);
-                    const committed_removals = msg.receipt.removedSourceRows.flatMap(
-                        (removed) => {
-                            const sheet_index = worksheet_target_index(sheets, removed);
-                            if (sheet_index === undefined) return [];
-                            const removed_rows = new Set(removed.sourceRows);
-                            const structural = edit_session_registry_ref.current!
-                                .pending_rows_for_sheet(sheet_index)
-                                .snapshot();
-                            return structural.tailRemovals
-                                .filter((removal) => removed_rows.has(removal.sourceRow))
-                                .map((removal) => ({
-                                    worksheet: {
-                                        sheetIndex: removed.sheetIndex,
-                                        ...(removed.sheetName === undefined
-                                            ? {}
-                                            : { sheetName: removed.sheetName }),
-                                        ...(removed.worksheetId === undefined
-                                            ? {}
-                                            : { worksheetId: removed.worksheetId }),
-                                    },
-                                    removal,
-                                }));
-                        },
-                    );
-                    history_store_ref.current!.rekey_saved_removals(committed_removals);
-                    const pending_focus = pending_save_grid_focus_ref.current?.pendingCell;
-                    if (pending_focus !== undefined) {
-                        const assignment = msg.receipt.appendedRows.find(
-                            (candidate) => candidate.pendingRowId === pending_focus.pendingRowId,
-                        );
-                        const sheet_index = assignment === undefined
-                            ? undefined
-                            : worksheet_target_index(sheets, assignment);
-                        if (assignment !== undefined && sheet_index !== undefined) {
-                            set_saved_row_focus({
-                                sequence: ++saved_row_focus_sequence_ref.current,
-                                sheetIndex: sheet_index,
-                                sourceRow: assignment.sourceRow,
-                                sourceColumn: pending_focus.sourceColumn,
-                                restoreFocus: pending_save_grid_focus_ref.current?.restoreFocus
-                                    === true,
-                            });
-                        }
-                    }
-                    for (const [sheet_index] of sheets.entries()) {
-                        const pending_ids = new Set(
-                            msg.receipt.appendedRows
-                                .filter((assignment) => worksheet_target_index(
-                                    sheets,
-                                    assignment,
-                                ) === sheet_index)
-                                .map((assignment) => assignment.pendingRowId),
-                        );
-                        const removed_rows = new Set(
-                            msg.receipt.removedSourceRows
-                                .filter((removal) => worksheet_target_index(
-                                    sheets,
-                                    removal,
-                                ) === sheet_index)
-                                .flatMap((removal) => removal.sourceRows),
-                        );
-                        if (pending_ids.size === 0 && removed_rows.size === 0) continue;
-                        edit_session_registry_ref.current!.pending_rows_for_sheet(
-                            sheet_index,
-                        ).clear_saved(
-                            operation.editSessionId,
-                            pending_ids,
-                            removed_rows,
-                        );
-                    }
-                }
                 const pending_grid_focus = pending_save_grid_focus_ref.current;
                 const restore_rejected_grid_focus = operation !== undefined
                     && pending_grid_focus?.editSessionId === operation.editSessionId
@@ -6661,6 +6753,7 @@ export function App(): React.JSX.Element {
         return () => window.removeEventListener('message', handler);
     }, [
         advance_edit_activation,
+        apply_save_receipt,
         apply_save_lifecycle,
         discard_edit_session,
         install_edit_session,

@@ -8885,6 +8885,180 @@ describe('edit mode save exit', () => {
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
     });
 
+    it('clears saved appended rows before leaving edit mode', async () => {
+        grid_shell_mock.has_uncommitted_changes = true;
+        grid_shell_mock.pending_active_cell.mockReturnValue({
+            pendingRowId: 'pending-row-1',
+            sourceColumn: 0,
+        });
+
+        const { post_message } = await render_app();
+        const meta = make_meta(['Sheet1'], false);
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        await click_button('Edit');
+        await dispatch_host_message({
+            type: 'editSessionResult',
+            granted: true,
+            editSessionId: 'append-session',
+            sheetIndex: 0,
+            pendingChanges: {
+                sheetIndex: 0,
+                sheetName: 'Sheet1',
+                cells: {},
+                formatTemplates: [{ id: 'plain', format: { kind: 'none' } }],
+                appendedRows: [{
+                    id: 'pending-row-1',
+                    cells: {},
+                    formatTemplateId: 'plain',
+                    createdOrder: 1,
+                }],
+                tailRemovals: [],
+                appendBasis: {
+                    sourceRowCount: 1,
+                    provisionalStartRow: 1,
+                    provisionalRowCount: 1,
+                    columnCount: 1,
+                    schemaFingerprint: transform_schema_for_sheet(meta.sheets[0]),
+                },
+                conflicts: [],
+            },
+        });
+        const pending_rows = () => (grid_shell_mock.latest_props!
+            .pending_row_store as GridShellProps['pending_row_store'])!;
+        expect(pending_rows().snapshot().appendedRows.map((row) => row.id))
+            .toEqual(['pending-row-1']);
+
+        post_message.mockClear();
+        await click_button('Edit');
+        await dispatch_host_message({ type: 'saveDialogResult', choice: 'save' });
+        const operation = grid_shell_mock.latest_props?.save_operation as CsvSaveOperation;
+        expect(operation.worksheets[0].structuralChanges?.appendedRows.map((row) => row.id))
+            .toEqual(['pending-row-1']);
+
+        const lifecycle = {
+            revision: 1,
+            state: 'succeeded' as const,
+            operation,
+        };
+        const grown = make_meta(['Sheet1'], false);
+        grown.sheets[0] = {
+            ...grown.sheets[0],
+            rowCount: 2,
+            sourceRowCount: 2,
+        };
+        await dispatch_host_message(refresh_snapshot_message(grown, {
+            state: {
+                pendingEdits: [{
+                    sheetName: 'Sheet1',
+                    cells: {},
+                    formatTemplates: [{ id: 'plain', format: { kind: 'none' } }],
+                    appendedRows: [{
+                        id: 'pending-row-1',
+                        cells: {},
+                        formatTemplateId: 'plain',
+                        createdOrder: 1,
+                    }],
+                    tailRemovals: [],
+                    appendBasis: {
+                        sourceRowCount: 1,
+                        provisionalStartRow: 1,
+                        provisionalRowCount: 1,
+                        columnCount: 1,
+                        schemaFingerprint: transform_schema_for_sheet(meta.sheets[0]),
+                    },
+                    conflicts: [],
+                }],
+            },
+            capabilities: {
+                csvEditable: false,
+                csvEditingSupported: true,
+                csvSaveLifecycle: lifecycle,
+            },
+        }));
+        await dispatch_host_message({
+            type: 'saveResult',
+            success: true,
+            lifecycle,
+            receipt: {
+                appendedRows: [{
+                    sheetIndex: 0,
+                    sheetName: 'Sheet1',
+                    pendingRowId: 'pending-row-1',
+                    sourceRow: 1,
+                    savedFingerprint: 'saved-row-fingerprint',
+                }],
+                removedSourceRows: [],
+            },
+        });
+
+        expect(pending_rows().snapshot().appendedRows).toEqual([]);
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
+        expect(grid_shell_mock.latest_props?.saved_row_focus).toMatchObject({
+            sheetIndex: 0,
+            sourceRow: 1,
+            sourceColumn: 0,
+        });
+    });
+
+    it('does not restore saved appended rows from an initial recovery snapshot', async () => {
+        await render_app();
+        const meta = make_meta(['Sheet1'], false);
+        const operation: CsvSaveOperation = {
+            editSessionId: 'recovered-session',
+            saveRequestId: 'recovered-save',
+            worksheets: [{
+                sheetIndex: 0,
+                sheetName: 'Sheet1',
+                edits: {},
+                dirtyEdits: {},
+                structuralChanges: {
+                    formatTemplates: [{ id: 'plain', format: { kind: 'none' } }],
+                    appendedRows: [{
+                        id: 'saved-pending-row',
+                        cells: {},
+                        formatTemplateId: 'plain',
+                        createdOrder: 1,
+                    }],
+                    tailRemovals: [],
+                    appendBasis: {
+                        sourceRowCount: 1,
+                        provisionalStartRow: 1,
+                        provisionalRowCount: 1,
+                        columnCount: 1,
+                        schemaFingerprint: transform_schema_for_sheet(meta.sheets[0]),
+                    },
+                    conflicts: [],
+                },
+            }],
+        };
+
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            state: {
+                pendingEdits: [{
+                    sheetName: 'Sheet1',
+                    cells: {},
+                    ...operation.worksheets[0].structuralChanges!,
+                }],
+            },
+            capabilities: {
+                csvEditable: false,
+                csvEditingSupported: true,
+                csvSaveLifecycle: {
+                    revision: 1,
+                    state: 'succeeded',
+                    operation,
+                },
+            },
+        }));
+
+        const pending_rows = grid_shell_mock.latest_props!
+            .pending_row_store as GridShellProps['pending_row_store'];
+        expect(pending_rows?.snapshot().appendedRows).toEqual([]);
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
+    });
+
     it('honors an authoritative success while local editing status is stale', async () => {
         grid_shell_mock.is_dirty = true;
         grid_shell_mock.has_uncommitted_changes = true;
