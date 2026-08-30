@@ -3926,6 +3926,17 @@ export function GridShell({
         () => columns.map((column) => column.title),
         [columns],
     );
+    /**
+     * The worksheet row number the first composed row will take, 1-based — the
+     * rows already in the source, less pending tail removals, plus rows already
+     * staged, plus one. The composer labels its rows with this rather than
+     * counting from one, so a legend names the row the values will actually
+     * land on.
+     */
+    const composer_first_row_number = sheet_meta.sourceRowCount
+        - pending_rows.tailRemovals.length
+        + pending_rows.appendedRows.length
+        + 1;
     const may_append_rows_ref = useRef(may_append_rows);
     may_append_rows_ref.current = may_append_rows;
     const append_and_focus_ref = useRef(append_and_focus);
@@ -8112,6 +8123,7 @@ export function GridShell({
                     secondary_actions={(
                         <AppendComposer
                             column_labels={composer_column_labels}
+                            first_row_number={composer_first_row_number}
                             draft={composer_draft}
                             on_draft_change={set_composer_draft}
                             remaining_capacity={remaining_append_capacity}

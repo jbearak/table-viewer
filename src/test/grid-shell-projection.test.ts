@@ -7083,6 +7083,28 @@ describe('GridShell append composer', () => {
         expect(pending.snapshot().appendedRows[0].cells[0]?.value).toBe('=SUM(A1:A2)');
     });
 
+    it('numbers composed rows by the worksheet row they will land on', async () => {
+        const pending = create_pending_row_store({ session_id: 'session-1' });
+        await render_grid(composer_props({ pending_row_store: pending }));
+        await open_composer();
+
+        // The fixture's rows are already on the sheet, so the first composed
+        // row is the one after them — not "Row 1".
+        const legends = () => Array.from(
+            document.querySelectorAll('.append-composer-row > legend'),
+        ).map((legend) => legend.textContent);
+        const [first] = legends();
+        expect(first).not.toBe('Row 1');
+        const first_number = Number.parseInt((first ?? '').replace(/\D/g, ''), 10);
+        expect(first_number).toBeGreaterThan(1);
+
+        await act(async () => { button('Add another row').click(); });
+        expect(legends()).toEqual([
+            `Row ${first_number}`,
+            `Row ${first_number + 1}`,
+        ]);
+    });
+
     it('stands the quick-add controls down while the composer is open', async () => {
         await render_grid(composer_props({
             pending_row_store: create_pending_row_store({ session_id: 'session-1' }),

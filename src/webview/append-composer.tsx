@@ -40,6 +40,12 @@ export interface AppendComposerProps {
     /** Visible column titles, indexed by display column. */
     readonly column_labels: readonly string[];
     /**
+     * Worksheet row number the first composed row will take, 1-based. Legends
+     * count up from it: a draft's second row is not "Row 2" of anything the
+     * user can see, it is the row after the one the first will land on.
+     */
+    readonly first_row_number: number;
+    /**
      * The session's held draft. Lifted above the dock deliberately: closing the
      * composer keeps un-staged values for the session rather than asking for a
      * confirmation on a lightweight input surface, and the dock unmounts the
@@ -79,6 +85,7 @@ export function normalize_draft(
 
 export function AppendComposer({
     column_labels,
+    first_row_number,
     draft,
     on_draft_change,
     remaining_capacity,
@@ -174,7 +181,9 @@ export function AppendComposer({
                             // is not an affordance the composer offers.
                             // eslint-disable-next-line react/no-array-index-key
                             <fieldset className="append-composer-row" key={row_index}>
-                                <legend>{`Row ${row_index + 1}`}</legend>
+                                <legend>
+                                    {`Row ${(first_row_number + row_index).toLocaleString('en-US')}`}
+                                </legend>
                                 {column_labels.map((label, column) => {
                                     const field_id
                                         = `append-composer-${row_index}-${column}`;
