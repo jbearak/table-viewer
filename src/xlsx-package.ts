@@ -345,9 +345,10 @@ export function create_xlsx_append_style_dependency_fingerprinter(
 }
 
 function parse_append_style_index(raw: string, message: string): number {
-    if (!/^[0-9]+$/.test(raw)) throw new Error(message);
-    const parsed = Number(raw);
-    if (!Number.isSafeInteger(parsed)) throw new Error(message);
+    const normalized = raw.replace(/^[\t\n\r ]+|[\t\n\r ]+$/g, '');
+    if (!/^[+-]?[0-9]+$/.test(normalized)) throw new Error(message);
+    const parsed = Number(normalized);
+    if (!Number.isSafeInteger(parsed) || parsed < 0) throw new Error(message);
     return parsed;
 }
 

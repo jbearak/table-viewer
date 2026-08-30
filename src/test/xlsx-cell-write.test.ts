@@ -206,6 +206,24 @@ describe('append row-format capture', () => {
                 .toThrow('The append format row contains an invalid row style');
         },
     );
+
+    it('accepts legal signed and whitespace-normalized style indices', () => {
+        const raw = patched_basic([[
+            '/xl/worksheets/sheet1.xml',
+            '<row r="2" spans="1:4" x14ac:dyDescent="0.25">',
+            '<row r="2" spans="1:4" x14ac:dyDescent="0.25" '
+                + 's=" +1 " customFormat="1">',
+        ], [
+            '/xl/worksheets/sheet1.xml',
+            '<c r="D2" s="1">',
+            '<c r="D2" s="+1">',
+        ]]);
+
+        expect(capture_xlsx_append_row_format(raw, 0, 3, 4, 2)).toMatchObject({
+            rowStyleIndex: 1,
+            cellStyleIndexes: [null, null, null, 1],
+        });
+    });
 });
 
 describe('iso_to_serial', () => {
