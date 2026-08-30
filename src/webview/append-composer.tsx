@@ -73,6 +73,8 @@ export interface AppendComposerProps {
      * panel open on the same values.
      */
     readonly on_stage_rows: (rows: AppendComposerDraft) => Promise<boolean>;
+    /** Successful staging closes both the composer and its owning dock. */
+    readonly on_stage_success: () => void;
 }
 
 const blank_row = (): Readonly<Record<number, string>> => ({});
@@ -100,27 +102,30 @@ export function AppendComposer({
     open,
     on_open_change,
     on_stage_rows,
+    on_stage_success,
 }: AppendComposerProps): React.ReactElement {
     const [staging, set_staging] = useState(false);
     const launcher_ref = useRef<HTMLButtonElement>(null);
     const first_field_ref = useRef<HTMLInputElement>(null);
+    const stage_ref = useRef<HTMLButtonElement>(null);
+    const refocus_launcher_ref = useRef(false);
+    const refocus_stage_ref = useRef(false);
 
     const rows = useMemo(() => normalize_draft(draft), [draft]);
 
     const close = useCallback(() => {
+        refocus_launcher_ref.current = true;
         on_open_change(false);
-        // Null when the whole dock closed underneath us, which focuses its own
-        // launcher instead.
-        launcher_ref.current?.focus();
     }, [on_open_change]);
 
-    // The dock unmounts this component when it closes, and a closed dock has no
-    // composer showing. Without this, reopening the dock would spring the panel
-    // back up on a surface the user asked to put away.
-    useEffect(() => () => { on_open_change(false); }, [on_open_change]);
-
     useEffect(() => {
-        if (open) first_field_ref.current?.focus();
+        if (open) {
+            first_field_ref.current?.focus();
+            return;
+        }
+        if (!refocus_launcher_ref.current) return;
+        refocus_launcher_ref.current = false;
+        launcher_ref.current?.focus();
     }, [open]);
 
     const set_field = useCallback((
@@ -137,6 +142,12 @@ export function AppendComposer({
         on_draft_change([...rows, blank_row()]);
     }, [on_draft_change, rows]);
 
+    const remove_last_row = useCallback(() => {
+        if (rows.length <= 1) return;
+        if (rows.length === 2) refocus_stage_ref.current = true;
+        on_draft_change(rows.slice(0, -1));
+    }, [on_draft_change, rows]);
+
     const in_flight = busy || staging;
     const satisfiable = rows.length >= 1 && rows.length <= remaining_capacity;
 
@@ -148,12 +159,20 @@ export function AppendComposer({
                 // Staging consumes the draft and moves focus into the grid, so
                 // the composer has nothing left to hold.
                 on_draft_change(EMPTY_APPEND_COMPOSER_DRAFT);
-                on_open_change(false);
+                on_stage_success();
+            } else {
+                refocus_stage_ref.current = true;
             }
         } finally {
             set_staging(false);
         }
-    }, [in_flight, on_draft_change, on_open_change, on_stage_rows, rows, satisfiable]);
+    }, [in_flight, on_draft_change, on_stage_rows, on_stage_success, rows, satisfiable]);
+
+    useEffect(() => {
+        if (in_flight || !refocus_stage_ref.current) return;
+        refocus_stage_ref.current = false;
+        stage_ref.current?.focus();
+    }, [in_flight, rows.length]);
 
     const stage_label = rows.length === 1 ? 'Stage row' : `Stage ${rows.length} rows`;
 
@@ -167,15 +186,17 @@ export function AppendComposer({
                 close();
             }}
         >
-            <button
-                ref={launcher_ref}
-                type="button"
-                className="append-composer-launcher"
-                aria-expanded={open}
-                onClick={() => { on_open_change(!open); }}
-            >
-                Compose row…
-            </button>
+            {!open && (
+                <button
+                    ref={launcher_ref}
+                    type="button"
+                    className="append-composer-launcher"
+                    aria-expanded="false"
+                    onClick={() => { on_open_change(true); }}
+                >
+                    Compose row…
+                </button>
+            )}
             {open && (
                 <div
                     className="append-composer-panel"
@@ -231,7 +252,18 @@ export function AppendComposer({
                         >
                             Add another row
                         </button>
+                        {rows.length > 1 && (
+                            <button
+                                type="button"
+                                className="append-composer-remove-row"
+                                disabled={in_flight}
+                                onClick={remove_last_row}
+                            >
+                                Remove last row
+                            </button>
+                        )}
                         <button
+                            ref={stage_ref}
                             type="button"
                             className="append-composer-stage"
                             disabled={in_flight || !satisfiable}

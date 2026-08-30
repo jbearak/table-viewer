@@ -797,6 +797,13 @@ body.vscode-high-contrast-light .toolbar-split-caret.open {
     white-space: nowrap;
 }
 
+.append-dock-panel.is-secondary-open {
+    padding: 0;
+    border: 0;
+    background: transparent;
+    box-shadow: none;
+}
+
 .append-dock-count-label {
     color: var(--vscode-descriptionForeground, #999);
 }
@@ -2020,9 +2027,9 @@ body.vscode-high-contrast-light .toolbar-split-caret.open {
     white-space: nowrap;
 }
 
-/* The row composer opens above the dock, which stays open and visible beneath
-   it. Like the dock it overlays the grid rather than reserving space. The panel
-   is anchored to its launcher so it rises from the control that opened it, and
+/* The row composer replaces the dock chrome while it is open. Like the dock it
+   overlays the grid rather than reserving space. The panel is anchored to the
+   dock's secondary-action slot, and
    it caps its own height because its whole point is a scrolling list of labeled
    fields on a table too wide to type across. */
 .append-composer {

@@ -7007,9 +7007,11 @@ describe('GridShell append composer', () => {
     it('stages the composed values into the pending band as one history entry', async () => {
         const history = create_history_store();
         const pending = create_pending_row_store({ session_id: 'session-1' });
+        const grid_focus_ref = React.createRef<GridFocusHandle | null>();
         await render_grid(composer_props({
             pending_row_store: pending,
             history_store: history,
+            grid_focus_ref,
         }));
         await open_composer();
         await act(async () => set_input_value(
@@ -7038,6 +7040,11 @@ describe('GridShell append composer', () => {
         expect((grid_mock.props!.gridSelection as {
             current?: { cell: [number, number] };
         }).current?.cell).toEqual([0, 1]);
+        await vi.waitUntil(() => grid_focus_ref.current?.has_focus() === true);
+        expect(document.querySelector('.append-composer-panel')).toBeNull();
+        expect(document.querySelector('.append-dock-panel')).toBeNull();
+        expect(document.querySelector('.append-dock-launcher')?.getAttribute('aria-expanded'))
+            .toBe('false');
     });
 
     it('stages a batch composed with Add another row as one gesture', async () => {
@@ -7081,6 +7088,40 @@ describe('GridShell append composer', () => {
 
         // No formula path of the composer's own: the same text, verbatim.
         expect(pending.snapshot().appendedRows[0].cells[0]?.value).toBe('=SUM(A1:A2)');
+    });
+
+    it('captures formula bases against every row in the composed batch', async () => {
+        const pending = create_pending_row_store({ session_id: 'session-1' });
+        const formula_reference_bases = vi.fn((
+            _value: string,
+            additional_pending_rows = 0,
+        ) => additional_pending_rows === 2 ? [{
+            targetSheetIndex: 0,
+            targetSheetName: 'Sheet1',
+            provisionalStartRow: 1,
+            provisionalRowCount: 2,
+        }] : []);
+        await render_grid(composer_props({
+            pending_row_store: pending,
+            edit_syntax: 'markdown',
+            formula_reference_bases,
+        }));
+        await open_composer();
+        await act(async () => { button('Add another row').click(); });
+        await act(async () => set_input_value(
+            field('append-composer-1-0') as HTMLInputElement,
+            '=A2',
+        ));
+        await act(async () => { button('Stage 2 rows').click(); });
+        await vi.waitUntil(() => pending.snapshot().appendedRows.length === 2);
+
+        expect(formula_reference_bases).toHaveBeenCalledWith('=A2', 2);
+        expect(pending.snapshot().appendedRows[1].cells[0]?.formulaReferenceBases)
+            .toMatchObject([{
+                targetSheetIndex: 0,
+                provisionalStartRow: 1,
+                provisionalRowCount: 2,
+            }]);
     });
 
     it('numbers composed rows by the worksheet row they will land on', async () => {
@@ -7183,11 +7224,17 @@ describe('GridShell append composer', () => {
         // fact quick add has nothing to do with the composed values.
         expect(document.getElementById('append-dock-count')).toBeNull();
         expect(document.querySelector('.append-dock-add')).toBeNull();
-        expect(button('Compose row…')).not.toBeNull();
+        expect(Array.from(document.querySelectorAll('button')).some(
+            (candidate) => candidate.textContent === 'Compose row…',
+        )).toBe(false);
+        expect(document.querySelector('.append-dock-launcher')).toBeNull();
+        expect(document.querySelector('.append-dock-panel')?.classList)
+            .toContain('is-secondary-open');
 
         await act(async () => { button('Close').click(); });
         expect(document.getElementById('append-dock-count')).not.toBeNull();
         expect(document.querySelector('.append-dock-add')).not.toBeNull();
+        await vi.waitUntil(() => document.activeElement?.textContent === 'Compose row…');
     });
 
     it('keeps an un-staged draft across close and reopen, and returns focus', async () => {
@@ -7199,16 +7246,67 @@ describe('GridShell append composer', () => {
             field('append-composer-0-0') as HTMLInputElement,
             'held',
         ));
-        const launcher = button('Compose row…');
         await act(async () => { button('Close').click(); });
         expect(document.querySelector('.append-composer-panel')).toBeNull();
-        // Dismiss returns focus to the control that opened the composer, and
-        // the dock is still open beneath it.
-        expect(document.activeElement).toBe(launcher);
+        // Dismiss returns focus to the remounted control that opened the composer,
+        // and the dock is still open beneath it.
+        expect(document.activeElement?.textContent).toBe('Compose row…');
         expect(document.getElementById('append-dock-count')).not.toBeNull();
 
         await act(async () => { button('Compose row…').click(); });
         expect((field('append-composer-0-0') as HTMLInputElement).value).toBe('held');
+    });
+
+    it('restores focus after a composed row is refused', async () => {
+        let finish_admission!: () => void;
+        const admission_gate = new Promise<void>((resolve) => { finish_admission = resolve; });
+        await render_grid(composer_props({
+            pending_row_store: create_pending_row_store({ session_id: 'session-1' }),
+            on_append_rows: vi.fn(async () => {
+                await admission_gate;
+                return undefined;
+            }),
+        }));
+        await open_composer();
+        const stage = button('Stage row');
+        stage.focus();
+        await act(async () => { stage.click(); });
+        await vi.waitUntil(() => stage.disabled);
+        // Browsers blur a focused control when it becomes disabled. jsdom does
+        // not, so reproduce that observable explicitly before admission settles.
+        document.body.tabIndex = -1;
+        document.body.focus();
+        expect(document.activeElement).not.toBe(stage);
+
+        await act(async () => { finish_admission(); });
+        await vi.waitUntil(() => document.activeElement === stage);
+        expect(document.querySelector('.append-composer-panel')).not.toBeNull();
+    });
+
+    it('lets a held batch recover when append capacity shrinks', async () => {
+        const pending = create_pending_row_store({ session_id: 'session-1' });
+        const GridShell = await render_grid(composer_props({ pending_row_store: pending }));
+        await open_composer();
+        await act(async () => { button('Add another row').click(); });
+        await act(async () => set_input_value(
+            field('append-composer-0-0') as HTMLInputElement,
+            'keep me',
+        ));
+
+        await act(async () => {
+            root!.render(React.createElement(GridShell, composer_props({
+                pending_row_store: pending,
+                append_row_ceiling: 2,
+            })));
+        });
+        expect(button('Stage 2 rows').disabled).toBe(true);
+        const remove = button('Remove last row');
+        remove.focus();
+        await act(async () => { remove.click(); });
+        const stage = button('Stage row');
+        expect(stage.disabled).toBe(false);
+        await vi.waitUntil(() => document.activeElement === stage);
+        expect((field('append-composer-0-0') as HTMLInputElement).value).toBe('keep me');
     });
 });
 

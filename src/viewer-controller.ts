@@ -13850,6 +13850,9 @@ export function attach_viewer(
             const save_tail = active_save_drain;
             const disposal_release_tail = disposal_edit_release_drain;
             const layout_tail = layout_write_tail;
+            const append_tail = append_admission_tails.get(
+                APPEND_ADMISSION_AUTHORITY_TAIL,
+            );
             const transform_tails = [...transform_commit_barriers]
                 .map((barrier) => barrier.completion);
             const compare_tails = [...compare_diff_sidecars];
@@ -13858,6 +13861,7 @@ export function attach_viewer(
                 save_tail,
                 disposal_release_tail,
                 layout_tail,
+                append_tail,
                 ...transform_tails,
                 ...compare_tails,
             ]);
@@ -13866,6 +13870,9 @@ export function attach_viewer(
                 && save_tail === active_save_drain
                 && disposal_release_tail === disposal_edit_release_drain
                 && layout_tail === layout_write_tail
+                && append_tail === append_admission_tails.get(
+                    APPEND_ADMISSION_AUTHORITY_TAIL,
+                )
                 && transform_commit_barriers.size === 0
                 && compare_diff_sidecars.size === 0
             ) return;

@@ -15,6 +15,8 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
  * history, and the pending band all stay where they were.
  */
 export interface AppendDockProps {
+    readonly open: boolean;
+    readonly on_open_change: (open: boolean) => void;
     /**
      * Rows this gesture may still stage — the smaller of the pending-append cap
      * and the source's row ceiling. The count control clamps to it live, so a
@@ -47,13 +49,14 @@ const clamp_count = (value: number, capacity: number): number =>
     Math.min(Math.max(1, Math.trunc(value)), Math.max(1, capacity));
 
 export function AppendDock({
+    open,
+    on_open_change,
     remaining_capacity,
     busy = false,
     on_add_rows,
     secondary_actions,
     secondary_open = false,
 }: AppendDockProps): React.ReactElement {
-    const [open, set_open] = useState(false);
     const [count, set_count] = useState(1);
     const [adding, set_adding] = useState(false);
     const launcher_ref = useRef<HTMLButtonElement>(null);
@@ -67,13 +70,13 @@ export function AppendDock({
     }, [remaining_capacity]);
 
     const close = useCallback(() => {
-        set_open(false);
+        on_open_change(false);
         launcher_ref.current?.focus();
-    }, []);
+    }, [on_open_change]);
 
     const toggle = useCallback(() => {
-        set_open((was_open) => !was_open);
-    }, []);
+        on_open_change(!open);
+    }, [on_open_change, open]);
 
     // Keyed on the dock's own opening only. Keying it on `secondary_open` too
     // would steal focus back to the count field the moment the composer closed,
@@ -97,12 +100,12 @@ export function AppendDock({
         try {
             // Staging moves focus into the grid, so the dock has nothing left
             // to hold; a refusal keeps it open on the same count.
-            if (await on_add_rows(count)) set_open(false);
+            if (await on_add_rows(count)) on_open_change(false);
             else refocus_count_ref.current = true;
         } finally {
             set_adding(false);
         }
-    }, [count, in_flight, on_add_rows, satisfiable]);
+    }, [count, in_flight, on_add_rows, on_open_change, satisfiable]);
 
     useEffect(() => {
         if (in_flight || !refocus_count_ref.current) return;
@@ -124,9 +127,13 @@ export function AppendDock({
         >
             {open && (
                 <div
-                    className="append-dock-panel"
-                    role="group"
-                    aria-label="Add rows to the end of this worksheet"
+                    className={secondary_open
+                        ? 'append-dock-panel is-secondary-open'
+                        : 'append-dock-panel'}
+                    role={secondary_open ? undefined : 'group'}
+                    aria-label={secondary_open
+                        ? undefined
+                        : 'Add rows to the end of this worksheet'}
                 >
                     {!secondary_open && (
                         <>
@@ -170,16 +177,18 @@ export function AppendDock({
                     )}
                 </div>
             )}
-            <button
-                ref={launcher_ref}
-                type="button"
-                className={open ? 'append-dock-launcher is-open' : 'append-dock-launcher'}
-                aria-expanded={open}
-                aria-label={open ? 'Close add rows' : 'Add rows'}
-                onClick={toggle}
-            >
-                <span aria-hidden="true">+</span>
-            </button>
+            {!secondary_open && (
+                <button
+                    ref={launcher_ref}
+                    type="button"
+                    className={open ? 'append-dock-launcher is-open' : 'append-dock-launcher'}
+                    aria-expanded={open}
+                    aria-label={open ? 'Close add rows' : 'Add rows'}
+                    onClick={toggle}
+                >
+                    <span aria-hidden="true">+</span>
+                </button>
+            )}
         </div>
     );
 }

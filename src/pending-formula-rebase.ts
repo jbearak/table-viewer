@@ -36,6 +36,7 @@ export function capture_pending_formula_reference_bases(
     formula_sheet_index: number,
     sheets: readonly SheetMeta[],
     structural_by_sheet: readonly PendingStructuralChanges[],
+    additional_appended_rows: Readonly<Record<number, number>> = {},
 ): readonly PendingFormulaReferenceBasis[] {
     if (!is_xlsx_formula_edit({ row: 0, col: 0, value })) return [];
     const references = workbook_a1_formula_references(
@@ -46,9 +47,11 @@ export function capture_pending_formula_reference_bases(
     const bases: PendingFormulaReferenceBasis[] = [];
     for (const [target_index, structural] of structural_by_sheet.entries()) {
         const sheet = sheets[target_index];
-        if (!sheet || structural.appendedRows.length === 0) continue;
+        const additional = additional_appended_rows[target_index] ?? 0;
+        const appended_row_count = structural.appendedRows.length + additional;
+        if (!sheet || appended_row_count === 0) continue;
         const provisionalStartRow = sheet.sourceRowCount - structural.tailRemovals.length;
-        const provisionalRowCount = structural.appendedRows.length;
+        const provisionalRowCount = appended_row_count;
         const last = provisionalStartRow + provisionalRowCount - 1;
         if (!references.some((reference) =>
             reference.sourceSheetIndex === target_index

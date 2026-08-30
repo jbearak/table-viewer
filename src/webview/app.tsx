@@ -140,6 +140,10 @@ import {
     type SavedRowFocus,
 } from './grid-shell';
 import {
+    EMPTY_APPEND_COMPOSER_DRAFT,
+    type AppendComposerDraft,
+} from './append-composer';
+import {
     clamp_sheet_index,
     trim_sheet_state_array,
     sanitize_transform_state,
@@ -741,6 +745,11 @@ export function App(): React.JSX.Element {
     const [append_row_ceiling, set_append_row_ceiling] = useState(MAX_SHEET_ROWS);
     const [csv_edit_session_id, set_csv_edit_session_id_state] = useState<string>();
     const csv_edit_session_id_ref = useRef<string>();
+    const append_composer_drafts_ref = useRef<Map<
+        string,
+        { sessionId: string; schema: string; draft: AppendComposerDraft }
+    >>(new Map());
+    const [, set_append_composer_draft_revision] = useState(0);
     /**
      * The edit *pointer*: the worksheet the workbook-scoped session is
      * currently editing on screen. The dirty maps live per sheet in the
@@ -1241,6 +1250,7 @@ export function App(): React.JSX.Element {
             pending_edit_durability.retire(previous);
             edit_session_registry_ref.current?.retire_parked();
         }
+        if (previous !== next) append_composer_drafts_ref.current.clear();
         csv_edit_session_id_ref.current = next;
         set_csv_edit_session_id_state(next);
     }, []);
@@ -7333,7 +7343,10 @@ export function App(): React.JSX.Element {
     const current_sheet = meta?.sheets[active_sheet_index];
     const active_pending_row_store = edit_session_registry_ref.current!
         .pending_rows_for_sheet(active_sheet_index);
-    const formula_reference_bases = useCallback((value: string) =>
+    const formula_reference_bases = useCallback((
+        value: string,
+        additional_pending_rows = 0,
+    ) =>
         capture_pending_formula_reference_bases(
             value,
             active_sheet_index,
@@ -7342,6 +7355,7 @@ export function App(): React.JSX.Element {
                 edit_session_registry_ref.current!
                     .pending_rows_for_sheet(index)
                     .snapshot()),
+            { [active_sheet_index]: additional_pending_rows },
         ), [active_sheet_index, meta]);
     const subscribe_active_pending_conflicts = useCallback((listener: () => void) =>
         active_pending_row_store.subscribe((change) => {
@@ -8029,6 +8043,23 @@ export function App(): React.JSX.Element {
         sheetName: current_sheet.name,
         worksheetId: current_sheet.worksheetId,
     });
+    const held_composer_draft = append_composer_drafts_ref.current.get(
+        active_scroll_position_key,
+    );
+    const active_composer_draft = held_composer_draft !== undefined
+        && held_composer_draft.sessionId === csv_edit_session_id
+        && held_composer_draft.schema === current_schema
+        ? held_composer_draft.draft
+        : EMPTY_APPEND_COMPOSER_DRAFT;
+    const handle_append_composer_draft_change = (draft: AppendComposerDraft) => {
+        if (csv_edit_session_id === undefined) return;
+        append_composer_drafts_ref.current.set(active_scroll_position_key, {
+            sessionId: csv_edit_session_id,
+            schema: current_schema,
+            draft,
+        });
+        set_append_composer_draft_revision((revision) => revision + 1);
+    };
 
     const grid = (
         <GridShell
@@ -8093,6 +8124,8 @@ export function App(): React.JSX.Element {
             pending_row_store={edit_session_registry_ref.current!.pending_rows_for_sheet(
                 active_sheet_index,
             )}
+            append_composer_draft={active_composer_draft}
+            on_append_composer_draft_change={handle_append_composer_draft_change}
             on_append_rows={request_append_rows}
             history_store={history_store_ref.current!}
             gestures_admitted={edit_gestures_admitted}

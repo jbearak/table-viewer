@@ -180,4 +180,25 @@ describe('pending formula rebase conflicts', () => {
             rebased_sheets,
         )).toEqual([]);
     });
+
+    it('captures references to rows created by the same composed batch', () => {
+        const empty: PendingStructuralChanges = {
+            formatTemplates: [],
+            appendedRows: [],
+            tailRemovals: [],
+            conflicts: [],
+        };
+        expect(capture_pending_formula_reference_bases(
+            '=A6',
+            0,
+            [sheet('Data', 4)],
+            [empty],
+            { 0: 2 },
+        )).toMatchObject([{
+            targetSheetIndex: 0,
+            targetSheetName: 'Data',
+            provisionalStartRow: 4,
+            provisionalRowCount: 2,
+        }]);
+    });
 });

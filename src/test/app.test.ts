@@ -5201,6 +5201,60 @@ describe('edit mode save exit', () => {
         expect(grid_stub().getAttribute('data-diff-mode')).toBe('true');
     });
 
+    it('keeps compatible composer drafts through a remount and clears stale ones', async () => {
+        await render_app();
+        const meta = make_meta(['Sheet1'], false);
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: {
+                csvEditable: true,
+                csvEditingSupported: true,
+                csvEditSessionId: 'draft-session-a',
+            },
+        }));
+        const first_mount = grid_stub().getAttribute('data-mount-id');
+        const change_draft = grid_shell_mock.latest_props
+            ?.on_append_composer_draft_change as ((draft: readonly Record<number, string>[]) => void);
+        await act(async () => change_draft([{ 0: 'held through transform' }]));
+        expect(grid_shell_mock.latest_props?.append_composer_draft)
+            .toEqual([{ 0: 'held through transform' }]);
+
+        await dispatch_host_message(refresh_snapshot_message({
+            ...meta,
+            sheets: [{
+                ...meta.sheets[0],
+                columnCount: 2,
+                columnNames: ['Changed', 'New'],
+            }],
+        }, {
+            capabilities: {
+                csvEditable: true,
+                csvEditingSupported: true,
+                csvEditSessionId: 'draft-session-a',
+            },
+        }));
+        expect(grid_shell_mock.latest_props?.append_composer_draft).toEqual([]);
+
+        await dispatch_host_message(refresh_snapshot_message(meta, {
+            capabilities: {
+                csvEditable: true,
+                csvEditingSupported: true,
+                csvEditSessionId: 'draft-session-a',
+            },
+        }));
+        expect(grid_stub().getAttribute('data-mount-id')).not.toBe(first_mount);
+        expect(grid_shell_mock.latest_props?.append_composer_draft)
+            .toEqual([{ 0: 'held through transform' }]);
+
+        await dispatch_host_message(refresh_snapshot_message(meta, {
+            capabilities: {
+                csvEditable: true,
+                csvEditingSupported: true,
+                csvEditSessionId: 'draft-session-b',
+            },
+        }));
+        expect(grid_shell_mock.latest_props?.append_composer_draft).toEqual([]);
+    });
+
     it('discarding from the save dialog clears persisted edits before releasing edit ownership', async () => {
         grid_shell_mock.is_dirty = true;
         grid_shell_mock.has_uncommitted_changes = true;

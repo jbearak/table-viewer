@@ -1116,6 +1116,7 @@ export interface GridShellProps {
     ) => string;
     formula_reference_bases?: (
         value: string,
+        additional_pending_rows?: number,
     ) => readonly PendingFormulaReferenceBasis[];
     generation: number;
     /** Source revision the pending structural overlay was derived from. */
@@ -1232,6 +1233,9 @@ export interface GridShellProps {
     edit_session?: EditSessionStore;
     /** Session-owned structural rows; never folded into source-keyed edits. */
     pending_row_store?: PendingRowStore;
+    /** App-owned so an uncommitted composer draft survives a grid remount. */
+    append_composer_draft?: AppendComposerDraft;
+    on_append_composer_draft_change?: (draft: AppendComposerDraft) => void;
     /** Admit one atomic append gesture against the current source generation. */
     on_append_rows?: (count: number) => Promise<AppendRowsAdmission | undefined>;
     /**
@@ -1377,6 +1381,8 @@ export function GridShell({
     initial_edits,
     edit_session,
     pending_row_store,
+    append_composer_draft,
+    on_append_composer_draft_change,
     on_append_rows,
     history_store,
     gestures_admitted,
@@ -3882,7 +3888,12 @@ export function GridShell({
                     ...(edit_syntax === 'markdown'
                         && formula_reference_bases !== undefined
                         && xlsx_edit_writes_formula(parsed.text, parsed.rich?.runs)
-                        ? { formulaReferenceBases: formula_reference_bases(parsed.text) }
+                        ? {
+                            formulaReferenceBases: formula_reference_bases(
+                                parsed.text,
+                                rows.length,
+                            ),
+                        }
                         : {}),
                 };
             });
@@ -3918,12 +3929,32 @@ export function GridShell({
         record_pending_row_gesture,
         visible_source_columns,
     ]);
-    const [composer_draft, set_composer_draft] = useState<AppendComposerDraft>(
+    const [local_composer_draft, set_local_composer_draft] = useState<AppendComposerDraft>(
         EMPTY_APPEND_COMPOSER_DRAFT,
     );
+    const composer_draft = append_composer_draft ?? local_composer_draft;
+    const set_composer_draft = on_append_composer_draft_change
+        ?? set_local_composer_draft;
     // Which append surface is showing. The shell owns it because the dock has
     // to stand its quick-add controls down while the composer is up.
+    const [append_dock_open, set_append_dock_open] = useState(false);
     const [composer_open, set_composer_open] = useState(false);
+    const previous_append_session_ref = useRef(edit_session_id);
+    useEffect(() => {
+        if (previous_append_session_ref.current === edit_session_id) return;
+        previous_append_session_ref.current = edit_session_id;
+        set_append_dock_open(false);
+        set_composer_open(false);
+        if (on_append_composer_draft_change === undefined) {
+            set_local_composer_draft(EMPTY_APPEND_COMPOSER_DRAFT);
+        }
+    }, [edit_session_id, on_append_composer_draft_change]);
+
+    useEffect(() => {
+        if (may_offer_append_dock) return;
+        set_append_dock_open(false);
+        set_composer_open(false);
+    }, [may_offer_append_dock]);
     /**
      * Labels for the composer's fields — the same titles the grid header
      * paints, so a field is identifiable by the column the user can see.
@@ -8122,6 +8153,8 @@ export function GridShell({
             />
             {may_offer_append_dock && (
                 <AppendDock
+                    open={append_dock_open}
+                    on_open_change={set_append_dock_open}
                     remaining_capacity={remaining_append_capacity}
                     busy={append_in_flight}
                     on_add_rows={add_rows_from_dock}
@@ -8138,6 +8171,10 @@ export function GridShell({
                             open={composer_open}
                             on_open_change={set_composer_open}
                             on_stage_rows={stage_composed_rows}
+                            on_stage_success={() => {
+                                set_composer_open(false);
+                                set_append_dock_open(false);
+                            }}
                         />
                     )}
                 />
