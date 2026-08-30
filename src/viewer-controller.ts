@@ -2011,6 +2011,20 @@ export function append_row_ceiling_for(profile: ViewerProfile): number {
     return profile.append_row_ceiling ?? MAX_SHEET_ROWS;
 }
 
+/**
+ * The same ceiling, shaped for the webview capability that carries it.
+ *
+ * `null` stands for "no ceiling". The resolved value is
+ * `UNBOUNDED_SHEET_ROWS` — `Number.POSITIVE_INFINITY` — and nothing guarantees
+ * a non-finite number survives the trip to the webview intact.
+ */
+export function projected_append_row_ceiling(
+    profile: ViewerProfile,
+): number | null {
+    const ceiling = append_row_ceiling_for(profile);
+    return Number.isFinite(ceiling) ? ceiling : null;
+}
+
 /** Whether two paths would take the same parser — the comparison `profile_for`
  *  makes, without building anything. */
 function same_extension(left: string, right: string): boolean {
@@ -6918,6 +6932,9 @@ export function attach_viewer(
                                     && may_retain_capability()
                                     && !next.truncationMessage,
                                 csvSaveLifecycle: projected_save_lifecycle(),
+                                appendRowCeiling: projected_append_row_ceiling(
+                                    profile,
+                                ),
                                 ...(owns_edit_session() && active_edit_session_id
                                     ? { csvEditSessionId: active_edit_session_id }
                                     : {}),
@@ -7181,6 +7198,9 @@ export function attach_viewer(
                                             && may_retain_capability()
                                             && !source!.truncationMessage,
                                         csvSaveLifecycle: projected_save_lifecycle(),
+                                        appendRowCeiling: projected_append_row_ceiling(
+                                            profile,
+                                        ),
                                         ...(owns_edit_session() && active_edit_session_id
                                             ? { csvEditSessionId: active_edit_session_id }
                                             : {}),

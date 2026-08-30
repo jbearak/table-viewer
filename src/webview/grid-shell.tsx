@@ -188,6 +188,7 @@ import {
     RowResizeOverlay,
     type RowResizeOverlayHandle,
 } from './row-resize-overlay';
+import { AppendDock } from './append-dock';
 import { row_boundary_hit } from './row-resize-model';
 import { read_overlay_editor_value } from './live-editor';
 
@@ -1200,6 +1201,13 @@ export interface GridShellProps {
     highlight_in_flight?: boolean;
     /** A host-backed append reservation is outstanding; all edits are fenced. */
     append_in_flight?: boolean;
+    /**
+     * The source's effective append row ceiling — `append_row_ceiling_for` on
+     * the host, delivered through the snapshot capability. Defaults to
+     * `MAX_SHEET_ROWS`, the value every format shared before the ceiling
+     * became a property of the profile; delimited sources pass Infinity.
+     */
+    append_row_ceiling?: number;
     /** How this sheet's cells are edited ('markdown' for xlsx). Default 'plain'. */
     edit_syntax?: EditSyntax;
     edit_session_id?: string;
@@ -1354,6 +1362,7 @@ export function GridShell({
     csv_editable = false,
     highlight_in_flight = false,
     append_in_flight = false,
+    append_row_ceiling = MAX_SHEET_ROWS,
     edit_syntax = 'plain',
     edit_session_id,
     value_edit_order_floor = 0,
@@ -3489,7 +3498,7 @@ export function GridShell({
         && pending_rows.appendedRows.length < MAX_PENDING_APPENDED_ROWS
         && sheet_meta.sourceRowCount
             - pending_rows.tailRemovals.length
-            + pending_rows.appendedRows.length < MAX_SHEET_ROWS;
+            + pending_rows.appendedRows.length < append_row_ceiling;
     const append_capacity = useCallback((count: number) => {
         const current = pending_store.snapshot();
         return Number.isSafeInteger(count)
@@ -3498,12 +3507,36 @@ export function GridShell({
             && sheet_meta.sourceRowCount
                 - current.tailRemovals.length
                 + current.appendedRows.length
-                + count <= MAX_SHEET_ROWS;
-    }, [pending_store, sheet_meta.sourceRowCount]);
+                + count <= append_row_ceiling;
+    }, [append_row_ceiling, pending_store, sheet_meta.sourceRowCount]);
+    /**
+     * How many more rows this gesture may stage right now — the smaller of the
+     * two capacities the dock clamps its count control against. Read from
+     * rendered pending state rather than the store snapshot, because it drives
+     * what the user sees; `append_capacity` re-checks the live snapshot at
+     * admission time.
+     */
+    const remaining_append_capacity = Math.max(0, Math.min(
+        MAX_PENDING_APPENDED_ROWS - pending_rows.appendedRows.length,
+        append_row_ceiling
+            - sheet_meta.sourceRowCount
+            + pending_rows.tailRemovals.length
+            - pending_rows.appendedRows.length,
+    ));
+    /**
+     * Whether the append dock is offered at all. Deliberately not
+     * `may_append_rows`: that folds in `append_in_flight`, which is the fence
+     * for the request the dock itself issued. Unmounting the dock under its own
+     * request would replace the busy state with a disappearing control, so the
+     * dock stays mounted across the round trip and renders `busy` instead.
+     */
+    const may_offer_append_dock = append_admission_active
+        && on_append_rows !== undefined
+        && edit_session_id !== undefined
+        && sheet_meta.columnCount > 0
+        && has_visible_columns
+        && remaining_append_capacity > 0;
     const get_row_accessibility_label = useCallback((row: number) => {
-        if (may_append_rows && row === row_count) {
-            return 'Append row at end of worksheet';
-        }
         const projected = pending_projection.row_at(row);
         if (projected?.kind === 'pending') {
             const label = `Pending appended row ${projected.intendedPhysicalRow + 1}`;
@@ -3521,7 +3554,7 @@ export function GridShell({
             return `Pending tail removal row ${projected.intendedPhysicalRow + 1}`;
         }
         return undefined;
-    }, [may_append_rows, pending_projection, row_count]);
+    }, [pending_projection]);
     const draw_pending_divider = useCallback<
         NonNullable<React.ComponentProps<typeof DataEditor>['drawCell']>
     >((args, draw_content) => {
@@ -3661,20 +3694,6 @@ export function GridShell({
         };
         poll();
     }), []);
-    const on_row_appended = useCallback(async () => {
-        const appended = await admit_pending_rows(1);
-        if (appended === undefined) return undefined;
-        const pending_row_id = appended.rowIds[0];
-        const display_row = await pending_display_row(pending_row_id);
-        if (display_row === undefined) return undefined;
-        return {
-            row: display_row,
-            ready: () => pending_projection_ref.current.display_row_for_identity({
-                kind: 'pending',
-                pendingRowId: pending_row_id,
-            }) === display_row,
-        };
-    }, [admit_pending_rows, pending_display_row]);
     const pending_paste_history_ref = useRef<{
         readonly before: PendingStructuralChanges;
         readonly rowIds: ReadonlySet<string>;
@@ -3774,8 +3793,18 @@ export function GridShell({
         pending_store,
         tail_removal_projection_key,
     ]);
-    const append_and_focus = useCallback(async (display_column: number): Promise<boolean> => {
-        const appended = await admit_pending_rows(1);
+    /**
+     * Stage `count` blank rows as one gesture, then put the caret in the first
+     * editable cell of the first of them. Selecting the cell is what scrolls
+     * the pending band into view — `select_active_display_cell` calls
+     * `scrollTo` — so quick add and the in-grid append paths land the user in
+     * the same place.
+     */
+    const append_and_focus_rows = useCallback(async (
+        count: number,
+        display_column: number,
+    ): Promise<boolean> => {
+        const appended = await admit_pending_rows(count);
         if (appended === undefined) return false;
         const pending_id = appended.rowIds[0];
         const display_row = await pending_display_row(pending_id);
@@ -3784,6 +3813,20 @@ export function GridShell({
         focus_grid_ref.current();
         return true;
     }, [admit_pending_rows, pending_display_row]);
+    const append_and_focus = useCallback(
+        (display_column: number): Promise<boolean> =>
+            append_and_focus_rows(1, display_column),
+        [append_and_focus_rows],
+    );
+    /**
+     * Quick add. The first editable cell of a new row is display column 0 —
+     * appended rows carry no per-cell editability of their own, and column 0 is
+     * the leftmost visible column under whatever projection is installed.
+     */
+    const add_rows_from_dock = useCallback(
+        (count: number): Promise<boolean> => append_and_focus_rows(count, 0),
+        [append_and_focus_rows],
+    );
     const may_append_rows_ref = useRef(may_append_rows);
     may_append_rows_ref.current = may_append_rows;
     const append_and_focus_ref = useRef(append_and_focus);
@@ -7913,12 +7956,6 @@ export function GridShell({
                 width="100%"
                 height="100%"
                 rows={row_count}
-                onRowAppended={may_append_rows ? on_row_appended : undefined}
-                trailingRowOptions={may_append_rows ? {
-                    sticky: true,
-                    hint: 'Append row',
-                    addIcon: 'plus',
-                } : undefined}
                 getRowAccessibilityLabel={get_row_accessibility_label}
                 columns={columns}
                 maxColumnWidth={MAX_COLUMN_WIDTH_PX}
@@ -7967,6 +8004,13 @@ export function GridShell({
                 onKeyDown={on_key_down}
                 provideEditor={provide_editor}
             />
+            {may_offer_append_dock && (
+                <AppendDock
+                    remaining_capacity={remaining_append_capacity}
+                    busy={append_in_flight}
+                    on_add_rows={add_rows_from_dock}
+                />
+            )}
             {append_in_flight && (
                 <span className="sr-only" role="status" aria-live="polite">
                     Adding rows. Editing is temporarily unavailable.

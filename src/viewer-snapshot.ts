@@ -171,6 +171,18 @@ export interface WorkbookSnapshotCapabilities {
      * and a plain editor is always safe.
      */
     readonly editSyntax?: 'plain' | 'markdown';
+    /**
+     * The row ceiling appended rows are checked against for this source, as
+     * `append_row_ceiling_for` resolves it. `null` means the format has no
+     * ceiling (CSV/TSV, which open with no row limit either); absent means an
+     * older host that never sent one, which the webview reads as
+     * `MAX_SHEET_ROWS` — the value every format used before it was per format.
+     *
+     * `null` rather than `Number.POSITIVE_INFINITY`: the profile carries
+     * `UNBOUNDED_SHEET_ROWS`, but the value crosses a message boundary that is
+     * not required to preserve a non-finite number.
+     */
+    readonly appendRowCeiling?: number | null;
 }
 
 /**

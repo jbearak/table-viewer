@@ -90,7 +90,11 @@ import {
     retarget_renamed_structured_formula,
 } from '../xlsx-formula';
 import { xlsx_edit_writes_formula } from '../xlsx-cell-value';
-import { MAX_WORKBOOK_FORMULAS } from '../spreadsheet-safety';
+import {
+    MAX_SHEET_ROWS,
+    MAX_WORKBOOK_FORMULAS,
+    UNBOUNDED_SHEET_ROWS,
+} from '../spreadsheet-safety';
 import { capture_pending_formula_reference_bases } from '../pending-formula-rebase';
 import {
     classify_snapshot,
@@ -730,6 +734,11 @@ export function App(): React.JSX.Element {
     const [csv_editing_supported, set_csv_editing_supported] = useState(false);
     // 'markdown' on xlsx: cell text edits as inline markup (see cell-edit-model).
     const [edit_syntax, set_edit_syntax] = useState<'plain' | 'markdown'>('plain');
+    // The source's append row ceiling, resolved host-side by
+    // `append_row_ceiling_for`. `null` on the wire means "no ceiling" and is
+    // widened to Infinity here; absent means an older host, which reads as the
+    // worksheet ceiling every format used to be checked against.
+    const [append_row_ceiling, set_append_row_ceiling] = useState(MAX_SHEET_ROWS);
     const [csv_edit_session_id, set_csv_edit_session_id_state] = useState<string>();
     const csv_edit_session_id_ref = useRef<string>();
     /**
@@ -4098,6 +4107,12 @@ export function App(): React.JSX.Element {
                         snapshot.capabilities.csvEditingSupported,
                     );
                     set_edit_syntax(snapshot.capabilities.editSyntax ?? 'plain');
+                    const ceiling = snapshot.capabilities.appendRowCeiling;
+                    set_append_row_ceiling(
+                        ceiling === undefined
+                            ? MAX_SHEET_ROWS
+                            : ceiling ?? UNBOUNDED_SHEET_ROWS,
+                    );
 
                     // Acknowledge the exact delivered identity before an optional
                     // corrective CAS write.
@@ -8063,6 +8078,7 @@ export function App(): React.JSX.Element {
             highlight_in_flight={highlight_request_pending}
             append_in_flight={append_request_pending}
             csv_editable={csv_editable}
+            append_row_ceiling={append_row_ceiling}
             edit_syntax={edit_syntax}
             edit_session_id={csv_edit_session_id}
             value_edit_order_floor={value_edit_order_floor}

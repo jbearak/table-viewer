@@ -5059,6 +5059,29 @@ describe('GridShell link-only edits', () => {
     });
 });
 
+// The append dock replaced Glide's trailing append row, so the append tests
+// drive the real control: open the launcher, then activate quick add.
+function append_launcher(): HTMLButtonElement | null {
+    return document.querySelector('.append-dock-launcher');
+}
+
+async function open_append_dock(): Promise<void> {
+    const launcher = append_launcher();
+    if (!launcher) throw new Error('append dock launcher is not rendered');
+    await act(async () => { launcher.click(); });
+}
+
+async function quick_add_rows(count = 1): Promise<void> {
+    if (count !== 1) {
+        const input = field('append-dock-count') as HTMLInputElement;
+        await act(async () => set_input_value(input, String(count)));
+    }
+    const add = button(count === 1 ? 'Add row' : `Add ${count} rows`);
+    // Not awaited to settlement: the click issues a host admission the test
+    // resolves itself, so awaiting the handler here would deadlock.
+    await act(async () => { add.click(); });
+}
+
 describe('GridShell edit-admission lifetime', () => {
     const editable = (overrides: Partial<GridShellProps> = {}) => props({
         edit_mode: true,
@@ -5085,28 +5108,27 @@ describe('GridShell edit-admission lifetime', () => {
             pending_row_store: pending,
             on_append_rows,
         }));
-        const on_row_appended = grid_mock.props!.onRowAppended as
-            () => Promise<unknown>;
-        const completion = on_row_appended();
+        await open_append_dock();
+        await quick_add_rows();
         await vi.waitUntil(() => on_append_rows.mock.calls.length === 1);
 
         await act(async () => editing_ref.current!.stop_edit_admission());
         const settle = vi.fn();
-        settle_admission({
-            rowIds: ['host-row-1'],
-            formatTemplate: { id: 'plain', format: { kind: 'none' } },
-            appendBasis: {
-                sourceRowCount: 1,
-                provisionalStartRow: 1,
-                columnCount: 3,
-                schemaFingerprint: 'schema',
-            },
-            settle,
+        await act(async () => {
+            settle_admission({
+                rowIds: ['host-row-1'],
+                formatTemplate: { id: 'plain', format: { kind: 'none' } },
+                appendBasis: {
+                    sourceRowCount: 1,
+                    provisionalStartRow: 1,
+                    columnCount: 3,
+                    schemaFingerprint: 'schema',
+                },
+                settle,
+            });
         });
-        let result: unknown;
-        await act(async () => { result = await completion; });
+        await vi.waitUntil(() => settle.mock.calls.length === 1);
 
-        expect(result).toBeUndefined();
         expect(pending.snapshot().appendedRows).toEqual([]);
         expect(settle).toHaveBeenCalledWith(false);
     });
@@ -5122,19 +5144,22 @@ describe('GridShell edit-admission lifetime', () => {
             on_append_rows,
         });
         const GridShell = await render_grid(initial);
-        const completion = (grid_mock.props!.onRowAppended as () => Promise<unknown>)();
+        await open_append_dock();
+        await quick_add_rows();
         await vi.waitUntil(() => on_append_rows.mock.calls.length === 1);
 
         // App commits this prop while the host owns the request. It is an
         // affordance fence, not evidence that the activation which issued the
-        // request has gone stale.
+        // request has gone stale. The dock stays mounted across it and shows a
+        // busy state rather than vanishing under its own request.
         await act(async () => {
             root!.render(React.createElement(GridShell, {
                 ...initial,
                 append_in_flight: true,
             }));
         });
-        expect(grid_mock.props!.onRowAppended).toBeUndefined();
+        expect(append_launcher()).not.toBeNull();
+        expect(button('Adding…').disabled).toBe(true);
 
         const settle = vi.fn();
         await act(async () => {
@@ -5150,10 +5175,8 @@ describe('GridShell edit-admission lifetime', () => {
                 settle,
             });
         });
-        let result: unknown;
-        await act(async () => { result = await completion; });
+        await vi.waitUntil(() => settle.mock.calls.length === 1);
 
-        expect(result).toEqual(expect.objectContaining({ row: 1 }));
         expect(pending.snapshot().appendedRows.map((row) => row.id))
             .toEqual(['host-row-1']);
         expect(settle).toHaveBeenCalledWith(true);
@@ -5169,9 +5192,32 @@ describe('GridShell edit-admission lifetime', () => {
             pending_row_store: pending,
             on_append_rows,
         }));
-        const append = grid_mock.props!.onRowAppended as () => Promise<unknown>;
-        const first = append();
-        const second = append();
+        // Driven through the in-grid path rather than the dock: the dock
+        // latches busy on its own request, so two overlapping gestures can only
+        // come from somewhere that does not — Tab past the last cell does.
+        const on_selection_change = grid_mock.props!.onGridSelectionChange as
+            (selection: unknown) => void;
+        await act(async () => on_selection_change({
+            columns: compact([]),
+            rows: compact([]),
+            current: {
+                cell: [1, 0],
+                range: { x: 1, y: 0, width: 1, height: 1 },
+                rangeStack: [],
+            },
+        }));
+        const on_key_down = grid_mock.props!.onKeyDown as
+            (args: Record<string, unknown>) => void;
+        const press_tab = () => on_key_down({
+            key: 'Tab',
+            shiftKey: false,
+            ctrlKey: false,
+            metaKey: false,
+            altKey: false,
+            cancel: () => {},
+            preventDefault: () => {},
+        });
+        await act(async () => { press_tab(); press_tab(); });
         await vi.waitUntil(() => on_append_rows.mock.calls.length === 1);
 
         const first_settle = vi.fn();
@@ -5201,7 +5247,8 @@ describe('GridShell edit-admission lifetime', () => {
             },
             settle: second_settle,
         }));
-        await act(async () => { await Promise.all([first, second]); });
+        await vi.waitUntil(() =>
+            pending.snapshot().appendedRows.length === 2);
 
         expect(pending.snapshot().appendedRows.map((row) => row.id))
             .toEqual(['host-row-1', 'host-row-2']);
@@ -6708,6 +6755,188 @@ describe('GridShell hyperlink dialog admission', () => {
 
         expect(document.getElementById('hyperlink-target')).toBeNull();
         expect(document.activeElement).toBe(surviving_target);
+    });
+});
+
+describe('GridShell append dock', () => {
+    const MAX_PENDING = 10_000;
+
+    function admit_immediately(prefix = 'host-row') {
+        let issued = 0;
+        return vi.fn(async (count: number) => ({
+            rowIds: Array.from(
+                { length: count },
+                () => `${prefix}-${(issued += 1)}`,
+            ),
+            formatTemplate: { id: 'plain', format: { kind: 'none' as const } },
+            appendBasis: {
+                sourceRowCount: 1,
+                provisionalStartRow: 1,
+                columnCount: 3,
+                schemaFingerprint: 'schema',
+            },
+            settle: () => {},
+        }));
+    }
+
+    function dock_props(overrides: Partial<GridShellProps> = {}) {
+        return props({
+            edit_mode: true,
+            edit_activation_id: 1,
+            csv_editable: true,
+            edit_session_id: 'session-1',
+            ...overrides,
+        });
+    }
+
+    it('withholds the launcher until appending is available', async () => {
+        const GridShell = await render_grid(dock_props({
+            pending_row_store: create_pending_row_store({ session_id: 'session-1' }),
+        }));
+        // No `on_append_rows`: the host cannot reserve rows, so there is
+        // nothing for the dock to offer.
+        expect(document.querySelector('.append-dock-launcher')).toBeNull();
+
+        await act(async () => {
+            root!.render(React.createElement(GridShell, dock_props({
+                pending_row_store: create_pending_row_store({ session_id: 'session-1' }),
+                on_append_rows: admit_immediately(),
+            })));
+        });
+        expect(document.querySelector('.append-dock-launcher')).not.toBeNull();
+    });
+
+    it('names its expanded state and returns focus to the launcher on dismiss', async () => {
+        await render_grid(dock_props({
+            pending_row_store: create_pending_row_store({ session_id: 'session-1' }),
+            on_append_rows: admit_immediately(),
+        }));
+        const launcher = document.querySelector('.append-dock-launcher') as HTMLButtonElement;
+        expect(launcher.getAttribute('aria-expanded')).toBe('false');
+        expect(launcher.getAttribute('aria-label')).toBe('Add rows');
+
+        await act(async () => { launcher.click(); });
+        expect(launcher.getAttribute('aria-expanded')).toBe('true');
+        expect(launcher.getAttribute('aria-label')).toBe('Close add rows');
+        expect(document.querySelector('[role="group"]')?.getAttribute('aria-label'))
+            .toBe('Add rows to the end of this worksheet');
+
+        await act(async () => {
+            document.querySelector('.append-dock')!.dispatchEvent(
+                new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }),
+            );
+        });
+        expect(launcher.getAttribute('aria-expanded')).toBe('false');
+        expect(document.activeElement).toBe(launcher);
+    });
+
+    it('clamps the requested count to the remaining pending-append capacity', async () => {
+        const pending = create_pending_row_store({ session_id: 'session-1' });
+        pending.append_rows(
+            'session-1',
+            Array.from({ length: MAX_PENDING - 3 }, (_, at) => `existing-${at}`),
+            { id: 'plain', format: { kind: 'none' } },
+            1,
+        );
+        await render_grid(dock_props({
+            pending_row_store: pending,
+            on_append_rows: admit_immediately(),
+        }));
+        await act(async () => {
+            (document.querySelector('.append-dock-launcher') as HTMLButtonElement).click();
+        });
+        const count = field('append-dock-count') as HTMLInputElement;
+        expect(count.max).toBe('3');
+
+        await act(async () => set_input_value(count, '50'));
+        expect(count.value).toBe('3');
+        expect(button('Add 3 rows').disabled).toBe(false);
+    });
+
+    it('respects a format ceiling lower than the pending-append cap', async () => {
+        await render_grid(dock_props({
+            // Two source rows against a four-row ceiling leaves room for two.
+            sheet_meta: { ...props().sheet_meta, rowCount: 2, sourceRowCount: 2 },
+            row_count: 2,
+            append_row_ceiling: 4,
+            pending_row_store: create_pending_row_store({ session_id: 'session-1' }),
+            on_append_rows: admit_immediately(),
+        }));
+        await act(async () => {
+            (document.querySelector('.append-dock-launcher') as HTMLButtonElement).click();
+        });
+        const count = field('append-dock-count') as HTMLInputElement;
+        await act(async () => set_input_value(count, '9'));
+        expect(count.value).toBe('2');
+        expect(button('Add 2 rows')).toBeTruthy();
+    });
+
+    it('lets a delimited source append past the worksheet row ceiling', async () => {
+        await render_grid(dock_props({
+            sheet_meta: {
+                ...props().sheet_meta,
+                rowCount: 1_048_600,
+                sourceRowCount: 1_048_600,
+            },
+            row_count: 1_048_600,
+            append_row_ceiling: Number.POSITIVE_INFINITY,
+            pending_row_store: create_pending_row_store({ session_id: 'session-1' }),
+            on_append_rows: admit_immediately(),
+        }));
+        expect(document.querySelector('.append-dock-launcher')).not.toBeNull();
+    });
+
+    it('stages N rows as one history entry and lands focus in the first of them', async () => {
+        const history = create_history_store();
+        const pending = create_pending_row_store({ session_id: 'session-1' });
+        await render_grid(dock_props({
+            pending_row_store: pending,
+            history_store: history,
+            on_append_rows: admit_immediately(),
+        }));
+        await act(async () => {
+            (document.querySelector('.append-dock-launcher') as HTMLButtonElement).click();
+        });
+        await act(async () => set_input_value(
+            field('append-dock-count') as HTMLInputElement,
+            '3',
+        ));
+        await act(async () => { button('Add 3 rows').click(); });
+        await vi.waitUntil(() => pending.snapshot().appendedRows.length === 3);
+
+        expect(history.snapshot().undoStack.map((entry) => entry.action.label))
+            .toEqual(['Append 3 rows']);
+        // The staged band starts at the row after the single source row, and
+        // the caret lands in its first visible column.
+        await vi.waitUntil(() => (grid_mock.props!.gridSelection as {
+            current?: { cell: [number, number] };
+        }).current !== undefined);
+        expect((grid_mock.props!.gridSelection as {
+            current?: { cell: [number, number] };
+        }).current?.cell).toEqual([0, 1]);
+        // Focus left the dock for the grid rather than staying on the button.
+        expect(document.activeElement?.closest('.append-dock')).toBeFalsy();
+        // Staging moved focus into the grid, so the dock closed behind it.
+        expect(document.getElementById('append-dock-count')).toBeNull();
+    });
+
+    it('keeps the dock open when admission refuses the gesture', async () => {
+        const pending = create_pending_row_store({ session_id: 'session-1' });
+        const on_append_rows = vi.fn(async () => undefined);
+        await render_grid(dock_props({
+            pending_row_store: pending,
+            on_append_rows,
+        }));
+        await act(async () => {
+            (document.querySelector('.append-dock-launcher') as HTMLButtonElement).click();
+        });
+        await act(async () => { button('Add row').click(); });
+        await vi.waitUntil(() => on_append_rows.mock.calls.length === 1);
+        await vi.waitUntil(() => document.querySelector('.append-dock-add')
+            ?.textContent === 'Add row');
+
+        expect(pending.snapshot().appendedRows).toEqual([]);
+        expect(document.getElementById('append-dock-count')).not.toBeNull();
     });
 });
 
