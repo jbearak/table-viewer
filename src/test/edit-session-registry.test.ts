@@ -307,6 +307,31 @@ describe('edit session registry', () => {
         expect(registry.formula_projection().moves).toHaveLength(1_000);
     });
 
+    it('rebuilds cached moves once when several worksheet row counts change', () => {
+        const { registry } = make_session_ref('session');
+        for (let sheet_index = 0; sheet_index < 3; sheet_index += 1) {
+            registry.for_sheet(sheet_index).commit('session', '2:0', {
+                value: `move-${sheet_index}`,
+                base: 'old',
+                movedFrom: { row: 0, col: 0, order: sheet_index + 1 },
+            });
+        }
+        expect(registry.formula_projection().moves).toHaveLength(3);
+        const sort = Array.prototype.sort;
+        let workbook_move_sorts = 0;
+        Array.prototype.sort = function counted_sort(compare) {
+            if (this.length === 3) workbook_move_sorts += 1;
+            return sort.call(this, compare);
+        };
+        try {
+            registry.formula_projection([10, 20, 30]);
+        } finally {
+            Array.prototype.sort = sort;
+        }
+
+        expect(workbook_move_sorts).toBe(1);
+    });
+
     it('refreshes cached moves when only move provenance changes', () => {
         const { registry } = make_session_ref('session');
         const store = registry.for_sheet(0);

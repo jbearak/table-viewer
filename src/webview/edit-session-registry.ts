@@ -936,11 +936,14 @@ export function create_edit_session_registry(
                         count !== source_row_counts[index]))) {
                 const previous = source_row_counts;
                 source_row_counts = Object.freeze([...next_source_row_counts]);
+                let refreshed = false;
                 for (let index = 0; index < Math.max(previous.length, source_row_counts.length); index += 1) {
                     if (previous[index] !== source_row_counts[index]) {
-                        refresh_formula_moves_for_sheet(index);
+                        refresh_formula_moves_for_sheet(index, false);
+                        refreshed = true;
                     }
                 }
+                if (refreshed) rebuild_formula_moves_from_contributions();
             }
             return ({
             edits: formula_edits,
