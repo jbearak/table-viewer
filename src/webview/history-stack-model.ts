@@ -957,11 +957,15 @@ function saved_row_cell_overlay(
     const base_link = pending_cell_link(persisted);
     const value_changed = !history_values_equal(value, base);
     const link_changed = !hyperlinks_equal(link, base_link);
-    const value_metadata_changed = JSON.stringify(historical?.movedFrom)
-        !== JSON.stringify(persisted?.movedFrom)
+    const value_metadata_changed = !structural_values_equal(
+        historical?.movedFrom,
+        persisted?.movedFrom,
+    )
         || historical?.valueEditOrder !== persisted?.valueEditOrder
-        || JSON.stringify(historical?.formulaReferenceBases ?? [])
-            !== JSON.stringify(persisted?.formulaReferenceBases ?? []);
+        || !structural_values_equal(
+            historical?.formulaReferenceBases ?? [],
+            persisted?.formulaReferenceBases ?? [],
+        );
     const value_dimension_changed = value_changed || value_metadata_changed;
     if (!value_dimension_changed && !link_changed) return absent_overlay();
     if (value_dimension_changed && link_changed) {
@@ -1759,7 +1763,7 @@ export function rekey_committed_tail_removal_history(
             }
         }
     }
-    const formats: PendingRowFormatTemplate[] = [];
+    const formats = new Map<number, PendingRowFormatTemplate[]>();
     const formats_by_identity = new WeakMap<object, PendingRowFormatTemplate>();
     const replacements = new Map<object, Array<{
         readonly key: string;
@@ -1798,14 +1802,17 @@ export function rekey_committed_tail_removal_history(
         const format = removal.savedRow.format;
         let template = formats_by_identity.get(format);
         if (template === undefined) {
-            template = formats.find((candidate) =>
+            const format_hash = structural_value_hash(format);
+            const candidates = formats.get(format_hash) ?? [];
+            template = candidates.find((candidate) =>
                 structural_values_equal(candidate.format, format));
             if (template === undefined) {
                 template = Object.freeze({
                     id: `restored-format:${append_history_id}`,
                     format,
                 });
-                formats.push(template);
+                candidates.push(template);
+                formats.set(format_hash, candidates);
             }
             formats_by_identity.set(format, template);
         }
@@ -2554,6 +2561,49 @@ export function action_is_single_worksheet(action: HistoryAction): boolean {
  */
 interface StructuralHistoryOwner {
     readonly templates: Map<string, PendingRowFormatTemplate[]>;
+}
+
+function mix_structural_hash(hash: number, value: number): number {
+    return Math.imul(hash ^ value, 0x01000193) >>> 0;
+}
+
+/** Allocation-free fingerprint; equality is still checked inside collision buckets. */
+function structural_value_hash(value: unknown): number {
+    if (value === null) return 0x42108421;
+    if (value === undefined) return 0x10204081;
+    if (typeof value === 'boolean') return value ? 0x51ed270b : 0x51ed270a;
+    if (typeof value === 'number') {
+        const whole = Math.trunc(value);
+        const fraction = Math.trunc((value - whole) * 0x7fffffff);
+        return mix_structural_hash(0x4e554d42, (whole ^ fraction) >>> 0);
+    }
+    if (typeof value === 'string') {
+        let hash = 0x53545200;
+        for (let index = 0; index < value.length; index += 1) {
+            hash = mix_structural_hash(hash, value.charCodeAt(index));
+        }
+        return hash;
+    }
+    if (typeof value !== 'object') return 0x7f4a7c15;
+    if (Array.isArray(value)) {
+        let hash = mix_structural_hash(0x41525200, value.length);
+        for (const child of value) hash = mix_structural_hash(hash, structural_value_hash(child));
+        return hash;
+    }
+    let xor = 0;
+    let sum = 0;
+    let count = 0;
+    for (const key in value) {
+        if (!Object.hasOwn(value, key)) continue;
+        const pair = mix_structural_hash(
+            structural_value_hash(key),
+            structural_value_hash((value as Record<string, unknown>)[key]),
+        );
+        xor ^= pair;
+        sum = (sum + Math.imul(pair, 0x9e3779b1)) >>> 0;
+        count += 1;
+    }
+    return mix_structural_hash(mix_structural_hash(0x4f424a00, xor), sum ^ count);
 }
 
 function structural_values_equal(left: unknown, right: unknown): boolean {
