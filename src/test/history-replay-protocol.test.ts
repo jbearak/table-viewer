@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import type { CellHyperlink, RichText } from '../cell-content';
 import {
+    MAX_HISTORY_ACTION_CELLS,
+    MAX_HISTORY_ACTION_ENCODED_BYTES,
+} from '../history-limits';
+import {
     history_replay_proposal_digest,
     sanitized_abandon_history_replay_request,
     sanitized_commit_history_replay_request,
@@ -229,6 +233,35 @@ describe('sanitized_prepare_history_replay_request', () => {
         expect(Object.isFrozen(parsed?.cells[0])).toBe(true);
     });
 
+    it('rejects an over-count request before walking or owning its sparse cells', () => {
+        expect(sanitized_prepare_history_replay_request(prepare_request({
+            cells: new Array(MAX_HISTORY_ACTION_CELLS + 1),
+        }))).toBeUndefined();
+    });
+
+    it('rejects aggregate replay bytes before cloning repeated large overlays', () => {
+        const shared = 'x'.repeat(2 * 1024 * 1024);
+        const count = Math.ceil(MAX_HISTORY_ACTION_ENCODED_BYTES / shared.length) + 1;
+        const cells = Array.from({ length: count }, (_, ordinal) => ({
+            ordinal,
+            worksheet: SHEET,
+            sourceRow: ordinal,
+            sourceColumn: 0,
+            overlay: {
+                kind: 'present',
+                value: {
+                    kind: 'present',
+                    value: { text: shared },
+                    base: { text: 'disk' },
+                    basePending: false,
+                },
+                hyperlink: { kind: 'untouched' },
+            },
+        }));
+        expect(sanitized_prepare_history_replay_request(prepare_request({ cells })))
+            .toBeUndefined();
+    });
+
     it('a caller mutating its own input cannot reach the parsed request', () => {
         const input = prepare_request() as {
             cells: { sourceRow: number; overlay: unknown }[];
@@ -265,6 +298,46 @@ describe('sanitized_prepare_history_replay_request', () => {
         expect(sanitized_prepare_history_replay_request(
             prepare_request({ cells: [], highlights: [] }),
         )).toBeUndefined();
+    });
+
+    it('owns a complete structural transition as a leased replay arm', () => {
+        const empty = {
+            formatTemplates: [], appendedRows: [], tailRemovals: [], conflicts: [],
+        };
+        const desired = {
+            ...empty,
+            conflicts: [{
+                reason: 'ambiguousColumns',
+                pendingRowIds: [],
+                tailRemovalIds: [],
+            }],
+        };
+        const parsed = sanitized_prepare_history_replay_request(prepare_request({
+            cells: [],
+            highlights: [],
+            structures: [{ ordinal: 0, worksheet: SHEET, expected: empty, desired }],
+        }));
+        expect(parsed?.structures).toEqual([{
+            ordinal: 0,
+            worksheet: SHEET,
+            expected: empty,
+            desired,
+        }]);
+        expect(Object.isFrozen(parsed?.structures?.[0].desired)).toBe(true);
+    });
+
+    it('owns bounded unique row-admission correlations', () => {
+        const parsed = sanitized_prepare_history_replay_request(prepare_request({
+            rowAdmissionRequestIds: ['restore-1', 'restore-2'],
+        }));
+        expect(parsed?.rowAdmissionRequestIds).toEqual(['restore-1', 'restore-2']);
+        expect(Object.isFrozen(parsed?.rowAdmissionRequestIds)).toBe(true);
+        expect(sanitized_prepare_history_replay_request(prepare_request({
+            rowAdmissionRequestIds: ['restore-1', 'restore-1'],
+        }))).toBeUndefined();
+        expect(sanitized_prepare_history_replay_request(prepare_request({
+            rowAdmissionRequestIds: ['x'.repeat(257)],
+        }))).toBeUndefined();
     });
 
     it('rejects sparse ordinals', () => {
@@ -357,6 +430,21 @@ describe('sanitized_commit_history_replay_request', () => {
         expect(Object.isFrozen(parsed)).toBe(true);
     });
 
+    it('rejects over-count and aggregate-byte commit proposals before ownership', () => {
+        expect(sanitized_commit_history_replay_request(commit_request({
+            cells: new Array(MAX_HISTORY_ACTION_CELLS + 1),
+        }))).toBeUndefined();
+
+        const shared = 'x'.repeat(2 * 1024 * 1024);
+        const count = Math.ceil(MAX_HISTORY_ACTION_ENCODED_BYTES / shared.length) + 1;
+        expect(sanitized_commit_history_replay_request(commit_request({
+            cells: Array.from({ length: count }, (_, ordinal) => ({
+                ordinal,
+                entry: { value: shared, base: 'disk' },
+            })),
+        }))).toBeUndefined();
+    });
+
     it('requires a lease and a mutation id', () => {
         expect(sanitized_commit_history_replay_request(
             commit_request({ leaseId: '' }),
@@ -382,6 +470,13 @@ describe('sanitized_commit_history_replay_request', () => {
             highlights: [{ ordinal: 0, desired: 'pink' }],
         }));
         expect(Object.keys(parsed!.highlights[0])).toEqual(['ordinal']);
+    });
+
+    it('a structural write names only the leased ordinal', () => {
+        const parsed = sanitized_commit_history_replay_request(commit_request({
+            structures: [{ ordinal: 0, desired: { appendedRows: ['unchecked'] } }],
+        }));
+        expect(parsed?.structures).toEqual([{ ordinal: 0 }]);
     });
 
     it('rejects a malformed entry', () => {
@@ -629,6 +724,36 @@ describe('history_replay_proposal_digest', () => {
             .not.toBe(history_replay_proposal_digest(ordered!));
         expect(history_replay_proposal_digest(moved!))
             .not.toBe(history_replay_proposal_digest(ordered!));
+    });
+
+    it('separates move proposals that differ only by stable row identity', () => {
+        const proposal = (pendingRowId: string) =>
+            sanitized_commit_history_replay_request(commit_request({
+                cells: [{
+                    ordinal: 0,
+                    entry: {
+                        value: 'typed',
+                        base: 'disk',
+                        movedFrom: {
+                            row: 1,
+                            col: 2,
+                            order: 7,
+                            rowIdentity: { kind: 'pending', pendingRowId },
+                            previous: [{
+                                sourceRow: 1,
+                                sourceCol: 2,
+                                destinationRow: 3,
+                                destinationCol: 4,
+                                order: 6,
+                                sourceRowIdentity: { kind: 'pending', pendingRowId },
+                                destinationRowIdentity: { kind: 'source', sourceRow: 3 },
+                            }],
+                        },
+                    },
+                }],
+            }));
+        expect(history_replay_proposal_digest(proposal('pending-a')!))
+            .not.toBe(history_replay_proposal_digest(proposal('pending-b')!));
     });
 
     it('separates a legacy string from an entry whose value equals it', () => {

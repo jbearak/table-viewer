@@ -62,6 +62,13 @@ export type FormulaCalculationResult = FormulaCalculationAddress & (
 export interface FormulaCalculationRequest {
     readonly edits: readonly FormulaCalculationEdit[];
     readonly targets: readonly FormulaCalculationAddress[];
+    /** Final worksheet extents while structural edits are still provisional. */
+    readonly prospectiveRowCounts?: readonly number[];
+    /** Physical rows whose old cells must read as blank before replacement edits apply. */
+    readonly removedRows?: readonly {
+        readonly sheetIndex: number;
+        readonly row: number;
+    }[];
 }
 
 export interface FormulaCalculationSchedule {
@@ -234,6 +241,11 @@ function* calculate_workbook_formula_steps(
     max_work?: number,
 ): CalculationSteps<readonly FormulaCalculationResult[]> {
     const sheets = source.meta().sheets;
+    const row_counts = sheets.map((sheet, sheet_index) =>
+        request.prospectiveRowCounts?.[sheet_index] ?? sheet.sourceRowCount);
+    const removed_rows = new Set((request.removedRows ?? []).map(
+        ({ sheetIndex, row }) => `${sheetIndex}:${row}`,
+    ));
     const sheet_names = sheets.map((sheet) => sheet.name);
     const sheet_lookup = new Map(sheet_names.map((name, index) => [name.toUpperCase(), index]));
     const edits = new Map(request.edits.map((edit) => [address_key(edit), edit]));
@@ -282,7 +294,7 @@ function* calculate_workbook_formula_steps(
         return sheet !== undefined
             && Number.isInteger(address.row)
             && address.row >= 0
-            && address.row < sheet.sourceRowCount
+            && address.row < row_counts[address.sheetIndex]
             && Number.isInteger(address.column)
             && address.column >= 0
             && address.column < sheet.columnCount;
@@ -295,12 +307,29 @@ function* calculate_workbook_formula_steps(
         columns: readonly number[],
     ): (RenderedCell | null)[][] => {
         consume_work(count * columns.length);
-        const canonical = source.read_canonical_columns?.(
-            sheet_index, start_row, count, columns,
+        const rows = Array.from(
+            { length: count },
+            () => columns.map(() => null as RenderedCell | null),
         );
-        return (canonical ?? read_source_columns(
-            source, sheet_index, start_row, count, columns,
-        )).rows;
+        const physical_row_count = sheets[sheet_index]?.sourceRowCount ?? 0;
+        const physical_count = Math.max(
+            0,
+            Math.min(count, physical_row_count - start_row),
+        );
+        if (physical_count > 0) {
+            const canonical = source.read_canonical_columns?.(
+                sheet_index, start_row, physical_count, columns,
+            );
+            const physical_rows = (canonical ?? read_source_columns(
+                source, sheet_index, start_row, physical_count, columns,
+            )).rows;
+            for (let offset = 0; offset < physical_count; offset += 1) {
+                if (!removed_rows.has(`${sheet_index}:${start_row + offset}`)) {
+                    rows[offset] = physical_rows[offset] ?? rows[offset];
+                }
+            }
+        }
+        return rows;
     };
 
     const read_cell = (address: FormulaCalculationAddress): RenderedCell | null | undefined => (
@@ -467,7 +496,8 @@ function* calculate_workbook_formula_steps(
                 if (matches.length > 1) return AMBIGUOUS_COLUMN;
                 const header_row = sheet.excelFirstRowHeader.sourceRow ?? 0;
                 if (ref.intersection) {
-                    if (this.formula_row <= header_row || this.formula_row >= sheet.sourceRowCount) {
+                    if (this.formula_row <= header_row
+                        || this.formula_row >= row_counts[source_sheet]) {
                         return ROW_OUTSIDE_BODY;
                     }
                     return yield* evaluate_cell({
@@ -481,7 +511,7 @@ function* calculate_workbook_formula_steps(
                     sheetIndex: source_sheet,
                     firstRow: header_row + 1,
                     firstColumn: matches[0],
-                    lastRow: sheet.sourceRowCount - 1,
+                    lastRow: row_counts[source_sheet] - 1,
                     lastColumn: matches[0],
                 };
             }
@@ -498,7 +528,7 @@ function* calculate_workbook_formula_steps(
                 if (!sheet) return PARSE_ERROR;
                 const first_row = Math.max(0, ref.firstRow);
                 const first_column = Math.max(0, ref.firstColumn);
-                const last_row = Math.min(ref.lastRow, sheet.sourceRowCount - 1);
+                const last_row = Math.min(ref.lastRow, row_counts[source_sheet] - 1);
                 const last_column = Math.min(ref.lastColumn, sheet.columnCount - 1);
                 const single_cell = ref.firstRow === ref.lastRow
                     && ref.firstColumn === ref.lastColumn;

@@ -25,6 +25,12 @@ import {
     action_replay_changes,
     type HistoryEntry,
 } from './history-stack-model';
+import { MAX_SHEET_ROWS } from '../spreadsheet-safety';
+import {
+    plan_pending_row_history_replay,
+    type PendingRowHistoryPlan,
+} from './pending-row-history';
+import type { PendingStructuralChanges } from '../pending-changes';
 import type {
     CellOverlayState,
     HistoryDirection,
@@ -71,6 +77,17 @@ export interface ReplayRequestSources {
         source_row: number,
         source_column: number,
     ) => CellOverlayState | undefined;
+    /** A worksheet's complete structural overlay, for mixed replay transactions. */
+    readonly read_structural?: (
+        worksheet: WorksheetTarget,
+    ) => PendingStructuralChanges | undefined;
+    /** Saved-row restoration grants reserved for the current structural replay. */
+    readonly row_admission_request_ids?: () => readonly string[];
+    /** A restoration's already-admitted structural transition, including its basis. */
+    readonly preplanned_structures?: (
+        entry: HistoryEntry,
+        direction: HistoryDirection,
+    ) => readonly PendingRowHistoryPlan[] | undefined;
     /** Correlation ids. Injected so tests are deterministic. */
     readonly next_id: (prefix: string) => string;
 }
@@ -92,7 +109,10 @@ export interface ReplayRequestSources {
  * no session behind them.
  */
 export function action_requires_edit_session(action: HistoryEntry['action']): boolean {
-    return action_has_cell_changes(action);
+    return action_has_cell_changes(action) || action.changes.some((change) =>
+        change.kind === 'rowAppend'
+        || change.kind === 'tailRemoval'
+        || change.kind === 'pendingRows');
 }
 
 /**
@@ -115,6 +135,8 @@ export function build_prepare_request(
     let focus: HistoryReplayFocus | undefined;
 
     for (const change of action_replay_changes(entry.action, direction)) {
+        if (change.kind === 'rowAppend' || change.kind === 'tailRemoval'
+            || change.kind === 'pendingRows') continue;
         const { worksheet, sourceRow, sourceColumn } = change.delta;
         focus = extend_focus(focus, worksheet, sourceRow, sourceColumn);
         if (change.kind === 'highlight') {
@@ -145,10 +167,45 @@ export function build_prepare_request(
             overlay,
         ));
     }
+    const preplanned = sources.preplanned_structures?.(entry, direction);
+    const structural = preplanned === undefined
+        ? plan_pending_row_history_replay(
+            entry.action,
+            direction,
+            (worksheet) => sources.read_structural?.(worksheet),
+        )
+        : { kind: 'plan' as const, plans: preplanned };
+    if (structural.kind === 'refused') return undefined;
+    const structures = structural.kind === 'plan'
+        ? structural.plans.map((plan, ordinal) => ({
+            ordinal,
+            worksheet: plan.worksheet,
+            expected: plan.expected,
+            desired: plan.next,
+        }))
+        : [];
+    for (const structure of structures) {
+        if (focus !== undefined) break;
+        const first_removal = structure.desired.tailRemovals[0]
+            ?? structure.expected.tailRemovals[0];
+        const source_row = first_removal?.sourceRow
+            ?? structure.desired.appendBasis?.sourceRowCount
+            ?? structure.expected.appendBasis?.sourceRowCount
+            ?? 0;
+        focus = extend_focus(
+            focus,
+            structure.worksheet,
+            Math.max(0, Math.min(source_row, MAX_SHEET_ROWS - 1)),
+            0,
+        );
+    }
     // A highlight-only action has no cells, and is replayable: highlights are
     // durable workbook state, not session-owned pending edits. What no request can
     // be is empty of both — there would be nothing for the host to verify or apply.
-    if (focus === undefined || (cells.length === 0 && highlights.length === 0)) {
+    if (
+        focus === undefined
+        || (cells.length === 0 && highlights.length === 0 && structures.length === 0)
+    ) {
         return undefined;
     }
     return {
@@ -156,6 +213,14 @@ export function build_prepare_request(
         replayId: sources.next_id('replay'),
         cells: Object.freeze(cells),
         highlights: Object.freeze(highlights),
+        structures: Object.freeze(structures),
+        ...(sources.row_admission_request_ids === undefined
+            ? {}
+            : {
+                rowAdmissionRequestIds: Object.freeze([
+                    ...sources.row_admission_request_ids(),
+                ]),
+            }),
         focus,
     };
 }
@@ -262,6 +327,7 @@ export function build_commit_request(
         // the correspondence the lease is built on — and the host requires the
         // proposal to cover exactly the prepared set.
         highlights: Object.freeze(highlight_ordinals.map((ordinal) => ({ ordinal }))),
+        structures: Object.freeze((prepared.structures ?? []).map(({ ordinal }) => ({ ordinal }))),
     };
 }
 
@@ -331,7 +397,7 @@ function entry_for_unwritten_cell(
  * A richer base-pending entry has no representation, and is refused rather than
  * written with the pending bit quietly dropped.
  */
-function wire_entry_for_destination(
+export function wire_entry_for_destination(
     entry: HistoryDirtyEntry | undefined,
 ): CommitHistoryReplayRequest['cells'][number]['entry'] | undefined {
     if (entry === undefined) return null;

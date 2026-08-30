@@ -2,6 +2,7 @@ import {
     copy_dirty_entry,
     type CsvDirtyEntry,
     type SheetPendingEditCells,
+    type WorksheetPendingChanges,
     worksheet_target_key,
 } from '../types';
 
@@ -54,6 +55,8 @@ interface PendingEditPublication {
     readonly payload: string;
     readonly sheetIndex: number;
     readonly sequence: number;
+    readonly structural: boolean;
+    readonly sourceGeneration?: number;
 }
 
 interface PendingEditSessionChannel {
@@ -87,6 +90,39 @@ function pending_edit_payload(edits: SheetPendingEditCells | null): string {
             : copy_dirty_entry(entry);
     }
     return JSON.stringify(canonical);
+}
+
+function pending_changes_payload(changes: WorksheetPendingChanges): string {
+    const cells: SheetPendingEditCells = {};
+    for (const key of Object.keys(changes.cells).sort()) {
+        cells[key] = copy_dirty_entry(changes.cells[key]);
+    }
+    return JSON.stringify({
+        sheetIndex: changes.sheetIndex,
+        ...(changes.sheetName !== undefined ? { sheetName: changes.sheetName } : {}),
+        ...(changes.worksheetId !== undefined ? { worksheetId: changes.worksheetId } : {}),
+        cells,
+        // Array order is semantic. Never sort these for dedupe.
+        formatTemplates: changes.formatTemplates,
+        appendedRows: changes.appendedRows,
+        tailRemovals: changes.tailRemovals,
+        ...(changes.appendBasis === undefined ? {} : { appendBasis: changes.appendBasis }),
+        conflicts: changes.conflicts,
+    });
+}
+
+function has_structural_pending_changes(changes: WorksheetPendingChanges): boolean {
+    return changes.appendedRows.length > 0
+        || changes.tailRemovals.length > 0
+        || changes.formatTemplates.length > 0
+        || changes.conflicts.length > 0
+        || changes.appendBasis !== undefined;
+}
+
+function pending_changes_channel_payload(changes: WorksheetPendingChanges): string {
+    return has_structural_pending_changes(changes)
+        ? pending_changes_payload(changes)
+        : pending_edit_payload(changes.cells);
 }
 
 function pending_edit_channel(session_id: string): PendingEditSessionChannel {
@@ -181,6 +217,7 @@ export const pending_edit_durability = {
             payload,
             sheetIndex,
             sequence,
+            structural: false,
         });
         channel.unacknowledgedSequences.add(sequence);
         host_bridge.postMessage({
@@ -261,6 +298,121 @@ export const pending_edit_durability = {
     },
 };
 
+/** Full Pending Changes publisher. It intentionally shares the legacy channel. */
+export const pending_changes_durability = {
+    publish(
+        editSessionId: string,
+        changes: WorksheetPendingChanges,
+        sourceGeneration: number,
+        force = false,
+    ): number {
+        const channel = pending_edit_channel(editSessionId);
+        const structural = has_structural_pending_changes(changes);
+        const payload = pending_changes_channel_payload(changes);
+        const dedupe_key = worksheet_target_key(changes);
+        const latest = channel.latestPublicationBySheet.get(dedupe_key);
+        if (
+            !force
+            && latest?.payload === payload
+            && latest.sourceGeneration === (structural ? sourceGeneration : undefined)
+            && (
+                !channel.unacknowledgedSequences.has(latest.sequence)
+                || latest.sheetIndex === changes.sheetIndex
+            )
+        ) return channel.nextSequence - 1;
+        const sequence = channel.nextSequence++;
+        if (latest) channel.unacknowledgedSequences.delete(latest.sequence);
+        channel.latestPublicationBySheet.set(dedupe_key, {
+            payload,
+            sheetIndex: changes.sheetIndex,
+            sequence,
+            structural,
+            ...(structural ? { sourceGeneration } : {}),
+        });
+        channel.unacknowledgedSequences.add(sequence);
+        host_bridge.postMessage(structural ? {
+            type: 'pendingChangesChanged',
+            editSessionId,
+            changes,
+            sequence,
+            sourceGeneration,
+        } : {
+            type: 'pendingEditsChanged',
+            editSessionId,
+            edits: changes.cells,
+            sequence,
+            sheetIndex: changes.sheetIndex,
+            ...(changes.sheetName !== undefined ? { sheetName: changes.sheetName } : {}),
+            ...(changes.worksheetId !== undefined
+                ? { worksheetId: changes.worksheetId }
+                : {}),
+        });
+        return sequence;
+    },
+    snapshot: pending_edit_durability.snapshot,
+    has_publication: pending_edit_durability.has_publication,
+    has_unacknowledged_payload: pending_edit_durability.has_unacknowledged_payload,
+    has_unacknowledged_structural_payload(
+        editSessionId: string,
+        sheetIndex: number,
+        sheetName: string | undefined,
+        worksheetId?: string,
+    ): boolean {
+        const channel = pending_edit_channels.get(editSessionId);
+        const publication = latest_pending_edit_publication(
+            editSessionId,
+            sheetIndex,
+            sheetName,
+            worksheetId,
+        );
+        return publication?.structural === true
+            && channel !== undefined
+            && channel.unacknowledgedSequences.has(publication.sequence);
+    },
+    unacknowledged_structural_payload(
+        editSessionId: string,
+        sheetIndex: number,
+        sheetName: string | undefined,
+        worksheetId?: string,
+    ): WorksheetPendingChanges | undefined {
+        const channel = pending_edit_channels.get(editSessionId);
+        const publication = latest_pending_edit_publication(
+            editSessionId,
+            sheetIndex,
+            sheetName,
+            worksheetId,
+        );
+        if (publication?.structural !== true
+            || channel === undefined
+            || !channel.unacknowledgedSequences.has(publication.sequence)) return undefined;
+        // `payload` was produced locally from a validated WorksheetPendingChanges
+        // value. Parsing that private canonical snapshot gives refresh merging an
+        // immutable publication base without retaining mutable caller objects.
+        return JSON.parse(publication.payload) as WorksheetPendingChanges;
+    },
+    unacknowledged_payload_matches(
+        editSessionId: string,
+        authoritativeChanges: WorksheetPendingChanges,
+        currentChanges: WorksheetPendingChanges,
+    ): boolean {
+        const channel = pending_edit_channels.get(editSessionId);
+        const publication = latest_pending_edit_publication(
+            editSessionId,
+            currentChanges.sheetIndex,
+            currentChanges.sheetName,
+            currentChanges.worksheetId,
+        );
+        return publication !== undefined
+            && publication.structural
+            && channel !== undefined
+            && channel.unacknowledgedSequences.has(publication.sequence)
+            && publication.payload === pending_changes_channel_payload(authoritativeChanges)
+            && publication.payload === pending_changes_channel_payload(currentChanges);
+    },
+    acknowledge: pending_edit_durability.acknowledge,
+    retire: pending_edit_durability.retire,
+};
+
 type PendingEditMessageGlobal = typeof globalThis & {
     __tableViewerPendingEditMessageDispatch?: (event: MessageEvent) => void;
     __tableViewerPendingEditMessageListenerWindow?: Window;
@@ -270,7 +422,8 @@ const pending_edit_message_global = globalThis as PendingEditMessageGlobal;
 pending_edit_message_global.__tableViewerPendingEditMessageDispatch = (event: MessageEvent) => {
     const message = event.data;
     if (
-        message?.type === 'requestPendingEditsFlush'
+        (message?.type === 'requestPendingEditsFlush'
+            || message?.type === 'requestPendingChangesFlush')
         && typeof message.requestId === 'string'
     ) {
         const request_id = message.requestId;
@@ -282,13 +435,17 @@ pending_edit_message_global.__tableViewerPendingEditMessageDispatch = (event: Me
             .then(() => pending_edit_flush_responder())
             .then(
                 (result) => host_bridge.postMessage({
-                    type: 'pendingEditsFlush',
+                    type: message.type === 'requestPendingChangesFlush'
+                        ? 'pendingChangesFlush'
+                        : 'pendingEditsFlush',
                     requestId: request_id,
                     editSessionId: result.editSessionId,
                     highestProducedSequence: result.highestProducedSequence,
                 }),
                 () => host_bridge.postMessage({
-                    type: 'pendingEditsFlushFailed',
+                    type: message.type === 'requestPendingChangesFlush'
+                        ? 'pendingChangesFlushFailed'
+                        : 'pendingEditsFlushFailed',
                     requestId: request_id,
                 }),
             )
@@ -298,11 +455,12 @@ pending_edit_message_global.__tableViewerPendingEditMessageDispatch = (event: Me
         return;
     }
     if (
-        message?.type !== 'pendingEditsAcknowledged'
+        (message?.type !== 'pendingEditsAcknowledged'
+            && message?.type !== 'pendingChangesAcknowledged')
         || typeof message.editSessionId !== 'string'
         || !Number.isSafeInteger(message.sequence)
     ) return;
-    pending_edit_durability.acknowledge(message.editSessionId, message.sequence);
+    pending_changes_durability.acknowledge(message.editSessionId, message.sequence);
 };
 
 if (typeof window !== 'undefined'

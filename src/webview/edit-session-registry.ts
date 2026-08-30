@@ -61,20 +61,43 @@ import type { FormulaCalculationEdit } from '../formula-calculation';
 import { rich_text_equal } from '../cell-content';
 import { xlsx_edit_writes_formula } from '../xlsx-cell-value';
 import type { XlsxFormulaCellMove } from '../xlsx-formula';
+import {
+    has_pending_structural_changes,
+    type PendingStructuralChanges,
+} from '../pending-changes';
+import {
+    create_pending_row_store,
+    type PendingRowStore,
+} from './pending-row-store';
 
 export interface EditSessionFormulaProjection {
     readonly edits: readonly FormulaCalculationEdit[];
+    /** Pending-row inputs use a stable row id plus their current append index. */
+    readonly pendingEdits: readonly PendingFormulaCalculationEdit[];
     readonly coordinateRevision: number;
     readonly calculationRevision: number;
+    /** Pending-row topology/value revision; excludes source link/style-only edits. */
+    readonly structuralRevision: number;
     readonly tooManyEdits: boolean;
     readonly hasFormulaEdits: boolean;
     readonly moves: readonly XlsxFormulaCellMove[];
+}
+
+export interface PendingFormulaCalculationEdit {
+    readonly sheetIndex: number;
+    readonly pendingRowId: string;
+    readonly pendingRowIndex: number;
+    readonly column: number;
+    readonly value: string;
+    readonly writesFormula: boolean;
+    readonly runs?: FormulaCalculationEdit['runs'];
 }
 
 export interface EditSessionSaveWorksheet {
     target: WorksheetTarget;
     edits: Readonly<Record<string, string>>;
     dirtyEdits: CsvDirtyMap;
+    structuralChanges?: PendingStructuralChanges;
 }
 
 export type EditSessionSavePreflight =
@@ -103,6 +126,10 @@ export interface StagedDiscard {
         readonly target: WorksheetTarget;
         readonly entries: ReadonlyMap<string, DirtyEntry>;
     }[];
+    readonly structuralWorksheets?: readonly {
+        readonly target: WorksheetTarget;
+        readonly changes: PendingStructuralChanges;
+    }[];
 }
 
 export interface EditSessionRegistry {
@@ -110,7 +137,7 @@ export interface EditSessionRegistry {
     subscribe(listener: () => void): () => void;
     revision(): number;
     /** Incrementally maintained formula inputs; unchanged by style/link-only writes. */
-    formula_projection(): EditSessionFormulaProjection;
+    formula_projection(source_row_counts?: readonly number[]): EditSessionFormulaProjection;
     /** Highest value/move order observed anywhere in this workbook session. */
     value_edit_order_floor(): number;
     /**
@@ -122,6 +149,8 @@ export interface EditSessionRegistry {
      * depend on that effect having already run.
      */
     for_sheet(sheet_index: number): EditSessionStore;
+    /** Structural overlay for one worksheet, separate from source-keyed cells. */
+    pending_rows_for_sheet(sheet_index: number): PendingRowStore;
     /** Re-stamp every existing store onto the current session. */
     adopt_session(): void;
     /**
@@ -133,11 +162,17 @@ export interface EditSessionRegistry {
         previous: readonly WorksheetIdentityInput[],
         next: readonly WorksheetIdentityInput[],
         retain_removed: (target: WorksheetTarget, store: EditSessionStore) => boolean,
+        retain_pending?: (target: WorksheetTarget, store: PendingRowStore) => boolean,
     ): {
         readonly locallyRetainedIndices: ReadonlySet<number>;
+        readonly locallyRetainedStructuralIndices: ReadonlySet<number>;
         readonly retryPublications: readonly {
             target: WorksheetTarget;
             store: EditSessionStore;
+        }[];
+        readonly retryStructuralPublications: readonly {
+            target: WorksheetTarget;
+            store: PendingRowStore;
         }[];
     };
     /** Drop detached stores when their session ends without replacing live stores. */
@@ -146,6 +181,11 @@ export interface EditSessionRegistry {
     publication_entries(sheets: readonly WorksheetIdentityInput[]): IterableIterator<{
         target: WorksheetTarget;
         store: EditSessionStore;
+        parked: boolean;
+    }>;
+    pending_publication_entries(sheets: readonly WorksheetIdentityInput[]): IterableIterator<{
+        target: WorksheetTarget;
+        store: PendingRowStore;
         parked: boolean;
     }>;
     /** Whether any live or parked worksheet store contains dirty entries. */
@@ -200,6 +240,7 @@ export interface EditSessionRegistry {
      * sheet's store may hold unpublished edits, not just the pointer sheet's.
      */
     entries(): IterableIterator<[number, EditSessionStore]>;
+    pending_entries(): IterableIterator<[number, PendingRowStore]>;
 }
 
 /**
@@ -232,22 +273,83 @@ export function create_edit_session_registry(
         target: WorksheetTarget;
         store: EditSessionStore;
     }>();
+    let pending_stores = new Map<number, PendingRowStore>();
+    const pending_parked = new Map<PendingRowStore, {
+        target: WorksheetTarget;
+        store: PendingRowStore;
+    }>();
     let revision = 0;
     const listeners = new Set<() => void>();
     const subscriptions = new Map<EditSessionStore, () => void>();
+    const pending_subscriptions = new Map<PendingRowStore, () => void>();
     let formula_edits: FormulaCalculationEdit[] = [];
     let formula_value_edit_count = 0;
     let formula_edit_count = 0;
     let formula_coordinate_revision = 0;
     let formula_calculation_revision = 0;
+    let structural_formula_revision = 0;
     let too_many_formula_edits = false;
     let formula_moves: XlsxFormulaCellMove[] = [];
+    let source_row_counts: readonly number[] = [];
+    type RelativePendingFormulaEdit = Omit<PendingFormulaCalculationEdit, 'sheetIndex'>;
+    const pending_formula_rows = new Map<
+        PendingRowStore,
+        Map<string, readonly RelativePendingFormulaEdit[]>
+    >();
+    let pending_formula_edits: PendingFormulaCalculationEdit[] = [];
     // Monotonic on purpose: removed/discarded edits do not make an already
     // issued order reusable, and keeping the high-water mark makes lookup O(1).
     let value_edit_order_floor = 0;
     const publish = () => {
         revision += 1;
         for (const listener of listeners) listener();
+    };
+    const pending_formula_row = (
+        store: PendingRowStore,
+        row_id: string,
+    ): readonly RelativePendingFormulaEdit[] => {
+        const snapshot = store.snapshot();
+        const pendingRowIndex = store.row_index(row_id);
+        const row = pendingRowIndex === undefined ? undefined : snapshot.appendedRows[pendingRowIndex];
+        if (row === undefined) return [];
+        const row_index = pendingRowIndex!;
+        return Object.entries(row.cells).flatMap(([column_text, cell]) => {
+            const column = Number(column_text);
+            if (!Number.isSafeInteger(column) || column < 0) return [];
+            const runs = cell.valueRuns?.runs;
+            return [{
+                pendingRowId: row.id,
+                pendingRowIndex: row_index,
+                column,
+                value: cell.value,
+                writesFormula: xlsx_edit_writes_formula(
+                    cell.value,
+                    runs && runs.length > 0 ? runs : undefined,
+                ),
+                ...(runs && runs.length > 0 ? { runs } : {}),
+            }];
+        });
+    };
+    const rebuild_pending_formula_output = (): void => {
+        const edits: PendingFormulaCalculationEdit[] = [];
+        for (const [sheetIndex, store] of pending_stores) {
+            for (const row of pending_formula_rows.get(store)?.values() ?? []) {
+                for (const edit of row) edits.push({ sheetIndex, ...edit });
+            }
+        }
+        edits.sort((left, right) => (left.sheetIndex - right.sheetIndex)
+            || (left.pendingRowIndex - right.pendingRowIndex)
+            || (left.column - right.column));
+        pending_formula_edits = edits;
+    };
+    const rebuild_pending_formula_store = (store: PendingRowStore): void => {
+        const rows = new Map<string, readonly RelativePendingFormulaEdit[]>();
+        for (const row of store.snapshot().appendedRows) {
+            const edits = pending_formula_row(store, row.id);
+            if (edits.length > 0) rows.set(row.id, edits);
+        }
+        pending_formula_rows.set(store, rows);
+        rebuild_pending_formula_output();
     };
 
     const compare_formula_edits = (
@@ -335,38 +437,105 @@ export function create_edit_session_registry(
             && previous.every((edit, index) => formula_edit_values_equal(edit, next[index]));
         if (!coordinates_equal) formula_coordinate_revision += 1;
         if (!calculations_equal) formula_calculation_revision += 1;
-        formula_moves = current_moves();
+        refresh_formula_moves();
     };
     const current_moves = (): XlsxFormulaCellMove[] => {
         const moves = new Map<string, XlsxFormulaCellMove>();
-        for (const [sheetIndex, store] of stores) {
-            for (const [key, entry] of store.snapshot()) {
-                const cell = parse_cell_key(key);
-                const moved = entry.movedFrom;
-                if (!cell || moved === undefined) continue;
-                for (const previous of moved.previous ?? []) {
-                    const move = {
-                        order: previous.order,
-                        sheetIndex,
-                        sourceRow: previous.sourceRow,
-                        sourceColumn: previous.sourceCol,
-                        destinationRow: previous.destinationRow,
-                        destinationColumn: previous.destinationCol,
-                    };
-                    moves.set(JSON.stringify(move), move);
-                }
+        const pending_layout = new Map([...pending_stores].map(([sheetIndex, store]) => {
+            const structural = store.snapshot();
+            return [sheetIndex, {
+                structural,
+                indexById: new Map(structural.appendedRows.map((row, index) => [row.id, index])),
+                start: (source_row_counts[sheetIndex]
+                    ?? structural.appendBasis?.sourceRowCount
+                    ?? 0) - structural.tailRemovals.length,
+            }] as const;
+        }));
+        const physical_row = (
+            sheetIndex: number,
+            identity: import('../pending-changes').RowIdentity | undefined,
+            fallback: number,
+        ): number => {
+            if (identity === undefined) return fallback;
+            if (identity.kind === 'source') return identity.sourceRow;
+            const layout = pending_layout.get(sheetIndex);
+            const index = layout?.indexById.get(identity.pendingRowId);
+            if (index === undefined || layout === undefined) return fallback;
+            return layout.start + index;
+        };
+        const add_move = (
+            sheetIndex: number,
+            moved: NonNullable<DirtyEntry['movedFrom']> | undefined,
+            destinationRow: number,
+            destinationColumn: number,
+        ): void => {
+            if (moved === undefined) return;
+            for (const previous of moved.previous ?? []) {
                 const move = {
-                    order: moved.order,
+                    order: previous.order,
                     sheetIndex,
-                    sourceRow: moved.row,
-                    sourceColumn: moved.col,
-                    destinationRow: cell.sourceRow,
-                    destinationColumn: cell.sourceColumn,
+                    sourceRow: physical_row(
+                        sheetIndex,
+                        previous.sourceRowIdentity,
+                        previous.sourceRow,
+                    ),
+                    sourceColumn: previous.sourceCol,
+                    destinationRow: physical_row(
+                        sheetIndex,
+                        previous.destinationRowIdentity,
+                        previous.destinationRow,
+                    ),
+                    destinationColumn: previous.destinationCol,
                 };
                 moves.set(JSON.stringify(move), move);
             }
+            const move = {
+                order: moved.order,
+                sheetIndex,
+                sourceRow: physical_row(sheetIndex, moved.rowIdentity, moved.row),
+                sourceColumn: moved.col,
+                destinationRow,
+                destinationColumn,
+            };
+            moves.set(JSON.stringify(move), move);
+        };
+        for (const [sheetIndex, store] of stores) {
+            for (const [key, entry] of store.snapshot()) {
+                const cell = parse_cell_key(key);
+                if (!cell) continue;
+                add_move(
+                    sheetIndex,
+                    entry.movedFrom,
+                    cell.sourceRow,
+                    cell.sourceColumn,
+                );
+            }
+        }
+        for (const [sheetIndex, store] of pending_stores) {
+            const structural = store.snapshot();
+            const start = pending_layout.get(sheetIndex)?.start ?? 0;
+            structural.appendedRows.forEach((row, index) => {
+                for (const [column, cell] of Object.entries(row.cells)) {
+                    add_move(sheetIndex, cell.movedFrom, start + index, Number(column));
+                }
+            });
         }
         return [...moves.values()].sort((left, right) => (left.order ?? 0) - (right.order ?? 0));
+    };
+    const refresh_formula_moves = (): void => {
+        const next = current_moves();
+        const unchanged = next.length === formula_moves.length
+            && next.every((move, index) => {
+                const current = formula_moves[index];
+                return current !== undefined
+                    && move.sheetIndex === current.sheetIndex
+                    && move.sourceRow === current.sourceRow
+                    && move.sourceColumn === current.sourceColumn
+                    && move.destinationRow === current.destinationRow
+                    && move.destinationColumn === current.destinationColumn
+                    && move.order === current.order;
+            });
+        if (!unchanged) formula_moves = next;
     };
     const apply_formula_change = (
         sheetIndex: number,
@@ -448,7 +617,7 @@ export function create_edit_session_registry(
             // A store can change move provenance without changing its formula
             // input (for example, a same-text cut destination). Those changes
             // deliberately arrive as `none`, but they still invalidate moves.
-            if (change.kind !== 'reset') formula_moves = current_moves();
+            if (change.kind !== 'reset') refresh_formula_moves();
             publish();
         }));
     };
@@ -461,6 +630,54 @@ export function create_edit_session_registry(
             subscriptions.delete(store);
         }
     };
+    const watch_pending = (store: PendingRowStore) => {
+        if (pending_subscriptions.has(store)) return;
+        pending_subscriptions.set(store, store.subscribe((change) => {
+            structural_formula_revision += 1;
+            const rows = change.kind === 'rows'
+                ? change.rows
+                : store.snapshot().appendedRows;
+            for (const row of rows) {
+                value_edit_order_floor = Math.max(value_edit_order_floor, row.createdOrder);
+                for (const cell of Object.values(row.cells)) {
+                    value_edit_order_floor = Math.max(
+                        value_edit_order_floor,
+                        cell.valueEditOrder ?? 0,
+                    );
+                }
+            }
+            if (change.kind === 'reset') {
+                rebuild_pending_formula_store(store);
+            } else {
+                let cached = pending_formula_rows.get(store);
+                if (cached === undefined) {
+                    cached = new Map();
+                    pending_formula_rows.set(store, cached);
+                }
+                for (const row of change.rows) {
+                    const edits = pending_formula_row(store, row.id);
+                    if (edits.length === 0) cached.delete(row.id);
+                    else cached.set(row.id, edits);
+                }
+                rebuild_pending_formula_output();
+            }
+            // Stable cut provenance can originate in or target a pending row.
+            // Rebuild only the move set; ordinary formula edits remain cached.
+            refresh_formula_moves();
+            publish();
+        }));
+    };
+    const unwatch_detached_pending = () => {
+        const retained = new Set(pending_stores.values());
+        for (const { store } of pending_parked.values()) retained.add(store);
+        for (const [store, unsubscribe] of pending_subscriptions) {
+            if (retained.has(store)) continue;
+            unsubscribe();
+            pending_subscriptions.delete(store);
+            pending_formula_rows.delete(store);
+        }
+        rebuild_pending_formula_output();
+    };
 
     return {
         subscribe: (listener) => {
@@ -468,14 +685,25 @@ export function create_edit_session_registry(
             return () => { listeners.delete(listener); };
         },
         revision: () => revision,
-        formula_projection: () => ({
+        formula_projection: (next_source_row_counts) => {
+            if (next_source_row_counts !== undefined
+                && (next_source_row_counts.length !== source_row_counts.length
+                    || next_source_row_counts.some((count, index) =>
+                        count !== source_row_counts[index]))) {
+                source_row_counts = Object.freeze([...next_source_row_counts]);
+                refresh_formula_moves();
+            }
+            return ({
             edits: formula_edits,
+            pendingEdits: pending_formula_edits,
             coordinateRevision: formula_coordinate_revision,
             calculationRevision: formula_calculation_revision,
+            structuralRevision: structural_formula_revision,
             tooManyEdits: too_many_formula_edits,
             hasFormulaEdits: formula_edit_count > 0,
             moves: formula_moves,
-        }),
+            });
+        },
         value_edit_order_floor: () => value_edit_order_floor,
         for_sheet: (sheet_index) => {
             const existing = stores.get(sheet_index);
@@ -487,9 +715,23 @@ export function create_edit_session_registry(
             watch(created);
             return created;
         },
-        reconcile_sheets: (previous, next, retain_removed) => {
+        pending_rows_for_sheet: (sheet_index) => {
+            const existing = pending_stores.get(sheet_index);
+            if (existing) return existing;
+            const created = create_pending_row_store({ session_id: current_session_id() });
+            pending_stores.set(sheet_index, created);
+            watch_pending(created);
+            return created;
+        },
+        reconcile_sheets: (
+            previous,
+            next,
+            retain_removed,
+            retain_pending = (_target, store) => has_pending_structural_changes(store.snapshot()),
+        ) => {
             const moved = new Map<number, EditSessionStore>();
             const locally_retained_indices = new Set<number>();
+            const locally_retained_structural_indices = new Set<number>();
             const retry_publications: Array<{
                 target: WorksheetTarget;
                 store: EditSessionStore;
@@ -532,17 +774,73 @@ export function create_edit_session_registry(
                 retry_publications.push(entry);
             }
             stores = moved;
+            const moved_pending = new Map<number, PendingRowStore>();
+            const retry_structural_publications: Array<{
+                target: WorksheetTarget;
+                store: PendingRowStore;
+            }> = [];
+            for (const [parked_store, entry] of pending_parked) {
+                const next_index = next_index_for(entry.target);
+                if (next_index === undefined || moved_pending.has(next_index)) {
+                    if (retain_pending(entry.target, entry.store)) {
+                        retry_structural_publications.push(entry);
+                    } else {
+                        pending_parked.delete(parked_store);
+                    }
+                    continue;
+                }
+                pending_parked.delete(parked_store);
+                moved_pending.set(next_index, entry.store);
+                if (retain_pending(entry.target, entry.store)) {
+                    locally_retained_structural_indices.add(next_index);
+                    retry_structural_publications.push({
+                        target: target_for_sheet(next_index, next[next_index]),
+                        store: entry.store,
+                    });
+                }
+            }
+            for (const [previous_index, store] of pending_stores) {
+                const previous_sheet = previous[previous_index];
+                if (!previous_sheet) continue;
+                const target = target_for_sheet(previous_index, previous_sheet);
+                const next_index = next_index_for(target);
+                if (next_index !== undefined && !moved_pending.has(next_index)) {
+                    moved_pending.set(next_index, store);
+                    if (retain_pending(target, store)) {
+                        locally_retained_structural_indices.add(next_index);
+                        retry_structural_publications.push({
+                            target: target_for_sheet(next_index, next[next_index]),
+                            store,
+                        });
+                    }
+                    continue;
+                }
+                if (!retain_pending(target, store)) continue;
+                const entry = { target, store };
+                pending_parked.set(store, entry);
+                retry_structural_publications.push(entry);
+            }
+            pending_stores = moved_pending;
+            structural_formula_revision += 1;
             unwatch_detached();
+            unwatch_detached_pending();
             rebuild_formula_projection();
+            rebuild_pending_formula_output();
             publish();
             return {
                 locallyRetainedIndices: locally_retained_indices,
+                locallyRetainedStructuralIndices: locally_retained_structural_indices,
                 retryPublications: retry_publications,
+                retryStructuralPublications: retry_structural_publications,
             };
         },
         retire_parked: () => {
             parked.clear();
+            pending_parked.clear();
+            structural_formula_revision += 1;
             unwatch_detached();
+            unwatch_detached_pending();
+            rebuild_pending_formula_output();
             publish();
         },
         publication_entries: function* (sheets) {
@@ -557,12 +855,30 @@ export function create_edit_session_registry(
             }
             for (const entry of parked.values()) yield { ...entry, parked: true };
         },
+        pending_publication_entries: function* (sheets) {
+            for (const [sheet_index, store] of pending_stores) {
+                const sheet = sheets[sheet_index];
+                if (!sheet) continue;
+                yield {
+                    target: target_for_sheet(sheet_index, sheet),
+                    store,
+                    parked: false,
+                };
+            }
+            for (const entry of pending_parked.values()) yield { ...entry, parked: true };
+        },
         has_dirty_entries: () => {
             for (const store of stores.values()) {
                 if (store.size() > 0) return true;
             }
             for (const { store } of parked.values()) {
                 if (store.size() > 0) return true;
+            }
+            for (const store of pending_stores.values()) {
+                if (has_pending_structural_changes(store.snapshot())) return true;
+            }
+            for (const { store } of pending_parked.values()) {
+                if (has_pending_structural_changes(store.snapshot())) return true;
             }
             return false;
         },
@@ -571,11 +887,17 @@ export function create_edit_session_registry(
             const unresolved_targets: WorksheetTarget[] = [];
             const parked_targets: WorksheetTarget[] = [];
 
-            for (const [sheet_index, store] of stores) {
+            const live_indices = new Set([...stores.keys(), ...pending_stores.keys()]);
+            for (const sheet_index of live_indices) {
+                const store = stores.get(sheet_index);
+                const pending_store = pending_stores.get(sheet_index);
                 const sheet = sheets[sheet_index];
                 if (!sheet) continue;
-                const snapshot = store.snapshot();
-                if (snapshot.size === 0) continue;
+                const snapshot = store?.snapshot() ?? new Map();
+                const structural = pending_store?.snapshot();
+                const has_structural = structural !== undefined
+                    && has_pending_structural_changes(structural);
+                if (snapshot.size === 0 && !has_structural) continue;
                 const target = Object.freeze(
                     target_for_sheet(sheet_index, sheet),
                 );
@@ -588,10 +910,15 @@ export function create_edit_session_registry(
                     target,
                     edits: payload.edits,
                     dirtyEdits: payload.dirtyEdits,
+                    ...(has_structural ? { structuralChanges: structural } : {}),
                 }));
             }
             for (const { target, store } of parked.values()) {
                 if (store.size() === 0) continue;
+                parked_targets.push(Object.freeze({ ...target }));
+            }
+            for (const { target, store } of pending_parked.values()) {
+                if (!has_pending_structural_changes(store.snapshot())) continue;
                 parked_targets.push(Object.freeze({ ...target }));
             }
 
@@ -619,7 +946,12 @@ export function create_edit_session_registry(
         replace_document: () => {
             stores.clear();
             parked.clear();
+            pending_stores.clear();
+            pending_parked.clear();
+            structural_formula_revision += 1;
             unwatch_detached();
+            unwatch_detached_pending();
+            rebuild_pending_formula_output();
             rebuild_formula_projection();
             publish();
         },
@@ -629,6 +961,10 @@ export function create_edit_session_registry(
                 target: WorksheetTarget;
                 entries: ReadonlyMap<string, DirtyEntry>;
             }[] = [];
+            const structuralWorksheets: Array<{
+                target: WorksheetTarget;
+                changes: PendingStructuralChanges;
+            }> = [];
             // Snapshot and stage in one step per store, so no window exists
             // between reading a map and fixing the state that map came from. A
             // `target` of undefined is a store whose sheet is gone from the
@@ -658,13 +994,43 @@ export function create_edit_session_registry(
             for (const { target, store } of parked.values()) {
                 if (!stage(store, target)) return undefined;
             }
-            return { mutations, worksheets };
+            const stage_pending = (
+                store: PendingRowStore,
+                target: WorksheetTarget | undefined,
+            ): boolean => {
+                const changes = store.snapshot();
+                const staged = store.stage_clear(session_id);
+                if (staged === undefined) return false;
+                mutations.push(staged);
+                if (target !== undefined && has_pending_structural_changes(changes)) {
+                    structuralWorksheets.push({ target, changes });
+                }
+                return true;
+            };
+            for (const [sheet_index, store] of pending_stores) {
+                const sheet = sheets[sheet_index];
+                if (!stage_pending(
+                    store,
+                    sheet === undefined ? undefined : target_for_sheet(sheet_index, sheet),
+                )) return undefined;
+            }
+            for (const { target, store } of pending_parked.values()) {
+                if (!stage_pending(store, target)) return undefined;
+            }
+            return {
+                mutations,
+                worksheets,
+                ...(structuralWorksheets.length > 0 ? { structuralWorksheets } : {}),
+            };
         },
         clear_all: (session_id) => {
             for (const store of stores.values()) store.clear(session_id);
             for (const { store } of parked.values()) store.clear(session_id);
+            for (const store of pending_stores.values()) store.clear(session_id);
+            for (const { store } of pending_parked.values()) store.clear(session_id);
         },
         entries: () => stores.entries(),
+        pending_entries: () => pending_stores.entries(),
         adopt_session: () => {
             // Unconditional: the store's adopt_session is a bare stamp
             // assignment with no notification, so there is nothing to save by
@@ -672,6 +1038,8 @@ export function create_edit_session_registry(
             const session_id = current_session_id();
             for (const store of stores.values()) store.adopt_session(session_id);
             for (const { store } of parked.values()) store.adopt_session(session_id);
+            for (const store of pending_stores.values()) store.adopt_session(session_id);
+            for (const { store } of pending_parked.values()) store.adopt_session(session_id);
         },
     };
 }

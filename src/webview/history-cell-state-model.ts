@@ -45,6 +45,8 @@ import {
     plain_value,
     rich_value,
     type EditableCellValue,
+    type PendingFormulaReferenceBasis,
+    type RowIdentity,
 } from '../pending-changes';
 import {
     dirty_entry_value_dimension_present,
@@ -122,6 +124,7 @@ export interface PresentValueDimension {
     readonly formattingKnown?: true;
     readonly movedFrom?: CsvDirtyEntry['movedFrom'];
     readonly valueEditOrder?: number;
+    readonly formulaReferenceBases?: readonly PendingFormulaReferenceBasis[];
 }
 
 export type OverlayValueDimension = UntouchedValueDimension | PresentValueDimension;
@@ -190,6 +193,7 @@ export function value_only_overlay(
     formatting_known?: true,
     moved_from?: CsvDirtyEntry['movedFrom'],
     value_edit_order?: number,
+    formula_reference_bases?: readonly PendingFormulaReferenceBasis[],
 ): PresentCellOverlayState {
     return {
         kind: 'present',
@@ -203,6 +207,9 @@ export function value_only_overlay(
             ...(formatting_known === true ? { formattingKnown: true as const } : {}),
             ...(moved_from === undefined ? {} : { movedFrom: moved_from }),
             ...(value_edit_order === undefined ? {} : { valueEditOrder: value_edit_order }),
+            ...(formula_reference_bases === undefined
+                ? {}
+                : { formulaReferenceBases: formula_reference_bases }),
         },
         hyperlink: { kind: 'untouched' },
     };
@@ -231,6 +238,7 @@ export function combined_overlay(
     formatting_known?: true,
     moved_from?: CsvDirtyEntry['movedFrom'],
     value_edit_order?: number,
+    formula_reference_bases?: readonly PendingFormulaReferenceBasis[],
 ): PresentCellOverlayState {
     return {
         kind: 'present',
@@ -244,6 +252,9 @@ export function combined_overlay(
             ...(formatting_known === true ? { formattingKnown: true as const } : {}),
             ...(moved_from === undefined ? {} : { movedFrom: moved_from }),
             ...(value_edit_order === undefined ? {} : { valueEditOrder: value_edit_order }),
+            ...(formula_reference_bases === undefined
+                ? {}
+                : { formulaReferenceBases: formula_reference_bases }),
         },
         hyperlink: { kind: 'present', value: hyperlink, base: base_hyperlink },
     };
@@ -295,6 +306,7 @@ export function overlay_state_from_dirty_entry(
         && entry.retainValue !== true
         && entry.movedFrom === undefined
         && entry.valueEditOrder === undefined
+        && entry.formulaReferenceBases === undefined
         && (
             value_intent === 'link-only'
             || !dirty_entry_value_dimension_present(entry)
@@ -315,6 +327,7 @@ export function overlay_state_from_dirty_entry(
             entry.formattingKnown,
             entry.movedFrom,
             entry.valueEditOrder,
+            entry.formulaReferenceBases,
         );
     }
     return value_only_overlay(
@@ -326,6 +339,7 @@ export function overlay_state_from_dirty_entry(
         entry.formattingKnown,
         entry.movedFrom,
         entry.valueEditOrder,
+        entry.formulaReferenceBases,
     );
 }
 
@@ -348,6 +362,7 @@ export function dirty_entry_from_overlay_state(
             formattingKnown: state.value.formattingKnown,
             movedFrom: state.value.movedFrom,
             valueEditOrder: state.value.valueEditOrder,
+            formulaReferenceBases: state.value.formulaReferenceBases,
         } : {},
     );
     const base_pending = state.value.kind === 'present' && state.value.basePending;
@@ -376,6 +391,8 @@ function value_dimensions_equal(
         && left.formattingKnown === right.formattingKnown
         && move_provenance_equal(left.movedFrom, right.movedFrom)
         && left.valueEditOrder === right.valueEditOrder
+        && JSON.stringify(left.formulaReferenceBases ?? [])
+            === JSON.stringify(right.formulaReferenceBases ?? [])
         && history_values_equal(left.value, right.value)
         && history_values_equal(left.base, right.base);
 }
@@ -598,6 +615,8 @@ function value_metadata_moved(before: CellOverlayState, after: CellOverlayState)
         || left.formattingKnown !== right.formattingKnown
         || !move_provenance_equal(left.movedFrom, right.movedFrom)
         || left.valueEditOrder !== right.valueEditOrder
+        || JSON.stringify(left.formulaReferenceBases ?? [])
+            !== JSON.stringify(right.formulaReferenceBases ?? [])
         || !history_values_equal(left.base, right.base);
 }
 
@@ -925,12 +944,28 @@ function copy_overlay(
                     row: value.movedFrom.row,
                     col: value.movedFrom.col,
                     order: value.movedFrom.order,
+                    ...(value.movedFrom.rowIdentity === undefined ? {} : {
+                        rowIdentity: copy_row_identity(value.movedFrom.rowIdentity),
+                    }),
                     ...(value.movedFrom.previous === undefined ? {} : {
-                        previous: value.movedFrom.previous.map((move) => ({ ...move })),
+                        previous: value.movedFrom.previous.map((move) => ({
+                            ...move,
+                            ...(move.sourceRowIdentity === undefined ? {} : {
+                                sourceRowIdentity: copy_row_identity(move.sourceRowIdentity),
+                            }),
+                            ...(move.destinationRowIdentity === undefined ? {} : {
+                                destinationRowIdentity: copy_row_identity(
+                                    move.destinationRowIdentity,
+                                ),
+                            }),
+                        })),
                     }),
                 },
             }),
             ...(value.valueEditOrder === undefined ? {} : { valueEditOrder: value.valueEditOrder }),
+            ...(value.formulaReferenceBases === undefined ? {} : {
+                formulaReferenceBases: value.formulaReferenceBases.map((basis) => ({ ...basis })),
+            }),
         }
         : { kind: 'untouched', anchor: value_of(value.anchor) };
     const copied_link_dimension: OverlayHyperlinkDimension = hyperlink.kind === 'present'
@@ -969,3 +1004,9 @@ export function delta_addresses_same_cell(
         && left.sourceColumn === right.sourceColumn
         && worksheet_target_matches(left.worksheet, right.worksheet);
 }
+    const copy_row_identity = (identity: RowIdentity | undefined): RowIdentity | undefined =>
+        identity === undefined
+            ? undefined
+            : identity.kind === 'source'
+                ? { kind: 'source', sourceRow: identity.sourceRow }
+                : { kind: 'pending', pendingRowId: identity.pendingRowId };

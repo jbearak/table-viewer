@@ -199,6 +199,7 @@ function MenuLevel({
                                 aria-haspopup="menu"
                                 aria-expanded={is_open}
                                 aria-controls={submenu_id}
+                                aria-disabled={item.disabled === true ? 'true' : undefined}
                                 disabled={item.disabled}
                                 tabIndex={!item.disabled && active_index === index ? 0 : -1}
                                 onFocus={() => set_active_index(index)}
@@ -240,6 +241,7 @@ function MenuLevel({
                         className={`context-menu-item${item.checked ? ' active' : ''}`}
                         role={item.checked === undefined ? 'menuitem' : 'menuitemcheckbox'}
                         aria-checked={item.checked}
+                        aria-disabled={item.disabled === true ? 'true' : undefined}
                         disabled={item.disabled}
                         tabIndex={!item.disabled && active_index === index ? 0 : -1}
                         onFocus={() => set_active_index(index)}

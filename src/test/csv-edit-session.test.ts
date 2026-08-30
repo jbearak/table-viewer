@@ -20,6 +20,7 @@ import { with_in_memory_authority_transactions } from '../state-authority';
 import type { WorkbookSnapshot, WorkbookSnapshotIdentity } from '../viewer-snapshot';
 import { InvalidPersistedTransformError } from '../panel-core';
 import { sheet_cells, sheet_edits } from './pending-edits-helper';
+import { MAX_PENDING_APPENDED_ROWS } from '../pending-changes';
 
 const enc = new TextEncoder();
 const empty_authority: DurableFileAuthority = {
@@ -423,6 +424,256 @@ beforeEach(() => {
 });
 
 describe('CSV edit sessions', () => {
+    function sized_editing_profile(row_count: number): ViewerProfile {
+        return {
+            editing: true,
+            plan_save: plan_csv_save,
+            build_source: async () => new class extends StubSource {
+                override meta(): WorkbookMeta {
+                    return {
+                        hasFormatting: false,
+                        sheets: [{
+                            name: 'Sheet1',
+                            rowCount: row_count,
+                            sourceRowCount: row_count,
+                            columnCount: 1,
+                            merges: [],
+                            hasFormatting: false,
+                        }],
+                    };
+                }
+            }(),
+        };
+    }
+
+    function append_result(panel: { __messages: unknown[] }, request_id: string) {
+        return [...panel.__messages].reverse().find((message): message is Extract<
+            HostMessage,
+            { type: 'appendRowsResult' }
+        > => (
+            typeof message === 'object'
+            && message !== null
+            && 'type' in message
+            && message.type === 'appendRowsResult'
+            && (message as { requestId?: unknown }).requestId === request_id
+        ));
+    }
+
+    it('enforces the application row cap during host append admission', async () => {
+        const panel = open_csv_table(
+            uri('/tmp/append-row-limit.csv'),
+            state_store().store,
+            sized_editing_profile(1_000_000),
+        );
+        await panel.__receive({ type: 'ready' });
+        await panel.__receive({ type: 'requestEditSession', requestId: 'edit' });
+        const session = latest_edit_session_message(panel)!.editSessionId!;
+        await panel.__receive({
+            type: 'requestAppendRows',
+            requestId: 'over-limit',
+            editSessionId: session,
+            worksheet: { sheetIndex: 0, sheetName: 'Sheet1' },
+            sourceGeneration: initial_snapshot(panel).sourceGeneration,
+            count: 1,
+        });
+        expect(append_result(panel, 'over-limit')).toMatchObject({ granted: false });
+    });
+
+    it('enforces the pending-row quota across the whole edit session', async () => {
+        const panel = open_csv_table(
+            uri('/tmp/append-reservations.csv'),
+            state_store().store,
+            sized_editing_profile(1),
+        );
+        await panel.__receive({ type: 'ready' });
+        await panel.__receive({ type: 'requestEditSession', requestId: 'edit' });
+        const session = latest_edit_session_message(panel)!.editSessionId!;
+        const source_generation = initial_snapshot(panel).sourceGeneration;
+        await panel.__receive({
+            type: 'requestAppendRows',
+            requestId: 'max',
+            editSessionId: session,
+            worksheet: { sheetIndex: 0, sheetName: 'Sheet1' },
+            sourceGeneration: source_generation,
+            count: MAX_PENDING_APPENDED_ROWS,
+        });
+        const maximum = append_result(panel, 'max');
+        expect(maximum?.granted, maximum?.reason).toBe(true);
+        expect(maximum?.rowIds).toHaveLength(MAX_PENDING_APPENDED_ROWS);
+        expect(maximum?.formatTemplate).toBeDefined();
+        expect(maximum?.appendBasis).toBeDefined();
+
+        await panel.__receive({
+            type: 'pendingChangesChanged',
+            sourceGeneration: latest_snapshot(panel).sourceGeneration,
+            editSessionId: session,
+            sequence: 1,
+            changes: {
+                sheetIndex: 0,
+                sheetName: 'Sheet1',
+                cells: {},
+                formatTemplates: [maximum!.formatTemplate!],
+                appendedRows: maximum!.rowIds!.map((id, createdOrder) => ({
+                    id,
+                    cells: {},
+                    formatTemplateId: maximum!.formatTemplate!.id,
+                    createdOrder,
+                })),
+                tailRemovals: [],
+                appendBasis: maximum!.appendBasis!,
+                conflicts: [],
+            },
+        });
+        // Removing accepted rows does not mint another lifetime's worth of
+        // host-authorized identities for the same edit session.
+        await panel.__receive({
+            type: 'pendingChangesChanged',
+            sourceGeneration: latest_snapshot(panel).sourceGeneration,
+            editSessionId: session,
+            sequence: 2,
+            changes: {
+                sheetIndex: 0,
+                sheetName: 'Sheet1',
+                cells: {},
+                formatTemplates: [],
+                appendedRows: [],
+                tailRemovals: [],
+                conflicts: [],
+            },
+        });
+        await panel.__receive({
+            type: 'requestAppendRows',
+            requestId: 'again',
+            editSessionId: session,
+            worksheet: { sheetIndex: 0, sheetName: 'Sheet1' },
+            sourceGeneration: source_generation,
+            count: 1,
+        });
+        expect(append_result(panel, 'again')).toMatchObject({ granted: false });
+    });
+
+    it('holds an omitted append grant until the renderer explicitly cancels it', async () => {
+        const panel = open_csv_table(
+            uri('/tmp/append-refused-aggregate.csv'),
+            state_store().store,
+            sized_editing_profile(1),
+        );
+        await panel.__receive({ type: 'ready' });
+        await panel.__receive({ type: 'requestEditSession', requestId: 'edit' });
+        const session = latest_edit_session_message(panel)!.editSessionId!;
+        const source_generation = initial_snapshot(panel).sourceGeneration;
+        await panel.__receive({
+            type: 'requestAppendRows',
+            requestId: 'unused',
+            editSessionId: session,
+            worksheet: { sheetIndex: 0, sheetName: 'Sheet1' },
+            sourceGeneration: source_generation,
+            count: MAX_PENDING_APPENDED_ROWS,
+        });
+        expect(append_result(panel, 'unused')?.granted).toBe(true);
+
+        // A basis-only/unchanged publication may race ahead of the renderer's
+        // verdict, so omission alone must not release the reservation.
+        await panel.__receive({
+            type: 'pendingChangesChanged',
+            sourceGeneration: latest_snapshot(panel).sourceGeneration,
+            editSessionId: session,
+            sequence: 1,
+            changes: {
+                sheetIndex: 0,
+                sheetName: 'Sheet1',
+                cells: {},
+                formatTemplates: [],
+                appendedRows: [],
+                tailRemovals: [],
+                conflicts: [],
+            },
+        });
+        await panel.__receive({
+            type: 'requestAppendRows',
+            requestId: 'before-cancel',
+            editSessionId: session,
+            worksheet: { sheetIndex: 0, sheetName: 'Sheet1' },
+            sourceGeneration: source_generation,
+            count: 1,
+        });
+        expect(append_result(panel, 'before-cancel')).toMatchObject({ granted: false });
+
+        await panel.__receive({
+            type: 'settleRowAdmission',
+            requestId: 'unused',
+            editSessionId: session,
+            accepted: false,
+        });
+        await panel.__receive({
+            type: 'requestAppendRows',
+            requestId: 'after-cancel',
+            editSessionId: session,
+            worksheet: { sheetIndex: 0, sheetName: 'Sheet1' },
+            sourceGeneration: source_generation,
+            count: 1,
+        });
+        expect(append_result(panel, 'after-cancel')).toMatchObject({
+            granted: true,
+            rowIds: [expect.any(String)],
+        });
+    });
+
+    it('retires an accepted append grant omitted from its first complete publication', async () => {
+        const panel = open_csv_table(
+            uri('/tmp/append-accepted-then-rolled-back.csv'),
+            state_store().store,
+            sized_editing_profile(1),
+        );
+        await panel.__receive({ type: 'ready' });
+        await panel.__receive({ type: 'requestEditSession', requestId: 'edit' });
+        const session = latest_edit_session_message(panel)!.editSessionId!;
+        const source_generation = initial_snapshot(panel).sourceGeneration;
+        await panel.__receive({
+            type: 'requestAppendRows',
+            requestId: 'accepted-but-omitted',
+            editSessionId: session,
+            worksheet: { sheetIndex: 0, sheetName: 'Sheet1' },
+            sourceGeneration: source_generation,
+            count: MAX_PENDING_APPENDED_ROWS,
+        });
+        const omitted = append_result(panel, 'accepted-but-omitted')!;
+        expect(omitted.granted).toBe(true);
+        await panel.__receive({
+            type: 'settleRowAdmission',
+            requestId: 'accepted-but-omitted',
+            editSessionId: session,
+            accepted: true,
+        });
+        await panel.__receive({
+            type: 'pendingChangesChanged',
+            sourceGeneration: latest_snapshot(panel).sourceGeneration,
+            editSessionId: session,
+            sequence: 1,
+            changes: {
+                sheetIndex: 0,
+                sheetName: 'Sheet1',
+                cells: {},
+                formatTemplates: [],
+                appendedRows: [],
+                tailRemovals: [],
+                conflicts: [],
+            },
+        });
+        await panel.__receive({
+            type: 'requestAppendRows',
+            requestId: 'after-accepted-rollback',
+            editSessionId: session,
+            worksheet: { sheetIndex: 0, sheetName: 'Sheet1' },
+            sourceGeneration: source_generation,
+            count: 1,
+        });
+        expect(append_result(panel, 'after-accepted-rollback')).toMatchObject({
+            granted: true,
+            appendBasis: { provisionalRowCount: 1 },
+        });
+    });
+
     it('flushes only after the exact renderer sequence reaches the current backend', async () => {
         vscode_mock.__setConfigurationValue('tableViewer.diffOnByDefault', true);
         const versioned = state_store();

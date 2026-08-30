@@ -10,7 +10,9 @@ export interface CellContextMenuModelProps {
     discard_edit_cell_count: number;
     has_distinct_copy_selection: boolean;
     preview_mode: boolean;
+    can_highlight: boolean;
     can_hide_rows: boolean;
+    show_disabled_hide_rows?: boolean;
     selected_row_count: number;
     selected_column_count: number;
     can_clear_highlight: boolean;
@@ -83,7 +85,7 @@ export function cell_context_menu_items(props: CellContextMenuModelProps): MenuI
             on_click: () => props.on_discard_edit(),
         });
     }
-    if (!props.preview_mode) {
+    if (!props.preview_mode && props.can_highlight) {
         if (items.length > 0) items.push({ kind: 'separator' });
         for (const color of CELL_HIGHLIGHT_COLORS) {
             items.push({
@@ -106,8 +108,12 @@ export function cell_context_menu_items(props: CellContextMenuModelProps): MenuI
         : { label: 'Copy cell', on_click: () => props.on_copy_cell() });
 
     const hide_items: MenuItem[] = [];
-    if (props.can_hide_rows) {
-        hide_items.push(hide_rows_menu_item(props.selected_row_count, props.on_hide_rows));
+    if (props.can_hide_rows || props.show_disabled_hide_rows) {
+        hide_items.push(hide_rows_menu_item(
+            props.selected_row_count,
+            props.on_hide_rows,
+            !props.can_hide_rows,
+        ));
     }
     hide_items.push(
         hide_columns_menu_item(props.selected_column_count, props.on_hide_columns),

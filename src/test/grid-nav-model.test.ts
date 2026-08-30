@@ -3,6 +3,7 @@ import {
     resolve_nav,
     is_copy_key,
     move_sequential_cell,
+    sequential_append_target_column,
 } from '../webview/grid-nav-model';
 
 // Defaults for a plain (no-modifier) key press; override per case.
@@ -110,6 +111,45 @@ describe('move_sequential_cell', () => {
     it('is total for an empty dimension', () => {
         expect(move_sequential_cell([0, 0], 'next', 0, 3)).toEqual([0, 0]);
         expect(move_sequential_cell([0, 0], 'next', 3, 0)).toEqual([0, 0]);
+    });
+});
+
+describe('sequential_append_target_column', () => {
+    it('continues Enter into the same column after the final row', () => {
+        expect(sequential_append_target_column([1, 2], 'below', 3, 4)).toBe(1);
+    });
+
+    it('wraps Tab into the first column after the final cell', () => {
+        expect(sequential_append_target_column([3, 2], 'next', 3, 4)).toBe(0);
+    });
+
+    it('does not append before a sequential boundary or for Shift+Tab', () => {
+        expect(sequential_append_target_column([2, 2], 'next', 3, 4)).toBeUndefined();
+        expect(sequential_append_target_column([0, 0], 'previous', 3, 4)).toBeUndefined();
+    });
+
+    it('appends when merge-aware traversal has no later reachable stop', () => {
+        expect(sequential_append_target_column(
+            [1, 0],
+            'below',
+            4,
+            3,
+            [1, 0],
+        )).toBe(1);
+        expect(sequential_append_target_column(
+            [1, 1],
+            'next',
+            3,
+            4,
+            [1, 1],
+        )).toBe(0);
+        expect(sequential_append_target_column(
+            [1, 1],
+            'next',
+            3,
+            4,
+            [2, 1],
+        )).toBeUndefined();
     });
 });
 

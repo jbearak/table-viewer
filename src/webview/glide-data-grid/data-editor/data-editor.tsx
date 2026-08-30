@@ -61,7 +61,7 @@ import { useAutoscroll } from "./use-autoscroll.js";
 import type { CustomRenderer, CellRenderer, InternalCellRenderer } from "../cells/cell-types.js";
 import {
     copyBufferContainsCut,
-    cutSourceGridLocations,
+    cutSourceCells,
     decodeHTML,
     getCopyBufferContents,
     resolveCopyBufferValue,
@@ -203,6 +203,12 @@ function shiftSelection(input: GridSelection, offset: number): GridSelection {
 /**
  * @category DataEditor
  */
+export interface PasteRowsAdmission {
+    /** Exact topology expected after installing only this admission's rows. */
+    readonly topologyKey: unknown;
+    rollback(): void;
+}
+
 export interface DataEditorProps extends Props, Pick<DataGridSearchProps, "imageWindowLoader"> {
     /** Emitted whenever the user has requested the deletion of the selection.
      * @group Editing
@@ -212,6 +218,9 @@ export interface DataEditorProps extends Props, Pick<DataGridSearchProps, "image
     readonly onClipboardPasteError?: (message: string) => void;
     /** Changes whenever an outstanding cut must be invalidated. */
     readonly cutValidationKey?: unknown;
+    /** Stable worksheet identity used to validate a cut before a trailing row exists. */
+    readonly clipboardSource?: string;
+    readonly clipboardProjectionGeneration?: number;
     /**
      * Fork addition: merged cell ranges in cell coordinates (x = column,
      * y = row, width = column span, height = row span). Each range renders as
@@ -239,11 +248,17 @@ export interface DataEditorProps extends Props, Pick<DataGridSearchProps, "image
     readonly onCellsEdited?: (
         newValues: readonly EditListItem[],
         source: CellEditSource
-    ) => boolean | void;
+    ) => boolean | "refused" | void;
     /** Emitted whenever a row append operation is requested. Append location can be set in callback.
      * @group Editing
      */
-    readonly onRowAppended?: () => Promise<"top" | "bottom" | number | undefined> | void;
+    readonly onRowAppended?: () => Promise<
+        | "top"
+        | "bottom"
+        | number
+        | { readonly row: number; readonly ready: () => boolean }
+        | undefined
+    > | void;
     /** Emitted when a column header should show a context menu. Usually right click.
      * @group Events
      */
@@ -627,6 +642,15 @@ export interface DataEditorProps extends Props, Pick<DataGridSearchProps, "image
      * @group Editing
      */
     readonly onPaste?: ((target: Item, values: readonly (readonly string[])[]) => boolean) | boolean;
+    /** Admit enough rows for one rectangular paste before any destination cell changes. */
+    readonly onPasteRowsNeeded?: (
+        count: number,
+        expectedTopologyKey: unknown,
+    ) => Promise<boolean | PasteRowsAdmission>;
+    /** Changes whenever numeric paste coordinates acquire a different meaning. */
+    readonly pasteTopologyKey?: string | number;
+    /** Adds row state to the accessibility tree without changing visible cell text. */
+    readonly getRowAccessibilityLabel?: (row: number) => string | undefined;
 
     /**
      * The theme used by the data grid to get all color and font information
@@ -816,8 +840,13 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
         onDragStart,
         onMouseMove,
         onPaste,
+        onPasteRowsNeeded,
+        pasteTopologyKey,
+        getRowAccessibilityLabel,
         onClipboardPasteError,
         cutValidationKey,
+        clipboardSource,
+        clipboardProjectionGeneration,
         copyHeaders = false,
         freezeColumns = 0,
         cellActivationBehavior = "second-click",
@@ -1242,6 +1271,10 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
     const pendingCutOperationIdRef = React.useRef<string | undefined>();
     const pendingClipboardOperationIdRef = React.useRef<string | undefined>();
     const pendingCutCellsRef = React.useRef<CutSourceIdentity | undefined>();
+    const pasteTopologyKeyRef = React.useRef(pasteTopologyKey);
+    React.useLayoutEffect(() => {
+        pasteTopologyKeyRef.current = pasteTopologyKey;
+    }, [pasteTopologyKey]);
     React.useLayoutEffect(() => {
         pendingCutOperationIdRef.current = undefined;
         pendingCutCellsRef.current = undefined;
@@ -1261,8 +1294,6 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
 
     const mangledOnCellsEdited = React.useCallback<NonNullable<typeof onCellsEdited>>(
         (items: readonly EditListItem[], source: CellEditSource) => {
-            pendingCutOperationIdRef.current = undefined;
-            pendingCutCellsRef.current = undefined;
             const mangledItems =
                 rowMarkerOffset === 0
                     ? items
@@ -1272,7 +1303,12 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
                       }));
             const r = onCellsEdited?.(mangledItems, source);
 
-            if (r !== true) {
+            if (r !== "refused") {
+                pendingCutOperationIdRef.current = undefined;
+                pendingCutCellsRef.current = undefined;
+            }
+
+            if (r !== true && r !== "refused") {
                 for (const i of mangledItems) onCellEdited?.(i.location, i.value);
             }
 
@@ -1462,6 +1498,8 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
             getCellContent,
         ]
     );
+    const getMangledCellContentRef = React.useRef(getMangledCellContent);
+    getMangledCellContentRef.current = getMangledCellContent;
 
     const mangledGetGroupDetails = React.useCallback<NonNullable<DataEditorProps["getGroupDetails"]>>(
         group => {
@@ -1755,17 +1793,20 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
             }
             const appendResult = onRowAppended?.();
 
-            let r: "top" | "bottom" | number | undefined = undefined;
+            let r: "top" | "bottom" | number | {
+                readonly row: number;
+                readonly ready: () => boolean;
+            } | undefined = undefined;
             let bottom = true;
             if (appendResult !== undefined) {
                 r = await appendResult;
                 if (r === "top") bottom = false;
-                if (typeof r === "number") bottom = false;
+                if (typeof r === "number" || typeof r === "object") bottom = false;
             }
 
             let backoff = 0;
             const doFocus = () => {
-                if (rowsRef.current <= rows) {
+                if (typeof r === "object" ? !r.ready() : rowsRef.current <= rows) {
                     if (backoff < 500) {
                         window.setTimeout(doFocus, backoff);
                     }
@@ -1773,7 +1814,11 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
                     return;
                 }
 
-                const row = typeof r === "number" ? r : bottom ? rows : 0;
+                const row = typeof r === "number"
+                    ? r
+                    : typeof r === "object"
+                        ? r.row
+                        : bottom ? rows : 0;
                 scrollToRef.current(col - rowMarkerOffset, row);
                 setCurrent(
                     {
@@ -3072,7 +3117,11 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
     const onFinishEditing = React.useCallback(
         (newValue: GridCell | undefined, movement: readonly [-1 | 0 | 1, -1 | 0 | 1]) => {
             if (overlay?.cell !== undefined && newValue !== undefined && isEditableGridCell(newValue)) {
-                mangledOnCellsEdited([{ location: overlay.cell, value: newValue }], "edit");
+                const result = mangledOnCellsEdited(
+                    [{ location: overlay.cell, value: newValue }],
+                    "edit"
+                );
+                if (result === "refused") return false;
                 window.requestAnimationFrame(() => {
                     gridRef.current?.damage([
                         {
@@ -3097,6 +3146,7 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
                 );
             }
             onFinishedEditing?.(newValue, movement);
+            return true;
         },
         [
             overlay?.cell,
@@ -3550,9 +3600,22 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
         ]
     );
 
-    const onPasteInternal = React.useCallback(
-        async (e?: ClipboardEvent) => {
+    const performPasteInternal = React.useCallback(
+        async (
+            e?: ClipboardEvent,
+            captured?: { readonly html?: string; readonly text?: string },
+            topologyKeyAtStart = pasteTopologyKeyRef.current
+        ) => {
             if (!keybindings.paste) return;
+            let expectedTopologyKey: unknown = topologyKeyAtStart;
+            const topologyChanged = () => pasteTopologyKeyRef.current !== expectedTopologyKey;
+            const reportTopologyChange = () => onClipboardPasteError?.(
+                "The table layout changed while pasting. No cells were changed."
+            );
+            if (topologyChanged()) {
+                reportTopologyChange();
+                return;
+            }
             function pasteToCell(
                 inner: InnerGridCell,
                 target: Item,
@@ -3630,7 +3693,12 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
                 const textPlain = "text/plain";
                 const textHtml = "text/html";
 
-                if (navigator.clipboard.read !== undefined) {
+                if (captured?.html !== undefined) {
+                    data = decodeHTML(captured.html);
+                    if (data === undefined) text = captured.text;
+                } else if (captured?.text !== undefined) {
+                    text = captured.text;
+                } else if (navigator.clipboard.read !== undefined) {
                     const clipboardContent = await navigator.clipboard.read();
 
                     for (const item of clipboardContent) {
@@ -3662,15 +3730,28 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
                     return; // I didn't want to read that paste value anyway
                 }
 
+                if (topologyChanged()) {
+                    reportTopologyChange();
+                    return;
+                }
+
                 const [targetCol, targetRow] = target;
-                const destinationSource = getMangledCellContent(target).clipboardData?.source;
+                const destinationClipboard = getMangledCellContent(target).clipboardData;
+                const targets_trailing_row = showTrailingBlankRow
+                    && targetRow === rowsRef.current;
+                const destinationSource = destinationClipboard?.source
+                    ?? (targets_trailing_row ? clipboardSource : undefined);
+                const destination_projection_generation =
+                    destinationClipboard?.projectionGeneration
+                    ?? (targets_trailing_row ? clipboardProjectionGeneration : undefined);
                 const cutSources = data === undefined
                     ? undefined
-                    : cutSourceGridLocations(
+                    : cutSourceCells(
                         data,
                         destinationSource,
                         pendingCutOperationIdRef.current,
                         pendingCutCellsRef.current,
+                        destination_projection_generation,
                     );
                 if (data !== undefined && copyBufferContainsCut(data) && cutSources === undefined) {
                     onClipboardPasteError?.(
@@ -3692,6 +3773,7 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
 
                 const editList: EditListItem[] = [];
                 let cutPasteComplete = true;
+                let rowAdmission: PasteRowsAdmission | undefined;
                 do {
                     if (onPaste === undefined) {
                         const cellData = getMangledCellContent(target);
@@ -3719,15 +3801,42 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
                         return;
                     }
 
+                    // Validate the rectangular paste before asking the owner to
+                    // grow the row model. A refused width must be atomic: it
+                    // cannot leave admitted blank rows behind merely because the
+                    // vertical bound was checked first.
+                    const rowsNeeded = targetRow + data.length - rowsRef.current;
+                    if (rowsNeeded > 0) {
+                        if (onPasteRowsNeeded === undefined) return;
+                        const admission = await onPasteRowsNeeded(
+                            rowsNeeded,
+                            expectedTopologyKey,
+                        );
+                        if (admission === false) return;
+                        if (typeof admission === "object") rowAdmission = admission;
+                        if (topologyChanged()) {
+                            if (
+                                rowAdmission !== undefined
+                                && pasteTopologyKeyRef.current === rowAdmission.topologyKey
+                            ) {
+                                expectedTopologyKey = rowAdmission.topologyKey;
+                            } else {
+                                rowAdmission?.rollback();
+                                reportTopologyChange();
+                                return;
+                            }
+                        }
+                    }
+
                     for (const [row, dataRow] of data.entries()) {
-                        if (row + targetRow >= rows) {
+                        if (row + targetRow >= rowsRef.current) {
                             if (cutSources !== undefined) cutPasteComplete = false;
                             break;
                         }
                         for (const [col, dataItem] of dataRow.entries()) {
                             const index = [col + targetCol, row + targetRow] as const;
                             const [writeCol, writeRow] = index;
-                            if (writeCol >= mangledCols.length || writeRow >= mangledRows) {
+                            if (writeCol >= mangledCols.length || writeRow >= rowsRef.current) {
                                 if (cutSources !== undefined) cutPasteComplete = false;
                                 continue;
                             }
@@ -3738,7 +3847,7 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
                                 if (cutSources !== undefined) cutPasteComplete = false;
                                 continue;
                             }
-                            const cellData = getMangledCellContent(index);
+                            const cellData = getMangledCellContentRef.current(index);
                             const rawValue = resolveCopyBufferValue(
                                 dataItem,
                                 cellData.clipboardData,
@@ -3746,12 +3855,21 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
                             );
                             const newVal = pasteToCell(cellData, index, rawValue, dataItem.formatted);
                             if (newVal !== undefined) {
-                                editList.push(cutSources === undefined
-                                    ? newVal
-                                    : {
-                                        ...newVal,
+                                const target = cellData.clipboardData;
+                                editList.push({
+                                    ...newVal,
+                                    ...(target?.rowIdentity === undefined ? {} : {
+                                        targetRowIdentity: target.rowIdentity,
+                                        targetSourceColumn: target.location[0],
+                                    }),
+                                    ...(cutSources === undefined ? {} : {
                                         movedFrom: dataItem.clipboardData!.location,
-                                    });
+                                        ...(dataItem.clipboardData!.rowIdentity === undefined ? {} : {
+                                            movedFromRowIdentity:
+                                                dataItem.clipboardData!.rowIdentity,
+                                        }),
+                                    }),
+                                });
                             } else if (cutSources !== undefined) {
                                 cutPasteComplete = false;
                             }
@@ -3761,6 +3879,7 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
                 } while (false);
 
                 if (cutSources !== undefined && !cutPasteComplete) {
+                    rowAdmission?.rollback();
                     onClipboardPasteError?.(
                         "The cut range cannot be moved to every destination cell. No cells were changed."
                     );
@@ -3772,24 +3891,47 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
                 // so history records one action. Metadata from another sheet or
                 // projection remains a paste and cannot clear this grid.
                 if (cutSources !== undefined && editList.length > 0) {
-                    const destinations = new Set(editList.map(({ location }) => `${location[0]}:${location[1]}`));
+                    const identityKey = (
+                        identity: NonNullable<EditListItem["targetRowIdentity"]>,
+                        sourceColumn: number,
+                    ) => identity.kind === "source"
+                        ? `source:${identity.sourceRow}:${sourceColumn}`
+                        : `pending:${identity.pendingRowId}:${sourceColumn}`;
+                    const destinations = new Set(editList.flatMap((item) =>
+                        item.targetRowIdentity === undefined
+                            || item.targetSourceColumn === undefined
+                            ? []
+                            : [identityKey(item.targetRowIdentity, item.targetSourceColumn)]));
                     const seen = new Set<string>();
                     const deletions: EditListItem[] = [];
-                    for (const [sourceCol, sourceRow] of cutSources) {
-                        const mangledSourceCol = sourceCol + rowMarkerOffset;
-                        const key = `${mangledSourceCol}:${sourceRow}`;
+                    for (const source of cutSources) {
+                        // A covered merge cell is storage-less. Clearing it as
+                        // well as the anchor would manufacture a second edit for
+                        // one logical source value.
+                        if (mergedCells?.isCovered(
+                            source.gridLocation[0] + rowMarkerOffset,
+                            source.gridLocation[1]
+                        ) === true) continue;
+                        const key = identityKey(source.rowIdentity, source.sourceColumn);
                         if (destinations.has(key) || seen.has(key)) continue;
-                        if (mergedCells?.isCovered(mangledSourceCol, sourceRow) === true) continue;
-                        const before = deletions.length;
-                        collectRangeDeletions({
-                            x: mangledSourceCol,
-                            y: sourceRow,
-                            width: 1,
-                            height: 1,
-                        }, deletions, seen);
-                        if (deletions.length !== before + 1) cutPasteComplete = false;
+                        seen.add(key);
+                        deletions.push({
+                            location: [
+                                source.gridLocation[0] + rowMarkerOffset,
+                                source.gridLocation[1],
+                            ],
+                            targetRowIdentity: source.rowIdentity,
+                            targetSourceColumn: source.sourceColumn,
+                            value: {
+                                kind: GridCellKind.Text,
+                                data: "",
+                                displayData: "",
+                                allowOverlay: true,
+                            },
+                        });
                     }
                     if (!cutPasteComplete) {
+                        rowAdmission?.rollback();
                         onClipboardPasteError?.(
                             "The cut source contains a cell that cannot be cleared. No cells were changed."
                         );
@@ -3798,7 +3940,14 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
                     editList.unshift(...deletions);
                 }
 
-                mangledOnCellsEdited(editList, "paste");
+                const result = mangledOnCellsEdited(editList, "paste");
+                if (result === "refused") {
+                    rowAdmission?.rollback();
+                    onClipboardPasteError?.(
+                        "The table is busy, so the paste was not applied. Try again."
+                    );
+                    return;
+                }
 
                 gridRef.current?.damage(
                     editList.map(c => ({
@@ -3818,12 +3967,40 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
             mangledOnCellsEdited,
             mangledRows,
             onPaste,
+            onPasteRowsNeeded,
+            pasteTopologyKey,
+            clipboardSource,
+            clipboardProjectionGeneration,
             onClipboardPasteError,
             rowMarkerOffset,
             rows,
             mergedCells,
         ]
     );
+
+    // A paste can cross asynchronous clipboard reads and host-backed row
+    // admission. Serialize the whole gesture so the next paste samples the
+    // selection and row extent produced by the previous one, not their stale
+    // pre-admission values. ClipboardEvent data is captured synchronously because
+    // browsers may clear its DataTransfer after the event returns.
+    const pasteTailRef = React.useRef<Promise<void>>(Promise.resolve());
+    const onPasteInternal = React.useCallback((e?: ClipboardEvent) => {
+        const topologyKeyAtStart = pasteTopologyKeyRef.current;
+        let captured: { html?: string; text?: string } | undefined;
+        if (e?.clipboardData !== null && e?.clipboardData !== undefined) {
+            captured = {};
+            if (e.clipboardData.types.includes("text/html")) {
+                captured.html = e.clipboardData.getData("text/html");
+            }
+            if (e.clipboardData.types.includes("text/plain")) {
+                captured.text = e.clipboardData.getData("text/plain");
+            }
+        }
+        const queued = pasteTailRef.current
+            .catch(() => undefined)
+            .then(() => performPasteInternal(e, captured, topologyKeyAtStart));
+        pasteTailRef.current = queued;
+    }, [performPasteInternal]);
 
     useEventListener("paste", onPasteInternal, safeWindow, false, true);
 
@@ -4298,6 +4475,7 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
                     cellXOffset={cellXOffset}
                     cellYOffset={cellYOffset}
                     accessibilityHeight={visibleRegion.height}
+                    getRowAccessibilityLabel={getRowAccessibilityLabel}
                     onDragEnd={onDragEnd}
                     columns={mangledCols}
                     nonGrowWidth={nonGrowWidth}

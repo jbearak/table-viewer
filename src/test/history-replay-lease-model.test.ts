@@ -154,6 +154,19 @@ describe('expiry', () => {
         expect(leases.current(time.now())?.state).toBe('committing');
         expect(leases.decide_commit(commit(), time.now()).kind).toBe('join');
     });
+
+    it('reports an expired issued lease to its resource owner', () => {
+        const time = clock();
+        const dropped: string[] = [];
+        const leases = create_history_replay_lease_registry<string, string>(
+            (lease) => dropped.push(lease.payload),
+        );
+        leases.issue(IDENTITY, 'reserved rows', time.now());
+
+        time.advance(HISTORY_REPLAY_LEASE_TTL_MS);
+        expect(leases.current(time.now())).toBeUndefined();
+        expect(dropped).toEqual(['reserved rows']);
+    });
 });
 
 describe('settled replays', () => {
@@ -215,6 +228,23 @@ describe('settled replays', () => {
         )).toBeDefined();
     });
 
+    it('a newer preparation evicts the prior retained terminal', () => {
+        const time = clock();
+        const leases = registry();
+        leases.issue(IDENTITY, 'payload-1', time.now());
+        leases.decide_commit(commit(), time.now());
+        leases.settle(IDENTITY.leaseId, 'committed-1', time.now());
+
+        const second = {
+            leaseId: 'lease-2',
+            requestId: 'req-2',
+            replayId: 'replay-2',
+        };
+        expect(leases.issue(second, 'payload-2', time.now())).toBeDefined();
+        expect(leases.decide_commit(commit(), time.now()))
+            .toEqual({ kind: 'refuse', reason: 'expired' });
+    });
+
     it('settling a lease that is not committing does nothing', () => {
         const time = clock();
         const leases = registry();
@@ -268,6 +298,22 @@ describe('abandonment and invalidation', () => {
         leases.decide_commit(commit({ leaseId: 'lease-2' }), time.now());
         leases.invalidate();
         expect(leases.current(time.now())?.state).toBe('committing');
+    });
+
+    it('reports invalidation and clear of issued leases exactly once', () => {
+        const time = clock();
+        const dropped: string[] = [];
+        const leases = create_history_replay_lease_registry<string, string>(
+            (lease) => dropped.push(lease.payload),
+        );
+        leases.issue(IDENTITY, 'invalidated', time.now());
+        leases.invalidate();
+        leases.invalidate();
+
+        leases.issue({ ...IDENTITY, leaseId: 'lease-2' }, 'cleared', time.now());
+        leases.clear();
+        leases.clear();
+        expect(dropped).toEqual(['invalidated', 'cleared']);
     });
 
     it('clearing forgets settled answers too', () => {

@@ -31,7 +31,10 @@ interface DataGridOverlayEditorProps {
     readonly initialValue?: string;
     readonly bloom?: readonly [number, number];
     readonly theme: Theme;
-    readonly onFinishEditing: (newCell: GridCell | undefined, movement: readonly [-1 | 0 | 1, -1 | 0 | 1]) => void;
+    readonly onFinishEditing: (
+        newCell: GridCell | undefined,
+        movement: readonly [-1 | 0 | 1, -1 | 0 | 1],
+    ) => boolean | void;
     readonly forceEditMode: boolean;
     readonly highlight: boolean;
     readonly imageEditorOverride?: ImageEditorType;
@@ -78,7 +81,7 @@ const DataGridOverlayEditor: React.FunctionComponent<DataGridOverlayEditorProps>
 
     const onFinishEditing = React.useCallback<typeof onFinishEditingIn>(
         (newCell, movement) => {
-            onFinishEditingIn(isValid ? newCell : undefined, movement);
+            return onFinishEditingIn(isValid ? newCell : undefined, movement);
         },
         [isValid, onFinishEditingIn]
     );
@@ -105,14 +108,17 @@ const DataGridOverlayEditor: React.FunctionComponent<DataGridOverlayEditorProps>
     const customMotion = React.useRef<[-1 | 0 | 1, -1 | 0 | 1] | undefined>(undefined);
 
     const onClickOutside = React.useCallback(() => {
-        onFinishEditing(tempValue, [0, 0]);
-        finished.current = true;
+        if (onFinishEditing(tempValue, [0, 0]) !== false) finished.current = true;
     }, [tempValue, onFinishEditing]);
 
     const onEditorFinished = React.useCallback(
         (newValue: GridCell | undefined, movement?: readonly [-1 | 0 | 1, -1 | 0 | 1]) => {
-            onFinishEditing(newValue, movement ?? customMotion.current ?? [0, 0]);
-            finished.current = true;
+            const committed = onFinishEditing(
+                newValue,
+                movement ?? customMotion.current ?? [0, 0],
+            );
+            if (committed !== false) finished.current = true;
+            return committed;
         },
         [onFinishEditing]
     );
@@ -138,8 +144,10 @@ const DataGridOverlayEditor: React.FunctionComponent<DataGridOverlayEditorProps>
 
             window.setTimeout(() => {
                 if (!finished.current && customMotion.current !== undefined) {
-                    onFinishEditing(save ? tempValue : undefined, customMotion.current);
-                    finished.current = true;
+                    if (onFinishEditing(
+                        save ? tempValue : undefined,
+                        customMotion.current,
+                    ) !== false) finished.current = true;
                 }
             }, 0);
         },

@@ -142,6 +142,19 @@ export class ExcelHeaderDataSource implements DataSource {
         return this._meta;
     }
 
+    append_style_dependency_fingerprint(
+        cell_style_indexes: readonly (number | null)[],
+        row_style_index?: number,
+    ): string {
+        if (!this.base.append_style_dependency_fingerprint) {
+            throw new Error('This workbook cannot fingerprint append styles.');
+        }
+        return this.base.append_style_dependency_fingerprint(
+            cell_style_indexes,
+            row_style_index,
+        );
+    }
+
     source_row_indices(
         sheet_index: number,
         projected_rows: ArrayLike<number>,

@@ -6,6 +6,31 @@ export type GridNavigationDecision =
     | { kind: 'direction'; direction: Direction }
     | { kind: 'sequential'; navigation: SequentialNavigation };
 
+/** Column to open after a sequential move crosses the final displayed cell. */
+export function sequential_append_target_column(
+    cell: readonly [number, number],
+    navigation: SequentialNavigation,
+    row_count: number,
+    column_count: number,
+    resolved_target?: readonly [number, number],
+): number | undefined {
+    if (row_count <= 0 || column_count <= 0) {
+        return undefined;
+    }
+    // Merge-aware traversal returns the current anchor when every later stop is
+    // covered. That is the real boundary even when the anchor itself is not in
+    // the literal last row/column.
+    if (resolved_target !== undefined
+        && (resolved_target[0] !== cell[0] || resolved_target[1] !== cell[1])) {
+        return undefined;
+    }
+    if (resolved_target === undefined && cell[1] !== row_count - 1) return undefined;
+    if (navigation === 'below') return cell[0];
+    if (navigation === 'next'
+        && (resolved_target !== undefined || cell[0] === column_count - 1)) return 0;
+    return undefined;
+}
+
 /**
  * Move through displayed cells. Tab order is row-major and retains the current
  * cell at the outer boundaries; hidden source columns are absent from

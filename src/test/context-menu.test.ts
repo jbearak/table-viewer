@@ -205,6 +205,7 @@ describe('ContextMenu keyboard behavior', () => {
         const trigger = document.querySelector<HTMLButtonElement>('button[aria-haspopup="menu"]')!;
         const disabled = Array.from(document.querySelectorAll<HTMLButtonElement>('button'))
             .find((button) => button.textContent === 'Unavailable')!;
+        expect(disabled.getAttribute('aria-disabled')).toBe('true');
         act(() => trigger.dispatchEvent(new MouseEvent('mouseover', { bubbles: true })));
         expect(trigger.getAttribute('aria-expanded')).toBe('true');
 
@@ -252,6 +253,7 @@ describe('ContextMenu keyboard behavior', () => {
             },
         ]);
         const triggers = document.querySelectorAll<HTMLButtonElement>('button[aria-haspopup="menu"]');
+        expect(triggers[1].getAttribute('aria-disabled')).toBe('true');
         act(() => triggers[1].click());
         expect(triggers[1].getAttribute('aria-expanded')).toBe('false');
         act(() => triggers[0].click());

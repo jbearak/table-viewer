@@ -1,4 +1,4 @@
-import { createHash } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 import { CsvDataSource } from './data-source/csv-source';
 import {
     build_source_from_buffer,
@@ -44,11 +44,14 @@ import {
     assert_safe_file_size,
     FileSizeLimitExceededError,
     MAX_CSV_ROWS,
+    MAX_SHEET_ROWS,
     MAX_WORKBOOK_FORMULAS,
 } from './spreadsheet-safety';
-import { prepare_csv_serializer } from './serialize-csv';
+import { prepare_csv_serializer, serialize_delimited_values } from './serialize-csv';
 import {
     create_xlsx_formula_write_plan,
+    capture_xlsx_append_row_format,
+    xlsx_append_style_dependency_fingerprint,
     write_xlsx_workbook_cell_edits,
     type XlsxFormulaWritePlan,
 } from './xlsx-package';
@@ -63,7 +66,7 @@ import {
     type FormulaCalculationResult,
 } from './formula-calculation';
 import { is_xlsx_formula_edit, type XlsxCellEdit } from './xlsx-cell-write';
-import { xlsx_edit_writes_formula } from './xlsx-cell-value';
+import { pending_formula_cells_referencing_provisional_rows } from './pending-formula-rebase';
 import { validate_dirty_bases } from './csv-base-validation';
 import { cell_edit_base } from './cell-edit-model';
 import { get_raw_cell_text } from './cell-display';
@@ -106,6 +109,8 @@ import {
     MAX_PERSISTED_HIDDEN_ROWS,
     MAX_PERSISTED_ROW_HEIGHTS,
     has_any_pending_edits,
+    own_wire_pending_changes,
+    pending_changes_for_sheet,
     pending_edits_for_sheet,
     reconcile_pending_edit_sheets,
     sanitize_excel_header_overrides,
@@ -113,6 +118,7 @@ import {
     transform_has_entries,
     transform_is_active,
     transform_schema_for_sheet,
+    with_pending_changes_for_sheet,
     with_pending_edits_for_sheet,
     worksheet_identity,
     worksheet_target_index,
@@ -120,7 +126,9 @@ import {
     worksheet_target_lookup,
     worksheet_target_matches,
     type ActiveCsvSaveLifecycle,
+    type CellHighlightColor,
     type CsvDirtyMap,
+    type CsvDirtyEntry,
     dirty_entries_equal,
     dirty_entry_link_changed,
     dirty_entry_value_changed,
@@ -143,6 +151,7 @@ import {
     type WorksheetIdentity,
     type WorksheetIdentityInput,
     type WorksheetPendingEdits,
+    type WorksheetPendingChanges,
     type WorksheetTarget,
 } from './types';
 import {
@@ -150,6 +159,28 @@ import {
     sanitize_transform_state,
 } from './webview/sheet-state';
 import { sanitize_column_visibility_state } from './webview/column-projection';
+import { create_column_projection } from './webview/column-projection';
+import {
+    advance_pending_append_basis,
+    assert_json_encoded_bound,
+    assert_pending_changes_encoded_bound,
+    assert_pending_user_changes_encoded_bound,
+    EMPTY_PENDING_STRUCTURAL_CHANGES,
+    MAX_PENDING_APPENDED_ROWS,
+    own_pending_structural_changes,
+    type PendingAppendedRow,
+    type PendingAppendBasis,
+    type PendingRowFormat,
+    type PendingRowFormatTemplate,
+    type PendingTailRemoval,
+    type PendingStructuralChanges,
+    type PendingStructuralConflict,
+    type PendingStructuralConflictReason,
+    type SavedAppendedRowSnapshot,
+} from './pending-changes';
+import { MAX_HISTORY_ACTION_ENCODED_BYTES } from './history-limits';
+import { RetainedPendingAppendAuthorityStore } from './retained-pending-append-authority';
+import { AppendAdmissionTemplateAuthorityStore } from './append-admission-template-authority';
 // The host is now the only writer of durable heights, so the floor a resize is clamped
 // against has to be applied here. Imported from the webview module that already owns it
 // rather than restated: two copies of a minimum are two numbers that can drift, and the
@@ -175,10 +206,12 @@ import {
     type CommitHistoryReplayRequest,
     type HistoryReplayCommitRefused,
     type HistoryReplayCommitted,
+    type HistoryReplayAcceptedStructuralWrite,
     type HistoryReplayFocus,
     type HistoryReplayHighlightInput,
     type HistoryReplayPrepareRefused,
     type HistoryReplayPreparedCell,
+    type HistoryReplayStructuralInput,
     type PrepareHistoryReplayRequest,
 } from './history-replay-protocol';
 import { resolve_replay_display_focus } from './history-replay-focus-model';
@@ -221,6 +254,7 @@ export interface SavePlanWorksheetInput {
      * serializer is text-only by design.
      */
     readonly dirty_edits?: CsvDirtyMap;
+    readonly structural_changes?: CsvSaveWorksheetOperation['structuralChanges'];
 }
 
 export interface SavePlanInput {
@@ -250,6 +284,8 @@ export interface SavePlan {
      * verifiably has no link" from "the cell was never observed".
      */
     readonly observed_links?: readonly ReadonlyMap<string, CellHyperlink | null>[];
+    /** Canonical identity transition committed by the bytes this plan produces. */
+    readonly receipt?: import('./types').PendingChangesSaveReceipt;
     /**
      * The bytes to write, given the file's current bytes.
      *
@@ -259,6 +295,59 @@ export interface SavePlan {
      * every part it does not touch is copied through byte-for-byte.
      */
     produce(raw: Uint8Array): Uint8Array;
+}
+
+/** Expected structural refusal, kept distinct from writer/programming failures. */
+class PendingStructuralSaveError extends Error {
+    constructor(
+        readonly worksheetOperationIndex: number,
+        readonly conflict: PendingStructuralConflict,
+        message: string,
+    ) {
+        super(message);
+        this.name = 'PendingStructuralSaveError';
+    }
+}
+
+function structural_save_error(
+    worksheet_operation_index: number,
+    structural: PendingStructuralChanges,
+    reason: PendingStructuralConflictReason,
+    message: string,
+    affected?: {
+        readonly pendingRowIds?: readonly string[];
+        readonly tailRemovalIds?: readonly string[];
+        readonly formulaCells?: PendingStructuralConflict['formulaCells'];
+    },
+): never {
+    throw new PendingStructuralSaveError(
+        worksheet_operation_index,
+        Object.freeze({
+            reason,
+            pendingRowIds: Object.freeze([...(affected?.pendingRowIds
+                ?? structural.appendedRows.map((row) => row.id))]),
+            tailRemovalIds: Object.freeze([...(affected?.tailRemovalIds
+                ?? structural.tailRemovals.map((removal) => removal.appendHistoryId))]),
+            ...(affected?.formulaCells === undefined ? {} : {
+                formulaCells: Object.freeze([...affected.formulaCells]),
+            }),
+        }),
+        message,
+    );
+}
+
+function structural_save_rejection(error: unknown): CsvSaveRejection | undefined {
+    if (!(error instanceof PendingStructuralSaveError)) return undefined;
+    return Object.freeze({
+        reason: 'structuralConflict',
+        worksheetOperationIndex: error.worksheetOperationIndex,
+        structuralReason: error.conflict.reason,
+        pendingRowIds: error.conflict.pendingRowIds,
+        tailRemovalIds: error.conflict.tailRemovalIds,
+        ...(error.conflict.formulaCells === undefined ? {} : {
+            formulaCells: error.conflict.formulaCells,
+        }),
+    });
 }
 
 /** The host surface the controller needs: the core's `PanelLike` (postMessage)
@@ -454,9 +543,19 @@ const ROW_HEIGHT_LIMIT_WARNING =
     + `${MAX_PERSISTED_ROW_HEIGHTS.toLocaleString('en-US')} custom row heights.`;
 const COMPARE_DIFF_INCOMPLETE_WARNING =
     'Table Viewer could not compare some visible cells. Unhighlighted cells may still differ.';
+const MAX_SAVED_APPEND_AUTHORITIES = 100_000;
+const MAX_SAVED_APPEND_AUTHORITY_BYTES = 256 * 1024 * 1024;
+const MAX_ACTIONABLE_STRUCTURAL_CONFLICT_ROW_IDS = 16;
 
 function content_digest(bytes: Uint8Array): string {
     return createHash('sha256').update(bytes).digest('hex');
+}
+
+function worksheet_append_schema_fingerprint(sheet: SheetMeta): string {
+    return `sha256:${createHash('sha256').update(JSON.stringify({
+        columnCount: sheet.columnCount,
+        columnNames: sheet.columnNames ?? null,
+    })).digest('hex')}`;
 }
 
 /**
@@ -749,6 +848,183 @@ function materialize_replay_cells(
     return observed;
 }
 
+function canonical_saved_row_physical_cells(
+    cells: Readonly<Record<string, import('./pending-changes').PendingRowCell>>,
+): readonly unknown[] {
+    return Object.entries(cells)
+        .map(([column, cell]) => [Number(column), cell] as const)
+        .filter(([, cell]) => cell.value !== '' || cell.valueRuns !== undefined || cell.link != null)
+        .sort(([left], [right]) => left - right)
+        .map(([column, cell]) => [column, {
+            value: cell.value,
+            ...(cell.valueRuns === undefined ? {} : { valueRuns: cell.valueRuns }),
+            ...(cell.link == null ? {} : { link: cell.link }),
+        }]);
+}
+
+function canonical_saved_row_format(
+    format: import('./pending-changes').PendingRowFormat,
+    include_viewer_height = true,
+): unknown {
+    if (format.kind === 'none') return format;
+    return {
+        kind: format.kind,
+        templateSourceRow: format.templateSourceRow,
+        styleFingerprint: format.styleFingerprint,
+        cellStyleIndexes: format.cellStyleIndexes,
+        ...(format.cellStyleFingerprints === undefined ? {} : {
+            cellStyleFingerprints: format.cellStyleFingerprints,
+        }),
+        ...(format.cellNumberFormats === undefined ? {} : {
+            cellNumberFormats: format.cellNumberFormats,
+        }),
+        ...(format.cellFontStyles === undefined ? {} : {
+            cellFontStyles: format.cellFontStyles,
+        }),
+        ...(format.rowStyleIndex === undefined ? {} : {
+            rowStyleIndex: format.rowStyleIndex,
+        }),
+        ...(format.rowNumberFormat === undefined ? {} : {
+            rowNumberFormat: format.rowNumberFormat,
+        }),
+        ...(format.rowFontStyle === undefined ? {} : {
+            rowFontStyle: format.rowFontStyle,
+        }),
+        ...(format.thickTop === undefined ? {} : { thickTop: true }),
+        ...(format.thickBottom === undefined ? {} : { thickBottom: true }),
+        ...(format.phonetic === undefined ? {} : { phonetic: true }),
+        ...(format.nativeRowHeight === undefined ? {} : {
+            nativeRowHeight: format.nativeRowHeight,
+        }),
+        ...(!include_viewer_height || format.viewerRowHeight === undefined ? {} : {
+            viewerRowHeight: format.viewerRowHeight,
+        }),
+    };
+}
+
+function saved_row_physical_fingerprint(
+    row: Pick<import('./pending-changes').SavedAppendedRowSnapshot, 'cells' | 'format'>,
+): string {
+    return content_digest(new TextEncoder().encode(JSON.stringify({
+        cells: canonical_saved_row_physical_cells(row.cells),
+        format: canonical_saved_row_format(row.format, false),
+    })));
+}
+
+function saved_row_snapshot_fingerprint(
+    row: import('./pending-changes').SavedAppendedRowSnapshot,
+): string {
+    const cells = Object.entries(row.cells)
+        .map(([column, cell]) => [Number(column), cell] as const)
+        .sort(([left], [right]) => left - right);
+    const highlights = Object.entries(row.highlights ?? {})
+        .map(([column, color]) => [Number(column), color] as const)
+        .sort(([left], [right]) => left - right);
+    return content_digest(new TextEncoder().encode(JSON.stringify({
+        cells,
+        format: canonical_saved_row_format(row.format),
+        ...(row.viewerRowHeight === undefined ? {} : {
+            viewerRowHeight: row.viewerRowHeight,
+        }),
+        ...(highlights.length === 0 ? {} : { highlights }),
+    })));
+}
+
+function saved_pending_row_fingerprint(
+    row: import('./pending-changes').PendingAppendedRow,
+    format: import('./pending-changes').PendingRowFormat,
+): string {
+    return saved_row_snapshot_fingerprint({
+        cells: row.cells,
+        format,
+        ...(row.viewerRowHeight === undefined ? {} : {
+            viewerRowHeight: row.viewerRowHeight,
+        }),
+        ...(row.highlights === undefined ? {} : { highlights: row.highlights }),
+    });
+}
+
+function persisted_saved_row_snapshot(
+    row: Pick<
+        import('./pending-changes').PendingAppendedRow,
+        'cells' | 'viewerRowHeight' | 'highlights'
+    >,
+    format: import('./pending-changes').PendingRowFormat,
+    physical_cells: Readonly<Record<string, import('./pending-changes').PendingRowCell>>,
+): import('./pending-changes').SavedAppendedRowSnapshot {
+    const cells: Record<string, import('./pending-changes').PendingRowCell> = {};
+    const columns = new Set([
+        ...Object.keys(row.cells),
+        ...Object.keys(physical_cells),
+    ]);
+    for (const column of columns) {
+        const physical = physical_cells[column] ?? { value: '' };
+        const metadata = row.cells[column];
+        cells[column] = Object.freeze({
+            value: physical.value,
+            ...(physical.valueRuns === undefined ? {} : { valueRuns: physical.valueRuns }),
+            ...(physical.link === undefined ? {} : { link: physical.link }),
+            ...(metadata?.valueEditOrder === undefined ? {} : {
+                valueEditOrder: metadata.valueEditOrder,
+            }),
+            ...(metadata?.formulaReferenceBases === undefined ? {} : {
+                formulaReferenceBases: metadata.formulaReferenceBases,
+            }),
+            ...(metadata?.movedFrom === undefined ? {} : { movedFrom: metadata.movedFrom }),
+        });
+    }
+    const viewer_row_height = row.viewerRowHeight
+        ?? (format.kind === 'xlsx' ? format.viewerRowHeight : undefined);
+    return Object.freeze({
+        cells: Object.freeze(cells),
+        format,
+        ...(viewer_row_height === undefined ? {} : {
+            viewerRowHeight: viewer_row_height,
+        }),
+        ...(row.highlights === undefined ? {} : { highlights: row.highlights }),
+    });
+}
+
+function source_row_cells_for_fingerprint(
+    src: DataSource,
+    sheet_index: number,
+    source_row: number,
+): Readonly<Record<string, import('./pending-changes').PendingRowCell>> {
+    const projected_row = projected_row_for_source(src, sheet_index, source_row);
+    const row = projected_row === undefined
+        ? (() => {
+            const column_count = src.meta().sheets[sheet_index]?.columnCount ?? 0;
+            if (!src.read_canonical_columns || column_count === 0) return undefined;
+            return src.read_canonical_columns(
+                sheet_index,
+                source_row,
+                1,
+                Array.from({ length: column_count }, (_, column) => column),
+            ).rows[0];
+        })()
+        : (() => {
+            const window = src.read_rows(sheet_index, projected_row, 1);
+            return window.startRow === projected_row && window.rows.length === 1
+                ? window.rows[0]
+                : undefined;
+        })();
+    if (row === undefined) {
+        throw new Error('A saved appended row is no longer available.');
+    }
+    const cells: Record<string, import('./pending-changes').PendingRowCell> = {};
+    for (const [column, cell] of row.entries()) {
+        if (cell === null) continue;
+        const value = cell.formula ?? get_raw_cell_text(cell.raw);
+        if (value === '' && cell.richText === undefined && cell.hyperlink == null) continue;
+        cells[column] = {
+            value,
+            ...(cell.richText === undefined ? {} : { valueRuns: cell.richText }),
+            ...(cell.hyperlink == null ? {} : { link: cell.hyperlink }),
+        };
+    }
+    return cells;
+}
+
 /**
  * `putexcel`-shaped save: rewrite exactly the edited cells, leave the rest of
  * the package alone.
@@ -764,7 +1040,13 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
     // Every worksheet is fully planned before bytes are produced. The package
     // writer likewise computes every replacement before mutating the container,
     // so one invalid worksheet rejects the workbook save atomically.
-    const planned = input.worksheets.map(({ sheet_index, edits, wanted_bases, dirty_edits }) => {
+    const planned = input.worksheets.map(({
+        sheet_index,
+        edits,
+        wanted_bases,
+        dirty_edits,
+        structural_changes,
+    }, worksheet_operation_index) => {
         const {
             texts: observed_bases,
             rich: observed_rich,
@@ -772,16 +1054,150 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
         } = harvest_source_bases(src, sheet_index, wanted_bases);
         const cell_edits: XlsxCellEdit[] = [];
         const sheet_meta = src.meta().sheets[sheet_index];
+        if (!sheet_meta) throw new Error('Could not locate a worksheet to save.');
+        const structural = structural_changes ?? own_pending_structural_changes({});
+        if (structural.conflicts.length > 0) {
+            throw new PendingStructuralSaveError(
+                worksheet_operation_index,
+                structural.conflicts[0],
+                'Pending rows have unresolved structural conflicts.',
+            );
+        }
+        if (
+            structural.appendedRows.length > 0
+            && structural.appendBasis === undefined
+        ) structural_save_error(
+            worksheet_operation_index,
+            structural,
+            'ambiguousColumns',
+            'Pending rows have no verified worksheet basis.',
+        );
+        if (
+            structural.appendBasis !== undefined
+            && (structural.appendBasis.columnCount !== sheet_meta.columnCount
+                || structural.appendBasis.schemaFingerprint
+                    !== worksheet_append_schema_fingerprint(sheet_meta))
+        ) structural_save_error(
+            worksheet_operation_index,
+            structural,
+            'ambiguousColumns',
+            'The worksheet columns changed after rows were appended.',
+        );
+        const retained_row_count = sheet_meta.sourceRowCount
+            - structural.tailRemovals.length;
+        if (retained_row_count < 0
+            || retained_row_count + structural.appendedRows.length > MAX_SHEET_ROWS) {
+            structural_save_error(
+                worksheet_operation_index,
+                structural,
+                'rowLimitExceeded',
+                'Pending row changes exceed the worksheet row limit.',
+            );
+        }
+        structural.tailRemovals.forEach((removal, index) => {
+            if (removal.sourceRow !== retained_row_count + index) {
+                structural_save_error(
+                    worksheet_operation_index,
+                    structural,
+                    'savedSuffixChanged',
+                    'Pending row removals are not a contiguous worksheet suffix.',
+                    { pendingRowIds: [], tailRemovalIds: [removal.appendHistoryId] },
+                );
+            }
+        });
+        const pending_index_by_id = new Map(structural.appendedRows.map(
+            (row, index) => [row.id, index],
+        ));
+        const physical_row_for_identity = (identity: import('./pending-changes').RowIdentity):
+            number | undefined => identity.kind === 'source'
+            ? identity.sourceRow
+            : (() => {
+                const index = pending_index_by_id.get(identity.pendingRowId);
+                return index === undefined ? undefined : retained_row_count + index;
+            })();
+        const resolved_move = (
+            moved: NonNullable<CsvDirtyEntry['movedFrom']> | undefined,
+            affected_cell: NonNullable<PendingStructuralConflict['formulaCells']>[number],
+        ): XlsxCellEdit['movedFrom'] | undefined => {
+            if (moved === undefined) return undefined;
+            const row = moved.rowIdentity === undefined
+                ? moved.row
+                : physical_row_for_identity(moved.rowIdentity);
+            if (row === undefined) {
+                structural_save_error(
+                    worksheet_operation_index,
+                    structural,
+                    'ambiguousPendingFormula',
+                    'A cut source row no longer has a stable destination.',
+                    {
+                        pendingRowIds: affected_cell.rowIdentity.kind === 'pending'
+                            ? [affected_cell.rowIdentity.pendingRowId]
+                            : [],
+                        tailRemovalIds: [],
+                        formulaCells: [affected_cell],
+                    },
+                );
+            }
+            const previous = moved.previous?.map((step) => {
+                const sourceRow = step.sourceRowIdentity === undefined
+                    ? step.sourceRow
+                    : physical_row_for_identity(step.sourceRowIdentity);
+                const destinationRow = step.destinationRowIdentity === undefined
+                    ? step.destinationRow
+                    : physical_row_for_identity(step.destinationRowIdentity);
+                if (sourceRow === undefined || destinationRow === undefined) {
+                    structural_save_error(
+                        worksheet_operation_index,
+                        structural,
+                        'ambiguousPendingFormula',
+                        'A prior cut row no longer has a stable destination.',
+                        {
+                            pendingRowIds: affected_cell.rowIdentity.kind === 'pending'
+                                ? [affected_cell.rowIdentity.pendingRowId]
+                                : [],
+                            tailRemovalIds: [],
+                            formulaCells: [affected_cell],
+                        },
+                    );
+                }
+                return {
+                    sourceRow,
+                    sourceCol: step.sourceCol,
+                    destinationRow,
+                    destinationCol: step.destinationCol,
+                    order: step.order,
+                };
+            });
+            return {
+                row,
+                col: moved.col,
+                order: moved.order,
+                ...(previous === undefined ? {} : { previous }),
+            };
+        };
+        const templates = new Map(structural.formatTemplates.map(
+            (template) => [template.id, template.format],
+        ));
         const header_row = sheet_meta?.excelFirstRowHeader?.sourceRow ?? 0;
         for (const [key, value] of Object.entries(edits)) {
             const [row, col] = key.split(':').map(Number);
             if (!Number.isInteger(row) || !Number.isInteger(col)) continue;
+            if (
+                structural.tailRemovals.length > 0
+                && row >= retained_row_count
+                && row < sheet_meta.sourceRowCount
+            ) {
+                throw new Error('A removed tail row also contains a source-cell edit.');
+            }
             // A styled edit carries its runs through to the package writer.
             // `validate_edit_cells` already required the runs' concatenated text
             // to equal `value`, so the plain projection and the rich form cannot
             // disagree by the time they get here.
             const runs = dirty_edits?.[key]?.valueRuns?.runs;
-            const moved_from = dirty_edits?.[key]?.movedFrom;
+            const moved_from = resolved_move(dirty_edits?.[key]?.movedFrom, {
+                rowIdentity: { kind: 'source', sourceRow: row },
+                sourceColumn: col,
+            });
             const value_edit_order = dirty_edits?.[key]?.valueEditOrder;
             const header_edit = sheet_meta?.excelFirstRowHeader?.active === true
                 && row === header_row;
@@ -822,15 +1238,146 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
             }
             link_edits.push({ row, col, link: entry.link ?? null });
         }
+        // A worksheet hyperlink is owned outside its row element. Clear links
+        // captured in removed-row snapshots or they can recreate deleted cells.
+        for (const removal of structural.tailRemovals) {
+            for (const [column, cell] of Object.entries(removal.savedRow.cells)) {
+                if (cell.link !== undefined) {
+                    link_edits.push({ row: removal.sourceRow, col: Number(column), link: null });
+                }
+            }
+        }
+        const append_shells: Array<NonNullable<
+            import('./xlsx-package').XlsxWorksheetCellEdits['row_changes']
+        >['appendRows'][number]> = [];
+        for (const [index, row] of structural.appendedRows.entries()) {
+            const format = templates.get(row.formatTemplateId);
+            if (!format || format.kind !== 'xlsx') {
+                structural_save_error(
+                    worksheet_operation_index,
+                    structural,
+                    'templateChanged',
+                    'An XLSX pending row has no XLSX format template.',
+                    { pendingRowIds: [row.id], tailRemovalIds: [] },
+                );
+            }
+            if (format.cellStyleIndexes.length !== sheet_meta.columnCount) {
+                structural_save_error(
+                    worksheet_operation_index,
+                    structural,
+                    'templateChanged',
+                    'An XLSX pending row format has the wrong width.',
+                    { pendingRowIds: [row.id], tailRemovalIds: [] },
+                );
+            }
+            const destination = retained_row_count + index;
+            append_shells.push(Object.freeze({
+                row: destination,
+                cellStyleIndexes: format.cellStyleIndexes,
+                ...(format.rowStyleIndex === undefined
+                    ? {}
+                    : { rowStyleIndex: format.rowStyleIndex }),
+                ...(format.thickTop === undefined ? {} : { thickTop: true as const }),
+                ...(format.thickBottom === undefined ? {} : { thickBottom: true as const }),
+                ...(format.phonetic === undefined ? {} : { phonetic: true as const }),
+                ...(format.nativeRowHeight === undefined
+                    ? {}
+                    : { height: format.nativeRowHeight }),
+            }));
+            for (const [column_text, pending_cell] of Object.entries(row.cells)) {
+                const column = Number(column_text);
+                if (column >= sheet_meta.columnCount) {
+                    throw new Error('A pending row contains a column outside the worksheet.');
+                }
+                const moved_from = resolved_move(pending_cell.movedFrom, {
+                    rowIdentity: { kind: 'pending', pendingRowId: row.id },
+                    sourceColumn: column,
+                });
+                cell_edits.push({
+                    row: destination,
+                    col: column,
+                    value: pending_cell.value,
+                    ...(pending_cell.valueRuns?.runs.length
+                        ? { runs: pending_cell.valueRuns.runs }
+                        : {}),
+                    ...(pending_cell.valueEditOrder === undefined
+                        ? {}
+                        : { valueEditOrder: pending_cell.valueEditOrder }),
+                    ...(moved_from === undefined ? {} : { movedFrom: moved_from }),
+                });
+                if (pending_cell.link !== undefined) {
+                    if (pending_cell.link?.kind === 'external') {
+                        const normalized = parse_http_external_url(pending_cell.link.target);
+                        if (normalized === null) {
+                            throw new Error('A pending-row hyperlink has an invalid target.');
+                        }
+                        link_edits.push({
+                            row: destination,
+                            col: column,
+                            link: { ...pending_cell.link, target: normalized },
+                        });
+                    } else {
+                        link_edits.push({
+                            row: destination,
+                            col: column,
+                            link: pending_cell.link,
+                        });
+                    }
+                }
+            }
+        }
+        const row_changes = structural.tailRemovals.length > 0
+            || append_shells.length > 0
+            ? Object.freeze({
+                sourceRowCount: sheet_meta.sourceRowCount,
+                removeRows: Object.freeze(structural.tailRemovals.map(
+                    (removal) => removal.sourceRow,
+                )),
+                appendRows: Object.freeze(append_shells),
+            })
+            : undefined;
         return {
+            worksheetOperationIndex: worksheet_operation_index,
             observed_bases,
             observed_rich,
             observed_links,
             sheetIndex: sheet_index,
             edits: cell_edits,
             link_edits,
+            ...(row_changes === undefined ? {} : { row_changes }),
+            structural,
+            retainedRowCount: retained_row_count,
+            formulaSourceCells: dirty_edits ?? {},
         };
     });
+    for (const formula_worksheet of planned) {
+        for (const target_worksheet of planned) {
+            const formulaCells = pending_formula_cells_referencing_provisional_rows(
+                formula_worksheet.structural,
+                formula_worksheet.formulaSourceCells,
+                target_worksheet.structural,
+                formula_worksheet.sheetIndex,
+                target_worksheet.sheetIndex,
+                src.meta().sheets,
+            );
+            if (formulaCells.length > 0) {
+                structural_save_error(
+                    formula_worksheet.worksheetOperationIndex,
+                    formula_worksheet.structural,
+                    'ambiguousPendingFormula',
+                    'A pending formula references a provisional row coordinate that changed.',
+                    {
+                        pendingRowIds: [...new Set(formulaCells.flatMap((cell) =>
+                            cell.rowIdentity.kind === 'pending'
+                                ? [cell.rowIdentity.pendingRowId]
+                                : []))],
+                        tailRemovalIds: [],
+                        formulaCells,
+                    },
+                );
+            }
+        }
+    }
     const calculation_edits: Array<{
         sheetIndex: number;
         row: number;
@@ -912,43 +1459,85 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
         || (left.row - right.row)
         || (left.column - right.column));
     let formula_write_plan: XlsxFormulaWritePlan | undefined;
-    if (too_many_calculation_edits || calculation_edits.length > 0) {
+    if (
+        too_many_calculation_edits
+        || calculation_edits.length > 0
+        || planned.some((worksheet) =>
+            worksheet.structural.tailRemovals.length > 0
+            || worksheet.structural.appendedRows.length > 0)
+    ) {
         const sheets = src.meta().sheets;
+        const planned_by_sheet = new Map(planned.map((worksheet) => [
+            worksheet.sheetIndex,
+            worksheet,
+        ]));
+        const prospective_row_counts = sheets.map((sheet, sheetIndex) => {
+            const worksheet = planned_by_sheet.get(sheetIndex);
+            return worksheet === undefined
+                ? sheet.sourceRowCount
+                : worksheet.retainedRowCount + worksheet.structural.appendedRows.length;
+        });
+        const removed_rows = planned.flatMap((worksheet) =>
+            worksheet.structural.tailRemovals.map(({ sourceRow }) => ({
+                sheetIndex: worksheet.sheetIndex,
+                row: sourceRow,
+            })));
+        const prospective_sheets = sheets.map((sheet, sheetIndex) => ({
+            ...sheet,
+            sourceRowCount: prospective_row_counts[sheetIndex],
+        }));
         assert_safe_workbook_formula_edits(
-            sheets,
-            input.worksheets.map(({ sheet_index, edits, dirty_edits }) => ({
-                sheetIndex: sheet_index,
-                values: edits,
-                isFormulaValue: (key: string, value: string) => {
-                    const cell = parse_cell_key(key);
-                    const sheet = sheets[sheet_index];
-                    if (
-                        cell
-                        && sheet?.excelFirstRowHeader?.active === true
-                        && cell.sourceRow === (sheet.excelFirstRowHeader.sourceRow ?? 0)
-                    ) return false;
-                    const runs = dirty_edits?.[key]?.valueRuns?.runs;
-                    return xlsx_edit_writes_formula(
-                        value,
-                        runs && runs.length > 0 ? runs : undefined,
-                    );
-                },
-            })),
+            prospective_sheets,
+            planned.map((worksheet) => {
+                const values: Record<string, string> = {};
+                const formula_keys = new Set<string>();
+                for (const edit of worksheet.edits) {
+                    const key = `${edit.row}:${edit.col}`;
+                    values[key] = edit.value;
+                    if (is_xlsx_formula_edit(edit)) formula_keys.add(key);
+                }
+                const source_formula_cells = sheets[worksheet.sheetIndex]?.formulaCells ?? [];
+                const removed = new Set(worksheet.structural.tailRemovals.map(
+                    ({ sourceRow }) => sourceRow,
+                ));
+                for (let offset = 0; offset + 1 < source_formula_cells.length; offset += 2) {
+                    const row = source_formula_cells[offset];
+                    if (!removed.has(row)) continue;
+                    const key = `${row}:${source_formula_cells[offset + 1]}`;
+                    if (!Object.hasOwn(values, key)) values[key] = '';
+                }
+                return {
+                    sheetIndex: worksheet.sheetIndex,
+                    values,
+                    isFormulaValue: (key: string) => formula_keys.has(key),
+                };
+            }),
         );
-        const formula_plan = too_many_calculation_edits || structured_column_renames.length > 0
+        const has_structural_removals = planned.some(
+            (worksheet) => worksheet.structural.tailRemovals.length > 0,
+        );
+        const has_structural_appends = planned.some(
+            (worksheet) => worksheet.structural.appendedRows.length > 0,
+        );
+        const formula_plan = too_many_calculation_edits
+            || structured_column_renames.length > 0
+            || has_structural_removals
+            || has_structural_appends
             ? {
-                sheetCount: sheets.length,
-                impact: all_workbook_formula_cells_impact(sheets),
+                sheetCount: prospective_sheets.length,
+                impact: all_workbook_formula_cells_impact(prospective_sheets),
                 targets: [],
                 formulaLimitExceeded: false,
             }
-            : plan_workbook_formula_recalculation(sheets, calculation_edits);
+            : plan_workbook_formula_recalculation(prospective_sheets, calculation_edits);
         if (formula_plan.formulaLimitExceeded) {
             throw new Error('Workbook would contain too many formulas to save safely.');
         }
         const formula_request = {
             edits: calculation_edits,
             targets: formula_plan.targets,
+            prospectiveRowCounts: prospective_row_counts,
+            removedRows: removed_rows,
         } satisfies FormulaCalculationRequest;
         // The package writer retargets dependent formula source for a move.
         // Results calculated here still describe the pre-move source graph, so
@@ -972,16 +1561,112 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
         observed_bases: planned.map(({ observed_bases }) => observed_bases),
         observed_rich: planned.map(({ observed_rich }) => observed_rich),
         observed_links: planned.map(({ observed_links }) => observed_links),
-        produce: (raw) => write_xlsx_workbook_cell_edits(
-            raw,
-            planned,
-            formula_write_plan || structured_column_renames.length > 0 ? {
-                ...(formula_write_plan ? { formulaWritePlan: formula_write_plan } : {}),
-                ...(structured_column_renames.length > 0
-                    ? { structuredColumnRenames: structured_column_renames }
-                    : {}),
-            } : undefined,
-        ),
+        produce: (raw) => {
+            for (const worksheet of planned) {
+                const sheet = src.meta().sheets[worksheet.sheetIndex];
+                for (const removal of worksheet.structural.tailRemovals) {
+                    const format = capture_xlsx_append_row_format(
+                        raw,
+                        worksheet.sheetIndex,
+                        removal.sourceRow + 1,
+                        sheet.columnCount,
+                        sheet.excelFirstRowHeader?.active === true
+                            ? sheet.excelFirstRowHeader.sourceRow
+                            : undefined,
+                    );
+                    const current = saved_row_physical_fingerprint({
+                        cells: source_row_cells_for_fingerprint(
+                            src,
+                            worksheet.sheetIndex,
+                            removal.sourceRow,
+                        ),
+                        format,
+                    });
+                    if (current !== saved_row_physical_fingerprint(removal.savedRow)) {
+                        structural_save_error(
+                            worksheet.worksheetOperationIndex,
+                            worksheet.structural,
+                            'savedSuffixChanged',
+                            'A saved appended row changed after it was saved.',
+                            {
+                                pendingRowIds: [],
+                                tailRemovalIds: [removal.appendHistoryId],
+                            },
+                        );
+                    }
+                }
+                if (worksheet.structural.appendedRows.length === 0) continue;
+                for (const template of worksheet.structural.formatTemplates) {
+                    if (
+                        template.format.kind !== 'xlsx'
+                        || template.format.styleFingerprint
+                            !== xlsx_append_style_dependency_fingerprint(
+                                raw,
+                                template.format.cellStyleIndexes,
+                                template.format.rowStyleIndex,
+                            )
+                    ) structural_save_error(
+                        worksheet.worksheetOperationIndex,
+                        worksheet.structural,
+                        'templateChanged',
+                        'The workbook style table changed after rows were appended.',
+                        {
+                            pendingRowIds: worksheet.structural.appendedRows
+                                .filter((row) => row.formatTemplateId === template.id)
+                                .map((row) => row.id),
+                            tailRemovalIds: [],
+                        },
+                    );
+                }
+            }
+            return write_xlsx_workbook_cell_edits(
+                raw,
+                planned,
+                formula_write_plan || structured_column_renames.length > 0 ? {
+                    ...(formula_write_plan ? { formulaWritePlan: formula_write_plan } : {}),
+                    ...(structured_column_renames.length > 0
+                        ? { structuredColumnRenames: structured_column_renames }
+                        : {}),
+                } : undefined,
+            );
+        },
+        receipt: Object.freeze({
+            appendedRows: Object.freeze(planned.flatMap((worksheet) => {
+                const sheet = src.meta().sheets[worksheet.sheetIndex];
+                const templates = new Map(worksheet.structural.formatTemplates.map(
+                    (template) => [template.id, template.format],
+                ));
+                return worksheet.structural.appendedRows.map((row, index) => {
+                    const format = templates.get(row.formatTemplateId);
+                    if (!format) throw new Error('A pending row lost its format template.');
+                    return Object.freeze({
+                        sheetIndex: worksheet.sheetIndex,
+                        sheetName: sheet.name,
+                        ...(sheet.worksheetId === undefined
+                            ? {}
+                            : { worksheetId: sheet.worksheetId }),
+                        pendingRowId: row.id,
+                        sourceRow: worksheet.retainedRowCount + index,
+                        savedFingerprint: saved_pending_row_fingerprint(row, format),
+                        savedRow: persisted_saved_row_snapshot(row, format, row.cells),
+                    });
+                });
+            })),
+            removedSourceRows: Object.freeze(planned.flatMap((worksheet) => {
+                if (worksheet.structural.tailRemovals.length === 0) return [];
+                const sheet = src.meta().sheets[worksheet.sheetIndex];
+                return [Object.freeze({
+                    sheetIndex: worksheet.sheetIndex,
+                    sheetName: sheet.name,
+                    ...(sheet.worksheetId === undefined
+                        ? {}
+                        : { worksheetId: sheet.worksheetId }),
+                    sourceRows: Object.freeze(worksheet.structural.tailRemovals.map(
+                        (removal) => removal.sourceRow,
+                    )),
+                })];
+            })),
+        }),
     };
 }
 
@@ -1079,9 +1764,79 @@ export function plan_csv_save(
         throw new Error('CSV saves require exactly one worksheet payload.');
     }
     const { source: src } = input;
-    const { edits, wanted_bases } = input.worksheets[0];
+    const { edits, wanted_bases, structural_changes } = input.worksheets[0];
     const sheet = src.meta().sheets[0];
     if (!sheet) throw new Error('CSV source has no worksheet.');
+    const structural = structural_changes ?? own_pending_structural_changes({});
+    if (structural.conflicts.length > 0) {
+        throw new PendingStructuralSaveError(
+            0,
+            structural.conflicts[0],
+            'Pending rows have unresolved structural conflicts.',
+        );
+    }
+    if (structural.formatTemplates.some((template) => template.format.kind !== 'none')) {
+        throw new Error('Delimited pending rows contain an XLSX format template.');
+    }
+    if (structural.appendedRows.length > 0 && structural.appendBasis === undefined) {
+        structural_save_error(
+            0,
+            structural,
+            'ambiguousColumns',
+            'Pending rows have no verified worksheet basis.',
+        );
+    }
+    if (
+        structural.appendBasis !== undefined
+        && (structural.appendBasis.columnCount !== sheet.columnCount
+            || structural.appendBasis.schemaFingerprint
+                !== worksheet_append_schema_fingerprint(sheet))
+    ) structural_save_error(
+        0,
+        structural,
+        'ambiguousColumns',
+        'The worksheet columns changed after rows were appended.',
+    );
+    if (sheet.sourceRowCount - structural.tailRemovals.length
+        + structural.appendedRows.length > MAX_SHEET_ROWS) {
+        structural_save_error(
+            0,
+            structural,
+            'rowLimitExceeded',
+            'The pending changes exceed the worksheet row limit.',
+        );
+    }
+    const retained_row_count = sheet.rowCount - structural.tailRemovals.length;
+    if (retained_row_count < 0) structural_save_error(
+        0,
+        structural,
+        'savedSuffixChanged',
+        'Pending tail removals exceed the source rows.',
+    );
+    structural.tailRemovals.forEach((removal, index) => {
+        if (removal.sourceRow !== retained_row_count + index) {
+            structural_save_error(
+                0,
+                structural,
+                'savedSuffixChanged',
+                'Pending row removals are not a contiguous worksheet suffix.',
+                { pendingRowIds: [], tailRemovalIds: [removal.appendHistoryId] },
+            );
+        }
+        const current = saved_row_physical_fingerprint({
+            cells: source_row_cells_for_fingerprint(src, 0, removal.sourceRow),
+            format: { kind: 'none' },
+        });
+        if (current !== saved_row_physical_fingerprint(removal.savedRow)) {
+            structural_save_error(
+                0,
+                structural,
+                'savedSuffixChanged',
+                'A saved appended row changed after it was saved.',
+                { pendingRowIds: [], tailRemovalIds: [removal.appendHistoryId] },
+            );
+        }
+    });
 
     // A renderer can only edit columns exposed by the source snapshot. Reject a
     // forged in-range row with an enormous column before it can widen a record
@@ -1101,6 +1856,17 @@ export function plan_csv_save(
         if (Object.prototype.hasOwnProperty.call(edits, key)) assert_valid_key(key);
     }
     for (const key of wanted_bases) assert_valid_key(key);
+    for (const key of new Set([...Object.keys(edits), ...wanted_bases])) {
+        const coordinates = parse_cell_key(key);
+        if (
+            coordinates
+            && structural.tailRemovals.length > 0
+            && coordinates.sourceRow >= retained_row_count
+            && coordinates.sourceRow < sheet.sourceRowCount
+        ) {
+            throw new Error('A removed tail row also contains a source-cell edit.');
+        }
+    }
 
     const observed_bases = new Map<string, string>();
     const wanted_columns = group_cell_keys_by_source_row(wanted_bases);
@@ -1115,10 +1881,16 @@ export function plan_csv_save(
     const chunks: Uint8Array[] = [];
     let pending_prefix = serializer.headerPrefix;
 
-    const row_count = sheet.rowCount;
+    const row_count = retained_row_count;
     let start = 0;
     while (start < row_count) {
-        const window = src.read_rows(0, start, SAVE_WINDOW);
+        const window = src.read_rows(
+            0,
+            start,
+            structural.tailRemovals.length === 0
+                ? SAVE_WINDOW
+                : Math.min(SAVE_WINDOW, row_count - start),
+        );
         if (
             window.startRow !== start
             || window.rows.length === 0
@@ -1155,6 +1927,26 @@ export function plan_csv_save(
         start += window.rows.length;
     }
     if (pending_prefix.length > 0) chunks.push(encoder.encode(pending_prefix));
+    const delimiter = get_delimiter(input.file_path);
+    const line_ending = src.lineEnding ?? '\n';
+    for (const row of structural.appendedRows) {
+        const values = Array<string>(sheet.columnCount).fill('');
+        for (const [column_text, cell] of Object.entries(row.cells)) {
+            const column = Number(column_text);
+            if (column >= sheet.columnCount) {
+                throw new Error('A pending row contains a column outside the worksheet.');
+            }
+            if (cell.valueRuns !== undefined || cell.link) {
+                throw new Error('Delimited pending rows cannot contain rich text or hyperlinks.');
+            }
+            values[column] = cell.value;
+        }
+        chunks.push(encoder.encode(serialize_delimited_values(
+            values,
+            delimiter,
+            line_ending,
+        )));
+    }
 
     // Eager rather than inside `produce`: the caller reads `observed_bases`
     // immediately and allocation failures remain planning failures. Build the
@@ -1164,6 +1956,29 @@ export function plan_csv_save(
     return {
         observed_bases: [observed_bases],
         produce: fixed_csv_bytes_producer(bytes),
+        receipt: Object.freeze({
+            appendedRows: Object.freeze(structural.appendedRows.map((row, index) => ({
+                sheetIndex: 0,
+                sheetName: sheet.name,
+                ...(sheet.worksheetId === undefined ? {} : { worksheetId: sheet.worksheetId }),
+                pendingRowId: row.id,
+                sourceRow: retained_row_count + index,
+                savedFingerprint: saved_pending_row_fingerprint(row, { kind: 'none' }),
+                savedRow: persisted_saved_row_snapshot(row, { kind: 'none' }, row.cells),
+            }))),
+            removedSourceRows: structural.tailRemovals.length === 0
+                ? Object.freeze([])
+                : Object.freeze([{
+                    sheetIndex: 0,
+                    sheetName: sheet.name,
+                    ...(sheet.worksheetId === undefined
+                        ? {}
+                        : { worksheetId: sheet.worksheetId }),
+                    sourceRows: Object.freeze(structural.tailRemovals.map(
+                        (removal) => removal.sourceRow,
+                    )),
+                }]),
+        }),
     };
 }
 
@@ -1357,6 +2172,10 @@ export function attach_viewer(
     interface ReplayLeasePayload {
         readonly cells: readonly HistoryReplayPreparedCell[];
         readonly highlights: readonly HistoryReplayHighlightInput[];
+        readonly structures: readonly (HistoryReplayStructuralInput & {
+            readonly resolvedSheetIndex: number;
+        })[];
+        readonly rowAdmissionRequestIds: readonly string[];
         /** Each prepared highlight's resolved sheet, by ordinal. */
         readonly highlightSheetIndices: ReadonlyMap<number, number>;
         readonly focus: HistoryReplayFocus;
@@ -1365,17 +2184,26 @@ export function attach_viewer(
         /** Whether the host state the lease was bound to is still in place. */
         readonly isCurrent: () => boolean;
     }
+    interface HistoryReplayCommitOutcome {
+        readonly result: HistoryReplayCommitted | HistoryReplayCommitRefused;
+        /** Publish the durable highlight arm after the terminal reaches the renderer. */
+        readonly publishCurrentMaterial: boolean;
+    }
+    let release_dropped_replay_lease: (lease: {
+        readonly leaseId: string;
+        readonly payload: ReplayLeasePayload;
+    }, reason: 'expired' | 'abandoned' | 'invalidated' | 'cleared') => void = () => {};
     const replay_leases = create_history_replay_lease_registry<
         ReplayLeasePayload,
-        HistoryReplayCommitted | HistoryReplayCommitRefused
-    >();
+        HistoryReplayCommitOutcome
+    >((lease, reason) => release_dropped_replay_lease(lease, reason));
     let replay_preparation_in_flight = false;
     /**
      * The commit operation a taken lease is running, so a retransmission can join
      * the one mutation instead of waiting on an answer that may never come.
      */
     let active_replay_commit:
-        | Promise<HistoryReplayCommitted | HistoryReplayCommitRefused>
+        | Promise<HistoryReplayCommitOutcome>
         | undefined;
     let active_save_operation: CsvSaveHostOperation | undefined;
     let active_save_drain: Promise<void> = Promise.resolve();
@@ -1454,6 +2282,842 @@ export function attach_viewer(
     const transform_panel_token = Symbol(file_key);
     /** The workbook-scoped session grant currently owned by this panel. */
     let active_edit_session_id: string | undefined;
+    interface AppendAdmissionLedger {
+        /** All row identities this host has ever issued in the live edit session. */
+        readonly ownedRowIds: Set<string>;
+        /** Exact format-template capability issued for each row identity. */
+        readonly templateIdByRowId: Map<string, string>;
+        /** Issued rows not yet observed in a complete renderer publication. */
+        /** Row ID -> first complete publication sequence that can retire it. */
+        readonly reservedRowIds: Map<string, number>;
+        /** Reservations awaiting the renderer's explicit install/cancel verdict. */
+        readonly unsettledRequestByRowId: Map<string, string>;
+        /** Exact structural basis issued for this worksheet in the session. */
+        appendBasis?: PendingAppendBasis;
+        sourceGeneration: number;
+        formatTemplate?: PendingRowFormatTemplate;
+    }
+    /**
+     * Host authority for temporary identities. A save may accept an ID only if
+     * it came from durable restored state or this edit-session ledger.
+     */
+    const append_admission_ledgers = new Map<string, AppendAdmissionLedger>();
+    interface RowAdmissionReservation {
+        readonly purpose: 'append' | 'restoration';
+        readonly editSessionId: string;
+        readonly ledgerKey: string;
+        /** Complete row set the admission gesture restores or appends. */
+        readonly gestureRowIds: readonly string[];
+        readonly rowIds: readonly string[];
+        readonly appendBasis: PendingAppendBasis;
+        readonly templates: readonly PendingRowFormatTemplate[];
+        readonly templateAuthorityOwner: string;
+        readonly appendTemplate?: PendingRowFormatTemplate;
+        readonly sourceGeneration: number;
+        state: 'unsettled' | 'accepted';
+        firstPublicationSequence?: number;
+        replayLeaseId?: string;
+    }
+    const row_admission_reservations = new Map<string, RowAdmissionReservation>();
+    /** Request IDs stay live until their reservation is cancelled or published. */
+    const row_admission_request_ids = new Set<string>();
+    // The template budget is shared by every worksheet, so its authority
+    // transitions use one tail even though the row ledgers themselves are keyed
+    // per worksheet. Holding this tail through publication makes the capacity
+    // preflight below remain true until the post-CAS commit.
+    const APPEND_ADMISSION_AUTHORITY_TAIL = '\u0000append-admission-authority';
+    const append_admission_tails = new Map<string, Promise<void>>();
+    interface AppendAdmissionAuthorityFence {
+        readonly ready: Promise<void>;
+        release(): void;
+    }
+    /** Install a synchronous queue barrier, then expose when prior authority work drained. */
+    const fence_append_admission_authority = (): AppendAdmissionAuthorityFence => {
+        const prior = append_admission_tails.get(APPEND_ADMISSION_AUTHORITY_TAIL)
+            ?? Promise.resolve();
+        const ready = prior.catch(() => {});
+        let release_hold!: () => void;
+        const hold = new Promise<void>((resolve) => { release_hold = resolve; });
+        const tail = ready.then(() => hold);
+        append_admission_tails.set(APPEND_ADMISSION_AUTHORITY_TAIL, tail);
+        let released = false;
+        return {
+            ready,
+            release: () => {
+                if (released) return;
+                released = true;
+                release_hold();
+                void tail.then(() => {
+                    if (append_admission_tails.get(APPEND_ADMISSION_AUTHORITY_TAIL) === tail) {
+                        append_admission_tails.delete(APPEND_ADMISSION_AUTHORITY_TAIL);
+                    }
+                });
+            },
+        };
+    };
+    const append_admission_template_authorities = new AppendAdmissionTemplateAuthorityStore(
+        MAX_SAVED_APPEND_AUTHORITY_BYTES,
+    );
+    const ledger_template_authority_owner = (ledger_key: string): string =>
+        `ledger:${ledger_key}`;
+    const reservation_template_authority_owner = (request_id: string): string =>
+        `reservation:${request_id}`;
+    // History-reachable unsaved row capabilities. These are populated only from
+    // IDs a live host ledger actually issued; renderer retention messages can
+    // keep such a capability alive but cannot mint one.
+    const retained_pending_append_keys = new Set<string>();
+    const retained_pending_append_authorities = new RetainedPendingAppendAuthorityStore(
+        MAX_SAVED_APPEND_AUTHORITY_BYTES,
+    );
+    interface SavedAppendAuthority {
+        readonly worksheet: WorksheetTarget;
+        readonly appendHistoryId: string;
+        readonly sourceRow: number;
+        readonly savedFingerprint: string;
+        readonly savedRow: SavedAppendedRowSnapshot;
+        readonly byteCost: number;
+        state: 'physical' | 'removed';
+    }
+    /**
+     * Capabilities for the only physical rows structural Undo may remove.
+     *
+     * They deliberately outlive an edit session: Save fences and releases that
+     * session before the user can invoke cross-save Undo. They do not outlive the
+     * panel/document history that needs them. A durable in-flight tail removal is
+     * allowed to seed the same capability after renderer reload, but only from a
+     * snapshot previously accepted into host-owned state.
+     */
+    const saved_append_authorities = new Map<string, SavedAppendAuthority>();
+    let saved_append_authority_bytes = 0;
+    const saved_append_authority_byte_cost = (
+        authority: Omit<SavedAppendAuthority, 'byteCost'>,
+    ): number => Buffer.byteLength(JSON.stringify({
+        worksheet: authority.worksheet,
+        appendHistoryId: authority.appendHistoryId,
+        sourceRow: authority.sourceRow,
+        savedFingerprint: authority.savedFingerprint,
+        savedRow: authority.savedRow,
+    }), 'utf8') + 256;
+    const forget_saved_append_authority = (key: string): void => {
+        const prior = saved_append_authorities.get(key);
+        if (prior === undefined) return;
+        saved_append_authorities.delete(key);
+        saved_append_authority_bytes -= prior.byteCost;
+    };
+    const remember_saved_append_authority = (
+        key: string,
+        authority: Omit<SavedAppendAuthority, 'byteCost'>,
+    ): void => {
+        forget_saved_append_authority(key);
+        const owned = { ...authority, byteCost: saved_append_authority_byte_cost(authority) };
+        saved_append_authorities.set(key, owned);
+        saved_append_authority_bytes += owned.byteCost;
+        while (
+            saved_append_authorities.size > MAX_SAVED_APPEND_AUTHORITIES
+            || saved_append_authority_bytes > MAX_SAVED_APPEND_AUTHORITY_BYTES
+        ) {
+            const oldest = saved_append_authorities.keys().next().value as string | undefined;
+            if (oldest === undefined) break;
+            forget_saved_append_authority(oldest);
+        }
+    };
+    const canonical_worksheet_target = (
+        target: WorksheetTarget,
+        sheets: readonly SheetMeta[] | undefined = source?.meta().sheets,
+    ): WorksheetTarget | undefined => {
+        if (!sheets) return undefined;
+        const sheet_index = worksheet_target_index(sheets, target);
+        const sheet = sheet_index === undefined ? undefined : sheets[sheet_index];
+        if (sheet_index === undefined || !sheet) return undefined;
+        return {
+            sheetIndex: sheet_index,
+            sheetName: sheet.name,
+            ...(sheet.worksheetId === undefined ? {} : { worksheetId: sheet.worksheetId }),
+        };
+    };
+    const saved_append_authority_key = (
+        target: WorksheetTarget,
+        append_history_id: string,
+    ): string | undefined => {
+        const canonical = canonical_worksheet_target(target);
+        return canonical === undefined
+            ? undefined
+            : `${worksheet_target_key(canonical)}\u0000${append_history_id}`;
+    };
+    const saved_append_authority_for = (
+        target: WorksheetTarget,
+        append_history_id: string,
+    ): SavedAppendAuthority | undefined => {
+        const key = saved_append_authority_key(target, append_history_id);
+        return key === undefined ? undefined : saved_append_authorities.get(key);
+    };
+    const tail_removal_matches_authority = (
+        target: WorksheetTarget,
+        removal: PendingTailRemoval,
+        state: SavedAppendAuthority['state'] = 'physical',
+    ): boolean => {
+        const authority = saved_append_authority_for(target, removal.appendHistoryId);
+        return authority !== undefined
+            && authority.state === state
+            && authority.sourceRow === removal.sourceRow
+            && authority.savedFingerprint === removal.savedFingerprint
+            && saved_row_snapshot_fingerprint(removal.savedRow)
+                === authority.savedFingerprint;
+    };
+    const seed_durable_tail_removal_authority = (
+        target: WorksheetTarget,
+        removal: PendingTailRemoval,
+    ): void => {
+        const key = saved_append_authority_key(target, removal.appendHistoryId);
+        const canonical = canonical_worksheet_target(target);
+        if (
+            key === undefined
+            || canonical === undefined
+            || saved_append_authorities.has(key)
+            || saved_row_snapshot_fingerprint(removal.savedRow) !== removal.savedFingerprint
+        ) return;
+        remember_saved_append_authority(key, {
+            worksheet: canonical,
+            appendHistoryId: removal.appendHistoryId,
+            sourceRow: removal.sourceRow,
+            savedFingerprint: removal.savedFingerprint,
+            savedRow: removal.savedRow,
+            state: 'physical',
+        });
+    };
+    const commit_saved_append_authorities = (
+        operation: CsvSaveHostOperation,
+        receipt: import('./types').PendingChangesSaveReceipt | undefined,
+        persisted_snapshots: ReadonlyMap<
+            string,
+            SavedAppendedRowSnapshot
+        > = new Map(),
+    ): void => {
+        for (const [worksheet_index, worksheet] of operation.identity.worksheets.entries()) {
+            const structural = worksheet.structuralChanges;
+            if (!structural) continue;
+            const target = operation.durableTargets[worksheet_index] ?? worksheet;
+            for (const removal of structural.tailRemovals) {
+                const authority = saved_append_authority_for(
+                    target,
+                    removal.appendHistoryId,
+                );
+                if (authority !== undefined) authority.state = 'removed';
+            }
+            const templates = new Map(structural.formatTemplates.map(
+                (template) => [template.id, template.format],
+            ));
+            for (const assignment of receipt?.appendedRows ?? []) {
+                if (!worksheet_target_matches(assignment, target)) continue;
+                const row = structural.appendedRows.find(
+                    (candidate) => candidate.id === assignment.pendingRowId,
+                );
+                const format = row === undefined
+                    ? undefined
+                    : templates.get(row.formatTemplateId);
+                const canonical = canonical_worksheet_target(target);
+                const key = saved_append_authority_key(target, assignment.pendingRowId);
+                if (row === undefined || format === undefined || canonical === undefined || !key) {
+                    continue;
+                }
+                const persisted = persisted_snapshots.get(assignment.pendingRowId)
+                    ?? assignment.savedRow
+                    ?? persisted_saved_row_snapshot(row, format, row.cells);
+                remember_saved_append_authority(key, {
+                    worksheet: canonical,
+                    appendHistoryId: assignment.pendingRowId,
+                    sourceRow: assignment.sourceRow,
+                    savedFingerprint: assignment.savedFingerprint,
+                    savedRow: persisted,
+                    state: 'physical',
+                });
+            }
+        }
+    };
+    const append_ledger_key = (session_id: string, target: WorksheetTarget) =>
+        `${session_id}\u0000${worksheet_target_key(target)}`;
+    const pending_append_history_key = (target_key: string, row_id: string): string =>
+        `${target_key}\u0000${row_id}`;
+    const appended_rows_match_ledger = (
+        ledger: AppendAdmissionLedger | undefined,
+        rows: readonly PendingAppendedRow[],
+    ): boolean => rows.length === 0 || (ledger !== undefined && rows.every((row) =>
+        ledger.ownedRowIds.has(row.id)
+        && ledger.templateIdByRowId.get(row.id) === row.formatTemplateId));
+    const unsettled_reservation_for_ledger = (
+        ledger_key: string,
+    ): RowAdmissionReservation | undefined => {
+        for (const reservation of row_admission_reservations.values()) {
+            if (reservation.ledgerKey === ledger_key && reservation.state === 'unsettled') {
+                return reservation;
+            }
+        }
+        return undefined;
+    };
+    const reservations_for_ledger = (
+        ledger_key: string,
+    ): readonly [string, RowAdmissionReservation][] => [...row_admission_reservations]
+        .filter(([, reservation]) => reservation.ledgerKey === ledger_key);
+    /** An admitted gesture may be omitted or included whole, never split. */
+    const row_admission_gestures_are_complete = (
+        reservations: readonly RowAdmissionReservation[],
+        rows: readonly PendingAppendedRow[],
+    ): boolean => {
+        const row_ids = new Set(rows.map((row) => row.id));
+        return reservations.every((reservation) => {
+            const included = reservation.gestureRowIds.filter((row_id) =>
+                row_ids.has(row_id)).length;
+            return included === 0 || included === reservation.gestureRowIds.length;
+        });
+    };
+    const accepted_row_admission_gestures_are_complete = (
+        ledger_key: string,
+        rows: readonly PendingAppendedRow[],
+    ): boolean => row_admission_gestures_are_complete(
+        reservations_for_ledger(ledger_key)
+            .map(([, reservation]) => reservation)
+            .filter((reservation) => reservation.state === 'accepted'),
+        rows,
+    );
+    const accepted_append_basis_for_ledger = (
+        ledger: AppendAdmissionLedger | undefined,
+        ledger_key: string,
+        additionally_authorized: ReadonlySet<string> = new Set(),
+    ): PendingAppendBasis | undefined => {
+        let basis = ledger?.appendBasis;
+        for (const [request_id, reservation] of reservations_for_ledger(ledger_key)) {
+            if (
+                reservation.state !== 'accepted'
+                && !additionally_authorized.has(request_id)
+            ) continue;
+            if (basis === undefined) {
+                basis = reservation.appendBasis;
+                continue;
+            }
+            const advanced = advance_pending_append_basis(basis, reservation.appendBasis);
+            if (advanced !== undefined) basis = advanced;
+        }
+        return basis;
+    };
+    const issued_append_template = (
+        ledger: AppendAdmissionLedger | undefined,
+        ledger_key: string,
+        template_id: string,
+        additionally_authorized: ReadonlySet<string> = new Set(),
+    ): PendingRowFormatTemplate | undefined => {
+        const committed = ledger === undefined
+            ? undefined
+            : append_admission_template_authorities.get(
+                ledger_template_authority_owner(ledger_key),
+                template_id,
+            );
+        if (committed !== undefined) return committed;
+        for (const [request_id, reservation] of reservations_for_ledger(ledger_key)) {
+            if (
+                reservation.state !== 'accepted'
+                && !additionally_authorized.has(request_id)
+            ) continue;
+            const issued = reservation.templates.find((template) => template.id === template_id);
+            if (issued !== undefined) return issued;
+        }
+        return undefined;
+    };
+    const changes_use_unsettled_row_authority = (
+        ledger: AppendAdmissionLedger | undefined,
+        ledger_key: string,
+        rows: readonly PendingAppendedRow[],
+        templates: readonly PendingRowFormatTemplate[],
+        append_basis?: PendingAppendBasis,
+        additionally_authorized: ReadonlySet<string> = new Set(),
+    ): boolean => {
+        if (ledger === undefined) {
+            return rows.length > 0 || templates.length > 0 || append_basis !== undefined;
+        }
+        if (rows.some((row) => {
+            const request_id = ledger.unsettledRequestByRowId.get(row.id);
+            return request_id !== undefined && !additionally_authorized.has(request_id);
+        })) return true;
+        const committed_owner = ledger_template_authority_owner(ledger_key);
+        if (templates.some((template) => (
+            append_admission_template_authorities.get(committed_owner, template.id) === undefined
+            && reservations_for_ledger(ledger_key).some(([request_id, reservation]) =>
+                reservation.state === 'unsettled'
+                && !additionally_authorized.has(request_id)
+                && reservation.templates.some((candidate) => candidate.id === template.id))
+        ))) return true;
+        if (append_basis === undefined) return false;
+        const accepted = accepted_append_basis_for_ledger(
+            ledger,
+            ledger_key,
+            additionally_authorized,
+        );
+        return JSON.stringify(accepted) !== JSON.stringify(append_basis)
+            && reservations_for_ledger(ledger_key).some(([request_id, reservation]) => (
+                reservation.state === 'unsettled'
+                && !additionally_authorized.has(request_id)
+                && JSON.stringify(reservation.appendBasis) === JSON.stringify(append_basis)
+            ));
+    };
+
+    interface PendingStructuralPublicationPlan {
+        readonly ledgerKey: string;
+        readonly priorLedger: AppendAdmissionLedger | undefined;
+        readonly nextLedger: AppendAdmissionLedger | undefined;
+        readonly retiringReservations: readonly [string, RowAdmissionReservation][];
+        readonly templateAdditions: readonly PendingRowFormatTemplate[];
+        readonly durableChanges: WorksheetPendingChanges;
+    }
+
+    const clone_append_admission_ledger = (
+        ledger: AppendAdmissionLedger,
+    ): AppendAdmissionLedger => ({
+        ownedRowIds: new Set(ledger.ownedRowIds),
+        templateIdByRowId: new Map(ledger.templateIdByRowId),
+        reservedRowIds: new Map(ledger.reservedRowIds),
+        unsettledRequestByRowId: new Map(ledger.unsettledRequestByRowId),
+        ...(ledger.appendBasis === undefined ? {} : { appendBasis: ledger.appendBasis }),
+        sourceGeneration: ledger.sourceGeneration,
+        ...(ledger.formatTemplate === undefined
+            ? {}
+            : { formatTemplate: ledger.formatTemplate }),
+    });
+
+    const project_retained_pending_rows = (
+        ledger: AppendAdmissionLedger | undefined,
+        target: WorksheetTarget,
+        rows: readonly PendingAppendedRow[],
+    ): ReadonlyMap<string, PendingRowFormatTemplate> => {
+        const templates = new Map<string, PendingRowFormatTemplate>();
+        if (ledger === undefined || rows.length === 0) return templates;
+        const target_key = worksheet_target_key(target);
+        for (const row of rows) {
+            const authority = retained_pending_append_authorities.get(target_key, row.id);
+            if (authority === undefined) continue;
+            if (ledger.ownedRowIds.size >= MAX_PENDING_APPENDED_ROWS) break;
+            if (
+                ledger.appendBasis !== undefined
+                && authority.appendBasis !== undefined
+                && advance_pending_append_basis(
+                    ledger.appendBasis,
+                    authority.appendBasis,
+                ) === undefined
+                && advance_pending_append_basis(
+                    authority.appendBasis,
+                    ledger.appendBasis,
+                ) === undefined
+            ) continue;
+            if (row.formatTemplateId !== authority.formatTemplateId) continue;
+            ledger.ownedRowIds.add(row.id);
+            ledger.templateIdByRowId.set(row.id, authority.formatTemplateId);
+            templates.set(authority.formatTemplate.id, authority.formatTemplate);
+            if (authority.appendBasis !== undefined) {
+                const advanced = ledger.appendBasis === undefined
+                    ? authority.appendBasis
+                    : advance_pending_append_basis(
+                        ledger.appendBasis,
+                        authority.appendBasis,
+                    );
+                if (advanced !== undefined) ledger.appendBasis = advanced;
+            }
+        }
+        return templates;
+    };
+
+    /**
+     * Validate and project one renderer publication without consuming authority.
+     * The returned transition is installed only after its durable state write.
+     */
+    const plan_pending_structural_publication = (
+        edit_session_id: string,
+        target: WorksheetTarget,
+        changes: WorksheetPendingChanges,
+        sequence: number,
+        verify_template_capacity = false,
+    ): PendingStructuralPublicationPlan | undefined => {
+        const ledger_key = append_ledger_key(edit_session_id, target);
+        const prior_ledger = append_admission_ledgers.get(ledger_key);
+        const next_ledger = prior_ledger === undefined
+            ? undefined
+            : clone_append_admission_ledger(prior_ledger);
+        if (changes_use_unsettled_row_authority(
+            prior_ledger,
+            ledger_key,
+            changes.appendedRows,
+            changes.formatTemplates,
+            changes.appendBasis,
+        )) return undefined;
+
+        const retiring_reservations = reservations_for_ledger(ledger_key).filter(
+            ([, reservation]) => reservation.state === 'accepted'
+                && reservation.firstPublicationSequence !== undefined
+                && sequence >= reservation.firstPublicationSequence,
+        );
+        if (!row_admission_gestures_are_complete(
+            retiring_reservations.map(([, reservation]) => reservation),
+            changes.appendedRows,
+        )) return undefined;
+        const published_row_ids = new Set(changes.appendedRows.map((row) => row.id));
+
+        const staged_templates = new Map(project_retained_pending_rows(
+            next_ledger,
+            target,
+            changes.appendedRows,
+        ));
+
+        const provisional_ledger_basis = accepted_append_basis_for_ledger(
+            next_ledger,
+            ledger_key,
+        );
+        if (
+            !appended_rows_match_ledger(next_ledger, changes.appendedRows)
+            || changes.formatTemplates.some((template) => {
+                const issued = staged_templates.get(template.id)
+                    ?? issued_append_template(
+                        next_ledger,
+                        ledger_key,
+                        template.id,
+                    );
+                return issued === undefined
+                    || JSON.stringify(issued) !== JSON.stringify(template);
+            })
+            || (
+                changes.appendBasis !== undefined
+                && JSON.stringify(changes.appendBasis)
+                    !== JSON.stringify(provisional_ledger_basis)
+            )
+            || changes.tailRemovals.some(
+                (removal) => !tail_removal_matches_authority(target, removal),
+            )
+        ) return undefined;
+
+        const retiring_ids = new Set(retiring_reservations.map(([request_id]) => request_id));
+        for (const [, reservation] of retiring_reservations) {
+            const included = reservation.gestureRowIds.every((row_id) =>
+                published_row_ids.has(row_id));
+            const retained_ids = new Set(reservation.rowIds.filter((row_id) =>
+                retained_pending_append_keys.has(pending_append_history_key(
+                    worksheet_target_key(target),
+                    row_id,
+                ))));
+            const keeps_authority = included || retained_ids.size > 0;
+            if (keeps_authority && next_ledger !== undefined) {
+                const advanced = next_ledger.appendBasis === undefined
+                    ? reservation.appendBasis
+                    : advance_pending_append_basis(
+                        next_ledger.appendBasis,
+                        reservation.appendBasis,
+                    );
+                if (advanced === undefined) return undefined;
+                next_ledger.appendBasis = advanced;
+                for (const template of reservation.templates) {
+                    staged_templates.set(template.id, template);
+                }
+                if (reservation.appendTemplate !== undefined) {
+                    next_ledger.formatTemplate = reservation.appendTemplate;
+                }
+                next_ledger.sourceGeneration = reservation.sourceGeneration;
+            }
+            for (const row_id of reservation.rowIds) {
+                next_ledger?.reservedRowIds.delete(row_id);
+                next_ledger?.unsettledRequestByRowId.delete(row_id);
+                if (included || retained_ids.has(row_id)) continue;
+                next_ledger?.ownedRowIds.delete(row_id);
+                next_ledger?.templateIdByRowId.delete(row_id);
+            }
+        }
+
+        let authorized_basis = next_ledger?.appendBasis;
+        for (const [request_id, reservation] of reservations_for_ledger(ledger_key)) {
+            if (retiring_ids.has(request_id) || reservation.state !== 'accepted') continue;
+            if (authorized_basis === undefined) {
+                authorized_basis = reservation.appendBasis;
+                continue;
+            }
+            const advanced = advance_pending_append_basis(
+                authorized_basis,
+                reservation.appendBasis,
+            );
+            if (advanced !== undefined) authorized_basis = advanced;
+        }
+        if (changes.appendedRows.length === 0) authorized_basis = undefined;
+        if (changes.appendedRows.length > 0 && authorized_basis === undefined) return undefined;
+        const { appendBasis: _posted_basis, ...changes_without_basis } = changes;
+        const durable_changes: WorksheetPendingChanges = Object.freeze({
+            ...changes_without_basis,
+            ...(authorized_basis === undefined ? {} : { appendBasis: authorized_basis }),
+        });
+        try {
+            assert_pending_changes_encoded_bound(durable_changes);
+        } catch {
+            return undefined;
+        }
+        const retiring_template_owners = retiring_reservations.map(([, reservation]) =>
+            reservation.templateAuthorityOwner);
+        if (
+            verify_template_capacity
+            && (retiring_template_owners.length > 0 || staged_templates.size > 0)
+            && !append_admission_template_authorities.can_commit_many(
+                retiring_template_owners,
+                ledger_template_authority_owner(ledger_key),
+                [...staged_templates.values()],
+            )
+        ) return undefined;
+        return {
+            ledgerKey: ledger_key,
+            priorLedger: prior_ledger,
+            nextLedger: next_ledger,
+            retiringReservations: Object.freeze(retiring_reservations),
+            templateAdditions: Object.freeze([...staged_templates.values()]),
+            durableChanges: durable_changes,
+        };
+    };
+
+    const commit_pending_structural_publication = (
+        plan: PendingStructuralPublicationPlan,
+    ): boolean => {
+        if (append_admission_ledgers.get(plan.ledgerKey) !== plan.priorLedger) return false;
+        if (plan.retiringReservations.some(([request_id, reservation]) =>
+            row_admission_reservations.get(request_id) !== reservation
+            || reservation.state !== 'accepted')) return false;
+        if (
+            (plan.retiringReservations.length > 0 || plan.templateAdditions.length > 0)
+            && !append_admission_template_authorities.commit_many(
+                plan.retiringReservations.map(([, reservation]) =>
+                    reservation.templateAuthorityOwner),
+                ledger_template_authority_owner(plan.ledgerKey),
+                plan.templateAdditions,
+            )
+        ) return false;
+        if (plan.nextLedger === undefined) {
+            append_admission_ledgers.delete(plan.ledgerKey);
+        } else {
+            append_admission_ledgers.set(plan.ledgerKey, plan.nextLedger);
+        }
+        for (const [request_id] of plan.retiringReservations) {
+            row_admission_reservations.delete(request_id);
+            row_admission_request_ids.delete(request_id);
+        }
+        return true;
+    };
+    type ResolvedReplayStructure = HistoryReplayStructuralInput & {
+        readonly resolvedSheetIndex: number;
+    };
+    /** Exact unsettled restoration capabilities one replay is allowed to consume. */
+    const replay_row_admissions_for_structures = (
+        request_ids: readonly string[],
+        structures: readonly ResolvedReplayStructure[],
+        source_generation: number,
+        replay_lease_id?: string,
+    ): ReadonlySet<string> | undefined => {
+        if (request_ids.length === 0) return new Set();
+        const edit_session_id = active_edit_session_id;
+        if (edit_session_id === undefined) return undefined;
+        const structure_by_ledger = new Map<string, ResolvedReplayStructure>();
+        for (const structural of structures) {
+            const target = canonical_worksheet_target({
+                ...structural.worksheet,
+                sheetIndex: structural.resolvedSheetIndex,
+            });
+            if (target === undefined) return undefined;
+            structure_by_ledger.set(
+                append_ledger_key(edit_session_id, target),
+                structural,
+            );
+        }
+        const seen_gesture_rows = new Set<string>();
+        for (const request_id of request_ids) {
+            const reservation = row_admission_reservations.get(request_id);
+            const structural = reservation === undefined
+                ? undefined
+                : structure_by_ledger.get(reservation.ledgerKey);
+            if (
+                reservation === undefined
+                || structural === undefined
+                || reservation.purpose !== 'restoration'
+                || reservation.editSessionId !== edit_session_id
+                || reservation.sourceGeneration !== source_generation
+                || reservation.state !== 'unsettled'
+                || reservation.replayLeaseId !== replay_lease_id
+            ) return undefined;
+            const expected_ids = new Set(structural.expected.appendedRows.map((row) => row.id));
+            const desired_rows = new Map(structural.desired.appendedRows.map(
+                (row) => [row.id, row],
+            ));
+            for (const row_id of reservation.gestureRowIds) {
+                if (
+                    expected_ids.has(row_id)
+                    || !desired_rows.has(row_id)
+                    || seen_gesture_rows.has(`${reservation.ledgerKey}\u0000${row_id}`)
+                ) return undefined;
+                seen_gesture_rows.add(`${reservation.ledgerKey}\u0000${row_id}`);
+            }
+            const desired_templates = new Map(structural.desired.formatTemplates.map(
+                (template) => [template.id, template],
+            ));
+            if (reservation.templates.some((template) => (
+                JSON.stringify(desired_templates.get(template.id))
+                    !== JSON.stringify(template)
+            ))) return undefined;
+            if (
+                structural.desired.appendBasis === undefined
+                || advance_pending_append_basis(
+                    reservation.appendBasis,
+                    structural.desired.appendBasis,
+                ) === undefined
+            ) return undefined;
+        }
+        return new Set(request_ids);
+    };
+
+    const lease_replay_row_admissions = (
+        request_ids: readonly string[],
+        replay_lease_id: string,
+    ): boolean => {
+        if (request_ids.some((request_id) => {
+            const reservation = row_admission_reservations.get(request_id);
+            return reservation === undefined
+                || reservation.state !== 'unsettled'
+                || reservation.replayLeaseId !== undefined;
+        })) return false;
+        for (const request_id of request_ids) {
+            row_admission_reservations.get(request_id)!.replayLeaseId = replay_lease_id;
+        }
+        return true;
+    };
+
+    const release_replay_row_admissions = (
+        request_ids: readonly string[],
+        replay_lease_id: string,
+    ): void => {
+        for (const request_id of request_ids) {
+            const reservation = row_admission_reservations.get(request_id);
+            if (reservation?.replayLeaseId === replay_lease_id) {
+                reservation.replayLeaseId = undefined;
+            }
+        }
+    };
+    const cancel_replay_row_admissions = (
+        request_ids: readonly string[],
+        replay_lease_id: string,
+    ): void => {
+        for (const request_id of request_ids) {
+            const reservation = row_admission_reservations.get(request_id);
+            if (reservation === undefined) continue;
+            settle_row_admission({
+                type: 'settleRowAdmission',
+                requestId: request_id,
+                editSessionId: reservation.editSessionId,
+                accepted: false,
+            }, replay_lease_id);
+        }
+    };
+    release_dropped_replay_lease = (lease, reason) => {
+        if (reason === 'invalidated' || reason === 'cleared') {
+            cancel_replay_row_admissions(
+                lease.payload.rowAdmissionRequestIds,
+                lease.leaseId,
+            );
+            return;
+        }
+        release_replay_row_admissions(
+            lease.payload.rowAdmissionRequestIds,
+            lease.leaseId,
+        );
+    };
+
+    const accept_replay_row_admissions = (
+        request_ids: readonly string[],
+        replay_lease_id: string,
+    ): boolean => {
+        const reservations = request_ids.map((request_id) =>
+            row_admission_reservations.get(request_id));
+        if (reservations.some((reservation) => reservation === undefined
+            || reservation.state !== 'unsettled'
+            || reservation.replayLeaseId !== replay_lease_id)) return false;
+        return request_ids.every((request_id, index) => settle_row_admission({
+            type: 'settleRowAdmission',
+            requestId: request_id,
+            editSessionId: reservations[index]!.editSessionId,
+            accepted: true,
+        }, replay_lease_id));
+    };
+    const clear_append_admission_session = (session_id: string): void => {
+        const prefix = `${session_id}\u0000`;
+        for (const [request_id, reservation] of row_admission_reservations) {
+            if (reservation.editSessionId === session_id) {
+                const ledger = append_admission_ledgers.get(reservation.ledgerKey);
+                if (
+                    reservation.state === 'accepted'
+                    && ledger !== undefined
+                    && reservation.rowIds.some((id) => {
+                        const target_key = reservation.ledgerKey.slice(prefix.length);
+                        return retained_pending_append_keys.has(
+                            pending_append_history_key(target_key, id),
+                        );
+                    })
+                ) {
+                    const advanced = ledger.appendBasis === undefined
+                        ? reservation.appendBasis
+                        : advance_pending_append_basis(
+                            ledger.appendBasis,
+                            reservation.appendBasis,
+                    );
+                    if (advanced !== undefined) ledger.appendBasis = advanced;
+                    if (!append_admission_template_authorities.commit(
+                        reservation.templateAuthorityOwner,
+                        ledger_template_authority_owner(reservation.ledgerKey),
+                        reservation.templates,
+                    )) {
+                        append_admission_template_authorities.forget_owner(
+                            reservation.templateAuthorityOwner,
+                        );
+                    }
+                    if (reservation.appendTemplate !== undefined) {
+                        ledger.formatTemplate = reservation.appendTemplate;
+                    }
+                } else {
+                    append_admission_template_authorities.forget_owner(
+                        reservation.templateAuthorityOwner,
+                    );
+                }
+                row_admission_reservations.delete(request_id);
+                row_admission_request_ids.delete(request_id);
+            }
+        }
+        for (const [key, ledger] of append_admission_ledgers) {
+            if (!key.startsWith(prefix)) continue;
+            const target_key = key.slice(prefix.length);
+            const retained_ids = [...ledger.ownedRowIds].filter((id) =>
+                retained_pending_append_keys.has(pending_append_history_key(target_key, id)));
+            if (retained_ids.length > 0) {
+                for (const id of retained_ids) {
+                    const format_template_id = ledger.templateIdByRowId.get(id);
+                    const format_template = format_template_id === undefined
+                        ? undefined
+                        : append_admission_template_authorities.get(
+                            ledger_template_authority_owner(key),
+                            format_template_id,
+                        );
+                    if (format_template_id === undefined || format_template === undefined) continue;
+                    retained_pending_append_authorities.remember(target_key, id, {
+                        formatTemplate: format_template,
+                        formatTemplateId: format_template_id,
+                        ...(ledger.appendBasis === undefined
+                            ? {}
+                            : { appendBasis: ledger.appendBasis }),
+                        sourceGeneration: ledger.sourceGeneration,
+                    });
+                }
+            }
+            append_admission_ledgers.delete(key);
+            append_admission_template_authorities.forget_owner(
+                ledger_template_authority_owner(key),
+            );
+        }
+        for (const key of append_admission_tails.keys()) {
+            if (key.startsWith(prefix)) append_admission_tails.delete(key);
+        }
+    };
     // The worksheet currently shown in edit mode and worksheets with a pending
     // publication that has not crossed the durable state boundary. Neither is
     // ownership — the grant remains workbook-scoped. Together they are the
@@ -2134,6 +3798,7 @@ export function attach_viewer(
     function reconciled_against(
         snapshot: Readonly<FileStateSnapshot>,
         next: DataSource,
+        commit_append_authority = true,
     ): Readonly<FileStateSnapshot> {
         const state = snapshot.state as PerFileState;
         if (!state.pendingEdits) return snapshot;
@@ -2141,9 +3806,343 @@ export function attach_viewer(
             state.pendingEdits,
             next.meta().sheets,
         );
-        if (reconciled === state.pendingEdits) return snapshot;
-        if (reconciled) {
-            return { revision: snapshot.revision, state: { ...state, pendingEdits: reconciled } };
+        let projected = reconciled;
+        if (projected) {
+            let next_slots: typeof projected | undefined;
+            for (let sheet_index = 0; sheet_index < projected.length; sheet_index += 1) {
+                const slot = projected[sheet_index];
+                const sheet = next.meta().sheets[sheet_index];
+                if (!slot || !sheet) continue;
+                const structural = own_pending_structural_changes(slot);
+                const basis = structural.appendBasis;
+                if (basis === undefined || structural.appendedRows.length === 0) continue;
+                const schema_fingerprint = worksheet_append_schema_fingerprint(sheet);
+                const schema_changed = basis.columnCount !== sheet.columnCount
+                    || basis.schemaFingerprint !== schema_fingerprint;
+                // A wider source preserves every pending column identity. A
+                // narrower source is safe only when the columns it discards do
+                // not carry pending content. Content in retained columns does
+                // not make a presentation-only width reconciliation ambiguous.
+                const has_truncated_content = sheet.columnCount < basis.columnCount
+                    && structural.appendedRows.some((row) =>
+                        Object.entries(row.cells).some(([column, cell]) =>
+                            Number(column) >= sheet.columnCount
+                            && (cell.value !== ''
+                                || cell.valueRuns !== undefined
+                                || cell.link != null))
+                        || Object.keys(row.highlights ?? {}).some(
+                            (column) => Number(column) >= sheet.columnCount,
+                        ));
+                const without_prior = structural.conflicts.filter((conflict) =>
+                    conflict.reason !== 'ambiguousColumns'
+                    && conflict.reason !== 'templateChanged');
+                const reconciliation_conflict_slot = (
+                    reason: 'ambiguousColumns' | 'templateChanged',
+                    pending_row_ids: readonly string[],
+                ) => {
+                    const conflicted = {
+                        ...slot,
+                        conflicts: Object.freeze([
+                            ...without_prior,
+                            Object.freeze({
+                                reason,
+                                pendingRowIds: Object.freeze(pending_row_ids.slice(
+                                    0,
+                                    MAX_ACTIONABLE_STRUCTURAL_CONFLICT_ROW_IDS,
+                                )),
+                                tailRemovalIds: Object.freeze([]),
+                            }),
+                        ]),
+                    };
+                    assert_pending_changes_encoded_bound(conflicted);
+                    return conflicted;
+                };
+                // A zero-width worksheet has no legal append schema. Even a
+                // blank pending row cannot be resized to it: PendingAppendBasis
+                // intentionally requires a positive column count at every
+                // durable and wire boundary.
+                if (has_truncated_content || sheet.columnCount === 0) {
+                    next_slots ??= projected.slice();
+                    next_slots[sheet_index] = reconciliation_conflict_slot(
+                        'ambiguousColumns',
+                        structural.appendedRows.map((row) => row.id),
+                    );
+                    continue;
+                }
+                const resize = <T,>(
+                    values: readonly T[],
+                    fill: () => T,
+                ): readonly T[] => Object.freeze(Array.from(
+                    { length: sheet.columnCount },
+                    (_unused, column) => column < values.length
+                        ? values[column] as T
+                        : fill(),
+                ));
+                // Compare the dependencies that survive the width change. A
+                // removed blank column may have had a style, but that style no
+                // longer participates in the appended row and cannot make the
+                // retained template stale.
+                const changed_template_ids = new Set(structural.formatTemplates.flatMap(
+                    (template) => {
+                        if (template.format.kind !== 'xlsx') return [];
+                        const fingerprint = next.append_style_dependency_fingerprint?.bind(next);
+                        if (fingerprint === undefined) return [template.id];
+                        const retained_count = Math.min(
+                            sheet.columnCount,
+                            basis.columnCount,
+                        );
+                        const slot_fingerprints = template.format.cellStyleFingerprints;
+                        if (slot_fingerprints === undefined) {
+                            // Legacy templates have only an aggregate hash. It
+                            // remains comparable across growth, but cannot prove
+                            // that a retained subset survived a shrink.
+                            if (sheet.columnCount < basis.columnCount) return [template.id];
+                            if (fingerprint(
+                                template.format.cellStyleIndexes,
+                                template.format.rowStyleIndex,
+                            ) !== template.format.styleFingerprint) return [template.id];
+                        } else {
+                            for (let column = 0; column < retained_count; column += 1) {
+                                if (fingerprint(
+                                    [template.format.cellStyleIndexes[column] ?? null],
+                                    template.format.rowStyleIndex,
+                                ) !== slot_fingerprints[column]) return [template.id];
+                            }
+                        }
+                        if (
+                            sheet.columnCount > basis.columnCount
+                            && template.format.rowStyleIndex !== undefined
+                            && (template.format.rowNumberFormat === undefined
+                                || template.format.rowFontStyle === undefined)
+                        ) return [template.id];
+                        return [];
+                    },
+                ));
+                if (changed_template_ids.size > 0) {
+                    next_slots ??= projected.slice();
+                    next_slots[sheet_index] = reconciliation_conflict_slot(
+                        'templateChanged',
+                        structural.appendedRows
+                            .filter((row) => changed_template_ids.has(row.formatTemplateId))
+                            .map((row) => row.id),
+                    );
+                    continue;
+                }
+                if (!schema_changed) {
+                    // Style-only refreshes must still run the dependency check
+                    // above. When the style returns to the admitted recipe, also
+                    // retire the conflict without rewriting otherwise-identical
+                    // row/template state.
+                    if (without_prior.length !== structural.conflicts.length) {
+                        next_slots ??= projected.slice();
+                        next_slots[sheet_index] = {
+                            ...slot,
+                            conflicts: Object.freeze(without_prior),
+                        };
+                    }
+                    continue;
+                }
+                // With no value/highlight attached to a column identity, a width
+                // change can only add or discard blank presentation slots. Keep
+                // row identity/order and resize the interned XLSX recipes.
+                const templates = structural.formatTemplates.map((template) => {
+                    if (template.format.kind !== 'xlsx') return template;
+                    const format = template.format;
+                    const cellStyleIndexes = resize(
+                        format.cellStyleIndexes,
+                        () => null,
+                    );
+                    const styleFingerprint = next.append_style_dependency_fingerprint?.(
+                        cellStyleIndexes,
+                        format.rowStyleIndex,
+                    );
+                    if (styleFingerprint === undefined) return template;
+                    const cellStyleFingerprints = Object.freeze(cellStyleIndexes.map((style) =>
+                        next.append_style_dependency_fingerprint!(
+                            [style],
+                            format.rowStyleIndex,
+                        )));
+                    return Object.freeze({
+                        ...template,
+                        format: Object.freeze({
+                            ...format,
+                            styleFingerprint,
+                            cellStyleIndexes,
+                            cellStyleFingerprints,
+                            ...(format.cellNumberFormats === undefined
+                                ? {}
+                                : {
+                                    cellNumberFormats: resize(
+                                        format.cellNumberFormats,
+                                        () => format.rowStyleIndex === undefined
+                                            ? null
+                                            : format.rowNumberFormat ?? null,
+                                    ),
+                                }),
+                            ...(format.cellFontStyles === undefined
+                                ? {}
+                                : {
+                                    cellFontStyles: resize(
+                                        format.cellFontStyles,
+                                        () => format.rowStyleIndex === undefined
+                                            ? { bold: false, italic: false }
+                                            : format.rowFontStyle
+                                                ?? { bold: false, italic: false },
+                                    ),
+                                }),
+                        }),
+                    });
+                });
+                const reconciled_xlsx_template = templates.find(
+                    (template) => template.format.kind === 'xlsx',
+                );
+                const reconciled_style_fingerprint = reconciled_xlsx_template?.format.kind
+                    === 'xlsx'
+                    ? reconciled_xlsx_template.format.styleFingerprint
+                    : undefined;
+                const appendBasis: PendingAppendBasis = Object.freeze({
+                    ...basis,
+                    columnCount: sheet.columnCount,
+                    schemaFingerprint: schema_fingerprint,
+                    ...(basis.styleFingerprint === undefined ? {} : {
+                        styleFingerprint: reconciled_style_fingerprint
+                            ?? basis.styleFingerprint,
+                    }),
+                });
+                const reconciled_slot = {
+                    ...slot,
+                    formatTemplates: Object.freeze(templates),
+                    appendBasis,
+                    conflicts: Object.freeze(without_prior),
+                };
+                let candidate_is_bounded = true;
+                try {
+                    // Width growth can repeat one row-level display recipe into
+                    // thousands of new slots. Measure the complete durable leaf
+                    // without first materializing its JSON representation.
+                    assert_pending_user_changes_encoded_bound(reconciled_slot);
+                } catch {
+                    candidate_is_bounded = false;
+                }
+                const reconciled_template_ids = new Set(templates.flatMap(
+                    (template, index) => template === structural.formatTemplates[index]
+                        ? []
+                        : [template.id],
+                ));
+                let ledger: AppendAdmissionLedger | undefined;
+                let ledger_key: string | undefined;
+                if (active_edit_session_id !== undefined) {
+                    const target: WorksheetTarget = {
+                        sheetIndex: sheet_index,
+                        sheetName: sheet.name,
+                        ...(sheet.worksheetId === undefined
+                            ? {}
+                            : { worksheetId: sheet.worksheetId }),
+                    };
+                    ledger_key = append_ledger_key(active_edit_session_id, target);
+                    ledger = append_admission_ledgers.get(ledger_key);
+                    if (
+                        candidate_is_bounded
+                        && commit_append_authority
+                        && ledger !== undefined
+                        && !append_admission_template_authorities.replace(
+                            ledger_template_authority_owner(ledger_key),
+                            templates,
+                        )
+                    ) {
+                        candidate_is_bounded = false;
+                    }
+                }
+                next_slots ??= projected.slice();
+                if (!candidate_is_bounded) {
+                    next_slots[sheet_index] = reconciliation_conflict_slot(
+                        'templateChanged',
+                        structural.appendedRows
+                            .filter((row) => reconciled_template_ids.has(
+                                row.formatTemplateId,
+                            ))
+                            .map((row) => row.id),
+                    );
+                    continue;
+                }
+                next_slots[sheet_index] = reconciled_slot;
+                if (
+                    commit_append_authority
+                    && ledger !== undefined
+                    && ledger_key !== undefined
+                ) {
+                    ledger.appendBasis = appendBasis;
+                }
+            }
+            projected = next_slots ?? projected;
+        }
+        if (projected && file_path.toLowerCase().endsWith('.xlsx')) {
+            let next_slots: typeof projected | undefined;
+            for (let formula_index = 0; formula_index < projected.length; formula_index += 1) {
+                const slot = projected[formula_index];
+                if (!slot) continue;
+                const formula_structural = own_pending_structural_changes(slot);
+                const formula_cells = projected.flatMap((target_slot, target_index) =>
+                    target_slot
+                        ? pending_formula_cells_referencing_provisional_rows(
+                            formula_structural,
+                            slot.cells,
+                            own_pending_structural_changes(target_slot),
+                            formula_index,
+                            target_index,
+                            next.meta().sheets,
+                        )
+                        : []);
+                const unique_formula_cells = [...new Map(formula_cells.map((cell) => [
+                    cell.rowIdentity.kind === 'source'
+                        ? `source:${cell.rowIdentity.sourceRow}:${cell.sourceColumn}`
+                        : `pending:${cell.rowIdentity.pendingRowId}:${cell.sourceColumn}`,
+                    cell,
+                ])).values()];
+                const ambiguous = unique_formula_cells.length > 0;
+                const without_prior = formula_structural.conflicts.filter(
+                    (conflict) => conflict.reason !== 'ambiguousPendingFormula',
+                );
+                if (!ambiguous) {
+                    if (without_prior.length === formula_structural.conflicts.length) continue;
+                    next_slots ??= projected.slice();
+                    next_slots[formula_index] = {
+                        ...slot,
+                        conflicts: Object.freeze(without_prior),
+                    };
+                    continue;
+                }
+                // Conflicts are actionable diagnostics, not a mirror of the
+                // entire workbook. Cap them before deriving row ids so a large
+                // workbook cannot inflate the durable state payload toward the
+                // webview message limit.
+                const actionable_formula_cells = unique_formula_cells.slice(0, 16);
+                next_slots ??= projected.slice();
+                const conflicted = {
+                    ...slot,
+                    conflicts: Object.freeze([
+                        ...without_prior,
+                        Object.freeze({
+                            reason: 'ambiguousPendingFormula' as const,
+                            pendingRowIds: Object.freeze([...new Set(
+                                actionable_formula_cells.flatMap((cell) =>
+                                    cell.rowIdentity.kind === 'pending'
+                                        ? [cell.rowIdentity.pendingRowId]
+                                        : []),
+                            )]),
+                            tailRemovalIds: Object.freeze([]),
+                            formulaCells: Object.freeze(actionable_formula_cells),
+                        }),
+                    ]),
+                };
+                assert_pending_changes_encoded_bound(conflicted);
+                next_slots[formula_index] = conflicted;
+            }
+            projected = next_slots ?? projected;
+        }
+        if (projected === state.pendingEdits) return snapshot;
+        if (projected) {
+            return { revision: snapshot.revision, state: { ...state, pendingEdits: projected } };
         }
         const { pendingEdits: _drop, ...rest } = state;
         return { revision: snapshot.revision, state: rest };
@@ -2723,6 +4722,10 @@ export function attach_viewer(
         }
         active_edit_session_targets.delete(edit_session_id);
         pending_edit_session_targets.delete(edit_session_id);
+        const admitted_pending_writes = pending_edit_writes;
+        const admitted_append_authority = append_admission_tails.get(
+            APPEND_ADMISSION_AUTHORITY_TAIL,
+        ) ?? Promise.resolve();
         const release = Symbol(file_key);
         file_edit_state.phase = {
             type: 'releasing',
@@ -2730,7 +4733,25 @@ export function attach_viewer(
             token: edit_session_token,
         };
         notify_edit_state();
-        return { release, admittedWrites: pending_edit_writes };
+        const admittedWrites = (async () => {
+            let failure: unknown;
+            try {
+                await admitted_pending_writes;
+            } catch (error) {
+                failure = error;
+            }
+            try {
+                await admitted_append_authority;
+            } catch (error) {
+                failure ??= error;
+            }
+            // Both tails are now settled, so every publication that crossed the
+            // fence has either committed its ledger transition or refused. Only
+            // now may release transfer the remaining capabilities to history.
+            clear_append_admission_session(edit_session_id);
+            if (failure !== undefined) throw failure;
+        })();
+        return { release, admittedWrites };
     }
 
     function release_edit_session(
@@ -3111,6 +5132,31 @@ export function attach_viewer(
         return strip_operation_owned_pending_edits(pending_edits, operation) === undefined;
     }
 
+    function pending_changes_echo_operation(
+        slot: WorksheetPendingEdits | undefined,
+        operation: CsvSaveWorksheetOperation,
+    ): boolean {
+        if (!slot) return false;
+        const owned_cell_count = Object.keys(operation.dirtyEdits).length;
+        const cells_match = owned_cell_count === 0
+            ? Object.keys(slot.cells).length === 0
+            : post_echoes_operation(slot.cells, operation);
+        if (!cells_match) return false;
+        const structural = operation.structuralChanges;
+        return JSON.stringify({
+            formatTemplates: slot.formatTemplates ?? [],
+            appendedRows: slot.appendedRows ?? [],
+            tailRemovals: slot.tailRemovals ?? [],
+            ...(slot.appendBasis === undefined ? {} : { appendBasis: slot.appendBasis }),
+            conflicts: slot.conflicts ?? [],
+        }) === JSON.stringify(structural ?? {
+            formatTemplates: [],
+            appendedRows: [],
+            tailRemovals: [],
+            conflicts: [],
+        });
+    }
+
     /**
      * `scope` names the worksheet whose cells these are, when the caller knows.
      * A save lifecycle and a tombstone each belong to one worksheet, so their
@@ -3202,14 +5248,10 @@ export function attach_viewer(
                 continue;
             }
             projected_slots ??= pending_edits.slice(0, index);
-            projected_slots.push(projected
-                ? {
-                    ...(slot.sheetName !== undefined ? { sheetName: slot.sheetName } : {}),
-                    ...(slot.worksheetId !== undefined
-                        ? { worksheetId: slot.worksheetId }
-                        : {}),
-                    cells: projected,
-                }
+            const has_structural = (slot.appendedRows?.length ?? 0) > 0
+                || (slot.tailRemovals?.length ?? 0) > 0;
+            projected_slots.push(projected || has_structural
+                ? { ...slot, cells: projected ?? {} }
                 : undefined);
         }
         // Preserve identity when nothing changed, so callers can keep using
@@ -3637,17 +5679,23 @@ export function attach_viewer(
             current: PerFileState,
             sheets: readonly SheetMeta[],
         ) => PerFileState,
+        write_currency?: {
+            readonly expectedAuthorityRevision: number;
+            readonly isCurrent: () => boolean;
+        },
     ): Promise<EditStateWriteResult> {
         const is_current = () => {
             if (
                 active_edit_session_id !== edit_session_id
                 || !pending_edit_admissions.has(admission)
+                || (write_currency !== undefined && !write_currency.isCurrent())
             ) return false;
             const phase = edit_phase();
             return (phase.type === 'owned' || phase.type === 'releasing')
                 && phase.token === edit_session_token;
         };
-        const expected_authority_revision = source_authority.authorityRevision;
+        const expected_authority_revision = write_currency?.expectedAuthorityRevision
+            ?? source_authority.authorityRevision;
         let snapshot = await read_file_state(false);
         for (;;) {
             if (!is_current()) return { type: 'aborted' };
@@ -4913,7 +6961,7 @@ export function attach_viewer(
                                         ))),
                                         dirtyEdits: validation.dirtyEdits,
                                     }],
-                                });
+                                }, next_sheets);
                                 if (parsed.status === 'malformed') {
                                     throw new Error('Restored save operation held malformed edits.');
                                 }
@@ -5255,7 +7303,7 @@ export function attach_viewer(
                             saved.sheetIndex,
                         );
                 if (target === undefined) continue;
-                next = with_pending_edits_for_sheet(
+                next = with_pending_changes_for_sheet(
                     next,
                     target,
                     undefined,
@@ -5881,6 +7929,777 @@ export function attach_viewer(
             && edit_session_id === active_edit_session_id;
     }
 
+    async function admit_append_rows(
+        message: Extract<WebviewMessage, { type: 'requestAppendRows' }>,
+        receiver_epoch: number,
+    ): Promise<void> {
+        if (row_admission_request_ids.has(message.requestId)) {
+            await post_to_receiver({
+                type: 'appendRowsResult',
+                requestId: message.requestId,
+                sourceGeneration: message.sourceGeneration,
+                granted: false,
+                reason: 'This row-admission request identity is already active.',
+            }, receiver_epoch);
+            return;
+        }
+        row_admission_request_ids.add(message.requestId);
+        const refuse = (reason: string): Promise<boolean> => {
+            row_admission_request_ids.delete(message.requestId);
+            return post_to_receiver({
+                type: 'appendRowsResult',
+                requestId: message.requestId,
+                sourceGeneration: message.sourceGeneration,
+                granted: false,
+                reason,
+            }, receiver_epoch);
+        };
+        if (
+            !editing_supported
+            || !edit_message_is_current(message.editSessionId)
+            || receiver_epoch !== session.current_receiver_epoch
+            || !core
+            || !source
+            || message.sourceGeneration !== core.source_generation
+        ) {
+            await refuse('The edit session or worksheet changed. Try appending again.');
+            return;
+        }
+        const requested_target = sanitized_wire_worksheet_target(message.worksheet);
+        if (!requested_target) {
+            await refuse('The worksheet identity is invalid.');
+            return;
+        }
+        const target = canonical_worksheet_target(requested_target);
+        const sheet_index = target?.sheetIndex;
+        if (target === undefined || sheet_index !== requested_target.sheetIndex) {
+            await refuse('The worksheet was removed or reordered.');
+            return;
+        }
+        const sheet = source.meta().sheets[sheet_index];
+        if (
+            !Number.isSafeInteger(message.count)
+            || message.count <= 0
+            || message.count > MAX_PENDING_APPENDED_ROWS
+        ) {
+            await refuse(`Append at most ${MAX_PENDING_APPENDED_ROWS.toLocaleString('en-US')} rows at once.`);
+            return;
+        }
+        if (source.truncationMessage) {
+            await refuse('Load the complete delimited file before appending rows.');
+            return;
+        }
+        if (sheet.columnCount <= 0) {
+            await refuse('This worksheet has no columns to append into.');
+            return;
+        }
+
+        const state_snapshot = await read_file_state();
+        if (
+            !edit_message_is_current(message.editSessionId)
+            || receiver_epoch !== session.current_receiver_epoch
+            || !core
+            || !source
+            || message.sourceGeneration !== core.source_generation
+        ) {
+            await refuse('The source changed while the row was being prepared.');
+            return;
+        }
+        const state = (reconciled_against(state_snapshot, source).state) as PerFileState;
+        const visibility = create_column_projection(
+            sheet.columnCount,
+            state.columnVisibility?.[sheet_index],
+            transform_schema_for_sheet(sheet),
+        );
+        if (visibility.visible_to_source.length === 0) {
+            await refuse('Show at least one column before appending a row.');
+            return;
+        }
+        const reconciled = reconcile_pending_edit_sheets(
+            state.pendingEdits,
+            source.meta().sheets,
+        );
+        const durable = pending_changes_for_sheet(
+            reconciled,
+            sheet_index,
+            sheet.name,
+            sheet.worksheetId,
+        );
+        const ledger_key = append_ledger_key(message.editSessionId, target);
+        let ledger = append_admission_ledgers.get(ledger_key);
+        if (!ledger) {
+            ledger = {
+                ownedRowIds: new Set(),
+                templateIdByRowId: new Map(),
+                reservedRowIds: new Map(),
+                unsettledRequestByRowId: new Map(),
+                sourceGeneration: message.sourceGeneration,
+            };
+            append_admission_ledgers.set(ledger_key, ledger);
+        }
+        if (unsettled_reservation_for_ledger(ledger_key) !== undefined) {
+            await refuse('Another row append is still being installed. Try again.');
+            return;
+        }
+        const provisional_ledger_basis = accepted_append_basis_for_ledger(
+            ledger,
+            ledger_key,
+        );
+        const admitted_ids = new Set(durable?.appendedRows?.map((row) => row.id) ?? []);
+        for (const id of ledger.reservedRowIds.keys()) admitted_ids.add(id);
+        // The product limit is deliberately session-lifetime, not merely the
+        // number still visible. Otherwise append/remove loops retain an
+        // unbounded host capability set while always appearing below quota.
+        if (ledger.ownedRowIds.size + message.count > MAX_PENDING_APPENDED_ROWS) {
+            await refuse(`A worksheet may keep at most ${MAX_PENDING_APPENDED_ROWS.toLocaleString('en-US')} pending rows.`);
+            return;
+        }
+        const prospective_rows = sheet.sourceRowCount
+            - (durable?.tailRemovals?.length ?? 0)
+            + admitted_ids.size
+            + message.count;
+        if (prospective_rows > MAX_SHEET_ROWS) {
+            await refuse('Appending these rows would exceed the worksheet row limit.');
+            return;
+        }
+
+        const schemaFingerprint = worksheet_append_schema_fingerprint(sheet);
+        if (
+            durable?.appendBasis !== undefined
+            && (durable.appendBasis.columnCount !== sheet.columnCount
+                || durable.appendBasis.schemaFingerprint !== schemaFingerprint)
+        ) {
+            await refuse('Pending rows need review because the worksheet columns changed.');
+            return;
+        }
+
+        let format: PendingRowFormatTemplate['format'];
+        if (file_path.toLowerCase().endsWith('.xlsx')) {
+            const observation = source_observation;
+            if (!observation) {
+                await refuse('The workbook source is not ready for an append.');
+                return;
+            }
+            const raw = await host.fs.read_file(uri);
+            if (
+                content_digest(raw) !== observation.digest
+                || !edit_message_is_current(message.editSessionId)
+                || receiver_epoch !== session.current_receiver_epoch
+                || !core
+                || message.sourceGeneration !== core.source_generation
+                || source_observation !== observation
+            ) {
+                await refuse('The workbook changed while the row format was being captured.');
+                return;
+            }
+            let template_source_row = sheet.sourceRowCount === 0
+                ? undefined
+                : sheet.sourceRowCount - 1;
+            if (
+                template_source_row !== undefined
+                && sheet.excelFirstRowHeader?.active === true
+                && sheet.excelFirstRowHeader.sourceRow === template_source_row
+            ) {
+                template_source_row = template_source_row === 0
+                    ? undefined
+                    : template_source_row - 1;
+            }
+            const viewer_height = template_source_row === undefined
+                ? undefined
+                : state.rowHeights?.[sheet_index]?.[template_source_row];
+            try {
+                format = capture_xlsx_append_row_format(
+                    raw,
+                    sheet_index,
+                    sheet.sourceRowCount,
+                    sheet.columnCount,
+                    sheet.excelFirstRowHeader?.active === true
+                        ? sheet.excelFirstRowHeader.sourceRow
+                        : undefined,
+                    viewer_height,
+                );
+            } catch (error) {
+                await refuse(error instanceof Error
+                    ? error.message
+                    : 'The final worksheet row cannot be used as a format template.');
+                return;
+            }
+            if (
+                durable?.appendBasis?.styleFingerprint !== undefined
+                && durable.appendBasis.styleFingerprint !== format.styleFingerprint
+            ) {
+                await refuse('Pending rows need review because the workbook styles changed.');
+                return;
+            }
+        } else {
+            format = { kind: 'none' };
+        }
+        const appendBasis: PendingAppendBasis = Object.freeze({
+            sourceRowCount: durable?.appendBasis?.sourceRowCount
+                ?? provisional_ledger_basis?.sourceRowCount
+                ?? sheet.sourceRowCount,
+            provisionalStartRow: durable?.appendBasis?.provisionalStartRow
+                ?? provisional_ledger_basis?.provisionalStartRow
+                ?? sheet.sourceRowCount - (durable?.tailRemovals?.length ?? 0),
+            provisionalRowCount: Math.max(
+                durable?.appendBasis?.provisionalRowCount ?? 0,
+                provisional_ledger_basis?.provisionalRowCount ?? 0,
+                admitted_ids.size + message.count,
+            ),
+            columnCount: sheet.columnCount,
+            schemaFingerprint,
+            ...(format.kind === 'xlsx'
+                ? { styleFingerprint: format.styleFingerprint }
+                : {}),
+        });
+        if (provisional_ledger_basis !== undefined
+            && advance_pending_append_basis(provisional_ledger_basis, appendBasis) === undefined) {
+            await refuse('Pending rows need review because their worksheet basis changed.');
+            return;
+        }
+        const matching_durable_template = durable?.formatTemplates?.find(
+            (candidate) => JSON.stringify(candidate.format) === JSON.stringify(format),
+        );
+        const formatTemplate = matching_durable_template
+            ?? (ledger.formatTemplate !== undefined
+                && JSON.stringify(ledger.formatTemplate.format) === JSON.stringify(format)
+                ? ledger.formatTemplate
+                : Object.freeze({
+                    id: `append-template:${randomUUID()}`,
+                    format,
+                }));
+        const rowIds = Object.freeze(Array.from({ length: message.count }, () => {
+            const id = `append-row:${randomUUID()}`;
+            return id;
+        }));
+        const tentative_rows = [
+            ...(durable?.appendedRows ?? []),
+            ...rowIds.map((id, index) => Object.freeze({
+                id,
+                cells: Object.freeze({}),
+                formatTemplateId: formatTemplate.id,
+                // Upper-bound the renderer's timestamp-shaped order spelling in
+                // the aggregate byte admission estimate.
+                createdOrder: Number.MAX_SAFE_INTEGER - rowIds.length + index + 1,
+            })),
+        ];
+        const tentative_templates = durable?.formatTemplates?.some(
+            (candidate) => candidate.id === formatTemplate.id,
+        ) === true
+            ? durable.formatTemplates
+            : [...(durable?.formatTemplates ?? []), formatTemplate];
+        if (!own_wire_pending_changes({
+            ...target,
+            cells: durable?.cells ?? {},
+            formatTemplates: tentative_templates,
+            appendedRows: tentative_rows,
+            tailRemovals: durable?.tailRemovals ?? [],
+            appendBasis,
+            conflicts: durable?.conflicts ?? [],
+        })) {
+            await refuse('Appending these rows would exceed the pending-changes size limit.');
+            return;
+        }
+        if (receiver_epoch !== session.current_receiver_epoch
+            || !edit_message_is_current(message.editSessionId)) {
+            row_admission_request_ids.delete(message.requestId);
+            return;
+        }
+        const template_authority_owner = reservation_template_authority_owner(
+            message.requestId,
+        );
+        if (!append_admission_template_authorities.reserve(
+            template_authority_owner,
+            [formatTemplate],
+        )) {
+            await refuse('Pending row format history has reached its memory limit.');
+            return;
+        }
+        for (const id of rowIds) {
+            ledger.ownedRowIds.add(id);
+            ledger.templateIdByRowId.set(id, formatTemplate.id);
+            ledger.reservedRowIds.set(id, highest_pending_edit_sequence + 1);
+            ledger.unsettledRequestByRowId.set(id, message.requestId);
+        }
+        row_admission_reservations.set(message.requestId, {
+            purpose: 'append',
+            editSessionId: message.editSessionId,
+            ledgerKey: ledger_key,
+            gestureRowIds: rowIds,
+            rowIds,
+            appendBasis,
+            templates: Object.freeze([formatTemplate]),
+            templateAuthorityOwner: template_authority_owner,
+            appendTemplate: formatTemplate,
+            sourceGeneration: message.sourceGeneration,
+            state: 'unsettled',
+        });
+        const delivered = await post_to_receiver({
+            type: 'appendRowsResult',
+            requestId: message.requestId,
+            sourceGeneration: message.sourceGeneration,
+            granted: true,
+            rowIds,
+            formatTemplate,
+            appendBasis,
+        }, receiver_epoch);
+        if (!delivered) {
+            settle_row_admission({
+                type: 'settleRowAdmission',
+                requestId: message.requestId,
+                editSessionId: message.editSessionId,
+                accepted: false,
+            });
+        }
+    }
+
+    async function validate_tail_removal_replay(
+        message: Extract<WebviewMessage, { type: 'validateTailRemovalReplay' }>,
+    ): Promise<void> {
+        const reply = (valid: boolean) => post_to_receiver({
+            type: 'tailRemovalReplayValidated' as const,
+            requestId: typeof message.requestId === 'string' ? message.requestId : '',
+            sourceGeneration: Number.isSafeInteger(message.sourceGeneration)
+                ? message.sourceGeneration
+                : -1,
+            valid,
+        });
+        if (
+            !edit_message_is_current(message.editSessionId)
+            || !core
+            || !source
+            || message.sourceGeneration !== core.source_generation
+            || !Array.isArray(message.worksheets)
+            || message.worksheets.length > source.meta().sheets.length
+        ) {
+            await reply(false);
+            return;
+        }
+        const observation = source_observation;
+        if (!observation) {
+            await reply(false);
+            return;
+        }
+        let raw: Uint8Array;
+        try {
+            raw = await host.fs.read_file(uri);
+        } catch {
+            await reply(false);
+            return;
+        }
+        if (
+            content_digest(raw) !== observation.digest
+            || source_observation !== observation
+            || !edit_message_is_current(message.editSessionId)
+        ) {
+            await reply(false);
+            return;
+        }
+        let removal_count = 0;
+        try {
+            const seen = new Set<number>();
+            for (const requested of message.worksheets) {
+                const target = sanitized_wire_worksheet_target(requested);
+                if (!target || !Array.isArray(requested.removals)) throw new Error('invalid');
+                const sheet_index = worksheet_target_index(source.meta().sheets, target);
+                if (sheet_index === undefined) throw new Error('invalid');
+                const sheet = source.meta().sheets[sheet_index];
+                if (!sheet || seen.has(sheet_index)) throw new Error('invalid');
+                seen.add(sheet_index);
+                removal_count += requested.removals.length;
+                if (removal_count > MAX_PENDING_APPENDED_ROWS) throw new Error('invalid');
+                for (const [index, removal] of requested.removals.entries()) {
+                    if (
+                        !is_plain_record(removal)
+                        || typeof removal.appendHistoryId !== 'string'
+                        || removal.appendHistoryId.length === 0
+                        || removal.appendHistoryId.length > 256
+                        || !Number.isSafeInteger(removal.sourceRow)
+                        || removal.sourceRow !== sheet.sourceRowCount
+                            - requested.removals.length + index
+                        || typeof removal.savedFingerprint !== 'string'
+                        || removal.savedFingerprint.length === 0
+                        || removal.savedFingerprint.length > 256
+                    ) throw new Error('invalid');
+                    const source_row = removal.sourceRow as number;
+                    const append_history_id = removal.appendHistoryId as string;
+                    const saved_fingerprint = removal.savedFingerprint as string;
+                    const authority = saved_append_authority_for(target, append_history_id);
+                    if (
+                        authority === undefined
+                        || authority.state !== 'physical'
+                        || authority.sourceRow !== source_row
+                        || authority.savedFingerprint !== saved_fingerprint
+                    ) throw new Error('unauthorized');
+                    const format = file_path.toLowerCase().endsWith('.xlsx')
+                        ? capture_xlsx_append_row_format(
+                            raw,
+                            sheet_index,
+                            source_row + 1,
+                            sheet.columnCount,
+                            sheet.excelFirstRowHeader?.active === true
+                                ? sheet.excelFirstRowHeader.sourceRow
+                                : undefined,
+                        )
+                        : { kind: 'none' as const };
+                    const fingerprint = saved_row_physical_fingerprint({
+                        cells: source_row_cells_for_fingerprint(
+                            source,
+                            sheet_index,
+                            source_row,
+                        ),
+                        format,
+                    });
+                    if (fingerprint !== saved_row_physical_fingerprint(
+                        authority.savedRow,
+                    )) throw new Error('changed');
+                }
+            }
+            await reply(true);
+        } catch {
+            await reply(false);
+        }
+    }
+
+    function settle_row_admission(
+        message: Extract<WebviewMessage, { type: 'settleRowAdmission' }>,
+        replay_lease_id?: string,
+    ): boolean {
+        const reservation = row_admission_reservations.get(message.requestId);
+        if (reservation === undefined
+            || reservation.editSessionId !== message.editSessionId
+            || reservation.state !== 'unsettled') return false;
+        if (
+            reservation.replayLeaseId !== undefined
+            && reservation.replayLeaseId !== replay_lease_id
+        ) return false;
+        const ledger = append_admission_ledgers.get(reservation.ledgerKey);
+        if (ledger === undefined) {
+            append_admission_template_authorities.forget_owner(
+                reservation.templateAuthorityOwner,
+            );
+            row_admission_reservations.delete(message.requestId);
+            row_admission_request_ids.delete(message.requestId);
+            return false;
+        }
+        let accepted = message.accepted === true;
+        if (accepted) {
+            const provisional_basis = accepted_append_basis_for_ledger(
+                ledger,
+                reservation.ledgerKey,
+            );
+            const advanced = provisional_basis === undefined
+                ? reservation.appendBasis
+                : advance_pending_append_basis(provisional_basis, reservation.appendBasis);
+            if (advanced === undefined) {
+                accepted = false;
+            }
+        }
+        for (const row_id of reservation.rowIds) {
+            if (ledger.unsettledRequestByRowId.get(row_id) !== message.requestId) continue;
+            ledger.unsettledRequestByRowId.delete(row_id);
+            if (accepted) {
+                ledger.reservedRowIds.set(row_id, highest_pending_edit_sequence + 1);
+                continue;
+            }
+            ledger.reservedRowIds.delete(row_id);
+            ledger.ownedRowIds.delete(row_id);
+            ledger.templateIdByRowId.delete(row_id);
+        }
+        if (accepted) {
+            reservation.state = 'accepted';
+            reservation.firstPublicationSequence = highest_pending_edit_sequence + 1;
+            reservation.replayLeaseId = undefined;
+            return true;
+        }
+        append_admission_template_authorities.forget_owner(
+            reservation.templateAuthorityOwner,
+        );
+        row_admission_reservations.delete(message.requestId);
+        row_admission_request_ids.delete(message.requestId);
+        return true;
+    }
+
+    async function admit_saved_row_restoration(
+        message: Extract<WebviewMessage, { type: 'requestRestoreSavedRows' }>,
+        receiver_epoch: number,
+    ): Promise<void> {
+        if (row_admission_request_ids.has(message.requestId)) {
+            await post_to_receiver({
+                type: 'restoreSavedRowsResult',
+                requestId: message.requestId,
+                sourceGeneration: message.sourceGeneration,
+                granted: false,
+                reason: 'This row-admission request identity is already active.',
+            }, receiver_epoch);
+            return;
+        }
+        row_admission_request_ids.add(message.requestId);
+        const refuse = (reason: string): Promise<boolean> => {
+            row_admission_request_ids.delete(message.requestId);
+            return post_to_receiver({
+                type: 'restoreSavedRowsResult',
+                requestId: message.requestId,
+                sourceGeneration: message.sourceGeneration,
+                granted: false,
+                reason,
+            }, receiver_epoch);
+        };
+        if (
+            !editing_supported
+            || !edit_message_is_current(message.editSessionId)
+            || receiver_epoch !== session.current_receiver_epoch
+            || !core
+            || !source
+            || message.sourceGeneration !== core.source_generation
+        ) {
+            await refuse('The edit session or worksheet changed. Try restoring again.');
+            return;
+        }
+        const requested_target = sanitized_wire_worksheet_target(message.worksheet);
+        const ids = Array.isArray(message.appendHistoryIds)
+            ? message.appendHistoryIds
+            : [];
+        if (
+            !requested_target
+            || ids.length === 0
+            || ids.length > MAX_PENDING_APPENDED_ROWS
+            || new Set(ids).size !== ids.length
+            || ids.some((id) => typeof id !== 'string' || id.length === 0 || id.length > 128)
+        ) {
+            await refuse('The saved-row restoration request is invalid.');
+            return;
+        }
+        const target = canonical_worksheet_target(requested_target);
+        if (target === undefined) {
+            await refuse('The worksheet was removed.');
+            return;
+        }
+        const sheet_index = target.sheetIndex;
+        const sheet = source.meta().sheets[sheet_index];
+        if (!sheet) {
+            await refuse('The worksheet was removed.');
+            return;
+        }
+        const authorities = ids.map((id) => saved_append_authority_for(target, id));
+        if (authorities.some((authority) => authority?.state !== 'removed')) {
+            await refuse('The saved appended row is no longer restorable.');
+            return;
+        }
+        const state_snapshot = await read_file_state();
+        if (!edit_message_is_current(message.editSessionId)
+            || receiver_epoch !== session.current_receiver_epoch
+            || !source || !core) {
+            await refuse('The source changed while the saved row was being restored.');
+            return;
+        }
+        const state = state_snapshot.state as PerFileState;
+        const reconciled = reconcile_pending_edit_sheets(
+            state.pendingEdits,
+            source.meta().sheets,
+        );
+        const durable = pending_changes_for_sheet(
+            reconciled,
+            sheet_index,
+            sheet.name,
+            sheet.worksheetId,
+        );
+        const ledger_key = append_ledger_key(message.editSessionId, target);
+        const ledger = append_admission_ledgers.get(ledger_key) ?? {
+            ownedRowIds: new Set<string>(),
+            templateIdByRowId: new Map<string, string>(),
+            reservedRowIds: new Map<string, number>(),
+            unsettledRequestByRowId: new Map<string, string>(),
+            sourceGeneration: message.sourceGeneration,
+        };
+        append_admission_ledgers.set(ledger_key, ledger);
+        if (unsettled_reservation_for_ledger(ledger_key) !== undefined) {
+            await refuse('Another row restoration is still being installed. Try again.');
+            return;
+        }
+        const provisional_ledger_basis = accepted_append_basis_for_ledger(
+            ledger,
+            ledger_key,
+        );
+        const new_ids = ids.filter((id) => !ledger.ownedRowIds.has(id));
+        if (ledger.ownedRowIds.size + new_ids.length > MAX_PENDING_APPENDED_ROWS) {
+            await refuse(`A worksheet may keep at most ${MAX_PENDING_APPENDED_ROWS.toLocaleString('en-US')} pending rows.`);
+            return;
+        }
+        const current_ids = new Set(durable?.appendedRows?.map((row) => row.id) ?? []);
+        for (const id of ledger.reservedRowIds.keys()) current_ids.add(id);
+        const requested_additions = ids.filter((id) => !current_ids.has(id));
+        if (
+            ids.some((id) => current_ids.has(id) && !ledger.ownedRowIds.has(id))
+            || current_ids.size + requested_additions.length > MAX_PENDING_APPENDED_ROWS
+            || sheet.sourceRowCount - (durable?.tailRemovals?.length ?? 0)
+                + current_ids.size + requested_additions.length > MAX_SHEET_ROWS
+        ) {
+            await refuse('Restoring these rows would exceed the worksheet row limit.');
+            return;
+        }
+        const schemaFingerprint = worksheet_append_schema_fingerprint(sheet);
+        const appendBasis: PendingAppendBasis = Object.freeze({
+            sourceRowCount: durable?.appendBasis?.sourceRowCount
+                ?? provisional_ledger_basis?.sourceRowCount
+                ?? sheet.sourceRowCount,
+            provisionalStartRow: durable?.appendBasis?.provisionalStartRow
+                ?? provisional_ledger_basis?.provisionalStartRow
+                ?? sheet.sourceRowCount - (durable?.tailRemovals?.length ?? 0),
+            provisionalRowCount: Math.max(
+                durable?.appendBasis?.provisionalRowCount ?? 0,
+                provisional_ledger_basis?.provisionalRowCount ?? 0,
+                current_ids.size + requested_additions.length,
+            ),
+            columnCount: sheet.columnCount,
+            schemaFingerprint,
+            ...(authorities[0]?.savedRow.format.kind === 'xlsx'
+                ? { styleFingerprint: authorities[0].savedRow.format.styleFingerprint }
+                : {}),
+        });
+        if (provisional_ledger_basis !== undefined
+            && advance_pending_append_basis(provisional_ledger_basis, appendBasis) === undefined) {
+            await refuse('Pending rows need review because their worksheet basis changed.');
+            return;
+        }
+        if (file_path.toLowerCase().endsWith('.xlsx')) {
+            const observation = source_observation;
+            if (!observation) {
+                await refuse('The workbook source is not ready for a restoration.');
+                return;
+            }
+            const raw = await host.fs.read_file(uri);
+            if (
+                content_digest(raw) !== observation.digest
+                || source_observation !== observation
+                || !edit_message_is_current(message.editSessionId)
+                || receiver_epoch !== session.current_receiver_epoch
+            ) {
+                await refuse('The workbook changed while the saved format was checked.');
+                return;
+            }
+            if (authorities.some((authority) =>
+                authority?.savedRow.format.kind !== 'xlsx'
+                || authority.savedRow.format.styleFingerprint
+                    !== xlsx_append_style_dependency_fingerprint(
+                        raw,
+                        authority.savedRow.format.cellStyleIndexes,
+                        authority.savedRow.format.rowStyleIndex,
+                    )
+                || authority.savedRow.format.cellStyleIndexes.length !== sheet.columnCount
+            )) {
+                await refuse('The workbook styles changed after the appended row was saved.');
+                return;
+            }
+        } else if (authorities.some((authority) => authority?.savedRow.format.kind !== 'none')) {
+            await refuse('The saved row format no longer matches this file.');
+            return;
+        }
+        const template_by_fingerprint = new Map<string, PendingRowFormatTemplate>();
+        const template_for_authority = authorities.map((authority) => {
+            const format = authority!.savedRow.format;
+            const fingerprint = content_digest(new TextEncoder().encode(JSON.stringify(format)));
+            let template = template_by_fingerprint.get(fingerprint);
+            if (template === undefined) {
+                template = Object.freeze({
+                    id: `restored-format:${fingerprint}`,
+                    format,
+                });
+                template_by_fingerprint.set(fingerprint, template);
+            }
+            return template;
+        });
+        const templates = [...template_by_fingerprint.values()];
+        const tentative_templates = [...(durable?.formatTemplates ?? [])];
+        for (const template of templates) {
+            const existing = tentative_templates.find((candidate) => candidate.id === template.id);
+            if (existing !== undefined && JSON.stringify(existing) !== JSON.stringify(template)) {
+                await refuse('A saved row format identity conflicts with current pending work.');
+                return;
+            }
+            if (existing === undefined) tentative_templates.push(template);
+        }
+        const tentative_rows = [
+            ...(durable?.appendedRows ?? []),
+            ...authorities.map((authority, index): PendingAppendedRow => ({
+                id: ids[index],
+                cells: authority!.savedRow.cells,
+                formatTemplateId: template_for_authority[index].id,
+                createdOrder: Number.MAX_SAFE_INTEGER - ids.length + index + 1,
+                ...(authority!.savedRow.viewerRowHeight === undefined
+                    ? {}
+                    : { viewerRowHeight: authority!.savedRow.viewerRowHeight }),
+                ...(authority!.savedRow.highlights === undefined
+                    ? {}
+                    : { highlights: authority!.savedRow.highlights }),
+            })),
+        ];
+        if (!own_wire_pending_changes({
+            ...target,
+            cells: durable?.cells ?? {},
+            formatTemplates: tentative_templates,
+            appendedRows: tentative_rows,
+            tailRemovals: durable?.tailRemovals ?? [],
+            appendBasis,
+            conflicts: durable?.conflicts ?? [],
+        })) {
+            await refuse('Restoring these rows would exceed the pending-changes size limit.');
+            return;
+        }
+        if (receiver_epoch !== session.current_receiver_epoch
+            || !edit_message_is_current(message.editSessionId)) {
+            row_admission_request_ids.delete(message.requestId);
+            return;
+        }
+        const template_authority_owner = reservation_template_authority_owner(
+            message.requestId,
+        );
+        if (!append_admission_template_authorities.reserve(
+            template_authority_owner,
+            templates,
+        )) {
+            await refuse('Pending row format history has reached its memory limit.');
+            return;
+        }
+        const template_id_by_restored_id = new Map(ids.map(
+            (id, index) => [id, template_for_authority[index].id],
+        ));
+        for (const id of new_ids) {
+            ledger.ownedRowIds.add(id);
+            ledger.templateIdByRowId.set(id, template_id_by_restored_id.get(id)!);
+            ledger.reservedRowIds.set(id, highest_pending_edit_sequence + 1);
+            ledger.unsettledRequestByRowId.set(id, message.requestId);
+        }
+        row_admission_reservations.set(message.requestId, {
+            purpose: 'restoration',
+            editSessionId: message.editSessionId,
+            ledgerKey: ledger_key,
+            gestureRowIds: Object.freeze([...ids]),
+            rowIds: Object.freeze([...new_ids]),
+            appendBasis,
+            templates: Object.freeze(templates),
+            templateAuthorityOwner: template_authority_owner,
+            sourceGeneration: message.sourceGeneration,
+            state: 'unsettled',
+        });
+        const delivered = await post_to_receiver({
+            type: 'restoreSavedRowsResult',
+            requestId: message.requestId,
+            sourceGeneration: message.sourceGeneration,
+            granted: true,
+            appendHistoryIds: Object.freeze([...ids]),
+            appendBasis,
+        }, receiver_epoch);
+        if (!delivered) {
+            settle_row_admission({
+                type: 'settleRowAdmission',
+                requestId: message.requestId,
+                editSessionId: message.editSessionId,
+                accepted: false,
+            });
+        }
+    }
+
     function receiver_request_is_current(request: ReceiverRequest): boolean {
         return !disposed
             && request.receiverEpoch === session.current_receiver_epoch;
@@ -5925,7 +8744,57 @@ export function attach_viewer(
         | { readonly status: 'valid'; readonly operation: CsvSaveOperation }
         | { readonly status: 'malformed'; readonly correlation?: CsvSaveCorrelation };
 
-    function parse_save_operation(input: unknown): ParsedSaveOperation {
+    /** Validate a structural Save claim without consuming its capabilities. */
+    const save_structural_claim_is_authorized = (
+        edit_session_id: string,
+        target: WorksheetTarget,
+        structural: NonNullable<CsvSaveWorksheetOperation['structuralChanges']>,
+    ): boolean => {
+        const ledger_key = append_ledger_key(edit_session_id, target);
+        const live_ledger = append_admission_ledgers.get(ledger_key);
+        const ledger = live_ledger === undefined
+            ? undefined
+            : clone_append_admission_ledger(live_ledger);
+        const retained_templates = project_retained_pending_rows(
+            ledger,
+            target,
+            structural.appendedRows,
+        );
+        if (changes_use_unsettled_row_authority(
+            live_ledger,
+            ledger_key,
+            structural.appendedRows,
+            structural.formatTemplates,
+            structural.appendBasis,
+        )) return false;
+        return accepted_row_admission_gestures_are_complete(
+            ledger_key,
+            structural.appendedRows,
+        )
+            && appended_rows_match_ledger(ledger, structural.appendedRows)
+            && structural.formatTemplates.every((template) => {
+                const issued = retained_templates.get(template.id)
+                    ?? issued_append_template(live_ledger, ledger_key, template.id);
+                return issued !== undefined
+                    && JSON.stringify(issued) === JSON.stringify(template);
+            })
+            && (
+                structural.appendBasis === undefined
+                || JSON.stringify(structural.appendBasis)
+                    === JSON.stringify(accepted_append_basis_for_ledger(
+                        ledger,
+                        ledger_key,
+                    ))
+            )
+            && structural.tailRemovals.every(
+                (removal) => tail_removal_matches_authority(target, removal),
+            );
+    };
+
+    function parse_save_operation(
+        input: unknown,
+        authoritative_sheets?: readonly SheetMeta[],
+    ): ParsedSaveOperation {
         if (!is_plain_record(input)) return { status: 'malformed' };
         const correlation = is_wire_save_correlation(input)
             ? Object.freeze<CsvSaveCorrelation>({
@@ -5959,12 +8828,44 @@ export function attach_viewer(
                 requested,
                 is_workbook_request ? undefined : 0,
             );
+            const canonical_target = target === undefined
+                ? undefined
+                : canonical_worksheet_target(target, authoritative_sheets);
             const maps = sanitized_wire_save_maps(
                 requested.edits,
                 requested.dirtyEdits,
             );
-            if (!target || !maps) return malformed();
-            const target_key = worksheet_target_key(target);
+            if (!target || !canonical_target || canonical_target.sheetIndex !== target.sheetIndex
+                || !maps) return malformed();
+            let structuralChanges: CsvSaveWorksheetOperation['structuralChanges'];
+            if (Object.prototype.hasOwnProperty.call(requested, 'structuralChanges')) {
+                if (!is_plain_record(requested.structuralChanges)) return malformed();
+                const owned = own_wire_pending_changes({
+                    ...target,
+                    cells: maps.dirtyEdits,
+                    ...requested.structuralChanges,
+                });
+                if (!owned) return malformed();
+                structuralChanges = Object.freeze({
+                    formatTemplates: owned.formatTemplates,
+                    appendedRows: owned.appendedRows,
+                    tailRemovals: owned.tailRemovals,
+                    ...(owned.appendBasis === undefined
+                        ? {}
+                        : { appendBasis: owned.appendBasis }),
+                    conflicts: owned.conflicts,
+                });
+                // Save parsing validates renderer claims but does not consume
+                // authority. Retained rows are projected into a clone so a Save
+                // arriving while publication is awaiting durable state cannot
+                // mutate the ledger or the shared template budget underneath it.
+                if (!save_structural_claim_is_authorized(
+                    correlation.editSessionId,
+                    canonical_target,
+                    structuralChanges,
+                )) return malformed();
+            }
+            const target_key = worksheet_target_key(canonical_target);
             if (
                 sheet_indices.has(target.sheetIndex)
                 || target_keys.has(target_key)
@@ -5984,6 +8885,7 @@ export function attach_viewer(
                     ? { worksheetId: target.worksheetId }
                     : {}),
                 ...maps,
+                ...(structuralChanges === undefined ? {} : { structuralChanges }),
             }));
         }
 
@@ -6028,24 +8930,57 @@ export function attach_viewer(
         // into the next session. That is the leak this gate exists to close, and the
         // surviving edit is the folded live-editor value the user never posted.
         persisted_save_targets.set(operation.identity, operation.durableTargets);
+        let conflict_overlays_authenticated = false;
         const committed = await update_file_state((current) => {
+            conflict_overlays_authenticated = false;
+            for (const [index, worksheet] of operation.identity.worksheets.entries()) {
+                const target = operation.durableTargets[index];
+                const canonical = own_pending_structural_changes(
+                    pending_changes_for_sheet(
+                        current.pendingEdits,
+                        target.sheetIndex,
+                        target.sheetName,
+                        target.worksheetId,
+                    ) ?? {},
+                ).conflicts;
+                const submitted = worksheet.structuralChanges?.conflicts ?? [];
+                if (JSON.stringify(submitted) !== JSON.stringify(canonical)) {
+                    return current;
+                }
+            }
+            conflict_overlays_authenticated = true;
             let pending = current.pendingEdits;
             operation.identity.worksheets.forEach((worksheet, index) => {
                 const target = operation.durableTargets[index];
                 // Already sanitized: `operation.identity` is the owned operation
                 // built by `parse_save_operation` after its complete dirty maps
                 // passed the wire boundary.
-                pending = with_pending_edits_for_sheet(
-                    pending,
-                    target.sheetIndex,
-                    { ...worksheet.dirtyEdits },
-                    target.sheetName,
-                    target.worksheetId,
-                );
+                pending = worksheet.structuralChanges === undefined
+                    ? with_pending_edits_for_sheet(
+                        pending,
+                        target.sheetIndex,
+                        { ...worksheet.dirtyEdits },
+                        target.sheetName,
+                        target.worksheetId,
+                    )
+                    : with_pending_changes_for_sheet(
+                        pending,
+                        target.sheetIndex,
+                        {
+                            cells: { ...worksheet.dirtyEdits },
+                            ...worksheet.structuralChanges,
+                        },
+                        target.sheetName,
+                        target.worksheetId,
+                    );
             });
             return { ...current, pendingEdits: pending };
         }, undefined, () => save_operation_is_current(operation));
-        if (!committed || !save_operation_is_current(operation)) {
+        if (
+            !conflict_overlays_authenticated
+            || !committed
+            || !save_operation_is_current(operation)
+        ) {
             throw new Error('The save operation changed before its edits were accepted.');
         }
         notify_edit_state(committed);
@@ -6152,11 +9087,22 @@ export function attach_viewer(
                     edits: worksheet.edits,
                     wanted_bases: new Set(Object.keys(worksheet.dirtyEdits)),
                     dirty_edits: worksheet.dirtyEdits,
+                    structural_changes: worksheet.structuralChanges,
                 })),
             });
         } catch (error) {
             const active = begin_save_lifecycle(identity);
             const lifecycle = finish_save_lifecycle(active.operation, 'failed');
+            const rejection = structural_save_rejection(error);
+            if (rejection !== undefined) {
+                void post_to_receiver({
+                    type: 'saveResult',
+                    success: false,
+                    lifecycle,
+                    rejection,
+                });
+                return;
+            }
             show_owner_error(
                 `Failed to save: ${error instanceof Error ? error.message : String(error)}`,
             );
@@ -6260,6 +9206,9 @@ export function attach_viewer(
             phase: 'preparing',
         };
         active_save_operation = operation;
+        // Installed synchronously: later append/settlement/publication authority
+        // work queues behind this Save until its final authority use is complete.
+        const save_append_authority = fence_append_admission_authority();
         const active_lifecycle = begin_save_lifecycle(identity);
         void post_to_receiver({
             type: 'saveOperationStarted',
@@ -6271,10 +9220,26 @@ export function attach_viewer(
         // it cannot be built before we know which bytes they are.
         let saved_bytes: Uint8Array;
         let saved_digest: string;
+        let save_receipt = plan.receipt;
+        const persisted_append_snapshots = new Map<
+            string,
+            SavedAppendedRowSnapshot
+        >();
         let post_save_reservation: { cancel(): void } | undefined;
         try {
             await pending_edit_writes.catch(() => {});
+            await save_append_authority.ready;
             if (!save_may_continue(operation)) return;
+            if (identity.worksheets.some((worksheet, index) => (
+                worksheet.structuralChanges !== undefined
+                && !save_structural_claim_is_authorized(
+                    identity.editSessionId,
+                    operation.durableTargets[index],
+                    worksheet.structuralChanges,
+                )
+            ))) {
+                throw new Error('The pending-row authority changed before Save began.');
+            }
             await persist_accepted_save(operation);
             operation.phase = 'accepted';
 
@@ -6322,6 +9287,70 @@ export function attach_viewer(
             // it is the correct base for a splice as well as for the comparison
             // above. A CSV plan ignores it and re-serializes from the source.
             saved_bytes = plan.produce(current_raw);
+            if (
+                save_receipt !== undefined
+                && save_receipt.appendedRows.length > 0
+                && file_path.toLowerCase().endsWith('.xlsx')
+            ) {
+                // The XLSX writer canonicalizes values (for example `1.0` to a
+                // numeric `1`) and external links before they reach disk. A
+                // receipt derived from renderer input would then reject its own
+                // untouched output during cross-save Undo. Parse the exact bytes
+                // we are about to write and fingerprint that physical result.
+                const current_state = await read_file_state(false);
+                const persisted_source = await profile.build_source(
+                    saved_bytes,
+                    file_path,
+                    current_state.state as PerFileState,
+                );
+                try {
+                    const appendedRows = save_receipt.appendedRows.map((assignment) => {
+                        const sheet = persisted_source.meta().sheets[assignment.sheetIndex];
+                        if (!sheet) throw new Error('A saved row receipt lost its worksheet.');
+                        const physical_format = capture_xlsx_append_row_format(
+                            saved_bytes,
+                            assignment.sheetIndex,
+                            assignment.sourceRow + 1,
+                            sheet.columnCount,
+                            sheet.excelFirstRowHeader?.active === true
+                                ? sheet.excelFirstRowHeader.sourceRow
+                                : undefined,
+                        );
+                        const inherited_viewer_height = assignment.savedRow?.format.kind === 'xlsx'
+                            ? assignment.savedRow.format.viewerRowHeight
+                            : undefined;
+                        const format = inherited_viewer_height === undefined
+                            ? physical_format
+                            : Object.freeze({
+                                ...physical_format,
+                                viewerRowHeight: inherited_viewer_height,
+                            });
+                        const cells = source_row_cells_for_fingerprint(
+                            persisted_source,
+                            assignment.sheetIndex,
+                            assignment.sourceRow,
+                        );
+                        const savedRow = persisted_saved_row_snapshot(
+                            assignment.savedRow ?? { cells: assignment.savedCells ?? {} },
+                            format,
+                            cells,
+                        );
+                        persisted_append_snapshots.set(assignment.pendingRowId, savedRow);
+                        return Object.freeze({
+                            ...assignment,
+                            savedCells: savedRow.cells,
+                            savedRow,
+                            savedFingerprint: saved_row_snapshot_fingerprint(savedRow),
+                        });
+                    });
+                    save_receipt = Object.freeze({
+                        appendedRows: Object.freeze(appendedRows),
+                        removedSourceRows: save_receipt.removedSourceRows,
+                    });
+                } finally {
+                    persisted_source.close();
+                }
+            }
             saved_digest = content_digest(saved_bytes);
 
             // Narrow (but do not close) the pre-check/pre-write TOCTOU.
@@ -6391,15 +9420,96 @@ export function attach_viewer(
                 && file_coordinator.state_write_is_current(expected_authority);
             let rebased = await update_file_state((current) => {
                 if (!save_operation_is_current(operation)) return current;
-                const highlights = rebase_cell_highlight_digest(
+                let highlights = rebase_cell_highlight_digest(
                     current.cellHighlights,
                     saved_digest,
                 );
-                if (cell_highlight_states_equal(current.cellHighlights, highlights)) {
+                const rowHeights = [...(current.rowHeights ?? [])];
+                const prospective_meta: WorkbookMeta = {
+                    ...src.meta(),
+                    sheets: src.meta().sheets.map((sheet, sheetIndex) => {
+                        const removed = save_receipt?.removedSourceRows.find(
+                            (entry) => entry.sheetIndex === sheetIndex,
+                        )?.sourceRows.length ?? 0;
+                        const appended = save_receipt?.appendedRows.filter(
+                            (entry) => entry.sheetIndex === sheetIndex,
+                        ).length ?? 0;
+                        const count = sheet.sourceRowCount - removed + appended;
+                        return { ...sheet, sourceRowCount: count, rowCount: count };
+                    }),
+                };
+                for (const [worksheet_index, worksheet] of identity.worksheets.entries()) {
+                    const structural = worksheet.structuralChanges;
+                    if (!structural) continue;
+                    const receipt_target = operation.durableTargets[worksheet_index] ?? worksheet;
+                    const assignments = save_receipt?.appendedRows.filter((assignment) =>
+                        worksheet_target_matches(assignment, receipt_target)) ?? [];
+                    const removed = save_receipt?.removedSourceRows.find((entry) =>
+                        worksheet_target_matches(entry, receipt_target))?.sourceRows ?? [];
+                    const patch: Record<string, CellHighlightColor | null> = {};
+                    const existing_highlights = highlights?.sheets[worksheet.sheetIndex]?.cells;
+                    if (existing_highlights && removed.length > 0) {
+                        const removed_set = new Set(removed);
+                        for (const key of Object.keys(existing_highlights)) {
+                            const coordinate = parse_cell_key(key);
+                            if (coordinate && removed_set.has(coordinate.sourceRow)) {
+                                patch[key] = null;
+                            }
+                        }
+                    }
+                    // Removal owns the old coordinate even when this save replaces
+                    // it with an appended row. Clear all old heights before applying
+                    // the replacement's explicit or template height below.
+                    if (removed.length > 0 && rowHeights[worksheet.sheetIndex]) {
+                        const sheet_heights = { ...rowHeights[worksheet.sheetIndex] };
+                        for (const row of removed) delete sheet_heights[row];
+                        rowHeights[worksheet.sheetIndex] = Object.keys(sheet_heights).length > 0
+                            ? sheet_heights
+                            : undefined;
+                    }
+                    const templates = new Map(structural.formatTemplates.map(
+                        (template) => [template.id, template.format],
+                    ));
+                    for (const assignment of assignments) {
+                        const row = structural.appendedRows.find(
+                            (candidate) => candidate.id === assignment.pendingRowId,
+                        );
+                        if (!row) throw new Error('A saved row receipt has no pending source.');
+                        for (const [column, color] of Object.entries(row.highlights ?? {})) {
+                            patch[`${assignment.sourceRow}:${column}`] = color;
+                        }
+                        const format = templates.get(row.formatTemplateId);
+                        const height = row.viewerRowHeight
+                            ?? (format?.kind === 'xlsx' ? format.viewerRowHeight : undefined);
+                        if (height !== undefined) {
+                            const sheet_heights = { ...(rowHeights[worksheet.sheetIndex] ?? {}) };
+                            sheet_heights[assignment.sourceRow] = height;
+                            rowHeights[worksheet.sheetIndex] = sheet_heights;
+                        }
+                    }
+                    if (Object.keys(patch).length > 0) {
+                        highlights = apply_cell_highlight_patch(
+                            highlights,
+                            { sheetIndex: worksheet.sheetIndex, cells: patch },
+                            prospective_meta,
+                            saved_digest,
+                        );
+                    }
+                }
+                const heights_unchanged = JSON.stringify(current.rowHeights ?? [])
+                    === JSON.stringify(rowHeights);
+                if (
+                    cell_highlight_states_equal(current.cellHighlights, highlights)
+                    && heights_unchanged
+                ) {
                     rebase_was_noop = true;
                     return current;
                 }
-                return { ...current, cellHighlights: highlights };
+                return {
+                    ...current,
+                    cellHighlights: highlights,
+                    rowHeights,
+                };
             }, undefined, rebase_is_current, {
                 expectedAuthorityRevision: expected_authority,
                 expectedPhysicalRevision: source_authority.physicalRevision,
@@ -6414,7 +9524,16 @@ export function attach_viewer(
                 );
             }
             update_session_state_material(rebased, false);
+            commit_saved_append_authorities(
+                operation,
+                save_receipt,
+                persisted_append_snapshots,
+            );
         } catch (error) {
+            // A disposed failure releases the edit session from this catch. Do
+            // not let that release wait on the Save's own authority fence; the
+            // finally below would otherwise be unreachable.
+            save_append_authority.release();
             if (active_save_operation !== operation) return;
             active_save_operation = undefined;
             post_save_reservation?.cancel();
@@ -6422,6 +9541,17 @@ export function attach_viewer(
             if (disposed) {
                 await release_edit_session(identity.editSessionId);
                 delete_shared_edit_state_if_unused();
+                return;
+            }
+            const rejection = structural_save_rejection(error);
+            if (rejection !== undefined) {
+                void post_to_receiver({
+                    type: 'saveResult',
+                    success: false,
+                    lifecycle,
+                    rejection,
+                    basesValidated: true,
+                });
                 return;
             }
             show_owner_error(
@@ -6434,6 +9564,8 @@ export function attach_viewer(
                 basesValidated: true,
             });
             return;
+        } finally {
+            save_append_authority.release();
         }
 
         // writeFile completed: fence later publications synchronously, then let
@@ -6481,6 +9613,7 @@ export function attach_viewer(
             type: 'saveResult',
             success: true,
             lifecycle: succeeded_lifecycle,
+            ...(save_receipt === undefined ? {} : { receipt: save_receipt }),
         });
         notify_edit_state();
 
@@ -6643,6 +9776,14 @@ export function attach_viewer(
                 // This must happen before the first await: an older receiver's
                 // compute or CAS continuation cannot overtake the new snapshot.
                 core?.begin_receiver_epoch(begun.receiverEpoch);
+                for (const [requestId, reservation] of [...row_admission_reservations]) {
+                    settle_row_admission({
+                        type: 'settleRowAdmission',
+                        requestId,
+                        editSessionId: reservation.editSessionId,
+                        accepted: false,
+                    });
+                }
                 active_edit_session_request = undefined;
                 cancel_edit_claim(active_edit_claim);
                 // A reloaded renderer has no history — it is session-scoped and
@@ -7379,7 +10520,10 @@ export function attach_viewer(
                         worksheetId: worksheet_id_at(granted_sheet_index),
                     });
                 }
-                if (edit_state) update_session_state_material(edit_state);
+                const reconciled_edit_state = granted && edit_state && source
+                    ? reconciled_against(edit_state, source)
+                    : edit_state;
+                if (reconciled_edit_state) update_session_state_material(reconciled_edit_state);
                 // The reason half of the same question `can_edit` asked: an installed
                 // sort or filter is not a denial, because editing under one is
                 // supported and the rows stay exactly where they are. Only work in
@@ -7397,7 +10541,7 @@ export function attach_viewer(
                 // into the requested sheet's store.
                 const reconciled_slots = granted
                     ? reconcile_pending_edit_sheets(
-                        (edit_state?.state as PerFileState | undefined)?.pendingEdits,
+                        (reconciled_edit_state?.state as PerFileState | undefined)?.pendingEdits,
                         source?.meta().sheets ?? [],
                     )
                     : undefined;
@@ -7416,6 +10560,66 @@ export function attach_viewer(
                         },
                     )
                     : undefined;
+                const durable_slot = granted
+                    ? pending_changes_for_sheet(
+                        reconciled_slots,
+                        granted_sheet_index,
+                        sheet_name_at(granted_sheet_index),
+                        worksheet_id_at(granted_sheet_index),
+                    )
+                    : undefined;
+                const pendingChanges = granted ? Object.freeze({
+                    sheetIndex: granted_sheet_index,
+                    ...(sheet_name_at(granted_sheet_index) === undefined
+                        ? {}
+                        : { sheetName: sheet_name_at(granted_sheet_index) }),
+                    ...(worksheet_id_at(granted_sheet_index) === undefined
+                        ? {}
+                        : { worksheetId: worksheet_id_at(granted_sheet_index) }),
+                    cells: Object.freeze(Object.fromEntries(
+                        Object.entries(pendingEdits ?? {}).map(([key, entry]) => [
+                            key,
+                            typeof entry === 'string'
+                                ? Object.freeze({ value: entry, base: '' })
+                                : entry,
+                        ]),
+                    )),
+                    ...own_pending_structural_changes(durable_slot ?? {}),
+                }) : undefined;
+                if (granted && active_edit_session_id && pendingChanges) {
+                    const target: WorksheetTarget = {
+                        sheetIndex: granted_sheet_index,
+                        ...(pendingChanges.sheetName === undefined
+                            ? {}
+                            : { sheetName: pendingChanges.sheetName }),
+                        ...(pendingChanges.worksheetId === undefined
+                            ? {}
+                            : { worksheetId: pendingChanges.worksheetId }),
+                    };
+                    const key = append_ledger_key(active_edit_session_id, target);
+                    const ledger = append_admission_ledgers.get(key) ?? {
+                        ownedRowIds: new Set<string>(),
+                        templateIdByRowId: new Map<string, string>(),
+                        reservedRowIds: new Map<string, number>(),
+                        unsettledRequestByRowId: new Map<string, string>(),
+                        sourceGeneration: core?.source_generation ?? 0,
+                    };
+                    for (const row of pendingChanges.appendedRows) {
+                        ledger.ownedRowIds.add(row.id);
+                        ledger.templateIdByRowId.set(row.id, row.formatTemplateId);
+                    }
+                    for (const template of pendingChanges.formatTemplates) {
+                        append_admission_template_authorities.remember(
+                            ledger_template_authority_owner(key),
+                            template,
+                        );
+                    }
+                    ledger.appendBasis = pendingChanges.appendBasis;
+                    for (const removal of pendingChanges.tailRemovals) {
+                        seed_durable_tail_removal_authority(target, removal);
+                    }
+                    append_admission_ledgers.set(key, ledger);
+                }
                 if (!request_is_current()) return;
                 active_edit_session_request = undefined;
                 void post_to_receiver({
@@ -7432,6 +10636,13 @@ export function attach_viewer(
                         ? { diffOnByDefault: host.config.diff_on_by_default() }
                         : {}),
                     ...(pendingEdits ? { pendingEdits } : {}),
+                    ...(pendingChanges && (
+                        pendingChanges.appendedRows.length > 0
+                        || pendingChanges.tailRemovals.length > 0
+                        || pendingChanges.formatTemplates.length > 0
+                        || pendingChanges.conflicts.length > 0
+                        || pendingChanges.appendBasis !== undefined
+                    ) ? { pendingChanges } : {}),
                 }, request.receiverEpoch);
                 if (cleanup_blocked) {
                     show_owner_warning(
@@ -7442,6 +10653,164 @@ export function attach_viewer(
                 } else if (denied_by_transform) {
                     show_owner_warning(
                         'Wait for sorting and filtering to finish before entering edit mode.');
+                }
+                return;
+            }
+            case 'retainedSavedAppendAuthoritiesChanged': {
+                if (!Array.isArray(msg.authorities)) return;
+                const retained = new Set<string>();
+                const retained_pending = new Set<string>();
+                let retained_count = 0;
+                let retained_pending_count = 0;
+                for (const raw of msg.authorities) {
+                    if (!is_plain_record(raw) || !Array.isArray(raw.appendHistoryIds)) return;
+                    const requested_target = sanitized_wire_worksheet_target(raw);
+                    const target = requested_target === undefined
+                        ? undefined
+                        : canonical_worksheet_target(requested_target);
+                    if (target === undefined || target.sheetIndex !== requested_target!.sheetIndex) {
+                        return;
+                    }
+                    for (const id of raw.appendHistoryIds) {
+                        retained_count += 1;
+                        if (
+                            retained_count > MAX_SAVED_APPEND_AUTHORITIES
+                            || typeof id !== 'string'
+                            || id.length === 0
+                            || id.length > 256
+                        ) return;
+                        const key = saved_append_authority_key(target, id);
+                        if (key === undefined) return;
+                        retained.add(key);
+                    }
+                    if (raw.pendingRowIds !== undefined && !Array.isArray(raw.pendingRowIds)) {
+                        return;
+                    }
+                    for (const id of raw.pendingRowIds ?? []) {
+                        retained_pending_count += 1;
+                        if (
+                            retained_pending_count > MAX_SAVED_APPEND_AUTHORITIES
+                            || typeof id !== 'string'
+                            || id.length === 0
+                            || id.length > 128
+                        ) return;
+                        retained_pending.add(pending_append_history_key(
+                            worksheet_target_key(target),
+                            id,
+                        ));
+                    }
+                }
+                const current_sheets = source?.meta().sheets ?? [];
+                for (const [key, authority] of saved_append_authorities) {
+                    // A retention projection can only speak for worksheets in
+                    // the renderer's current snapshot. Keep a known capability
+                    // while its worksheet is temporarily absent; if that same
+                    // identity returns, the next projection can retire it or
+                    // keep it. The map remains subject to its hard count/byte
+                    // limits while a permanently removed sheet stays absent.
+                    if (
+                        !retained.has(key)
+                        && worksheet_target_index(current_sheets, authority.worksheet)
+                            !== undefined
+                    ) forget_saved_append_authority(key);
+                }
+                retained_pending_append_keys.clear();
+                for (const key of retained_pending) retained_pending_append_keys.add(key);
+                for (const [target_key, authorities] of retained_pending_append_authorities.entries()) {
+                    for (const id of [...authorities.keys()]) {
+                        if (!retained_pending.has(pending_append_history_key(target_key, id))) {
+                            retained_pending_append_authorities.forget(target_key, id);
+                        }
+                    }
+                }
+                return;
+            }
+            case 'requestAppendRows': {
+                const receiver_epoch = session.current_receiver_epoch;
+                // Two rapid Enter/paste gestures receive IDs in request order
+                // even when format capture crosses asynchronous file/state reads.
+                const prior = append_admission_tails.get(
+                    APPEND_ADMISSION_AUTHORITY_TAIL,
+                ) ?? Promise.resolve();
+                const admitted = prior.catch(() => undefined).then(async () => {
+                    try {
+                        await admit_append_rows(msg, receiver_epoch);
+                    } catch (error) {
+                        settle_row_admission({
+                            type: 'settleRowAdmission',
+                            requestId: msg.requestId,
+                            editSessionId: msg.editSessionId,
+                            accepted: false,
+                        });
+                        row_admission_request_ids.delete(msg.requestId);
+                        log_sanitized_failure('Failed to admit appended rows', error);
+                        await post_to_receiver({
+                            type: 'appendRowsResult',
+                            requestId: msg.requestId,
+                            sourceGeneration: msg.sourceGeneration,
+                            granted: false,
+                            reason: 'Table Viewer could not prepare the appended rows.',
+                        }, receiver_epoch);
+                    }
+                });
+                append_admission_tails.set(APPEND_ADMISSION_AUTHORITY_TAIL, admitted);
+                await admitted;
+                if (append_admission_tails.get(APPEND_ADMISSION_AUTHORITY_TAIL) === admitted) {
+                    append_admission_tails.delete(APPEND_ADMISSION_AUTHORITY_TAIL);
+                }
+                return;
+            }
+            case 'settleRowAdmission': {
+                // Settlement mutates the same reservation, ledger and template
+                // authority that publication snapshots before its durable CAS.
+                // Queue it behind that publication so neither transition can
+                // overwrite the other's authority state.
+                const prior = append_admission_tails.get(
+                    APPEND_ADMISSION_AUTHORITY_TAIL,
+                ) ?? Promise.resolve();
+                const settled = prior.catch(() => undefined).then(() => {
+                    settle_row_admission(msg);
+                });
+                append_admission_tails.set(APPEND_ADMISSION_AUTHORITY_TAIL, settled);
+                await settled;
+                if (append_admission_tails.get(APPEND_ADMISSION_AUTHORITY_TAIL) === settled) {
+                    append_admission_tails.delete(APPEND_ADMISSION_AUTHORITY_TAIL);
+                }
+                return;
+            }
+            case 'validateTailRemovalReplay':
+                await validate_tail_removal_replay(msg);
+                return;
+            case 'requestRestoreSavedRows': {
+                const receiver_epoch = session.current_receiver_epoch;
+                const prior = append_admission_tails.get(
+                    APPEND_ADMISSION_AUTHORITY_TAIL,
+                ) ?? Promise.resolve();
+                const admitted = prior.catch(() => undefined).then(async () => {
+                    try {
+                        await admit_saved_row_restoration(msg, receiver_epoch);
+                    } catch (error) {
+                        settle_row_admission({
+                            type: 'settleRowAdmission',
+                            requestId: msg.requestId,
+                            editSessionId: msg.editSessionId,
+                            accepted: false,
+                        });
+                        row_admission_request_ids.delete(msg.requestId);
+                        log_sanitized_failure('Failed to restore saved appended rows', error);
+                        await post_to_receiver({
+                            type: 'restoreSavedRowsResult',
+                            requestId: msg.requestId,
+                            sourceGeneration: msg.sourceGeneration,
+                            granted: false,
+                            reason: 'Table Viewer could not restore the saved rows.',
+                        }, receiver_epoch);
+                    }
+                });
+                append_admission_tails.set(APPEND_ADMISSION_AUTHORITY_TAIL, admitted);
+                await admitted;
+                if (append_admission_tails.get(APPEND_ADMISSION_AUTHORITY_TAIL) === admitted) {
+                    append_admission_tails.delete(APPEND_ADMISSION_AUTHORITY_TAIL);
                 }
                 return;
             }
@@ -7585,6 +10954,21 @@ export function attach_viewer(
             case 'setRowHeights': {
                 const message = structuredClone(msg);
                 const receiver_epoch = session.current_receiver_epoch;
+                const settle_resize = (applied: boolean): void => {
+                    if (
+                        message.requestId === undefined
+                        || disposed
+                        || session.current_receiver_epoch !== receiver_epoch
+                    ) return;
+                    void post_to_receiver({
+                        type: 'rowHeightsChanged',
+                        requestId: message.requestId,
+                        sheetIndex: message.sheetIndex,
+                        applied,
+                        sourceGeneration: core?.source_generation
+                            ?? message.sourceGeneration,
+                    }, receiver_epoch);
+                };
                 const expected_authority = source_authority.authorityRevision;
                 const expected_physical_revision = source_authority.physicalRevision;
                 const expected_projection_revision = source_authority.projectionRevision;
@@ -7632,9 +11016,18 @@ export function attach_viewer(
                     // neighbours is worth more than one term less.
                     && file_coordinator.state_write_is_current(expected_authority)
                     && source_authority.authorityRevision === expected_authority;
-                if (!core || !source || !resize_is_current()) return;
-                if (!source.meta().sheets[message.sheetIndex]) return;
-                if (!Number.isFinite(message.height)) return;
+                if (!core || !source || !resize_is_current()) {
+                    settle_resize(false);
+                    return;
+                }
+                if (!source.meta().sheets[message.sheetIndex]) {
+                    settle_resize(false);
+                    return;
+                }
+                if (!Number.isFinite(message.height)) {
+                    settle_resize(false);
+                    return;
+                }
                 // Clamped before anything durable is touched, so no arithmetic slip in
                 // the webview can persist a zero- or negative-height row — a row the
                 // user would then have no visible edge left to drag back.
@@ -7650,7 +11043,10 @@ export function attach_viewer(
                         !Number.isInteger(interval.start)
                         || !Number.isInteger(interval.end)
                         || interval.end < interval.start
-                    ) return;
+                    ) {
+                        settle_resize(false);
+                        return;
+                    }
                     requested_rows += interval.end - interval.start + 1;
                 }
                 // Only reachable from an empty `rows` array — every interval that gets
@@ -7662,9 +11058,13 @@ export function attach_viewer(
                 // nothing to change, and takes the no-op-success path — which delivers,
                 // so a message naming no rows would cost a state read and a snapshot
                 // round-trip per occurrence.
-                if (requested_rows === 0) return;
+                if (requested_rows === 0) {
+                    settle_resize(false);
+                    return;
+                }
                 if (requested_rows > MAX_PERSISTED_ROW_HEIGHTS) {
                     show_owner_warning(ROW_HEIGHT_LIMIT_WARNING);
+                    settle_resize(false);
                     return;
                 }
                 let mapped: Uint32Array;
@@ -7677,6 +11077,7 @@ export function attach_viewer(
                     // `map_display_rows_to_source` throws for an interval outside the
                     // installed view. On a current generation that is a malformed request
                     // rather than a stale one, and there is nothing to write either way.
+                    settle_resize(false);
                     return;
                 }
                 // Set by the updater when the accumulated map would pass the bound, and
@@ -7854,6 +11255,9 @@ export function attach_viewer(
                             { deliver: true },
                         );
                     });
+                    settle_resize(true);
+                } else {
+                    settle_resize(false);
                 }
                 return;
             }
@@ -8154,8 +11558,320 @@ export function attach_viewer(
                     }
                 }
                 return;
+            case 'pendingChangesChanged': {
+                if (
+                    !editing_supported
+                    || !edit_message_is_current(msg.editSessionId)
+                    || active_replay_commit !== undefined
+                ) return;
+                const publication_source = source;
+                const publication_core = core;
+                if (
+                    publication_source === undefined
+                    || publication_core === undefined
+                    || !Number.isSafeInteger(msg.sourceGeneration)
+                    || msg.sourceGeneration !== publication_core.source_generation
+                ) return;
+                const changes = own_wire_pending_changes(msg.changes);
+                if (!changes) return;
+                const message_target: WorksheetTarget = {
+                    sheetIndex: changes.sheetIndex,
+                    sheetName: changes.sheetName,
+                    worksheetId: changes.worksheetId,
+                };
+                if (active_save_operation?.durableTargets.some((target) => (
+                    worksheet_target_matches(target, message_target)
+                    || worksheet_target_matches(message_target, target)
+                ))) return;
+                if (pending_edit_sequence_session_id !== msg.editSessionId) {
+                    pending_edit_sequence_session_id = msg.editSessionId;
+                    highest_pending_edit_sequence = 0;
+                    highest_acknowledged_edit_sequence = 0;
+                }
+                if (!Number.isSafeInteger(msg.sequence) || msg.sequence <= 0) return;
+                const sequence = msg.sequence;
+                if (sequence <= highest_pending_edit_sequence) {
+                    if (sequence <= highest_acknowledged_edit_sequence) {
+                        await post_to_receiver({
+                            type: 'pendingChangesAcknowledged',
+                            editSessionId: msg.editSessionId,
+                            sequence,
+                        });
+                    }
+                    return;
+                }
+                const sheets = source?.meta().sheets;
+                const requires_identity = (sheets?.length ?? 0) > 1;
+                if (
+                    requires_identity
+                    && changes.sheetName === undefined
+                    && changes.worksheetId === undefined
+                ) return;
+                const live_posted_sheet = sheets?.[changes.sheetIndex];
+                if (
+                    !Number.isSafeInteger(changes.sheetIndex)
+                    || changes.sheetIndex < 0
+                    || (
+                        changes.sheetName === undefined
+                        && changes.worksheetId === undefined
+                        && sheets !== undefined
+                        && !live_posted_sheet
+                    )
+                ) return;
+
+                const posted_sheet_index = changes.sheetIndex;
+                const posted_sheet_name = changes.sheetName;
+                const posted_worksheet_id = changes.worksheetId;
+                const requested_posted_target: WorksheetTarget = {
+                    sheetIndex: posted_sheet_index,
+                    sheetName: posted_sheet_name ?? live_posted_sheet?.name,
+                    worksheetId: posted_worksheet_id ?? (
+                        posted_sheet_name === undefined
+                            ? live_posted_sheet?.worksheetId
+                            : undefined
+                        ),
+                };
+                const posted_target = canonical_worksheet_target(requested_posted_target);
+                if (posted_target === undefined
+                    || posted_target.sheetIndex !== requested_posted_target.sheetIndex) return;
+                const publication_authority_revision = source_authority.authorityRevision;
+                if (
+                    source !== publication_source
+                    || core !== publication_core
+                    || publication_core.source_generation !== msg.sourceGeneration
+                    || source_authority.authorityRevision !== publication_authority_revision
+                    || !file_coordinator.state_write_is_current(
+                        publication_authority_revision,
+                    )
+                ) return;
+                const ledger_key = append_ledger_key(msg.editSessionId, posted_target);
+                // Refuse malformed or partial admission batches before claiming
+                // the renderer sequence. The same pure plan is rebuilt after
+                // the write queues drain, where it becomes authoritative.
+                if (plan_pending_structural_publication(
+                    msg.editSessionId,
+                    posted_target,
+                    changes,
+                    sequence,
+                ) === undefined) return;
+                const receiver_epoch = session.current_receiver_epoch;
+                const edit_session_id = msg.editSessionId;
+                const admission = Symbol(edit_session_id);
+                pending_edit_admissions.add(admission);
+                observe_pending_edit_target(edit_session_id, posted_target, sequence);
+                highest_pending_edit_sequence = sequence;
+                const prior_pending_write = pending_edit_writes.catch(() => {});
+                const prior_append_admission = (append_admission_tails.get(
+                    APPEND_ADMISSION_AUTHORITY_TAIL,
+                ) ?? Promise.resolve()).catch(() => {});
+                const publication_is_current = () => !disposed
+                    && source === publication_source
+                    && core === publication_core
+                    && publication_core.source_generation === msg.sourceGeneration
+                    && source_authority.authorityRevision === publication_authority_revision
+                    && file_coordinator.state_write_is_current(
+                        publication_authority_revision,
+                    );
+                const write = Promise.all([
+                    prior_pending_write,
+                    prior_append_admission,
+                ]).then(async () => {
+                    if (!publication_is_current()) return;
+                    const queued_snapshot = await read_file_state(false);
+                    if (!publication_is_current()) return;
+                    const queued_durable_state = normalize_host_state(
+                        queued_snapshot.state,
+                        publication_source.meta().sheets,
+                    );
+                    const queued_durable_structural = own_pending_structural_changes(
+                        pending_changes_for_sheet(
+                            queued_durable_state.pendingEdits,
+                            posted_target.sheetIndex,
+                            posted_target.sheetName,
+                            posted_target.worksheetId,
+                        ) ?? {},
+                    );
+                    const queued_projected_state = reconciled_against(
+                        queued_snapshot,
+                        publication_source,
+                        false,
+                    ).state as PerFileState;
+                    const queued_structural = own_pending_structural_changes(
+                        pending_changes_for_sheet(
+                            queued_projected_state.pendingEdits,
+                            posted_target.sheetIndex,
+                            posted_target.sheetName,
+                            posted_target.worksheetId,
+                        ) ?? {},
+                    );
+                    const posted_structural = own_pending_structural_changes(changes);
+                    const host_structural_echo = JSON.stringify(queued_structural)
+                        === JSON.stringify(posted_structural);
+                    if (
+                        !host_structural_echo
+                        && !await replay_structures_are_authorized([Object.freeze({
+                            ordinal: 0,
+                            worksheet: posted_target,
+                            resolvedSheetIndex: posted_target.sheetIndex,
+                            expected: EMPTY_PENDING_STRUCTURAL_CHANGES,
+                            desired: posted_structural,
+                        })], publication_source)
+                    ) return;
+                    if (!publication_is_current()) return;
+                    const authority_plan = plan_pending_structural_publication(
+                        edit_session_id,
+                        posted_target,
+                        changes,
+                        sequence,
+                        true,
+                    );
+                    if (authority_plan === undefined) return;
+                    let conflict_overlay_authorized = false;
+                    const result = await update_edit_session_state(
+                        edit_session_id,
+                        admission,
+                        (current, current_sheets) => {
+                            conflict_overlay_authorized = false;
+                            const has_identity = posted_worksheet_id !== undefined
+                                || posted_sheet_name !== undefined;
+                            const live_target_index = !has_identity
+                                ? posted_sheet_index
+                                : sheet_index_identified(
+                                    posted_worksheet_id,
+                                    posted_sheet_name,
+                                    current_sheets,
+                                );
+                            let target_index = live_target_index;
+                            if (has_identity && target_index === undefined) {
+                                target_index = pending_edit_slot_index_identified(
+                                    current.pendingEdits,
+                                    posted_worksheet_id,
+                                    posted_sheet_name,
+                                    posted_sheet_index,
+                                );
+                                if (target_index === undefined) {
+                                    const nonempty = Object.keys(changes.cells).length > 0
+                                        || changes.appendedRows.length > 0
+                                        || changes.tailRemovals.length > 0;
+                                    if (!nonempty) return current;
+                                    const hole = current.pendingEdits
+                                        ?.findIndex((slot) => slot === undefined) ?? -1;
+                                    target_index = hole >= 0
+                                        ? hole
+                                        : current.pendingEdits?.length ?? 0;
+                                }
+                            }
+                            if (target_index === undefined) return current;
+                            const current_structural = own_pending_structural_changes(
+                                current.pendingEdits?.[target_index] ?? {},
+                            );
+                            if (host_structural_echo) {
+                                if (JSON.stringify(current_structural)
+                                    !== JSON.stringify(queued_durable_structural)) return current;
+                            } else if (JSON.stringify(current_structural.conflicts)
+                                !== JSON.stringify(changes.conflicts)) return current;
+                            conflict_overlay_authorized = true;
+                            const parked = has_identity && live_target_index === undefined;
+                            const durable_changes = authority_plan.durableChanges;
+                            const next = with_pending_changes_for_sheet(
+                                current.pendingEdits,
+                                target_index,
+                                {
+                                    cells: durable_changes.cells,
+                                    formatTemplates: durable_changes.formatTemplates,
+                                    appendedRows: durable_changes.appendedRows,
+                                    tailRemovals: durable_changes.tailRemovals,
+                                    ...(durable_changes.appendBasis === undefined
+                                        ? {}
+                                        : { appendBasis: durable_changes.appendBasis }),
+                                    // Conflicts consume the host reserve. Echo the
+                                    // authenticated durable overlay, never a
+                                    // renderer-authored replacement.
+                                    conflicts: host_structural_echo
+                                        ? queued_structural.conflicts
+                                        : current_structural.conflicts,
+                                },
+                                parked ? posted_sheet_name : current_sheets[target_index]?.name,
+                                parked
+                                    ? posted_worksheet_id
+                                    : current_sheets[target_index]?.worksheetId,
+                            );
+                            if (next) return { ...current, pendingEdits: next };
+                            if (!current.pendingEdits) return current;
+                            const { pendingEdits: _drop, ...rest } = current;
+                            return rest;
+                        },
+                        {
+                            expectedAuthorityRevision: publication_authority_revision,
+                            isCurrent: publication_is_current,
+                        },
+                    );
+                    if (
+                        result.type === 'aborted'
+                        || !conflict_overlay_authorized
+                        || !publication_is_current()
+                        || !commit_pending_structural_publication(authority_plan)
+                    ) return;
+                    retire_pending_edit_target(edit_session_id, posted_target, sequence);
+                    const committed = result.snapshot.state as PerFileState;
+                    const supersedes = (operation: CsvSaveOperation) => operation.worksheets
+                        .some((worksheet) => {
+                            const operation_index = operation_sheet_index(
+                                worksheet,
+                                undefined,
+                                committed.pendingEdits,
+                            );
+                            if (operation_index === undefined) return false;
+                            return !pending_changes_echo_operation(
+                                pending_changes_for_sheet(
+                                    committed.pendingEdits,
+                                    operation_index,
+                                    worksheet.sheetName,
+                                    worksheet.worksheetId,
+                                ),
+                                worksheet,
+                            );
+                        });
+                    const tombstone = file_edit_state?.failedSaveTombstone;
+                    if (
+                        file_edit_state
+                        && tombstone
+                        && (
+                            tombstone.editSessionId !== edit_session_id
+                            || supersedes(tombstone)
+                        )
+                    ) file_edit_state.failedSaveTombstone = undefined;
+                    if (save_lifecycle.state === 'failed') {
+                        const correlation = save_lifecycle_correlation(save_lifecycle);
+                        if (
+                            correlation?.editSessionId !== edit_session_id
+                            || ('operation' in save_lifecycle && supersedes(save_lifecycle.operation))
+                        ) retire_save_lifecycle(undefined, 'failed');
+                    }
+                    notify_edit_state(result.snapshot);
+                    delete_shared_edit_state_if_unused();
+                    highest_acknowledged_edit_sequence = Math.max(
+                        highest_acknowledged_edit_sequence,
+                        sequence,
+                    );
+                    await post_to_receiver({
+                        type: 'pendingChangesAcknowledged',
+                        editSessionId: msg.editSessionId,
+                        sequence,
+                    }, receiver_epoch);
+                    resolve_pending_edit_ack_waiters();
+                }).finally(() => pending_edit_admissions.delete(admission));
+                pending_edit_writes = write;
+                const append_tail = write.then(() => {}, () => {});
+                append_admission_tails.set(APPEND_ADMISSION_AUTHORITY_TAIL, append_tail);
+                await write;
+                if (append_admission_tails.get(APPEND_ADMISSION_AUTHORITY_TAIL) === append_tail) {
+                    append_admission_tails.delete(APPEND_ADMISSION_AUTHORITY_TAIL);
+                }
+                return;
+            }
             case 'pendingEditsChanged': {
-                if (!editing_supported) return;
+                if (!editing_supported || active_replay_commit !== undefined) return;
                 if (!edit_message_is_current(msg.editSessionId)) return;
                 const message_target: WorksheetTarget = {
                     sheetIndex: msg.sheetIndex ?? 0,
@@ -8557,8 +12273,8 @@ export function attach_viewer(
                 if (decision.kind === 'replay') {
                     // A lost acknowledgement. The document was already mutated
                     // once; re-post the answer and touch nothing.
-                    void post_to_receiver(
-                        history_replay_result_message(decision.settled.result),
+                    await post_history_replay_outcome(
+                        decision.settled.result,
                         receiver_epoch,
                     );
                     return;
@@ -8573,17 +12289,11 @@ export function attach_viewer(
                     // outcome the single mutation produced.
                     const running = active_replay_commit;
                     if (running === undefined) return;
-                    void post_to_receiver(
-                        history_replay_result_message(await running),
-                        receiver_epoch,
-                    );
+                    await post_history_replay_outcome(await running, receiver_epoch);
                     return;
                 }
                 const operation = run_history_replay_commit(request, decision.lease.payload);
-                void post_to_receiver(
-                    history_replay_result_message(await operation),
-                    receiver_epoch,
-                );
+                await post_history_replay_outcome(await operation, receiver_epoch);
                 return;
             }
             case 'abandonHistoryReplay': {
@@ -8595,6 +12305,7 @@ export function attach_viewer(
                 replay_leases.abandon(request.leaseId);
                 return;
             }
+            case 'pendingChangesFlush':
             case 'pendingEditsFlush': {
                 const waiter = pending_edit_flush_waiters.get(msg.requestId);
                 if (!waiter || !Number.isSafeInteger(msg.highestProducedSequence)) return;
@@ -8606,6 +12317,7 @@ export function attach_viewer(
                 });
                 return;
             }
+            case 'pendingChangesFlushFailed':
             case 'pendingEditsFlushFailed': {
                 const waiter = pending_edit_flush_waiters.get(msg.requestId);
                 if (!waiter) return;
@@ -8637,6 +12349,34 @@ export function attach_viewer(
                     choice,
                 }, request.receiverEpoch);
                 flush_sheet_selections();
+                return;
+            }
+            case 'requestSourceDisplayRows': {
+                const request_core = core;
+                const sheet = source?.meta().sheets[msg.sheetIndex];
+                if (
+                    request_core === undefined
+                    || sheet === undefined
+                    || msg.generation !== request_core.generation
+                    || typeof msg.requestId !== 'string'
+                    || msg.requestId.length === 0
+                    || msg.requestId.length > 256
+                    || !Array.isArray(msg.sourceRows)
+                    || msg.sourceRows.length > MAX_PENDING_APPENDED_ROWS + 1
+                    || new Set(msg.sourceRows).size !== msg.sourceRows.length
+                    || msg.sourceRows.some((row) => !Number.isSafeInteger(row)
+                        || row < 0 || row >= MAX_SHEET_ROWS)
+                ) return;
+                await post_to_receiver({
+                    type: 'sourceDisplayRows',
+                    requestId: msg.requestId,
+                    sheetIndex: msg.sheetIndex,
+                    sourceRows: Object.freeze([...msg.sourceRows]),
+                    displayRows: Object.freeze(msg.sourceRows.map((row) =>
+                        request_core.display_row_for_source(msg.sheetIndex, row) ?? null)),
+                    generation: msg.generation,
+                    mappingGeneration: request_core.mapping_generation(msg.sheetIndex),
+                });
                 return;
             }
             default:
@@ -8715,6 +12455,8 @@ export function attach_viewer(
         const requires_edit_session = replay_request_requires_edit_session(request);
         const edit_session = requires_edit_session ? active_edit_session_id : undefined;
         const bound_source_generation = replay_core?.source_generation;
+        const row_admission_request_ids = request.rowAdmissionRequestIds ?? [];
+        let row_admission_lease_id: string | undefined;
 
         /**
          * Whether everything the lease is bound to is still in place.
@@ -8739,6 +12481,15 @@ export function attach_viewer(
             && source_authority.authorityRevision === expected_authority
             && source_authority.physicalRevision === expected_physical_revision
             && file_coordinator.state_write_is_current(expected_authority)
+            && (
+                row_admission_lease_id === undefined
+                || replay_row_admissions_for_structures(
+                    row_admission_request_ids,
+                    resolved_structures,
+                    bound_source_generation!,
+                    row_admission_lease_id,
+                ) !== undefined
+            )
             // Every term above is unconditional — the document, source, adoption,
             // authority and digest identities bind every lease. Only the session
             // terms are conditional, and a highlight-only lease is still
@@ -8771,6 +12522,7 @@ export function attach_viewer(
         const sheets = src.meta().sheets;
         const lookup = worksheet_target_lookup(sheets);
         const resolved_cells: { readonly input: typeof request.cells[number]; readonly sheetIndex: number }[] = [];
+        const resolved_cell_coordinates = new Set<string>();
         for (const cell of request.cells) {
             const sheet_index = lookup(cell.worksheet);
             const sheet = sheet_index === undefined ? undefined : sheets[sheet_index];
@@ -8783,6 +12535,17 @@ export function attach_viewer(
                 refuse('unavailable');
                 return;
             }
+            const coordinate = `${sheet_index}:${cell.sourceRow}:${cell.sourceColumn}`;
+            // One addressed cell has one ordinal even when a gesture touched it
+            // repeatedly. Besides making the prepare/commit correspondence
+            // ambiguous, accepting duplicates would let a tiny overlay request
+            // amplify one source-owned 32 KiB cell thousands of times in the
+            // prepared response.
+            if (resolved_cell_coordinates.has(coordinate)) {
+                refuse('malformed');
+                return;
+            }
+            resolved_cell_coordinates.add(coordinate);
             resolved_cells.push({ input: cell, sheetIndex: sheet_index });
         }
         const highlight_sheet_indices = new Map<number, number>();
@@ -8799,6 +12562,47 @@ export function attach_viewer(
                 return;
             }
             highlight_sheet_indices.set(highlight.ordinal, sheet_index);
+        }
+        const resolved_structures: (HistoryReplayStructuralInput & {
+            readonly resolvedSheetIndex: number;
+        })[] = [];
+        const structural_sheet_indices = new Set<number>();
+        for (const structural of request.structures ?? []) {
+            const sheet_index = lookup(structural.worksheet);
+            const sheet = sheet_index === undefined ? undefined : sheets[sheet_index];
+            if (
+                sheet_index === undefined
+                || sheet === undefined
+                || structural_sheet_indices.has(sheet_index)
+            ) {
+                refuse('unavailable');
+                return;
+            }
+            structural_sheet_indices.add(sheet_index);
+            resolved_structures.push(Object.freeze({
+                ...structural,
+                resolvedSheetIndex: sheet_index,
+            }));
+        }
+        const authorized_row_admissions = replay_row_admissions_for_structures(
+            row_admission_request_ids,
+            resolved_structures,
+            replay_core.source_generation,
+        );
+        if (
+            authorized_row_admissions === undefined
+            || !await replay_structures_are_authorized(
+                resolved_structures,
+                src,
+                authorized_row_admissions,
+            )
+        ) {
+            refuse('conflict');
+            return;
+        }
+        if (!replay_is_current()) {
+            refuse('document-changed');
+            return;
         }
         const focus_sheet_index = lookup(request.focus.worksheet);
         if (focus_sheet_index === undefined) {
@@ -8867,7 +12671,27 @@ export function attach_viewer(
             refuse('conflict');
             return;
         }
-
+        if (!replay_structures_match_durable(current, resolved_structures, sheets)) {
+            refuse('conflict');
+            return;
+        }
+        if (
+            request.cells.length === 0
+            && replay_structures_have_ambiguous_pending_formulas(
+                current,
+                resolved_structures,
+                sheets,
+                [],
+                false,
+            )
+            && !resolved_structures.some((structural) =>
+                structural.desired.conflicts.some(
+                    (conflict) => conflict.reason === 'ambiguousPendingFormula',
+                ))
+        ) {
+            refuse('conflict');
+            return;
+        }
         // 3. PHYSICAL CURRENCY. Last because it reads the whole file, and a
         // conflict found above would have made the read wasted work.
         const physical = await replay_physical_source_is_current(
@@ -8887,14 +12711,44 @@ export function attach_viewer(
         }
 
         const now = Date.now();
+        const lease_id = `${request.requestId}:${now}`;
+        const owned_prepared_cells = Object.freeze(prepared_cells);
+        const owned_resolved_structures = Object.freeze(resolved_structures);
+        const prepared_message: HostMessage = Object.freeze({
+            type: 'historyReplayPrepared',
+            prepared: Object.freeze({
+                requestId: request.requestId,
+                replayId: request.replayId,
+                leaseId: lease_id,
+                focusSheetIndex: focus_sheet_index,
+                focus: request.focus,
+                cells: owned_prepared_cells,
+                structures: owned_resolved_structures,
+            }),
+        });
+        try {
+            // Preparation adds persisted source content that was not in the
+            // bounded renderer request. Bound the exact outbound message before
+            // either retaining a lease payload or asking structured clone to
+            // transport it.
+            assert_json_encoded_bound(
+                prepared_message,
+                MAX_HISTORY_ACTION_ENCODED_BYTES,
+            );
+        } catch {
+            refuse('unavailable');
+            return;
+        }
         const lease = replay_leases.issue(
             {
-                leaseId: `${request.requestId}:${now}`,
+                leaseId: lease_id,
                 requestId: request.requestId,
                 replayId: request.replayId,
             },
             {
-                cells: Object.freeze(prepared_cells),
+                cells: owned_prepared_cells,
+                structures: owned_resolved_structures,
+                rowAdmissionRequestIds: Object.freeze([...row_admission_request_ids]),
                 highlights: request.highlights,
                 highlightSheetIndices: highlight_sheet_indices,
                 focus: request.focus,
@@ -8908,25 +12762,27 @@ export function attach_viewer(
             refuse('busy');
             return;
         }
+        if (!lease_replay_row_admissions(row_admission_request_ids, lease.leaseId)) {
+            replay_leases.abandon(lease.leaseId);
+            refuse('conflict');
+            return;
+        }
+        row_admission_lease_id = lease.leaseId;
         // Awaited, unlike most posts here: the lease is already live, and a
         // renderer that never learned its id can neither spend nor abandon it —
         // it would hold the one-at-a-time slot and refuse every replay as `busy`
         // until its TTL ran out. Abandoning on a failed delivery is what keeps the
         // slot's occupancy tied to a renderer that actually knows about it.
-        const delivered = await post_to_receiver({
-            type: 'historyReplayPrepared',
-            prepared: {
-                requestId: request.requestId,
-                replayId: request.replayId,
-                leaseId: lease.leaseId,
-                focusSheetIndex: focus_sheet_index,
-                focus: request.focus,
-                cells: Object.freeze(prepared_cells),
-            },
-        }, receiver_epoch);
+        const delivered = await post_to_receiver(prepared_message, receiver_epoch);
         // Conditional on this exact lease, so a newer one issued in the meantime
         // is never the thing dropped.
-        if (!delivered && replay_leases.current(Date.now())?.leaseId === lease.leaseId) {
+        if (!delivered) {
+            // The renderer never learned this lease or took responsibility for
+            // settling its restoration grants. Cancel them even if checking the
+            // registry observes that the lease expired during a slow post.
+            // Both operations are exact-ID/idempotent, so neither can touch a
+            // newer lease or an already-started commit.
+            cancel_replay_row_admissions(row_admission_request_ids, lease.leaseId);
             replay_leases.abandon(lease.leaseId);
         }
     }
@@ -8938,6 +12794,30 @@ export function attach_viewer(
         return 'reason' in result
             ? { type: 'historyReplayCommitRefused', refusal: result }
             : { type: 'historyReplayCommitted', committed: result };
+    }
+
+    /**
+     * The terminal must cross the renderer boundary before a refresh exposes the
+     * replay's durable pending-state arm. Otherwise snapshot reconciliation moves
+     * the renderer stores first and their old→new CAS in the terminal cannot stage,
+     * leaving the host mutation committed while history remains unmoved.
+     */
+    async function post_history_replay_outcome(
+        outcome: HistoryReplayCommitOutcome,
+        receiver_epoch: number,
+    ): Promise<void> {
+        const delivered = await post_to_receiver(
+            history_replay_result_message(outcome.result),
+            receiver_epoch,
+        );
+        if (
+            delivered
+            && outcome.publishCurrentMaterial
+            && !('reason' in outcome.result)
+            && !disposed
+        ) {
+            session.deliver_current_material();
+        }
     }
 
     /**
@@ -8959,8 +12839,13 @@ export function attach_viewer(
     function run_history_replay_commit(
         request: CommitHistoryReplayRequest,
         payload: ReplayLeasePayload,
-    ): Promise<HistoryReplayCommitted | HistoryReplayCommitRefused> {
-        const operation = commit_history_replay(request, payload)
+    ): Promise<HistoryReplayCommitOutcome> {
+        const prior_append_authority = append_admission_tails.get(
+            APPEND_ADMISSION_AUTHORITY_TAIL,
+        ) ?? Promise.resolve();
+        let append_tail: Promise<void>;
+        const operation = prior_append_authority.catch(() => {}).then(() =>
+            commit_history_replay(request, payload))
             .catch((error: unknown): HistoryReplayCommitRefused => {
                 console.warn('History replay commit failed', error);
                 return Object.freeze({
@@ -8972,13 +12857,29 @@ export function attach_viewer(
                 });
             })
             .then((result) => {
-                replay_leases.settle(request.leaseId, result, Date.now());
-                return result;
+                if ('reason' in result) {
+                    release_replay_row_admissions(
+                        payload.rowAdmissionRequestIds,
+                        request.leaseId,
+                    );
+                }
+                const outcome = Object.freeze({
+                    result,
+                    publishCurrentMaterial: !('reason' in result)
+                        && payload.highlights.length > 0,
+                });
+                replay_leases.settle(request.leaseId, outcome, Date.now());
+                return outcome;
             })
             .finally(() => {
                 if (active_replay_commit === operation) active_replay_commit = undefined;
+                if (append_admission_tails.get(APPEND_ADMISSION_AUTHORITY_TAIL) === append_tail) {
+                    append_admission_tails.delete(APPEND_ADMISSION_AUTHORITY_TAIL);
+                }
             });
         active_replay_commit = operation;
+        append_tail = operation.then(() => {}, () => {});
+        append_admission_tails.set(APPEND_ADMISSION_AUTHORITY_TAIL, append_tail);
         return operation;
     }
 
@@ -9038,6 +12939,32 @@ export function attach_viewer(
         if (highlights.length !== payload.highlights.length) {
             return refused('proposal-mismatch');
         }
+        const structural_ordinals = new Set(
+            (request.structures ?? []).map((write) => write.ordinal),
+        );
+        if (
+            structural_ordinals.size !== payload.structures.length
+            || payload.structures.some((structural) => !structural_ordinals.has(structural.ordinal))
+        ) return refused('proposal-mismatch');
+        const authorization_source = source;
+        const authorized_row_admissions = replay_row_admissions_for_structures(
+            payload.rowAdmissionRequestIds,
+            payload.structures,
+            payload.sourceGeneration,
+            request.leaseId,
+        );
+        if (
+            authorization_source === undefined
+            || authorized_row_admissions === undefined
+            || !await replay_structures_are_authorized(
+                payload.structures,
+                authorization_source,
+                authorized_row_admissions,
+            )
+        ) {
+            return refused('conflict');
+        }
+        if (!payload.isCurrent()) return refused('document-changed');
 
         await pending_edit_writes.catch(() => {});
         if (!payload.isCurrent()) return refused('document-changed');
@@ -9129,14 +13056,35 @@ export function attach_viewer(
             return refused('proposal-mismatch');
         }
 
+        const committed_cells = Object.freeze(writes.map((write) => Object.freeze({
+            ordinal: write.ordinal,
+            resolvedSheetIndex: write.sheetIndex,
+            key: write.key,
+            entry: write.entry,
+        })));
+        // The row mapping is source-owned, not pending-state-owned, so resolving
+        // it before the durable CAS is safe. Keeping the exact terminal material
+        // available here lets the updater size the complete response before it
+        // authorizes the corresponding state transition.
+        const display_focus = resolve_replay_display_focus(
+            payload,
+            (sheet_index, source_row) => replay_core.display_row_for_source(
+                sheet_index,
+                source_row,
+            ),
+            replay_core.mapping_generation(payload.focusSheetIndex),
+        );
+
         // The compare-and-swap. `conflict` is reported by the updater rather than
         // thrown, because a conflict is an ordinary outcome — someone typed while
         // the replay was in flight — and must leave history exactly where it is.
         let conflicted = false;
         let unavailable = false;
-        const replay_committed = await update_file_state((current, updater_sheets) => {
+        let committed_structures: readonly HistoryReplayAcceptedStructuralWrite[] | undefined;
+        await update_file_state((current, updater_sheets) => {
             conflicted = false;
             unavailable = false;
+            committed_structures = undefined;
             if (!payload.isCurrent()) {
                 unavailable = true;
                 return current;
@@ -9155,6 +13103,11 @@ export function attach_viewer(
                     payload.highlightSheetIndices,
                     identities,
                 )
+                || !replay_structures_match_durable(
+                    current,
+                    payload.structures,
+                    identities,
+                )
             ) {
                 conflicted = true;
                 return current;
@@ -9166,26 +13119,185 @@ export function attach_viewer(
                 if (sheet_writes === undefined) by_sheet.set(write.sheetIndex, [write]);
                 else sheet_writes.push(write);
             }
-            for (const [sheet_index, sheet_writes] of by_sheet) {
-                const sheet = identities[sheet_index];
-                const cells = pending_edits_for_sheet(
-                    next.pendingEdits,
-                    sheet_index,
-                    sheet?.name,
-                    sheet?.worksheetId,
-                );
-                const updated = pending_edits_with_replay_writes(cells, sheet_writes);
-                if (updated === cells) continue;
-                next = {
-                    ...next,
-                    pendingEdits: with_pending_edits_for_sheet(
+            const structure_by_sheet = new Map(payload.structures.map(
+                (structural) => [structural.resolvedSheetIndex, structural] as const,
+            ));
+            const changed_sheet_indices = new Set([
+                ...by_sheet.keys(),
+                ...structure_by_sheet.keys(),
+            ]);
+            try {
+                const canonical_before = reconciled_against(
+                    { revision: 0, state: current },
+                    src,
+                    false,
+                ).state as PerFileState;
+                for (const sheet_index of changed_sheet_indices) {
+                    const sheet_writes = by_sheet.get(sheet_index) ?? [];
+                    const sheet = identities[sheet_index];
+                    const durable_structural = own_pending_structural_changes(
+                        pending_changes_for_sheet(
+                            next.pendingEdits,
+                            sheet_index,
+                            sheet?.name,
+                            sheet?.worksheetId,
+                        ) ?? {},
+                    );
+                    const cells = pending_edits_for_sheet(
                         next.pendingEdits,
                         sheet_index,
-                        updated,
                         sheet?.name,
                         sheet?.worksheetId,
-                    ),
-                };
+                    );
+                    const updated = pending_edits_with_replay_writes(cells, sheet_writes);
+                    const structural = structure_by_sheet.get(sheet_index)?.desired
+                        ?? durable_structural;
+                    const pending_ids = new Set(structural.appendedRows.map((row) => row.id));
+                    const removal_ids = new Set(structural.tailRemovals.map(
+                        (removal) => removal.appendHistoryId,
+                    ));
+                    // Start from the authenticated durable diagnostics, never the
+                    // renderer's desired array. Formula diagnostics are derived
+                    // afresh below. Other diagnostics survive only for structural
+                    // identities the prospective state still contains.
+                    const retained_conflicts = durable_structural.conflicts.flatMap(
+                        (conflict): PendingStructuralConflict[] => {
+                            if (conflict.reason === 'ambiguousPendingFormula') return [];
+                            const pendingRowIds = conflict.pendingRowIds.filter(
+                                (id) => pending_ids.has(id),
+                            );
+                            const tailRemovalIds = conflict.tailRemovalIds.filter(
+                                (id) => removal_ids.has(id),
+                            );
+                            if (pendingRowIds.length === 0 && tailRemovalIds.length === 0) {
+                                return [];
+                            }
+                            return [{
+                                ...conflict,
+                                pendingRowIds,
+                                tailRemovalIds,
+                            }];
+                        },
+                    );
+                    const prospective = {
+                        cells: updated ?? {},
+                        formatTemplates: structural.formatTemplates,
+                        appendedRows: structural.appendedRows,
+                        tailRemovals: structural.tailRemovals,
+                        ...(structural.appendBasis === undefined
+                            ? {}
+                            : { appendBasis: structural.appendBasis }),
+                        conflicts: retained_conflicts,
+                    };
+                    // The conflict reserve is host-only. Measure the complete
+                    // renderer-owned worksheet envelope, including live cell
+                    // overlays combined with the replayed row state, before a
+                    // canonical diagnostic is allowed to occupy the reserve.
+                    assert_pending_user_changes_encoded_bound({
+                        sheetIndex: sheet_index,
+                        ...(sheet?.name === undefined ? {} : { sheetName: sheet.name }),
+                        ...(sheet?.worksheetId === undefined
+                            ? {}
+                            : { worksheetId: sheet.worksheetId }),
+                        ...prospective,
+                        conflicts: [],
+                    });
+                    next = {
+                        ...next,
+                        pendingEdits: with_pending_changes_for_sheet(
+                            next.pendingEdits,
+                            sheet_index,
+                            prospective,
+                            sheet?.name,
+                            sheet?.worksheetId,
+                        ),
+                    };
+                }
+
+                // Reconcile the prospective transaction against the same source
+                // that owns the replay lease. This recomputes formula, schema,
+                // and template diagnostics from host-readable facts. A renderer
+                // must have predicted that canonical result exactly in every
+                // structural arm; it cannot mint or suppress a host conflict.
+                const canonical = reconciled_against(
+                    { revision: 0, state: next },
+                    src,
+                    false,
+                ).state as PerFileState;
+                const canonical_structures: HistoryReplayAcceptedStructuralWrite[] =
+                    payload.structures.map((structural) => {
+                    const sheet = identities[structural.resolvedSheetIndex];
+                    const desired = own_pending_structural_changes(
+                        pending_changes_for_sheet(
+                            canonical.pendingEdits,
+                            structural.resolvedSheetIndex,
+                            sheet?.name,
+                            sheet?.worksheetId,
+                        ) ?? {},
+                    );
+                    if (JSON.stringify(desired) !== JSON.stringify(structural.desired)) {
+                        throw new Error('noncanonical replay conflict overlay');
+                    }
+                    return Object.freeze({
+                        ordinal: structural.ordinal,
+                        resolvedSheetIndex: structural.resolvedSheetIndex,
+                        expected: structural.expected,
+                        desired,
+                    });
+                });
+                const structural_indices = new Set(payload.structures.map(
+                    (structural) => structural.resolvedSheetIndex,
+                ));
+                const derived_structures: HistoryReplayAcceptedStructuralWrite[] = [];
+                for (let sheet_index = 0; sheet_index < identities.length; sheet_index += 1) {
+                    if (structural_indices.has(sheet_index)) continue;
+                    const sheet = identities[sheet_index];
+                    const before = own_pending_structural_changes(pending_changes_for_sheet(
+                        canonical_before.pendingEdits,
+                        sheet_index,
+                        sheet?.name,
+                        sheet?.worksheetId,
+                    ) ?? {});
+                    const after = own_pending_structural_changes(pending_changes_for_sheet(
+                        canonical.pendingEdits,
+                        sheet_index,
+                        sheet?.name,
+                        sheet?.worksheetId,
+                    ) ?? {});
+                    if (JSON.stringify(before) === JSON.stringify(after)) continue;
+                    const without_conflicts = (value: PendingStructuralChanges) => ({
+                        formatTemplates: value.formatTemplates,
+                        appendedRows: value.appendedRows,
+                        tailRemovals: value.tailRemovals,
+                        ...(value.appendBasis === undefined
+                            ? {}
+                            : { appendBasis: value.appendBasis }),
+                    });
+                    // A replay may make a formula diagnostic on a sibling sheet
+                    // appear or disappear. That transition is derived from the
+                    // atomically verified workbook, not chosen by the renderer.
+                    // No sibling row/template/basis mutation gets the same
+                    // privilege: those still require an explicit leased arm.
+                    if (JSON.stringify(without_conflicts(before))
+                        !== JSON.stringify(without_conflicts(after))) {
+                        throw new Error('unnamed replay structural mutation');
+                    }
+                    derived_structures.push(Object.freeze({
+                        ordinal: payload.structures.length + derived_structures.length,
+                        resolvedSheetIndex: sheet_index,
+                        hostDerived: true,
+                        expectedConflicts: before.conflicts,
+                        desiredConflicts: after.conflicts,
+                    }));
+                }
+                next = canonical;
+                committed_structures = Object.freeze([
+                    ...canonical_structures,
+                    ...derived_structures,
+                ]);
+            } catch {
+                conflicted = true;
+                return current;
             }
             for (const patch of highlight_patches) {
                 try {
@@ -9205,6 +13317,29 @@ export function attach_viewer(
                     return current;
                 }
             }
+            try {
+                // Ingress bounds are not enough: a cell commit and a structural
+                // preparation arrive separately, and canonical sibling conflict
+                // patches are created only here. Bound the exact prospective
+                // terminal while refusal can still leave the durable snapshot
+                // untouched.
+                assert_json_encoded_bound({
+                    requestId: request.requestId,
+                    replayId: request.replayId,
+                    leaseId: request.leaseId,
+                    mutationId: request.mutationId,
+                    sourceGeneration: payload.sourceGeneration,
+                    cells: committed_cells,
+                    structures: committed_structures,
+                    focusSheetIndex: payload.focusSheetIndex,
+                    focus: payload.focus,
+                    displayFocus: display_focus,
+                }, MAX_HISTORY_ACTION_ENCODED_BYTES);
+            } catch {
+                unavailable = true;
+                committed_structures = undefined;
+                return current;
+            }
             return next;
         }, undefined, payload.isCurrent, {
             expectedAuthorityRevision: expected_authority,
@@ -9213,53 +13348,25 @@ export function attach_viewer(
 
         if (unavailable) return refused('unavailable');
         if (conflicted) return refused('conflict');
+        if (committed_structures === undefined) return refused('conflict');
         if (!payload.isCurrent()) return refused('document-changed');
-        // Highlights the replay wrote have to be PUBLISHED, not merely committed.
-        // `update_file_state` refreshes the session's state material without
-        // delivering it, which is right for pending edits — the renderer holds
-        // those in its own stores and applies the accepted writes itself — but a
-        // highlight lives only in durable state, so without this the cells would
-        // change on disk and never repaint.
-        //
-        // AFTER the currency check above, and never folded into the commit as a
-        // `deliver` flag: delivering supersedes the acknowledged snapshot, so
-        // `acknowledged_current()` — a term of `replay_is_current` — goes false
-        // the moment it happens. Delivering first would make this replay's own
-        // publication refuse it as `document-changed` with the highlight already
-        // durably written, leaving the renderer's history unmoved and every retry
-        // conflicting against the state the replay had in fact applied.
-        //
-        // Deliberately not the `cellHighlightsChanged` shape the highlight
-        // COMMANDS publish: that message carries a request id and the gesture's
-        // deltas, which are what enter a window's undo history. A replay is the
-        // history moving, so re-entering it would record undo as a new gesture.
-        if (highlight_patches.length > 0 && replay_committed !== undefined && !disposed) {
-            // The material already held, not `replay_committed` re-installed. An
-            // unrelated writer committing behind this replay installs a LATER
-            // revision, and `update_state_snapshot` refuses an older one — so
-            // re-installing to force the delivery would silently deliver nothing
-            // and leave the replayed highlight painted stale indefinitely. That
-            // newer material already contains this commit.
-            session.deliver_current_material();
-        }
-        // The updater's own result is used ONLY for that delivery. An unchanged
-        // updater reports `undefined` — for a replay that means the document
+        if (!accept_replay_row_admissions(
+            payload.rowAdmissionRequestIds,
+            request.leaseId,
+        )) return refused('conflict');
+        // An unchanged updater reports `undefined` — for a replay that means the document
         // already held everything the replay would write, a byte-identical redo of
         // a gesture that changed nothing durable, which is a success and not a
-        // refusal, and needs no repaint. The answer below is assembled from the
-        // retained preparation either way.
+        // refusal. Highlight publication happens only after the caller posts this
+        // terminal, so renderer store CASes cannot be pre-empted by a refresh.
         return Object.freeze({
             requestId: request.requestId,
             replayId: request.replayId,
             leaseId: request.leaseId,
             mutationId: request.mutationId,
             sourceGeneration: payload.sourceGeneration,
-            cells: Object.freeze(writes.map((write) => Object.freeze({
-                ordinal: write.ordinal,
-                resolvedSheetIndex: write.sheetIndex,
-                key: write.key,
-                entry: write.entry,
-            }))),
+            cells: committed_cells,
+            structures: committed_structures,
             focusSheetIndex: payload.focusSheetIndex,
             focus: payload.focus,
             // Resolved HERE and not at preparation: a replay waits on a keypress
@@ -9268,14 +13375,7 @@ export function attach_viewer(
             // Serialized commands mean anything queued after this point publishes
             // after the commit, and the generation stamp is what lets the renderer
             // decline a projection that was overtaken anyway.
-            displayFocus: resolve_replay_display_focus(
-                payload,
-                (sheet_index, source_row) => replay_core.display_row_for_source(
-                    sheet_index,
-                    source_row,
-                ),
-                replay_core.mapping_generation(payload.focusSheetIndex),
-            ),
+            displayFocus: display_focus,
         });
     }
 
@@ -9308,6 +13408,252 @@ export function attach_viewer(
                 persisted: cell.persisted,
                 persistedHyperlink: cell.persistedHyperlink,
             })) return false;
+        }
+        return true;
+    }
+
+    /** Whether every leased worksheet still holds its complete structural arm. */
+    function replay_structures_match_durable(
+        current: PerFileState,
+        structures: readonly (HistoryReplayStructuralInput & {
+            readonly resolvedSheetIndex: number;
+        })[],
+        sheets: readonly WorksheetIdentity[],
+    ): boolean {
+        for (const structural of structures) {
+            const sheet = sheets[structural.resolvedSheetIndex];
+            const actual = own_pending_structural_changes(pending_changes_for_sheet(
+                current.pendingEdits,
+                structural.resolvedSheetIndex,
+                sheet?.name,
+                sheet?.worksheetId,
+            ) ?? {});
+            if (JSON.stringify(actual) !== JSON.stringify(structural.expected)) return false;
+        }
+        return true;
+    }
+
+    /** Whether prospective replay rows make an authored A1 formula ambiguous. */
+    function replay_structures_have_ambiguous_pending_formulas(
+        current: PerFileState,
+        structures: readonly ResolvedReplayStructure[],
+        sheets: readonly SheetMeta[],
+        writes: readonly ReplayCellWrite[] = [],
+        include_source_cells = true,
+    ): boolean {
+        if (!file_path.toLowerCase().endsWith('.xlsx')) return false;
+        const desired_by_sheet = new Map(structures.map(
+            (structural) => [structural.resolvedSheetIndex, structural.desired] as const,
+        ));
+        const structural_by_sheet = sheets.map((sheet, sheet_index) =>
+            desired_by_sheet.get(sheet_index) ?? own_pending_structural_changes(
+                pending_changes_for_sheet(
+                    current.pendingEdits,
+                    sheet_index,
+                    sheet.name,
+                    sheet.worksheetId,
+                ) ?? {},
+            ));
+        const writes_by_sheet = new Map<number, ReplayCellWrite[]>();
+        for (const write of writes) {
+            const entries = writes_by_sheet.get(write.sheetIndex) ?? [];
+            entries.push(write);
+            writes_by_sheet.set(write.sheetIndex, entries);
+        }
+        for (let formula_index = 0; formula_index < sheets.length; formula_index += 1) {
+            const formula_sheet = sheets[formula_index]!;
+            const current_cells = include_source_cells
+                ? pending_edits_for_sheet(
+                    current.pendingEdits,
+                    formula_index,
+                    formula_sheet.name,
+                    formula_sheet.worksheetId,
+                )
+                : undefined;
+            const prospective_cells = include_source_cells
+                ? pending_edits_with_replay_writes(
+                    current_cells,
+                    writes_by_sheet.get(formula_index) ?? [],
+                ) ?? {}
+                : {};
+            for (let target_index = 0; target_index < sheets.length; target_index += 1) {
+                if (pending_formula_cells_referencing_provisional_rows(
+                    structural_by_sheet[formula_index]!,
+                    prospective_cells,
+                    structural_by_sheet[target_index]!,
+                    formula_index,
+                    target_index,
+                    sheets,
+                ).length > 0) return true;
+            }
+        }
+        return false;
+    }
+
+    /** Structural replay writes stay current and inside authority already issued. */
+    async function replay_structures_are_authorized(
+        structures: readonly ResolvedReplayStructure[],
+        replay_source: DataSource,
+        additionally_authorized: ReadonlySet<string> = new Set(),
+    ): Promise<boolean> {
+        const edit_session_id = active_edit_session_id;
+        if (structures.length > 0 && edit_session_id === undefined) return false;
+        const is_xlsx = file_path.toLowerCase().endsWith('.xlsx');
+        let xlsx_bytes: Uint8Array | undefined;
+        if (is_xlsx && structures.some(
+            (structural) => structural.desired.tailRemovals.length > 0,
+        )) {
+            try {
+                xlsx_bytes = await host.fs.read_file(uri);
+            } catch {
+                return false;
+            }
+        }
+        // History can retain a row after it leaves the durable Pending Changes
+        // leaf. A source refresh therefore cannot reconcile that state in
+        // place. Validate every desired structural arm against the source that
+        // this replay lease will bind before consulting the retained capability.
+        try {
+            for (const structural of structures) {
+                const desired = structural.desired;
+                const sheet = replay_source.meta().sheets[structural.resolvedSheetIndex];
+                if (sheet === undefined) return false;
+                if (desired.appendedRows.length > 0 && desired.appendBasis === undefined) {
+                    return false;
+                }
+                if (
+                    desired.appendBasis !== undefined
+                    && (
+                        desired.appendBasis.columnCount !== sheet.columnCount
+                        || desired.appendBasis.schemaFingerprint
+                            !== worksheet_append_schema_fingerprint(sheet)
+                    )
+                ) return false;
+                if (
+                    sheet.sourceRowCount - desired.tailRemovals.length < 0
+                    || sheet.sourceRowCount - desired.tailRemovals.length
+                        + desired.appendedRows.length > MAX_SHEET_ROWS
+                ) return false;
+                const retained_row_count = sheet.sourceRowCount
+                    - desired.tailRemovals.length;
+                if (desired.tailRemovals.some(
+                    (removal, index) => removal.sourceRow !== retained_row_count + index,
+                )) return false;
+                if (desired.appendedRows.some((row) => (
+                    Object.keys(row.cells).some((column) => Number(column) >= sheet.columnCount)
+                    || Object.keys(row.highlights ?? {}).some(
+                        (column) => Number(column) >= sheet.columnCount,
+                    )
+                ))) return false;
+                for (const template of desired.formatTemplates) {
+                    if (!is_xlsx) {
+                        if (template.format.kind !== 'none') return false;
+                        continue;
+                    }
+                    if (
+                        template.format.kind !== 'xlsx'
+                        || template.format.cellStyleIndexes.length !== sheet.columnCount
+                        || replay_source.append_style_dependency_fingerprint === undefined
+                        || template.format.styleFingerprint
+                            !== replay_source.append_style_dependency_fingerprint(
+                                template.format.cellStyleIndexes,
+                                template.format.rowStyleIndex,
+                            )
+                    ) return false;
+                }
+                if (
+                    is_xlsx
+                    && desired.appendedRows.length > 0
+                    && desired.appendBasis !== undefined
+                    && desired.formatTemplates.some((template) => (
+                        template.format.kind !== 'xlsx'
+                        || desired.appendBasis!.styleFingerprint
+                            !== template.format.styleFingerprint
+                    ))
+                ) return false;
+                for (const removal of desired.tailRemovals) {
+                    const current_format: PendingRowFormat = is_xlsx
+                        ? capture_xlsx_append_row_format(
+                            xlsx_bytes!,
+                            structural.resolvedSheetIndex,
+                            removal.sourceRow + 1,
+                            sheet.columnCount,
+                            sheet.excelFirstRowHeader?.active === true
+                                ? sheet.excelFirstRowHeader.sourceRow
+                                : undefined,
+                        )
+                        : { kind: 'none' };
+                    const current = saved_row_physical_fingerprint({
+                        cells: source_row_cells_for_fingerprint(
+                            replay_source,
+                            structural.resolvedSheetIndex,
+                            removal.sourceRow,
+                        ),
+                        format: current_format,
+                    });
+                    if (current !== saved_row_physical_fingerprint(removal.savedRow)) {
+                        return false;
+                    }
+                }
+            }
+        } catch {
+            return false;
+        }
+        // Validate the whole request before admitting retained rows into any
+        // ledger, so one invalid worksheet cannot partially mutate authority.
+        for (const structural of structures) {
+            const target = canonical_worksheet_target({
+                ...structural.worksheet,
+                sheetIndex: structural.resolvedSheetIndex,
+            });
+            if (target === undefined || edit_session_id === undefined) return false;
+            const ledger_key = append_ledger_key(edit_session_id, target);
+            const live_ledger = append_admission_ledgers.get(ledger_key);
+            if (!accepted_row_admission_gestures_are_complete(
+                ledger_key,
+                structural.desired.appendedRows,
+            )) return false;
+            if (changes_use_unsettled_row_authority(
+                live_ledger,
+                ledger_key,
+                structural.desired.appendedRows,
+                structural.desired.formatTemplates,
+                structural.desired.appendBasis,
+                additionally_authorized,
+            )) return false;
+            const ledger = live_ledger === undefined
+                ? undefined
+                : clone_append_admission_ledger(live_ledger);
+            const retained_templates = project_retained_pending_rows(
+                ledger,
+                target,
+                structural.desired.appendedRows,
+            );
+            if (!appended_rows_match_ledger(ledger, structural.desired.appendedRows)) return false;
+            if (structural.desired.formatTemplates.some((template) => {
+                const issued = retained_templates.get(template.id)
+                    ?? issued_append_template(
+                        ledger,
+                        ledger_key,
+                        template.id,
+                        additionally_authorized,
+                    );
+                return issued === undefined
+                    || JSON.stringify(issued) !== JSON.stringify(template);
+            })) return false;
+            const provisional_basis = accepted_append_basis_for_ledger(
+                ledger,
+                ledger_key,
+                additionally_authorized,
+            );
+            if (
+                structural.desired.appendBasis !== undefined
+                && JSON.stringify(structural.desired.appendBasis)
+                    !== JSON.stringify(provisional_basis)
+            ) return false;
+            if (structural.desired.tailRemovals.some(
+                (removal) => !tail_removal_matches_authority(target, removal),
+            )) return false;
         }
         return true;
     }

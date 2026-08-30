@@ -31,6 +31,13 @@ const BOLD: RichText = { runs: [{ text: 'typed', style: { bold: true } }] };
 
 const SHEET: WorksheetTarget = { sheetIndex: 0, sheetName: 'Data', worksheetId: 'rId1' };
 const SECOND: WorksheetTarget = { sheetIndex: 1, sheetName: 'Notes', worksheetId: 'rId2' };
+const FORMULA_BASES = [{
+    targetSheetIndex: 1,
+    targetSheetName: 'Notes',
+    targetWorksheetId: 'rId2',
+    provisionalStartRow: 10,
+    provisionalRowCount: 2,
+}] as const;
 
 /** Every arm a real overlay can have, including the ones that differ only in intent. */
 const OVERLAYS: readonly (readonly [string, CellOverlayState])[] = [
@@ -44,7 +51,7 @@ const OVERLAYS: readonly (readonly [string, CellOverlayState])[] = [
     )],
     ['value only, combined metadata', value_only_overlay(
         history_value('A'), history_value('A'), false,
-        true, undefined, true, { row: 3, col: 2, order: 7 }, 8,
+        true, undefined, true, { row: 3, col: 2, order: 7 }, 8, FORMULA_BASES,
     )],
     ['link only', hyperlink_only_overlay(history_value('disk'), LINK, null)],
     ['link only, cleared', hyperlink_only_overlay(history_value('disk'), null, LINK)],
@@ -172,6 +179,26 @@ describe('overlay round trip', () => {
         const back = cell_overlay_state_from_wire(wire);
         expect(back.kind === 'present' && back.value.kind === 'present'
             && back.value.formattingKnown).toBe(true);
+    });
+
+    it('preserves formula reference bases through the replay wire', () => {
+        const wire = wire_overlay_from_cell_overlay_state(
+            value_only_overlay(
+                history_value('=Notes!A11'),
+                history_value(''),
+                false,
+                undefined,
+                undefined,
+                true,
+                undefined,
+                9,
+                FORMULA_BASES,
+            ),
+        );
+        const back = cell_overlay_state_from_wire(wire);
+        expect(back.kind === 'present' && back.value.kind === 'present'
+            ? back.value.formulaReferenceBases
+            : undefined).toEqual(FORMULA_BASES);
     });
 });
 

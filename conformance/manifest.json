@@ -2,7 +2,7 @@
   "$schema": "schema-v1.json",
   "format_version": 1,
   "corpus": "ooxml-worksheet-edit",
-  "corpus_version": "1.0.0",
+  "corpus_version": "1.1.0",
   "api_version": 1,
   "operation": "apply-worksheet-edits",
   "encoding": "utf-8",
@@ -533,7 +533,7 @@
     },
     {
       "id": "supported-prefixed-sheet-data",
-      "description": "A direct prefixed sheetData explains the missing body only when its QName resolves to SpreadsheetML.",
+      "description": "A direct prefixed SpreadsheetML sheetData is edited using the same qualified element names.",
       "input": "fixtures/supported-prefixed-sheet-data.xml",
       "edits": [
         {
@@ -549,8 +549,8 @@
         "run_font_bases": []
       },
       "expected": {
-        "kind": "refusal",
-        "code": "namespace-prefixed-worksheet-element"
+        "kind": "output",
+        "golden": "goldens/supported-prefixed-sheet-data.xml"
       }
     },
     {

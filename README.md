@@ -70,7 +70,7 @@ It also removes other friction from reading tables:
 - **Diffing a spreadsheet in Git shows you a wall of text.** Click a changed `.xlsx`, `.xls`, `.csv`, `.tsv`, or `.dta` file in VS Code's Source Control or Timeline view and Table Viewer opens the comparison as a table: added and deleted rows banded, changed cells showing before and after in place. The desktop app also compares any two files.
 - **Comparing a Git LFS file shows you the pointer, not the table.** An LFS-tracked file is stored in Git as a small pointer naming the real object, so the version you want to compare against is often not on your machine at all. Table Viewer recognizes the pointer on either side of a comparison and offers to download the object.
 
-**Limitations:** Table Viewer is *not* a full spreadsheet editor. You can't create files or sheets or add cells beyond the file's existing bounds. Formula editing and recalculation intentionally support a documented subset of Excel; see [Excel formula support](docs/excel-formulas.md).
+**Limitations:** Table Viewer is *not* a full spreadsheet editor. You can't create files or sheets, insert rows in the middle, or add columns. Edit mode can append rows to `.xlsx`, CSV, and TSV worksheets. Formula editing and recalculation intentionally support a documented subset of Excel; see [Excel formula support](docs/excel-formulas.md).
 
 ## Features
 
@@ -156,12 +156,16 @@ It also removes other friction from reading tables:
 - Click the **Edit** button in the toolbar to enter edit mode
 - Edit, copy, cut, and recalculate `.xlsx` formulas within the [documented Excel formula support](docs/excel-formulas.md)
 - Double-click a cell, press **Enter**, or choose **Edit cell** from the right-click menu to edit its value
-- **Enter** confirms and moves to the cell below; **Tab** moves right
+- Use the sticky **Append row** at the bottom of the grid to add a row. Pasting a block there adds the whole block's row count as one undoable change
+- **Enter** confirms and moves to the cell below. When there is no next row, it appends one and continues in the same column. **Tab** moves row-major and appends from the final visible column of the final row
+- Pending rows keep their intended physical row numbers and use the existing added-row tint. Right-click a pending row number to remove it; right-click a pending removal to cancel it
+- Active sorts and filters leave pending rows in a separate section at the end. **Hide row** remains visible for those rows but is disabled
 - **Shift+Enter** or **Alt+Enter** inserts a line break within a cell
 - **Escape** cancels the current edit
 - **Ctrl+S** / **Cmd+S** saves all changes back to the file
 - Edit `.xlsx` cell styling with Markdown syntax: `**bold**`, `*italic*`, `<u>underline</u>`, and `~~strikethrough~~`
 - Add, edit, or remove `.xlsx` hyperlinks to a web address or a place in the workbook from the cell context menu
+- An `.xlsx` append adds worksheet rows. It does not enlarge an OOXML Excel Table region
 - Edited cells are highlighted with a different background color until saved
 - Rows keep their position for the whole edit session, so a cell stays under your cursor while you work on it. You can enter edit mode with a sort or filter already applied, and add or change one while editing; neither moves the rows you are working on. A row you edit so that it no longer matches an active filter stays visible until you save; the view reflects your new values once the file is saved and reloaded
 - When exiting edit mode with unsaved changes, you're prompted to save or discard

@@ -149,6 +149,36 @@ describe("copy-paste", () => {
         ]], "workbook-1/sheet-1/projection-4", operationId, expected)).toBeUndefined();
     });
 
+    test("stable row identities survive remapping while numeric fallbacks do not", () => {
+        const cell = (withIdentity: boolean): CellBuffer => ({
+            rawValue: "value",
+            formatted: "value",
+            format: "string",
+            clipboardData: {
+                source: "workbook-1/sheet-1",
+                location: [2, 3],
+                gridLocation: [2, 1],
+                projectionGeneration: 4,
+                ...(withIdentity ? {
+                    rowIdentity: { kind: "pending" as const, pendingRowId: "pending-1" },
+                } : {}),
+                action: "cut",
+                operationId,
+            },
+        });
+        const stable = [[cell(true)]];
+        expect(cutSourceGridLocations(
+            stable, "workbook-1/sheet-1", operationId, stable, 5,
+        )).toEqual([[2, 1]]);
+        const numeric = [[cell(false)]];
+        expect(cutSourceGridLocations(
+            numeric, "workbook-1/sheet-1", operationId, numeric, 5,
+        )).toBeUndefined();
+        expect(cutSourceGridLocations(
+            numeric, "workbook-1/sheet-1", operationId, numeric, 4,
+        )).toEqual([[2, 1]]);
+    });
+
     test("decode html", () => {
         const html = `
             <table>

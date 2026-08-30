@@ -14,6 +14,7 @@ import {
     is_range_filter_operator,
     is_wire_csv_save_rejection,
     pending_edits_for_sheet,
+    pending_changes_for_sheet,
     sheet_index_with_pending_edits,
     transform_has_entries,
     transform_is_active,
@@ -28,6 +29,7 @@ import {
     type CellHighlightState,
     type HighlightCellDelta,
     dirty_entries_equal,
+    copy_dirty_entry,
     dirty_entry_base_formatting_unknown,
     dirty_entry_value_dimension_present,
     dirty_entry_with_observed_file_base,
@@ -50,8 +52,16 @@ import {
     type TransformIntent,
     type ViewBasis,
     type WorksheetTarget,
+    type WorksheetPendingChanges,
 } from '../types';
 import type { WorkbookMeta } from '../data-source/interface';
+import {
+    advance_pending_append_basis,
+    assert_pending_changes_encoded_bound,
+    EMPTY_PENDING_STRUCTURAL_CHANGES,
+    type PendingAppendBasis,
+    type PendingStructuralChanges,
+} from '../pending-changes';
 import {
     hyperlinks_equal,
     normalize_rich_text,
@@ -79,6 +89,8 @@ import {
     retarget_renamed_structured_formula,
 } from '../xlsx-formula';
 import { xlsx_edit_writes_formula } from '../xlsx-cell-value';
+import { MAX_WORKBOOK_FORMULAS } from '../spreadsheet-safety';
+import { capture_pending_formula_reference_bases } from '../pending-formula-rebase';
 import {
     classify_snapshot,
     normalize_complete_per_file_state,
@@ -113,10 +125,14 @@ import {
     GridShell,
     type EditingStatus,
     type EditingHandle,
+    type AppendRowsAdmission,
     type GridActionsHandle,
     type GridFocusHandle,
     type HighlightSelectionHandle,
     type PendingPreviewScroll,
+    type PendingHostGesture,
+    type PendingRowFocus,
+    type SavedRowFocus,
 } from './grid-shell';
 import {
     clamp_sheet_index,
@@ -161,13 +177,25 @@ import {
     type HistoryFocusOutcome,
     type PendingHistoryFocus,
 } from './history-focus-model';
-import { replayed_store_entry } from './history-replay-request-model';
+import {
+    replayed_store_entry,
+    wire_entry_for_destination,
+} from './history-replay-request-model';
 import {
     absent_overlay,
     overlay_state_from_dirty_entry,
     type HistoryDirection,
 } from './history-cell-state-model';
-import type { HistoryEntry } from './history-stack-model';
+import {
+    peek_history,
+    retained_pending_row_authorities,
+    retained_saved_append_authorities,
+    type HistoryEntry,
+} from './history-stack-model';
+import {
+    plan_pending_row_history_replay,
+    type PendingRowHistoryPlan,
+} from './pending-row-history';
 import type { HistoryReplayCommitted } from '../history-replay-protocol';
 import { pending_signal, type PendingSignal } from './pending-signal';
 import { run_discard_transaction } from './discard-transaction-model';
@@ -196,6 +224,7 @@ import {
     host_bridge,
     install_pending_edit_flush_responder,
     pending_edit_durability,
+    pending_changes_durability,
 } from './host-bridge';
 import { apply_font_family, apply_font_size } from './vscode-theme';
 import {
@@ -734,7 +763,9 @@ export function App(): React.JSX.Element {
         edit_session_registry_ref.current.revision,
         edit_session_registry_ref.current.revision,
     );
-    const formula_roots_projection = edit_session_registry_ref.current.formula_projection();
+    const formula_roots_projection = edit_session_registry_ref.current.formula_projection(
+        meta?.sheets.map((sheet) => sheet.sourceRowCount),
+    );
     const value_edit_order_floor = edit_session_registry_ref.current.value_edit_order_floor();
     const formula_header_coordinate_signature = JSON.stringify((meta?.sheets ?? []).map(
         (sheet) => [
@@ -742,17 +773,60 @@ export function App(): React.JSX.Element {
             sheet.excelFirstRowHeader?.sourceRow ?? 0,
         ],
     ));
-    const formula_calculation_edits = useMemo(
-        () => formula_roots_projection.edits.map((edit) => {
+    const structural_formula_state = useMemo(() => {
+        const edits: FormulaCalculationEdit[] = formula_roots_projection.edits.map((edit) => {
             const sheet = meta?.sheets[edit.sheetIndex];
             const header_row = sheet?.excelFirstRowHeader?.sourceRow ?? 0;
             return sheet?.excelFirstRowHeader?.active === true && edit.row === header_row
                 ? { ...edit, writesFormula: false }
                 : edit;
-        }),
+        });
+        const pending_by_sheet = new Map(edit_session_registry_ref.current!.pending_entries());
+        const prospectiveRowCounts = (meta?.sheets ?? []).map((sheet, sheetIndex) => {
+            const changes = pending_by_sheet.get(sheetIndex)?.snapshot()
+                ?? EMPTY_PENDING_STRUCTURAL_CHANGES;
+            const prospective_start = sheet.sourceRowCount - changes.tailRemovals.length;
+            return prospective_start + changes.appendedRows.length;
+        });
+        for (const edit of formula_roots_projection.pendingEdits) {
+            const sheet = meta?.sheets[edit.sheetIndex];
+            if (sheet === undefined || edit.column >= sheet.columnCount) continue;
+            const changes = pending_by_sheet.get(edit.sheetIndex)?.snapshot()
+                ?? EMPTY_PENDING_STRUCTURAL_CHANGES;
+            edits.push({
+                sheetIndex: edit.sheetIndex,
+                row: sheet.sourceRowCount - changes.tailRemovals.length
+                    + edit.pendingRowIndex,
+                column: edit.column,
+                value: edit.value,
+                writesFormula: edit.writesFormula,
+                ...(edit.runs !== undefined ? { runs: edit.runs } : {}),
+            });
+        }
+        const removedRows = [...pending_by_sheet].flatMap(([sheetIndex, store]) =>
+            store.snapshot().tailRemovals.map(({ sourceRow }) => ({ sheetIndex, row: sourceRow })));
+        edits.sort((left, right) => (left.sheetIndex - right.sheetIndex)
+            || (left.row - right.row)
+            || (left.column - right.column));
+        return {
+            edits,
+            prospectiveRowCounts,
+            removedRows,
+            tooManyEdits: formula_roots_projection.tooManyEdits
+                || edits.length > MAX_WORKBOOK_FORMULAS,
+        };
+    },
         // eslint-disable-next-line react-hooks/exhaustive-deps
-        [formula_roots_projection.calculationRevision, formula_header_coordinate_signature],
+        [
+            formula_roots_projection.structuralRevision,
+            formula_roots_projection.calculationRevision,
+            formula_header_coordinate_signature,
+            meta,
+        ],
     );
+    const formula_calculation_edits = structural_formula_state.edits;
+    const prospective_formula_row_counts = structural_formula_state.prospectiveRowCounts;
+    const removed_formula_rows = structural_formula_state.removedRows;
     const header_calculation_edits = useMemo(() => formula_calculation_edits.filter((edit) => {
         const sheet = meta?.sheets[edit.sheetIndex];
         return sheet?.excelFirstRowHeader?.active === true
@@ -760,11 +834,13 @@ export function App(): React.JSX.Element {
     // eslint-disable-next-line react-hooks/exhaustive-deps
     }), [formula_calculation_edits, formula_header_coordinate_signature]);
     const formula_roots = formula_calculation_edits;
-    const formula_root_signature = formula_roots_projection.tooManyEdits
+    const formula_root_signature = structural_formula_state.tooManyEdits
         ? 'too-many-edits'
-        : `${formula_roots_projection.coordinateRevision}`;
+        : `${formula_roots_projection.coordinateRevision}:`
+            + `${formula_roots_projection.structuralRevision}`;
     const formula_calculation_edit_signature
-        = formula_roots_projection.calculationRevision;
+        = `${formula_roots_projection.calculationRevision}:`
+            + `${formula_roots_projection.structuralRevision}`;
     const formula_moves = formula_roots_projection.moves;
     const has_formula_moves = formula_moves.length > 0;
     const formula_sheet_names = (meta?.sheets ?? []).map((sheet) => sheet.name);
@@ -821,7 +897,7 @@ export function App(): React.JSX.Element {
             structured_column_rename_signature,
         ],
     );
-    const too_many_formula_calculation_edits = formula_roots_projection.tooManyEdits;
+    const too_many_formula_calculation_edits = structural_formula_state.tooManyEdits;
     const [edit_mode, set_edit_mode_state] = useState(false);
     // Diff toggle (before/after view of dirty cells). Deliberately never reset
     // when edit mode exits: the button hides with edit mode, but the choice
@@ -920,6 +996,15 @@ export function App(): React.JSX.Element {
      * next keypress immediately, not after a render.
      */
     const replay_coordinator_ref = useRef<HistoryReplayCoordinator | null>(null);
+    /** Structural-only replay is local, but reserves the same chronological stack. */
+    const pending_row_replay_busy_ref = useRef(false);
+    const pending_row_replay_plan_ref = useRef<{
+        readonly entryId: object;
+        readonly direction: HistoryDirection;
+        readonly plans: readonly PendingRowHistoryPlan[];
+        readonly restorationRequestIds: readonly string[];
+        readonly settleRestorations: readonly ((accepted: boolean) => void)[];
+    } | null>(null);
     /**
      * Acquire an edit session for a replay that has none.
      *
@@ -955,6 +1040,26 @@ export function App(): React.JSX.Element {
                     ? absent_overlay()
                     : overlay_state_from_dirty_entry(entry);
             },
+            read_structural: (worksheet) => {
+                const sheets = meta_ref.current?.sheets;
+                if (sheets === undefined) return undefined;
+                const sheet_index = worksheet_target_index(sheets, worksheet);
+                return sheet_index === undefined
+                    ? undefined
+                    : edit_session_registry_ref.current!
+                        .pending_rows_for_sheet(sheet_index)
+                        .snapshot();
+            },
+            row_admission_request_ids: () =>
+                pending_row_replay_plan_ref.current?.restorationRequestIds ?? [],
+            preplanned_structures: (entry, direction) => {
+                const planned = pending_row_replay_plan_ref.current;
+                return planned !== null
+                    && planned.entryId === entry.id
+                    && planned.direction === direction
+                    ? planned.plans
+                    : undefined;
+            },
             post: (message) => { host_bridge.postMessage(message); },
             next_id: (prefix) => `${prefix}-${++replay_id_counter_ref.current}`,
         });
@@ -986,21 +1091,133 @@ export function App(): React.JSX.Element {
             writes.push({ key: write.key, entry: replayed_store_entry(write.entry) });
             by_sheet.set(write.resolvedSheetIndex, writes);
         }
+        const structural = pending_row_replay_plan_ref.current;
+        const action_has_structural_changes = entry.action.changes.some((change) =>
+            change.kind === 'rowAppend'
+            || change.kind === 'tailRemoval'
+            || change.kind === 'pendingRows');
+        const accepted_structures = committed.structures ?? [];
+        const requested_structures = accepted_structures.filter(
+            (accepted) => accepted.hostDerived !== true,
+        );
+        if (action_has_structural_changes) {
+            if (
+                structural === null
+                || structural.entryId !== entry.id
+                || structural.direction !== direction
+            ) return false;
+            if (requested_structures.length !== structural.plans.length) return false;
+        } else if (requested_structures.length > 0) {
+            return false;
+        }
+
+        const sheets = meta_ref.current?.sheets;
+        if (sheets === undefined) return false;
+        const structural_by_sheet = new Map<number, {
+            readonly expected: PendingStructuralChanges;
+            readonly desired: PendingStructuralChanges;
+        }>();
+        for (const accepted of accepted_structures) {
+            if (structural_by_sheet.has(accepted.resolvedSheetIndex)) return false;
+            if (accepted.hostDerived === true) {
+                // A host-derived arm is deliberately only a conflict CAS patch.
+                // Preserve every renderer-owned row/template field from the
+                // store staged against instead of accepting a full sibling leaf
+                // that would amplify the replay terminal.
+                const current = registry.pending_rows_for_sheet(
+                    accepted.resolvedSheetIndex,
+                ).snapshot();
+                if (JSON.stringify(current.conflicts)
+                    !== JSON.stringify(accepted.expectedConflicts)) return false;
+                structural_by_sheet.set(accepted.resolvedSheetIndex, {
+                    expected: current,
+                    desired: { ...current, conflicts: accepted.desiredConflicts },
+                });
+            } else {
+                structural_by_sheet.set(accepted.resolvedSheetIndex, {
+                    expected: accepted.expected,
+                    desired: accepted.desired,
+                });
+            }
+        }
+
+        // Validate each worksheet's COMPLETE desired envelope once. Validating
+        // staged cells against old rows and staged rows against old cells can
+        // falsely reject a valid transfer near the cap after the host has
+        // already committed it. Once this pass succeeds, both store participants
+        // stage under the same proof.
+        const affected_sheet_indices = new Set([
+            ...by_sheet.keys(),
+            ...structural_by_sheet.keys(),
+        ]);
+        for (const sheet_index of affected_sheet_indices) {
+            const sheet = sheets[sheet_index];
+            if (sheet === undefined) return false;
+            const desired_cells: Record<string, string | CsvDirtyEntry> = {};
+            for (const [key, entry] of registry.for_sheet(sheet_index).snapshot()) {
+                const wire = wire_entry_for_destination(entry);
+                if (wire === undefined || wire === null) return false;
+                desired_cells[key] = wire;
+            }
+            for (const write of by_sheet.get(sheet_index) ?? []) {
+                if (write.entry === undefined) delete desired_cells[write.key];
+                else {
+                    const wire = wire_entry_for_destination(write.entry);
+                    if (wire === undefined || wire === null) return false;
+                    desired_cells[write.key] = wire;
+                }
+            }
+            const desired_structural = structural_by_sheet.get(sheet_index)?.desired
+                ?? registry.pending_rows_for_sheet(sheet_index).snapshot();
+            try {
+                assert_pending_changes_encoded_bound({
+                    sheetIndex: sheet_index,
+                    sheetName: sheet.name,
+                    ...(sheet.worksheetId === undefined
+                        ? {}
+                        : { worksheetId: sheet.worksheetId }),
+                    cells: desired_cells,
+                    ...desired_structural,
+                });
+            } catch {
+                return false;
+            }
+        }
+
         const staged: StagedMutation[] = [];
         for (const [sheet_index, writes] of by_sheet) {
-            const staging = registry.for_sheet(sheet_index).stage_writes(session_id, writes);
+            const staging = registry.for_sheet(sheet_index).stage_writes(
+                session_id,
+                writes,
+                true,
+            );
             // A store whose session moved on refuses to stage. Abandoning the
             // whole transaction is right: a replay is one gesture, and applying
             // the sheets that would still take it leaves half an undo.
             if (staging === undefined) return false;
             staged.push(staging);
         }
+        for (const [sheet_index, changes] of structural_by_sheet) {
+            const staging = registry.pending_rows_for_sheet(sheet_index).stage_replace(
+                session_id,
+                changes.expected,
+                changes.desired,
+                true,
+            );
+            if (staging === undefined) return false;
+            staged.push(staging);
+        }
         const move = history_store_ref.current!.stage_move(direction, entry);
         staged.push(move);
         // Highlights need no participant here: they are the host's own durable
-        // state, and the renderer learns their new value from the
-        // `cellHighlightsChanged` the commit's write already produces.
-        return commit_staged_transaction(staged);
+        // state. The host publishes their refreshed snapshot only after this
+        // terminal has moved every renderer-owned participant and history.
+        const applied = commit_staged_transaction(staged);
+        if (applied && structural?.entryId === entry.id) {
+            structural.settleRestorations.forEach((settle) => settle(true));
+            pending_row_replay_plan_ref.current = null;
+        }
+        return applied;
     }, []);
 
     const set_csv_edit_session_id = useCallback((next: string | undefined) => {
@@ -1082,6 +1299,8 @@ export function App(): React.JSX.Element {
     }>({ key: '', value: { status: 'loading' } });
     const [pending_preview_scroll, set_pending_preview_scroll] =
         useState<PendingPreviewScroll | null>(null);
+    const [saved_row_focus, set_saved_row_focus] = useState<SavedRowFocus | null>(null);
+    const [pending_row_focus, set_pending_row_focus] = useState<PendingRowFocus | null>(null);
     const [grid_focus_restore, set_grid_focus_restore_state] =
         useState<GridFocusRestoreState | null>(null);
     const grid_focus_restore_ref = useRef<GridFocusRestoreState | null>(null);
@@ -1113,6 +1332,8 @@ export function App(): React.JSX.Element {
     // acknowledging one tab from resurrecting an unchanged notice on another.
     const [dismissed_external_change_occurrences, set_dismissed_external_change_occurrences] =
         useState<Readonly<Record<string, number>>>({});
+    const [dismissed_structural_conflict_signature, set_dismissed_structural_conflict_signature] =
+        useState<string>();
     const [open_external_change_occurrence, set_open_external_change_occurrence] =
         useState<string | null>(null);
     const [external_change_navigation_status, set_external_change_navigation_status] =
@@ -1268,6 +1489,35 @@ export function App(): React.JSX.Element {
         Array.from(crypto.getRandomValues(new Uint32Array(2)), (value) =>
             value.toString(36)).join('-'),
     );
+    const append_request_seq_ref = useRef(0);
+    const append_request_prefix_ref = useRef(
+        Array.from(crypto.getRandomValues(new Uint32Array(2)), (value) =>
+            value.toString(36)).join('-'),
+    );
+    const pending_append_requests_ref = useRef(new Map<string, {
+        readonly sourceGeneration: number;
+        readonly editSessionId: string;
+        readonly sheetIndex: number;
+        readonly resolve: (result: AppendRowsAdmission | undefined) => void;
+    }>());
+    const [append_request_pending, set_append_request_pending] = useState(false);
+    const restore_saved_rows_seq_ref = useRef(0);
+    const pending_saved_row_restorations_ref = useRef(new Map<string, {
+        readonly sourceGeneration: number;
+        readonly expectedIds: readonly string[];
+        readonly sheetIndex: number;
+        readonly editSessionId: string;
+        readonly resolve: (admission: {
+            readonly requestId: string;
+            readonly appendBasis: PendingAppendBasis;
+            readonly settle: (accepted: boolean) => void;
+        } | undefined) => void;
+    }>());
+    const tail_removal_validation_seq_ref = useRef(0);
+    const pending_tail_removal_validations_ref = useRef(new Map<string, {
+        readonly sourceGeneration: number;
+        readonly resolve: (valid: boolean) => void;
+    }>());
     const dialog_request_seq_ref = useRef(0);
     const excel_header_request_seq_ref = useRef(0);
     const excel_header_request_prefix_ref = useRef(
@@ -1300,7 +1550,14 @@ export function App(): React.JSX.Element {
     const pending_save_grid_focus_ref = useRef<{
         editSessionId: string;
         saveRequestId: string;
+        pendingCell?: {
+            readonly pendingRowId: string;
+            readonly sourceColumn: number;
+        };
+        restoreFocus: boolean;
     } | null>(null);
+    const saved_row_focus_sequence_ref = useRef(0);
+    const pending_row_focus_sequence_ref = useRef(0);
     const save_projection_ref = useRef<CsvSaveProjection>(
         INITIAL_CSV_SAVE_PROJECTION,
     );
@@ -1345,9 +1602,22 @@ export function App(): React.JSX.Element {
             : [];
     });
     const formula_graph_key = `${load_epoch}:${source_generation_ref.current}:`
-        + JSON.stringify([header_formula_signature, pending_header_formula_signature]);
+        + JSON.stringify([
+            header_formula_signature,
+            pending_header_formula_signature,
+            prospective_formula_row_counts,
+        ]);
+    const prospective_formula_sheets = useMemo(() => (meta?.sheets ?? []).map(
+        (sheet, sheetIndex) => ({
+            ...sheet,
+            sourceRowCount: prospective_formula_row_counts[sheetIndex]
+                ?? sheet.sourceRowCount,
+        })),
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+        [formula_graph_key],
+    );
     const workbook_formula_graph = useMemo(
-        () => compile_workbook_formula_graph(meta?.sheets ?? []),
+        () => compile_workbook_formula_graph(prospective_formula_sheets),
         // Metadata is cloned between deliveries; this key names source topology.
         // eslint-disable-next-line react-hooks/exhaustive-deps
         [formula_graph_key],
@@ -1359,7 +1629,7 @@ export function App(): React.JSX.Element {
         || (sheet.structuredFormulaReferences?.references.length ?? 0) > 0);
     const has_formula_work = source_has_formula_work
         || has_formula_moves
-        || formula_roots_projection.hasFormulaEdits;
+        || formula_calculation_edits.length > 0;
     const dependency_root_signature = has_formula_work
         ? formula_root_signature
         : 'no-formula-work';
@@ -1425,7 +1695,7 @@ export function App(): React.JSX.Element {
             };
         }
         return plan_workbook_formula_recalculation(
-            meta?.sheets ?? [],
+            prospective_formula_sheets,
             formula_calculation_edits,
             { impact: dependency_formula_impact },
         );
@@ -1436,6 +1706,7 @@ export function App(): React.JSX.Element {
         has_formula_work,
         has_formula_moves,
         meta?.sheets.length,
+        prospective_formula_sheets,
         too_many_formula_calculation_edits,
     ]);
     const formula_impact = formula_calculation_plan.impact;
@@ -1488,6 +1759,8 @@ export function App(): React.JSX.Element {
             sourceGeneration,
             edits,
             targets,
+            prospectiveRowCounts: prospective_formula_row_counts,
+            removedRows: removed_formula_rows,
         });
         return () => {
             if (active_formula_calculation_ref.current?.requestId === requestId) {
@@ -1505,6 +1778,8 @@ export function App(): React.JSX.Element {
         formula_calculation_edits,
         header_calculation_edits,
         load_epoch,
+        prospective_formula_row_counts,
+        removed_formula_rows,
         source_formulas_ready,
         source_pending_formula_targets,
     ]);
@@ -1580,7 +1855,13 @@ export function App(): React.JSX.Element {
     const pending_highlight_request_ref = useRef<{
         readonly requestId: string;
         readonly label: string;
+        readonly pendingGesture?: PendingHostGesture;
     } | null>(null);
+    const row_resize_request_seq_ref = useRef(0);
+    const pending_row_resize_requests_ref = useRef(new Map<
+        string,
+        { readonly sourceGeneration: number; readonly finish: (applied: boolean) => void }
+    >());
     const last_highlight_state_revision_ref = useRef(0);
 
     const { persist_immediate } = use_state_sync(
@@ -1598,10 +1879,12 @@ export function App(): React.JSX.Element {
         // App-owned store that survives generation-keyed GridShell remounts.
         const editing = editing_ref.current;
         editing?.stop_edit_admission();
-        editing?.commit_live_edit_at_close_barrier();
+        if (editing?.commit_live_edit_at_close_barrier() === false) {
+            throw new Error('The open cell edit exceeds the pending-changes limit.');
+        }
         await new Promise<void>((resolve) => queueMicrotask(resolve));
 
-        const durability = pending_edit_durability.snapshot(edit_session_id);
+        const durability = pending_changes_durability.snapshot(edit_session_id);
         const publication_fenced = renderer_publication_fenced_session_ref.current
             === edit_session_id;
         let highest_produced_sequence = durability.highestProducedSequence;
@@ -1611,15 +1894,45 @@ export function App(): React.JSX.Element {
             // edit pointer names. Publish each store's current truth — content
             // or explicit null — so the host's slots match what the user sees
             // when the document comes back.
+            const entries = new Map<string, {
+                target: WorksheetTarget;
+                cellStore?: ReturnType<EditSessionRegistry['for_sheet']>;
+                pendingStore?: ReturnType<EditSessionRegistry['pending_rows_for_sheet']>;
+                parked: boolean;
+            }>();
             for (const { target, store, parked } of
                 edit_session_registry_ref.current!.publication_entries(
                     meta_ref.current?.sheets ?? [],
                 )) {
-                const snapshot = store.snapshot();
+                entries.set(worksheet_target_key(target), {
+                    target,
+                    cellStore: store,
+                    parked,
+                });
+            }
+            for (const { target, store, parked } of
+                edit_session_registry_ref.current!.pending_publication_entries(
+                    meta_ref.current?.sheets ?? [],
+                )) {
+                const key = worksheet_target_key(target);
+                entries.set(key, {
+                    ...entries.get(key),
+                    target,
+                    pendingStore: store,
+                    parked: parked || entries.get(key)?.parked === true,
+                });
+            }
+            for (const { target, cellStore, pendingStore, parked } of entries.values()) {
+                const snapshot = cellStore?.snapshot() ?? new Map();
+                const structural = pendingStore?.snapshot()
+                    ?? EMPTY_PENDING_STRUCTURAL_CHANGES;
                 if (
                     !parked
                     && snapshot.size === 0
-                    && !pending_edit_durability.has_publication(
+                    && structural.appendedRows.length === 0
+                    && structural.tailRemovals.length === 0
+                    && structural.conflicts.length === 0
+                    && !pending_changes_durability.has_publication(
                         edit_session_id,
                         target.sheetIndex,
                         target.sheetName,
@@ -1628,18 +1941,20 @@ export function App(): React.JSX.Element {
                 ) continue;
                 highest_produced_sequence = Math.max(
                     highest_produced_sequence,
-                    pending_edit_durability.publish(
+                    pending_changes_durability.publish(
                         edit_session_id,
-                        snapshot.size > 0 ? Object.fromEntries(snapshot) : null,
-                        target.sheetIndex,
-                        target.sheetName,
-                        pending_edit_durability.has_unacknowledged_payload(
+                        Object.freeze({
+                            ...target,
+                            cells: Object.freeze(Object.fromEntries(snapshot)),
+                            ...structural,
+                        }),
+                        source_generation_ref.current,
+                        pending_changes_durability.has_unacknowledged_payload(
                             edit_session_id,
                             target.sheetIndex,
                             target.sheetName,
                             target.worksheetId,
                         ),
-                        target.worksheetId,
                     ),
                 );
             }
@@ -1753,6 +2068,13 @@ export function App(): React.JSX.Element {
             });
             return;
         }
+        if (pending_row_resize_requests_ref.current.size > 0) {
+            host_bridge.postMessage({
+                type: 'showWarning',
+                message: 'A row resize is still being applied. Try discarding again in a moment.',
+            });
+            return;
+        }
         if (!edit_gestures_admitted()) {
             host_bridge.postMessage({
                 type: 'showWarning',
@@ -1763,7 +2085,7 @@ export function App(): React.JSX.Element {
         // Fold any open cell editor FIRST, so its text is part of what the discard
         // throws away and therefore part of what undoing it restores. Left open, it
         // would be dropped by the exit below with nothing in history describing it.
-        editing_ref.current?.commit_live_edit();
+        if (editing_ref.current?.commit_live_edit() === false) return;
         // Emptying the stores and recording what was emptied are ONE transaction;
         // the invariant and its outcomes live in the model.
         const outcome = run_discard_transaction({
@@ -1805,6 +2127,9 @@ export function App(): React.JSX.Element {
     }, [clear_save_verdict, csv_edit_session_id, fence_edit_session_exit]);
 
     const begin_save_operation = useCallback((): CsvSaveOperation | undefined => {
+        // Structural review dismissal is occurrence-scoped: Save is the user's
+        // explicit request to see whether the condition still blocks persistence.
+        set_dismissed_structural_conflict_signature(undefined);
         if (!csv_edit_session_id || save_projection_ref.current.operation) return undefined;
         const sheets = meta_ref.current?.sheets ?? [];
         const preflight = edit_session_registry_ref.current!
@@ -1819,11 +2144,17 @@ export function App(): React.JSX.Element {
             return undefined;
         }
         if (preflight.worksheets.length === 0) return undefined;
-        const worksheets = preflight.worksheets.map(({ target, edits, dirtyEdits }) =>
+        const worksheets = preflight.worksheets.map(({
+            target,
+            edits,
+            dirtyEdits,
+            structuralChanges,
+        }) =>
             Object.freeze<CsvSaveWorksheetOperation>({
                 ...target,
                 edits,
                 dirtyEdits,
+                ...(structuralChanges === undefined ? {} : { structuralChanges }),
             }));
         const operation = Object.freeze<CsvSaveOperation>({
             editSessionId: csv_edit_session_id,
@@ -1836,13 +2167,16 @@ export function App(): React.JSX.Element {
         });
         const projection = propose_csv_save(save_projection_ref.current, operation);
         save_projection_ref.current = projection;
-        pending_save_grid_focus_ref.current =
-            grid_focus_ref.current?.has_focus() === true
-                ? {
-                    editSessionId: operation.editSessionId,
-                    saveRequestId: operation.saveRequestId,
-                }
-                : null;
+        const pending_cell = grid_focus_ref.current?.pending_active_cell?.();
+        const restore_focus = grid_focus_ref.current?.has_focus() === true;
+        pending_save_grid_focus_ref.current = pending_cell !== undefined || restore_focus
+            ? {
+                editSessionId: operation.editSessionId,
+                saveRequestId: operation.saveRequestId,
+                restoreFocus: restore_focus,
+                ...(pending_cell === undefined ? {} : { pendingCell: pending_cell }),
+            }
+            : null;
         set_save_operation(operation);
         save_in_flight_ref.current = true;
         host_bridge.postMessage({ type: 'saveCsv', operation });
@@ -1867,11 +2201,22 @@ export function App(): React.JSX.Element {
         // pointer that moved on to another worksheet mid-lifecycle cannot pull
         // the restored map into the wrong store.
         sheet_index: number = edit_session_sheet_index_ref.current,
+        pending_changes?: unknown,
     ) => {
         // Read the outgoing stamp before install overwrites it.
         const store = edit_session_registry_ref.current!.for_sheet(sheet_index);
         const previous_identity = store.identity();
         store.install({ session_id }, edits);
+        const pending_store = edit_session_registry_ref.current!
+            .pending_rows_for_sheet(sheet_index);
+        const previous_pending_identity = pending_store.identity();
+        if (
+            pending_changes !== undefined
+            || previous_pending_identity === null
+            || previous_pending_identity.session_id !== session_id
+        ) {
+            pending_store.install({ session_id }, pending_changes);
+        }
         // An acknowledgement is about a specific set of dirty cells, so it expires
         // when the *session* it belonged to does — not on every crossing of this
         // boundary. Crossing it is not by itself evidence of a new dirty map: the
@@ -2052,6 +2397,27 @@ export function App(): React.JSX.Element {
                 if (matching_request) {
                     pending_highlight_request_ref.current = null;
                     set_highlight_request_pending(false);
+                    if (!msg.error && msg.deltas !== undefined && pending_highlight !== null) {
+                        if (pending_highlight.pendingGesture !== undefined) {
+                            const committed = pending_highlight.pendingGesture.commit(
+                                [...highlight_history_source(
+                                    msg.deltas,
+                                    meta_ref.current?.sheets ?? [],
+                                )],
+                                pending_highlight.label,
+                            );
+                            if (!committed) {
+                                host_bridge.postMessage({
+                                    type: 'showWarning',
+                                    message: 'The pending-row half of the highlight could not be applied.',
+                                });
+                            }
+                        } else {
+                            record_highlight_gesture(msg.deltas, pending_highlight.label);
+                        }
+                    } else {
+                        pending_highlight?.pendingGesture?.cancel();
+                    }
                 }
                 if (msg.stateRevision < last_highlight_state_revision_ref.current) {
                     // A superseded reply still resolves this panel's own pending
@@ -2067,18 +2433,6 @@ export function App(): React.JSX.Element {
                     return;
                 }
                 last_highlight_state_revision_ref.current = msg.stateRevision;
-                // Only this window's OWN gesture enters its history. The same
-                // message arrives for another window's highlight, an external
-                // reload, and a post-save rebase; recording those would let undo
-                // repaint cells this user never touched.
-                if (
-                    matching_request
-                    && !msg.error
-                    && msg.deltas !== undefined
-                    && pending_highlight !== null
-                ) {
-                    record_highlight_gesture(msg.deltas, pending_highlight.label);
-                }
                 state_ref.current = {
                     ...state_ref.current,
                     cellHighlights: msg.state,
@@ -2090,6 +2444,17 @@ export function App(): React.JSX.Element {
                 } else {
                     set_highlight_status(msg.requestId ? 'Cell highlights updated.' : 'Cell highlights refreshed.');
                 }
+            }
+
+            if (msg.type === 'rowHeightsChanged') {
+                const pending = pending_row_resize_requests_ref.current.get(msg.requestId);
+                if (pending === undefined) return;
+                pending_row_resize_requests_ref.current.delete(msg.requestId);
+                pending.finish(
+                    msg.applied
+                    && msg.sourceGeneration === pending.sourceGeneration
+                    && msg.sourceGeneration === source_generation_ref.current,
+                );
             }
 
             if (msg.type === 'filterHistogram') {
@@ -2298,10 +2663,28 @@ export function App(): React.JSX.Element {
                         || generation_remounts_the_grid
                         || next_active_sheet_index !== active_sheet_index
                         || active_sheet_changed;
+                    const pending_cell_before_remount = remounts_the_grid
+                        ? grid_focus_ref.current?.pending_active_cell?.()
+                        : undefined;
+                    if (
+                        snapshot.presentation === 'refresh'
+                        && !active_sheet_changed
+                        && pending_cell_before_remount !== undefined
+                    ) {
+                        set_pending_row_focus({
+                            sequence: ++pending_row_focus_sequence_ref.current,
+                            sheetIndex: next_active_sheet_index,
+                            pendingRowId: pending_cell_before_remount.pendingRowId,
+                            sourceColumn: pending_cell_before_remount.sourceColumn,
+                            restoreFocus: grid_focus_ref.current?.has_focus() === true,
+                        });
+                    } else if (snapshot.presentation === 'initial') {
+                        set_pending_row_focus(null);
+                    }
                     if (active_sheet_changed) {
-                        editing_ref.current?.flush_live_edit();
+                        if (editing_ref.current?.flush_live_edit() === false) return;
                     } else if (remounts_the_grid) {
-                        editing_ref.current?.commit_live_edit();
+                        if (editing_ref.current?.commit_live_edit() === false) return;
                     }
                     // The basis a pending highlight request was sent against, read
                     // BEFORE this snapshot overwrites either — see the abandonment
@@ -2449,6 +2832,35 @@ export function App(): React.JSX.Element {
                                 target.worksheetId,
                             );
                     };
+                    const authoritative_refresh_changes_for_target = (
+                        target: WorksheetTarget,
+                    ) => {
+                        if (snapshot.presentation !== 'refresh') return undefined;
+                        const pending = refresh_authoritative_state?.pendingEdits;
+                        const direct = pending_changes_for_sheet(
+                            pending,
+                            target.sheetIndex,
+                            target.sheetName,
+                            target.worksheetId,
+                        );
+                        if (direct !== undefined || !pending) return direct;
+                        const identified_index = pending.findIndex((slot) => {
+                            if (!slot) return false;
+                            return slot.worksheetId !== undefined
+                                ? target.worksheetId !== undefined
+                                    && slot.worksheetId === target.worksheetId
+                                : slot.sheetName !== undefined
+                                    && slot.sheetName === target.sheetName;
+                        });
+                        return identified_index === -1
+                            ? undefined
+                            : pending_changes_for_sheet(
+                                pending,
+                                identified_index,
+                                target.sheetName,
+                                target.worksheetId,
+                            );
+                    };
                     // Reconcile the registry at the snapshot itself, not in
                     // install_edit_session: a refresh that advances the session
                     // id makes `refresh_editing_current_session` false and skips
@@ -2472,7 +2884,47 @@ export function App(): React.JSX.Element {
                         });
                     };
                     let locally_retained_sheet_indices: ReadonlySet<number> = new Set();
+                    let locally_retained_structural_sheet_indices: ReadonlySet<number> = new Set();
                     if (snapshot.presentation === 'initial') {
+                        // These requests belong to the document that is leaving.
+                        // Resolve every caller before clearing the maps so no
+                        // stale admission can hold editing or structural history
+                        // forever. Settlement is posted even before a result: the
+                        // host serializes it behind admission, and a later grant
+                        // is therefore explicitly rejected rather than leaked.
+                        for (const [request_id, pending] of
+                            pending_append_requests_ref.current) {
+                            host_bridge.postMessage({
+                                type: 'settleRowAdmission',
+                                requestId: request_id,
+                                editSessionId: pending.editSessionId,
+                                accepted: false,
+                            });
+                            pending.resolve(undefined);
+                        }
+                        pending_append_requests_ref.current.clear();
+                        set_append_request_pending(false);
+                        for (const [request_id, pending] of
+                            pending_saved_row_restorations_ref.current) {
+                            host_bridge.postMessage({
+                                type: 'settleRowAdmission',
+                                requestId: request_id,
+                                editSessionId: pending.editSessionId,
+                                accepted: false,
+                            });
+                            pending.resolve(undefined);
+                        }
+                        pending_saved_row_restorations_ref.current.clear();
+                        for (const pending of
+                            pending_tail_removal_validations_ref.current.values()) {
+                            pending.resolve(false);
+                        }
+                        pending_tail_removal_validations_ref.current.clear();
+                        pending_row_replay_plan_ref.current?.settleRestorations.forEach(
+                            (settle) => settle(false),
+                        );
+                        pending_row_replay_plan_ref.current = null;
+                        pending_row_replay_busy_ref.current = false;
                         edit_session_registry_ref.current!.replace_document();
                         // A different file is under the history now. Any
                         // surviving action would be the previous workbook's
@@ -2519,9 +2971,19 @@ export function App(): React.JSX.Element {
                                             target.worksheetId,
                                         )
                                 ),
+                                (target) => !!edit_session_id
+                                    && pending_changes_durability
+                                        .has_unacknowledged_structural_payload(
+                                        edit_session_id,
+                                        target.sheetIndex,
+                                        target.sheetName,
+                                        target.worksheetId,
+                                    ),
                             );
                         locally_retained_sheet_indices =
                             reconciliation.locallyRetainedIndices;
+                        locally_retained_structural_sheet_indices =
+                            reconciliation.locallyRetainedStructuralIndices;
 
                         // Every refresh changes the host authority revision and can
                         // abort a publication admitted against the preceding one.
@@ -2539,6 +3001,13 @@ export function App(): React.JSX.Element {
                         if (edit_session_id) {
                             for (const { target, store } of
                                 reconciliation.retryPublications) {
+                                if (pending_changes_durability
+                                    .has_unacknowledged_structural_payload(
+                                        edit_session_id,
+                                        target.sheetIndex,
+                                        target.sheetName,
+                                        target.worksheetId,
+                                    )) continue;
                                 const store_snapshot = store.snapshot();
                                 const current_edits = store_snapshot.size > 0
                                     ? Object.fromEntries(store_snapshot)
@@ -2560,6 +3029,141 @@ export function App(): React.JSX.Element {
                                     target.sheetName,
                                     true,
                                     target.worksheetId,
+                                );
+                            }
+                            const cell_stores = new Map(
+                                Array.from(
+                                    edit_session_registry_ref.current!
+                                        .publication_entries(next_sheets),
+                                    (entry) => [worksheet_target_key(entry.target), entry.store],
+                                ),
+                            );
+                            for (const { target, store } of
+                                reconciliation.retryStructuralPublications) {
+                                const cells = cell_stores.get(
+                                    worksheet_target_key(target),
+                                )?.snapshot();
+                                const current_cells = Object.fromEntries(
+                                    [...(cells ?? new Map())].map(([key, entry]) => [
+                                        key,
+                                        copy_dirty_entry(entry),
+                                    ]),
+                                );
+                                const current: WorksheetPendingChanges = {
+                                    ...target,
+                                    cells: current_cells,
+                                    ...store.snapshot(),
+                                };
+                                const slot = authoritative_refresh_changes_for_target(target);
+                                const authoritative_cells = Object.fromEntries(
+                                    Object.entries(slot?.cells ?? {}).map(([key, entry]) => [
+                                        key,
+                                        typeof entry === 'string'
+                                            ? { value: entry, base: entry }
+                                            : entry,
+                                    ]),
+                                );
+                                const authoritative: WorksheetPendingChanges = {
+                                    ...target,
+                                    cells: authoritative_cells,
+                                    formatTemplates: slot?.formatTemplates ?? [],
+                                    appendedRows: slot?.appendedRows ?? [],
+                                    tailRemovals: slot?.tailRemovals ?? [],
+                                    ...(slot?.appendBasis === undefined
+                                        ? {}
+                                        : { appendBasis: slot.appendBasis }),
+                                    conflicts: slot?.conflicts ?? [],
+                                };
+                                if (pending_changes_durability
+                                    .unacknowledged_payload_matches(
+                                        edit_session_id,
+                                        authoritative,
+                                        current,
+                                    )) continue;
+                                const published = pending_changes_durability
+                                    .unacknowledged_structural_payload(
+                                        edit_session_id,
+                                        target.sheetIndex,
+                                        target.sheetName,
+                                        target.worksheetId,
+                                    );
+                                const unchanged = <T,>(now: T, then: T): boolean =>
+                                    JSON.stringify(now) === JSON.stringify(then);
+                                const merged: WorksheetPendingChanges = published === undefined
+                                    ? current
+                                    : {
+                                        ...target,
+                                        cells: unchanged(current.cells, published.cells)
+                                            ? authoritative.cells : current.cells,
+                                        formatTemplates: unchanged(
+                                            current.formatTemplates,
+                                            published.formatTemplates,
+                                        ) ? authoritative.formatTemplates : current.formatTemplates,
+                                        appendedRows: unchanged(
+                                            current.appendedRows,
+                                            published.appendedRows,
+                                        ) ? authoritative.appendedRows : current.appendedRows,
+                                        tailRemovals: unchanged(
+                                            current.tailRemovals,
+                                            published.tailRemovals,
+                                        ) ? authoritative.tailRemovals : current.tailRemovals,
+                                        ...(unchanged(current.appendBasis, published.appendBasis)
+                                            ? authoritative.appendBasis === undefined
+                                                ? {}
+                                                : { appendBasis: authoritative.appendBasis }
+                                            : current.appendBasis === undefined
+                                                ? {}
+                                                : { appendBasis: current.appendBasis }),
+                                        conflicts: unchanged(
+                                            current.conflicts,
+                                            published.conflicts,
+                                        ) ? authoritative.conflicts : current.conflicts,
+                                    };
+                                const cell_store = cell_stores.get(worksheet_target_key(target));
+                                try {
+                                    assert_pending_changes_encoded_bound(merged);
+                                } catch {
+                                    host_bridge.postMessage({
+                                        type: 'showWarning',
+                                        message: 'Newer pending changes could not be merged because the worksheet reached its size limit.',
+                                    });
+                                    continue;
+                                }
+                                const current_structural = store.snapshot();
+                                const cell_writes: StoreWrite[] = [];
+                                if (cell_store !== undefined) {
+                                    const keys = new Set([
+                                        ...cell_store.snapshot().keys(),
+                                        ...Object.keys(merged.cells),
+                                    ]);
+                                    for (const key of keys) {
+                                        cell_writes.push({ key, entry: merged.cells[key] });
+                                    }
+                                }
+                                const cell_stage = cell_store?.stage_writes(
+                                    edit_session_id,
+                                    cell_writes,
+                                    true,
+                                );
+                                const structural_stage = store.stage_replace(
+                                    edit_session_id,
+                                    current_structural,
+                                    merged,
+                                    true,
+                                );
+                                if (
+                                    (cell_store !== undefined && cell_stage === undefined)
+                                    || structural_stage === undefined
+                                ) continue;
+                                const stages: StagedMutation[] = [structural_stage];
+                                if (cell_stage !== undefined) stages.unshift(cell_stage);
+                                if (!commit_staged_transaction(stages)) continue;
+                                if (unchanged(merged, authoritative)) continue;
+                                pending_changes_durability.publish(
+                                    edit_session_id,
+                                    merged,
+                                    snapshot.sourceGeneration,
+                                    true,
                                 );
                             }
                         }
@@ -2626,22 +3230,39 @@ export function App(): React.JSX.Element {
                         for (const [index] of edit_session_registry_ref.current!.entries()) {
                             refresh_sheet_indices.add(index);
                         }
+                        for (const { target, parked } of edit_session_registry_ref.current!
+                            .pending_publication_entries(next_sheets)) {
+                            if (!parked) refresh_sheet_indices.add(target.sheetIndex);
+                        }
                         refresh_authoritative_state?.pendingEdits?.forEach(
                             (slot, index) => {
                                 if (slot !== undefined) refresh_sheet_indices.add(index);
                             },
                         );
                         for (const sheet_index of refresh_sheet_indices) {
-                            if (
-                                sheet_index === snapshot_edit_sheet_index
-                                || locally_retained_sheet_indices.has(sheet_index)
-                            ) continue;
-                            edit_session_registry_ref.current!
-                                .for_sheet(sheet_index)
-                                .reconcile(
-                                    { session_id: snapshot_edit_session_id },
-                                    refresh_edits_for_sheet(sheet_index),
+                            if (!locally_retained_sheet_indices.has(sheet_index)) {
+                                edit_session_registry_ref.current!
+                                    .for_sheet(sheet_index)
+                                    .reconcile(
+                                        { session_id: snapshot_edit_session_id },
+                                        refresh_edits_for_sheet(sheet_index),
+                                    );
+                            }
+                            if (!locally_retained_structural_sheet_indices.has(sheet_index)) {
+                                const sheet = next_sheets[sheet_index];
+                                const slot = pending_changes_for_sheet(
+                                    refresh_authoritative_state?.pendingEdits,
+                                    sheet_index,
+                                    sheet?.name,
+                                    sheet?.worksheetId,
                                 );
+                                edit_session_registry_ref.current!
+                                    .pending_rows_for_sheet(sheet_index)
+                                    .reconcile(
+                                        { session_id: snapshot_edit_session_id },
+                                        slot,
+                                    );
+                            }
                         }
                     }
                     document_epoch_ref.current += 1;
@@ -2659,6 +3280,7 @@ export function App(): React.JSX.Element {
                     diff_on_by_default_ref.current = snapshot.configuration.diffOnByDefault;
                     if (snapshot.presentation === 'initial') {
                         set_diff_mode(snapshot.configuration.diffOnByDefault);
+                        set_saved_row_focus(null);
                         diff_mode_initialized_ref.current = false;
                         grid_scroll_positions_ref.current = new Map();
                         last_preview_visible_row_ref.current = null;
@@ -2729,9 +3351,12 @@ export function App(): React.JSX.Element {
                         pending_edit_request_ref.current = null;
                         pending_save_dialog_ref.current = null;
                         // The document is being replaced, which clears history with
-                        // it: a switch a replay asked for describes a workbook that
-                        // is no longer loaded.
+                        // it: every part of a replay cursor destination describes a
+                        // workbook that is no longer loaded.
+                        history_focus_ref.current = null;
+                        set_history_focus(null);
                         deferred_history_sheet_ref.current = null;
+                        deferred_history_grid_focus_ref.current = null;
                     }
                     // A highlight request names the basis it was sent against, and
                     // its reply is filtered on that basis matching the live one — so
@@ -2752,8 +3377,17 @@ export function App(): React.JSX.Element {
                             || snapshot.sourceGeneration !== pending_basis_source_generation
                         )
                     ) {
+                        pending_highlight_request_ref.current.pendingGesture?.cancel();
                         pending_highlight_request_ref.current = null;
                         set_highlight_request_pending(false);
+                    }
+                    for (const [request_id, pending] of pending_row_resize_requests_ref.current) {
+                        if (
+                            snapshot.presentation !== 'initial'
+                            && pending.sourceGeneration === snapshot.sourceGeneration
+                        ) continue;
+                        pending_row_resize_requests_ref.current.delete(request_id);
+                        pending.finish(false);
                     }
                     set_source_epoch((n) => n + 1);
                     // What the rows *are* changes with a new source, a new view
@@ -2910,6 +3544,18 @@ export function App(): React.JSX.Element {
                                 restored_sheet?.worksheetId,
                             ),
                         );
+                        const restored_pending_changes = pending_changes_for_sheet(
+                            normalized.pendingEdits,
+                            snapshot_edit_sheet_index,
+                            restored_sheet?.name,
+                            restored_sheet?.worksheetId,
+                        );
+                        const restored_has_structural_changes =
+                            (restored_pending_changes?.formatTemplates?.length ?? 0) > 0
+                            || (restored_pending_changes?.appendedRows?.length ?? 0) > 0
+                            || (restored_pending_changes?.tailRemovals?.length ?? 0) > 0
+                            || restored_pending_changes?.appendBasis !== undefined
+                            || (restored_pending_changes?.conflicts?.length ?? 0) > 0;
                         const exact_session_succeeded =
                             applied_save_transition.next.authoritative.state === 'succeeded'
                             && applied_save_transition.next.authoritative.operation.editSessionId
@@ -2924,10 +3570,13 @@ export function App(): React.JSX.Element {
                         install_edit_session(
                             hydrated_edits,
                             snapshot_edit_session_id,
+                            snapshot_edit_sheet_index,
+                            restored_pending_changes,
                         );
                         // The session covers the whole workbook, so restored
-                        // edits can sit in any sheet's slot, not just the
-                        // pointer sheet's. Seed each one's registry store directly.
+                        // cells and structural changes can sit in any sheet's
+                        // slot, not just the pointer sheet's. Seed both sibling
+                        // stores, including structural-only slots.
                         normalized.pendingEdits?.forEach((_slot, index) => {
                             if (index === snapshot_edit_sheet_index) return;
                             const sheet = snapshot.meta.sheets[index];
@@ -2940,16 +3589,29 @@ export function App(): React.JSX.Element {
                                     sheet?.worksheetId,
                                 ),
                             );
-                            if (!cells) return;
+                            const changes = pending_changes_for_sheet(
+                                normalized.pendingEdits,
+                                index,
+                                sheet?.name,
+                                sheet?.worksheetId,
+                            );
+                            if (!cells && changes === undefined) return;
                             edit_session_registry_ref.current!
                                 .for_sheet(index)
                                 .install(
                                     { session_id: snapshot_edit_session_id },
                                     cells,
                                 );
+                            edit_session_registry_ref.current!
+                                .pending_rows_for_sheet(index)
+                                .install(
+                                    { session_id: snapshot_edit_session_id },
+                                    changes,
+                                );
                         });
                         const enters_edit_mode = owns_clean_or_dirty_session
-                            || restored_edits !== undefined;
+                            || restored_edits !== undefined
+                            || restored_has_structural_changes;
                         diff_mode_initialized_ref.current = enters_edit_mode;
                         set_edit_mode(enters_edit_mode);
                         set_editing_status(null);
@@ -3416,7 +4078,7 @@ export function App(): React.JSX.Element {
                 // preserving "the grant/refresh owns the complete pending-edit
                 // projection, including authoritative absence".
                 if (view.basis.generation !== generation_ref.current) {
-                    editing_ref.current?.commit_live_edit();
+                    if (editing_ref.current?.commit_live_edit() === false) return;
                     set_grid_mount_epoch((epoch) => epoch + 1);
                 }
                 const origin = pending_transform_origins_ref.current[msg.sheetIndex];
@@ -3884,7 +4546,10 @@ export function App(): React.JSX.Element {
      */
     const edit_gestures_admitted = useCallback(
         () => !(replay_coordinator_ref.current?.is_busy() ?? false)
-            && pending_highlight_request_ref.current === null,
+            && !pending_row_replay_busy_ref.current
+            && pending_highlight_request_ref.current === null
+            && pending_row_resize_requests_ref.current.size === 0
+            && pending_append_requests_ref.current.size === 0,
         [],
     );
 
@@ -3909,7 +4574,7 @@ export function App(): React.JSX.Element {
             // outside the tree, so its cleanup releases the captured row without
             // committing the text. Fold it first, as the transform and refresh
             // remounts do; the store lives above the grid and keeps it.
-            editing_ref.current?.commit_live_edit();
+            if (editing_ref.current?.commit_live_edit() === false) return;
             set_filter_editor(null);
             set_grid_focus_restore(null);
             set_toolbar_focus_restore(null);
@@ -3961,7 +4626,7 @@ export function App(): React.JSX.Element {
         if (sheet_index !== active_sheet_index) {
             handle_sheet_select(sheet_index);
         }
-    }, [active_sheet_index, handle_sheet_select]);
+    }, [active_sheet_index, edit_gestures_admitted, handle_sheet_select]);
 
     /**
      * Where the last undo or redo landed, held until a GridShell consumes it.
@@ -3991,6 +4656,8 @@ export function App(): React.JSX.Element {
      * handler that answers the dialog.
      */
     const deferred_history_sheet_ref = useRef<number | null>(null);
+    /** Structural-only replay has no cell focus request to survive a remount. */
+    const deferred_history_grid_focus_ref = useRef<number | null>(null);
 
     /**
      * Show the sheet a replay landed on, if we are allowed to right now.
@@ -4014,6 +4681,15 @@ export function App(): React.JSX.Element {
     useEffect(() => {
         switch_to_history_sheet();
     });
+
+    // GridShell installs its imperative handle in a child layout effect. The
+    // parent layout effect therefore runs after a history-driven sheet remount
+    // can accept this one-shot bare-grid focus intent.
+    useLayoutEffect(() => {
+        if (deferred_history_grid_focus_ref.current !== active_sheet_index) return;
+        deferred_history_grid_focus_ref.current = null;
+        grid_focus_ref.current?.focus();
+    }, [active_sheet_index]);
 
     const handle_history_focus_applied = useCallback((
         sequence: number,
@@ -4050,6 +4726,15 @@ export function App(): React.JSX.Element {
      * flash it to advertise a change the renderer does not hold.
      */
     const handle_committed_history_replay = useCallback((accepted: AcceptedReplay) => {
+        // The accepted host terminal owns the complete cursor destination even
+        // when this renderer can no longer apply its writes. Leaving an older
+        // request or dialog-blocked switch alive would move the cursor after the
+        // newer replay has already committed and this view has declared itself
+        // divergent.
+        history_focus_ref.current = null;
+        set_history_focus(null);
+        deferred_history_sheet_ref.current = null;
+        deferred_history_grid_focus_ref.current = null;
         const applied = apply_committed_replay(
             accepted.committed,
             accepted.entry,
@@ -4066,6 +4751,12 @@ export function App(): React.JSX.Element {
             return;
         }
         const display_focus = accepted.committed.displayFocus;
+        const structural_only = accepted.entry.action.changes.length > 0
+            && accepted.entry.action.changes.every((change) => (
+                change.kind === 'rowAppend'
+                || change.kind === 'tailRemoval'
+                || change.kind === 'pendingRows'
+            ));
         if (display_focus !== null) {
             const request = history_focus_request(
                 history_focus_sequence_ref.current += 1,
@@ -4077,13 +4768,22 @@ export function App(): React.JSX.Element {
             );
             history_focus_ref.current = request;
             set_history_focus(request);
-        } else {
+        } else if (!structural_only) {
             // Every touched row is filtered out of the view. The replay succeeded;
             // there is simply nowhere truthful for the cursor to go.
             host_bridge.postMessage({
                 type: 'showWarning',
                 message: `The change was ${replayed_verb(accepted.direction)}, but the affected cells are hidden by the current view.`,
             });
+        } else if (accepted.committed.focusSheetIndex === active_sheet_index) {
+            // Structural-only replay has no source-keyed cells from which the
+            // host can derive a display row. The store transaction has already
+            // clamped any removed selection or installed the restored pending
+            // row, so retain keyboard ownership without pretending the row was
+            // filtered out.
+            grid_focus_ref.current?.focus();
+        } else {
+            deferred_history_grid_focus_ref.current = accepted.committed.focusSheetIndex;
         }
         // The cursor follows what changed, which for a workbook-wide history can be
         // a sheet the user is not looking at.
@@ -4137,6 +4837,60 @@ export function App(): React.JSX.Element {
         host_bridge.postMessage({ type: 'historyMenuStateChanged', state: projection });
     }, []);
 
+    const publish_retained_saved_append_authorities = useCallback(() => {
+        const store = history_store_ref.current;
+        if (store === null) return;
+        const grouped = new Map<string, {
+            worksheet: WorksheetTarget;
+            ids: Set<string>;
+            pendingIds: Set<string>;
+        }>(retained_saved_append_authorities(store.snapshot()).map(
+            (entry) => [worksheet_target_key(entry), {
+                worksheet: entry,
+                ids: new Set(entry.appendHistoryIds),
+                pendingIds: new Set(),
+            }],
+        ));
+        for (const entry of retained_pending_row_authorities(store.snapshot())) {
+            const key = worksheet_target_key(entry);
+            const group = grouped.get(key) ?? {
+                worksheet: entry,
+                ids: new Set<string>(),
+                pendingIds: new Set<string>(),
+            };
+            for (const id of entry.pendingRowIds) group.pendingIds.add(id);
+            grouped.set(key, group);
+        }
+        const sheets = meta_ref.current?.sheets ?? [];
+        for (const [sheetIndex, pending] of edit_session_registry_ref.current!.pending_entries()) {
+            const sheet = sheets[sheetIndex];
+            if (sheet === undefined) continue;
+            const worksheet = {
+                sheetIndex,
+                sheetName: sheet.name,
+                ...(sheet.worksheetId === undefined ? {} : { worksheetId: sheet.worksheetId }),
+            };
+            const key = worksheet_target_key(worksheet);
+            const group = grouped.get(key) ?? {
+                worksheet,
+                ids: new Set<string>(),
+                pendingIds: new Set<string>(),
+            };
+            for (const removal of pending.snapshot().tailRemovals) {
+                group.ids.add(removal.appendHistoryId);
+            }
+            grouped.set(key, group);
+        }
+        host_bridge.postMessage({
+            type: 'retainedSavedAppendAuthoritiesChanged',
+            authorities: [...grouped.values()].map(({ worksheet, ids, pendingIds }) => ({
+                ...worksheet,
+                appendHistoryIds: [...ids],
+                pendingRowIds: [...pendingIds],
+            })),
+        });
+    }, []);
+
     /**
      * Both things the projection is built from, watched where each moves.
      *
@@ -4151,16 +4905,24 @@ export function App(): React.JSX.Element {
      */
     useEffect(() => {
         publish_history_menu_state();
-        const unsubscribe = history_store_ref.current!.subscribe(publish_history_menu_state);
+        publish_retained_saved_append_authorities();
+        const unsubscribe = history_store_ref.current!.subscribe(() => {
+            publish_history_menu_state();
+            publish_retained_saved_append_authorities();
+        });
+        const unsubscribe_edit_session = edit_session_registry_ref.current!.subscribe(
+            publish_retained_saved_append_authorities,
+        );
         const on_focus_change = () => publish_history_menu_state();
         window.addEventListener('focusin', on_focus_change, true);
         window.addEventListener('focusout', on_focus_change, true);
         return () => {
             unsubscribe();
+            unsubscribe_edit_session();
             window.removeEventListener('focusin', on_focus_change, true);
             window.removeEventListener('focusout', on_focus_change, true);
         };
-    }, [publish_history_menu_state]);
+    }, [publish_history_menu_state, publish_retained_saved_append_authorities]);
 
     /**
      * Undo or redo, from a keystroke or the desktop Edit menu.
@@ -4176,14 +4938,280 @@ export function App(): React.JSX.Element {
     const run_history_command = useCallback(async (direction: HistoryDirection) => {
         const coordinator = replay_coordinator_ref.current;
         if (coordinator === null) return;
+        const replay_document_epoch = document_epoch_ref.current;
+        if (!edit_gestures_admitted()) return;
+        const initial = peek_history(history_store_ref.current!.snapshot(), direction);
+        if (
+            initial.kind === 'available'
+            && initial.entry.action.changes.some((change) =>
+                change.kind === 'rowAppend'
+                || change.kind === 'tailRemoval'
+                || change.kind === 'pendingRows')
+        ) {
+            pending_row_replay_busy_ref.current = true;
+            const restoration_settlements: ((accepted: boolean) => void)[] = [];
+            const restoration_request_ids: string[] = [];
+            const restoration_bases = new Map<string, PendingAppendBasis>();
+            let restorations_handed_off = false;
+            let restorations_accepted = false;
+            try {
+                const replay_session_ready = await (
+                    ensure_replay_session_ref.current?.() ?? Promise.resolve(false)
+                );
+                if (document_epoch_ref.current !== replay_document_epoch) return;
+                if (!replay_session_ready) {
+                    host_bridge.postMessage({
+                        type: 'showWarning',
+                        message: 'Undo is unavailable because editing could not be started.',
+                    });
+                    return;
+                }
+                // Session acquisition can hydrate stores and can let a newer
+                // gesture land. Undo always means the top entry after that
+                // boundary, so re-read and only take the local path if it is
+                // still structural.
+                const current = peek_history(history_store_ref.current!.snapshot(), direction);
+                if (current.kind !== 'available') return;
+                const sheets = meta_ref.current?.sheets;
+                const session_id = csv_edit_session_id_ref.current;
+                if (sheets === undefined || session_id === undefined) return;
+                const restoration_groups = new Map<string, {
+                    worksheet: WorksheetTarget;
+                    ids: string[];
+                }>();
+                for (const change of current.entry.action.changes) {
+                    if (
+                        change.kind !== 'rowAppend'
+                        || change.delta.restoredFromSavedRemoval !== true
+                    ) continue;
+                    const desired = direction === 'undo'
+                        ? change.delta.before
+                        : change.delta.after;
+                    if (desired === null) continue;
+                    const key = worksheet_target_key(change.delta.worksheet);
+                    const group = restoration_groups.get(key) ?? {
+                        worksheet: change.delta.worksheet,
+                        ids: [],
+                    };
+                    group.ids.push(change.delta.pendingRowId);
+                    restoration_groups.set(key, group);
+                }
+                for (const { worksheet, ids } of restoration_groups.values()) {
+                    const sheet_index = worksheet_target_index(sheets, worksheet);
+                    if (sheet_index === undefined) return;
+                    const source_generation = source_generation_ref.current;
+                    const request_id = [
+                        'restore-saved-rows',
+                        ++restore_saved_rows_seq_ref.current,
+                    ].join(':');
+                    const admission = await new Promise<{
+                        readonly requestId: string;
+                        readonly appendBasis: PendingAppendBasis;
+                        readonly settle: (accepted: boolean) => void;
+                    } | undefined>((resolve) => {
+                        pending_saved_row_restorations_ref.current.set(request_id, {
+                            sourceGeneration: source_generation,
+                            expectedIds: [...ids],
+                            sheetIndex: sheet_index,
+                            editSessionId: session_id,
+                            resolve,
+                        });
+                        host_bridge.postMessage({
+                            type: 'requestRestoreSavedRows',
+                            requestId: request_id,
+                            editSessionId: session_id,
+                            worksheet,
+                            sourceGeneration: source_generation,
+                            appendHistoryIds: ids,
+                        });
+                    });
+                    if (document_epoch_ref.current !== replay_document_epoch) return;
+                    if (admission === undefined) {
+                        host_bridge.postMessage({
+                            type: 'showWarning',
+                            message: 'The saved appended rows could not be restored.',
+                        });
+                        return;
+                    }
+                    restoration_settlements.push(admission.settle);
+                    restoration_request_ids.push(admission.requestId);
+                    restoration_bases.set(
+                        worksheet_target_key(worksheet),
+                        admission.appendBasis,
+                    );
+                }
+                let planned = plan_pending_row_history_replay(
+                    current.entry.action,
+                    direction,
+                    (worksheet) => {
+                        const sheet_index = worksheet_target_index(sheets, worksheet);
+                        return sheet_index === undefined
+                            ? undefined
+                            : edit_session_registry_ref.current!
+                                .pending_rows_for_sheet(sheet_index)
+                                .snapshot();
+                        },
+                );
+                if (planned.kind === 'plan' && restoration_bases.size > 0) {
+                    let invalid_basis = false;
+                    const plans = planned.plans.map((plan): PendingRowHistoryPlan => {
+                        const admitted = restoration_bases.get(
+                            worksheet_target_key(plan.worksheet),
+                        );
+                        if (admitted === undefined) return plan;
+                        const advanced = plan.next.appendBasis === undefined
+                            ? admitted
+                            : advance_pending_append_basis(
+                                plan.next.appendBasis,
+                                admitted,
+                            );
+                        if (advanced === undefined) {
+                            invalid_basis = true;
+                            return plan;
+                        }
+                        return {
+                            ...plan,
+                            next: { ...plan.next, appendBasis: advanced },
+                        };
+                    });
+                    planned = invalid_basis
+                        ? { kind: 'refused', reason: 'conflict' }
+                        : { kind: 'plan', plans };
+                }
+                if (planned.kind === 'not-structural') {
+                    // A different action landed during acquisition; release the
+                    // local reservation and let the ordinary coordinator handle
+                    // that action below.
+                } else if (planned.kind === 'refused') {
+                    host_bridge.postMessage({
+                        type: 'showWarning',
+                        message: direction === 'undo'
+                            && current.entry.action.changes.some(
+                                (change) => change.kind === 'tailRemoval',
+                            )
+                            ? "Can't undo appended rows because the worksheet changed after they were saved."
+                            : 'The pending rows changed, so this history action could not be replayed.',
+                    });
+                    return;
+                } else {
+                    // A saved append can become a prospective removal only while
+                    // every row in question is still part of the physical suffix.
+                    // The save planner repeats this against fresh file bytes and
+                    // fingerprints; this immediate check keeps an obviously-grown
+                    // worksheet from appearing to accept the undo meanwhile.
+                    const suffix_is_safe = planned.plans.every((plan) => {
+                        const sheet_index = worksheet_target_index(sheets, plan.worksheet);
+                        if (sheet_index === undefined) return false;
+                        const source_row_count = sheets[sheet_index]?.sourceRowCount;
+                        if (source_row_count === undefined) return false;
+                        return plan.next.tailRemovals.every(
+                            (removal, index, removals) => removal.sourceRow
+                                === source_row_count - removals.length + index,
+                        );
+                    });
+                    if (!suffix_is_safe) {
+                        host_bridge.postMessage({
+                            type: 'showWarning',
+                            message: "Can't undo appended rows because the worksheet changed after they were saved.",
+                        });
+                        return;
+                    }
+                    const removals_to_validate = planned.plans.flatMap((plan) => {
+                        const expected_ids = new Set(plan.expected.tailRemovals.map(
+                            (removal) => removal.appendHistoryId,
+                        ));
+                        const added_removals = plan.next.tailRemovals.filter(
+                            (removal) => !expected_ids.has(removal.appendHistoryId),
+                        );
+                        return added_removals.length === 0 ? [] : [{
+                            ...plan.worksheet,
+                            // Host validation proves the complete prospective
+                            // suffix, including removals staged by earlier Undos.
+                            removals: plan.next.tailRemovals.map(({
+                                appendHistoryId,
+                                sourceRow,
+                                savedFingerprint,
+                            }) => ({
+                                appendHistoryId,
+                                sourceRow,
+                                savedFingerprint,
+                            })),
+                        }];
+                    });
+                    if (removals_to_validate.length > 0) {
+                        const source_generation = source_generation_ref.current;
+                        const request_id = [
+                            'tail-removal-validation',
+                            ++tail_removal_validation_seq_ref.current,
+                        ].join(':');
+                        const valid = await new Promise<boolean>((resolve) => {
+                            pending_tail_removal_validations_ref.current.set(request_id, {
+                                sourceGeneration: source_generation,
+                                resolve,
+                            });
+                            host_bridge.postMessage({
+                                type: 'validateTailRemovalReplay',
+                                requestId: request_id,
+                                editSessionId: session_id,
+                                sourceGeneration: source_generation,
+                                worksheets: removals_to_validate,
+                            });
+                        });
+                        if (document_epoch_ref.current !== replay_document_epoch) return;
+                        if (!valid) {
+                            host_bridge.postMessage({
+                                type: 'showWarning',
+                                message: "Can't undo appended rows because the worksheet changed after they were saved.",
+                            });
+                            return;
+                        }
+                    }
+                    pending_row_replay_plan_ref.current = {
+                        entryId: current.entry.id,
+                        direction,
+                        plans: planned.plans,
+                        restorationRequestIds: Object.freeze([
+                            ...restoration_request_ids,
+                        ]),
+                        settleRestorations: restoration_settlements,
+                    };
+                    restorations_handed_off = true;
+                    const barrier_label = history_store_ref.current?.snapshot().barrier?.label;
+                    const outcome = await coordinator.begin(direction);
+                    if (document_epoch_ref.current !== replay_document_epoch) return;
+                    if (outcome.kind === 'refused') {
+                        const warning = history_refusal_warning(
+                            outcome.reason,
+                            direction,
+                            barrier_label,
+                        );
+                        if (warning !== null) {
+                            host_bridge.postMessage({ type: 'showWarning', message: warning });
+                        }
+                    }
+                    return;
+                }
+            } finally {
+                if (!restorations_handed_off && !restorations_accepted) {
+                    restoration_settlements.forEach((settle) => settle(false));
+                }
+                const replay = pending_row_replay_plan_ref.current;
+                if (replay !== null && replay.settleRestorations === restoration_settlements) {
+                    replay.settleRestorations.forEach((settle) => settle(false));
+                }
+                pending_row_replay_busy_ref.current = false;
+                pending_row_replay_plan_ref.current = null;
+            }
+        }
         // Read BEFORE the replay: a `blocked` refusal is about the barrier that was
         // in the way, and the stack may move under the await.
         const barrier_label = history_store_ref.current?.snapshot().barrier?.label;
         const outcome = await coordinator.begin(direction);
+        if (document_epoch_ref.current !== replay_document_epoch) return;
         if (outcome.kind !== 'refused') return;
         const warning = history_refusal_warning(outcome.reason, direction, barrier_label);
         if (warning !== null) host_bridge.postMessage({ type: 'showWarning', message: warning });
-    }, []);
+    }, [active_sheet_index, handle_sheet_select]);
 
     /**
      * Undo and redo from the keyboard, for the VS Code webview.
@@ -4649,9 +5677,22 @@ export function App(): React.JSX.Element {
             });
             return;
         }
+        if (!edit_gestures_admitted()) {
+            host_bridge.postMessage({
+                type: 'showWarning',
+                message: pending_highlight_request_ref.current !== null
+                    ? 'A cell highlight is still being applied. Try exiting Edit mode again in a moment.'
+                    : pending_row_resize_requests_ref.current.size > 0
+                        ? 'A row resize is still being applied. Try exiting Edit mode again in a moment.'
+                        : pending_append_requests_ref.current.size > 0
+                            ? 'A row append is still being applied. Try exiting Edit mode again in a moment.'
+                            : 'An undo is still being applied. Try exiting Edit mode again in a moment.',
+            });
+            return;
+        }
         // Fold the active overlay before testing the registry: the session is
         // workbook-wide and App owns the complete dirty-set decision.
-        editing_ref.current?.commit_live_edit();
+        if (editing_ref.current?.commit_live_edit() === false) return;
         if (edit_session_registry_ref.current!.has_dirty_entries()) {
             if (!csv_edit_session_id || pending_save_dialog_ref.current) return;
             const request = {
@@ -4678,6 +5719,7 @@ export function App(): React.JSX.Element {
         edit_session_pending,
         active_sheet_index,
         csv_edit_session_id,
+        edit_gestures_admitted,
         meta,
     ]);
 
@@ -4703,7 +5745,8 @@ export function App(): React.JSX.Element {
         || edit_session_pending
         || preview_mode
         || pending_excel_header_ref.current !== null
-    ), [edit_session_pending, preview_mode]);
+        || !edit_gestures_admitted()
+    ), [edit_gestures_admitted, edit_session_pending, preview_mode]);
 
     const handle_transform_change = useCallback(
         (next_state: SheetTransformState, origin: TransformOrigin): boolean => {
@@ -4780,6 +5823,48 @@ export function App(): React.JSX.Element {
         pending_transforms,
         transform_request_blocked,
     ]);
+
+    const request_append_rows = useCallback((count: number): Promise<
+        AppendRowsAdmission | undefined
+    > => {
+        const edit_session_id = csv_edit_session_id_ref.current;
+        const sheet = meta_ref.current?.sheets[active_sheet_index];
+        if (
+            edit_session_id === undefined
+            || sheet === undefined
+            || !Number.isSafeInteger(count)
+            || count <= 0
+        ) return Promise.resolve(undefined);
+        const source_generation = source_generation_ref.current;
+        const request_id = [
+            'append',
+            append_request_prefix_ref.current,
+            ++append_request_seq_ref.current,
+        ].join(':');
+        return new Promise((resolve) => {
+            pending_append_requests_ref.current.set(request_id, {
+                sourceGeneration: source_generation,
+                editSessionId: edit_session_id,
+                sheetIndex: active_sheet_index,
+                resolve,
+            });
+            set_append_request_pending(true);
+            host_bridge.postMessage({
+                type: 'requestAppendRows',
+                requestId: request_id,
+                editSessionId: edit_session_id,
+                worksheet: {
+                    sheetIndex: active_sheet_index,
+                    sheetName: sheet.name,
+                    ...(sheet.worksheetId === undefined
+                        ? {}
+                        : { worksheetId: sheet.worksheetId }),
+                },
+                sourceGeneration: source_generation,
+                count,
+            });
+        });
+    }, [active_sheet_index]);
 
     const handle_unhide_all_rows = useCallback(() => {
         const header = meta?.sheets[active_sheet_index]?.excelFirstRowHeader;
@@ -5079,7 +6164,12 @@ export function App(): React.JSX.Element {
                     // one — installs into the mounted grid. Bumping load_epoch here
                     // would also reset column visibility, and entering edit mode is
                     // not a data reload.
-                    install_edit_session(msg.pendingEdits, msg.editSessionId);
+                    install_edit_session(
+                        msg.pendingChanges?.cells ?? msg.pendingEdits,
+                        msg.editSessionId,
+                        msg.sheetIndex ?? 0,
+                        msg.pendingChanges,
+                    );
                     set_edit_mode(true);
                 } else if (csv_edit_session_id_ref.current === undefined) {
                     pending_exit_ref.current = false;
@@ -5090,6 +6180,106 @@ export function App(): React.JSX.Element {
                 // resuming here reads the stores the grant just replaced rather
                 // than the ones it is about to.
                 settle_session_grant_waiters(msg.granted && !!msg.editSessionId);
+            } else if (msg.type === 'appendRowsResult') {
+                const pending = pending_append_requests_ref.current.get(msg.requestId);
+                if (pending === undefined) return;
+                pending_append_requests_ref.current.delete(msg.requestId);
+                if (pending_append_requests_ref.current.size === 0) {
+                    set_append_request_pending(false);
+                }
+                if (
+                    msg.sourceGeneration !== pending.sourceGeneration
+                    || msg.sourceGeneration !== source_generation_ref.current
+                    || csv_edit_session_id_ref.current !== pending.editSessionId
+                    || rendered_sheet_index_ref.current !== pending.sheetIndex
+                    || !msg.granted
+                    || msg.rowIds === undefined
+                    || msg.formatTemplate === undefined
+                    || msg.appendBasis === undefined
+                ) {
+                    if (msg.granted) {
+                        host_bridge.postMessage({
+                            type: 'settleRowAdmission',
+                            requestId: msg.requestId,
+                            editSessionId: pending.editSessionId,
+                            accepted: false,
+                        });
+                    }
+                    pending.resolve(undefined);
+                    if (msg.reason) {
+                        host_bridge.postMessage({ type: 'showWarning', message: msg.reason });
+                    }
+                    return;
+                }
+                let settled = false;
+                pending.resolve({
+                    rowIds: msg.rowIds,
+                    formatTemplate: msg.formatTemplate,
+                    appendBasis: msg.appendBasis,
+                    settle: (accepted) => {
+                        if (settled) return;
+                        settled = true;
+                        host_bridge.postMessage({
+                            type: 'settleRowAdmission',
+                            requestId: msg.requestId,
+                            editSessionId: pending.editSessionId,
+                            accepted,
+                        });
+                    },
+                });
+            } else if (msg.type === 'restoreSavedRowsResult') {
+                const pending = pending_saved_row_restorations_ref.current.get(msg.requestId);
+                if (pending === undefined) return;
+                pending_saved_row_restorations_ref.current.delete(msg.requestId);
+                const ids_match = msg.appendHistoryIds !== undefined
+                    && JSON.stringify(msg.appendHistoryIds)
+                        === JSON.stringify(pending.expectedIds);
+                const current = msg.sourceGeneration === pending.sourceGeneration
+                    && msg.sourceGeneration === source_generation_ref.current
+                    && csv_edit_session_id_ref.current === pending.editSessionId;
+                const admission_is_current = current
+                    && msg.granted
+                    && ids_match
+                    && msg.appendBasis !== undefined;
+                if (!admission_is_current) {
+                    if (msg.granted) {
+                        host_bridge.postMessage({
+                            type: 'settleRowAdmission',
+                            requestId: msg.requestId,
+                            editSessionId: pending.editSessionId,
+                            accepted: false,
+                        });
+                    }
+                    pending.resolve(undefined);
+                } else {
+                    let settled = false;
+                    pending.resolve({
+                        requestId: msg.requestId,
+                        appendBasis: msg.appendBasis!,
+                        settle: (accepted) => {
+                            if (settled) return;
+                            settled = true;
+                            host_bridge.postMessage({
+                                type: 'settleRowAdmission',
+                                requestId: msg.requestId,
+                                editSessionId: pending.editSessionId,
+                                accepted,
+                            });
+                        },
+                    });
+                }
+                if (!admission_is_current && msg.reason) {
+                    host_bridge.postMessage({ type: 'showWarning', message: msg.reason });
+                }
+            } else if (msg.type === 'tailRemovalReplayValidated') {
+                const pending = pending_tail_removal_validations_ref.current.get(msg.requestId);
+                if (pending === undefined) return;
+                pending_tail_removal_validations_ref.current.delete(msg.requestId);
+                pending.resolve(
+                    msg.valid
+                    && msg.sourceGeneration === pending.sourceGeneration
+                    && msg.sourceGeneration === source_generation_ref.current,
+                );
             } else if (msg.type === 'discardEditSessionResult') {
                 const pending = discard_cleanup_ref.current;
                 if (pending !== undefined && pending.session === msg.editSessionId) {
@@ -5136,6 +6326,129 @@ export function App(): React.JSX.Element {
                         || save_lifecycle_correlation(msg.lifecycle)?.editSessionId
                             === current_session_id;
                 if (!matching) return;
+                if (
+                    msg.lifecycle.state === 'succeeded'
+                    && msg.receipt !== undefined
+                    && operation !== undefined
+                ) {
+                    const sheets = meta_ref.current?.sheets ?? [];
+                    const saved_history_rows = msg.receipt.appendedRows.flatMap(
+                        (assignment) => {
+                            const sheet_index = worksheet_target_index(sheets, assignment);
+                            if (sheet_index === undefined) return [];
+                            const structural = edit_session_registry_ref.current!
+                                .pending_rows_for_sheet(sheet_index)
+                                .snapshot();
+                            const row = structural.appendedRows.find(
+                                (candidate) => candidate.id === assignment.pendingRowId,
+                            );
+                            const format = row === undefined
+                                ? undefined
+                                : structural.formatTemplates.find(
+                                    (template) => template.id === row.formatTemplateId,
+                                )?.format;
+                            if (row === undefined || format === undefined) return [];
+                            return [{
+                                worksheet: {
+                                    sheetIndex: assignment.sheetIndex,
+                                    ...(assignment.sheetName === undefined
+                                        ? {}
+                                        : { sheetName: assignment.sheetName }),
+                                    ...(assignment.worksheetId === undefined
+                                        ? {}
+                                        : { worksheetId: assignment.worksheetId }),
+                                },
+                                pendingRowId: assignment.pendingRowId,
+                                sourceRow: assignment.sourceRow,
+                                savedFingerprint: assignment.savedFingerprint,
+                                savedRow: assignment.savedRow ?? {
+                                    cells: assignment.savedCells ?? row.cells,
+                                    format,
+                                    ...(row.viewerRowHeight === undefined
+                                        ? {}
+                                        : { viewerRowHeight: row.viewerRowHeight }),
+                                    ...(row.highlights === undefined
+                                        ? {}
+                                        : { highlights: row.highlights }),
+                                },
+                            }];
+                        },
+                    );
+                    // History must stop naming temporary row IDs before those IDs
+                    // disappear from the live stores below. The receipt is the
+                    // host's proof of their physical source identities.
+                    history_store_ref.current!.rekey_saved_rows(saved_history_rows);
+                    const committed_removals = msg.receipt.removedSourceRows.flatMap(
+                        (removed) => {
+                            const sheet_index = worksheet_target_index(sheets, removed);
+                            if (sheet_index === undefined) return [];
+                            const removed_rows = new Set(removed.sourceRows);
+                            const structural = edit_session_registry_ref.current!
+                                .pending_rows_for_sheet(sheet_index)
+                                .snapshot();
+                            return structural.tailRemovals
+                                .filter((removal) => removed_rows.has(removal.sourceRow))
+                                .map((removal) => ({
+                                    worksheet: {
+                                        sheetIndex: removed.sheetIndex,
+                                        ...(removed.sheetName === undefined
+                                            ? {}
+                                            : { sheetName: removed.sheetName }),
+                                        ...(removed.worksheetId === undefined
+                                            ? {}
+                                            : { worksheetId: removed.worksheetId }),
+                                    },
+                                    removal,
+                                }));
+                        },
+                    );
+                    history_store_ref.current!.rekey_saved_removals(committed_removals);
+                    const pending_focus = pending_save_grid_focus_ref.current?.pendingCell;
+                    if (pending_focus !== undefined) {
+                        const assignment = msg.receipt.appendedRows.find(
+                            (candidate) => candidate.pendingRowId === pending_focus.pendingRowId,
+                        );
+                        const sheet_index = assignment === undefined
+                            ? undefined
+                            : worksheet_target_index(sheets, assignment);
+                        if (assignment !== undefined && sheet_index !== undefined) {
+                            set_saved_row_focus({
+                                sequence: ++saved_row_focus_sequence_ref.current,
+                                sheetIndex: sheet_index,
+                                sourceRow: assignment.sourceRow,
+                                sourceColumn: pending_focus.sourceColumn,
+                                restoreFocus: pending_save_grid_focus_ref.current?.restoreFocus
+                                    === true,
+                            });
+                        }
+                    }
+                    for (const [sheet_index] of sheets.entries()) {
+                        const pending_ids = new Set(
+                            msg.receipt.appendedRows
+                                .filter((assignment) => worksheet_target_index(
+                                    sheets,
+                                    assignment,
+                                ) === sheet_index)
+                                .map((assignment) => assignment.pendingRowId),
+                        );
+                        const removed_rows = new Set(
+                            msg.receipt.removedSourceRows
+                                .filter((removal) => worksheet_target_index(
+                                    sheets,
+                                    removal,
+                                ) === sheet_index)
+                                .flatMap((removal) => removal.sourceRows),
+                        );
+                        if (pending_ids.size === 0 && removed_rows.size === 0) continue;
+                        edit_session_registry_ref.current!.pending_rows_for_sheet(
+                            sheet_index,
+                        ).clear_saved(
+                            operation.editSessionId,
+                            pending_ids,
+                            removed_rows,
+                        );
+                    }
+                }
                 const pending_grid_focus = pending_save_grid_focus_ref.current;
                 const restore_rejected_grid_focus = operation !== undefined
                     && pending_grid_focus?.editSessionId === operation.editSessionId
@@ -5171,6 +6484,117 @@ export function App(): React.JSX.Element {
                         msg.lifecycle.operation,
                     )[rejection.worksheetOperationIndex];
                     if (!submitted_worksheet) return;
+                    if (rejection.reason === 'structuralConflict') {
+                        const sheets = meta_ref.current?.sheets ?? [];
+                        const rejected_sheet_index = worksheet_target_index(
+                            sheets,
+                            submitted_worksheet,
+                        );
+                        if (rejected_sheet_index === undefined) return;
+                        const store = edit_session_registry_ref.current!
+                            .pending_rows_for_sheet(rejected_sheet_index);
+                        const current = store.snapshot();
+                        // A save may name thousands of affected formulas. Retain a
+                        // bounded actionable slice; clearing it and retrying causes
+                        // the host to recompute the next slice. Never replace exact
+                        // cell identities with an addressless summary — such a
+                        // conflict has no review action and cannot be resolved.
+                        const formula_cells = rejection.formulaCells?.slice(0, 16);
+                        const actionable_conflict = Object.freeze({
+                            reason: rejection.structuralReason,
+                            pendingRowIds: Object.freeze(formula_cells === undefined
+                                ? rejection.pendingRowIds.slice(0, 16)
+                                : [...new Set(formula_cells.flatMap((cell) =>
+                                    cell.rowIdentity.kind === 'pending'
+                                        ? [cell.rowIdentity.pendingRowId]
+                                        : []))]),
+                            tailRemovalIds: Object.freeze(
+                                rejection.tailRemovalIds.slice(0, 16),
+                            ),
+                            ...(formula_cells === undefined ? {} : {
+                                formulaCells: Object.freeze(formula_cells),
+                            }),
+                        });
+                        if (
+                            actionable_conflict.pendingRowIds.length === 0
+                            && actionable_conflict.tailRemovalIds.length === 0
+                            && (actionable_conflict.formulaCells?.length ?? 0) === 0
+                        ) {
+                            host_bridge.postMessage({
+                                type: 'showWarning',
+                                message: 'The host returned a structural conflict without an affected cell or row.',
+                            });
+                            return;
+                        }
+                        const live_cells = Object.fromEntries(
+                            [...edit_session_registry_ref.current!
+                                .for_sheet(rejected_sheet_index).snapshot()].map(
+                                ([key, entry]) => [key, copy_dirty_entry(entry)],
+                            ),
+                        );
+                        const retained_conflicts = current.conflicts.filter((candidate) =>
+                            candidate.reason !== rejection.structuralReason);
+                        const fits = (
+                            conflict: typeof actionable_conflict,
+                            conflicts = retained_conflicts,
+                        ): boolean => {
+                            try {
+                                assert_pending_changes_encoded_bound({
+                                    sheetIndex: submitted_worksheet.sheetIndex,
+                                    ...(submitted_worksheet.sheetName === undefined
+                                        ? {}
+                                        : { sheetName: submitted_worksheet.sheetName }),
+                                    ...(submitted_worksheet.worksheetId === undefined
+                                        ? {}
+                                        : { worksheetId: submitted_worksheet.worksheetId }),
+                                    cells: live_cells,
+                                    ...current,
+                                    conflicts: [...conflicts, conflict],
+                                });
+                                return true;
+                            } catch {
+                                return false;
+                            }
+                        };
+                        const existing_exact = current.conflicts.find((candidate) =>
+                            JSON.stringify(candidate) === JSON.stringify(actionable_conflict));
+                        const conflict = existing_exact ?? (fits(actionable_conflict)
+                            ? actionable_conflict
+                            : fits(actionable_conflict, []) ? actionable_conflict : undefined);
+                        if (conflict === undefined) {
+                            host_bridge.postMessage({
+                                type: 'showWarning',
+                                message: 'The conflict could not be retained because Pending Changes reached its size limit.',
+                            });
+                            return;
+                        }
+                        const duplicate = current.conflicts.some((candidate) =>
+                            JSON.stringify(candidate) === JSON.stringify(conflict));
+                        if (!duplicate) {
+                            const base = fits(conflict) ? retained_conflicts : [];
+                            store.reconcile(
+                                { session_id: msg.lifecycle.operation.editSessionId },
+                                { ...current, conflicts: [...base, conflict] },
+                            );
+                        }
+                        clear_save_verdict();
+                        if (rejected_sheet_index !== rendered_sheet_index_ref.current) {
+                            if (
+                                grid_focus_ref.current?.has_focus() === true
+                                || restore_rejected_grid_focus
+                            ) {
+                                rejected_sheet_grid_focus_ref.current = {
+                                    sheet_index: rejected_sheet_index,
+                                    generation: generation_ref.current,
+                                    document_epoch: document_epoch_ref.current,
+                                };
+                            }
+                            handle_sheet_select(rejected_sheet_index);
+                        } else if (restore_rejected_grid_focus) {
+                            grid_focus_ref.current?.focus();
+                        }
+                        return;
+                    }
                     const submitted = submitted_worksheet.dirtyEdits;
                     clear_save_verdict();
                     set_save_rejection({
@@ -5294,6 +6718,7 @@ export function App(): React.JSX.Element {
     const handle_highlight_selection = useCallback((
         selection: CellHighlightSelection,
         mutation: CellHighlightMutation,
+        pending_gesture?: PendingHostGesture,
     ) => {
         const sheet = meta_ref.current?.sheets[active_sheet_index];
         const identity = snapshot_identity_ref.current;
@@ -5302,13 +6727,19 @@ export function App(): React.JSX.Element {
             || !identity
             || preview_mode_ref.current
             || pending_highlight_request_ref.current
-        ) return;
+        ) {
+            pending_gesture?.cancel();
+            return;
+        }
         // Highlight admission makes every cell read-only until the host replies.
         // Glide does not reliably close an overlay it already mounted when
         // provideEditor changes, so fold and terminate it before reserving the
         // history slot. Doing this after setting the pending ref would make the
         // gesture gate reject the user's already-typed text.
-        editing_ref.current?.commit_live_edit();
+        if (editing_ref.current?.commit_live_edit() === false) {
+            pending_gesture?.cancel();
+            return;
+        }
         const request_id = [
             'highlight',
             highlight_request_prefix_ref.current,
@@ -5320,6 +6751,7 @@ export function App(): React.JSX.Element {
         pending_highlight_request_ref.current = {
             requestId: request_id,
             label: mutation.type === 'clear' ? 'Clear highlight' : 'Highlight cells',
+            ...(pending_gesture === undefined ? {} : { pendingGesture: pending_gesture }),
         };
         set_highlight_request_pending(true);
         set_highlight_status('Updating cell highlights…');
@@ -5342,8 +6774,9 @@ export function App(): React.JSX.Element {
             !identity
             || preview_mode_ref.current
             || pending_highlight_request_ref.current
+            || !edit_gestures_admitted()
         ) return;
-        editing_ref.current?.commit_live_edit();
+        if (editing_ref.current?.commit_live_edit() === false) return;
         const request_id = [
             'highlight',
             highlight_request_prefix_ref.current,
@@ -5362,7 +6795,7 @@ export function App(): React.JSX.Element {
             sourceGeneration: source_generation_ref.current,
             snapshotIdentity: identity,
         });
-    }, []);
+    }, [edit_gestures_admitted]);
 
     const handle_toggle_tab_orientation = useCallback(() => {
         set_vertical_tabs((prev) => {
@@ -5407,6 +6840,7 @@ export function App(): React.JSX.Element {
     const update_column_visibility = useCallback((
         updater: ColumnVisibilityUpdater,
     ) => {
+        if (!edit_gestures_admitted()) return;
         const sheet = meta?.sheets[active_sheet_index];
         const snapshot_identity = snapshot_identity_ref.current;
         if (!sheet || !snapshot_identity) return;
@@ -5425,7 +6859,7 @@ export function App(): React.JSX.Element {
 
         // Glide's overlay editor is portalled outside the grid. Capture its live
         // source-coordinate value before changing the displayed-column projection.
-        editing_ref.current?.commit_live_edit();
+        if (editing_ref.current?.commit_live_edit() === false) return;
         deactivate_auto_fit_for_sheet(active_sheet_index);
 
         const next_visibility = [
@@ -5449,6 +6883,7 @@ export function App(): React.JSX.Element {
     }, [
         active_sheet_index,
         deactivate_auto_fit_for_sheet,
+        edit_gestures_admitted,
         meta,
         persist_immediate,
     ]);
@@ -5515,13 +6950,23 @@ export function App(): React.JSX.Element {
      * field is not even delivered, so there is no stale copy here to derive one from.
      */
     const handle_row_resize = useCallback(
-        (rows: readonly DisplayRowInterval[], height: number) => {
-            if (!Number.isFinite(height)) return;
+        (
+            rows: readonly DisplayRowInterval[],
+            height: number,
+            on_result?: (applied: boolean) => void,
+        ) => {
+            if (!Number.isFinite(height)) {
+                on_result?.(false);
+                return;
+            }
             let requested_rows = 0;
             for (const interval of rows) {
                 requested_rows += interval.end - interval.start + 1;
             }
-            if (requested_rows === 0) return;
+            if (requested_rows === 0) {
+                on_result?.(false);
+                return;
+            }
             // Clamped here as well as host-side, and not merely for symmetry: the overlay
             // is reconciled against the delivered projection by *value*, so an
             // unclamped optimistic height would never match the clamped height the host
@@ -5529,6 +6974,19 @@ export function App(): React.JSX.Element {
             // clamps (`row-resize-model`), so this is the case that should not arise
             // rather than one that does.
             const clamped = clamp_row_height(height);
+            const request_id = on_result === undefined
+                ? undefined
+                : [
+                    'row-resize',
+                    highlight_request_prefix_ref.current,
+                    ++row_resize_request_seq_ref.current,
+                ].join(':');
+            if (request_id !== undefined && on_result !== undefined) {
+                pending_row_resize_requests_ref.current.set(request_id, {
+                    sourceGeneration: source_generation_ref.current,
+                    finish: on_result,
+                });
+            }
             host_bridge.postMessage({
                 type: 'setRowHeights',
                 sheetIndex: active_sheet_index,
@@ -5539,6 +6997,7 @@ export function App(): React.JSX.Element {
                 height: clamped,
                 generation: generation_ref.current,
                 sourceGeneration: source_generation_ref.current,
+                ...(request_id === undefined ? {} : { requestId: request_id }),
             });
             // Posted either way, but painted optimistically only when the host can
             // actually keep it. Over the cap the host refuses the whole request and warns
@@ -5764,6 +7223,31 @@ export function App(): React.JSX.Element {
     }, [meta, restore_widths_for_sheets, update_pending_auto_fit_sheets]);
 
     const current_sheet = meta?.sheets[active_sheet_index];
+    const active_pending_row_store = edit_session_registry_ref.current!
+        .pending_rows_for_sheet(active_sheet_index);
+    const formula_reference_bases = useCallback((value: string) =>
+        capture_pending_formula_reference_bases(
+            value,
+            active_sheet_index,
+            meta?.sheets ?? [],
+            (meta?.sheets ?? []).map((_sheet, index) =>
+                edit_session_registry_ref.current!
+                    .pending_rows_for_sheet(index)
+                    .snapshot()),
+        ), [active_sheet_index, meta]);
+    const subscribe_active_pending_conflicts = useCallback((listener: () => void) =>
+        active_pending_row_store.subscribe((change) => {
+            if (change.kind === 'reset') listener();
+        }), [active_pending_row_store]);
+    const active_pending_conflict_snapshot = useCallback(
+        () => active_pending_row_store.snapshot().conflicts,
+        [active_pending_row_store],
+    );
+    const active_pending_conflicts = useSyncExternalStore(
+        subscribe_active_pending_conflicts,
+        active_pending_conflict_snapshot,
+        active_pending_conflict_snapshot,
+    );
     const current_column_projection = useMemo(
         () => create_column_projection(
             current_sheet?.columnCount ?? 0,
@@ -5812,6 +7296,25 @@ export function App(): React.JSX.Element {
         if (pending_preview_scroll_ref.current?.sequence === sequence) {
             pending_preview_scroll_ref.current = null;
         }
+    }, []);
+    const handle_saved_row_focus_applied = useCallback((
+        sequence: number,
+        visible: boolean,
+    ) => {
+        set_saved_row_focus((current) => (
+            current?.sequence === sequence ? null : current
+        ));
+        if (!visible) {
+            host_bridge.postMessage({
+                type: 'showWarning',
+                message: 'Saved row is hidden by the current filters.',
+            });
+        }
+    }, []);
+    const handle_pending_row_focus_applied = useCallback((sequence: number) => {
+        set_pending_row_focus((current) => (
+            current?.sequence === sequence ? null : current
+        ));
     }, []);
     const handle_preview_visible_row_change = useCallback((row: number) => {
         if (preview_mode_ref.current) last_preview_visible_row_ref.current = row;
@@ -6253,6 +7756,18 @@ export function App(): React.JSX.Element {
         }`;
     };
     const removed_rows = rejected_rows(removed_keys);
+    const structural_conflicts = edit_mode_on_active_sheet
+        ? active_pending_conflicts
+        : [];
+    const structurally_conflicted_pending_row_ids = [...new Set(
+        structural_conflicts.flatMap((conflict) => conflict.pendingRowIds),
+    )];
+    const structurally_conflicted_tail_removal_ids = [...new Set(
+        structural_conflicts.flatMap((conflict) => conflict.tailRemovalIds),
+    )];
+    const structurally_conflicted_formula_cells = structural_conflicts.flatMap(
+        (conflict) => conflict.formulaCells ?? [],
+    );
     const external_change_item_count = changed_items.length + removed_items.length;
     const external_change_is_active = external_change_item_count > 0;
     const external_change_worksheet_key = worksheet_target_key({
@@ -6262,6 +7777,12 @@ export function App(): React.JSX.Element {
             ? { worksheetId: current_sheet.worksheetId }
             : {}),
     });
+    const structural_conflict_signature = JSON.stringify([
+        external_change_worksheet_key,
+        structural_conflicts,
+    ]);
+    const show_structural_conflicts = structural_conflicts.length > 0
+        && dismissed_structural_conflict_signature !== structural_conflict_signature;
     const previous_external_change = external_change_occurrences_ref.current.get(
         external_change_worksheet_key,
     ) ?? {
@@ -6410,7 +7931,9 @@ export function App(): React.JSX.Element {
             formula_results={active_formula_results}
             source_formula_results={active_source_formula_results}
             formula_move_retargeter={formula_move_retargeter}
+            formula_reference_bases={formula_reference_bases}
             generation={generation}
+            source_generation={source_generation_ref.current}
             row_count={effective_row_count}
             show_formatting={show_formatting}
             auto_fit_active={auto_fit_active[active_sheet_index] ?? false}
@@ -6421,6 +7944,10 @@ export function App(): React.JSX.Element {
             mapping_generation={mapping_generations_ref.current[active_sheet_index] ?? 1}
             history_focus={history_focus}
             on_history_focus_applied={handle_history_focus_applied}
+            saved_row_focus={saved_row_focus}
+            on_saved_row_focus_applied={handle_saved_row_focus_applied}
+            pending_row_focus={pending_row_focus}
+            on_pending_row_focus_applied={handle_pending_row_focus_applied}
             column_widths={column_widths[active_sheet_index] ?? {}}
             on_column_resize={handle_column_resize}
             // The host's display-keyed projection for this sheet — never `{}` under a
@@ -6441,6 +7968,7 @@ export function App(): React.JSX.Element {
             }
             edit_activation_id={edit_activation_id}
             highlight_in_flight={highlight_request_pending}
+            append_in_flight={append_request_pending}
             csv_editable={csv_editable}
             edit_syntax={edit_syntax}
             edit_session_id={csv_edit_session_id}
@@ -6453,6 +7981,10 @@ export function App(): React.JSX.Element {
             edit_session={edit_session_registry_ref.current!.for_sheet(
                 active_sheet_index,
             )}
+            pending_row_store={edit_session_registry_ref.current!.pending_rows_for_sheet(
+                active_sheet_index,
+            )}
+            on_append_rows={request_append_rows}
             history_store={history_store_ref.current!}
             gestures_admitted={edit_gestures_admitted}
             host_rejected_keys={live_rejected_keys}
@@ -6753,6 +8285,94 @@ export function App(): React.JSX.Element {
                         </button>
                     </div>
                 </div>
+            )}
+            {show_structural_conflicts && (
+                <section
+                    className="external-change-review structural-conflict-review"
+                    role="alert"
+                    aria-label="Pending rows that need review"
+                >
+                    <div className="external-change-review-header">
+                        <h2>Pending rows need review</h2>
+                    </div>
+                    <p>
+                        The worksheet structure changed, so these row changes cannot be
+                        saved until you edit or remove pending rows, or cancel affected removals.
+                    </p>
+                    <ul className="external-change-list">
+                        {structural_conflicts.map((conflict, index) => (
+                            <li key={`${conflict.reason}:${index}`}>
+                                {conflict.reason === 'ambiguousColumns'
+                                    ? 'Column identities no longer match.'
+                                    : conflict.reason === 'ambiguousPendingFormula'
+                                        ? 'A pending formula would refer to a different row after rebasing.'
+                                        : conflict.reason === 'worksheetReplaced'
+                                            ? 'The worksheet was replaced.'
+                                            : conflict.reason === 'rowLimitExceeded'
+                                                ? 'The worksheet no longer has room for every pending row.'
+                                                : conflict.reason === 'templateChanged'
+                                                    ? 'The row-format template changed.'
+                                                    : 'The saved worksheet suffix changed.'}
+                            </li>
+                        ))}
+                    </ul>
+                    <div className="external-change-item-actions">
+                        <button
+                            disabled={structurally_conflicted_pending_row_ids.length === 0
+                                && structurally_conflicted_tail_removal_ids.length === 0
+                                && structurally_conflicted_formula_cells.length === 0}
+                            onClick={() => {
+                                const pending = structurally_conflicted_pending_row_ids[0];
+                                const removal = structurally_conflicted_tail_removal_ids[0];
+                                const formula = structurally_conflicted_formula_cells[0];
+                                if (pending !== undefined) {
+                                    editing_ref.current?.reveal_pending_row(pending);
+                                } else if (removal !== undefined) {
+                                    editing_ref.current?.reveal_tail_removal(removal);
+                                } else if (formula?.rowIdentity.kind === 'source') {
+                                    void editing_ref.current?.reveal_source_cell(
+                                        formula.rowIdentity.sourceRow,
+                                        formula.sourceColumn,
+                                    );
+                                }
+                            }}
+                        >
+                            Go to affected row
+                        </button>
+                        {structurally_conflicted_pending_row_ids.length > 0 && (
+                            <button
+                                onClick={() => {
+                                    editing_ref.current?.remove_pending_rows(
+                                        structurally_conflicted_pending_row_ids,
+                                    );
+                                }}
+                            >
+                                Remove affected pending rows
+                            </button>
+                        )}
+                        {structurally_conflicted_tail_removal_ids.length > 0 && (
+                            <button
+                                onClick={() => {
+                                    editing_ref.current?.cancel_tail_removals(
+                                        structurally_conflicted_tail_removal_ids,
+                                    );
+                                }}
+                            >
+                                Cancel affected row removals
+                            </button>
+                        )}
+                        <button
+                            onClick={() => {
+                                set_dismissed_structural_conflict_signature(
+                                    structural_conflict_signature,
+                                );
+                                queueMicrotask(() => grid_focus_ref.current?.focus());
+                            }}
+                        >
+                            Dismiss notice
+                        </button>
+                    </div>
+                </section>
             )}
             {show_external_change_banner && (
                 <div className="external-change-banner" role="status">

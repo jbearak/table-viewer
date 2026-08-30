@@ -1,11 +1,13 @@
+import { createHash } from 'node:crypto';
 import {
-    element_close,
+    apply_utf8_splices,
     update_formula_cached_values,
     worksheet_formula_dependencies,
     worksheet_formula_move_edits,
     worksheet_structured_formula_rename_edits,
     is_xlsx_formula_edit,
     worksheet_content_cells,
+    writable_worksheet_sheet_data,
     type XlsxCellEdit,
 } from './xlsx-cell-write';
 import {
@@ -20,7 +22,15 @@ import {
     type XlsxFormulaCellMove,
 } from './xlsx-formula';
 import type { PackedFormulaDependencies } from './data-source/interface';
-import { worksheet_scan_input } from './ooxml-worksheet-scan';
+import {
+    direct_child_elements,
+    find_first_element_by_local_name,
+    get_tag_attr,
+    opening_tag_text,
+    scan_rows,
+    utf8_text,
+    worksheet_scan_input,
+} from './ooxml-worksheet-scan';
 import {
     create_number_format_resolver,
     get_style,
@@ -29,10 +39,8 @@ import {
 import {
     decode_xml,
     find_tag_end,
+    get_attr as get_xml_attr,
     get_text,
-    ignorable_end,
-    ignorable_ranges,
-    is_tag_boundary,
     iter_elements,
 } from './ooxml-xml';
 import { font_to_style } from './xlsx-rich-text';
@@ -44,11 +52,15 @@ import {
     worksheet_part_entries_from_package,
 } from './parse-xlsx';
 import type { DateMode } from './spreadsheet-format';
-import { rels_path_for_part } from './ooxml-relationships';
+import { rels_path_for_part, scan_relationships_document } from './ooxml-relationships';
 import type { XlsxHyperlinkEdit } from './xlsx-hyperlink-write';
-import { apply_worksheet_edits } from './ooxml-surgery';
+import {
+    apply_worksheet_edits,
+    type XlsxWorksheetRowChanges,
+} from './ooxml-surgery';
 import { ZipPackage, ZipPackageError } from './zip-package';
 import { create_workbook_budget } from './spreadsheet-safety';
+import type { XlsxPendingRowFormat } from './pending-changes';
 
 /**
  * Package-level (.xlsx container) side of `putexcel`-style saving.
@@ -88,6 +100,439 @@ function write_part_bytes(
 
 function write_part_text(zip: ZipPackage, path: string, text: string): boolean {
     return write_part_bytes(zip, path, Buffer.from(text, 'utf8'));
+}
+
+interface StyleElement {
+    readonly open: string;
+    readonly inner: string;
+}
+
+function style_elements(styles: string, section_name: string, element_name: string): StyleElement[] {
+    const section = get_text(styles, section_name);
+    if (section === null) return [];
+    const elements: StyleElement[] = [];
+    iter_elements(section, element_name, (open, inner) => elements.push({ open, inner }));
+    return elements;
+}
+
+/**
+ * Canonicalize the subset of XML syntax used by style definitions. Attribute
+ * order, quoting, insignificant inter-tag whitespace, comments and processing
+ * instructions do not identify a style; element/attribute names and decoded
+ * values do. This is deliberately narrower than a general XML canonicalizer.
+ */
+function canonical_style_markup(
+    markup: string,
+    used_prefixes?: Set<string>,
+): readonly unknown[] {
+    const tokens: unknown[] = [];
+    let position = 0;
+    while (position < markup.length) {
+        const open = markup.indexOf('<', position);
+        const text = (open === -1 ? markup.slice(position) : markup.slice(position, open)).trim();
+        if (text.length > 0) tokens.push(['text', decode_xml(text)]);
+        if (open === -1) break;
+        if (markup.startsWith('<!--', open)) {
+            const end = markup.indexOf('-->', open + 4);
+            position = end === -1 ? markup.length : end + 3;
+            continue;
+        }
+        if (markup.startsWith('<?', open)) {
+            const end = markup.indexOf('?>', open + 2);
+            position = end === -1 ? markup.length : end + 2;
+            continue;
+        }
+        if (markup.startsWith('<![CDATA[', open)) {
+            const end = markup.indexOf(']]>', open + 9);
+            const value_end = end === -1 ? markup.length : end;
+            tokens.push(['text', markup.slice(open + 9, value_end)]);
+            position = end === -1 ? markup.length : end + 3;
+            continue;
+        }
+        const end = find_tag_end(markup, open);
+        if (end === -1) {
+            tokens.push(['malformed', markup.slice(open)]);
+            break;
+        }
+        const tag = markup.slice(open, end + 1);
+        const closing = tag.startsWith('</');
+        const self_closing = /\/\s*>$/.test(tag);
+        let cursor = closing ? 2 : 1;
+        while (cursor < tag.length && /\s/.test(tag[cursor])) cursor += 1;
+        const name_start = cursor;
+        while (cursor < tag.length && !/[\s/>]/.test(tag[cursor])) cursor += 1;
+        const name = tag.slice(name_start, cursor);
+        const name_colon = name.indexOf(':');
+        used_prefixes?.add(name_colon === -1 ? '' : name.slice(0, name_colon));
+        if (closing) {
+            tokens.push(['close', name]);
+            position = end + 1;
+            continue;
+        }
+        const attributes: Array<readonly [string, string]> = [];
+        while (cursor < tag.length) {
+            while (cursor < tag.length && /\s/.test(tag[cursor])) cursor += 1;
+            if (cursor >= tag.length || tag[cursor] === '/' || tag[cursor] === '>') break;
+            const attr_start = cursor;
+            while (cursor < tag.length && !/[\s=/>]/.test(tag[cursor])) cursor += 1;
+            const attr_name = tag.slice(attr_start, cursor);
+            const attr_colon = attr_name.indexOf(':');
+            if (attr_colon > 0 && !attr_name.startsWith('xmlns:')) {
+                used_prefixes?.add(attr_name.slice(0, attr_colon));
+            }
+            while (cursor < tag.length && /\s/.test(tag[cursor])) cursor += 1;
+            if (tag[cursor] !== '=') break;
+            cursor += 1;
+            while (cursor < tag.length && /\s/.test(tag[cursor])) cursor += 1;
+            const quote = tag[cursor];
+            if (quote !== '"' && quote !== "'") break;
+            const value_start = ++cursor;
+            const value_end = tag.indexOf(quote, value_start);
+            if (value_end === -1) break;
+            attributes.push([attr_name, decode_xml(tag.slice(value_start, value_end))]);
+            cursor = value_end + 1;
+        }
+        attributes.sort(([left], [right]) => left.localeCompare(right));
+        tokens.push(['open', name, attributes, self_closing]);
+        position = end + 1;
+    }
+    return tokens;
+}
+
+function append_style_dependency_fingerprint(
+    styles: string | null,
+    cell_style_indexes: readonly (number | null)[],
+    row_style_index?: number,
+): string {
+    const selected = [...new Set([
+        ...cell_style_indexes.map((style) => style ?? row_style_index ?? 0),
+        ...(row_style_index === undefined ? [] : [row_style_index]),
+    ])]
+        .sort((left, right) => left - right);
+    if (styles === null) {
+        return `sha256:${createHash('sha256').update(JSON.stringify({ selected })).digest('hex')}`;
+    }
+    const xfs = style_elements(styles, 'cellXfs', 'xf');
+    const fonts = style_elements(styles, 'fonts', 'font');
+    const fills = style_elements(styles, 'fills', 'fill');
+    const borders = style_elements(styles, 'borders', 'border');
+    const base_xfs = style_elements(styles, 'cellStyleXfs', 'xf');
+    const number_formats = new Map<number, StyleElement>();
+    for (const element of style_elements(styles, 'numFmts', 'numFmt')) {
+        const id = Number(get_xml_attr(element.open, 'numFmtId'));
+        if (Number.isSafeInteger(id) && id >= 0) number_formats.set(id, element);
+    }
+    const used_prefixes = new Set<string>();
+    const canonical = (element: StyleElement | undefined): readonly unknown[] | null =>
+        element === undefined
+            ? null
+            : canonical_style_markup(`${element.open}${element.inner}`, used_prefixes);
+    const referenced = (xf: StyleElement, attribute: string): number => {
+        const value = Number(get_xml_attr(xf.open, attribute) ?? 0);
+        return Number.isSafeInteger(value) && value >= 0 ? value : -1;
+    };
+    const xf_dependencies = (xf: StyleElement | undefined): unknown => {
+        if (xf === undefined) return null;
+        const reference = (attribute: string): number => referenced(xf, attribute);
+        const font = reference('fontId');
+        const fill = reference('fillId');
+        const border = reference('borderId');
+        const number_format = reference('numFmtId');
+        return {
+            xf: canonical(xf),
+            font: [font, canonical(fonts[font])],
+            fill: [fill, canonical(fills[fill])],
+            border: [border, canonical(borders[border])],
+            numberFormat: number_format < 164
+                ? ['builtin', number_format]
+                : [number_format, canonical(number_formats.get(number_format))],
+        };
+    };
+    const dependency = selected.map((index) => {
+        const xf = xfs[index];
+        if (xf === undefined) return { index, missing: true };
+        const direct = xf_dependencies(xf) as Record<string, unknown>;
+        const base = referenced(xf, 'xfId');
+        return {
+            index,
+            ...direct,
+            // A cell XF inherits from cellStyleXfs. Fingerprinting the base tag
+            // alone misses its own font/fill/border/custom-format references, so
+            // include the same transitive dependency closure used for the cell XF.
+            base: [base, xf_dependencies(base_xfs[base])],
+        };
+    });
+    const root_start = styles.search(/<(?:[A-Za-z_][\w.-]*:)?styleSheet(?:\s|\/?>)/);
+    const root_end = root_start === -1 ? -1 : find_tag_end(styles, root_start);
+    let root: unknown = null;
+    if (root_start !== -1 && root_end !== -1) {
+        const root_tokens = canonical_style_markup(styles.slice(root_start, root_end + 1));
+        const token = root_tokens.find((entry) => Array.isArray(entry) && entry[0] === 'open') as
+            | readonly ['open', string, readonly (readonly [string, string])[], boolean]
+            | undefined;
+        if (token !== undefined) {
+            const colon = token[1].indexOf(':');
+            used_prefixes.add(colon === -1 ? '' : token[1].slice(0, colon));
+            const namespaces = token[2].filter(([name]) => name === 'xmlns'
+                ? used_prefixes.has('')
+                : name.startsWith('xmlns:')
+                    && used_prefixes.has(name.slice('xmlns:'.length)));
+            root = [token[1], namespaces];
+        }
+    }
+    return `sha256:${createHash('sha256').update(JSON.stringify({ root, dependency })).digest('hex')}`;
+}
+
+/** Recompute the style dependency fingerprint for an already captured template. */
+export function xlsx_append_style_dependency_fingerprint(
+    raw: Uint8Array,
+    cell_style_indexes: readonly (number | null)[],
+    row_style_index?: number,
+): string {
+    if (
+        cell_style_indexes.length > 256
+        || cell_style_indexes.some((style) => style !== null && (
+            !Number.isSafeInteger(style) || style < 0
+        ))
+        || (row_style_index !== undefined && (
+            !Number.isSafeInteger(row_style_index) || row_style_index < 0
+        ))
+    ) throw new Error('Invalid worksheet append style dependency request');
+    let zip: ZipPackage;
+    try {
+        zip = ZipPackage.open(raw);
+    } catch {
+        throw new Error('Not a valid .xlsx file');
+    }
+    const styles = read_part_bytes(zip, '/xl/styles.xml');
+    return append_style_dependency_fingerprint(
+        styles === null ? null : Buffer.from(styles).toString('utf8'),
+        cell_style_indexes,
+        row_style_index,
+    );
+}
+
+/** Retain only the styles part needed to re-key a reconciled append template. */
+export function create_xlsx_append_style_dependency_fingerprinter(
+    raw: Uint8Array,
+): (
+    cell_style_indexes: readonly (number | null)[],
+    row_style_index?: number,
+) => string {
+    let zip: ZipPackage;
+    try {
+        zip = ZipPackage.open(raw);
+    } catch {
+        throw new Error('Not a valid .xlsx file');
+    }
+    const styles = read_part_bytes(zip, '/xl/styles.xml');
+    const styles_text = styles === null ? null : Buffer.from(styles).toString('utf8');
+    return (cell_style_indexes, row_style_index) => {
+        if (
+            cell_style_indexes.length > 256
+            || cell_style_indexes.some((style) => style !== null && (
+                !Number.isSafeInteger(style) || style < 0
+            ))
+            || (row_style_index !== undefined && (
+                !Number.isSafeInteger(row_style_index) || row_style_index < 0
+            ))
+        ) throw new Error('Invalid worksheet append style dependency request');
+        return append_style_dependency_fingerprint(
+            styles_text,
+            cell_style_indexes,
+            row_style_index,
+        );
+    };
+}
+
+/**
+ * Capture the exact presentation dependency for rows admitted at the physical
+ * worksheet tail. This reads the verified package, never the paged DataSource,
+ * so a sparse or unloaded final row cannot silently lose its formatting.
+ */
+export function capture_xlsx_append_row_format(
+    raw: Uint8Array,
+    sheet_index: number,
+    source_row_count: number,
+    column_count: number,
+    header_source_row?: number,
+    viewer_row_height?: number,
+): XlsxPendingRowFormat {
+    if (
+        !Number.isSafeInteger(sheet_index)
+        || sheet_index < 0
+        || !Number.isSafeInteger(source_row_count)
+        || source_row_count < 0
+        || source_row_count > 1_048_576
+        || !Number.isSafeInteger(column_count)
+        || column_count <= 0
+        || column_count > 256
+    ) throw new Error('Invalid worksheet append format request');
+
+    let zip: ZipPackage;
+    try {
+        zip = ZipPackage.open(raw);
+    } catch {
+        throw new Error('Not a valid .xlsx file');
+    }
+    const part = worksheet_part_entries_from_package(zip)[sheet_index];
+    if (!part) throw new Error('Could not locate a worksheet to append');
+    const content = read_part_bytes(zip, `/${part.path}`);
+    if (!content) throw new Error('Could not read a worksheet to append');
+    const xml = worksheet_scan_input(content);
+    const sheet_data = writable_worksheet_sheet_data(xml).element;
+
+    const styles = read_part_bytes(zip, '/xl/styles.xml') ?? new Uint8Array();
+    let templateSourceRow: number | null = source_row_count === 0
+        ? null
+        : source_row_count - 1;
+    if (templateSourceRow === header_source_row) {
+        templateSourceRow = templateSourceRow === 0 ? null : templateSourceRow - 1;
+    }
+    const cellStyleIndexes: Array<number | null> = Array(column_count).fill(null);
+    let nativeRowHeight: number | undefined;
+    let rowStyleIndex: number | undefined;
+    let thickTop: true | undefined;
+    let thickBottom: true | undefined;
+    let phonetic: true | undefined;
+
+    if (templateSourceRow !== null) {
+        const seen_columns = new Set<number>();
+        const rows = scan_rows(xml, sheet_data.inner_start, sheet_data.inner_end, {
+            capture_cell: (row) => row === templateSourceRow,
+            on_cell: (row, col, cell) => {
+                if (row !== templateSourceRow || col >= column_count) return;
+                if (seen_columns.has(col)) {
+                    throw new Error('The append format row contains duplicate cells');
+                }
+                seen_columns.add(col);
+                const raw_style = get_tag_attr(xml, cell.start, cell.inner_start, 's');
+                if (raw_style === null) return;
+                const style = parseInt(raw_style, 10);
+                if (!Number.isSafeInteger(style) || style < 0) {
+                    throw new Error('The append format row contains an invalid style');
+                }
+                cellStyleIndexes[col] = style;
+            },
+        });
+        const owners = rows.get(templateSourceRow);
+        if (owners && owners.length > 1) {
+            throw new Error('The append format row is ambiguous');
+        }
+        const owner = owners?.[0];
+        if (owner) {
+            const boolean_attribute = (name: string): boolean => {
+                const raw = get_tag_attr(xml, owner.start, owner.inner_start, name);
+                if (raw === null || raw === '0' || raw === 'false') return false;
+                if (raw === '1' || raw === 'true') return true;
+                throw new Error(`The append format row has an invalid ${name} flag`);
+            };
+            const raw_height = get_tag_attr(xml, owner.start, owner.inner_start, 'ht');
+            if (raw_height !== null) {
+                const parsed = Number(raw_height);
+                if (!Number.isFinite(parsed) || parsed <= 0) {
+                    throw new Error('The append format row has an invalid height');
+                }
+                nativeRowHeight = parsed;
+            }
+            const custom_format = boolean_attribute('customFormat');
+            const raw_row_style = get_tag_attr(xml, owner.start, owner.inner_start, 's');
+            if (raw_row_style !== null) {
+                const parsed = Number(raw_row_style);
+                if (!Number.isSafeInteger(parsed) || parsed < 0) {
+                    throw new Error('The append format row contains an invalid row style');
+                }
+                if (custom_format) rowStyleIndex = parsed;
+            } else if (custom_format) {
+                rowStyleIndex = 0;
+            }
+            if (boolean_attribute('thickTop')) thickTop = true;
+            if (boolean_attribute('thickBot')) thickBottom = true;
+            if (boolean_attribute('ph')) phonetic = true;
+        }
+    }
+
+    const styles_text = styles.length === 0 ? null : Buffer.from(styles).toString('utf8');
+    const { cellNumberFormats, cellFontStyles, rowNumberFormat, rowFontStyle } = styles_text === null
+        ? (() => {
+            if (
+                cellStyleIndexes.some((style) => style !== null && style !== 0)
+                || (rowStyleIndex !== undefined && rowStyleIndex !== 0)
+            ) {
+                throw new Error('The append format row references a missing cell style');
+            }
+            return {
+                cellNumberFormats: cellStyleIndexes.map(() => null),
+                cellFontStyles: cellStyleIndexes.map(() => ({
+                    bold: false,
+                    italic: false,
+                })),
+                rowNumberFormat: rowStyleIndex === undefined ? undefined : null,
+                rowFontStyle: rowStyleIndex === undefined ? undefined : {
+                    bold: false,
+                    italic: false,
+                },
+            };
+        })()
+        : (() => {
+            const { fonts, xfs, format_map } = parse_styles(styles_text);
+            if (
+                cellStyleIndexes.some((style) => style !== null && style >= xfs.length)
+                || (rowStyleIndex !== undefined && rowStyleIndex >= xfs.length)
+            ) {
+                throw new Error('The append format row references a missing cell style');
+            }
+            const resolve = create_number_format_resolver(xfs, format_map, read_datemode(zip));
+            const row_font = rowStyleIndex === undefined
+                ? undefined
+                : get_style(rowStyleIndex, xfs, fonts);
+            return {
+                cellNumberFormats: cellStyleIndexes.map(
+                    (style) => resolve(style ?? rowStyleIndex ?? 0) ?? null,
+                ),
+                cellFontStyles: cellStyleIndexes.map((style) => {
+                    const font = get_style(style ?? rowStyleIndex ?? 0, xfs, fonts);
+                    return { bold: font.bold, italic: font.italic };
+                }),
+                rowNumberFormat: rowStyleIndex === undefined
+                    ? undefined
+                    : resolve(rowStyleIndex) ?? null,
+                rowFontStyle: row_font === undefined ? undefined : {
+                    bold: row_font.bold,
+                    italic: row_font.italic,
+                },
+            };
+        })();
+    const styleFingerprint = append_style_dependency_fingerprint(
+        styles_text,
+        cellStyleIndexes,
+        rowStyleIndex,
+    );
+    const cellStyleFingerprints = cellStyleIndexes.map((style) =>
+        append_style_dependency_fingerprint(styles_text, [style], rowStyleIndex));
+    return Object.freeze({
+        kind: 'xlsx',
+        templateSourceRow,
+        styleFingerprint,
+        cellStyleIndexes: Object.freeze(cellStyleIndexes),
+        cellStyleFingerprints: Object.freeze(cellStyleFingerprints),
+        cellNumberFormats: Object.freeze(cellNumberFormats),
+        cellFontStyles: Object.freeze(cellFontStyles.map((entry) => Object.freeze(entry))),
+        ...(rowStyleIndex === undefined ? {} : { rowStyleIndex }),
+        ...(rowNumberFormat === undefined ? {} : {
+            rowNumberFormat: rowNumberFormat === null
+                ? null
+                : Object.freeze(rowNumberFormat),
+        }),
+        ...(rowFontStyle === undefined ? {} : {
+            rowFontStyle: Object.freeze(rowFontStyle),
+        }),
+        ...(thickTop === undefined ? {} : { thickTop }),
+        ...(thickBottom === undefined ? {} : { thickBottom }),
+        ...(phonetic === undefined ? {} : { phonetic }),
+        ...(nativeRowHeight === undefined ? {} : { nativeRowHeight }),
+        ...(viewer_row_height === undefined ? {} : { viewerRowHeight: viewer_row_height }),
+    });
 }
 
 /**
@@ -258,6 +703,7 @@ export interface XlsxWorksheetCellEdits {
     /** Whole-cell hyperlink edits, applied to the worksheet's `<hyperlinks>`
      *  section and its `.rels` part alongside the value edits. */
     readonly link_edits?: readonly XlsxHyperlinkEdit[];
+    readonly row_changes?: XlsxWorksheetRowChanges;
 }
 
 export interface XlsxFormulaCacheAddress {
@@ -372,7 +818,10 @@ export function write_xlsx_workbook_cell_edits(
     options?: XlsxWorkbookWriteOptions,
 ): Uint8Array {
     let active = worksheets.filter(
-        ({ edits, link_edits }) => edits.length > 0 || (link_edits?.length ?? 0) > 0,
+        ({ edits, link_edits, row_changes }) => edits.length > 0
+            || (link_edits?.length ?? 0) > 0
+            || (row_changes?.removeRows.length ?? 0) > 0
+            || (row_changes?.appendRows.length ?? 0) > 0,
     );
     if (active.length === 0) return raw;
     if (options?.formulaWritePlan && options.formulaDependencies) {
@@ -562,6 +1011,9 @@ export function write_xlsx_workbook_cell_edits(
                 sheetIndex: sheet_index,
                 edits: [...(current?.edits ?? []), ...derived],
                 ...(current?.link_edits === undefined ? {} : { link_edits: current.link_edits }),
+                ...(current?.row_changes === undefined
+                    ? {}
+                    : { row_changes: current.row_changes }),
             });
         }
         active = [...active_by_index.values()].sort(
@@ -606,6 +1058,9 @@ export function write_xlsx_workbook_cell_edits(
                 sheetIndex: sheet_index,
                 edits: [...(current?.edits ?? []), ...derived],
                 ...(current?.link_edits === undefined ? {} : { link_edits: current.link_edits }),
+                ...(current?.row_changes === undefined
+                    ? {}
+                    : { row_changes: current.row_changes }),
             });
         }
         active = [...active_by_index.values()].sort(
@@ -744,6 +1199,7 @@ export function write_xlsx_workbook_cell_edits(
                 relationships_xml: rels_xml,
                 cell_edits: edits,
                 hyperlink_edits: link_edits,
+                row_changes: active_entry.row_changes,
                 write_options: {
                     datemode,
                     is_date_style,
@@ -860,51 +1316,48 @@ function plan_reference_removals(
     return commits;
 }
 
-function* string_live_tags_in(xml: string, name: string): Generator<[number, string]> {
-    const ranges = ignorable_ranges(xml, 0, xml.length);
-    let pos = 0;
-    while (pos < xml.length) {
-        const at = xml.indexOf(`<${name}`, pos);
-        if (at === -1) return;
-        const skip_to = ignorable_end(ranges, at);
-        if (skip_to !== undefined) { pos = skip_to; continue; }
-        if (!is_tag_boundary(xml[at + name.length + 1])) { pos = at + 1; continue; }
-        const tag_end = find_tag_end(xml, at);
-        if (tag_end === -1) return;
-        yield [at, xml.slice(at, tag_end + 1)];
-        pos = tag_end + 1;
-    }
+function local_name(name: string): string {
+    return name.slice(name.lastIndexOf(':') + 1);
 }
 
-/**
- * Delete every live empty `<name …>` element that `wanted` selects.
- *
- * Both spellings: XML lets an empty element be written `<X .../>` or
- * `<X ...></X>` — pretty-printed, with whitespace between the halves — and
- * writers in the wild use both. Spans are removed back to front so the earlier
- * offsets stay valid. An element that actually has content is left alone rather
- * than half-deleted; both parts this serves are attribute-only by schema.
- */
-function remove_elements(xml: string, name: string, wanted: (tag: string) => boolean): string {
-    const spans: Array<[number, number]> = [];
-    for (const [at, tag] of string_live_tags_in(xml, name)) {
-        if (!wanted(tag)) continue;
-        const inner_start = at + tag.length;
-        if (tag.endsWith('/>')) {
-            spans.push([at, inner_start]);
-            continue;
-        }
-        // Located comment-aware, not by `indexOf`: `</Override>` written inside a
-        // comment is text, and mistaking it for the real end tag made the element
-        // look like it had content, so the removal declined and the package kept a
-        // reference to a part it no longer contains.
-        const closed = element_close(xml, name, inner_start);
-        if (closed === null || /\S/.test(closed.inner)) continue;
-        spans.push([at, closed.end]);
+function qname_prefix(name: string): string {
+    const colon = name.indexOf(':');
+    return colon === -1 ? '' : name.slice(0, colon);
+}
+
+function namespace_attribute(prefix: string): string {
+    return prefix === '' ? 'xmlns' : `xmlns:${prefix}`;
+}
+
+/** Remove selected direct children in the same namespace as a qualified root. */
+function remove_namespaced_children(
+    xml: string,
+    root_local_name: string,
+    child_local_name: string,
+    supported_namespaces: ReadonlySet<string>,
+    wanted: (tag: string) => boolean,
+): string {
+    const bytes = Buffer.from(xml, 'utf8');
+    const root = find_first_element_by_local_name(bytes, root_local_name);
+    if (root === null) throw new Error(`Malformed ${root_local_name} part`);
+    const root_open = opening_tag_text(bytes, root.element);
+    const root_namespace = get_xml_attr(
+        root_open,
+        namespace_attribute(qname_prefix(root.name)),
+    );
+    if (root_namespace === null || !supported_namespaces.has(root_namespace)) {
+        throw new Error(`Unsupported ${root_local_name} namespace`);
     }
-    let out = xml;
-    for (const [start, end] of spans.reverse()) out = out.slice(0, start) + out.slice(end);
-    return out;
+    const splices = direct_child_elements(bytes, root.element).flatMap((child) => {
+        if (local_name(child.name) !== child_local_name) return [];
+        const open = opening_tag_text(bytes, child.element);
+        const declaration = namespace_attribute(qname_prefix(child.name));
+        const child_namespace = get_xml_attr(open, declaration)
+            ?? get_xml_attr(root_open, declaration);
+        if (child_namespace !== root_namespace || !wanted(open)) return [];
+        return [{ start: child.element.start, end: child.element.end, text: '' }];
+    });
+    return utf8_text(apply_utf8_splices(bytes, splices));
 }
 
 /**
@@ -926,9 +1379,14 @@ function content_type_override_removed(
 ): string | null {
     const xml = read_part_text(zip, '/[Content_Types].xml');
     if (!xml) return null;
-    const stripped = remove_elements(
+    const stripped = remove_namespaced_children(
         xml,
+        'Types',
         'Override',
+        new Set([
+            'http://schemas.openxmlformats.org/package/2006/content-types',
+            'http://purl.oclc.org/ooxml/package/content-types',
+        ]),
         // `attr` decodes, as in `worksheet_part_path`: an encoded spelling of the
         // same part name is the same part, and missing it leaves an override for a
         // part that is no longer in the package.
@@ -954,11 +1412,19 @@ function workbook_relationship_removed(
     // See `content_type_override_removed`: same quote-aware location, and a
     // relationship left pointing at a deleted part is the other half of the same
     // broken package.
-    const stripped = remove_elements(xml, 'Relationship', (tag) => {
-        const path = attr(tag, 'Target');
-        if (path === null) return false;
-        const resolved = resolve_part_path(path);
-        return resolved === wanted;
-    });
+    const document = scan_relationships_document(xml);
+    if (document === undefined) throw new Error('Malformed workbook relationships part');
+    const bytes = Buffer.from(xml, 'utf8');
+    const stripped = utf8_text(apply_utf8_splices(bytes, document.relationships.flatMap(
+        (relationship) => {
+            const path = attr(relationship.openTag, 'Target');
+            if (path === null || resolve_part_path(path) !== wanted) return [];
+            return [{
+                start: relationship.element.start,
+                end: relationship.element.end,
+                text: '',
+            }];
+        },
+    )));
     return stripped === xml ? null : stripped;
 }

@@ -502,6 +502,9 @@ export function find_first_element(
     from = 0,
     to = xml.length,
 ): Span | null {
+    if (!name.includes(':')) {
+        return find_first_element_by_local_name(xml, name, from, to)?.element ?? null;
+    }
     const ranges = ignorable_ranges(xml, from, to);
     for (const tag of live_tags(xml, name, from, to, ranges)) {
         const tag_end = tag.end - 1;
@@ -520,6 +523,112 @@ export function find_first_element(
             end: end_tag[1],
             inner_start: tag.end,
             inner_end: end_tag[0],
+        };
+    }
+    return null;
+}
+
+/** A live element together with the qualified name used by its opening tag. */
+export interface QualifiedElementSpan {
+    readonly name: string;
+    readonly element: Span;
+}
+
+/** Complete direct child elements of `parent`, in document order. */
+export function direct_child_elements(
+    xml: Uint8Array,
+    parent: Span,
+): QualifiedElementSpan[] {
+    const out: QualifiedElementSpan[] = [];
+    const ranges = ignorable_ranges(xml, parent.inner_start, parent.inner_end);
+    let position = parent.inner_start;
+    while (position < parent.inner_end) {
+        const start = indexOf_live(xml, '<', position, ranges, parent.inner_end);
+        if (start === -1) break;
+        const first = xml[start + 1];
+        if (first === undefined || first === SLASH || first === 0x21 || first === 0x3f) {
+            position = start + 1;
+            continue;
+        }
+        let name_end = start + 1;
+        while (name_end < parent.inner_end && !is_tag_boundary(xml[name_end])) name_end += 1;
+        if (name_end >= parent.inner_end || name_end === start + 1) break;
+        const name = utf8_text(xml, start + 1, name_end);
+        const tag_end = find_tag_end(xml, name_end, parent.inner_end);
+        if (tag_end === -1) break;
+        if (is_self_closing(xml, start, tag_end)) {
+            const end = tag_end + 1;
+            out.push({ name, element: { start, end, inner_start: end, inner_end: end } });
+            position = end;
+            continue;
+        }
+        const close = end_tag_after(xml, name, tag_end + 1, ranges, parent.inner_end);
+        if (close === null) break;
+        out.push({
+            name,
+            element: {
+                start,
+                end: close[1],
+                inner_start: tag_end + 1,
+                inner_end: close[0],
+            },
+        });
+        position = close[1];
+    }
+    return out;
+}
+
+/**
+ * The first live element whose qualified name has `local_name` as its local
+ * part. Worksheet parts may use either the default spreadsheet namespace or an
+ * explicit prefix, and opener-shaped text in comments/CDATA is not markup.
+ */
+export function find_first_element_by_local_name(
+    xml: Uint8Array,
+    local_name: string,
+    from = 0,
+    to = xml.length,
+): QualifiedElementSpan | null {
+    if (local_name.length === 0 || local_name.includes(':')) return null;
+    const ranges = ignorable_ranges(xml, from, to);
+    for (let start = from; start < to; start += 1) {
+        if (xml[start] !== LESS_THAN) continue;
+        const skip_to = ignorable_end(ranges, start);
+        if (skip_to !== undefined) {
+            start = skip_to - 1;
+            continue;
+        }
+        const first = xml[start + 1];
+        if (first === undefined || first === SLASH || first === 0x21 || first === 0x3f) continue;
+        let name_end = start + 1;
+        while (name_end < to && !is_tag_boundary(xml[name_end])) name_end += 1;
+        if (name_end === start + 1 || name_end >= to) continue;
+        const name = utf8_text(xml, start + 1, name_end);
+        const colon = name.lastIndexOf(':');
+        if (name.slice(colon + 1) !== local_name || (colon === 0)) continue;
+        const tag_end = find_tag_end(xml, name_end, to);
+        if (tag_end === -1) return null;
+        if (is_self_closing(xml, start, tag_end)) {
+            return {
+                name,
+                element: {
+                    start,
+                    end: tag_end + 1,
+                    inner_start: tag_end + 1,
+                    inner_end: tag_end + 1,
+                },
+            };
+        }
+        const end_tag = end_tag_after(xml, name, tag_end + 1, ranges, to);
+        if (end_tag === null) return null;
+        return {
+            name,
+            element: {
+                start,
+                end: end_tag[1],
+                inner_start: tag_end + 1,
+                inner_end: end_tag[0],
+            },
         };
     }
     return null;
@@ -573,36 +682,25 @@ type ScannedCellCallback = (
     inner_end: number,
 ) => void;
 
-function next_cell_start(
+function next_element_start_by_local_name(
     xml: Uint8Array,
     from: number,
     to: number,
     ranges: IgnorableRangeIndex,
-): number {
-    for (let i = from; i + 2 < to; i++) {
+    local_name: string,
+): { readonly start: number; readonly name: string } | null {
+    for (let i = from; i + local_name.length + 1 < to; i++) {
         if (xml[i] !== LESS_THAN) continue;
         const skip_to = ignorable_end(ranges, i);
         if (skip_to !== undefined) { i = skip_to - 1; continue; }
-        if (xml[i + 1] === 0x63 && is_tag_boundary(xml[i + 2])) return i;
-    }
-    return -1;
-}
-
-function cell_end_tag_after(
-    xml: Uint8Array,
-    from: number,
-    to: number,
-    ranges: IgnorableRangeIndex,
-): [number, number] | null {
-    for (let i = from; i + 3 < to; i++) {
-        if (xml[i] !== LESS_THAN) continue;
-        const skip_to = ignorable_end(ranges, i);
-        if (skip_to !== undefined) { i = skip_to - 1; continue; }
-        if (xml[i + 1] !== SLASH || xml[i + 2] !== 0x63) continue;
-        if (xml[i + 3] === GREATER_THAN) return [i, i + 4];
-        let end = i + 3;
-        while (end < to && is_xml_whitespace(xml[end])) end++;
-        if (end > i + 3 && xml[end] === GREATER_THAN) return [i, end + 1];
+        const first = xml[i + 1];
+        if (first === undefined || first === SLASH || first === 0x21 || first === 0x3f) continue;
+        let name_end = i + 1;
+        while (name_end < to && !is_tag_boundary(xml[name_end])) name_end += 1;
+        if (name_end >= to || name_end === i + 1) continue;
+        const name = utf8_text(xml, i + 1, name_end);
+        const colon = name.lastIndexOf(':');
+        if (colon !== 0 && name.slice(colon + 1) === local_name) return { start: i, name };
     }
     return null;
 }
@@ -617,8 +715,9 @@ function scan_cell_elements(
 ): void {
     let pos = from;
     while (pos < to) {
-        const start = next_cell_start(xml, pos, to, ranges);
-        if (start === -1) return;
+        const next = next_element_start_by_local_name(xml, pos, to, ranges, 'c');
+        if (next === null) return;
+        const { start, name } = next;
         const tag_end = find_tag_end(xml, start, to);
         if (tag_end === -1 || tag_end >= to) return;
         const reference = resolve_cell_reference_bytes(
@@ -632,7 +731,7 @@ function scan_cell_elements(
             end = tag_end + 1;
             inner_end = end;
         } else {
-            const end_tag = cell_end_tag_after(xml, tag_end + 1, to, ranges);
+            const end_tag = end_tag_after(xml, name, tag_end + 1, ranges, to);
             if (end_tag === null) return;
             [inner_end, end] = end_tag;
         }
@@ -693,11 +792,9 @@ export function scan_rows(
     const ignorable = ignorable_ranges(xml, from, to);
     let pos = from;
     while (pos < to) {
-        const start = index_of_bytes(xml, '<row', pos, to);
-        if (start === -1 || start >= to) break;
-        const skip_to = ignorable_end(ignorable, start);
-        if (skip_to !== undefined) { pos = skip_to; continue; }
-        if (!is_tag_boundary(xml[start + 4])) { pos = start + 1; continue; }
+        const next = next_element_start_by_local_name(xml, pos, to, ignorable, 'row');
+        if (next === null) break;
+        const { start, name } = next;
         const tag_end = find_tag_end(xml, start, to);
         if (tag_end === -1 || tag_end >= to) break;
         const row_index = row_index_from_tag(xml, start, tag_end);
@@ -713,7 +810,7 @@ export function scan_rows(
             pos = tag_end + 1;
             continue;
         }
-        const end_tag = end_tag_after(xml, 'row', tag_end + 1, ignorable, to);
+        const end_tag = end_tag_after(xml, name, tag_end + 1, ignorable, to);
         if (end_tag === null || end_tag[1] > to) break;
         const [close, after_close] = end_tag;
         const span = { start, end: after_close, inner_start: tag_end + 1, inner_end: close };

@@ -22,6 +22,7 @@ import type {
     WorkbookMeta,
 } from './interface';
 import type { MergeRange } from '../types';
+import { create_xlsx_append_style_dependency_fingerprinter } from '../xlsx-package';
 
 interface SheetEntry {
     name: string;
@@ -42,10 +43,21 @@ export class XlsxDataSource implements DataSource {
     /** Structurally immutable after construction; built once (see constructor). */
     private readonly _meta: WorkbookMeta;
     readonly warnings: string[];
+    private readonly style_dependency_fingerprint: (
+        indexes: readonly (number | null)[],
+        row_style_index?: number,
+    ) => string;
 
-    private constructor(sheets: SheetEntry[], hasFormatting: boolean, warnings: string[]) {
+    private constructor(
+        sheets: SheetEntry[],
+        hasFormatting: boolean,
+        warnings: string[],
+        raw: Uint8Array,
+    ) {
         this.sheets = sheets;
         this.warnings = warnings;
+        this.style_dependency_fingerprint
+            = create_xlsx_append_style_dependency_fingerprinter(raw);
         this._meta = {
             hasFormatting,
             sheets: sheets.map((s) => ({
@@ -101,11 +113,18 @@ export class XlsxDataSource implements DataSource {
                 store: b.build(),
             };
         });
-        return new XlsxDataSource(sheets, has_formatting, parsed.warnings);
+        return new XlsxDataSource(sheets, has_formatting, parsed.warnings, buf);
     }
 
     meta(): WorkbookMeta {
         return this._meta;
+    }
+
+    append_style_dependency_fingerprint(
+        cell_style_indexes: readonly (number | null)[],
+        row_style_index?: number,
+    ): string {
+        return this.style_dependency_fingerprint(cell_style_indexes, row_style_index);
     }
 
     read_rows(sheet_index: number, start_row: number, count: number): RowWindow {

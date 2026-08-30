@@ -613,4 +613,35 @@ describe('calculate_workbook_formulas', () => {
             { ...target(0, 0, 2), error: 'numeric error' },
         ]);
     });
+
+    it('calculates formulas in provisional appended rows against the prospective extent', () => {
+        const source = workbook([{ name: 'Data', columnNames: ['Value', 'Total'], rows: [
+            [cell('Value', { rawType: 'string' }), cell('Total', { rawType: 'string' })],
+            [cell('7')],
+        ] }]);
+        expect(calculate_workbook_formulas(source, {
+            prospectiveRowCounts: [3],
+            edits: [
+                { ...target(0, 2, 0), value: '5', writesFormula: false },
+                { ...target(0, 2, 1), value: '=SUM([Value])', writesFormula: true },
+            ],
+            targets: [target(0, 2, 1)],
+        })).toEqual([{ ...target(0, 2, 1), value: '12' }]);
+    });
+
+    it('reads a removed physical suffix as blank when a provisional row replaces it', () => {
+        const source = workbook([{ name: 'Data', columnNames: ['Value', 'Total'], rows: [
+            [cell('Value', { rawType: 'string' }), cell('Total', { rawType: 'string' })],
+            [cell('7')],
+            [cell('100')],
+        ] }]);
+        expect(calculate_workbook_formulas(source, {
+            prospectiveRowCounts: [3],
+            removedRows: [{ sheetIndex: 0, row: 2 }],
+            edits: [
+                { ...target(0, 2, 1), value: '=SUM([Value])', writesFormula: true },
+            ],
+            targets: [target(0, 2, 1)],
+        })).toEqual([{ ...target(0, 2, 1), value: '7' }]);
+    });
 });

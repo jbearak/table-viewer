@@ -29,6 +29,10 @@
 import { parse_cell_highlight_key } from '../cell-highlights';
 import type { WorksheetTarget } from '../types';
 import {
+    EMPTY_PENDING_STRUCTURAL_CHANGES,
+    type PendingStructuralChanges,
+} from '../pending-changes';
+import {
     absent_overlay,
     history_value,
     overlay_state_from_dirty_entry,
@@ -41,6 +45,27 @@ import type { HistoryChange } from './history-stack-model';
 export interface DiscardedWorksheet {
     readonly target: WorksheetTarget;
     readonly entries: ReadonlyMap<string, HistoryDirtyEntry>;
+}
+
+export interface DiscardedStructuralWorksheet {
+    readonly target: WorksheetTarget;
+    readonly changes: PendingStructuralChanges;
+}
+
+/** Exact structural transitions for the same workbook-wide discard gesture. */
+export function* discard_structural_history_source(
+    worksheets: Iterable<DiscardedStructuralWorksheet>,
+): Generator<HistoryChange> {
+    for (const { target, changes } of worksheets) {
+        yield {
+            kind: 'pendingRows',
+            delta: {
+                worksheet: target,
+                before: changes,
+                after: EMPTY_PENDING_STRUCTURAL_CHANGES,
+            },
+        };
+    }
 }
 
 /**

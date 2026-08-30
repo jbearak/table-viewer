@@ -11,6 +11,7 @@ function base() {
         discard_edit_cell_count: 0,
         has_distinct_copy_selection: false,
         preview_mode: false,
+        can_highlight: true,
         can_hide_rows: true,
         selected_row_count: 1,
         selected_column_count: 1,
@@ -108,6 +109,26 @@ describe('cell context menu model', () => {
             && item.label.startsWith('Highlight '))).toBe(false);
         expect(submenu(items, 'Hide').map((item) => item.kind === 'separator' ? '' : item.label))
             .toEqual(['Hide column']);
+    });
+
+    it('omits highlight actions when the selection has no highlightable cells', () => {
+        const items = cell_context_menu_items({
+            ...base(),
+            can_highlight: false,
+            can_clear_highlight: true,
+        });
+        expect(items.some((item) => item.kind !== 'separator'
+            && (item.label.startsWith('Highlight ') || item.label.startsWith('Clear highlight'))))
+            .toBe(false);
+    });
+
+    it('keeps Hide row visible but disabled for a structural-row selection', () => {
+        const items = cell_context_menu_items({
+            ...base(),
+            can_hide_rows: false,
+            show_disabled_hide_rows: true,
+        });
+        expect(action(submenu(items, 'Hide'), 'Hide row').disabled).toBe(true);
     });
 
     it('wires submenu callbacks', () => {

@@ -9,6 +9,11 @@ import { versioned_state_store } from './helpers/versioned-state-store';
 import { messages_of } from './helpers/panel-messages';
 import * as vscode_mock from './mocks/vscode';
 import { fake_viewer_host } from './mocks/host-ports';
+import {
+    history_value,
+    value_only_overlay,
+} from '../webview/history-cell-state-model';
+import { wire_overlay_from_cell_overlay_state } from '../webview/history-replay-wire-model';
 
 const enc = new TextEncoder();
 const file_path = '/tmp/history-replay-focus.csv';
@@ -374,5 +379,134 @@ describe('save and history replay serialization', () => {
 
         release_write?.();
         await save;
+    });
+});
+
+describe('mixed replay durability', () => {
+    it('posts the terminal before publishing a cell + pending-row + highlight commit', async () => {
+        const format = { id: 'plain', format: { kind: 'none' as const } };
+        const row = {
+            id: 'pending-1',
+            cells: {},
+            formatTemplateId: format.id,
+            createdOrder: 1,
+        };
+        const expected = {
+            formatTemplates: [format],
+            appendedRows: [row],
+            tailRemovals: [],
+            conflicts: [],
+        };
+        const state = versioned_state_store({
+            pendingEdits: [{
+                sheetName: 'Sheet1',
+                cells: { '0:0': { value: 'edited', base: 'a' } },
+                ...expected,
+            }],
+        });
+        const panel = open_csv_table(state.store);
+        await ready(panel);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'edit', sheetIndex: 0 });
+
+        await panel.__receive({
+            type: 'prepareHistoryReplay',
+            request: {
+                requestId: 'mixed-prepare',
+                replayId: 'mixed-replay',
+                cells: [{
+                    ordinal: 0,
+                    worksheet: SHEET,
+                    sourceRow: 0,
+                    sourceColumn: 0,
+                    overlay: wire_overlay_from_cell_overlay_state(value_only_overlay(
+                        history_value('edited'),
+                        history_value('a'),
+                    )),
+                }],
+                highlights: [{
+                    ordinal: 0,
+                    worksheet: SHEET,
+                    sourceRow: 0,
+                    sourceColumn: 0,
+                    expected: null,
+                    desired: 'yellow',
+                }],
+                structures: [{
+                    ordinal: 0,
+                    worksheet: SHEET,
+                    expected,
+                    desired: {
+                        formatTemplates: [],
+                        appendedRows: [],
+                        tailRemovals: [],
+                        conflicts: [],
+                    },
+                }],
+                focus: {
+                    worksheet: SHEET,
+                    sourceRowStart: 0,
+                    sourceRowEnd: 0,
+                    sourceColumnStart: 0,
+                    sourceColumnEnd: 0,
+                },
+            },
+        } satisfies Extract<WebviewMessage, { type: 'prepareHistoryReplay' }>);
+        await vi.waitFor(() => expect(messages_of(panel, 'historyReplayPrepared').some(
+            (message) => message.prepared.replayId === 'mixed-replay',
+        )).toBe(true));
+        const prepared = messages_of(panel, 'historyReplayPrepared').find(
+            (message) => message.prepared.replayId === 'mixed-replay',
+        )!.prepared;
+
+        const snapshot_count_before_commit = messages_of(panel, 'workbookSnapshot').length;
+        await panel.__receive({
+            type: 'commitHistoryReplay',
+            request: {
+                requestId: prepared.requestId,
+                replayId: prepared.replayId,
+                leaseId: prepared.leaseId,
+                mutationId: 'mixed-mutation',
+                cells: [{ ordinal: 0, entry: null }],
+                highlights: [{ ordinal: 0 }],
+                structures: [{ ordinal: 0 }],
+            },
+        } satisfies Extract<WebviewMessage, { type: 'commitHistoryReplay' }>);
+        await vi.waitFor(() => expect(messages_of(panel, 'historyReplayCommitted').some(
+            (message) => message.committed.replayId === 'mixed-replay',
+        )).toBe(true));
+        await vi.waitFor(() => expect(messages_of(panel, 'workbookSnapshot').length)
+            .toBeGreaterThan(snapshot_count_before_commit));
+
+        const terminal_index = panel.__messages.findIndex((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { type?: unknown }).type === 'historyReplayCommitted'
+            && (message as { committed?: { replayId?: unknown } }).committed?.replayId
+                === 'mixed-replay'
+        ));
+        const refresh_index = panel.__messages.findIndex((message, index) => (
+            index > terminal_index
+            && typeof message === 'object'
+            && message !== null
+            && (message as { type?: unknown }).type === 'workbookSnapshot'
+        ));
+        expect(terminal_index).toBeGreaterThanOrEqual(0);
+        expect(refresh_index).toBeGreaterThan(terminal_index);
+
+        // Even if the renderer now fails to stage the accepted response or exits,
+        // reopening reads neither half of the undone gesture back from disk state.
+        expect(state.get_state(file_path).pendingEdits).toBeUndefined();
+        panel.dispose();
+        const reopened = open_csv_table(state.store);
+        await ready(reopened);
+        await reopened.__receive({
+            type: 'requestEditSession', requestId: 'reopen-edit', sheetIndex: 0,
+        });
+        expect(messages_of(reopened, 'editSessionResult').at(-1)).not.toHaveProperty(
+            'pendingChanges',
+        );
+        expect(messages_of(reopened, 'editSessionResult').at(-1)).not.toHaveProperty(
+            'pendingEdits',
+        );
     });
 });

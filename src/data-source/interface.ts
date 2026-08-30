@@ -192,6 +192,12 @@ export interface DataSource {
         expected_digest: string,
         is_cancelled: () => boolean,
     ): Promise<boolean>;
+    /** Recompute an XLSX append-template dependency hash without retaining the
+     * complete package bytes at the controller boundary. */
+    append_style_dependency_fingerprint?(
+        cell_style_indexes: readonly (number | null)[],
+        row_style_index?: number,
+    ): string;
     /** Map projected rows exposed by this DataSource to canonical source rows.
      * Optional identity default for sources without a row projection. */
     source_row_indices?(

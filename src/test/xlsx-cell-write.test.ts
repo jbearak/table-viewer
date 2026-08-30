@@ -2,7 +2,9 @@ import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'fs';
 import CFB from 'cfb';
 import {
+    capture_xlsx_append_row_format,
     create_xlsx_formula_write_plan,
+    xlsx_append_style_dependency_fingerprint,
     write_xlsx_cell_edits,
     write_xlsx_workbook_cell_edits,
 } from '../xlsx-package';
@@ -13,6 +15,7 @@ import {
     col_index_to_letter,
     formula_count,
     iso_to_serial,
+    update_formula_cached_values,
     widen_dimension,
 } from '../xlsx-cell-write';
 import { OoxmlRefusalError, type OoxmlRefusalCode } from '../ooxml-refusal';
@@ -86,6 +89,84 @@ function patched_basic(edits: Array<[part: string, from: string | RegExp, to: st
 function patched_styles(from: string, to: string): Uint8Array {
     return patched_parts([['/xl/styles.xml', from, to]]);
 }
+
+describe('append style dependency fingerprint', () => {
+    it('ignores unused root namespace declarations', () => {
+        const raw = readFileSync(FORMATTED);
+        const baseline = xlsx_append_style_dependency_fingerprint(raw, [1]);
+        const with_unused_namespace = patched_styles(
+            '<styleSheet xmlns="',
+            '<styleSheet xmlns:vendor="urn:unused" xmlns="',
+        );
+        expect(xlsx_append_style_dependency_fingerprint(with_unused_namespace, [1]))
+            .toBe(baseline);
+    });
+
+    it('tracks the selected xf and its transitive base-style resources only', () => {
+        const raw = readFileSync(FORMATTED);
+        const baseline = xlsx_append_style_dependency_fingerprint(raw, [1]);
+        expect(xlsx_append_style_dependency_fingerprint(patched_styles(
+            '<numFmt numFmtId="165" formatCode="yyyy-mm-dd"/>',
+            '<numFmt numFmtId="165" formatCode="yyyy/mm/dd"/>',
+        ), [1])).toBe(baseline);
+        expect(xlsx_append_style_dependency_fingerprint(patched_styles(
+            '<name val="Calibri"/>',
+            '<name val="Aptos"/>',
+        ), [1])).not.toBe(baseline);
+        expect(xlsx_append_style_dependency_fingerprint(patched_styles(
+            '<cellStyleXfs count="1"><xf numFmtId="0"',
+            '<cellStyleXfs count="1"><xf numFmtId="164"',
+        ), [1])).not.toBe(baseline);
+    });
+
+    it('distinguishes a foreign element with the same local style name', () => {
+        const raw = readFileSync(FORMATTED);
+        const baseline = xlsx_append_style_dependency_fingerprint(raw, [1]);
+        const foreign_font = patched_parts([
+            [
+                '/xl/styles.xml',
+                '<styleSheet xmlns="',
+                '<styleSheet xmlns:v="urn:vendor" xmlns="',
+            ],
+            [
+                '/xl/styles.xml',
+                '<font><color theme="1"/><family val="2"/><scheme val="minor"/><sz val="11"/><name val="Calibri"/></font>',
+                '<v:font><color theme="1"/><family val="2"/><scheme val="minor"/><sz val="11"/><name val="Calibri"/></v:font>',
+            ],
+        ]);
+        expect(xlsx_append_style_dependency_fingerprint(foreign_font, [1]))
+            .not.toBe(baseline);
+    });
+});
+
+describe('append row-format capture', () => {
+    it('uses the preceding body row when the physical final row is the active header', () => {
+        const raw = patched_basic([[
+            '/xl/worksheets/sheet1.xml',
+            '<row r="2" spans="1:4" x14ac:dyDescent="0.25">',
+            '<row r="2" spans="1:4" x14ac:dyDescent="0.25" s="1" customFormat="1" '
+                + 'ht="21" customHeight="1" thickTop="1" thickBot="1" ph="1" '
+                + 'hidden="1" collapsed="1" outlineLevel="2">',
+        ]]);
+
+        const format = capture_xlsx_append_row_format(raw, 0, 3, 4, 2);
+        expect(format).toMatchObject({
+            kind: 'xlsx',
+            templateSourceRow: 1,
+            rowStyleIndex: 1,
+            nativeRowHeight: 21,
+            thickTop: true,
+            thickBottom: true,
+            phonetic: true,
+            cellStyleIndexes: [null, null, null, 1],
+        });
+        expect(format).not.toHaveProperty('hidden');
+        expect(format).not.toHaveProperty('collapsed');
+        expect(format).not.toHaveProperty('outlineLevel');
+        expect(format.styleFingerprint)
+            .toBe(xlsx_append_style_dependency_fingerprint(raw, [null, null, null, 1], 1));
+    });
+});
 
 describe('iso_to_serial', () => {
     it('converts plain ISO dates in the 1900 system', () => {
@@ -252,6 +333,74 @@ describe('apply_cell_edits', () => {
         expect(out).toContain('<c r="B1"><f>A1*2</f></c>');
         expect(out).toContain('<c r="C1"><f>B1*3</f></c>');
         expect(out).toContain('<c r="D1"><f>Z1</f><v>99</v></c>');
+    });
+
+    it('uses the formula namespace prefix when adding a missing cache value', () => {
+        const xml = Buffer.from(
+            '<x:worksheet xmlns:x="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+            + '<x:sheetData><x:row r="1"><x:c r="A1"><x:f>1+1</x:f></x:c>'
+            + '</x:row></x:sheetData></x:worksheet>',
+        );
+        const out = update_formula_cached_values(
+            xml,
+            [{ row: 0, column: 0 }],
+            [{ row: 0, column: 0, value: '2' }],
+        ).toString();
+
+        expect(out).toContain('<x:f>1+1</x:f><x:v>2</x:v>');
+        expect(out).not.toContain('<v>2</v>');
+    });
+
+    it('uses the cell namespace when a formula prefix is declared only on the formula', () => {
+        const xml = Buffer.from(
+            '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+            + '<sheetData><row r="1"><c r="A1">'
+            + '<p:f xmlns:p="http://schemas.openxmlformats.org/spreadsheetml/2006/main">1+1</p:f>'
+            + '</c></row></sheetData></worksheet>',
+        );
+        const out = update_formula_cached_values(
+            xml,
+            [{ row: 0, column: 0 }],
+            [{ row: 0, column: 0, value: '2' }],
+        ).toString();
+
+        expect(out).toContain('</p:f><v>2</v>');
+        expect(out).not.toContain('<p:v>');
+    });
+
+    it('preserves an existing cache element opening tag and local namespace declaration', () => {
+        const xml = Buffer.from(
+            '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+            + '<sheetData><row r="1"><c r="A1"><f>1+1</f>'
+            + '<q:v xmlns:q="http://schemas.openxmlformats.org/spreadsheetml/2006/main" vendor="keep">1</q:v>'
+            + '</c></row></sheetData></worksheet>',
+        );
+        const out = update_formula_cached_values(
+            xml,
+            [{ row: 0, column: 0 }],
+            [{ row: 0, column: 0, value: '2' }],
+        ).toString();
+
+        expect(out).toContain(
+            '<q:v xmlns:q="http://schemas.openxmlformats.org/spreadsheetml/2006/main" vendor="keep">2</q:v>',
+        );
+    });
+
+    it('updates only a direct SpreadsheetML cache child, preserving nested foreign v elements', () => {
+        const xml = Buffer.from(
+            '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+            + '<sheetData><row r="1"><c r="A1"><f>1+1</f>'
+            + '<extLst><ext xmlns="urn:vendor"><v>KEEP</v></ext></extLst>'
+            + '</c></row></sheetData></worksheet>',
+        );
+        const out = update_formula_cached_values(
+            xml,
+            [{ row: 0, column: 0 }],
+            [{ row: 0, column: 0, value: '2' }],
+        ).toString();
+
+        expect(out).toContain('<ext xmlns="urn:vendor"><v>KEEP</v></ext>');
+        expect(out).toContain('<f>1+1</f><v>2</v><extLst>');
     });
 
     it('invalidates cache-only followers of an affected array formula', () => {
@@ -1298,20 +1447,17 @@ describe('apply_cell_edits', () => {
             .toContain('<c r="A1"><v>2</v></c>');
     });
 
-    it('classifies a structurally eligible prefixed SpreadsheetML sheetData', () => {
+    it('edits a structurally eligible prefixed SpreadsheetML sheetData', () => {
         const ns = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';
         for (const xml of [
             `<worksheet><x:sheetData xmlns:x="${ns}"/></worksheet>`,
             `<worksheet xmlns:x="${ns}"><x:sheetData/></worksheet>`,
         ]) {
-            expect_refusal(
-                () => apply_cell_edits(
-                    xml,
-                    [{ row: 0, col: 0, value: '2' }],
-                    OPTS,
-                ),
-                'namespace-prefixed-worksheet-element',
-            );
+            expect(apply_cell_edits(
+                xml,
+                [{ row: 0, col: 0, value: '2' }],
+                OPTS,
+            )).toContain('<x:row r="1"><x:c r="A1"><x:v>2</x:v></x:c></x:row>');
         }
     });
 
@@ -2928,6 +3074,46 @@ describe('write_xlsx_cell_edits', () => {
                 with_formula_at_b2(readFileSync(SAMPLE)),
             );
             expect(text_part(raw, '/xl/worksheets/sheet3.xml')).toContain('<f>1+1</f>');
+
+            const out = write_xlsx_cell_edits(raw, 2, [{ row: 1, col: 1, value: '42' }]);
+
+            expect(part(out, '/xl/calcChain.xml')).toBeNull();
+            expect(text_part(out, '/[Content_Types].xml')).not.toContain('/xl/calcChain.xml');
+            expect(text_part(out, '/xl/_rels/workbook.xml.rels')).not.toContain('calcChain.xml');
+        });
+
+        it('removes prefixed content-type and workbook relationship references', () => {
+            const file = CFB.read(
+                with_calc_chain(with_formula_at_b2(readFileSync(SAMPLE))),
+                { type: 'buffer' },
+            );
+            const content_types = CFB.find(file, '/[Content_Types].xml')!;
+            const content_text = Buffer.from(content_types.content as Uint8Array)
+                .toString('utf8')
+                .replace(
+                    /<Types xmlns="([^"]+)">/,
+                    '<ct:Types xmlns:ct="$1">',
+                )
+                .replace(/<Override\b/g, '<ct:Override')
+                .replace(/<\/Types>/, '</ct:Types>');
+            content_types.content = Buffer.from(content_text, 'utf8');
+            content_types.size = content_types.content.length;
+            const rels = CFB.find(file, '/xl/_rels/workbook.xml.rels')!;
+            const rels_text = Buffer.from(rels.content as Uint8Array).toString('utf8')
+                .replace(
+                    /<Relationships xmlns="([^"]+)">/,
+                    '<p:Relationships xmlns:p="$1">',
+                )
+                .replace(/<Relationship\b/g, '<p:Relationship')
+                .replace(/<\/Relationships>/, '</p:Relationships>');
+            rels.content = Buffer.from(rels_text, 'utf8');
+            rels.size = rels.content.length;
+            const written = CFB.write(file, {
+                type: 'buffer', fileType: 'zip', compression: true,
+            });
+            const raw = written instanceof Uint8Array
+                ? written
+                : new Uint8Array(written as ArrayBufferLike);
 
             const out = write_xlsx_cell_edits(raw, 2, [{ row: 1, col: 1, value: '42' }]);
 

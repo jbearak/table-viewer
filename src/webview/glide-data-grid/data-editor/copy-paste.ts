@@ -14,6 +14,10 @@ export interface ClipboardCellData {
     readonly source: string;
     readonly location: readonly [number, number];
     readonly gridLocation: readonly [number, number];
+    readonly projectionGeneration?: number;
+    readonly rowIdentity?:
+        | { readonly kind: "source"; readonly sourceRow: number }
+        | { readonly kind: "pending"; readonly pendingRowId: string };
     readonly formula?: string;
     readonly action: ClipboardAction;
     readonly operationId?: string;
@@ -57,6 +61,17 @@ function validClipboardData(value: ClipboardCellData): boolean {
         && value.source.length <= MAX_CLIPBOARD_SOURCE_LENGTH
         && validLocation(value.location)
         && validLocation(value.gridLocation)
+        && (value.projectionGeneration === undefined
+            || (Number.isSafeInteger(value.projectionGeneration)
+                && value.projectionGeneration >= 0))
+        && (value.rowIdentity === undefined
+            || (value.rowIdentity.kind === "source"
+                ? Number.isSafeInteger(value.rowIdentity.sourceRow)
+                    && value.rowIdentity.sourceRow >= 0
+                    && value.rowIdentity.sourceRow <= MAX_XLSX_ROW
+                : typeof value.rowIdentity.pendingRowId === "string"
+                    && value.rowIdentity.pendingRowId.length > 0
+                    && value.rowIdentity.pendingRowId.length <= 128))
         && (value.action === "copy" || value.action === "cut")
         && typeof value.operationId === "string"
         && /^[A-Za-z0-9-]{16,128}$/.test(value.operationId)
@@ -250,11 +265,21 @@ function clipboardHtmlAttributes(cell: CellBuffer): string {
         `data-tv-grid-row="${data.gridLocation[1]}"`,
         `data-tv-action="${data.action}"`,
     ];
+    if (data.projectionGeneration !== undefined) {
+        fields.push(`data-tv-projection="${data.projectionGeneration}"`);
+    }
     if (data.formula !== undefined) {
         fields.push(`data-tv-formula=${formatHtmlAttributeContent(data.formula)}`);
     }
     if (data.operationId !== undefined) {
         fields.push(`data-tv-operation=${formatHtmlAttributeContent(data.operationId)}`);
+    }
+    if (data.rowIdentity?.kind === "source") {
+        fields.push(`data-tv-row-kind="source"`);
+        fields.push(`data-tv-source-row="${data.rowIdentity.sourceRow}"`);
+    } else if (data.rowIdentity?.kind === "pending") {
+        fields.push(`data-tv-row-kind="pending"`);
+        fields.push(`data-tv-pending-row=${formatHtmlAttributeContent(data.rowIdentity.pendingRowId)}`);
     }
     return ` ${fields.join(" ")}`;
 }
@@ -342,16 +367,27 @@ function decodedClipboardData(cell: HTMLTableCellElement): ClipboardCellData | u
     const row = coordinate("data-tv-row");
     const gridColumn = coordinate("data-tv-grid-column");
     const gridRow = coordinate("data-tv-grid-row");
+    const projectionGeneration = coordinate("data-tv-projection");
     if (column === undefined || row === undefined || gridColumn === undefined || gridRow === undefined) {
         return undefined;
     }
     const action = cell.getAttribute("data-tv-action");
     const formula = cell.getAttribute("data-tv-formula") ?? undefined;
     const operationId = cell.getAttribute("data-tv-operation") ?? undefined;
+    const rowKind = cell.getAttribute("data-tv-row-kind");
+    const sourceRow = coordinate("data-tv-source-row");
+    const pendingRow = cell.getAttribute("data-tv-pending-row");
+    const rowIdentity = rowKind === "source" && sourceRow !== undefined
+        ? { kind: "source" as const, sourceRow }
+        : rowKind === "pending" && pendingRow !== null
+            ? { kind: "pending" as const, pendingRowId: pendingRow }
+            : undefined;
     const result: ClipboardCellData = {
         source,
         location: [column, row],
         gridLocation: [gridColumn, gridRow],
+        ...(projectionGeneration === undefined ? {} : { projectionGeneration }),
+        ...(rowIdentity === undefined ? {} : { rowIdentity }),
         ...(formula === undefined ? {} : { formula }),
         action: action as ClipboardAction,
         ...(operationId === undefined ? {} : { operationId }),
@@ -384,17 +420,26 @@ export function resolveCopyBufferValue(
  * from the destination's current projection. A copied or cross-sheet payload
  * must never clear cells in this grid.
  */
-export function cutSourceGridLocations(
+export interface CutSourceCell {
+    readonly gridLocation: readonly [number, number];
+    readonly sourceColumn: number;
+    readonly rowIdentity:
+        | { readonly kind: "source"; readonly sourceRow: number }
+        | { readonly kind: "pending"; readonly pendingRowId: string };
+}
+
+export function cutSourceCells(
     buffer: CopyBuffer,
     destinationSource: string | undefined,
     expectedOperationId?: string,
     expectedCells?: CutSourceIdentity,
-): readonly (readonly [number, number])[] | undefined {
+    destinationProjectionGeneration?: number,
+): readonly CutSourceCell[] | undefined {
     if (destinationSource === undefined || expectedOperationId === undefined
         || expectedCells === undefined || buffer.length === 0) return undefined;
     if (buffer.length !== expectedCells.length
         || buffer.some((row, index) => row.length !== expectedCells[index]?.length)) return undefined;
-    const locations: Array<readonly [number, number]> = [];
+    const locations: CutSourceCell[] = [];
     const seen = new Set<string>();
     for (const [row_index, row] of buffer.entries()) {
         for (const [column_index, cell] of row.entries()) {
@@ -404,6 +449,8 @@ export function cutSourceGridLocations(
                 || metadata.action !== "cut"
                 || metadata.source !== destinationSource
                 || metadata.operationId !== expectedOperationId
+                || (metadata.rowIdentity === undefined
+                    && metadata.projectionGeneration !== destinationProjectionGeneration)
             ) return undefined;
             const key = `${metadata.gridLocation[0]}:${metadata.gridLocation[1]}`;
             if (seen.has(key)) return undefined;
@@ -418,12 +465,39 @@ export function cutSourceGridLocations(
                 || expected_metadata.location[0] !== metadata.location[0]
                 || expected_metadata.location[1] !== metadata.location[1]
                 || expected_metadata.gridLocation[0] !== metadata.gridLocation[0]
-                || expected_metadata.gridLocation[1] !== metadata.gridLocation[1]) return undefined;
+                || expected_metadata.gridLocation[1] !== metadata.gridLocation[1]
+                || expected_metadata.projectionGeneration !== metadata.projectionGeneration
+                || JSON.stringify(expected_metadata.rowIdentity)
+                    !== JSON.stringify(metadata.rowIdentity)) return undefined;
             seen.add(key);
-            locations.push(metadata.gridLocation);
+            locations.push({
+                gridLocation: metadata.gridLocation,
+                sourceColumn: metadata.location[0],
+                rowIdentity: metadata.rowIdentity ?? {
+                    kind: "source",
+                    sourceRow: metadata.location[1],
+                },
+            });
         }
     }
     return locations.length === 0 ? undefined : locations;
+}
+
+export function cutSourceGridLocations(
+    buffer: CopyBuffer,
+    destinationSource: string | undefined,
+    expectedOperationId?: string,
+    expectedCells?: CutSourceIdentity,
+    destinationProjectionGeneration?: number,
+): readonly (readonly [number, number])[] | undefined {
+    return cutSourceCells(
+        buffer,
+        destinationSource,
+        expectedOperationId,
+        expectedCells,
+        destinationProjectionGeneration,
+    )
+        ?.map((cell) => cell.gridLocation);
 }
 
 export function copyBufferContainsCut(buffer: CopyBuffer): boolean {

@@ -19,6 +19,10 @@ import {
 } from '../types';
 export { MAX_PERSISTED_HIDDEN_ROWS } from '../types';
 import { sanitize_column_visibility_state } from './column-projection';
+import {
+    has_pending_structural_changes,
+    own_pending_structural_changes,
+} from '../pending-changes';
 
 export function clamp_sheet_index(
     sheet_index: number | undefined,
@@ -300,7 +304,7 @@ function normalize_active_sheet_index(
 /**
  * Normalize the worksheet-scoped pending-edit leaf.
  *
- * Two jobs, in order. First the per-sheet cell maps are sanitized as before.
+ * Two jobs, in order. First each complete pending-changes slot is sanitized.
  * Then slots are reconciled against the workbook as loaded: a slot recording a
  * `sheetName` that no longer sits at its index describes a worksheet that moved,
  * and honouring it by position would apply one sheet's draft to another, keyed
@@ -322,13 +326,25 @@ function normalize_pending_edits(
 
     const slots = value.map((slot) => {
         if (!slot || typeof slot !== 'object' || Array.isArray(slot)) return undefined;
-        const record = slot as {
+        const record = slot as Record<string, unknown> & {
             sheetName?: unknown;
             worksheetId?: unknown;
             cells?: unknown;
         };
         const cells = normalize_pending_edit_cells(record.cells);
-        if (!cells) return undefined;
+        let structural;
+        try {
+            structural = own_pending_structural_changes({
+                formatTemplates: record.formatTemplates,
+                appendedRows: record.appendedRows,
+                tailRemovals: record.tailRemovals,
+                appendBasis: record.appendBasis,
+                conflicts: record.conflicts,
+            });
+        } catch {
+            return undefined;
+        }
+        if (!cells && !has_pending_structural_changes(structural)) return undefined;
         return {
             ...(typeof record.sheetName === 'string'
                 ? { sheetName: record.sheetName }
@@ -336,7 +352,22 @@ function normalize_pending_edits(
             ...(typeof record.worksheetId === 'string'
                 ? { worksheetId: record.worksheetId }
                 : {}),
-            cells,
+            cells: cells ?? {},
+            ...(structural.formatTemplates.length === 0
+                ? {}
+                : { formatTemplates: structural.formatTemplates }),
+            ...(structural.appendedRows.length === 0
+                ? {}
+                : { appendedRows: structural.appendedRows }),
+            ...(structural.tailRemovals.length === 0
+                ? {}
+                : { tailRemovals: structural.tailRemovals }),
+            ...(structural.appendBasis === undefined
+                ? {}
+                : { appendBasis: structural.appendBasis }),
+            ...(structural.conflicts.length === 0
+                ? {}
+                : { conflicts: structural.conflicts }),
         };
     });
     while (slots.length > 0 && slots[slots.length - 1] === undefined) slots.pop();

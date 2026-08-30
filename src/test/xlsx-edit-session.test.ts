@@ -1,5 +1,6 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { createHash } from 'node:crypto';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type * as vscode from 'vscode';
 import { attach_viewer, profile_for } from '../viewer-controller';
@@ -8,10 +9,19 @@ import { versioned_state_store } from './helpers/versioned-state-store';
 import CFB from 'cfb';
 import {
     decode_stored_per_file_state,
+    own_wire_pending_changes,
     type PerFileState,
     type SheetPendingEditCells,
+    type WorksheetTarget,
 } from '../types';
 import { parse_xlsx } from '../parse-xlsx';
+import { capture_xlsx_append_row_format } from '../xlsx-package';
+import {
+    MAX_PENDING_CHANGES_ENCODED_BYTES,
+    MAX_PENDING_USER_CHANGES_ENCODED_BYTES,
+    type PendingStructuralChanges,
+} from '../pending-changes';
+import { HISTORY_REPLAY_LEASE_TTL_MS } from '../history-replay-protocol';
 import * as vscode_mock from './mocks/vscode';
 import { fake_viewer_host } from './mocks/host-ports';
 import { sheet_cells } from './pending-edits-helper';
@@ -30,6 +40,115 @@ const FIXTURES = path.join(__dirname, 'fixtures');
 
 function read_fixture(name: string): Uint8Array {
     return fs.readFileSync(path.join(FIXTURES, name));
+}
+
+function build_many_sheet_xlsx(sheet_count: number): Uint8Array {
+    const package_file = CFB.utils.cfb_new();
+    const sheet_overrides = Array.from({ length: sheet_count }, (_, index) =>
+        `  <Override PartName="/xl/worksheets/sheet${index + 1}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>`)
+        .join('\n');
+    const content_types = `<?xml version="1.0" encoding="UTF-8"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+${sheet_overrides}
+</Types>`;
+    const root_relationships = `<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>`;
+    const workbook_sheets = Array.from({ length: sheet_count }, (_, index) =>
+        `<sheet name="S${index}" sheetId="${index + 1}" r:id="rId${index + 1}"/>`)
+        .join('');
+    const workbook = `<?xml version="1.0" encoding="UTF-8"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheets>${workbook_sheets}</sheets>
+</workbook>`;
+    const workbook_relationships = `<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+${Array.from({ length: sheet_count }, (_, index) =>
+        `  <Relationship Id="rId${index + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet${index + 1}.xml"/>`)
+        .join('\n')}
+</Relationships>`;
+    const worksheet = `<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <dimension ref="A1"/>
+  <sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>base</t></is></c></row></sheetData>
+</worksheet>`;
+    CFB.utils.cfb_add(package_file, '/[Content_Types].xml', Buffer.from(content_types));
+    CFB.utils.cfb_add(package_file, '/_rels/.rels', Buffer.from(root_relationships));
+    CFB.utils.cfb_add(package_file, '/xl/workbook.xml', Buffer.from(workbook));
+    CFB.utils.cfb_add(
+        package_file,
+        '/xl/_rels/workbook.xml.rels',
+        Buffer.from(workbook_relationships),
+    );
+    for (let index = 0; index < sheet_count; index += 1) {
+        CFB.utils.cfb_add(
+            package_file,
+            `/xl/worksheets/sheet${index + 1}.xml`,
+            Buffer.from(worksheet),
+        );
+    }
+    const written = CFB.write(package_file, {
+        type: 'buffer',
+        fileType: 'zip',
+        compression: true,
+    });
+    return written instanceof Uint8Array
+        ? written
+        : new Uint8Array(written as ArrayBufferLike);
+}
+
+function build_repeated_shared_string_xlsx(cell_count: number, value: string): Uint8Array {
+    const package_file = CFB.utils.cfb_new();
+    const content_types = `<?xml version="1.0" encoding="UTF-8"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+  <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+  <Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/>
+</Types>`;
+    const root_relationships = `<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>`;
+    const workbook = `<?xml version="1.0" encoding="UTF-8"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheets><sheet name="Repeated" sheetId="1" r:id="rId1"/></sheets>
+</workbook>`;
+    const workbook_relationships = `<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+  <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" Target="sharedStrings.xml"/>
+</Relationships>`;
+    const rows = Array.from({ length: cell_count }, (_, row) =>
+        `<row r="${row + 1}"><c r="A${row + 1}" t="s"><v>0</v></c></row>`)
+        .join('');
+    const worksheet = `<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <dimension ref="A1:A${cell_count}"/><sheetData>${rows}</sheetData>
+</worksheet>`;
+    const shared_strings = `<?xml version="1.0" encoding="UTF-8"?>
+<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="${cell_count}" uniqueCount="1"><si><t>${value}</t></si></sst>`;
+    for (const [part, content] of [
+        ['/[Content_Types].xml', content_types],
+        ['/_rels/.rels', root_relationships],
+        ['/xl/workbook.xml', workbook],
+        ['/xl/_rels/workbook.xml.rels', workbook_relationships],
+        ['/xl/worksheets/sheet1.xml', worksheet],
+        ['/xl/sharedStrings.xml', shared_strings],
+    ] as const) {
+        CFB.utils.cfb_add(package_file, part, Buffer.from(content));
+    }
+    const written = CFB.write(package_file, {
+        type: 'buffer', fileType: 'zip', compression: true,
+    });
+    return written instanceof Uint8Array
+        ? written
+        : new Uint8Array(written as ArrayBufferLike);
 }
 
 function uri(file_path: string): vscode.Uri {
@@ -97,6 +216,8 @@ function latest_snapshot(panel: { __messages: unknown[] }) {
             name: string;
             worksheetId?: string;
             rowCount: number;
+            sourceRowCount: number;
+            columnCount: number;
             excelFirstRowHeader?: { active: boolean; sourceRow?: number };
         }[] };
         state?: PerFileState;
@@ -161,12 +282,39 @@ function latest_edit_session(panel: { __messages: unknown[] }) {
     ).at(-1);
 }
 
+async function request_edit_session_when_available(
+    panel: { __messages: unknown[]; __receive(message: unknown): Promise<void> },
+    request_prefix: string,
+    sheet_index = 0,
+): Promise<string> {
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+        const requestId = `${request_prefix}-${attempt}`;
+        await panel.__receive({
+            type: 'requestEditSession',
+            requestId,
+            sheetIndex: sheet_index,
+        });
+        const result = panel.__messages.find((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { type?: unknown }).type === 'editSessionResult'
+            && (message as { requestId?: unknown }).requestId === requestId
+        )) as { granted?: boolean; editSessionId?: string } | undefined;
+        if (result?.granted && result.editSessionId !== undefined) {
+            return result.editSessionId;
+        }
+        await new Promise((done) => { setImmediate(done); });
+    }
+    throw new Error('Edit session did not become available.');
+}
+
 function save_results(panel: { __messages: unknown[] }) {
     return panel.__messages.filter(
         (message): message is {
             type: string;
             success: boolean;
             lifecycle: { operation: import('../types').CsvSaveOperation };
+            receipt?: import('../types').PendingChangesSaveReceipt;
         } => (
             typeof message === 'object'
             && message !== null
@@ -310,6 +458,153 @@ describe('xlsx edit sessions', () => {
             editSessionId: session,
             saveRequestId: request_id,
             worksheets: [worksheet],
+        };
+    }
+
+    async function prepare_saved_row_restoration(
+        panel: Awaited<ReturnType<typeof open_ready_xlsx>>,
+        prefix: string,
+    ) {
+        await panel.__receive({
+            type: 'requestEditSession',
+            requestId: `${prefix}-append-edit`,
+            sheetIndex: 0,
+        });
+        const append_session = latest_edit_session(panel)!.editSessionId!;
+        const initial = latest_snapshot(panel);
+        await panel.__receive({
+            type: 'requestAppendRows',
+            requestId: `${prefix}-append`,
+            editSessionId: append_session,
+            worksheet: { sheetIndex: 0, sheetName: 'People', worksheetId: '1' },
+            sourceGeneration: initial.sourceGeneration,
+            count: 1,
+        });
+        const admission = panel.__messages.find((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { type?: unknown }).type === 'appendRowsResult'
+            && (message as { requestId?: unknown }).requestId === `${prefix}-append`
+        )) as Extract<import('../types').HostMessage, { type: 'appendRowsResult' }>;
+        expect(admission.granted, admission.reason).toBe(true);
+        await panel.__receive({
+            type: 'settleRowAdmission',
+            requestId: `${prefix}-append`,
+            editSessionId: append_session,
+            accepted: true,
+        });
+        const original_row = {
+            id: admission.rowIds![0],
+            cells: { 0: { value: `${prefix}-saved`, valueEditOrder: 1 } },
+            formatTemplateId: admission.formatTemplate!.id,
+            createdOrder: 1,
+        };
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: workbook_request(
+                append_session,
+                `${prefix}-save-append`,
+                save_worksheet({
+                    edits: {},
+                    dirtyEdits: {},
+                    structuralChanges: {
+                        formatTemplates: [admission.formatTemplate!],
+                        appendedRows: [original_row],
+                        tailRemovals: [],
+                        appendBasis: admission.appendBasis!,
+                        conflicts: [],
+                    },
+                }),
+            ),
+        });
+        await wait_for_observable(() => save_results(panel).some(
+            (result) => result.lifecycle.operation.saveRequestId === `${prefix}-save-append`,
+        ));
+        const append_result = save_results(panel).find(
+            (result) => result.lifecycle.operation.saveRequestId === `${prefix}-save-append`,
+        )!;
+        expect(append_result.success).toBe(true);
+        const assignment = append_result.receipt!.appendedRows[0];
+
+        const remove_session = await request_edit_session_when_available(
+            panel,
+            `${prefix}-remove-edit`,
+        );
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: workbook_request(
+                remove_session,
+                `${prefix}-save-remove`,
+                save_worksheet({
+                    edits: {},
+                    dirtyEdits: {},
+                    structuralChanges: {
+                        formatTemplates: [],
+                        appendedRows: [],
+                        tailRemovals: [{
+                            appendHistoryId: assignment.pendingRowId,
+                            sourceRow: assignment.sourceRow,
+                            savedFingerprint: assignment.savedFingerprint,
+                            savedRow: assignment.savedRow!,
+                        }],
+                        conflicts: [],
+                    },
+                }),
+            ),
+        });
+        await wait_for_observable(() => save_results(panel).some(
+            (result) => result.lifecycle.operation.saveRequestId === `${prefix}-save-remove`,
+        ));
+        expect(save_results(panel).find(
+            (result) => result.lifecycle.operation.saveRequestId === `${prefix}-save-remove`,
+        )?.success).toBe(true);
+
+        const restore_session = await request_edit_session_when_available(
+            panel,
+            `${prefix}-restore-edit`,
+        );
+        const source_generation = latest_snapshot(panel).sourceGeneration;
+        const restore_request_id = `${prefix}-restore`;
+        await panel.__receive({
+            type: 'requestRestoreSavedRows',
+            requestId: restore_request_id,
+            editSessionId: restore_session,
+            worksheet: { sheetIndex: 0, sheetName: 'People', worksheetId: '1' },
+            sourceGeneration: source_generation,
+            appendHistoryIds: [assignment.pendingRowId],
+        });
+        const restoration = panel.__messages.find((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { type?: unknown }).type === 'restoreSavedRowsResult'
+            && (message as { requestId?: unknown }).requestId === restore_request_id
+        )) as Extract<import('../types').HostMessage, { type: 'restoreSavedRowsResult' }>;
+        expect(restoration.granted, restoration.reason).toBe(true);
+        const format = assignment.savedRow!.format;
+        const template = {
+            id: `restored-format:${createHash('sha256')
+                .update(JSON.stringify(format)).digest('hex')}`,
+            format,
+        };
+        const row = {
+            id: assignment.pendingRowId,
+            cells: assignment.savedRow!.cells,
+            formatTemplateId: template.id,
+            createdOrder: Number.MAX_SAFE_INTEGER,
+        };
+        const desired = {
+            formatTemplates: [template],
+            appendedRows: [row],
+            tailRemovals: [],
+            appendBasis: restoration.appendBasis!,
+            conflicts: [],
+        };
+        return {
+            assignment,
+            desired,
+            restoreRequestId: restore_request_id,
+            restoreSession: restore_session,
+            sourceGeneration: source_generation,
         };
     }
 
@@ -3347,6 +3642,4409 @@ describe('xlsx edit sessions', () => {
 
         expect(save_results(panel).at(-1)).toMatchObject({ success: true });
         expect(read_part(bytes, 'xl/styles.xml')).toEqual(styles_before);
+    });
+
+    it('settles source-display lookups beyond the current worksheet extent', async () => {
+        const panel = await open_ready_xlsx(file_path);
+        const snapshot = latest_snapshot(panel);
+        await panel.__receive({
+            type: 'requestSourceDisplayRows',
+            requestId: 'resolve-future-row',
+            sheetIndex: 0,
+            sourceRows: [1, 100],
+            generation: snapshot.generation,
+        });
+        expect(panel.__messages).toContainEqual({
+            type: 'sourceDisplayRows',
+            requestId: 'resolve-future-row',
+            sheetIndex: 0,
+            sourceRows: [1, 100],
+            displayRows: [0, null],
+            generation: snapshot.generation,
+            mappingGeneration: expect.any(Number),
+        });
+    });
+
+    it('fingerprints only the style dependencies used by appended rows', async () => {
+        const parsed = await parse_xlsx(bytes);
+        const source_row_count = parsed.data.sheets[0].rows.length;
+        const column_count = parsed.data.sheets[0].rows.reduce(
+            (largest, row) => Math.max(largest, row.length),
+            1,
+        );
+        const baseline = capture_xlsx_append_row_format(
+            bytes,
+            0,
+            source_row_count,
+            column_count,
+        );
+        const rewrite_styles = (transform: (xml: string) => string): Uint8Array => {
+            const file = CFB.read(bytes, { type: 'buffer' });
+            const entry = CFB.find(file, '/xl/styles.xml')!;
+            const rewritten = Buffer.from(
+                transform(Buffer.from(entry.content as Uint8Array).toString('utf8')),
+                'utf8',
+            );
+            entry.content = rewritten;
+            entry.size = rewritten.length;
+            const written = CFB.write(file, {
+                type: 'buffer',
+                fileType: 'zip',
+                compression: true,
+            });
+            return written instanceof Uint8Array
+                ? written
+                : new Uint8Array(written as ArrayBufferLike);
+        };
+        const unrelated = rewrite_styles((xml) => xml.replace(
+            'defaultSlicerStyle="SlicerStyleLight1"',
+            'defaultSlicerStyle="SlicerStyleDark1"',
+        ));
+        const referenced = rewrite_styles((xml) => xml.replace(
+            '<color theme="1"/>',
+            '<color theme="2"/>',
+        ));
+
+        expect(capture_xlsx_append_row_format(
+            unrelated,
+            0,
+            source_row_count,
+            column_count,
+        ).styleFingerprint).toBe(baseline.styleFingerprint);
+        expect(capture_xlsx_append_row_format(
+            referenced,
+            0,
+            source_row_count,
+            column_count,
+        ).styleFingerprint).not.toBe(baseline.styleFingerprint);
+    });
+
+    it('does not bless a width shrink when a retained style dependency also changed', async () => {
+        const state = versioned_state_store({});
+        const panel = await open_ready_xlsx(file_path, state);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'edit', sheetIndex: 0 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+        const snapshot = latest_snapshot(panel);
+        await panel.__receive({
+            type: 'requestAppendRows',
+            requestId: 'append-before-width-and-style-change',
+            editSessionId: session,
+            worksheet: { sheetIndex: 0, sheetName: 'People', worksheetId: '1' },
+            sourceGeneration: snapshot.sourceGeneration,
+            count: 1,
+        });
+        const admission = panel.__messages.find((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { type?: unknown }).type === 'appendRowsResult'
+            && (message as { requestId?: unknown }).requestId
+                === 'append-before-width-and-style-change'
+        )) as Extract<import('../types').HostMessage, { type: 'appendRowsResult' }>;
+        expect(admission.granted, admission.reason).toBe(true);
+        expect(admission.appendBasis?.provisionalRowCount).toBe(1);
+        await panel.__receive({
+            type: 'settleRowAdmission',
+            requestId: 'append-before-width-and-style-change',
+            editSessionId: session,
+            accepted: true,
+        });
+        await panel.__receive({
+            type: 'pendingChangesChanged',
+            sourceGeneration: latest_snapshot(panel).sourceGeneration,
+            editSessionId: session,
+            sequence: 1,
+            changes: {
+                sheetIndex: 0,
+                sheetName: 'People',
+                worksheetId: '1',
+                cells: {},
+                formatTemplates: [admission.formatTemplate!],
+                appendedRows: [{
+                    id: admission.rowIds![0],
+                    cells: {},
+                    formatTemplateId: admission.formatTemplate!.id,
+                    createdOrder: 1,
+                }],
+                tailRemovals: [],
+                appendBasis: admission.appendBasis!,
+                conflicts: [],
+            },
+        });
+        await controller_of(panel).drain();
+
+        const file = CFB.read(bytes, { type: 'buffer' });
+        const sheet = CFB.find(file, '/xl/worksheets/sheet1.xml')!;
+        const sheet_before = Buffer.from(sheet.content as Uint8Array).toString('utf8');
+        const sheet_after = sheet_before
+            .replace('<dimension ref="A1:D3"/>', '<dimension ref="A1:C3"/>')
+            .replace(/ spans="1:4"/g, ' spans="1:3"')
+            .replace(/<c r="D[123]"[^>]*>[\s\S]*?<\/c>/g, '');
+        expect(sheet_after).not.toBe(sheet_before);
+        sheet.content = Buffer.from(sheet_after, 'utf8');
+        sheet.size = sheet.content.length;
+        const styles = CFB.find(file, '/xl/styles.xml')!;
+        const styles_before = Buffer.from(styles.content as Uint8Array).toString('utf8');
+        const styles_after = styles_before.replace(
+            '<color theme="1"/>',
+            '<color theme="2"/>',
+        );
+        expect(styles_after).not.toBe(styles_before);
+        styles.content = Buffer.from(styles_after, 'utf8');
+        styles.size = styles.content.length;
+        const written = CFB.write(file, { type: 'buffer', fileType: 'zip', compression: true });
+        bytes = written instanceof Uint8Array
+            ? written
+            : new Uint8Array(written as ArrayBufferLike);
+
+        await vscode_mock.__getActiveWatchers()[0].__fireChange();
+        await wait_for_observable(() => source_refresh_snapshots(panel).length > 0);
+        const reconciled = latest_snapshot(panel).state?.pendingEdits?.[0];
+        expect(reconciled?.appendBasis?.columnCount).toBe(4);
+        expect(reconciled?.conflicts).toContainEqual({
+            reason: 'templateChanged',
+            pendingRowIds: admission.rowIds,
+            tailRemovalIds: [],
+        });
+    });
+
+    it('rejects a delayed structural publication from before a source refresh', async () => {
+        const state = versioned_state_store({});
+        const panel = await open_ready_xlsx(file_path, state);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'edit', sheetIndex: 0 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+        const before_refresh = latest_snapshot(panel);
+        await panel.__receive({
+            type: 'requestAppendRows',
+            requestId: 'append-before-delayed-publication',
+            editSessionId: session,
+            worksheet: { sheetIndex: 0, sheetName: 'People', worksheetId: '1' },
+            sourceGeneration: before_refresh.sourceGeneration,
+            count: 1,
+        });
+        const admission = panel.__messages.find((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { type?: unknown }).type === 'appendRowsResult'
+            && (message as { requestId?: unknown }).requestId
+                === 'append-before-delayed-publication'
+        )) as Extract<import('../types').HostMessage, { type: 'appendRowsResult' }>;
+        expect(admission.granted, admission.reason).toBe(true);
+        await panel.__receive({
+            type: 'settleRowAdmission',
+            requestId: 'append-before-delayed-publication',
+            editSessionId: session,
+            accepted: true,
+        });
+        const delayed_changes = {
+            sheetIndex: 0,
+            sheetName: 'People',
+            worksheetId: '1',
+            cells: {},
+            formatTemplates: [admission.formatTemplate!],
+            appendedRows: [{
+                id: admission.rowIds![0],
+                cells: { 3: { value: 'stale-width', valueEditOrder: 1 } },
+                formatTemplateId: admission.formatTemplate!.id,
+                createdOrder: 1,
+            }],
+            tailRemovals: [],
+            appendBasis: admission.appendBasis!,
+            conflicts: [],
+        };
+
+        const file = CFB.read(bytes, { type: 'buffer' });
+        const sheet = CFB.find(file, '/xl/worksheets/sheet1.xml')!;
+        const before = Buffer.from(sheet.content as Uint8Array).toString('utf8');
+        const after = before
+            .replace('<dimension ref="A1:D3"/>', '<dimension ref="A1:C3"/>')
+            .replace(/ spans="1:4"/g, ' spans="1:3"')
+            .replace(/<c r="D[123]"[^>]*>[\s\S]*?<\/c>/g, '');
+        sheet.content = Buffer.from(after, 'utf8');
+        sheet.size = sheet.content.length;
+        const written = CFB.write(file, { type: 'buffer', fileType: 'zip', compression: true });
+        bytes = written instanceof Uint8Array
+            ? written
+            : new Uint8Array(written as ArrayBufferLike);
+        await vscode_mock.__getActiveWatchers()[0].__fireChange();
+        await wait_for_observable(() => latest_snapshot(panel).meta.sheets[0].columnCount === 3);
+
+        await panel.__receive({
+            type: 'pendingChangesChanged',
+            sourceGeneration: before_refresh.sourceGeneration,
+            editSessionId: session,
+            sequence: 1,
+            changes: delayed_changes,
+        });
+        await controller_of(panel).drain();
+        expect(panel.__messages).not.toContainEqual({
+            type: 'pendingChangesAcknowledged',
+            editSessionId: session,
+            sequence: 1,
+        });
+        expect(state.get_state(file_path).pendingEdits).toBeUndefined();
+    });
+
+    it('fences a structural publication queued behind a blocked state write', async () => {
+        const state = versioned_state_store({});
+        const original_read = state.store.read.bind(state.store);
+        let block_next_read = false;
+        let blocked_read_entered = false;
+        let release_read!: () => void;
+        const blocked_read = new Promise<void>((resolve) => { release_read = resolve; });
+        state.store.read = async (...args: Parameters<typeof original_read>) => {
+            if (block_next_read) {
+                block_next_read = false;
+                blocked_read_entered = true;
+                await blocked_read;
+            }
+            return original_read(...args);
+        };
+        const panel = await open_ready_xlsx(file_path, state);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'edit', sheetIndex: 0 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+
+        block_next_read = true;
+        const blocking_write = panel.__receive({
+            type: 'pendingEditsChanged',
+            editSessionId: session,
+            sequence: 1,
+            sheetIndex: 0,
+            sheetName: 'People',
+            worksheetId: '1',
+            edits: { '0:0': { value: 'queued first', base: 'Alice' } },
+        });
+        await wait_for_observable(() => blocked_read_entered);
+
+        const before_refresh = latest_snapshot(panel);
+        await panel.__receive({
+            type: 'requestAppendRows',
+            requestId: 'append-behind-blocked-write',
+            editSessionId: session,
+            worksheet: { sheetIndex: 0, sheetName: 'People', worksheetId: '1' },
+            sourceGeneration: before_refresh.sourceGeneration,
+            count: 1,
+        });
+        const admission = panel.__messages.find((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { type?: unknown }).type === 'appendRowsResult'
+            && (message as { requestId?: unknown }).requestId
+                === 'append-behind-blocked-write'
+        )) as Extract<import('../types').HostMessage, { type: 'appendRowsResult' }>;
+        expect(admission.granted, admission.reason).toBe(true);
+        await panel.__receive({
+            type: 'settleRowAdmission',
+            requestId: 'append-behind-blocked-write',
+            editSessionId: session,
+            accepted: true,
+        });
+        const structural_write = panel.__receive({
+            type: 'pendingChangesChanged',
+            sourceGeneration: before_refresh.sourceGeneration,
+            editSessionId: session,
+            sequence: 2,
+            changes: {
+                sheetIndex: 0,
+                sheetName: 'People',
+                worksheetId: '1',
+                cells: { '0:0': { value: 'queued first', base: 'Alice' } },
+                formatTemplates: [admission.formatTemplate!],
+                appendedRows: [{
+                    id: admission.rowIds![0],
+                    cells: {},
+                    formatTemplateId: admission.formatTemplate!.id,
+                    createdOrder: 1,
+                }],
+                tailRemovals: [],
+                appendBasis: admission.appendBasis!,
+                conflicts: [],
+            },
+        });
+
+        const file = CFB.read(bytes, { type: 'buffer' });
+        const sheet = CFB.find(file, '/xl/worksheets/sheet1.xml')!;
+        const before = Buffer.from(sheet.content as Uint8Array).toString('utf8');
+        const after = before
+            .replace('<dimension ref="A1:D3"/>', '<dimension ref="A1:C3"/>')
+            .replace(/ spans="1:4"/g, ' spans="1:3"')
+            .replace(/<c r="D[123]"[^>]*>[\s\S]*?<\/c>/g, '');
+        sheet.content = Buffer.from(after, 'utf8');
+        sheet.size = sheet.content.length;
+        const written = CFB.write(file, { type: 'buffer', fileType: 'zip', compression: true });
+        bytes = written instanceof Uint8Array
+            ? written
+            : new Uint8Array(written as ArrayBufferLike);
+        const refresh = vscode_mock.__getActiveWatchers()[0].__fireChange();
+        await wait_for_observable(() => latest_snapshot(panel).meta.sheets[0].columnCount === 3);
+
+        release_read();
+        await Promise.all([blocking_write, structural_write, refresh]);
+        await controller_of(panel).drain();
+        expect(panel.__messages).not.toContainEqual({
+            type: 'pendingChangesAcknowledged',
+            editSessionId: session,
+            sequence: 2,
+        });
+        expect(state.get_state(file_path).pendingEdits?.[0]?.appendedRows ?? [])
+            .toEqual([]);
+    });
+
+    it('does not let a repeated settlement overtake structural publication', async () => {
+        const state = versioned_state_store({});
+        const compare = state.store.compare_and_set.bind(state.store);
+        let block_publication = false;
+        let publication_entered = false;
+        let release_publication!: () => void;
+        const publication_gate = new Promise<void>((resolve) => {
+            release_publication = resolve;
+        });
+        state.store.compare_and_set = async (...args) => {
+            if (block_publication) {
+                block_publication = false;
+                publication_entered = true;
+                await publication_gate;
+            }
+            return compare(...args);
+        };
+        const panel = await open_ready_xlsx(file_path, state);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'edit', sheetIndex: 0 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+        const snapshot = latest_snapshot(panel);
+        await panel.__receive({
+            type: 'requestAppendRows',
+            requestId: 'settled-once',
+            editSessionId: session,
+            worksheet: { sheetIndex: 0, sheetName: 'People', worksheetId: '1' },
+            sourceGeneration: snapshot.sourceGeneration,
+            count: 1,
+        });
+        const admission = panel.__messages.find((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { type?: unknown }).type === 'appendRowsResult'
+            && (message as { requestId?: unknown }).requestId === 'settled-once'
+        )) as Extract<import('../types').HostMessage, { type: 'appendRowsResult' }>;
+        await panel.__receive({
+            type: 'settleRowAdmission',
+            requestId: 'settled-once',
+            editSessionId: session,
+            accepted: true,
+        });
+        const row = {
+            id: admission.rowIds![0],
+            cells: {},
+            formatTemplateId: admission.formatTemplate!.id,
+            createdOrder: 1,
+        };
+        block_publication = true;
+        const publication = panel.__receive({
+            type: 'pendingChangesChanged',
+            sourceGeneration: snapshot.sourceGeneration,
+            editSessionId: session,
+            sequence: 1,
+            changes: {
+                sheetIndex: 0,
+                sheetName: 'People',
+                worksheetId: '1',
+                cells: {},
+                formatTemplates: [admission.formatTemplate!],
+                appendedRows: [row],
+                tailRemovals: [],
+                appendBasis: admission.appendBasis!,
+                conflicts: [],
+            },
+        });
+        await wait_for_observable(() => publication_entered);
+        const repeated_settlement = panel.__receive({
+            type: 'settleRowAdmission',
+            requestId: 'settled-once',
+            editSessionId: session,
+            accepted: false,
+        });
+
+        release_publication();
+        await Promise.all([publication, repeated_settlement]);
+        await controller_of(panel).drain();
+        expect(panel.__messages).toContainEqual({
+            type: 'pendingChangesAcknowledged',
+            editSessionId: session,
+            sequence: 1,
+        });
+        expect(state.get_state(file_path).pendingEdits?.[0]?.appendedRows).toEqual([row]);
+    });
+
+    it('keeps append authority until an admitted publication settles during release', async () => {
+        const state = versioned_state_store({});
+        const compare = state.store.compare_and_set.bind(state.store);
+        let publication_entered = false;
+        let release_publication!: () => void;
+        const publication_gate = new Promise<void>((resolve) => {
+            release_publication = resolve;
+        });
+        let block_publication = false;
+        state.store.compare_and_set = async (...args) => {
+            if (block_publication) {
+                block_publication = false;
+                publication_entered = true;
+                await publication_gate;
+            }
+            return compare(...args);
+        };
+        const panel = await open_ready_xlsx(file_path, state);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'edit', sheetIndex: 0 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+        const snapshot = latest_snapshot(panel);
+        await panel.__receive({
+            type: 'requestAppendRows',
+            requestId: 'publish-while-releasing',
+            editSessionId: session,
+            worksheet: { sheetIndex: 0, sheetName: 'People', worksheetId: '1' },
+            sourceGeneration: snapshot.sourceGeneration,
+            count: 1,
+        });
+        const admission = panel.__messages.find((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { type?: unknown }).type === 'appendRowsResult'
+            && (message as { requestId?: unknown }).requestId === 'publish-while-releasing'
+        )) as Extract<import('../types').HostMessage, { type: 'appendRowsResult' }>;
+        await panel.__receive({
+            type: 'settleRowAdmission',
+            requestId: 'publish-while-releasing',
+            editSessionId: session,
+            accepted: true,
+        });
+        const row = {
+            id: admission.rowIds![0],
+            cells: {},
+            formatTemplateId: admission.formatTemplate!.id,
+            createdOrder: 1,
+        };
+        block_publication = true;
+        const publication = panel.__receive({
+            type: 'pendingChangesChanged',
+            sourceGeneration: snapshot.sourceGeneration,
+            editSessionId: session,
+            sequence: 1,
+            changes: {
+                sheetIndex: 0,
+                sheetName: 'People',
+                worksheetId: '1',
+                cells: {},
+                formatTemplates: [admission.formatTemplate!],
+                appendedRows: [row],
+                tailRemovals: [],
+                appendBasis: admission.appendBasis!,
+                conflicts: [],
+            },
+        });
+        await wait_for_observable(() => publication_entered);
+        const releasing = panel.__receive({
+            type: 'releaseEditSession',
+            editSessionId: session,
+        });
+
+        release_publication();
+        await Promise.all([publication, releasing]);
+        await controller_of(panel).drain();
+        expect(panel.__messages).toContainEqual({
+            type: 'pendingChangesAcknowledged',
+            editSessionId: session,
+            sequence: 1,
+        });
+        expect(state.get_state(file_path).pendingEdits?.[0]?.appendedRows).toEqual([row]);
+
+        await panel.__receive({ type: 'requestEditSession', requestId: 'restore', sheetIndex: 0 });
+        const restored = latest_edit_session(panel) as ReturnType<typeof latest_edit_session> & {
+            pendingChanges?: import('../types').WorksheetPendingChanges;
+        };
+        expect(restored.pendingChanges?.appendedRows).toEqual([row]);
+    });
+
+    it('revalidates append authority after an earlier publication drains before Save', async () => {
+        const state = versioned_state_store({});
+        const compare = state.store.compare_and_set.bind(state.store);
+        let publication_entered = false;
+        let release_publication!: () => void;
+        const publication_gate = new Promise<void>((resolve) => {
+            release_publication = resolve;
+        });
+        let block_publication = false;
+        state.store.compare_and_set = async (...args) => {
+            if (block_publication) {
+                block_publication = false;
+                publication_entered = true;
+                await publication_gate;
+            }
+            return compare(...args);
+        };
+        const panel = await open_ready_xlsx(file_path, state);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'edit', sheetIndex: 0 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+        const snapshot = latest_snapshot(panel);
+        await panel.__receive({
+            type: 'requestAppendRows',
+            requestId: 'consumed-before-save',
+            editSessionId: session,
+            worksheet: { sheetIndex: 0, sheetName: 'People', worksheetId: '1' },
+            sourceGeneration: snapshot.sourceGeneration,
+            count: 1,
+        });
+        const admission = panel.__messages.find((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { type?: unknown }).type === 'appendRowsResult'
+            && (message as { requestId?: unknown }).requestId === 'consumed-before-save'
+        )) as Extract<import('../types').HostMessage, { type: 'appendRowsResult' }>;
+        await panel.__receive({
+            type: 'settleRowAdmission',
+            requestId: 'consumed-before-save',
+            editSessionId: session,
+            accepted: true,
+        });
+        const row = {
+            id: admission.rowIds![0],
+            cells: {},
+            formatTemplateId: admission.formatTemplate!.id,
+            createdOrder: 1,
+        };
+        block_publication = true;
+        const publication = panel.__receive({
+            type: 'pendingChangesChanged',
+            sourceGeneration: snapshot.sourceGeneration,
+            editSessionId: session,
+            sequence: 1,
+            changes: {
+                sheetIndex: 0,
+                sheetName: 'People',
+                worksheetId: '1',
+                cells: { '0:0': { value: 'queued first', base: 'Alice' } },
+                formatTemplates: [],
+                appendedRows: [],
+                tailRemovals: [],
+                conflicts: [],
+            },
+        });
+        await wait_for_observable(() => publication_entered);
+
+        const bytes_before_save = bytes;
+        const save_count = save_results(panel).length;
+        const save = panel.__receive({
+            type: 'saveCsv',
+            operation: workbook_request(session, 'save-consumed-admission', save_worksheet({
+                edits: {},
+                dirtyEdits: {},
+                structuralChanges: {
+                    formatTemplates: [admission.formatTemplate!],
+                    appendedRows: [row],
+                    tailRemovals: [],
+                    appendBasis: admission.appendBasis!,
+                    conflicts: [],
+                },
+            })),
+        });
+        release_publication();
+        await Promise.all([publication, save]);
+        await wait_for_observable(() => save_results(panel).length > save_count);
+
+        expect(save_results(panel).at(-1)?.success).toBe(false);
+        expect(bytes).toBe(bytes_before_save);
+        expect(state.get_state(file_path).pendingEdits?.[0]?.appendedRows ?? []).toEqual([]);
+        expect(state.get_state(file_path).pendingEdits?.[0]?.cells).toEqual({
+            '0:0': { value: 'queued first', base: 'Alice' },
+        });
+    });
+
+    it('refuses redo of an undone append after the worksheet width changes', async () => {
+        const state = versioned_state_store({});
+        const panel = await open_ready_xlsx(file_path, state);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'edit', sheetIndex: 0 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+        const snapshot = latest_snapshot(panel);
+        await panel.__receive({
+            type: 'requestAppendRows',
+            requestId: 'append-before-undo-and-shrink',
+            editSessionId: session,
+            worksheet: { sheetIndex: 0, sheetName: 'People', worksheetId: '1' },
+            sourceGeneration: snapshot.sourceGeneration,
+            count: 1,
+        });
+        const admission = panel.__messages.find((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { type?: unknown }).type === 'appendRowsResult'
+            && (message as { requestId?: unknown }).requestId
+                === 'append-before-undo-and-shrink'
+        )) as Extract<import('../types').HostMessage, { type: 'appendRowsResult' }>;
+        expect(admission.granted, admission.reason).toBe(true);
+        await panel.__receive({
+            type: 'settleRowAdmission',
+            requestId: 'append-before-undo-and-shrink',
+            editSessionId: session,
+            accepted: true,
+        });
+        await panel.__receive({
+            type: 'retainedSavedAppendAuthoritiesChanged',
+            authorities: [{
+                sheetIndex: 0,
+                sheetName: 'People',
+                worksheetId: '1',
+                appendHistoryIds: [],
+                pendingRowIds: admission.rowIds!,
+            }],
+        });
+        const appended = {
+            formatTemplates: [admission.formatTemplate!],
+            appendedRows: [{
+                id: admission.rowIds![0],
+                cells: { 3: { value: 'removed-column value', valueEditOrder: 1 } },
+                formatTemplateId: admission.formatTemplate!.id,
+                createdOrder: 1,
+            }],
+            tailRemovals: [],
+            appendBasis: admission.appendBasis!,
+            conflicts: [],
+        };
+        const empty = {
+            formatTemplates: [],
+            appendedRows: [],
+            tailRemovals: [],
+            conflicts: [],
+        };
+        await panel.__receive({
+            type: 'pendingChangesChanged',
+            sourceGeneration: latest_snapshot(panel).sourceGeneration,
+            editSessionId: session,
+            sequence: 1,
+            changes: {
+                sheetIndex: 0,
+                sheetName: 'People',
+                worksheetId: '1',
+                cells: {},
+                ...appended,
+            },
+        });
+        await controller_of(panel).drain();
+
+        await panel.__receive({
+            type: 'prepareHistoryReplay',
+            request: {
+                requestId: 'undo-append-prepare',
+                replayId: 'undo-append-replay',
+                cells: [],
+                highlights: [],
+                structures: [{
+                    ordinal: 0,
+                    worksheet: { sheetIndex: 0, sheetName: 'People', worksheetId: '1' },
+                    expected: appended,
+                    desired: empty,
+                }],
+                focus: {
+                    worksheet: { sheetIndex: 0, sheetName: 'People', worksheetId: '1' },
+                    sourceRowStart: 2,
+                    sourceRowEnd: 2,
+                    sourceColumnStart: 0,
+                    sourceColumnEnd: 0,
+                },
+            },
+        });
+        await wait_for_observable(() => panel.__messages.some((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { type?: unknown }).type === 'historyReplayPrepared'
+            && (message as { prepared?: { replayId?: unknown } }).prepared?.replayId
+                === 'undo-append-replay'
+        )));
+        const undo_prepared = panel.__messages.find((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { type?: unknown }).type === 'historyReplayPrepared'
+            && (message as { prepared?: { replayId?: unknown } }).prepared?.replayId
+                === 'undo-append-replay'
+        )) as Extract<import('../types').HostMessage, { type: 'historyReplayPrepared' }>;
+        const compare = state.store.compare_and_set.bind(state.store);
+        let replay_write_entered = false;
+        let release_replay_write!: () => void;
+        const replay_write_gate = new Promise<void>((resolve) => {
+            release_replay_write = resolve;
+        });
+        let block_replay_write = true;
+        state.store.compare_and_set = async (...args) => {
+            if (block_replay_write) {
+                block_replay_write = false;
+                replay_write_entered = true;
+                await replay_write_gate;
+            }
+            return compare(...args);
+        };
+        const undo_commit = panel.__receive({
+            type: 'commitHistoryReplay',
+            request: {
+                requestId: undo_prepared.prepared.requestId,
+                replayId: undo_prepared.prepared.replayId,
+                leaseId: undo_prepared.prepared.leaseId,
+                mutationId: 'undo-append-mutation',
+                cells: [],
+                highlights: [],
+                structures: [{ ordinal: 0 }],
+            },
+        });
+        await wait_for_observable(() => replay_write_entered);
+        const late_publication = panel.__receive({
+            type: 'pendingChangesChanged',
+            sourceGeneration: snapshot.sourceGeneration,
+            editSessionId: session,
+            sequence: 2,
+            changes: {
+                sheetIndex: 0,
+                sheetName: 'People',
+                worksheetId: '1',
+                cells: {},
+                ...appended,
+            },
+        });
+        release_replay_write();
+        await Promise.all([undo_commit, late_publication]);
+        await wait_for_observable(() => panel.__messages.some((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { type?: unknown }).type === 'historyReplayCommitted'
+            && (message as { committed?: { replayId?: unknown } }).committed?.replayId
+                === 'undo-append-replay'
+        )));
+        expect(state.get_state(file_path).pendingEdits).toBeUndefined();
+        expect(panel.__messages).not.toContainEqual({
+            type: 'pendingChangesAcknowledged',
+            editSessionId: session,
+            sequence: 2,
+        });
+
+        const file = CFB.read(bytes, { type: 'buffer' });
+        const sheet = CFB.find(file, '/xl/worksheets/sheet1.xml')!;
+        const sheet_before = Buffer.from(sheet.content as Uint8Array).toString('utf8');
+        const sheet_after = sheet_before
+            .replace('<dimension ref="A1:D3"/>', '<dimension ref="A1:C3"/>')
+            .replace(/ spans="1:4"/g, ' spans="1:3"')
+            .replace(/<c r="D[123]"[^>]*>[\s\S]*?<\/c>/g, '');
+        expect(sheet_after).not.toBe(sheet_before);
+        sheet.content = Buffer.from(sheet_after, 'utf8');
+        sheet.size = sheet.content.length;
+        const written = CFB.write(file, { type: 'buffer', fileType: 'zip', compression: true });
+        bytes = written instanceof Uint8Array
+            ? written
+            : new Uint8Array(written as ArrayBufferLike);
+        await vscode_mock.__getActiveWatchers()[0].__fireChange();
+        await wait_for_observable(() => latest_snapshot(panel).meta.sheets[0].columnCount === 3);
+
+        await panel.__receive({
+            type: 'prepareHistoryReplay',
+            request: {
+                requestId: 'redo-append-prepare',
+                replayId: 'redo-append-replay',
+                cells: [],
+                highlights: [],
+                structures: [{
+                    ordinal: 0,
+                    worksheet: { sheetIndex: 0, sheetName: 'People', worksheetId: '1' },
+                    expected: empty,
+                    desired: appended,
+                }],
+                focus: {
+                    worksheet: { sheetIndex: 0, sheetName: 'People', worksheetId: '1' },
+                    sourceRowStart: 2,
+                    sourceRowEnd: 2,
+                    sourceColumnStart: 0,
+                    sourceColumnEnd: 0,
+                },
+            },
+        });
+        await wait_for_observable(() => panel.__messages.some((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { type?: unknown }).type === 'historyReplayPrepareRefused'
+            && (message as { refusal?: { replayId?: unknown } }).refusal?.replayId
+                === 'redo-append-replay'
+        )));
+        const refusal = panel.__messages.find((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { type?: unknown }).type === 'historyReplayPrepareRefused'
+            && (message as { refusal?: { replayId?: unknown } }).refusal?.replayId
+                === 'redo-append-replay'
+        )) as Extract<import('../types').HostMessage, { type: 'historyReplayPrepareRefused' }>;
+        expect(refusal.refusal.reason).toBe('conflict');
+        expect(state.get_state(file_path).pendingEdits).toBeUndefined();
+    });
+
+    it('refuses redo when external growth captures a provisional formula coordinate', async () => {
+        const state = versioned_state_store({});
+        const panel = await open_ready_xlsx(file_path, state);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'edit', sheetIndex: 0 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+        const snapshot = latest_snapshot(panel);
+        await panel.__receive({
+            type: 'requestAppendRows',
+            requestId: 'append-formula-band',
+            editSessionId: session,
+            worksheet: { sheetIndex: 0, sheetName: 'People', worksheetId: '1' },
+            sourceGeneration: snapshot.sourceGeneration,
+            count: 2,
+        });
+        const admission = panel.__messages.find((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { type?: unknown }).type === 'appendRowsResult'
+            && (message as { requestId?: unknown }).requestId === 'append-formula-band'
+        )) as Extract<import('../types').HostMessage, { type: 'appendRowsResult' }>;
+        await panel.__receive({
+            type: 'settleRowAdmission',
+            requestId: 'append-formula-band',
+            editSessionId: session,
+            accepted: true,
+        });
+        await panel.__receive({
+            type: 'retainedSavedAppendAuthoritiesChanged',
+            authorities: [{
+                sheetIndex: 0,
+                sheetName: 'People',
+                worksheetId: '1',
+                appendHistoryIds: [],
+                pendingRowIds: admission.rowIds!,
+            }],
+        });
+        const appended = {
+            formatTemplates: [admission.formatTemplate!],
+            appendedRows: [{
+                id: admission.rowIds![0],
+                cells: { 0: { value: 'pending target', valueEditOrder: 1 } },
+                formatTemplateId: admission.formatTemplate!.id,
+                createdOrder: 1,
+            }, {
+                id: admission.rowIds![1],
+                cells: {
+                    1: {
+                        value: '=A4',
+                        valueEditOrder: 2,
+                        formulaReferenceBases: [{
+                            targetSheetIndex: 0,
+                            targetSheetName: 'People',
+                            targetWorksheetId: '1',
+                            provisionalStartRow: 3,
+                            provisionalRowCount: 2,
+                        }],
+                    },
+                },
+                formatTemplateId: admission.formatTemplate!.id,
+                createdOrder: 2,
+            }],
+            tailRemovals: [],
+            appendBasis: admission.appendBasis!,
+            conflicts: [],
+        };
+        const empty = {
+            formatTemplates: [],
+            appendedRows: [],
+            tailRemovals: [],
+            conflicts: [],
+        };
+        await panel.__receive({
+            type: 'pendingChangesChanged',
+            sourceGeneration: snapshot.sourceGeneration,
+            editSessionId: session,
+            sequence: 1,
+            changes: {
+                sheetIndex: 0,
+                sheetName: 'People',
+                worksheetId: '1',
+                cells: {},
+                ...appended,
+            },
+        });
+        await controller_of(panel).drain();
+        await panel.__receive({
+            type: 'prepareHistoryReplay',
+            request: {
+                requestId: 'undo-formula-band',
+                replayId: 'undo-formula-band',
+                cells: [],
+                highlights: [],
+                structures: [{
+                    ordinal: 0,
+                    worksheet: { sheetIndex: 0, sheetName: 'People', worksheetId: '1' },
+                    expected: appended,
+                    desired: empty,
+                }],
+                focus: {
+                    worksheet: { sheetIndex: 0, sheetName: 'People', worksheetId: '1' },
+                    sourceRowStart: 3,
+                    sourceRowEnd: 4,
+                    sourceColumnStart: 0,
+                    sourceColumnEnd: 1,
+                },
+            },
+        });
+        await wait_for_observable(() => panel.__messages.some((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { type?: unknown }).type === 'historyReplayPrepared'
+            && (message as { prepared?: { replayId?: unknown } }).prepared?.replayId
+                === 'undo-formula-band'
+        )));
+        const prepared = panel.__messages.find((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { type?: unknown }).type === 'historyReplayPrepared'
+            && (message as { prepared?: { replayId?: unknown } }).prepared?.replayId
+                === 'undo-formula-band'
+        )) as Extract<import('../types').HostMessage, { type: 'historyReplayPrepared' }>;
+        await panel.__receive({
+            type: 'commitHistoryReplay',
+            request: {
+                requestId: prepared.prepared.requestId,
+                replayId: prepared.prepared.replayId,
+                leaseId: prepared.prepared.leaseId,
+                mutationId: 'undo-formula-band',
+                cells: [],
+                highlights: [],
+                structures: [{ ordinal: 0 }],
+            },
+        });
+        await wait_for_observable(() => panel.__messages.some((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { type?: unknown }).type === 'historyReplayCommitted'
+            && (message as { committed?: { replayId?: unknown } }).committed?.replayId
+                === 'undo-formula-band'
+        )));
+
+        const grown = CFB.read(bytes, { type: 'buffer' });
+        const sheet = CFB.find(grown, '/xl/worksheets/sheet1.xml')!;
+        const before = Buffer.from(sheet.content as Uint8Array).toString('utf8');
+        const after = before
+            .replace('<dimension ref="A1:D3"/>', '<dimension ref="A1:D4"/>')
+            .replace('</sheetData>', '<row r="4"><c r="A4" t="inlineStr"><is><t>external</t></is></c></row></sheetData>');
+        sheet.content = Buffer.from(after, 'utf8');
+        sheet.size = sheet.content.length;
+        const written = CFB.write(grown, {
+            type: 'buffer', fileType: 'zip', compression: true,
+        });
+        bytes = written instanceof Uint8Array
+            ? written
+            : new Uint8Array(written as ArrayBufferLike);
+        await vscode_mock.__getActiveWatchers()[0].__fireChange();
+        await wait_for_observable(() => latest_snapshot(panel).meta.sheets[0].sourceRowCount === 4);
+
+        await panel.__receive({
+            type: 'prepareHistoryReplay',
+            request: {
+                requestId: 'redo-formula-band',
+                replayId: 'redo-formula-band',
+                cells: [],
+                highlights: [],
+                structures: [{
+                    ordinal: 0,
+                    worksheet: { sheetIndex: 0, sheetName: 'People', worksheetId: '1' },
+                    expected: empty,
+                    desired: appended,
+                }],
+                focus: {
+                    worksheet: { sheetIndex: 0, sheetName: 'People', worksheetId: '1' },
+                    sourceRowStart: 3,
+                    sourceRowEnd: 4,
+                    sourceColumnStart: 0,
+                    sourceColumnEnd: 1,
+                },
+            },
+        });
+        await wait_for_observable(() => panel.__messages.some((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { type?: unknown }).type === 'historyReplayPrepareRefused'
+            && (message as { refusal?: { replayId?: unknown } }).refusal?.replayId
+                === 'redo-formula-band'
+        )));
+        expect(panel.__messages).toContainEqual(expect.objectContaining({
+            type: 'historyReplayPrepareRefused',
+            refusal: expect.objectContaining({
+                replayId: 'redo-formula-band',
+                reason: 'conflict',
+            }),
+        }));
+        expect(state.get_state(file_path).pendingEdits).toBeUndefined();
+    });
+
+    it('marks pending rows conflicted after a style-only external change', async () => {
+        const state = versioned_state_store({});
+        const panel = await open_ready_xlsx(file_path, state);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'edit', sheetIndex: 0 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+        const snapshot = latest_snapshot(panel);
+        await panel.__receive({
+            type: 'requestAppendRows',
+            requestId: 'append-before-style-only-change',
+            editSessionId: session,
+            worksheet: { sheetIndex: 0, sheetName: 'People', worksheetId: '1' },
+            sourceGeneration: snapshot.sourceGeneration,
+            count: 1,
+        });
+        const admission = panel.__messages.find((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { type?: unknown }).type === 'appendRowsResult'
+            && (message as { requestId?: unknown }).requestId
+                === 'append-before-style-only-change'
+        )) as Extract<import('../types').HostMessage, { type: 'appendRowsResult' }>;
+        await panel.__receive({
+            type: 'settleRowAdmission',
+            requestId: 'append-before-style-only-change',
+            editSessionId: session,
+            accepted: true,
+        });
+        await panel.__receive({
+            type: 'pendingChangesChanged',
+            sourceGeneration: latest_snapshot(panel).sourceGeneration,
+            editSessionId: session,
+            sequence: 1,
+            changes: {
+                sheetIndex: 0,
+                sheetName: 'People',
+                worksheetId: '1',
+                cells: {},
+                formatTemplates: [admission.formatTemplate!],
+                appendedRows: [{
+                    id: admission.rowIds![0],
+                    cells: {},
+                    formatTemplateId: admission.formatTemplate!.id,
+                    createdOrder: 1,
+                }],
+                tailRemovals: [],
+                appendBasis: admission.appendBasis!,
+                conflicts: [],
+            },
+        });
+        await controller_of(panel).drain();
+
+        const file = CFB.read(bytes, { type: 'buffer' });
+        const styles = CFB.find(file, '/xl/styles.xml')!;
+        const before = Buffer.from(styles.content as Uint8Array).toString('utf8');
+        const after = before.replace('<color theme="1"/>', '<color theme="2"/>');
+        expect(after).not.toBe(before);
+        styles.content = Buffer.from(after, 'utf8');
+        styles.size = styles.content.length;
+        const written = CFB.write(file, { type: 'buffer', fileType: 'zip', compression: true });
+        bytes = written instanceof Uint8Array
+            ? written
+            : new Uint8Array(written as ArrayBufferLike);
+
+        await vscode_mock.__getActiveWatchers()[0].__fireChange();
+        await wait_for_observable(() => source_refresh_snapshots(panel).length > 0);
+        const reconciled = latest_snapshot(panel).state?.pendingEdits?.[0];
+        expect(reconciled?.appendBasis).toEqual(admission.appendBasis);
+        expect(reconciled?.conflicts).toContainEqual({
+            reason: 'templateChanged',
+            pendingRowIds: admission.rowIds,
+            tailRemovalIds: [],
+        });
+    });
+
+    it('keeps a many-row reconciliation conflict inside the reserved byte budget', async () => {
+        const format = capture_xlsx_append_row_format(bytes, 0, 3, 4, 0);
+        const template = { id: 'near-limit-template', format };
+        const rows = Array.from({ length: 1_000 }, (_, index) => ({
+            id: `near-limit-row-${index.toString().padStart(4, '0')}`,
+            cells: {},
+            formatTemplateId: template.id,
+            createdOrder: index + 1,
+        }));
+        const basis = {
+            sourceRowCount: 3,
+            provisionalStartRow: 3,
+            provisionalRowCount: rows.length,
+            columnCount: 4,
+            schemaFingerprint: `sha256:${createHash('sha256').update(JSON.stringify({
+                columnCount: 4,
+                columnNames: ['Name', 'Age', 'Active', 'Joined'],
+            })).digest('hex')}`,
+            styleFingerprint: format.styleFingerprint,
+        };
+        const base_slot = {
+            sheetName: 'People',
+            worksheetId: '1',
+            cells: {},
+            formatTemplates: [template],
+            appendedRows: rows,
+            tailRemovals: [],
+            appendBasis: basis,
+            conflicts: [],
+        };
+        const base_bytes = Buffer.byteLength(JSON.stringify({
+            sheetIndex: 0,
+            ...base_slot,
+        }), 'utf8');
+        const filler_size = MAX_PENDING_USER_CHANGES_ENCODED_BYTES - base_bytes - 256;
+        expect(filler_size).toBeGreaterThan(0);
+        rows[0] = {
+            ...rows[0],
+            cells: { 0: { value: 'x'.repeat(filler_size), valueEditOrder: 1 } },
+        };
+        const near_limit_slot = { ...base_slot, appendedRows: rows };
+        expect(Buffer.byteLength(JSON.stringify(near_limit_slot), 'utf8'))
+            .toBeLessThanOrEqual(MAX_PENDING_USER_CHANGES_ENCODED_BYTES);
+        expect(Buffer.byteLength(JSON.stringify({
+            ...near_limit_slot,
+            conflicts: [{
+                reason: 'templateChanged',
+                pendingRowIds: rows.map((row) => row.id),
+                tailRemovalIds: [],
+            }],
+        }), 'utf8')).toBeGreaterThan(MAX_PENDING_CHANGES_ENCODED_BYTES);
+
+        const state = versioned_state_store({ pendingEdits: [near_limit_slot] });
+        const panel = await open_ready_xlsx(file_path, state);
+        const file = CFB.read(bytes, { type: 'buffer' });
+        const styles = CFB.find(file, '/xl/styles.xml')!;
+        const before = Buffer.from(styles.content as Uint8Array).toString('utf8');
+        const after = before.replace('<color theme="1"/>', '<color theme="2"/>');
+        expect(after).not.toBe(before);
+        styles.content = Buffer.from(after, 'utf8');
+        styles.size = styles.content.length;
+        const written = CFB.write(file, { type: 'buffer', fileType: 'zip', compression: true });
+        bytes = written instanceof Uint8Array
+            ? written
+            : new Uint8Array(written as ArrayBufferLike);
+
+        await vscode_mock.__getActiveWatchers()[0].__fireChange();
+        await wait_for_observable(() => source_refresh_snapshots(panel).length > 0);
+        const reconciled = latest_snapshot(panel).state?.pendingEdits?.[0];
+        expect(reconciled?.conflicts).toEqual([{
+            reason: 'templateChanged',
+            pendingRowIds: rows.slice(0, 16).map((row) => row.id),
+            tailRemovalIds: [],
+        }]);
+        expect(Buffer.byteLength(JSON.stringify(reconciled), 'utf8'))
+            .toBeLessThanOrEqual(MAX_PENDING_CHANGES_ENCODED_BYTES);
+    });
+
+    it('uses the conflict reserve when width reconciliation crosses the user cap', async () => {
+        const format = capture_xlsx_append_row_format(bytes, 0, 3, 4, 0);
+        const template = { id: 'gap-template', format };
+        const basis = {
+            sourceRowCount: 3,
+            provisionalStartRow: 3,
+            provisionalRowCount: 1,
+            columnCount: 4,
+            schemaFingerprint: `sha256:${createHash('sha256').update(JSON.stringify({
+                columnCount: 4,
+                columnNames: ['Name', 'Age', 'Active', 'Joined'],
+            })).digest('hex')}`,
+            styleFingerprint: format.styleFingerprint,
+        };
+        const row = {
+            id: 'gap-row',
+            cells: { 0: { value: '', valueEditOrder: 1 } },
+            formatTemplateId: template.id,
+            createdOrder: 1,
+        };
+        const base_slot = {
+            sheetName: 'People',
+            worksheetId: '1',
+            cells: {},
+            formatTemplates: [template],
+            appendedRows: [row],
+            tailRemovals: [],
+            appendBasis: basis,
+            conflicts: [],
+        };
+        const base_bytes = Buffer.byteLength(JSON.stringify({
+            sheetIndex: 0,
+            ...base_slot,
+        }), 'utf8');
+        row.cells[0].value = 'x'.repeat(
+            MAX_PENDING_USER_CHANGES_ENCODED_BYTES - base_bytes - 1,
+        );
+        const near_user_cap = { ...base_slot, appendedRows: [row] };
+        expect(Buffer.byteLength(JSON.stringify({
+            sheetIndex: 0,
+            ...near_user_cap,
+        }), 'utf8'))
+            .toBeLessThanOrEqual(MAX_PENDING_USER_CHANGES_ENCODED_BYTES);
+
+        const state = versioned_state_store({ pendingEdits: [near_user_cap] });
+        const panel = await open_ready_xlsx(file_path, state);
+        const grown = CFB.read(bytes, { type: 'buffer' });
+        const sheet = CFB.find(grown, '/xl/worksheets/sheet1.xml')!;
+        const before = Buffer.from(sheet.content as Uint8Array).toString('utf8');
+        const after = before
+            .replace('<dimension ref="A1:D3"/>', '<dimension ref="A1:E3"/>')
+            .replace(/ spans="1:4"/g, ' spans="1:5"')
+            .replace(
+                '<c r="D3" s="1"><v>45078</v></c>',
+                '<c r="D3" s="1"><v>45078</v></c><c r="E3"><v>1</v></c>',
+            );
+        sheet.content = Buffer.from(after, 'utf8');
+        sheet.size = sheet.content.length;
+        const written = CFB.write(grown, {
+            type: 'buffer', fileType: 'zip', compression: true,
+        });
+        bytes = written instanceof Uint8Array
+            ? written
+            : new Uint8Array(written as ArrayBufferLike);
+        await vscode_mock.__getActiveWatchers()[0].__fireChange();
+        await wait_for_observable(() => source_refresh_snapshots(panel).length > 0);
+
+        const reconciled = latest_snapshot(panel).state?.pendingEdits?.[0];
+        expect(reconciled?.appendBasis).toEqual(basis);
+        expect(reconciled?.conflicts).toEqual([{
+            reason: 'templateChanged',
+            pendingRowIds: ['gap-row'],
+            tailRemovalIds: [],
+        }]);
+        expect(Buffer.byteLength(JSON.stringify(reconciled), 'utf8'))
+            .toBeLessThanOrEqual(MAX_PENDING_CHANGES_ENCODED_BYTES);
+        const roundtrip = {
+            sheetIndex: 0,
+            ...reconciled!,
+            tailRemovals: reconciled!.tailRemovals ?? [],
+        };
+        expect(Buffer.byteLength(JSON.stringify(roundtrip), 'utf8'))
+            .toBeGreaterThan(MAX_PENDING_USER_CHANGES_ENCODED_BYTES);
+        expect(Buffer.byteLength(JSON.stringify(roundtrip), 'utf8'))
+            .toBeLessThanOrEqual(MAX_PENDING_CHANGES_ENCODED_BYTES);
+        expect(Buffer.byteLength(JSON.stringify({
+            ...roundtrip,
+            conflicts: [],
+        }), 'utf8')).toBeLessThanOrEqual(MAX_PENDING_USER_CHANGES_ENCODED_BYTES);
+
+        const session = await request_edit_session_when_available(panel, 'conflict-roundtrip');
+        expect(own_wire_pending_changes(roundtrip)).toBeDefined();
+        await panel.__receive({
+            type: 'pendingChangesChanged',
+            sourceGeneration: latest_snapshot(panel).sourceGeneration,
+            editSessionId: session,
+            sequence: 1,
+            changes: roundtrip,
+        });
+        await controller_of(panel).drain();
+        expect(panel.__messages).toContainEqual({
+            type: 'pendingChangesAcknowledged',
+            editSessionId: session,
+            sequence: 1,
+        });
+        const save_count = save_results(panel).length;
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: workbook_request(
+                session,
+                'save-host-conflict-in-reserve',
+                save_worksheet({
+                    edits: {},
+                    dirtyEdits: {},
+                    structuralChanges: {
+                        formatTemplates: reconciled!.formatTemplates!,
+                        appendedRows: reconciled!.appendedRows!,
+                        tailRemovals: reconciled!.tailRemovals ?? [],
+                        appendBasis: reconciled!.appendBasis!,
+                        conflicts: reconciled!.conflicts!,
+                    },
+                }),
+            ),
+        });
+        await wait_for_observable(() => save_results(panel).length > save_count);
+        expect(save_results(panel).at(-1)).toMatchObject({
+            success: false,
+            rejection: {
+                reason: 'structuralConflict',
+                structuralReason: 'templateChanged',
+            },
+        });
+
+        const bytes_before_stripped_save = bytes;
+        const stripped_save_count = save_results(panel).length;
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: workbook_request(
+                session,
+                'save-with-stripped-host-conflict',
+                save_worksheet({
+                    edits: {},
+                    dirtyEdits: {},
+                    structuralChanges: {
+                        formatTemplates: reconciled!.formatTemplates!,
+                        appendedRows: reconciled!.appendedRows!,
+                        tailRemovals: reconciled!.tailRemovals ?? [],
+                        appendBasis: reconciled!.appendBasis!,
+                        conflicts: [],
+                    },
+                }),
+            ),
+        });
+        await wait_for_observable(() => save_results(panel).length > stripped_save_count);
+        expect(save_results(panel).at(-1)?.success).toBe(false);
+        expect(bytes).toBe(bytes_before_stripped_save);
+        expect(state.get_state(file_path).pendingEdits?.[0]?.conflicts).toEqual(
+            reconciled?.conflicts,
+        );
+    });
+
+    it('drops style dependencies belonging only to a removed blank column', async () => {
+        const state = versioned_state_store({});
+        const panel = await open_ready_xlsx(file_path, state);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'edit', sheetIndex: 0 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+        const snapshot = latest_snapshot(panel);
+        await panel.__receive({
+            type: 'requestAppendRows',
+            requestId: 'append-before-shrink',
+            editSessionId: session,
+            worksheet: { sheetIndex: 0, sheetName: 'People', worksheetId: '1' },
+            sourceGeneration: snapshot.sourceGeneration,
+            count: 1,
+        });
+        const admission = panel.__messages.find((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { type?: unknown }).type === 'appendRowsResult'
+            && (message as { requestId?: unknown }).requestId === 'append-before-shrink'
+        )) as Extract<import('../types').HostMessage, { type: 'appendRowsResult' }>;
+        expect(admission.formatTemplate?.format).toMatchObject({
+            cellStyleIndexes: [null, null, null, 1],
+        });
+        await panel.__receive({
+            type: 'settleRowAdmission',
+            requestId: 'append-before-shrink',
+            editSessionId: session,
+            accepted: true,
+        });
+        await panel.__receive({
+            type: 'pendingChangesChanged',
+            sourceGeneration: latest_snapshot(panel).sourceGeneration,
+            editSessionId: session,
+            sequence: 1,
+            changes: {
+                sheetIndex: 0,
+                sheetName: 'People',
+                worksheetId: '1',
+                cells: {},
+                formatTemplates: [admission.formatTemplate!],
+                appendedRows: [{
+                    id: admission.rowIds![0],
+                    cells: {},
+                    formatTemplateId: admission.formatTemplate!.id,
+                    createdOrder: 1,
+                }],
+                tailRemovals: [],
+                appendBasis: admission.appendBasis!,
+                conflicts: [],
+            },
+        });
+        await controller_of(panel).drain();
+
+        const file = CFB.read(bytes, { type: 'buffer' });
+        const sheet = CFB.find(file, '/xl/worksheets/sheet1.xml')!;
+        const sheet_before = Buffer.from(sheet.content as Uint8Array).toString('utf8');
+        const sheet_after = sheet_before
+            .replace('<dimension ref="A1:D3"/>', '<dimension ref="A1:C3"/>')
+            .replace(/ spans="1:4"/g, ' spans="1:3"')
+            .replace(/<c r="D[123]"[^>]*>[\s\S]*?<\/c>/g, '');
+        expect(sheet_after).not.toBe(sheet_before);
+        sheet.content = Buffer.from(sheet_after, 'utf8');
+        sheet.size = sheet.content.length;
+        const styles = CFB.find(file, '/xl/styles.xml')!;
+        const styles_before = Buffer.from(styles.content as Uint8Array).toString('utf8');
+        const styles_after = styles_before.replace(
+            '<xf numFmtId="14" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>',
+            '<xf numFmtId="15" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>',
+        );
+        expect(styles_after).not.toBe(styles_before);
+        styles.content = Buffer.from(styles_after, 'utf8');
+        styles.size = styles.content.length;
+        const written = CFB.write(file, { type: 'buffer', fileType: 'zip', compression: true });
+        bytes = written instanceof Uint8Array
+            ? written
+            : new Uint8Array(written as ArrayBufferLike);
+
+        await vscode_mock.__getActiveWatchers()[0].__fireChange();
+        await wait_for_observable(() => source_refresh_snapshots(panel).length > 0);
+        const reconciled = latest_snapshot(panel).state?.pendingEdits?.[0];
+        expect(reconciled?.appendBasis?.columnCount).toBe(3);
+        expect(reconciled?.formatTemplates?.[0]?.format).toMatchObject({
+            cellStyleIndexes: [null, null, null],
+        });
+        expect(reconciled?.appendBasis?.styleFingerprint).toBe(
+            reconciled?.formatTemplates?.[0]?.format.kind === 'xlsx'
+                ? reconciled.formatTemplates[0].format.styleFingerprint
+                : undefined,
+        );
+        expect(reconciled?.conflicts ?? []).toEqual([]);
+    });
+
+    it('uses the row-style display recipe for columns added after admission', async () => {
+        const styled = CFB.read(bytes, { type: 'buffer' });
+        const styled_sheet = CFB.find(styled, '/xl/worksheets/sheet1.xml')!;
+        const styled_before = Buffer.from(styled_sheet.content as Uint8Array).toString('utf8');
+        const styled_after = styled_before.replace(
+            '<row r="3" spans="1:4" x14ac:dyDescent="0.25">',
+            '<row r="3" spans="1:4" x14ac:dyDescent="0.25" s="1" customFormat="1">',
+        ).replace('<c r="A3"', '<c r="A3" s="0"');
+        expect(styled_after).not.toBe(styled_before);
+        styled_sheet.content = Buffer.from(styled_after, 'utf8');
+        styled_sheet.size = styled_sheet.content.length;
+        const styled_bytes = CFB.write(styled, {
+            type: 'buffer', fileType: 'zip', compression: true,
+        });
+        bytes = styled_bytes instanceof Uint8Array
+            ? styled_bytes
+            : new Uint8Array(styled_bytes as ArrayBufferLike);
+
+        const state = versioned_state_store({});
+        const panel = await open_ready_xlsx(file_path, state);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'edit', sheetIndex: 0 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+        const snapshot = latest_snapshot(panel);
+        await panel.__receive({
+            type: 'requestAppendRows',
+            requestId: 'append-before-row-style-growth',
+            editSessionId: session,
+            worksheet: { sheetIndex: 0, sheetName: 'People', worksheetId: '1' },
+            sourceGeneration: snapshot.sourceGeneration,
+            count: 1,
+        });
+        const admission = panel.__messages.find((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { type?: unknown }).type === 'appendRowsResult'
+            && (message as { requestId?: unknown }).requestId
+                === 'append-before-row-style-growth'
+        )) as Extract<import('../types').HostMessage, { type: 'appendRowsResult' }>;
+        expect(admission.formatTemplate?.format).toMatchObject({
+            rowStyleIndex: 1,
+            rowNumberFormat: { code: 'm/d/yy' },
+            rowFontStyle: { bold: false, italic: false },
+        });
+        await panel.__receive({
+            type: 'settleRowAdmission',
+            requestId: 'append-before-row-style-growth',
+            editSessionId: session,
+            accepted: true,
+        });
+        await panel.__receive({
+            type: 'pendingChangesChanged',
+            sourceGeneration: latest_snapshot(panel).sourceGeneration,
+            editSessionId: session,
+            sequence: 1,
+            changes: {
+                sheetIndex: 0,
+                sheetName: 'People',
+                worksheetId: '1',
+                cells: {},
+                formatTemplates: [admission.formatTemplate!],
+                appendedRows: [{
+                    id: admission.rowIds![0],
+                    cells: {},
+                    formatTemplateId: admission.formatTemplate!.id,
+                    createdOrder: 1,
+                }],
+                tailRemovals: [],
+                appendBasis: admission.appendBasis!,
+                conflicts: [],
+            },
+        });
+        await controller_of(panel).drain();
+
+        const grown = CFB.read(bytes, { type: 'buffer' });
+        const grown_sheet = CFB.find(grown, '/xl/worksheets/sheet1.xml')!;
+        const grown_before = Buffer.from(grown_sheet.content as Uint8Array).toString('utf8');
+        const grown_after = grown_before
+            .replace('<dimension ref="A1:D3"/>', '<dimension ref="A1:E3"/>')
+            .replace(/ spans="1:4"/g, ' spans="1:5"')
+            .replace(
+                '<c r="D3" s="1"><v>45078</v></c>',
+                '<c r="D3" s="1"><v>45078</v></c><c r="E3"><v>1</v></c>',
+            );
+        expect(grown_after).not.toBe(grown_before);
+        grown_sheet.content = Buffer.from(grown_after, 'utf8');
+        grown_sheet.size = grown_sheet.content.length;
+        const grown_bytes = CFB.write(grown, {
+            type: 'buffer', fileType: 'zip', compression: true,
+        });
+        bytes = grown_bytes instanceof Uint8Array
+            ? grown_bytes
+            : new Uint8Array(grown_bytes as ArrayBufferLike);
+
+        await vscode_mock.__getActiveWatchers()[0].__fireChange();
+        await wait_for_observable(() => source_refresh_snapshots(panel).length > 0);
+        const reconciled = latest_snapshot(panel).state?.pendingEdits?.[0];
+        expect(reconciled?.appendBasis?.columnCount).toBe(5);
+        expect(reconciled?.formatTemplates?.[0]?.format).toMatchObject({
+            cellStyleIndexes: [0, null, null, 1, null],
+            cellNumberFormats: [
+                null,
+                { code: 'm/d/yy' },
+                { code: 'm/d/yy' },
+                { code: 'm/d/yy' },
+                { code: 'm/d/yy' },
+            ],
+            cellFontStyles: [
+                { bold: false, italic: false },
+                { bold: false, italic: false },
+                { bold: false, italic: false },
+                { bold: false, italic: false },
+                { bold: false, italic: false },
+            ],
+        });
+        expect(reconciled?.conflicts ?? []).toEqual([]);
+    });
+
+    it('conflicts instead of expanding a row display recipe past the pending byte bound', async () => {
+        const long_number_format = '0'.repeat(32_767);
+        const styled = CFB.read(bytes, { type: 'buffer' });
+        const styles = CFB.find(styled, '/xl/styles.xml')!;
+        const styles_before = Buffer.from(styles.content as Uint8Array).toString('utf8');
+        const styles_after = styles_before
+            .replace(
+                '<fonts count="1"',
+                `<numFmts count="1"><numFmt numFmtId="164" formatCode="${long_number_format}"/></numFmts><fonts count="1"`,
+            )
+            .replace(
+                '<xf numFmtId="14" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>',
+                '<xf numFmtId="164" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>',
+            );
+        expect(styles_after).not.toBe(styles_before);
+        styles.content = Buffer.from(styles_after, 'utf8');
+        styles.size = styles.content.length;
+        const styled_sheet = CFB.find(styled, '/xl/worksheets/sheet1.xml')!;
+        const sheet_before = Buffer.from(styled_sheet.content as Uint8Array).toString('utf8');
+        const sheet_after = sheet_before.replace(
+            '<row r="3" spans="1:4" x14ac:dyDescent="0.25">',
+            '<row r="3" spans="1:4" x14ac:dyDescent="0.25" s="1" customFormat="1">',
+        ).replace('<c r="A3"', '<c r="A3" s="0"');
+        expect(sheet_after).not.toBe(sheet_before);
+        styled_sheet.content = Buffer.from(sheet_after, 'utf8');
+        styled_sheet.size = styled_sheet.content.length;
+        const styled_bytes = CFB.write(styled, {
+            type: 'buffer', fileType: 'zip', compression: true,
+        });
+        bytes = styled_bytes instanceof Uint8Array
+            ? styled_bytes
+            : new Uint8Array(styled_bytes as ArrayBufferLike);
+
+        const state = versioned_state_store({});
+        const panel = await open_ready_xlsx(file_path, state);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'edit', sheetIndex: 0 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+        const snapshot = latest_snapshot(panel);
+        await panel.__receive({
+            type: 'requestAppendRows',
+            requestId: 'append-before-extreme-growth',
+            editSessionId: session,
+            worksheet: { sheetIndex: 0, sheetName: 'People', worksheetId: '1' },
+            sourceGeneration: snapshot.sourceGeneration,
+            count: 1,
+        });
+        const admission = panel.__messages.find((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { type?: unknown }).type === 'appendRowsResult'
+            && (message as { requestId?: unknown }).requestId
+                === 'append-before-extreme-growth'
+        )) as Extract<import('../types').HostMessage, { type: 'appendRowsResult' }>;
+        expect(admission.granted, admission.reason).toBe(true);
+        expect(admission.formatTemplate?.format).toMatchObject({
+            rowNumberFormat: { code: long_number_format },
+        });
+        await panel.__receive({
+            type: 'settleRowAdmission',
+            requestId: 'append-before-extreme-growth',
+            editSessionId: session,
+            accepted: true,
+        });
+        await panel.__receive({
+            type: 'pendingChangesChanged',
+            sourceGeneration: latest_snapshot(panel).sourceGeneration,
+            editSessionId: session,
+            sequence: 1,
+            changes: {
+                sheetIndex: 0,
+                sheetName: 'People',
+                worksheetId: '1',
+                cells: {},
+                formatTemplates: [admission.formatTemplate!],
+                appendedRows: [{
+                    id: admission.rowIds![0],
+                    cells: {},
+                    formatTemplateId: admission.formatTemplate!.id,
+                    createdOrder: 1,
+                }],
+                tailRemovals: [],
+                appendBasis: admission.appendBasis!,
+                conflicts: [],
+            },
+        });
+        await controller_of(panel).drain();
+
+        const grown = CFB.read(bytes, { type: 'buffer' });
+        const grown_sheet = CFB.find(grown, '/xl/worksheets/sheet1.xml')!;
+        const grown_before = Buffer.from(grown_sheet.content as Uint8Array).toString('utf8');
+        const grown_after = grown_before
+            .replace('<dimension ref="A1:D3"/>', '<dimension ref="A1:IV3"/>')
+            .replace(/ spans="1:4"/g, ' spans="1:256"')
+            .replace(
+                '<c r="D3" s="1"><v>45078</v></c>',
+                '<c r="D3" s="1"><v>45078</v></c><c r="IV3"><v>1</v></c>',
+            );
+        expect(grown_after).not.toBe(grown_before);
+        grown_sheet.content = Buffer.from(grown_after, 'utf8');
+        grown_sheet.size = grown_sheet.content.length;
+        const grown_bytes = CFB.write(grown, {
+            type: 'buffer', fileType: 'zip', compression: true,
+        });
+        bytes = grown_bytes instanceof Uint8Array
+            ? grown_bytes
+            : new Uint8Array(grown_bytes as ArrayBufferLike);
+        expect((await parse_xlsx(bytes)).data.sheets[0].columnCount).toBe(256);
+        vscode_mock.__setStatImplementation(async () => ({
+            size: bytes.byteLength,
+            mtime: 2,
+        }));
+
+        await vscode_mock.__getActiveWatchers()[0].__fireChange();
+        await controller_of(panel).drain();
+        await wait_for_observable(() => source_refresh_snapshots(panel).length > 0);
+        const reconciled = latest_snapshot(panel).state?.pendingEdits?.[0];
+        expect(reconciled?.appendBasis).toEqual(admission.appendBasis);
+        expect(reconciled?.formatTemplates).toEqual([admission.formatTemplate]);
+        expect(reconciled?.conflicts).toContainEqual({
+            reason: 'templateChanged',
+            pendingRowIds: admission.rowIds,
+            tailRemovalIds: [],
+        });
+    });
+
+    it('releases a refused maximum-size append reservation immediately', async () => {
+        const panel = await open_ready_xlsx(file_path);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'edit', sheetIndex: 0 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+        const snapshot = latest_snapshot(panel);
+        const request = async (requestId: string, count: number) => {
+            await panel.__receive({
+                type: 'requestAppendRows',
+                requestId,
+                editSessionId: session,
+                worksheet: { sheetIndex: 0, sheetName: 'People', worksheetId: '1' },
+                sourceGeneration: snapshot.sourceGeneration,
+                count,
+            });
+            return panel.__messages.find((message) => (
+                typeof message === 'object'
+                && message !== null
+                && (message as { type?: unknown }).type === 'appendRowsResult'
+                && (message as { requestId?: unknown }).requestId === requestId
+            )) as Extract<import('../types').HostMessage, { type: 'appendRowsResult' }>;
+        };
+
+        const refused_locally = await request('maximum-reservation', 10_000);
+        expect(refused_locally.granted, refused_locally.reason).toBe(true);
+        expect(refused_locally.rowIds).toHaveLength(10_000);
+        await panel.__receive({
+            type: 'settleRowAdmission',
+            requestId: 'maximum-reservation',
+            editSessionId: session,
+            accepted: false,
+        });
+
+        const current = await request('after-cancel', 1);
+        expect(current.granted, current.reason).toBe(true);
+        expect(current.rowIds).toHaveLength(1);
+        expect(current.appendBasis?.provisionalRowCount).toBe(1);
+        expect(current.appendBasis?.provisionalStartRow)
+            .toBe(refused_locally.appendBasis?.provisionalStartRow);
+        expect(current.formatTemplate?.id).not.toBe(refused_locally.formatTemplate?.id);
+    });
+
+    it('cancels an undelivered admission when the receiver reloads', async () => {
+        const panel = await open_ready_xlsx(file_path);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'first', sheetIndex: 0 });
+        const first_session = latest_edit_session(panel)!.editSessionId!;
+        const snapshot = latest_snapshot(panel);
+        await panel.__receive({
+            type: 'requestAppendRows',
+            requestId: 'stale-admission',
+            editSessionId: first_session,
+            worksheet: { sheetIndex: 0, sheetName: 'People', worksheetId: '1' },
+            sourceGeneration: snapshot.sourceGeneration,
+            count: 1,
+        });
+        const stale = panel.__messages.find((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { type?: unknown }).type === 'appendRowsResult'
+            && (message as { requestId?: unknown }).requestId === 'stale-admission'
+        )) as Extract<import('../types').HostMessage, { type: 'appendRowsResult' }>;
+        expect(stale.granted, stale.reason).toBe(true);
+
+        const prior_snapshots = panel.__messages.filter((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { type?: unknown }).type === 'workbookSnapshot'
+        )).length;
+        await panel.__receive({ type: 'ready' });
+        await wait_for_observable(() => panel.__messages.filter((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { type?: unknown }).type === 'workbookSnapshot'
+        )).length > prior_snapshots);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'second', sheetIndex: 0 });
+        const second_session = latest_edit_session(panel)!.editSessionId!;
+        const reloaded = latest_snapshot(panel);
+        await panel.__receive({
+            type: 'requestAppendRows',
+            requestId: 'fresh-admission',
+            editSessionId: second_session,
+            worksheet: { sheetIndex: 0, sheetName: 'People', worksheetId: '1' },
+            sourceGeneration: reloaded.sourceGeneration,
+            count: 1,
+        });
+        const fresh = panel.__messages.find((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { type?: unknown }).type === 'appendRowsResult'
+            && (message as { requestId?: unknown }).requestId === 'fresh-admission'
+        )) as Extract<import('../types').HostMessage, { type: 'appendRowsResult' }>;
+        expect(fresh.granted, fresh.reason).toBe(true);
+        expect(fresh.appendBasis?.provisionalRowCount).toBe(1);
+    });
+
+    it('builds append receipts from canonical cells parsed from the saved XLSX', async () => {
+        const panel = await open_ready_xlsx(file_path);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'edit', sheetIndex: 0 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+        const snapshot = latest_snapshot(panel);
+        await panel.__receive({
+            type: 'requestAppendRows',
+            requestId: 'append-canonical',
+            editSessionId: session,
+            worksheet: { sheetIndex: 0, sheetName: 'People', worksheetId: '1' },
+            sourceGeneration: snapshot.sourceGeneration,
+            count: 2,
+        });
+        const admission = panel.__messages.find((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { type?: unknown }).type === 'appendRowsResult'
+            && (message as { requestId?: unknown }).requestId === 'append-canonical'
+        )) as Extract<import('../types').HostMessage, { type: 'appendRowsResult' }>;
+        expect(admission.granted, admission.reason).toBe(true);
+        expect(admission.appendBasis?.provisionalRowCount).toBe(2);
+        await panel.__receive({
+            type: 'settleRowAdmission',
+            requestId: 'append-canonical',
+            editSessionId: session,
+            accepted: true,
+        });
+        const rich = { runs: [{ text: 'Rich', style: { bold: true } }] };
+        const formula_reference_bases = [{
+            targetSheetIndex: 0,
+            targetSheetName: 'People',
+            targetWorksheetId: '1',
+            provisionalStartRow: 3,
+            provisionalRowCount: 2,
+        }];
+        const input_rows = [{
+            id: admission.rowIds![0],
+            cells: {
+                0: { value: '1.0', valueEditOrder: 1 },
+                1: { value: 'TRUE', valueEditOrder: 1 },
+                2: { value: '=1+1', valueEditOrder: 1 },
+                3: { value: '2024-01-01', valueEditOrder: 1 },
+            },
+            formatTemplateId: admission.formatTemplate!.id,
+            createdOrder: 1,
+        }, {
+            id: admission.rowIds![1],
+            cells: {
+                0: { value: 'Rich', valueRuns: rich, valueEditOrder: 2 },
+                1: {
+                    value: 'site',
+                    link: { kind: 'external' as const, target: 'HTTPS://Example.COM/a/../b' },
+                    valueEditOrder: 2,
+                },
+                2: {
+                    value: '=A4',
+                    valueEditOrder: 2,
+                    formulaReferenceBases: formula_reference_bases,
+                },
+            },
+            formatTemplateId: admission.formatTemplate!.id,
+            createdOrder: 2,
+        }];
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: workbook_request(session, 'save-canonical-append', save_worksheet({
+                edits: {},
+                dirtyEdits: {},
+                structuralChanges: {
+                    formatTemplates: [admission.formatTemplate!],
+                    appendedRows: input_rows,
+                    tailRemovals: [],
+                    appendBasis: admission.appendBasis!,
+                    conflicts: [],
+                },
+            })),
+        });
+        await wait_for_observable(() => save_results(panel).some(
+            (result) => result.lifecycle.operation.saveRequestId === 'save-canonical-append',
+        ));
+
+        const result = save_results(panel).find(
+            (candidate) => candidate.lifecycle.operation.saveRequestId === 'save-canonical-append',
+        )!;
+        expect(result.success).toBe(true);
+        expect(result.receipt?.appendedRows).toHaveLength(2);
+        const parsed = await parse_xlsx(bytes);
+        for (const assignment of result.receipt!.appendedRows) {
+            const persisted = parsed.data.sheets[0].rows[assignment.sourceRow];
+            expect(assignment.savedCells).toBeDefined();
+            for (const [column_text, cell] of Object.entries(assignment.savedCells!)) {
+                const persisted_cell = persisted[Number(column_text)]!;
+                expect(cell.value).toBe(persisted_cell.formula ?? String(persisted_cell.raw ?? ''));
+                expect(cell.valueRuns).toEqual(persisted_cell.richText);
+                expect(cell.link).toEqual(persisted_cell.hyperlink);
+            }
+        }
+        expect(result.receipt!.appendedRows[0].savedCells![0].value).not.toBe('1.0');
+        expect(result.receipt!.appendedRows[1].savedCells![0].valueRuns).toEqual(rich);
+        expect(result.receipt!.appendedRows[1].savedCells![1].link).toEqual({
+            kind: 'external',
+            target: 'https://example.com/b',
+        });
+        expect(result.receipt!.appendedRows[1].savedRow?.cells[2].formulaReferenceBases)
+            .toEqual(formula_reference_bases);
+    });
+
+    it('recalculates workbook formula caches for a completely blank append', async () => {
+        const file = CFB.read(bytes, { type: 'buffer' });
+        const formula_sheet = CFB.find(file, '/xl/worksheets/sheet2.xml')!;
+        const formula_xml = Buffer.from(formula_sheet.content as Uint8Array).toString('utf8')
+            .replace('<c r="C2"><v>100</v></c>', '<c r="C2"><f>1+1</f><v>99</v></c>');
+        expect(formula_xml).toContain('<c r="C2"><f>1+1</f><v>99</v></c>');
+        formula_sheet.content = Buffer.from(formula_xml, 'utf8');
+        formula_sheet.size = formula_sheet.content.length;
+        const patched = CFB.write(file, { type: 'buffer', fileType: 'zip', compression: true });
+        bytes = patched instanceof Uint8Array
+            ? patched
+            : new Uint8Array(patched as ArrayBufferLike);
+
+        const panel = await open_ready_xlsx(file_path);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'edit', sheetIndex: 0 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+        const snapshot = latest_snapshot(panel);
+        await panel.__receive({
+            type: 'requestAppendRows',
+            requestId: 'append-blank',
+            editSessionId: session,
+            worksheet: { sheetIndex: 0, sheetName: 'People', worksheetId: '1' },
+            sourceGeneration: snapshot.sourceGeneration,
+            count: 1,
+        });
+        const admission = panel.__messages.find((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { type?: unknown }).type === 'appendRowsResult'
+            && (message as { requestId?: unknown }).requestId === 'append-blank'
+        )) as Extract<import('../types').HostMessage, { type: 'appendRowsResult' }>;
+        expect(admission.granted, admission.reason).toBe(true);
+        await panel.__receive({
+            type: 'settleRowAdmission',
+            requestId: 'append-blank',
+            editSessionId: session,
+            accepted: true,
+        });
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: workbook_request(session, 'save-blank-append', save_worksheet({
+                edits: {},
+                dirtyEdits: {},
+                structuralChanges: {
+                    formatTemplates: [admission.formatTemplate!],
+                    appendedRows: [{
+                        id: admission.rowIds![0],
+                        cells: {},
+                        formatTemplateId: admission.formatTemplate!.id,
+                        createdOrder: 1,
+                    }],
+                    tailRemovals: [],
+                    appendBasis: admission.appendBasis!,
+                    conflicts: [],
+                },
+            })),
+        });
+        await wait_for_observable(() => save_results(panel).some(
+            (result) => result.lifecycle.operation.saveRequestId === 'save-blank-append',
+        ));
+
+        expect(save_results(panel).find(
+            (result) => result.lifecycle.operation.saveRequestId === 'save-blank-append',
+        )?.success).toBe(true);
+        const saved_formula_xml = read_part(bytes, 'xl/worksheets/sheet2.xml')!.toString('utf8');
+        expect(saved_formula_xml).toContain('<c r="C2"><f>1+1</f></c>');
+        expect(saved_formula_xml).not.toContain('<f>1+1</f><v>99</v>');
+    });
+
+    it('returns a structured rejection with every affected structural identity', async () => {
+        const panel = await open_ready_xlsx(file_path);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'edit', sheetIndex: 0 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+        const snapshot = latest_snapshot(panel);
+        await panel.__receive({
+            type: 'requestAppendRows',
+            requestId: 'append-conflicted',
+            editSessionId: session,
+            worksheet: { sheetIndex: 0, sheetName: 'People', worksheetId: '1' },
+            sourceGeneration: snapshot.sourceGeneration,
+            count: 1,
+        });
+        const admission = panel.__messages.find((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { type?: unknown }).type === 'appendRowsResult'
+            && (message as { requestId?: unknown }).requestId === 'append-conflicted'
+        )) as Extract<import('../types').HostMessage, { type: 'appendRowsResult' }>;
+        await panel.__receive({
+            type: 'settleRowAdmission',
+            requestId: 'append-conflicted',
+            editSessionId: session,
+            accepted: true,
+        });
+        const untouched = bytes;
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: workbook_request(session, 'save-conflicted-append', save_worksheet({
+                edits: {},
+                dirtyEdits: {},
+                structuralChanges: {
+                    formatTemplates: [admission.formatTemplate!],
+                    appendedRows: [{
+                        id: admission.rowIds![0],
+                        cells: {},
+                        formatTemplateId: admission.formatTemplate!.id,
+                        createdOrder: 1,
+                    }],
+                    tailRemovals: [],
+                    appendBasis: admission.appendBasis!,
+                    conflicts: [{
+                        reason: 'rowLimitExceeded',
+                        pendingRowIds: admission.rowIds!,
+                        tailRemovalIds: [],
+                    }],
+                },
+            })),
+        });
+        await wait_for_observable(() => save_results(panel).some(
+            (result) => result.lifecycle.operation.saveRequestId === 'save-conflicted-append',
+        ));
+
+        expect(save_results(panel).find(
+            (result) => result.lifecycle.operation.saveRequestId === 'save-conflicted-append',
+        )).toMatchObject({
+            success: false,
+            rejection: {
+                reason: 'structuralConflict',
+                worksheetOperationIndex: 0,
+                structuralReason: 'rowLimitExceeded',
+                pendingRowIds: admission.rowIds,
+                tailRemovalIds: [],
+            },
+        });
+        expect(bytes).toBe(untouched);
+    });
+
+    it('round-trips complete admitted row basis through durable publication', async () => {
+        const state = versioned_state_store({});
+        const panel = await open_ready_xlsx(file_path, state);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'edit', sheetIndex: 0 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+        const snapshot = latest_snapshot(panel);
+        await panel.__receive({
+            type: 'requestAppendRows',
+            requestId: 'append',
+            editSessionId: session,
+            worksheet: { sheetIndex: 0, sheetName: 'People', worksheetId: '1' },
+            sourceGeneration: snapshot.sourceGeneration,
+            count: 1,
+        });
+        const admission = panel.__messages.find((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { type?: unknown }).type === 'appendRowsResult'
+            && (message as { requestId?: unknown }).requestId === 'append'
+        )) as Extract<import('../types').HostMessage, { type: 'appendRowsResult' }>;
+        expect(admission.granted, admission.reason).toBe(true);
+        await panel.__receive({
+            type: 'settleRowAdmission',
+            requestId: 'append',
+            editSessionId: session,
+            accepted: true,
+        });
+        await panel.__receive({
+            type: 'pendingChangesChanged',
+            sourceGeneration: latest_snapshot(panel).sourceGeneration,
+            editSessionId: session,
+            sequence: 1,
+            changes: {
+                sheetIndex: 0,
+                sheetName: 'People',
+                worksheetId: '1',
+                cells: {},
+                formatTemplates: [admission.formatTemplate!],
+                appendedRows: [{
+                    id: admission.rowIds![0],
+                    cells: {},
+                    formatTemplateId: admission.formatTemplate!.id,
+                    createdOrder: 1,
+                }],
+                tailRemovals: [],
+                appendBasis: admission.appendBasis!,
+                conflicts: [],
+            },
+        });
+        await controller_of(panel).drain();
+
+        expect(state.get_state(file_path).pendingEdits?.[0]).toMatchObject({
+            appendBasis: admission.appendBasis,
+            conflicts: [],
+        });
+
+        await panel.__receive({
+            type: 'pendingChangesChanged',
+            sourceGeneration: latest_snapshot(panel).sourceGeneration,
+            editSessionId: session,
+            sequence: 2,
+            changes: {
+                sheetIndex: 0,
+                sheetName: 'People',
+                worksheetId: '1',
+                cells: {},
+                formatTemplates: [admission.formatTemplate!],
+                appendedRows: [{
+                    id: admission.rowIds![0],
+                    cells: {},
+                    formatTemplateId: admission.formatTemplate!.id,
+                    createdOrder: 1,
+                }],
+                tailRemovals: [],
+                appendBasis: {
+                    ...admission.appendBasis!,
+                    sourceRowCount: admission.appendBasis!.sourceRowCount + 1,
+                },
+                conflicts: [],
+            },
+        });
+        await controller_of(panel).drain();
+        expect(state.get_state(file_path).pendingEdits?.[0]?.appendBasis)
+            .toEqual(admission.appendBasis);
+        expect(panel.__messages).not.toContainEqual({
+            type: 'pendingEditsAcknowledged',
+            editSessionId: session,
+            sequence: 2,
+        });
+
+        await panel.__receive({
+            type: 'pendingChangesChanged',
+            sourceGeneration: latest_snapshot(panel).sourceGeneration,
+            editSessionId: session,
+            sequence: 3,
+            changes: {
+                sheetIndex: 0,
+                sheetName: 'People',
+                worksheetId: '1',
+                cells: {},
+                formatTemplates: [admission.formatTemplate!],
+                appendedRows: [{
+                    id: admission.rowIds![0],
+                    cells: {},
+                    formatTemplateId: admission.formatTemplate!.id,
+                    createdOrder: 1,
+                }],
+                tailRemovals: [{
+                    appendHistoryId: 'forged-history',
+                    sourceRow: snapshot.meta.sheets[0].sourceRowCount - 1,
+                    savedFingerprint: 'forged-fingerprint',
+                    savedRow: { cells: {}, format: { kind: 'none' } },
+                }],
+                appendBasis: admission.appendBasis!,
+                conflicts: [],
+            },
+        });
+        await controller_of(panel).drain();
+        expect(state.get_state(file_path).pendingEdits?.[0]?.tailRemovals).toEqual([]);
+        expect(panel.__messages).not.toContainEqual({
+            type: 'pendingEditsAcknowledged',
+            editSessionId: session,
+            sequence: 3,
+        });
+
+        await panel.__receive({ type: 'releaseEditSession', editSessionId: session });
+        await panel.__receive({ type: 'requestEditSession', requestId: 'restore', sheetIndex: 0 });
+        const restored = latest_edit_session(panel) as typeof admission & {
+            pendingChanges?: import('../types').WorksheetPendingChanges;
+        };
+        expect(restored.pendingChanges).toMatchObject({
+            appendBasis: admission.appendBasis,
+            // Reconciliation proved the blank row's formula mapping unambiguous,
+            // so the stale formula-only conflict is resolved on restoration.
+            conflicts: [],
+        });
+    });
+
+    it('binds every admitted row identity to the exact format template it was granted', async () => {
+        const state = versioned_state_store({});
+        const panel = await open_ready_xlsx(file_path, state);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'edit', sheetIndex: 0 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+        const request_append = async (requestId: string) => {
+            const snapshot = latest_snapshot(panel);
+            await panel.__receive({
+                type: 'requestAppendRows',
+                requestId,
+                editSessionId: session,
+                worksheet: { sheetIndex: 0, sheetName: 'People', worksheetId: '1' },
+                sourceGeneration: snapshot.sourceGeneration,
+                count: 1,
+            });
+            return panel.__messages.find((message) => (
+                typeof message === 'object'
+                && message !== null
+                && (message as { type?: unknown }).type === 'appendRowsResult'
+                && (message as { requestId?: unknown }).requestId === requestId
+            )) as Extract<import('../types').HostMessage, { type: 'appendRowsResult' }>;
+        };
+        const first = await request_append('first-format');
+        expect(first.granted, first.reason).toBe(true);
+        expect(first.appendBasis?.provisionalRowCount).toBe(1);
+        await panel.__receive({
+            type: 'settleRowAdmission',
+            requestId: 'first-format',
+            editSessionId: session,
+            accepted: true,
+        });
+
+        const before_resize = latest_snapshot(panel);
+        await panel.__receive({
+            type: 'setRowHeights',
+            sheetIndex: 0,
+            rows: [{ start: 1, end: 1 }],
+            height: 44,
+            generation: before_resize.generation,
+            sourceGeneration: before_resize.sourceGeneration,
+        });
+        await wait_for_observable(() => state.get_state(file_path).rowHeights?.[0]?.[2] === 44);
+        const second = await request_append('second-format');
+        expect(second.granted, second.reason).toBe(true);
+        expect(second.appendBasis?.provisionalRowCount).toBe(2);
+        expect(second.formatTemplate!.id).not.toBe(first.formatTemplate!.id);
+        expect(second.formatTemplate?.format).toMatchObject({ viewerRowHeight: 44 });
+        await panel.__receive({
+            type: 'settleRowAdmission',
+            requestId: 'second-format',
+            editSessionId: session,
+            accepted: true,
+        });
+
+        const rows = [{
+            id: first.rowIds![0],
+            cells: {},
+            formatTemplateId: second.formatTemplate!.id,
+            createdOrder: 1,
+        }, {
+            id: second.rowIds![0],
+            cells: {},
+            formatTemplateId: first.formatTemplate!.id,
+            createdOrder: 2,
+        }];
+        const changes = {
+            sheetIndex: 0,
+            sheetName: 'People',
+            worksheetId: '1',
+            cells: {},
+            formatTemplates: [first.formatTemplate!, second.formatTemplate!],
+            appendedRows: rows,
+            tailRemovals: [],
+            appendBasis: second.appendBasis!,
+            conflicts: [],
+        };
+        await panel.__receive({
+            type: 'pendingChangesChanged',
+            sourceGeneration: latest_snapshot(panel).sourceGeneration,
+            editSessionId: session,
+            sequence: 1,
+            changes,
+        });
+        await controller_of(panel).drain();
+        expect(panel.__messages).not.toContainEqual({
+            type: 'pendingChangesAcknowledged',
+            editSessionId: session,
+            sequence: 1,
+        });
+        expect(state.get_state(file_path).pendingEdits).toBeUndefined();
+
+        const valid_changes = {
+            ...changes,
+            appendedRows: [{
+                ...rows[0],
+                formatTemplateId: first.formatTemplate!.id,
+            }, {
+                ...rows[1],
+                formatTemplateId: second.formatTemplate!.id,
+            }],
+        };
+        await panel.__receive({
+            type: 'pendingChangesChanged',
+            sourceGeneration: latest_snapshot(panel).sourceGeneration,
+            editSessionId: session,
+            sequence: 1,
+            changes: valid_changes,
+        });
+        await controller_of(panel).drain();
+        expect(panel.__messages).toContainEqual({
+            type: 'pendingChangesAcknowledged',
+            editSessionId: session,
+            sequence: 1,
+        });
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: workbook_request(
+                session,
+                'save-inherited-viewer-height',
+                save_worksheet({
+                    edits: {},
+                    dirtyEdits: {},
+                    structuralChanges: valid_changes,
+                }),
+            ),
+        });
+        await wait_for_observable(() => save_results(panel).some(
+            (result) => result.lifecycle?.operation.saveRequestId
+                === 'save-inherited-viewer-height',
+        ));
+        const result = save_results(panel).find(
+            (candidate) => candidate.lifecycle?.operation.saveRequestId
+                === 'save-inherited-viewer-height',
+        );
+        expect(result?.success).toBe(true);
+        expect(result?.receipt?.appendedRows.find(
+            (row) => row.pendingRowId === second.rowIds?.[0],
+        )?.savedRow).toMatchObject({
+            viewerRowHeight: 44,
+            format: { viewerRowHeight: 44 },
+        });
+    });
+
+    it('uses one canonical append ledger across equivalent worksheet target spellings', async () => {
+        const panel = await open_ready_xlsx(file_path);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'edit', sheetIndex: 0 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+        const snapshot = latest_snapshot(panel);
+        await panel.__receive({
+            type: 'requestAppendRows',
+            requestId: 'name-only-grant',
+            editSessionId: session,
+            worksheet: { sheetIndex: 0, sheetName: 'People' },
+            sourceGeneration: snapshot.sourceGeneration,
+            count: 1,
+        });
+        const admission = panel.__messages.find((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { type?: unknown }).type === 'appendRowsResult'
+            && (message as { requestId?: unknown }).requestId === 'name-only-grant'
+        )) as Extract<import('../types').HostMessage, { type: 'appendRowsResult' }>;
+        expect(admission.granted, admission.reason).toBe(true);
+        await panel.__receive({
+            type: 'settleRowAdmission',
+            requestId: 'name-only-grant',
+            editSessionId: session,
+            accepted: true,
+        });
+
+        await panel.__receive({
+            type: 'pendingChangesChanged',
+            sourceGeneration: latest_snapshot(panel).sourceGeneration,
+            editSessionId: session,
+            sequence: 1,
+            changes: {
+                sheetIndex: 0,
+                worksheetId: '1',
+                cells: {},
+                formatTemplates: [admission.formatTemplate!],
+                appendedRows: [{
+                    id: admission.rowIds![0],
+                    cells: {},
+                    formatTemplateId: admission.formatTemplate!.id,
+                    createdOrder: 1,
+                }],
+                tailRemovals: [],
+                appendBasis: admission.appendBasis!,
+                conflicts: [],
+            },
+        });
+        await controller_of(panel).drain();
+
+        expect(panel.__messages).toContainEqual({
+            type: 'pendingChangesAcknowledged',
+            editSessionId: session,
+            sequence: 1,
+        });
+    });
+
+    it('rejects a live row-admission request identity reused on another worksheet', async () => {
+        const panel = await open_ready_xlsx(file_path);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'edit', sheetIndex: 0 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+        const source_generation = latest_snapshot(panel).sourceGeneration;
+        await panel.__receive({
+            type: 'requestAppendRows',
+            requestId: 'same-request',
+            editSessionId: session,
+            worksheet: { sheetIndex: 0, sheetName: 'People', worksheetId: '1' },
+            sourceGeneration: source_generation,
+            count: 1,
+        });
+        await panel.__receive({
+            type: 'requestAppendRows',
+            requestId: 'same-request',
+            editSessionId: session,
+            worksheet: { sheetIndex: 1, sheetName: 'Inventory', worksheetId: '2' },
+            sourceGeneration: source_generation,
+            count: 1,
+        });
+        const results = panel.__messages.filter((message): message is Extract<
+            import('../types').HostMessage,
+            { type: 'appendRowsResult' }
+        > => typeof message === 'object'
+            && message !== null
+            && (message as { type?: unknown }).type === 'appendRowsResult'
+            && (message as { requestId?: unknown }).requestId === 'same-request');
+        expect(results).toHaveLength(2);
+        expect(results[0].granted).toBe(true);
+        expect(results[1]).toMatchObject({ granted: false });
+        await panel.__receive({
+            type: 'settleRowAdmission',
+            requestId: 'same-request',
+            editSessionId: session,
+            accepted: false,
+        });
+        await panel.__receive({
+            type: 'requestAppendRows',
+            requestId: 'fresh-inventory-request',
+            editSessionId: session,
+            worksheet: { sheetIndex: 1, sheetName: 'Inventory', worksheetId: '2' },
+            sourceGeneration: source_generation,
+            count: 1,
+        });
+        expect(panel.__messages).toContainEqual(expect.objectContaining({
+            type: 'appendRowsResult',
+            requestId: 'fresh-inventory-request',
+            granted: true,
+        }));
+    });
+
+    it('rejects a partial publication of one accepted row-admission batch', async () => {
+        const state = versioned_state_store({});
+        const panel = await open_ready_xlsx(file_path, state);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'edit', sheetIndex: 0 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+        const snapshot = latest_snapshot(panel);
+        await panel.__receive({
+            type: 'requestAppendRows',
+            requestId: 'two-row-batch',
+            editSessionId: session,
+            worksheet: { sheetIndex: 0, sheetName: 'People', worksheetId: '1' },
+            sourceGeneration: snapshot.sourceGeneration,
+            count: 2,
+        });
+        const admission = panel.__messages.find((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { type?: unknown }).type === 'appendRowsResult'
+            && (message as { requestId?: unknown }).requestId === 'two-row-batch'
+        )) as Extract<import('../types').HostMessage, { type: 'appendRowsResult' }>;
+        await panel.__receive({
+            type: 'settleRowAdmission',
+            requestId: 'two-row-batch',
+            editSessionId: session,
+            accepted: true,
+        });
+        const rows = admission.rowIds!.map((id, index) => ({
+            id,
+            cells: {},
+            formatTemplateId: admission.formatTemplate!.id,
+            createdOrder: index + 1,
+        }));
+        const changes = {
+            sheetIndex: 0,
+            sheetName: 'People',
+            worksheetId: '1',
+            cells: {},
+            formatTemplates: [admission.formatTemplate!],
+            appendedRows: rows,
+            tailRemovals: [],
+            appendBasis: admission.appendBasis!,
+            conflicts: [],
+        };
+        await panel.__receive({
+            type: 'pendingChangesChanged',
+            sourceGeneration: latest_snapshot(panel).sourceGeneration,
+            editSessionId: session,
+            sequence: 1,
+            changes: { ...changes, appendedRows: [rows[0]] },
+        });
+        await controller_of(panel).drain();
+        expect(panel.__messages).not.toContainEqual({
+            type: 'pendingChangesAcknowledged',
+            editSessionId: session,
+            sequence: 1,
+        });
+        expect(state.get_state(file_path).pendingEdits).toBeUndefined();
+
+        await panel.__receive({
+            type: 'pendingChangesChanged',
+            sourceGeneration: latest_snapshot(panel).sourceGeneration,
+            editSessionId: session,
+            sequence: 1,
+            changes,
+        });
+        await controller_of(panel).drain();
+        expect(panel.__messages).toContainEqual({
+            type: 'pendingChangesAcknowledged',
+            editSessionId: session,
+            sequence: 1,
+        });
+        expect(state.get_state(file_path).pendingEdits?.[0]?.appendedRows).toEqual(rows);
+    });
+
+    it('rejects partial Save and replay of one accepted row-admission gesture', async () => {
+        const state = versioned_state_store({});
+        const untouched = bytes;
+        const panel = await open_ready_xlsx(file_path, state);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'edit', sheetIndex: 0 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+        const snapshot = latest_snapshot(panel);
+        await panel.__receive({
+            type: 'requestAppendRows',
+            requestId: 'two-row-direct-consumer',
+            editSessionId: session,
+            worksheet: { sheetIndex: 0, sheetName: 'People', worksheetId: '1' },
+            sourceGeneration: snapshot.sourceGeneration,
+            count: 2,
+        });
+        const admission = panel.__messages.find((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { type?: unknown }).type === 'appendRowsResult'
+            && (message as { requestId?: unknown }).requestId === 'two-row-direct-consumer'
+        )) as Extract<import('../types').HostMessage, { type: 'appendRowsResult' }>;
+        await panel.__receive({
+            type: 'settleRowAdmission',
+            requestId: 'two-row-direct-consumer',
+            editSessionId: session,
+            accepted: true,
+        });
+        const partial = {
+            formatTemplates: [admission.formatTemplate!],
+            appendedRows: [{
+                id: admission.rowIds![0],
+                cells: {},
+                formatTemplateId: admission.formatTemplate!.id,
+                createdOrder: 1,
+            }],
+            tailRemovals: [],
+            appendBasis: admission.appendBasis!,
+            conflicts: [],
+        };
+
+        const save_count = save_results(panel).length;
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: workbook_request(session, 'partial-direct-save', save_worksheet({
+                edits: {},
+                dirtyEdits: {},
+                structuralChanges: partial,
+            })),
+        });
+        await wait_for_observable(() => save_results(panel).length > save_count);
+        expect(save_results(panel).at(-1)?.success).toBe(false);
+        expect(bytes).toBe(untouched);
+
+        await panel.__receive({
+            type: 'prepareHistoryReplay',
+            request: {
+                requestId: 'partial-direct-replay-prepare',
+                replayId: 'partial-direct-replay',
+                cells: [],
+                highlights: [],
+                structures: [{
+                    ordinal: 0,
+                    worksheet: { sheetIndex: 0, sheetName: 'People', worksheetId: '1' },
+                    expected: {
+                        formatTemplates: [],
+                        appendedRows: [],
+                        tailRemovals: [],
+                        conflicts: [],
+                    },
+                    desired: partial,
+                }],
+                focus: {
+                    worksheet: { sheetIndex: 0, sheetName: 'People', worksheetId: '1' },
+                    sourceRowStart: snapshot.meta.sheets[0].sourceRowCount - 1,
+                    sourceRowEnd: snapshot.meta.sheets[0].sourceRowCount - 1,
+                    sourceColumnStart: 0,
+                    sourceColumnEnd: 0,
+                },
+            },
+        });
+        await wait_for_observable(() => panel.__messages.some((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { type?: unknown }).type === 'historyReplayPrepareRefused'
+            && (message as { refusal?: { replayId?: unknown } }).refusal?.replayId
+                === 'partial-direct-replay'
+        )));
+        expect(panel.__messages).toContainEqual(expect.objectContaining({
+            type: 'historyReplayPrepareRefused',
+            refusal: expect.objectContaining({
+                replayId: 'partial-direct-replay',
+                reason: 'conflict',
+            }),
+        }));
+    });
+
+    it('rejects a structural replay that forges a host-owned conflict', async () => {
+        const state = versioned_state_store({});
+        const panel = await open_ready_xlsx(file_path, state);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'edit', sheetIndex: 0 });
+        const empty = {
+            formatTemplates: [],
+            appendedRows: [],
+            tailRemovals: [],
+            conflicts: [],
+        };
+
+        await panel.__receive({
+            type: 'prepareHistoryReplay',
+            request: {
+                requestId: 'forged-conflict-prepare',
+                replayId: 'forged-conflict-replay',
+                cells: [],
+                highlights: [],
+                structures: [{
+                    ordinal: 0,
+                    worksheet: { sheetIndex: 0, sheetName: 'People', worksheetId: '1' },
+                    expected: empty,
+                    desired: {
+                        ...empty,
+                        conflicts: [{
+                            reason: 'templateChanged',
+                            pendingRowIds: [],
+                            tailRemovalIds: [],
+                        }],
+                    },
+                }],
+                focus: {
+                    worksheet: { sheetIndex: 0, sheetName: 'People', worksheetId: '1' },
+                    sourceRowStart: 0,
+                    sourceRowEnd: 0,
+                    sourceColumnStart: 0,
+                    sourceColumnEnd: 0,
+                },
+            },
+        });
+        await wait_for_observable(() => panel.__messages.some((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { type?: unknown }).type === 'historyReplayPrepared'
+            && (message as { prepared?: { replayId?: unknown } }).prepared?.replayId
+                === 'forged-conflict-replay'
+        )));
+        const prepared = panel.__messages.find((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { type?: unknown }).type === 'historyReplayPrepared'
+            && (message as { prepared?: { replayId?: unknown } }).prepared?.replayId
+                === 'forged-conflict-replay'
+        )) as Extract<import('../types').HostMessage, { type: 'historyReplayPrepared' }>;
+        await panel.__receive({
+            type: 'commitHistoryReplay',
+            request: {
+                requestId: prepared.prepared.requestId,
+                replayId: prepared.prepared.replayId,
+                leaseId: prepared.prepared.leaseId,
+                mutationId: 'forged-conflict-mutation',
+                cells: [],
+                highlights: [],
+                structures: [{ ordinal: 0 }],
+            },
+        });
+        await wait_for_observable(() => panel.__messages.some((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { type?: unknown }).type === 'historyReplayCommitRefused'
+            && (message as { refusal?: { replayId?: unknown } }).refusal?.replayId
+                === 'forged-conflict-replay'
+        )));
+        expect(panel.__messages).toContainEqual(expect.objectContaining({
+            type: 'historyReplayCommitRefused',
+            refusal: expect.objectContaining({
+                replayId: 'forged-conflict-replay',
+                reason: 'conflict',
+            }),
+        }));
+        expect(state.get_state(file_path).pendingEdits).toBeUndefined();
+    });
+
+    it('keeps the conflict reserve unavailable to replayed row content', async () => {
+        const state = versioned_state_store({});
+        const panel = await open_ready_xlsx(file_path, state);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'edit', sheetIndex: 0 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+        const snapshot = latest_snapshot(panel);
+        await panel.__receive({
+            type: 'requestAppendRows',
+            requestId: 'near-cap-replay-admission',
+            editSessionId: session,
+            worksheet: { sheetIndex: 0, sheetName: 'People', worksheetId: '1' },
+            sourceGeneration: snapshot.sourceGeneration,
+            count: 1,
+        });
+        const admission = panel.__messages.find((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { type?: unknown }).type === 'appendRowsResult'
+            && (message as { requestId?: unknown }).requestId === 'near-cap-replay-admission'
+        )) as Extract<import('../types').HostMessage, { type: 'appendRowsResult' }>;
+        expect(admission.granted, admission.reason).toBe(true);
+        await panel.__receive({
+            type: 'settleRowAdmission',
+            requestId: 'near-cap-replay-admission',
+            editSessionId: session,
+            accepted: true,
+        });
+
+        const row = {
+            id: admission.rowIds![0],
+            cells: { 0: { value: '', valueEditOrder: 1 } },
+            formatTemplateId: admission.formatTemplate!.id,
+            createdOrder: 1,
+        };
+        const desired = {
+            formatTemplates: [admission.formatTemplate!],
+            appendedRows: [row],
+            tailRemovals: [],
+            appendBasis: admission.appendBasis!,
+            conflicts: [],
+        };
+        const wire_target = {
+            sheetIndex: 0,
+            sheetName: 'People',
+            worksheetId: '1',
+            cells: {},
+            ...desired,
+        };
+        const base_bytes = Buffer.byteLength(JSON.stringify(wire_target), 'utf8');
+        row.cells[0].value = 'x'.repeat(
+            MAX_PENDING_USER_CHANGES_ENCODED_BYTES - base_bytes + 1,
+        );
+        expect(Buffer.byteLength(JSON.stringify(wire_target), 'utf8'))
+            .toBeGreaterThan(MAX_PENDING_USER_CHANGES_ENCODED_BYTES);
+        expect(Buffer.byteLength(JSON.stringify(wire_target), 'utf8'))
+            .toBeLessThanOrEqual(MAX_PENDING_CHANGES_ENCODED_BYTES);
+
+        await panel.__receive({
+            type: 'prepareHistoryReplay',
+            request: {
+                requestId: 'near-cap-replay-prepare',
+                replayId: 'near-cap-replay',
+                cells: [],
+                highlights: [],
+                structures: [{
+                    ordinal: 0,
+                    worksheet: { sheetIndex: 0, sheetName: 'People', worksheetId: '1' },
+                    expected: {
+                        formatTemplates: [],
+                        appendedRows: [],
+                        tailRemovals: [],
+                        conflicts: [],
+                    },
+                    desired,
+                }],
+                focus: {
+                    worksheet: { sheetIndex: 0, sheetName: 'People', worksheetId: '1' },
+                    sourceRowStart: snapshot.meta.sheets[0].sourceRowCount,
+                    sourceRowEnd: snapshot.meta.sheets[0].sourceRowCount,
+                    sourceColumnStart: 0,
+                    sourceColumnEnd: 0,
+                },
+            },
+        });
+        await wait_for_observable(() => panel.__messages.some((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (
+                (message as { prepared?: { replayId?: unknown } }).prepared?.replayId
+                    === 'near-cap-replay'
+                || (message as { refusal?: { replayId?: unknown } }).refusal?.replayId
+                    === 'near-cap-replay'
+            )
+        )));
+        const prepared = panel.__messages.find((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { type?: unknown }).type === 'historyReplayPrepared'
+            && (message as { prepared?: { replayId?: unknown } }).prepared?.replayId
+                === 'near-cap-replay'
+        )) as Extract<import('../types').HostMessage, { type: 'historyReplayPrepared' }> | undefined;
+        expect(prepared, JSON.stringify(panel.__messages.filter((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { refusal?: { replayId?: unknown } }).refusal?.replayId
+                === 'near-cap-replay'
+        )))).toBeDefined();
+        await panel.__receive({
+            type: 'commitHistoryReplay',
+            request: {
+                requestId: prepared!.prepared.requestId,
+                replayId: prepared!.prepared.replayId,
+                leaseId: prepared!.prepared.leaseId,
+                mutationId: 'near-cap-replay-mutation',
+                cells: [],
+                highlights: [],
+                structures: [{ ordinal: 0 }],
+            },
+        });
+        await wait_for_observable(() => panel.__messages.some((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { type?: unknown }).type === 'historyReplayCommitRefused'
+            && (message as { refusal?: { replayId?: unknown } }).refusal?.replayId
+                === 'near-cap-replay'
+        )));
+        expect(panel.__messages).toContainEqual(expect.objectContaining({
+            type: 'historyReplayCommitRefused',
+            refusal: expect.objectContaining({
+                replayId: 'near-cap-replay',
+                reason: 'conflict',
+            }),
+        }));
+        expect(state.get_state(file_path).pendingEdits).toBeUndefined();
+    });
+
+    it('rejects duplicate resolved replay coordinates before materializing source content', async () => {
+        const panel = await open_ready_xlsx(file_path);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'edit', sheetIndex: 0 });
+        const target = { sheetIndex: 0, sheetName: 'People', worksheetId: '1' };
+        await panel.__receive({
+            type: 'prepareHistoryReplay',
+            request: {
+                requestId: 'duplicate-coordinate-prepare',
+                replayId: 'duplicate-coordinate-replay',
+                cells: [0, 1].map((ordinal) => ({
+                    ordinal,
+                    worksheet: target,
+                    sourceRow: 1,
+                    sourceColumn: 0,
+                    overlay: { kind: 'absent' as const },
+                })),
+                highlights: [],
+                focus: {
+                    worksheet: target,
+                    sourceRowStart: 1,
+                    sourceRowEnd: 1,
+                    sourceColumnStart: 0,
+                    sourceColumnEnd: 0,
+                },
+            },
+        });
+        await wait_for_observable(() => panel.__messages.some((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { refusal?: { replayId?: unknown } }).refusal?.replayId
+                === 'duplicate-coordinate-replay'
+        )));
+        expect(panel.__messages).toContainEqual(expect.objectContaining({
+            type: 'historyReplayPrepareRefused',
+            refusal: expect.objectContaining({
+                replayId: 'duplicate-coordinate-replay',
+                reason: 'malformed',
+            }),
+        }));
+        expect(panel.__messages).not.toContainEqual(expect.objectContaining({
+            type: 'historyReplayPrepared',
+            prepared: expect.objectContaining({ replayId: 'duplicate-coordinate-replay' }),
+        }));
+    });
+
+    it('bounds source-content amplification in the exact prepared response', async () => {
+        const cell_count = 10_000;
+        bytes = build_repeated_shared_string_xlsx(
+            cell_count,
+            'x'.repeat(32_767),
+        );
+        const panel = await open_ready_xlsx(file_path);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'edit', sheetIndex: 0 });
+        const snapshot = latest_snapshot(panel);
+        const sheet = snapshot.meta.sheets[0];
+        expect(sheet.sourceRowCount).toBe(cell_count);
+        const target = {
+            sheetIndex: 0,
+            sheetName: sheet.name,
+            ...(sheet.worksheetId === undefined ? {} : { worksheetId: sheet.worksheetId }),
+        };
+        await panel.__receive({
+            type: 'prepareHistoryReplay',
+            request: {
+                requestId: 'prepared-amplification-prepare',
+                replayId: 'prepared-amplification-replay',
+                cells: Array.from({ length: cell_count }, (_, ordinal) => ({
+                    ordinal,
+                    worksheet: target,
+                    sourceRow: ordinal,
+                    sourceColumn: 0,
+                    overlay: { kind: 'absent' as const },
+                })),
+                highlights: [],
+                focus: {
+                    worksheet: target,
+                    sourceRowStart: 0,
+                    sourceRowEnd: cell_count - 1,
+                    sourceColumnStart: 0,
+                    sourceColumnEnd: 0,
+                },
+            },
+        });
+        await wait_for_observable(() => panel.__messages.some((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { refusal?: { replayId?: unknown } }).refusal?.replayId
+                === 'prepared-amplification-replay'
+        )));
+        expect(panel.__messages).toContainEqual(expect.objectContaining({
+            type: 'historyReplayPrepareRefused',
+            refusal: expect.objectContaining({
+                replayId: 'prepared-amplification-replay',
+                reason: 'unavailable',
+            }),
+        }));
+        expect(panel.__messages).not.toContainEqual(expect.objectContaining({
+            type: 'historyReplayPrepared',
+            prepared: expect.objectContaining({ replayId: 'prepared-amplification-replay' }),
+        }));
+    }, 30_000);
+
+    it('refuses an oversized combined replay terminal before changing durable state', async () => {
+        const sheet_count = 34;
+        bytes = build_many_sheet_xlsx(sheet_count);
+        const state = versioned_state_store({});
+        const panel = await open_ready_xlsx(file_path, state);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'edit', sheetIndex: 0 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+        const snapshot = latest_snapshot(panel);
+        expect(snapshot.meta.sheets).toHaveLength(sheet_count);
+
+        const current_structures: PendingStructuralChanges[] = [];
+        const targets: WorksheetTarget[] = [];
+        for (let sheet_index = 0; sheet_index < sheet_count; sheet_index += 1) {
+            const sheet = snapshot.meta.sheets[sheet_index];
+            const target = {
+                sheetIndex: sheet_index,
+                sheetName: sheet.name,
+                ...(sheet.worksheetId === undefined
+                    ? {}
+                    : { worksheetId: sheet.worksheetId }),
+            };
+            targets.push(target);
+            const request_id = `terminal-bound-admission-${sheet_index}`;
+            await panel.__receive({
+                type: 'requestAppendRows',
+                requestId: request_id,
+                editSessionId: session,
+                worksheet: target,
+                sourceGeneration: snapshot.sourceGeneration,
+                count: 1,
+            });
+            const admission = panel.__messages.find((message) => (
+                typeof message === 'object'
+                && message !== null
+                && (message as { type?: unknown }).type === 'appendRowsResult'
+                && (message as { requestId?: unknown }).requestId === request_id
+            )) as Extract<import('../types').HostMessage, { type: 'appendRowsResult' }>;
+            expect(admission.granted, admission.reason).toBe(true);
+            await panel.__receive({
+                type: 'settleRowAdmission',
+                requestId: request_id,
+                editSessionId: session,
+                accepted: true,
+            });
+            const current = {
+                formatTemplates: [admission.formatTemplate!],
+                appendedRows: [{
+                    id: admission.rowIds![0],
+                    cells: { 0: { value: 'seed' } },
+                    formatTemplateId: admission.formatTemplate!.id,
+                    createdOrder: 1,
+                }],
+                tailRemovals: [],
+                appendBasis: admission.appendBasis!,
+                conflicts: [],
+            };
+            current_structures.push(current);
+            await panel.__receive({
+                type: 'pendingChangesChanged',
+                sourceGeneration: snapshot.sourceGeneration,
+                editSessionId: session,
+                sequence: sheet_index + 1,
+                changes: {
+                    ...target,
+                    cells: {},
+                    ...current,
+                },
+            });
+        }
+        await controller_of(panel).drain();
+
+        // Reused deliberately: the byte measurer must count every logical
+        // occurrence while scanning the shared string's UTF-8 only once.
+        const large = 'x'.repeat(4_050_000);
+        const desired_structures = current_structures.map((current) => ({
+            ...current,
+            appendedRows: [{
+                ...current.appendedRows[0],
+                cells: { 0: { value: large } },
+            }],
+        }));
+        await panel.__receive({
+            type: 'prepareHistoryReplay',
+            request: {
+                requestId: 'terminal-bound-prepare',
+                replayId: 'terminal-bound-replay',
+                cells: targets.map((worksheet, ordinal) => ({
+                    ordinal,
+                    worksheet,
+                    sourceRow: 0,
+                    sourceColumn: 0,
+                    overlay: { kind: 'absent' as const },
+                })),
+                highlights: [],
+                structures: targets.map((worksheet, ordinal) => ({
+                    ordinal,
+                    worksheet,
+                    expected: current_structures[ordinal],
+                    desired: desired_structures[ordinal],
+                })),
+                focus: {
+                    worksheet: targets[0],
+                    sourceRowStart: 0,
+                    sourceRowEnd: 0,
+                    sourceColumnStart: 0,
+                    sourceColumnEnd: 0,
+                },
+            },
+        });
+        await wait_for_observable(() => panel.__messages.some((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { prepared?: { replayId?: unknown } }).prepared?.replayId
+                === 'terminal-bound-replay'
+        )));
+        const prepared = panel.__messages.find((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { type?: unknown }).type === 'historyReplayPrepared'
+            && (message as { prepared?: { replayId?: unknown } }).prepared?.replayId
+                === 'terminal-bound-replay'
+        )) as Extract<import('../types').HostMessage, { type: 'historyReplayPrepared' }>;
+
+        await panel.__receive({
+            type: 'commitHistoryReplay',
+            request: {
+                requestId: prepared.prepared.requestId,
+                replayId: prepared.prepared.replayId,
+                leaseId: prepared.prepared.leaseId,
+                mutationId: 'terminal-bound-mutation',
+                cells: targets.map((_target, ordinal) => ({
+                    ordinal,
+                    entry: { value: large, base: 'base' },
+                })),
+                highlights: [],
+                structures: targets.map((_target, ordinal) => ({ ordinal })),
+            },
+        });
+        await wait_for_observable(() => panel.__messages.some((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { refusal?: { replayId?: unknown } }).refusal?.replayId
+                === 'terminal-bound-replay'
+        )));
+        expect(panel.__messages).toContainEqual(expect.objectContaining({
+            type: 'historyReplayCommitRefused',
+            refusal: expect.objectContaining({
+                replayId: 'terminal-bound-replay',
+                reason: 'unavailable',
+            }),
+        }));
+        const durable = state.get_state(file_path).pendingEdits;
+        expect(durable).toHaveLength(sheet_count);
+        for (let sheet_index = 0; sheet_index < sheet_count; sheet_index += 1) {
+            expect(durable?.[sheet_index]?.cells).toEqual({});
+            expect(durable?.[sheet_index]?.appendedRows?.[0].cells[0]?.value).toBe('seed');
+        }
+    }, 30_000);
+
+    it('recomputes a resolved formula conflict across Undo and Redo', async () => {
+        const format = capture_xlsx_append_row_format(bytes, 0, 3, 4, 0);
+        const template = { id: 'formula-replay-template', format };
+        const row = {
+            id: 'formula-replay-row',
+            cells: {},
+            formatTemplateId: template.id,
+            createdOrder: 1,
+        };
+        const basis = {
+            sourceRowCount: 2,
+            provisionalStartRow: 2,
+            provisionalRowCount: 1,
+            columnCount: 4,
+            schemaFingerprint: `sha256:${createHash('sha256').update(JSON.stringify({
+                columnCount: 4,
+                columnNames: ['Name', 'Age', 'Active', 'Joined'],
+            })).digest('hex')}`,
+            styleFingerprint: format.styleFingerprint,
+        };
+        const resolved_entry = { value: 'resolved', base: 'Alice', valueEditOrder: 2 };
+        const formula_reference_bases = [{
+            targetSheetIndex: 0,
+            targetSheetName: 'People',
+            targetWorksheetId: '1',
+            provisionalStartRow: 2,
+            provisionalRowCount: 1,
+        }];
+        const formula_entry = {
+            value: '=A3',
+            base: 'Alice',
+            valueEditOrder: 1,
+            formulaReferenceBases: formula_reference_bases,
+        };
+        const clean_structural = {
+            formatTemplates: [template],
+            appendedRows: [row],
+            tailRemovals: [],
+            appendBasis: basis,
+            conflicts: [],
+        };
+        const conflicted_structural = {
+            ...clean_structural,
+            conflicts: [{
+                reason: 'ambiguousPendingFormula',
+                pendingRowIds: [],
+                tailRemovalIds: [],
+                formulaCells: [{
+                    rowIdentity: { kind: 'source', sourceRow: 1 },
+                    sourceColumn: 0,
+                }],
+            }],
+        };
+        const state = versioned_state_store({ pendingEdits: [{
+            sheetName: 'People',
+            worksheetId: '1',
+            cells: { '1:0': resolved_entry },
+            ...clean_structural,
+        }] });
+        const panel = await open_ready_xlsx(file_path, state);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'edit', sheetIndex: 0 });
+        expect(latest_edit_session(panel)?.granted).toBe(true);
+
+        const resolved_overlay = {
+            kind: 'present',
+            value: {
+                kind: 'present',
+                value: { text: resolved_entry.value },
+                base: { text: resolved_entry.base },
+                basePending: false,
+                valueEditOrder: resolved_entry.valueEditOrder,
+            },
+            hyperlink: { kind: 'untouched' },
+        };
+        await panel.__receive({
+            type: 'prepareHistoryReplay',
+            request: {
+                requestId: 'restore-formula-conflict-prepare',
+                replayId: 'restore-formula-conflict',
+                cells: [{
+                    ordinal: 0,
+                    worksheet: { sheetIndex: 0, sheetName: 'People', worksheetId: '1' },
+                    sourceRow: 1,
+                    sourceColumn: 0,
+                    overlay: resolved_overlay,
+                }],
+                highlights: [],
+                structures: [{
+                    ordinal: 0,
+                    worksheet: { sheetIndex: 0, sheetName: 'People', worksheetId: '1' },
+                    expected: clean_structural,
+                    desired: conflicted_structural,
+                }],
+                focus: {
+                    worksheet: { sheetIndex: 0, sheetName: 'People', worksheetId: '1' },
+                    sourceRowStart: 1,
+                    sourceRowEnd: 1,
+                    sourceColumnStart: 0,
+                    sourceColumnEnd: 0,
+                },
+            },
+        });
+        await wait_for_observable(() => panel.__messages.some((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (
+                (message as { prepared?: { replayId?: unknown } }).prepared?.replayId
+                    === 'restore-formula-conflict'
+                || (message as { refusal?: { replayId?: unknown } }).refusal?.replayId
+                    === 'restore-formula-conflict'
+            )
+        )));
+        const undo_prepared = panel.__messages.find((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { type?: unknown }).type === 'historyReplayPrepared'
+            && (message as { prepared?: { replayId?: unknown } }).prepared?.replayId
+                === 'restore-formula-conflict'
+        )) as Extract<import('../types').HostMessage, { type: 'historyReplayPrepared' }> | undefined;
+        expect(undo_prepared, JSON.stringify(panel.__messages.filter((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { refusal?: { replayId?: unknown } }).refusal?.replayId
+                === 'restore-formula-conflict'
+        )))).toBeDefined();
+        await panel.__receive({
+            type: 'commitHistoryReplay',
+            request: {
+                requestId: undo_prepared!.prepared.requestId,
+                replayId: undo_prepared!.prepared.replayId,
+                leaseId: undo_prepared!.prepared.leaseId,
+                mutationId: 'restore-formula-conflict-mutation',
+                cells: [{ ordinal: 0, entry: formula_entry }],
+                highlights: [],
+                structures: [{ ordinal: 0 }],
+            },
+        });
+        await wait_for_observable(() => panel.__messages.some((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { type?: unknown }).type === 'historyReplayCommitted'
+            && (message as { committed?: { replayId?: unknown } }).committed?.replayId
+                === 'restore-formula-conflict'
+        )));
+        expect(state.get_state(file_path).pendingEdits?.[0]).toMatchObject({
+            cells: { '1:0': formula_entry },
+            conflicts: conflicted_structural.conflicts,
+        });
+
+        const formula_overlay = {
+            kind: 'present',
+            value: {
+                kind: 'present',
+                value: { text: formula_entry.value },
+                base: { text: formula_entry.base },
+                basePending: false,
+                valueEditOrder: formula_entry.valueEditOrder,
+                formulaReferenceBases: formula_reference_bases,
+            },
+            hyperlink: { kind: 'untouched' },
+        };
+        await panel.__receive({
+            type: 'prepareHistoryReplay',
+            request: {
+                requestId: 'resolve-formula-conflict-prepare',
+                replayId: 'resolve-formula-conflict',
+                cells: [{
+                    ordinal: 0,
+                    worksheet: { sheetIndex: 0, sheetName: 'People', worksheetId: '1' },
+                    sourceRow: 1,
+                    sourceColumn: 0,
+                    overlay: formula_overlay,
+                }],
+                highlights: [],
+                structures: [{
+                    ordinal: 0,
+                    worksheet: { sheetIndex: 0, sheetName: 'People', worksheetId: '1' },
+                    expected: conflicted_structural,
+                    desired: clean_structural,
+                }],
+                focus: {
+                    worksheet: { sheetIndex: 0, sheetName: 'People', worksheetId: '1' },
+                    sourceRowStart: 1,
+                    sourceRowEnd: 1,
+                    sourceColumnStart: 0,
+                    sourceColumnEnd: 0,
+                },
+            },
+        });
+        await wait_for_observable(() => panel.__messages.some((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { type?: unknown }).type === 'historyReplayPrepared'
+            && (message as { prepared?: { replayId?: unknown } }).prepared?.replayId
+                === 'resolve-formula-conflict'
+        )));
+        const redo_prepared = panel.__messages.find((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { type?: unknown }).type === 'historyReplayPrepared'
+            && (message as { prepared?: { replayId?: unknown } }).prepared?.replayId
+                === 'resolve-formula-conflict'
+        )) as Extract<import('../types').HostMessage, { type: 'historyReplayPrepared' }>;
+        await panel.__receive({
+            type: 'commitHistoryReplay',
+            request: {
+                requestId: redo_prepared.prepared.requestId,
+                replayId: redo_prepared.prepared.replayId,
+                leaseId: redo_prepared.prepared.leaseId,
+                mutationId: 'resolve-formula-conflict-mutation',
+                cells: [{ ordinal: 0, entry: resolved_entry }],
+                highlights: [],
+                structures: [{ ordinal: 0 }],
+            },
+        });
+        await wait_for_observable(() => panel.__messages.some((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { type?: unknown }).type === 'historyReplayCommitted'
+            && (message as { committed?: { replayId?: unknown } }).committed?.replayId
+                === 'resolve-formula-conflict'
+        )));
+        expect(state.get_state(file_path).pendingEdits?.[0]).toMatchObject({
+            cells: { '1:0': resolved_entry },
+            conflicts: [],
+        });
+    });
+
+    it('commits host-derived cross-sheet formula conflicts across append Undo and Redo', async () => {
+        const format = capture_xlsx_append_row_format(bytes, 1, 3, 3, 0);
+        const template = { id: 'inventory-replay-template', format };
+        const row = {
+            id: 'inventory-replay-row',
+            cells: {},
+            formatTemplateId: template.id,
+            createdOrder: 1,
+        };
+        const basis = {
+            sourceRowCount: 2,
+            provisionalStartRow: 2,
+            provisionalRowCount: 1,
+            columnCount: 3,
+            schemaFingerprint: `sha256:${createHash('sha256').update(JSON.stringify({
+                columnCount: 3,
+                columnNames: ['Product', 'Price', 'Quantity'],
+            })).digest('hex')}`,
+            styleFingerprint: format.styleFingerprint,
+        };
+        const appended = {
+            formatTemplates: [template],
+            appendedRows: [row],
+            tailRemovals: [],
+            appendBasis: basis,
+            conflicts: [],
+        };
+        const empty = {
+            formatTemplates: [],
+            appendedRows: [],
+            tailRemovals: [],
+            conflicts: [],
+        };
+        const formula_entry = {
+            value: "='Inventory'!A3",
+            base: 'Alice',
+            valueEditOrder: 1,
+            formulaReferenceBases: [{
+                targetSheetIndex: 1,
+                targetSheetName: 'Inventory',
+                targetWorksheetId: '2',
+                provisionalStartRow: 2,
+                provisionalRowCount: 1,
+            }],
+        };
+        const formula_conflict = {
+            reason: 'ambiguousPendingFormula',
+            pendingRowIds: [],
+            tailRemovalIds: [],
+            formulaCells: [{
+                rowIdentity: { kind: 'source', sourceRow: 1 },
+                sourceColumn: 0,
+            }],
+        };
+        const state = versioned_state_store({ pendingEdits: [{
+            sheetName: 'People',
+            worksheetId: '1',
+            cells: { '1:0': formula_entry },
+            ...empty,
+        }, {
+            sheetName: 'Inventory',
+            worksheetId: '2',
+            cells: {},
+            ...appended,
+        }] });
+        const panel = await open_ready_xlsx(file_path, state);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'edit', sheetIndex: 1 });
+        expect(latest_edit_session(panel)?.granted).toBe(true);
+
+        const replay_structure = async (
+            replay_id: string,
+            expected: typeof appended | typeof empty,
+            desired: typeof appended | typeof empty,
+        ) => {
+            await panel.__receive({
+                type: 'prepareHistoryReplay',
+                request: {
+                    requestId: `${replay_id}-prepare`,
+                    replayId: replay_id,
+                    cells: [],
+                    highlights: [],
+                    structures: [{
+                        ordinal: 0,
+                        worksheet: {
+                            sheetIndex: 1,
+                            sheetName: 'Inventory',
+                            worksheetId: '2',
+                        },
+                        expected,
+                        desired,
+                    }],
+                    focus: {
+                        worksheet: {
+                            sheetIndex: 1,
+                            sheetName: 'Inventory',
+                            worksheetId: '2',
+                        },
+                        sourceRowStart: 2,
+                        sourceRowEnd: 2,
+                        sourceColumnStart: 0,
+                        sourceColumnEnd: 0,
+                    },
+                },
+            });
+            await wait_for_observable(() => panel.__messages.some((message) => (
+                typeof message === 'object'
+                && message !== null
+                && (message as { type?: unknown }).type === 'historyReplayPrepared'
+                && (message as { prepared?: { replayId?: unknown } }).prepared?.replayId
+                    === replay_id
+            )));
+            const prepared = panel.__messages.find((message) => (
+                typeof message === 'object'
+                && message !== null
+                && (message as { type?: unknown }).type === 'historyReplayPrepared'
+                && (message as { prepared?: { replayId?: unknown } }).prepared?.replayId
+                    === replay_id
+            )) as Extract<import('../types').HostMessage, { type: 'historyReplayPrepared' }>;
+            await panel.__receive({
+                type: 'commitHistoryReplay',
+                request: {
+                    requestId: prepared.prepared.requestId,
+                    replayId: prepared.prepared.replayId,
+                    leaseId: prepared.prepared.leaseId,
+                    mutationId: `${replay_id}-mutation`,
+                    cells: [],
+                    highlights: [],
+                    structures: [{ ordinal: 0 }],
+                },
+            });
+            await wait_for_observable(() => panel.__messages.some((message) => (
+                typeof message === 'object'
+                && message !== null
+                && (message as { type?: unknown }).type === 'historyReplayCommitted'
+                && (message as { committed?: { replayId?: unknown } }).committed?.replayId
+                    === replay_id
+            )));
+            return panel.__messages.find((message) => (
+                typeof message === 'object'
+                && message !== null
+                && (message as { type?: unknown }).type === 'historyReplayCommitted'
+                && (message as { committed?: { replayId?: unknown } }).committed?.replayId
+                    === replay_id
+            )) as Extract<import('../types').HostMessage, { type: 'historyReplayCommitted' }>;
+        };
+
+        const undone = await replay_structure('undo-cross-sheet-append', appended, empty);
+        expect(undone.committed.structures).toContainEqual({
+            ordinal: 1,
+            resolvedSheetIndex: 0,
+            expectedConflicts: [formula_conflict],
+            desiredConflicts: [],
+            hostDerived: true,
+        });
+        expect(state.get_state(file_path).pendingEdits?.[0]?.cells)
+            .toEqual({ '1:0': formula_entry });
+        expect(state.get_state(file_path).pendingEdits?.[0]?.conflicts ?? []).toEqual([]);
+        expect(state.get_state(file_path).pendingEdits?.[1]).toBeUndefined();
+
+        const redone = await replay_structure('redo-cross-sheet-append', empty, appended);
+        expect(redone.committed.structures).toContainEqual({
+            ordinal: 1,
+            resolvedSheetIndex: 0,
+            expectedConflicts: [],
+            desiredConflicts: [formula_conflict],
+            hostDerived: true,
+        });
+        expect(state.get_state(file_path).pendingEdits?.[0]).toMatchObject({
+            cells: { '1:0': formula_entry },
+            conflicts: [formula_conflict],
+        });
+        expect(state.get_state(file_path).pendingEdits?.[1]?.appendedRows).toEqual([row]);
+    });
+
+    it('strips an omitted accepted admission basis while preserving dirty cells', async () => {
+        const state = versioned_state_store({});
+        const panel = await open_ready_xlsx(file_path, state);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'edit', sheetIndex: 0 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+        const snapshot = latest_snapshot(panel);
+        await panel.__receive({
+            type: 'requestAppendRows',
+            requestId: 'accepted-then-omitted',
+            editSessionId: session,
+            worksheet: { sheetIndex: 0, sheetName: 'People', worksheetId: '1' },
+            sourceGeneration: snapshot.sourceGeneration,
+            count: 1,
+        });
+        const admission = panel.__messages.find((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { type?: unknown }).type === 'appendRowsResult'
+            && (message as { requestId?: unknown }).requestId === 'accepted-then-omitted'
+        )) as Extract<import('../types').HostMessage, { type: 'appendRowsResult' }>;
+        await panel.__receive({
+            type: 'settleRowAdmission',
+            requestId: 'accepted-then-omitted',
+            editSessionId: session,
+            accepted: true,
+        });
+        await panel.__receive({
+            type: 'pendingChangesChanged',
+            sourceGeneration: snapshot.sourceGeneration,
+            editSessionId: session,
+            sequence: 1,
+            changes: {
+                sheetIndex: 0,
+                sheetName: 'People',
+                worksheetId: '1',
+                cells: { '0:0': { value: 'edited', base: 'Alice' } },
+                formatTemplates: [],
+                appendedRows: [],
+                tailRemovals: [],
+                appendBasis: admission.appendBasis!,
+                conflicts: [],
+            },
+        });
+        await controller_of(panel).drain();
+
+        expect(panel.__messages).toContainEqual({
+            type: 'pendingChangesAcknowledged',
+            editSessionId: session,
+            sequence: 1,
+        });
+        expect(state.get_state(file_path).pendingEdits?.[0]).toEqual(expect.objectContaining({
+            cells: { '0:0': { value: 'edited', base: 'Alice' } },
+            appendedRows: [],
+        }));
+        expect(state.get_state(file_path).pendingEdits?.[0]).not.toHaveProperty('appendBasis');
+    });
+
+    it('rejects publication and save before an append admission is settled', async () => {
+        const state = versioned_state_store({});
+        const untouched = bytes;
+        const panel = await open_ready_xlsx(file_path, state);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'edit', sheetIndex: 0 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+        const snapshot = latest_snapshot(panel);
+        await panel.__receive({
+            type: 'requestAppendRows',
+            requestId: 'unsettled-append',
+            editSessionId: session,
+            worksheet: { sheetIndex: 0, sheetName: 'People', worksheetId: '1' },
+            sourceGeneration: snapshot.sourceGeneration,
+            count: 1,
+        });
+        const admission = panel.__messages.find((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { type?: unknown }).type === 'appendRowsResult'
+            && (message as { requestId?: unknown }).requestId === 'unsettled-append'
+        )) as Extract<import('../types').HostMessage, { type: 'appendRowsResult' }>;
+        const row = {
+            id: admission.rowIds![0],
+            cells: {},
+            formatTemplateId: admission.formatTemplate!.id,
+            createdOrder: 1,
+        };
+        const changes = {
+            sheetIndex: 0,
+            sheetName: 'People',
+            worksheetId: '1',
+            cells: {},
+            formatTemplates: [admission.formatTemplate!],
+            appendedRows: [row],
+            tailRemovals: [],
+            appendBasis: admission.appendBasis!,
+            conflicts: [],
+        };
+
+        await panel.__receive({
+            type: 'pendingChangesChanged',
+            sourceGeneration: latest_snapshot(panel).sourceGeneration,
+            editSessionId: session,
+            sequence: 1,
+            changes,
+        });
+        await controller_of(panel).drain();
+        expect(panel.__messages).not.toContainEqual({
+            type: 'pendingChangesAcknowledged',
+            editSessionId: session,
+            sequence: 1,
+        });
+        expect(state.get_state(file_path).pendingEdits).toBeUndefined();
+
+        const save_result_count = save_results(panel).length;
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: workbook_request(session, 'save-unsettled-append', save_worksheet({
+                edits: {},
+                dirtyEdits: {},
+                structuralChanges: changes,
+            })),
+        });
+        await wait_for_observable(() => save_results(panel).length > save_result_count);
+        expect(save_results(panel).at(-1)?.success).toBe(false);
+        expect(bytes).toBe(untouched);
+
+        await panel.__receive({
+            type: 'settleRowAdmission',
+            requestId: 'unsettled-append',
+            editSessionId: session,
+            accepted: false,
+        });
+        await panel.__receive({
+            type: 'pendingChangesChanged',
+            sourceGeneration: latest_snapshot(panel).sourceGeneration,
+            editSessionId: session,
+            sequence: 1,
+            changes,
+        });
+        await controller_of(panel).drain();
+        expect(state.get_state(file_path).pendingEdits).toBeUndefined();
+    });
+
+    it('releases restoration reservations when an unspent replay lease expires', async () => {
+        const panel = await open_ready_xlsx(file_path, versioned_state_store({}));
+        const restoration = await prepare_saved_row_restoration(panel, 'expired-lease');
+        await panel.__receive({
+            type: 'prepareHistoryReplay',
+            request: {
+                requestId: 'expired-lease-prepare',
+                replayId: 'expired-lease-replay',
+                rowAdmissionRequestIds: [restoration.restoreRequestId],
+                cells: [],
+                highlights: [],
+                structures: [{
+                    ordinal: 0,
+                    worksheet: { sheetIndex: 0, sheetName: 'People', worksheetId: '1' },
+                    expected: {
+                        formatTemplates: [],
+                        appendedRows: [],
+                        tailRemovals: [],
+                        conflicts: [],
+                    },
+                    desired: restoration.desired,
+                }],
+                focus: {
+                    worksheet: { sheetIndex: 0, sheetName: 'People', worksheetId: '1' },
+                    sourceRowStart: 2,
+                    sourceRowEnd: 2,
+                    sourceColumnStart: 0,
+                    sourceColumnEnd: 0,
+                },
+            },
+        });
+        await wait_for_observable(() => panel.__messages.some((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { prepared?: { replayId?: unknown } }).prepared?.replayId
+                === 'expired-lease-replay'
+        )));
+        const prepared = panel.__messages.find((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { type?: unknown }).type === 'historyReplayPrepared'
+            && (message as { prepared?: { replayId?: unknown } }).prepared?.replayId
+                === 'expired-lease-replay'
+        )) as Extract<import('../types').HostMessage, { type: 'historyReplayPrepared' }>;
+        const clock = vi.spyOn(Date, 'now').mockReturnValue(
+            Date.now() + HISTORY_REPLAY_LEASE_TTL_MS,
+        );
+        await panel.__receive({
+            type: 'commitHistoryReplay',
+            request: {
+                requestId: prepared.prepared.requestId,
+                replayId: prepared.prepared.replayId,
+                leaseId: prepared.prepared.leaseId,
+                mutationId: 'expired-lease-mutation',
+                cells: [],
+                highlights: [],
+                structures: [{ ordinal: 0 }],
+            },
+        });
+        clock.mockRestore();
+        expect(panel.__messages).toContainEqual(expect.objectContaining({
+            type: 'historyReplayCommitRefused',
+            refusal: expect.objectContaining({
+                replayId: 'expired-lease-replay',
+                reason: 'expired',
+            }),
+        }));
+
+        await panel.__receive({
+            type: 'settleRowAdmission',
+            requestId: restoration.restoreRequestId,
+            editSessionId: restoration.restoreSession,
+            accepted: false,
+        });
+        await panel.__receive({
+            type: 'requestRestoreSavedRows',
+            requestId: 'expired-lease-restore-retry',
+            editSessionId: restoration.restoreSession,
+            worksheet: { sheetIndex: 0, sheetName: 'People', worksheetId: '1' },
+            sourceGeneration: latest_snapshot(panel).sourceGeneration,
+            appendHistoryIds: [restoration.assignment.pendingRowId],
+        });
+        expect(panel.__messages).toContainEqual(expect.objectContaining({
+            type: 'restoreSavedRowsResult',
+            requestId: 'expired-lease-restore-retry',
+            granted: true,
+        }));
+    });
+
+    it('cancels restoration reservations when source adoption invalidates a lease', async () => {
+        const panel = await open_ready_xlsx(file_path, versioned_state_store({}));
+        const restoration = await prepare_saved_row_restoration(panel, 'invalidated-lease');
+        await panel.__receive({
+            type: 'prepareHistoryReplay',
+            request: {
+                requestId: 'invalidated-lease-prepare',
+                replayId: 'invalidated-lease-replay',
+                rowAdmissionRequestIds: [restoration.restoreRequestId],
+                cells: [],
+                highlights: [],
+                structures: [{
+                    ordinal: 0,
+                    worksheet: { sheetIndex: 0, sheetName: 'People', worksheetId: '1' },
+                    expected: {
+                        formatTemplates: [],
+                        appendedRows: [],
+                        tailRemovals: [],
+                        conflicts: [],
+                    },
+                    desired: restoration.desired,
+                }],
+                focus: {
+                    worksheet: { sheetIndex: 0, sheetName: 'People', worksheetId: '1' },
+                    sourceRowStart: 2,
+                    sourceRowEnd: 2,
+                    sourceColumnStart: 0,
+                    sourceColumnEnd: 0,
+                },
+            },
+        });
+        await wait_for_observable(() => panel.__messages.some((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { prepared?: { replayId?: unknown } }).prepared?.replayId
+                === 'invalidated-lease-replay'
+        )));
+
+        bytes = rewrite_workbook_xml(bytes, (xml) =>
+            xml.replace('name="Inventory"', 'name="Stock"'));
+        await vscode_mock.__getActiveWatchers()[0].__fireChange();
+        await wait_for_observable(() => sheet_names(panel).includes('Stock'));
+
+        await panel.__receive({
+            type: 'requestRestoreSavedRows',
+            requestId: 'invalidated-lease-restore-retry',
+            editSessionId: restoration.restoreSession,
+            worksheet: { sheetIndex: 0, sheetName: 'People', worksheetId: '1' },
+            sourceGeneration: latest_snapshot(panel).sourceGeneration,
+            appendHistoryIds: [restoration.assignment.pendingRowId],
+        });
+        expect(panel.__messages).toContainEqual(expect.objectContaining({
+            type: 'restoreSavedRowsResult',
+            requestId: 'invalidated-lease-restore-retry',
+            granted: true,
+        }));
+    });
+
+    it('cancels restoration reservations when replay preparation delivery fails', async () => {
+        const panel = await open_ready_xlsx(file_path, versioned_state_store({}));
+        const restoration = await prepare_saved_row_restoration(panel, 'undelivered-lease');
+        const post_message = panel.webview.postMessage.bind(panel.webview);
+        let delivery_entered = false;
+        let release_delivery!: () => void;
+        const delivery_gate = new Promise<void>((resolve) => {
+            release_delivery = resolve;
+        });
+        panel.webview.postMessage = async (message: unknown) => {
+            if (
+                typeof message === 'object'
+                && message !== null
+                && (message as { type?: unknown }).type === 'historyReplayPrepared'
+            ) {
+                delivery_entered = true;
+                await delivery_gate;
+                return false;
+            }
+            return post_message(message);
+        };
+        const preparing = panel.__receive({
+            type: 'prepareHistoryReplay',
+            request: {
+                requestId: 'undelivered-lease-prepare',
+                replayId: 'undelivered-lease-replay',
+                rowAdmissionRequestIds: [restoration.restoreRequestId],
+                cells: [],
+                highlights: [],
+                structures: [{
+                    ordinal: 0,
+                    worksheet: { sheetIndex: 0, sheetName: 'People', worksheetId: '1' },
+                    expected: {
+                        formatTemplates: [],
+                        appendedRows: [],
+                        tailRemovals: [],
+                        conflicts: [],
+                    },
+                    desired: restoration.desired,
+                }],
+                focus: {
+                    worksheet: { sheetIndex: 0, sheetName: 'People', worksheetId: '1' },
+                    sourceRowStart: 2,
+                    sourceRowEnd: 2,
+                    sourceColumnStart: 0,
+                    sourceColumnEnd: 0,
+                },
+            },
+        });
+        await wait_for_observable(() => delivery_entered);
+        const clock = vi.spyOn(Date, 'now').mockReturnValue(
+            Date.now() + HISTORY_REPLAY_LEASE_TTL_MS,
+        );
+        release_delivery();
+        await preparing;
+        clock.mockRestore();
+        panel.webview.postMessage = post_message;
+        expect(panel.__messages).not.toContainEqual(expect.objectContaining({
+            type: 'historyReplayPrepared',
+            prepared: expect.objectContaining({ replayId: 'undelivered-lease-replay' }),
+        }));
+
+        await panel.__receive({
+            type: 'requestRestoreSavedRows',
+            requestId: 'undelivered-lease-restore-retry',
+            editSessionId: restoration.restoreSession,
+            worksheet: { sheetIndex: 0, sheetName: 'People', worksheetId: '1' },
+            sourceGeneration: latest_snapshot(panel).sourceGeneration,
+            appendHistoryIds: [restoration.assignment.pendingRowId],
+        });
+        expect(panel.__messages).toContainEqual(expect.objectContaining({
+            type: 'restoreSavedRowsResult',
+            requestId: 'undelivered-lease-restore-retry',
+            granted: true,
+        }));
+    });
+
+    it('keeps saved-row authority while its worksheet is temporarily absent', async () => {
+        const panel = await open_ready_xlsx(file_path, versioned_state_store({}));
+        const restoration = await prepare_saved_row_restoration(panel, 'missing-sheet');
+        await panel.__receive({
+            type: 'settleRowAdmission',
+            requestId: restoration.restoreRequestId,
+            editSessionId: restoration.restoreSession,
+            accepted: false,
+        });
+        await panel.__receive({
+            type: 'requestEditSession',
+            requestId: 'missing-sheet-visit-inventory',
+            sheetIndex: 1,
+            sheetName: 'Inventory',
+            worksheetId: '2',
+        });
+        expect(latest_edit_session(panel)?.editSessionId).toBe(restoration.restoreSession);
+        await panel.__receive({
+            type: 'retainedSavedAppendAuthoritiesChanged',
+            authorities: [{
+                sheetIndex: 0,
+                sheetName: 'People',
+                worksheetId: '1',
+                appendHistoryIds: [restoration.assignment.pendingRowId],
+                pendingRowIds: [],
+            }],
+        });
+
+        const complete_workbook = bytes;
+        bytes = drop_first_sheet(bytes);
+        await vscode_mock.__getActiveWatchers()[0].__fireChange();
+        await wait_for_observable(() => !sheet_names(panel).includes('People'));
+        await panel.__receive({
+            type: 'retainedSavedAppendAuthoritiesChanged',
+            authorities: [],
+        });
+
+        bytes = swap_sheet_order(complete_workbook);
+        await vscode_mock.__getActiveWatchers()[0].__fireChange();
+        await wait_for_observable(() => sheet_names(panel)[1] === 'People');
+        await panel.__receive({
+            type: 'requestRestoreSavedRows',
+            requestId: 'missing-sheet-restore-retry',
+            editSessionId: restoration.restoreSession,
+            // The history target still carries People's old index. Its stable
+            // worksheet ID is authoritative after the sheet returns at index 1.
+            worksheet: { sheetIndex: 0, sheetName: 'People', worksheetId: '1' },
+            sourceGeneration: latest_snapshot(panel).sourceGeneration,
+            appendHistoryIds: [restoration.assignment.pendingRowId],
+        });
+        expect(panel.__messages).toContainEqual(expect.objectContaining({
+            type: 'restoreSavedRowsResult',
+            requestId: 'missing-sheet-restore-retry',
+            granted: true,
+        }));
+    });
+
+    it('rejects a partial publication of one accepted saved-row restoration batch', async () => {
+        const state = versioned_state_store({});
+        const panel = await open_ready_xlsx(file_path, state);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'append-edit', sheetIndex: 0 });
+        const append_session = latest_edit_session(panel)!.editSessionId!;
+        const initial = latest_snapshot(panel);
+        await panel.__receive({
+            type: 'requestAppendRows',
+            requestId: 'append-two-for-restore',
+            editSessionId: append_session,
+            worksheet: { sheetIndex: 0, sheetName: 'People', worksheetId: '1' },
+            sourceGeneration: initial.sourceGeneration,
+            count: 2,
+        });
+        const admission = panel.__messages.find((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { type?: unknown }).type === 'appendRowsResult'
+            && (message as { requestId?: unknown }).requestId === 'append-two-for-restore'
+        )) as Extract<import('../types').HostMessage, { type: 'appendRowsResult' }>;
+        await panel.__receive({
+            type: 'settleRowAdmission',
+            requestId: 'append-two-for-restore',
+            editSessionId: append_session,
+            accepted: true,
+        });
+        const original_rows = admission.rowIds!.map((id, index) => ({
+            id,
+            cells: { 0: { value: `saved-${index}`, valueEditOrder: index + 1 } },
+            formatTemplateId: admission.formatTemplate!.id,
+            createdOrder: index + 1,
+        }));
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: workbook_request(append_session, 'save-two-for-restore', save_worksheet({
+                edits: {},
+                dirtyEdits: {},
+                structuralChanges: {
+                    formatTemplates: [admission.formatTemplate!],
+                    appendedRows: original_rows,
+                    tailRemovals: [],
+                    appendBasis: admission.appendBasis!,
+                    conflicts: [],
+                },
+            })),
+        });
+        await wait_for_observable(() => save_results(panel).some(
+            (result) => result.lifecycle.operation.saveRequestId === 'save-two-for-restore',
+        ));
+        const append_result = save_results(panel).find(
+            (result) => result.lifecycle.operation.saveRequestId === 'save-two-for-restore',
+        )!;
+        expect(append_result.success).toBe(true);
+        const assignments = append_result.receipt!.appendedRows;
+        expect(assignments).toHaveLength(2);
+
+        const remove_session = await request_edit_session_when_available(panel, 'remove-edit');
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: workbook_request(remove_session, 'remove-two-for-restore', save_worksheet({
+                edits: {},
+                dirtyEdits: {},
+                structuralChanges: {
+                    formatTemplates: [],
+                    appendedRows: [],
+                    tailRemovals: assignments.map((assignment) => ({
+                        appendHistoryId: assignment.pendingRowId,
+                        sourceRow: assignment.sourceRow,
+                        savedFingerprint: assignment.savedFingerprint,
+                        savedRow: assignment.savedRow!,
+                    })),
+                    conflicts: [],
+                },
+            })),
+        });
+        await wait_for_observable(() => save_results(panel).some(
+            (result) => result.lifecycle.operation.saveRequestId === 'remove-two-for-restore',
+        ));
+        expect(save_results(panel).find(
+            (result) => result.lifecycle.operation.saveRequestId === 'remove-two-for-restore',
+        )?.success).toBe(true);
+
+        const restore_session = await request_edit_session_when_available(panel, 'restore-edit');
+        const restored_source = latest_snapshot(panel);
+        await panel.__receive({
+            type: 'requestRestoreSavedRows',
+            requestId: 'restore-two-row-batch',
+            editSessionId: restore_session,
+            worksheet: { sheetIndex: 0, sheetName: 'People', worksheetId: '1' },
+            sourceGeneration: restored_source.sourceGeneration,
+            appendHistoryIds: admission.rowIds!,
+        });
+        const restoration = panel.__messages.find((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { type?: unknown }).type === 'restoreSavedRowsResult'
+            && (message as { requestId?: unknown }).requestId === 'restore-two-row-batch'
+        )) as Extract<import('../types').HostMessage, { type: 'restoreSavedRowsResult' }>;
+        expect(restoration.granted, restoration.reason).toBe(true);
+        const basis_only = {
+            formatTemplates: [],
+            appendedRows: [],
+            tailRemovals: [],
+            appendBasis: restoration.appendBasis!,
+            conflicts: [],
+        };
+        await panel.__receive({
+            type: 'pendingChangesChanged',
+            sourceGeneration: latest_snapshot(panel).sourceGeneration,
+            editSessionId: restore_session,
+            sequence: 1,
+            changes: {
+                sheetIndex: 0,
+                sheetName: 'People',
+                worksheetId: '1',
+                cells: {},
+                ...basis_only,
+            },
+        });
+        await controller_of(panel).drain();
+        expect(panel.__messages).not.toContainEqual({
+            type: 'pendingChangesAcknowledged',
+            editSessionId: restore_session,
+            sequence: 1,
+        });
+        expect(state.get_state(file_path).pendingEdits).toBeUndefined();
+
+        const basis_save_count = save_results(panel).length;
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: workbook_request(
+                restore_session,
+                'save-unsettled-restoration-basis',
+                save_worksheet({
+                    edits: {},
+                    dirtyEdits: {},
+                    structuralChanges: basis_only,
+                }),
+            ),
+        });
+        await wait_for_observable(() => save_results(panel).length > basis_save_count);
+        expect(save_results(panel).at(-1)?.success).toBe(false);
+
+        await panel.__receive({
+            type: 'prepareHistoryReplay',
+            request: {
+                requestId: 'replay-unsettled-restoration-basis',
+                replayId: 'replay-unsettled-restoration-basis',
+                cells: [],
+                highlights: [],
+                structures: [{
+                    ordinal: 0,
+                    worksheet: { sheetIndex: 0, sheetName: 'People', worksheetId: '1' },
+                    expected: {
+                        formatTemplates: [],
+                        appendedRows: [],
+                        tailRemovals: [],
+                        conflicts: [],
+                    },
+                    desired: basis_only,
+                }],
+                focus: {
+                    worksheet: { sheetIndex: 0, sheetName: 'People', worksheetId: '1' },
+                    sourceRowStart: 2,
+                    sourceRowEnd: 2,
+                    sourceColumnStart: 0,
+                    sourceColumnEnd: 0,
+                },
+            },
+        });
+        await wait_for_observable(() => panel.__messages.some((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { type?: unknown }).type === 'historyReplayPrepareRefused'
+            && (message as { refusal?: { replayId?: unknown } }).refusal?.replayId
+                === 'replay-unsettled-restoration-basis'
+        )));
+        expect(panel.__messages).toContainEqual(expect.objectContaining({
+            type: 'historyReplayPrepareRefused',
+            refusal: expect.objectContaining({
+                replayId: 'replay-unsettled-restoration-basis',
+                reason: 'conflict',
+            }),
+        }));
+        const restored_templates = assignments.map((assignment) => {
+            const format = assignment.savedRow!.format;
+            return {
+                id: `restored-format:${createHash('sha256')
+                    .update(JSON.stringify(format)).digest('hex')}`,
+                format,
+            };
+        });
+        const restored_rows = assignments.map((assignment, index) => ({
+            id: assignment.pendingRowId,
+            cells: assignment.savedRow!.cells,
+            formatTemplateId: restored_templates[index].id,
+            createdOrder: index + 1,
+        }));
+        const changes = {
+            sheetIndex: 0,
+            sheetName: 'People',
+            worksheetId: '1',
+            cells: {},
+            formatTemplates: restored_templates,
+            appendedRows: restored_rows,
+            tailRemovals: [],
+            appendBasis: restoration.appendBasis!,
+            conflicts: [],
+        };
+        await panel.__receive({
+            type: 'pendingChangesChanged',
+            sourceGeneration: latest_snapshot(panel).sourceGeneration,
+            editSessionId: restore_session,
+            sequence: 1,
+            changes,
+        });
+        await controller_of(panel).drain();
+        expect(panel.__messages).not.toContainEqual({
+            type: 'pendingChangesAcknowledged',
+            editSessionId: restore_session,
+            sequence: 1,
+        });
+        expect(state.get_state(file_path).pendingEdits).toBeUndefined();
+        await panel.__receive({
+            type: 'settleRowAdmission',
+            requestId: 'restore-two-row-batch',
+            editSessionId: restore_session,
+            accepted: false,
+        });
+
+        await panel.__receive({
+            type: 'requestRestoreSavedRows',
+            requestId: 'restore-two-row-batch-retry',
+            editSessionId: restore_session,
+            worksheet: { sheetIndex: 0, sheetName: 'People', worksheetId: '1' },
+            sourceGeneration: restored_source.sourceGeneration,
+            appendHistoryIds: admission.rowIds!,
+        });
+        const retry = panel.__messages.find((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { type?: unknown }).type === 'restoreSavedRowsResult'
+            && (message as { requestId?: unknown }).requestId === 'restore-two-row-batch-retry'
+        )) as Extract<import('../types').HostMessage, { type: 'restoreSavedRowsResult' }>;
+        expect(retry.granted, retry.reason).toBe(true);
+        const accepted_changes = { ...changes, appendBasis: retry.appendBasis! };
+        await panel.__receive({
+            type: 'prepareHistoryReplay',
+            request: {
+                requestId: 'mixed-restoration-prepare',
+                replayId: 'mixed-restoration-replay',
+                rowAdmissionRequestIds: ['restore-two-row-batch-retry'],
+                cells: [{
+                    ordinal: 0,
+                    worksheet: { sheetIndex: 0, sheetName: 'People', worksheetId: '1' },
+                    sourceRow: 0,
+                    sourceColumn: 0,
+                    overlay: { kind: 'absent' },
+                }],
+                highlights: [],
+                structures: [{
+                    ordinal: 0,
+                    worksheet: { sheetIndex: 0, sheetName: 'People', worksheetId: '1' },
+                    expected: {
+                        formatTemplates: [],
+                        appendedRows: [],
+                        tailRemovals: [],
+                        conflicts: [],
+                    },
+                    desired: accepted_changes,
+                }],
+                focus: {
+                    worksheet: { sheetIndex: 0, sheetName: 'People', worksheetId: '1' },
+                    sourceRowStart: 0,
+                    sourceRowEnd: 0,
+                    sourceColumnStart: 0,
+                    sourceColumnEnd: 0,
+                },
+            },
+        });
+        await wait_for_observable(() => panel.__messages.some((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { type?: unknown }).type === 'historyReplayPrepared'
+            && (message as { prepared?: { replayId?: unknown } }).prepared?.replayId
+                === 'mixed-restoration-replay'
+        )));
+        const mixed_prepared = panel.__messages.find((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { type?: unknown }).type === 'historyReplayPrepared'
+            && (message as { prepared?: { replayId?: unknown } }).prepared?.replayId
+                === 'mixed-restoration-replay'
+        )) as Extract<import('../types').HostMessage, { type: 'historyReplayPrepared' }>;
+        await panel.__receive({
+            type: 'commitHistoryReplay',
+            request: {
+                requestId: mixed_prepared.prepared.requestId,
+                replayId: mixed_prepared.prepared.replayId,
+                leaseId: mixed_prepared.prepared.leaseId,
+                mutationId: 'mixed-restoration-mutation',
+                cells: [{ ordinal: 0, entry: null }],
+                highlights: [],
+                structures: [{ ordinal: 0 }],
+            },
+        });
+        await wait_for_observable(() => panel.__messages.some((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { type?: unknown }).type === 'historyReplayCommitted'
+            && (message as { committed?: { replayId?: unknown } }).committed?.replayId
+                === 'mixed-restoration-replay'
+        )));
+        expect(state.get_state(file_path).pendingEdits?.[0]?.appendedRows)
+            .toEqual(restored_rows);
+        await panel.__receive({
+            type: 'pendingChangesChanged',
+            sourceGeneration: latest_snapshot(panel).sourceGeneration,
+            editSessionId: restore_session,
+            sequence: 1,
+            changes: { ...accepted_changes, appendedRows: [restored_rows[0]] },
+        });
+        await controller_of(panel).drain();
+        expect(panel.__messages).not.toContainEqual({
+            type: 'pendingChangesAcknowledged',
+            editSessionId: restore_session,
+            sequence: 1,
+        });
+        expect(state.get_state(file_path).pendingEdits?.[0]?.appendedRows)
+            .toEqual(restored_rows);
+
+        await panel.__receive({
+            type: 'pendingChangesChanged',
+            sourceGeneration: latest_snapshot(panel).sourceGeneration,
+            editSessionId: restore_session,
+            sequence: 1,
+            changes: accepted_changes,
+        });
+        await controller_of(panel).drain();
+        expect(panel.__messages).toContainEqual({
+            type: 'pendingChangesAcknowledged',
+            editSessionId: restore_session,
+            sequence: 1,
+        });
+        expect(state.get_state(file_path).pendingEdits?.[0]?.appendedRows)
+            .toEqual(restored_rows);
+
+        await panel.__receive({
+            type: 'pendingChangesChanged',
+            sourceGeneration: latest_snapshot(panel).sourceGeneration,
+            editSessionId: restore_session,
+            sequence: 2,
+            changes: {
+                sheetIndex: 0,
+                sheetName: 'People',
+                worksheetId: '1',
+                cells: {},
+                formatTemplates: [],
+                appendedRows: [],
+                tailRemovals: [],
+                conflicts: [],
+            },
+        });
+        await controller_of(panel).drain();
+        expect(panel.__messages).toContainEqual({
+            type: 'pendingChangesAcknowledged',
+            editSessionId: restore_session,
+            sequence: 2,
+        });
+        expect(state.get_state(file_path).pendingEdits).toBeUndefined();
+
+        await panel.__receive({
+            type: 'requestRestoreSavedRows',
+            requestId: 'restore-two-row-batch-again',
+            editSessionId: restore_session,
+            worksheet: { sheetIndex: 0, sheetName: 'People', worksheetId: '1' },
+            sourceGeneration: latest_snapshot(panel).sourceGeneration,
+            appendHistoryIds: admission.rowIds!,
+        });
+        const repeated = panel.__messages.find((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { type?: unknown }).type === 'restoreSavedRowsResult'
+            && (message as { requestId?: unknown }).requestId
+                === 'restore-two-row-batch-again'
+        )) as Extract<import('../types').HostMessage, { type: 'restoreSavedRowsResult' }>;
+        expect(repeated.granted, repeated.reason).toBe(true);
+        await panel.__receive({
+            type: 'settleRowAdmission',
+            requestId: 'restore-two-row-batch-again',
+            editSessionId: restore_session,
+            accepted: true,
+        });
+        const repeated_changes = {
+            ...accepted_changes,
+            appendBasis: repeated.appendBasis!,
+        };
+        await panel.__receive({
+            type: 'pendingChangesChanged',
+            sourceGeneration: latest_snapshot(panel).sourceGeneration,
+            editSessionId: restore_session,
+            sequence: 3,
+            changes: { ...repeated_changes, appendedRows: [restored_rows[0]] },
+        });
+        await controller_of(panel).drain();
+        expect(panel.__messages).not.toContainEqual({
+            type: 'pendingChangesAcknowledged',
+            editSessionId: restore_session,
+            sequence: 3,
+        });
+        expect(state.get_state(file_path).pendingEdits).toBeUndefined();
+
+        await panel.__receive({
+            type: 'pendingChangesChanged',
+            sourceGeneration: latest_snapshot(panel).sourceGeneration,
+            editSessionId: restore_session,
+            sequence: 3,
+            changes: repeated_changes,
+        });
+        await controller_of(panel).drain();
+        expect(panel.__messages).toContainEqual({
+            type: 'pendingChangesAcknowledged',
+            editSessionId: restore_session,
+            sequence: 3,
+        });
+        expect(state.get_state(file_path).pendingEdits?.[0]?.appendedRows)
+            .toEqual(restored_rows);
+    });
+
+    it('readmits an unsaved pending row retained only by history in a new session', async () => {
+        const state = versioned_state_store({});
+        const panel = await open_ready_xlsx(file_path, state);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'first', sheetIndex: 0 });
+        const first_session = latest_edit_session(panel)!.editSessionId!;
+        const snapshot = latest_snapshot(panel);
+        await panel.__receive({
+            type: 'requestAppendRows',
+            requestId: 'append-for-history',
+            editSessionId: first_session,
+            worksheet: { sheetIndex: 0, sheetName: 'People', worksheetId: '1' },
+            sourceGeneration: snapshot.sourceGeneration,
+            count: 1,
+        });
+        const admission = panel.__messages.find((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { type?: unknown }).type === 'appendRowsResult'
+            && (message as { requestId?: unknown }).requestId === 'append-for-history'
+        )) as Extract<import('../types').HostMessage, { type: 'appendRowsResult' }>;
+        await panel.__receive({
+            type: 'settleRowAdmission',
+            requestId: 'append-for-history',
+            editSessionId: first_session,
+            accepted: true,
+        });
+        const row = {
+            id: admission.rowIds![0],
+            cells: { 0: { value: 'restored by undo', valueEditOrder: 2 } },
+            formatTemplateId: admission.formatTemplate!.id,
+            createdOrder: 1,
+        };
+        await panel.__receive({
+            type: 'retainedSavedAppendAuthoritiesChanged',
+            authorities: [{
+                sheetIndex: 0,
+                sheetName: 'People',
+                worksheetId: '1',
+                appendHistoryIds: [],
+                pendingRowIds: [row.id],
+            }],
+        });
+        await panel.__receive({
+            type: 'pendingChangesChanged',
+            sourceGeneration: latest_snapshot(panel).sourceGeneration,
+            editSessionId: first_session,
+            sequence: 1,
+            changes: {
+                sheetIndex: 0,
+                sheetName: 'People',
+                worksheetId: '1',
+                cells: {},
+                formatTemplates: [],
+                appendedRows: [],
+                tailRemovals: [],
+                conflicts: [],
+            },
+        });
+        await controller_of(panel).drain();
+        expect(panel.__messages).toContainEqual({
+            type: 'pendingChangesAcknowledged',
+            editSessionId: first_session,
+            sequence: 1,
+        });
+        await panel.__receive({ type: 'releaseEditSession', editSessionId: first_session });
+        await panel.__receive({ type: 'requestEditSession', requestId: 'second', sheetIndex: 0 });
+        const second_session = latest_edit_session(panel)!.editSessionId!;
+        expect(second_session).not.toBe(first_session);
+
+        await panel.__receive({
+            type: 'pendingChangesChanged',
+            sourceGeneration: latest_snapshot(panel).sourceGeneration,
+            editSessionId: second_session,
+            sequence: 1,
+            changes: {
+                sheetIndex: 0,
+                sheetName: 'People',
+                worksheetId: '1',
+                cells: {},
+                formatTemplates: [admission.formatTemplate!],
+                appendedRows: [row],
+                tailRemovals: [],
+                appendBasis: admission.appendBasis!,
+                conflicts: [],
+            },
+        });
+        await controller_of(panel).drain();
+        expect(panel.__messages).toContainEqual({
+            type: 'pendingChangesAcknowledged',
+            editSessionId: second_session,
+            sequence: 1,
+        });
+        expect(state.get_state(file_path).pendingEdits?.[0]?.appendedRows)
+            .toEqual([row]);
     });
 });
 

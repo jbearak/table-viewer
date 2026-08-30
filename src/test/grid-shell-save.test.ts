@@ -60,8 +60,23 @@ const grid_mock = vi.hoisted(() => ({
 
 vi.mock('../webview/glide-data-grid', () => {
     const React = require('react') as typeof import('react');
+    const empty_selection = {
+        length: 0,
+        toArray: () => [],
+        toRanges: () => [],
+        first: () => undefined,
+        last: () => undefined,
+        hasIndex: () => false,
+        equals: (other: unknown) => other === empty_selection,
+        add: () => empty_selection,
+        remove: () => empty_selection,
+        *[Symbol.iterator]() {},
+    };
     return {
-        CompactSelection: { empty: () => ({}) },
+        CompactSelection: {
+            empty: () => empty_selection,
+            fromSingleSelection: () => empty_selection,
+        },
         DataEditor: React.forwardRef((props: unknown, ref: React.ForwardedRef<unknown>) => {
             grid_mock.props = props as typeof grid_mock.props;
             React.useImperativeHandle(ref, () => ({
@@ -264,6 +279,7 @@ async function render_grid(
         },
         sheet_index: 0,
         generation: 1,
+        source_generation: 1,
         show_formatting: false,
         edit_activation_id: 1,
         column_projection,

@@ -13,7 +13,10 @@
  */
 
 import type { WorksheetIdentityInput } from '../types';
-import { discard_history_source } from './history-discard-model';
+import {
+    discard_history_source,
+    discard_structural_history_source,
+} from './history-discard-model';
 import type { EditSessionRegistry } from './edit-session-registry';
 import type { HistoryStore } from './history-store';
 import type { HistoryBounds } from './history-stack-model';
@@ -67,7 +70,12 @@ export function run_discard_transaction(args: {
         label: 'Discard edits',
         // Streamed, not built: a workbook-wide discard is the gesture most likely
         // to exceed the bounds, and the recorder stops mid-walk.
-        changes: discard_history_source(discarded.worksheets),
+        changes: (function* () {
+            yield* discard_history_source(discarded.worksheets);
+            yield* discard_structural_history_source(
+                discarded.structuralWorksheets ?? [],
+            );
+        })(),
     }, args.bounds);
     const staged: readonly StagedMutation[] = [...discarded.mutations, recorded];
     // Validity, not the commit's answer. `commit_staged_transaction` reports

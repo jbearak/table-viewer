@@ -22,9 +22,33 @@ import {
     type RichCellFields,
     type RichText,
 } from './cell-content';
-import { is_valid_hyperlink } from './pending-changes';
+import {
+    has_pending_structural_changes,
+    assert_pending_changes_encoded_bound,
+    assert_pending_user_changes_encoded_bound,
+    is_valid_hyperlink,
+    MAX_PENDING_APPENDED_ROWS,
+    own_pending_structural_changes,
+    own_pending_formula_reference_bases,
+    type PendingAppendedRow,
+    type PendingAppendBasis,
+    type PendingRowFormatTemplate,
+    type SavedAppendedRowSnapshot,
+    type PendingTailRemoval,
+    type PendingStructuralChanges,
+    type PendingStructuralConflict,
+    type PendingStructuralConflictReason,
+    type PendingFormulaReferenceBasis,
+    type RowIdentity,
+} from './pending-changes';
 import { is_plain_record } from './plain-record';
 import { is_canonical_cell_key } from './cell-key';
+import { MAX_SHEET_COLUMNS } from './spreadsheet-safety';
+import {
+    CELL_HIGHLIGHT_COLORS,
+    type CellHighlightColor,
+} from './cell-highlight-colors';
+export { CELL_HIGHLIGHT_COLORS, type CellHighlightColor } from './cell-highlight-colors';
 // Type-only, and deliberately so: `history-replay-protocol.ts` imports this
 // module's sanitizers, so a value import here would close a runtime cycle. The
 // `import type` is erased, and the protocol module stays the one place that
@@ -399,9 +423,6 @@ export interface SheetColumnVisibilityState {
     /** Uses the same sheet identity fingerprint as transform descriptors. */
     schema?: string;
 }
-
-export const CELL_HIGHLIGHT_COLORS = ['yellow', 'green', 'blue', 'pink'] as const;
-export type CellHighlightColor = typeof CELL_HIGHLIGHT_COLORS[number];
 
 /** Compact rectangular-union selection: display-row runs crossed with sorted
  * canonical source columns. Adjacent row runs must be coalesced by the sender. */
@@ -905,6 +926,10 @@ function validate_edit_cells(value: unknown): Record<string, string | CsvDirtyEn
         if (entry.valueEditOrder !== undefined && !is_valid_value_edit_order(entry.valueEditOrder)) {
             invalid_leaf('pendingEdits');
         }
+        if (entry.formulaReferenceBases !== undefined
+            && own_pending_formula_reference_bases(entry.formulaReferenceBases) === undefined) {
+            invalid_leaf('pendingEdits');
+        }
     }
     return value as Record<string, string | CsvDirtyEntry>;
 }
@@ -931,6 +956,14 @@ function rebase_pending_edit_orders(
             add(entry.valueEditOrder);
             add(entry.movedFrom?.order);
             for (const previous of entry.movedFrom?.previous ?? []) add(previous.order);
+        }
+        for (const row of slot.appendedRows ?? []) {
+            add(row.createdOrder);
+            for (const cell of Object.values(row.cells)) {
+                add(cell.valueEditOrder);
+                add(cell.movedFrom?.order);
+                for (const previous of cell.movedFrom?.previous ?? []) add(previous.order);
+            }
         }
     }
     if (latest < VALUE_EDIT_ORDER_REBASE_THRESHOLD) return slots;
@@ -962,7 +995,37 @@ function rebase_pending_edit_orders(
                 }),
             }];
         }));
-        return { ...slot, cells };
+        const appendedRows = slot.appendedRows?.map((row) => ({
+            ...row,
+            createdOrder: replacements.get(row.createdOrder)!,
+            cells: Object.fromEntries(Object.entries(row.cells).map(([column, cell]) => [
+                column,
+                (() => {
+                    const movedFrom = cell.movedFrom === undefined ? undefined : {
+                        ...cell.movedFrom,
+                        order: replacements.get(cell.movedFrom.order)!,
+                        ...(cell.movedFrom.previous === undefined ? {} : {
+                            previous: cell.movedFrom.previous.map((move) => ({
+                                ...move,
+                                order: replacements.get(move.order)!,
+                            })),
+                        }),
+                    };
+                    return {
+                        ...cell,
+                        ...(cell.valueEditOrder === undefined ? {} : {
+                            valueEditOrder: replacements.get(cell.valueEditOrder)!,
+                        }),
+                        ...(movedFrom === undefined ? {} : { movedFrom }),
+                    };
+                })(),
+            ])),
+        }));
+        return {
+            ...slot,
+            cells,
+            ...(appendedRows === undefined ? {} : { appendedRows }),
+        };
     });
 }
 
@@ -971,8 +1034,10 @@ function rebase_pending_edit_orders(
  *
  * Three are accepted, and all three are objects on disk:
  *
- *  - `{sheets: [...]}` — what this version writes. See {@link encode_pending_edits}
- *    for why the list is wrapped rather than stored bare.
+ *  - `{version: 1, sheets: [...]}` — what this version writes. See
+ *    {@link stringify_stored_per_file_state} for why the list is wrapped rather
+ *    than stored bare.
+ *  - `{sheets: [...]}` — the first worksheet-scoped envelope.
  *  - a bare array — never persisted, but this is also the in-memory shape, and the
  *    same decoder runs over states that never went to disk.
  *  - a flat cell map — the pre-worksheet shape, one CSV's edits, which becomes slot
@@ -983,13 +1048,22 @@ function rebase_pending_edit_orders(
  * flat-map keys are all `"<row>:<col>"` and `validate_edit_cells` rejects anything
  * else. Returns `undefined` when nothing survives, so the caller can drop the leaf.
  */
-function decode_pending_edits(value: unknown): (WorksheetPendingEdits | undefined)[] | undefined {
+function decode_pending_edits(
+    value: unknown,
+    enforce_complete_bound = false,
+): (WorksheetPendingEdits | undefined)[] | undefined {
     if (is_plain_record(value)) {
         if (Object.hasOwn(value, 'sheets')) {
-            if (Object.keys(value).length !== 1 || !Array.isArray(value.sheets)) {
+            const versioned = Object.hasOwn(value, 'version');
+            if (
+                !Array.isArray(value.sheets)
+                || (versioned
+                    ? value.version !== 1 || Object.keys(value).length !== 2
+                    : Object.keys(value).length !== 1)
+            ) {
                 invalid_leaf('pendingEdits');
             }
-            return decode_pending_edits(value.sheets);
+            return decode_pending_edits(value.sheets, versioned);
         }
         const cells = validate_edit_cells(value);
         return Object.keys(cells).length === 0
@@ -1008,12 +1082,39 @@ function decode_pending_edits(value: unknown): (WorksheetPendingEdits | undefine
             invalid_leaf('pendingEdits');
         }
         const cells = validate_edit_cells(slot.cells);
-        if (Object.keys(cells).length === 0) return undefined;
-        return {
+        const structural = own_pending_structural_changes(slot);
+        if (Object.keys(cells).length === 0 && !has_pending_structural_changes(structural)) {
+            return undefined;
+        }
+        const decoded = {
             ...(slot.sheetName !== undefined ? { sheetName: slot.sheetName } : {}),
             ...(slot.worksheetId !== undefined ? { worksheetId: slot.worksheetId } : {}),
             cells,
+            ...(structural.formatTemplates.length > 0
+                ? { formatTemplates: structural.formatTemplates }
+                : {}),
+            ...(structural.appendedRows.length > 0
+                ? { appendedRows: structural.appendedRows }
+                : {}),
+            ...(structural.tailRemovals.length > 0
+                ? { tailRemovals: structural.tailRemovals }
+                : {}),
+            ...(structural.appendBasis === undefined
+                ? {}
+                : { appendBasis: structural.appendBasis }),
+            ...(structural.conflicts.length > 0
+                ? { conflicts: structural.conflicts }
+                : {}),
         };
+        if (
+            enforce_complete_bound
+            || slot.formatTemplates !== undefined
+            || slot.appendedRows !== undefined
+            || slot.tailRemovals !== undefined
+            || slot.appendBasis !== undefined
+            || slot.conflicts !== undefined
+        ) assert_pending_changes_encoded_bound(decoded);
+        return decoded;
     });
 
     // Trailing empties carry no information; trimming keeps the persisted array
@@ -1052,7 +1153,10 @@ export function stringify_stored_per_file_state(state: StoredPerFileState): stri
         const { pendingEdits: _dropped, ...rest } = state as PerFileState;
         return JSON.stringify(rest);
     }
-    return JSON.stringify({ ...state, pendingEdits: { sheets: pending } });
+    for (const slot of pending) {
+        if (slot !== undefined) assert_pending_changes_encoded_bound(slot);
+    }
+    return JSON.stringify({ ...state, pendingEdits: { version: 1, sheets: pending } });
 }
 
 /** Validate known leaves while preserving unknown top-level leaves verbatim. */
@@ -1133,6 +1237,21 @@ export interface WorksheetPendingEdits {
     /** Stable worksheet identity. Absent only on legacy slots and formats without one. */
     readonly worksheetId?: string;
     readonly cells: SheetPendingEditCells;
+    /** Interned presentation snapshots referenced by `appendedRows`. */
+    readonly formatTemplates?: readonly PendingRowFormatTemplate[];
+    /** Ordered structural additions whose identities do not exist in the source yet. */
+    readonly appendedRows?: readonly PendingAppendedRow[];
+    /** Ordered Undo-only removals of saved append suffixes. */
+    readonly tailRemovals?: readonly PendingTailRemoval[];
+    /** Source schema/style facts captured when structural work was admitted. */
+    readonly appendBasis?: PendingStructuralChanges['appendBasis'];
+    /** Durable save refusals for pending rows. */
+    readonly conflicts?: PendingStructuralChanges['conflicts'];
+}
+
+/** New wire/save shape: one complete, version-1 worksheet Pending Changes snapshot. */
+export interface WorksheetPendingChanges extends WorksheetTarget, PendingStructuralChanges {
+    readonly cells: CsvDirtyMap;
 }
 
 /** Format-neutral worksheet identity used to reconcile durable positional state. */
@@ -1208,6 +1327,41 @@ export function worksheet_target_index(
  */
 export type SheetPendingEditCells = Record<string, string | CsvDirtyEntry>;
 
+function worksheet_slot_has_pending_changes(slot: WorksheetPendingEdits | undefined): boolean {
+    return !!slot && (
+        Object.keys(slot.cells).length > 0
+        || (slot.appendedRows?.length ?? 0) > 0
+        || (slot.tailRemovals?.length ?? 0) > 0
+        || (slot.conflicts?.length ?? 0) > 0
+    );
+}
+
+function worksheet_slot_matches_identity(
+    slot: WorksheetPendingEdits,
+    sheet_name?: string,
+    worksheet_id?: string,
+): boolean {
+    return slot.worksheetId !== undefined
+        ? worksheet_id !== undefined && slot.worksheetId === worksheet_id
+        : sheet_name === undefined
+            || slot.sheetName === undefined
+            || slot.sheetName === sheet_name;
+}
+
+/** One complete worksheet Pending Changes slot, after identity validation. */
+export function pending_changes_for_sheet(
+    pending: PerFileState['pendingEdits'],
+    sheet_index: number,
+    sheet_name?: string,
+    worksheet_id?: string,
+): WorksheetPendingEdits | undefined {
+    const slot = pending?.[sheet_index];
+    if (!slot || !worksheet_slot_matches_identity(slot, sheet_name, worksheet_id)) {
+        return undefined;
+    }
+    return worksheet_slot_has_pending_changes(slot) ? slot : undefined;
+}
+
 /** One sheet's cell map out of the worksheet-scoped leaf, or undefined. */
 export function pending_edits_for_sheet(
     pending: PerFileState['pendingEdits'],
@@ -1216,22 +1370,8 @@ export function pending_edits_for_sheet(
     sheet_name?: string,
     worksheet_id?: string,
 ): Record<string, string | CsvDirtyEntry> | undefined {
-    const slot = pending?.[sheet_index];
+    const slot = pending_changes_for_sheet(pending, sheet_index, sheet_name, worksheet_id);
     if (!slot) return undefined;
-    // A stable ID is authoritative whenever the slot has one. Name fallback is
-    // reserved for legacy ID-less slots; otherwise deleting a worksheet and
-    // recreating one under the same name would inherit the deleted sheet's draft.
-    if (slot.worksheetId !== undefined) {
-        if (worksheet_id === undefined || slot.worksheetId !== worksheet_id) {
-            return undefined;
-        }
-    } else if (
-        sheet_name !== undefined
-        && slot.sheetName !== undefined
-        && slot.sheetName !== sheet_name
-    ) {
-        return undefined;
-    }
     for (const key in slot.cells) {
         if (Object.prototype.hasOwnProperty.call(slot.cells, key)) return slot.cells;
     }
@@ -1255,7 +1395,7 @@ export function sheet_index_with_pending_edits(
     for (let i = 0; i < pending.length; i++) {
         const sheet = sheets[i];
         const identity = sheet === undefined ? undefined : worksheet_identity(sheet);
-        if (identity && pending_edits_for_sheet(
+        if (identity && pending_changes_for_sheet(
             pending,
             i,
             identity.name,
@@ -1281,10 +1421,10 @@ export function sheet_index_with_pending_edits(
  * moves back to its own index as soon as the winner clears — so the incumbent is
  * moved to a free slot rather than dropped.
  */
-export function with_pending_edits_for_sheet(
+export function with_pending_changes_for_sheet(
     pending: PerFileState['pendingEdits'],
     sheet_index: number,
-    cells: Record<string, string | CsvDirtyEntry> | undefined,
+    changes: Omit<WorksheetPendingEdits, 'sheetName' | 'worksheetId'> | undefined,
     sheet_name?: string,
     worksheet_id?: string,
 ): PerFileState['pendingEdits'] {
@@ -1305,15 +1445,19 @@ export function with_pending_edits_for_sheet(
     // there. The write path below relocates such an incumbent; a clear must simply
     // leave it alone, or discarding a session that never published a durable map
     // silently dropped the other worksheet's draft.
-    if (foreign && !(cells && Object.keys(cells).length > 0)) return pending;
+    if (foreign && !worksheet_slot_has_pending_changes(changes)) return pending;
     const displaced = foreign ? incumbent : undefined;
-    next[sheet_index] = cells && Object.keys(cells).length > 0
-        ? {
+    if (worksheet_slot_has_pending_changes(changes)) {
+        const next_slot = {
             ...(sheet_name !== undefined ? { sheetName: sheet_name } : {}),
             ...(worksheet_id !== undefined ? { worksheetId: worksheet_id } : {}),
-            cells,
-        }
-        : undefined;
+            ...changes!,
+        };
+        assert_pending_changes_encoded_bound(next_slot);
+        next[sheet_index] = next_slot;
+    } else {
+        next[sheet_index] = undefined;
+    }
     if (displaced && next[sheet_index] !== undefined) {
         let free = next.findIndex((slot, index) => index !== sheet_index && slot === undefined);
         if (free === -1) free = next.push(undefined) - 1;
@@ -1323,9 +1467,53 @@ export function with_pending_edits_for_sheet(
     return next.length === 0 ? undefined : next;
 }
 
+/**
+ * Replace only one worksheet's cell changes while retaining its structural
+ * changes. Legacy cell-edit publishers use this during the protocol migration.
+ */
+export function with_pending_edits_for_sheet(
+    pending: PerFileState['pendingEdits'],
+    sheet_index: number,
+    cells: Record<string, string | CsvDirtyEntry> | undefined,
+    sheet_name?: string,
+    worksheet_id?: string,
+): PerFileState['pendingEdits'] {
+    const incumbent = pending_changes_for_sheet(
+        pending,
+        sheet_index,
+        sheet_name,
+        worksheet_id,
+    );
+    const changes = {
+        cells: cells ?? {},
+        ...(incumbent?.formatTemplates !== undefined
+            ? { formatTemplates: incumbent.formatTemplates }
+            : {}),
+        ...(incumbent?.appendedRows !== undefined
+            ? { appendedRows: incumbent.appendedRows }
+            : {}),
+        ...(incumbent?.tailRemovals !== undefined
+            ? { tailRemovals: incumbent.tailRemovals }
+            : {}),
+        ...(incumbent?.appendBasis !== undefined
+            ? { appendBasis: incumbent.appendBasis }
+            : {}),
+        ...(incumbent?.conflicts !== undefined
+            ? { conflicts: incumbent.conflicts }
+            : {}),
+    };
+    return with_pending_changes_for_sheet(
+        pending,
+        sheet_index,
+        changes,
+        sheet_name,
+        worksheet_id,
+    );
+}
+
 /** True when any sheet holds pending edits. */
 export function has_any_pending_edits(pending: PerFileState['pendingEdits']): boolean {
-    return !!pending?.some((slot) => slot && Object.keys(slot.cells).length > 0);
+    return !!pending?.some(worksheet_slot_has_pending_changes);
 }
 
 /**
@@ -1565,10 +1753,13 @@ export interface CsvDirtyEntry {
         readonly row: number;
         readonly col: number;
         readonly order: number;
+        readonly rowIdentity?: RowIdentity;
         readonly previous?: readonly CellMoveIntent[];
     };
     /** Order of the last explicit value edit to this cell. */
     readonly valueEditOrder?: number;
+    /** Pending append bands referenced by the formula when this value was authored. */
+    readonly formulaReferenceBases?: readonly PendingFormulaReferenceBasis[];
 }
 
 /** The latest persisted side of a cell carrying a pending edit. */
@@ -1584,6 +1775,8 @@ export interface CellMoveIntent {
     readonly destinationRow: number;
     readonly destinationCol: number;
     readonly order: number;
+    readonly sourceRowIdentity?: RowIdentity;
+    readonly destinationRowIdentity?: RowIdentity;
 }
 
 interface DirtyMoveIndex {
@@ -1745,6 +1938,19 @@ export function dirty_move_component_sizes(
     return sizes;
 }
 
+function sanitized_move_row_identity(value: unknown): RowIdentity | undefined {
+    if (!is_plain_record(value)) return undefined;
+    if (value.kind === 'source' && Number.isSafeInteger(value.sourceRow)
+        && (value.sourceRow as number) >= 0 && (value.sourceRow as number) < 1_048_576) {
+        return { kind: 'source', sourceRow: value.sourceRow as number };
+    }
+    if (value.kind === 'pending' && typeof value.pendingRowId === 'string'
+        && value.pendingRowId.length > 0 && value.pendingRowId.length <= 128) {
+        return { kind: 'pending', pendingRowId: value.pendingRowId };
+    }
+    return undefined;
+}
+
 function sanitized_cell_move_intent(value: unknown): CellMoveIntent | undefined {
     if (!is_plain_record(value)) return undefined;
     const coordinates = [value.sourceRow, value.sourceCol, value.destinationRow, value.destinationCol];
@@ -1753,13 +1959,23 @@ function sanitized_cell_move_intent(value: unknown): CellMoveIntent | undefined 
     }
     if ((value.sourceRow as number) >= 1_048_576 || (value.destinationRow as number) >= 1_048_576
         || (value.sourceCol as number) >= 16_384 || (value.destinationCol as number) >= 16_384
-        || !is_valid_value_edit_order(value.order)) return undefined;
+        || !is_valid_value_edit_order(value.order)
+        || (value.sourceRowIdentity !== undefined
+            && sanitized_move_row_identity(value.sourceRowIdentity) === undefined)
+        || (value.destinationRowIdentity !== undefined
+            && sanitized_move_row_identity(value.destinationRowIdentity) === undefined)) return undefined;
     return {
         sourceRow: value.sourceRow as number,
         sourceCol: value.sourceCol as number,
         destinationRow: value.destinationRow as number,
         destinationCol: value.destinationCol as number,
         order: value.order as number,
+        ...(value.sourceRowIdentity === undefined ? {} : {
+            sourceRowIdentity: sanitized_move_row_identity(value.sourceRowIdentity)!,
+        }),
+        ...(value.destinationRowIdentity === undefined ? {} : {
+            destinationRowIdentity: sanitized_move_row_identity(value.destinationRowIdentity)!,
+        }),
     };
 }
 
@@ -1774,6 +1990,8 @@ function is_valid_move_provenance(
         && (value.col as number) >= 0
         && (value.col as number) < 16_384
         && is_valid_value_edit_order(value.order)
+        && (value.rowIdentity === undefined
+            || sanitized_move_row_identity(value.rowIdentity) !== undefined)
         && (
             value.previous === undefined
             || Array.isArray(value.previous)
@@ -1789,14 +2007,19 @@ export function move_provenance_equal(
     left: CsvDirtyEntry['movedFrom'],
     right: CsvDirtyEntry['movedFrom'],
 ): boolean {
-    if (left?.row !== right?.row || left?.col !== right?.col || left?.order !== right?.order) return false;
+    if (left?.row !== right?.row || left?.col !== right?.col || left?.order !== right?.order
+        || JSON.stringify(left?.rowIdentity) !== JSON.stringify(right?.rowIdentity)) return false;
     const left_previous = left?.previous ?? [];
     const right_previous = right?.previous ?? [];
     return left_previous.length === right_previous.length && left_previous.every((move, index) => {
         const other = right_previous[index];
         return move.sourceRow === other?.sourceRow && move.sourceCol === other.sourceCol
             && move.destinationRow === other.destinationRow
-            && move.destinationCol === other.destinationCol && move.order === other.order;
+            && move.destinationCol === other.destinationCol && move.order === other.order
+            && JSON.stringify(move.sourceRowIdentity)
+                === JSON.stringify(other.sourceRowIdentity)
+            && JSON.stringify(move.destinationRowIdentity)
+                === JSON.stringify(other.destinationRowIdentity);
     });
 }
 
@@ -1809,6 +2032,7 @@ export interface DirtyEntryOptions {
     readonly formattingKnown?: true;
     readonly movedFrom?: CsvDirtyEntry['movedFrom'];
     readonly valueEditOrder?: number;
+    readonly formulaReferenceBases?: readonly PendingFormulaReferenceBasis[];
 }
 
 /**
@@ -1842,6 +2066,9 @@ export function make_dirty_entry(
         ...(options.valueEditOrder !== undefined
             ? { valueEditOrder: options.valueEditOrder }
             : {}),
+        ...(options.formulaReferenceBases !== undefined
+            ? { formulaReferenceBases: options.formulaReferenceBases }
+            : {}),
     };
 }
 
@@ -1874,6 +2101,7 @@ export function copy_dirty_entry(
             formattingKnown: merged.formattingKnown,
             movedFrom: merged.movedFrom,
             valueEditOrder: merged.valueEditOrder,
+            formulaReferenceBases: merged.formulaReferenceBases,
         },
     );
 }
@@ -1953,6 +2181,7 @@ export function sanitized_dirty_entry(entry: {
     readonly formattingKnown?: unknown;
     readonly movedFrom?: unknown;
     readonly valueEditOrder?: unknown;
+    readonly formulaReferenceBases?: unknown;
 }): CsvDirtyEntry {
     const keep = (runs: unknown, text: string): RichText | undefined => (
         is_matching_rich_text(runs, text) ? runs : undefined
@@ -1997,17 +2226,25 @@ export function sanitized_dirty_entry(entry: {
         && (entry.movedFrom.col as number) >= 0
         && (entry.movedFrom.col as number) < 16_384
         && is_valid_value_edit_order(entry.movedFrom.order)
+        && (entry.movedFrom.rowIdentity === undefined
+            || sanitized_move_row_identity(entry.movedFrom.rowIdentity) !== undefined)
         && previous_moves.every((move) => move !== undefined)
         ? {
             row: entry.movedFrom.row as number,
             col: entry.movedFrom.col as number,
             order: entry.movedFrom.order as number,
+            ...(entry.movedFrom.rowIdentity === undefined ? {} : {
+                rowIdentity: sanitized_move_row_identity(entry.movedFrom.rowIdentity)!,
+            }),
             ...(previous_moves.length === 0 ? {} : { previous: previous_moves as CellMoveIntent[] }),
         }
         : undefined;
     const value_edit_order = is_valid_value_edit_order(entry.valueEditOrder)
         ? entry.valueEditOrder as number
         : undefined;
+    const formula_reference_bases = entry.formulaReferenceBases === undefined
+        ? undefined
+        : own_pending_formula_reference_bases(entry.formulaReferenceBases);
     return make_dirty_entry(
         entry.value,
         entry.base,
@@ -2022,6 +2259,7 @@ export function sanitized_dirty_entry(entry: {
             formattingKnown: entry.formattingKnown === true ? true : undefined,
             movedFrom: moved_from,
             valueEditOrder: value_edit_order,
+            formulaReferenceBases: formula_reference_bases,
         },
     );
 }
@@ -2044,6 +2282,10 @@ export function sanitized_wire_dirty_entry(entry: unknown): CsvDirtyEntry | unde
     if (entry.valueEditOrder !== undefined && !is_valid_value_edit_order(entry.valueEditOrder)) {
         return undefined;
     }
+    if (entry.formulaReferenceBases !== undefined
+        && own_pending_formula_reference_bases(entry.formulaReferenceBases) === undefined) {
+        return undefined;
+    }
     return sanitized_dirty_entry(entry as {
         readonly value: string;
         readonly base: string;
@@ -2057,6 +2299,7 @@ export function sanitized_wire_dirty_entry(entry: unknown): CsvDirtyEntry | unde
         readonly formattingKnown?: unknown;
         readonly movedFrom?: unknown;
         readonly valueEditOrder?: unknown;
+        readonly formulaReferenceBases?: unknown;
     });
 }
 
@@ -2081,6 +2324,10 @@ export function is_strict_wire_dirty_entry(value: unknown): value is CsvDirtyEnt
     if (value.formattingKnown !== undefined && value.formattingKnown !== true) return false;
     if (value.movedFrom !== undefined && !is_valid_move_provenance(value.movedFrom)) return false;
     if (value.valueEditOrder !== undefined && !is_valid_value_edit_order(value.valueEditOrder)) {
+        return false;
+    }
+    if (value.formulaReferenceBases !== undefined
+        && own_pending_formula_reference_bases(value.formulaReferenceBases) === undefined) {
         return false;
     }
 
@@ -2167,7 +2414,9 @@ export function dirty_entries_equal(
         && left.retainValue === right.retainValue
         && left.formattingKnown === right.formattingKnown
         && move_provenance_equal(left.movedFrom, right.movedFrom)
-        && left.valueEditOrder === right.valueEditOrder;
+        && left.valueEditOrder === right.valueEditOrder
+        && JSON.stringify(left.formulaReferenceBases ?? [])
+            === JSON.stringify(right.formulaReferenceBases ?? []);
 }
 
 export function observed_file_bases_equal(
@@ -2275,7 +2524,7 @@ function optional_runs_equal(
  *  rejection sent as its own message could be applied against a dirty map that
  *  has not been restored yet, naming keys the store does not hold. One message,
  *  one ordering. */
-export interface CsvSaveRejection {
+export interface CsvCellSaveRejection {
     readonly reason: 'baseMismatch' | 'rowsRemoved';
     /** Ordinal of the rejected worksheet in lifecycle.operation.worksheets. */
     readonly worksheetOperationIndex: number;
@@ -2287,13 +2536,71 @@ export interface CsvSaveRejection {
     readonly observedBases?: Readonly<Record<string, CsvObservedFileBase>>;
 }
 
+/** A host-side structural validation discovered after the renderer submitted. */
+export interface CsvStructuralSaveRejection {
+    readonly reason: 'structuralConflict';
+    /** Ordinal of the rejected worksheet in lifecycle.operation.worksheets. */
+    readonly worksheetOperationIndex: number;
+    readonly structuralReason: PendingStructuralConflictReason;
+    readonly pendingRowIds: readonly string[];
+    readonly tailRemovalIds: readonly string[];
+    readonly formulaCells?: PendingStructuralConflict['formulaCells'];
+}
+
+export type CsvSaveRejection = CsvCellSaveRejection | CsvStructuralSaveRejection;
+
 export function is_wire_csv_save_rejection(
     value: unknown,
 ): value is CsvSaveRejection {
     if (!(is_plain_record(value)
-        && (value.reason === 'baseMismatch' || value.reason === 'rowsRemoved')
         && Number.isSafeInteger(value.worksheetOperationIndex)
         && (value.worksheetOperationIndex as number) >= 0
+    )) return false;
+    if (value.reason === 'structuralConflict') {
+        const reasons = new Set<PendingStructuralConflictReason>([
+            'worksheetReplaced',
+            'rowLimitExceeded',
+            'templateChanged',
+            'ambiguousColumns',
+            'ambiguousPendingFormula',
+            'savedSuffixChanged',
+        ]);
+        let payload_within_bound = false;
+        try {
+            assert_pending_changes_encoded_bound({
+                conflicts: [{
+                    reason: value.structuralReason,
+                    pendingRowIds: value.pendingRowIds,
+                    tailRemovalIds: value.tailRemovalIds,
+                    ...(value.formulaCells === undefined
+                        ? {}
+                        : { formulaCells: value.formulaCells }),
+                }],
+            });
+            payload_within_bound = true;
+        } catch {
+            payload_within_bound = false;
+        }
+        return payload_within_bound
+            && reasons.has(value.structuralReason as PendingStructuralConflictReason)
+            && Array.isArray(value.pendingRowIds)
+            && Array.isArray(value.tailRemovalIds)
+            && (value.formulaCells === undefined || (Array.isArray(value.formulaCells)
+                && value.formulaCells.every((cell) => is_plain_record(cell)
+                    && Number.isSafeInteger(cell.sourceColumn)
+                    && (cell.sourceColumn as number) >= 0
+                    && (cell.sourceColumn as number) < MAX_SHEET_COLUMNS
+                    && sanitized_move_row_identity(cell.rowIdentity) !== undefined)))
+            && value.pendingRowIds.length <= MAX_PENDING_APPENDED_ROWS
+            && value.tailRemovalIds.length <= MAX_PENDING_APPENDED_ROWS
+            && value.pendingRowIds.every((id) => typeof id === 'string'
+                && id.length > 0 && id.length <= 128)
+            && value.tailRemovalIds.every((id) => typeof id === 'string'
+                && id.length > 0 && id.length <= 128)
+            && new Set(value.pendingRowIds).size === value.pendingRowIds.length
+            && new Set(value.tailRemovalIds).size === value.tailRemovalIds.length;
+    }
+    if (!((value.reason === 'baseMismatch' || value.reason === 'rowsRemoved')
         && Array.isArray(value.keys)
         && value.keys.every((key) => typeof key === 'string')
     )) return false;
@@ -2330,6 +2637,25 @@ export function is_wire_csv_save_rejection(
 export interface CsvSaveWorksheetOperation extends WorksheetTarget {
     readonly edits: Readonly<Record<string, string>>;
     readonly dirtyEdits: CsvDirtyMap;
+    /** Present on the new protocol; absent is the legacy cell-only operation. */
+    readonly structuralChanges?: PendingStructuralChanges;
+}
+
+export interface AppendedRowAssignment extends WorksheetTarget {
+    readonly pendingRowId: string;
+    readonly sourceRow: number;
+    readonly savedFingerprint: string;
+    /** Exact canonical cells parsed from the bytes written by XLSX saves. */
+    readonly savedCells?: SavedAppendedRowSnapshot['cells'];
+    /** Complete host-bound history snapshot, including non-physical metadata. */
+    readonly savedRow?: SavedAppendedRowSnapshot;
+}
+
+export interface PendingChangesSaveReceipt {
+    readonly appendedRows: readonly AppendedRowAssignment[];
+    readonly removedSourceRows: readonly (WorksheetTarget & {
+        readonly sourceRows: readonly number[];
+    })[];
 }
 
 /** Decode one worksheet target, optionally defaulting a legacy missing index. */
@@ -2353,6 +2679,76 @@ export function sanitized_wire_worksheet_target(
         ...(value.sheetName !== undefined ? { sheetName: value.sheetName } : {}),
         ...(value.worksheetId !== undefined ? { worksheetId: value.worksheetId } : {}),
     });
+}
+
+const STRICT_DIRTY_ENTRY_KEYS = new Set([
+    'value',
+    'base',
+    'valueRuns',
+    'baseRuns',
+    'link',
+    'baseLink',
+    'observedBase',
+    'writeValue',
+    'retainValue',
+    'formattingKnown',
+    'movedFrom',
+    'valueEditOrder',
+    'formulaReferenceBases',
+]);
+
+/** Strict all-or-nothing owner for the new full-snapshot wire protocol. */
+export function own_wire_pending_changes(value: unknown): WorksheetPendingChanges | undefined {
+    if (!is_plain_record(value)) return undefined;
+    try {
+        // Conflicts are host-owned and may use the reserved tail of the durable
+        // envelope. The renderer-owned content is measured separately below.
+        assert_pending_changes_encoded_bound(value);
+    } catch {
+        return undefined;
+    }
+    const allowed = new Set([
+        'sheetIndex',
+        'sheetName',
+        'worksheetId',
+        'cells',
+        'formatTemplates',
+        'appendedRows',
+        'tailRemovals',
+        'appendBasis',
+        'conflicts',
+    ]);
+    if (
+        Object.keys(value).some((key) => !allowed.has(key))
+        || value.formatTemplates === undefined
+        || value.appendedRows === undefined
+        || value.tailRemovals === undefined
+        || value.conflicts === undefined
+    ) return undefined;
+    const target = sanitized_wire_worksheet_target(value);
+    if (!target || !is_plain_record(value.cells)) return undefined;
+    for (const [key, entry] of Object.entries(value.cells)) {
+        if (
+            !is_canonical_cell_key(key)
+            || !is_strict_wire_dirty_entry(entry)
+            || !is_plain_record(entry)
+            || Object.keys(entry).some((field) => !STRICT_DIRTY_ENTRY_KEYS.has(field))
+        ) return undefined;
+    }
+    const cells = sanitized_wire_dirty_map(value.cells);
+    if (cells === undefined) return undefined;
+    try {
+        const structural = own_pending_structural_changes(value);
+        const owned = Object.freeze({ ...target, cells, ...structural });
+        assert_pending_changes_encoded_bound(owned);
+        assert_pending_user_changes_encoded_bound({
+            ...owned,
+            conflicts: Object.freeze([]),
+        });
+        return owned;
+    } catch {
+        return undefined;
+    }
 }
 
 /**
@@ -2527,6 +2923,15 @@ export type HostMessage =
     | { type: 'editCommand'; command: 'copy' | 'selectAll' | 'undo' | 'redo' }
     | { type: 'workbookSnapshot'; snapshot: WorkbookSnapshot }
     | { type: 'rowData'; sheetIndex: number; startRow: number; rows: (RenderedCell | null)[][]; sourceRows: number[]; requestId: string; generation: number }
+    | {
+        type: 'sourceDisplayRows';
+        requestId: string;
+        sheetIndex: number;
+        sourceRows: readonly number[];
+        displayRows: readonly (number | null)[];
+        generation: number;
+        mappingGeneration: number;
+    }
     | { type: 'formulaCalculation'; requestId: string; sourceGeneration: number; results: readonly FormulaCalculationResult[] }
     /** Git compare mode: sparse positional diff for the same page a rowData
      *  answered. `rowStatus[i]` describes row `startRow + i`; `changedCells`
@@ -2541,11 +2946,15 @@ export type HostMessage =
         rejection?: CsvSaveRejection;
         /** The host reached and passed dirty-base validation before this result. */
         basesValidated?: true;
+        receipt?: PendingChangesSaveReceipt;
     }
     // `sheetIndex` mirrors the request's: optional, defaulting to the only sheet
     // a single-sheet source has. Every host answer echoes back the sheet it was
     // asked about, so the webview can route a grant to the right worksheet store.
-    | { type: 'editSessionResult'; requestId: string; granted: boolean; editSessionId?: string; sheetIndex?: number; pendingEdits?: SheetPendingEditCells; diffOnByDefault?: boolean }
+    | { type: 'editSessionResult'; requestId: string; granted: boolean; editSessionId?: string; sheetIndex?: number; pendingEdits?: SheetPendingEditCells; pendingChanges?: WorksheetPendingChanges; diffOnByDefault?: boolean }
+    | { type: 'appendRowsResult'; requestId: string; sourceGeneration: number; granted: boolean; rowIds?: readonly string[]; formatTemplate?: PendingRowFormatTemplate; appendBasis?: PendingAppendBasis; reason?: string }
+    | { type: 'restoreSavedRowsResult'; requestId: string; sourceGeneration: number; granted: boolean; appendHistoryIds?: readonly string[]; appendBasis?: PendingAppendBasis; reason?: string }
+    | { type: 'tailRemovalReplayValidated'; requestId: string; sourceGeneration: number; valid: boolean }
     /**
      * A discard's host-side cleanup has settled.
      *
@@ -2565,8 +2974,11 @@ export type HostMessage =
     | { type: 'saveDialogResult'; requestId: string; editSessionId: string; choice: 'save' | 'discard' | 'cancel' }
     /** The current state backend accepted a pending-edit full map through this sequence. */
     | { type: 'pendingEditsAcknowledged'; editSessionId: string; sequence: number }
+    /** New full-snapshot acknowledgement; shares sequencing with the legacy path. */
+    | { type: 'pendingChangesAcknowledged'; editSessionId: string; sequence: number }
     /** Stop accepting edits and report the highest full-map sequence produced. */
     | { type: 'requestPendingEditsFlush'; requestId: string }
+    | { type: 'requestPendingChangesFlush'; requestId: string }
     | { type: 'filterHistogram'; sheetIndex: number; columnIndex: number; bins: HistogramBin[]; columnKind?: FilterColumnKind; defaultCategorical?: boolean; distinctValues: FilterValueOption[]; distinctValuesExceeded: boolean; requestId: string; generation: number; sourceGeneration: number; error?: string }
     /**
      * `deltas` is the gesture's own change set, and is present ONLY on the
@@ -2577,6 +2989,8 @@ export type HostMessage =
      * built by diffing would revert that other window's highlight.
      */
     | { type: 'cellHighlightsChanged'; sheetIndex?: number; requestId?: string; stateRevision: number; physicalRevision: number; state: CellHighlightState | undefined; deltas?: readonly HighlightCellDelta[]; sourceGeneration: number; error?: string }
+    /** Correlated only for a mixed source/pending resize that must commit atomically. */
+    | { type: 'rowHeightsChanged'; requestId: string; sheetIndex: number; applied: boolean; sourceGeneration: number }
     /**
      * The host installed a view. This is the *only* answer that describes one, and
      * the only message that can move the view generation, so a consumer that reads
@@ -2694,7 +3108,22 @@ export type WebviewMessage =
     | { type: 'resolveLfsObject'; requestId: string }
     | { type: 'snapshotApplied'; identity: WorkbookSnapshotIdentity; disposition: SnapshotDisposition }
     | { type: 'requestRows'; sheetIndex: number; startRow: number; count: number; requestId: string; generation: number }
-    | { type: 'requestFormulaCalculation'; requestId: string; sourceGeneration: number; edits: readonly FormulaCalculationEdit[]; targets: readonly FormulaCalculationAddress[] }
+    | {
+        type: 'requestSourceDisplayRows';
+        requestId: string;
+        sheetIndex: number;
+        sourceRows: readonly number[];
+        generation: number;
+    }
+    | {
+        type: 'requestFormulaCalculation';
+        requestId: string;
+        sourceGeneration: number;
+        edits: readonly FormulaCalculationEdit[];
+        targets: readonly FormulaCalculationAddress[];
+        prospectiveRowCounts?: readonly number[];
+        removedRows?: readonly { readonly sheetIndex: number; readonly row: number }[];
+    }
     | { type: 'cancelFormulaCalculation'; requestId: string; sourceGeneration: number }
     | { type: 'stateChanged'; state: PerFileState; sourceGeneration: number; snapshotIdentity: WorkbookSnapshotIdentity }
     | { type: 'visibleRowChanged'; row: number }
@@ -2720,10 +3149,49 @@ export type WebviewMessage =
     // resolves the *name* at write time, so a post queued across an external
     // reorder still lands in the worksheet the user actually edited.
     | { type: 'pendingEditsChanged'; edits: Record<string, CsvDirtyEntry> | null; editSessionId: string; sequence: number; sheetIndex?: number; sheetName?: string; worksheetId?: string }
+    | { type: 'pendingChangesChanged'; changes: WorksheetPendingChanges; editSessionId: string; sequence: number; sourceGeneration: number }
     /** Renderer close/reload barrier response; zero means no map was produced. */
     | { type: 'pendingEditsFlush'; requestId: string; editSessionId?: string; highestProducedSequence: number }
+    | { type: 'pendingChangesFlush'; requestId: string; editSessionId?: string; highestProducedSequence: number }
     /** The renderer could not establish the requested close/reload barrier. */
     | { type: 'pendingEditsFlushFailed'; requestId: string }
+    | { type: 'pendingChangesFlushFailed'; requestId: string }
+    | {
+        type: 'requestAppendRows';
+        requestId: string;
+        editSessionId: string;
+        worksheet: WorksheetTarget;
+        sourceGeneration: number;
+        count: number;
+    }
+    | {
+        /** Release or retain a host-issued append/restoration reservation. */
+        type: 'settleRowAdmission';
+        requestId: string;
+        editSessionId: string;
+        accepted: boolean;
+    }
+    | {
+        type: 'validateTailRemovalReplay';
+        requestId: string;
+        editSessionId: string;
+        sourceGeneration: number;
+        worksheets: readonly (WorksheetTarget & {
+            readonly removals: readonly {
+                readonly appendHistoryId: string;
+                readonly sourceRow: number;
+                readonly savedFingerprint: string;
+            }[];
+        })[];
+    }
+    | {
+        type: 'requestRestoreSavedRows';
+        requestId: string;
+        editSessionId: string;
+        worksheet: WorksheetTarget;
+        sourceGeneration: number;
+        appendHistoryIds: readonly string[];
+    }
     /**
      * What the desktop Edit menu's Undo and Redo items should read and whether
      * they should be enabled.
@@ -2736,6 +3204,15 @@ export type WebviewMessage =
      * routes to the renderer, which decides against its own live stack).
      */
     | { type: 'historyMenuStateChanged'; state: HistoryMenuProjection }
+    /** Saved-row capabilities still reachable from Undo or Redo history. */
+    | {
+        type: 'retainedSavedAppendAuthoritiesChanged';
+        authorities: readonly (WorksheetTarget & {
+            readonly appendHistoryIds: readonly string[];
+            /** Unsaved temporary identities reachable from Undo/Redo history. */
+            readonly pendingRowIds?: readonly string[];
+        })[];
+    }
     // User-facing warning raised inside the webview (e.g. a clipped copy) that
     // the host surfaces via vscode.window.showWarningMessage.
     | { type: 'showWarning'; message: string }
@@ -2803,7 +3280,7 @@ export type WebviewMessage =
      * when the delivered heights agree with it — so an id here would be a protocol field
      * nothing on either side reads.
      */
-    | { type: 'setRowHeights'; sheetIndex: number; rows: DisplayRowInterval[]; height: number; generation: number; sourceGeneration: number }
+    | { type: 'setRowHeights'; sheetIndex: number; rows: DisplayRowInterval[]; height: number; generation: number; sourceGeneration: number; requestId?: string }
     | { type: 'setColumnVisibility'; sheetIndex: number; sheetName: string; state: SheetColumnVisibilityState | undefined; sourceGeneration: number; snapshotIdentity: WorkbookSnapshotIdentity }
     | { type: 'applyCellHighlights'; sheetIndex: number; sheetName: string; selection: CellHighlightSelection; mutation: CellHighlightMutation; requestId: string; generation: number; sourceGeneration: number; snapshotIdentity: WorkbookSnapshotIdentity }
     | { type: 'clearAllCellHighlights'; requestId: string; generation: number; sourceGeneration: number; snapshotIdentity: WorkbookSnapshotIdentity };

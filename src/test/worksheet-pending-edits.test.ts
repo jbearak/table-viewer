@@ -2,15 +2,28 @@ import { describe, it, expect } from 'vitest';
 import {
     decode_stored_per_file_state,
     has_any_pending_edits,
+    pending_changes_for_sheet,
     pending_edits_for_sheet,
     reconcile_pending_edit_sheets,
     sheet_index_with_pending_edits,
     stringify_stored_per_file_state,
+    with_pending_changes_for_sheet,
     with_pending_edits_for_sheet,
 } from '../types';
 import type { PerFileState } from '../types';
 
 const entry = (value: string, base = '') => ({ value, base });
+
+const structural_changes = (createdOrder = 1) => ({
+    formatTemplates: [{ id: 'plain', format: { kind: 'none' as const } }],
+    appendedRows: [{
+        id: 'pending-row-1',
+        cells: { 0: { value: 'new', valueEditOrder: createdOrder + 1 } },
+        formatTemplateId: 'plain',
+        createdOrder,
+    }],
+    tailRemovals: [],
+});
 
 /** Decode and narrow to the modern arm; `StoredPerFileState`'s legacy arm has no such leaf. */
 function decoded_edits(value: unknown): PerFileState['pendingEdits'] {
@@ -163,8 +176,40 @@ describe('decode_stored_per_file_state — pendingEdits migration', () => {
             }],
         };
         const json = stringify_stored_per_file_state(state as never);
-        expect(JSON.parse(json).pendingEdits).toEqual({ sheets: state.pendingEdits });
+        expect(JSON.parse(json).pendingEdits).toEqual({ version: 1, sheets: state.pendingEdits });
         expect(decode_stored_per_file_state(JSON.parse(json))).toEqual(state);
+    });
+
+    it('round-trips a blank appended row without manufacturing a cell edit', () => {
+        const state = {
+            pendingEdits: [{
+                sheetName: 'S',
+                cells: {},
+                ...structural_changes(),
+            }],
+        };
+        const json = stringify_stored_per_file_state(state as never);
+        expect(decode_stored_per_file_state(JSON.parse(json))).toEqual({
+            pendingEdits: [{
+                sheetName: 'S',
+                cells: {},
+                formatTemplates: state.pendingEdits[0].formatTemplates,
+                appendedRows: state.pendingEdits[0].appendedRows,
+            }],
+        });
+    });
+
+    it('rebases exhausted edit orders inside appended rows', () => {
+        const decoded = decoded_edits({
+            pendingEdits: [{
+                cells: {},
+                ...structural_changes(Number.MAX_SAFE_INTEGER - 1),
+            }],
+        });
+        expect(decoded?.[0]?.appendedRows?.[0]).toMatchObject({
+            createdOrder: 1,
+            cells: { 0: { valueEditOrder: 2 } },
+        });
     });
 
     it('leaves a state with no pending edits unwrapped', () => {
@@ -188,6 +233,9 @@ describe('decode_stored_per_file_state — pendingEdits migration', () => {
         // to be exactly that and nothing else — otherwise a malformed leaf could be
         // read as a wrapper and silently lose the rest of its contents.
         expect(() => decode_stored_per_file_state({ pendingEdits: { sheets: {} } })).toThrow();
+        expect(() => decode_stored_per_file_state({
+            pendingEdits: { version: 2, sheets: [{ cells: { '0:0': entry('x') } }] },
+        })).toThrow();
         expect(() => decode_stored_per_file_state({
             pendingEdits: { sheets: [{ cells: { '0:0': entry('x') } }], '0:0': entry('y') },
         })).toThrow();
@@ -231,6 +279,22 @@ describe('pending_edits_for_sheet', () => {
     });
 });
 
+describe('pending_changes_for_sheet', () => {
+    it('returns a structural-only slot through the same worksheet identity guard', () => {
+        const pending: PerFileState['pendingEdits'] = [{
+            sheetName: 'Data',
+            worksheetId: '9',
+            cells: {},
+            ...structural_changes(),
+        }];
+        expect(pending_changes_for_sheet(pending, 0, 'Renamed', '9')?.appendedRows)
+            .toHaveLength(1);
+        expect(pending_changes_for_sheet(pending, 0, 'Data', 'replacement'))
+            .toBeUndefined();
+        expect(pending_edits_for_sheet(pending, 0, 'Renamed', '9')).toBeUndefined();
+    });
+});
+
 describe('sheet_index_with_pending_edits', () => {
     it('skips an ID-tagged draft parked over a replacement worksheet', () => {
         const pending: PerFileState['pendingEdits'] = [{
@@ -262,7 +326,7 @@ describe('with_pending_edits_for_sheet', () => {
         expect(pending_edits_for_sheet(after, 1)).toEqual({ '2:0': entry('B2') });
     });
 
-    it('clears one sheet and leaves the rest — the save/discard path', () => {
+    it('clears one sheet of cell changes and leaves the rest', () => {
         const before: PerFileState['pendingEdits'] = [
             { sheetName: 'A', cells: { '0:0': entry('a') } },
             { sheetName: 'B', cells: { '1:0': entry('b') } },
@@ -293,6 +357,46 @@ describe('with_pending_edits_for_sheet', () => {
         const after = with_pending_edits_for_sheet(undefined, 0, { '0:0': entry('x') });
         expect(after![0]).toEqual({ cells: { '0:0': entry('x') } });
     });
+
+    it('preserves structural changes when a legacy cell publisher replaces its map', () => {
+        const before: PerFileState['pendingEdits'] = [{
+            sheetName: 'S',
+            cells: { '0:0': entry('old') },
+            ...structural_changes(),
+        }];
+        const after = with_pending_edits_for_sheet(before, 0, { '1:0': entry('new') }, 'S');
+        expect(after?.[0]).toMatchObject({
+            cells: { '1:0': entry('new') },
+            appendedRows: [{ id: 'pending-row-1' }],
+        });
+    });
+});
+
+describe('with_pending_changes_for_sheet', () => {
+    it('replaces the complete Pending Changes slot', () => {
+        const before: PerFileState['pendingEdits'] = [{
+            sheetName: 'S',
+            cells: { '0:0': entry('old') },
+            ...structural_changes(),
+        }];
+        const after = with_pending_changes_for_sheet(before, 0, {
+            cells: {},
+            ...structural_changes(20),
+        }, 'S');
+        expect(after?.[0]?.cells).toEqual({});
+        expect(after?.[0]?.appendedRows?.[0]?.createdOrder).toBe(20);
+    });
+
+    it('clears a structural-only slot without touching its neighbour', () => {
+        const before: PerFileState['pendingEdits'] = [{
+            sheetName: 'S', cells: {}, ...structural_changes(),
+        }, {
+            sheetName: 'Other', cells: { '0:0': entry('kept') },
+        }];
+        const after = with_pending_changes_for_sheet(before, 0, undefined, 'S');
+        expect(pending_changes_for_sheet(after, 0, 'S')).toBeUndefined();
+        expect(pending_edits_for_sheet(after, 1, 'Other')).toEqual({ '0:0': entry('kept') });
+    });
 });
 
 describe('has_any_pending_edits', () => {
@@ -301,6 +405,7 @@ describe('has_any_pending_edits', () => {
         expect(has_any_pending_edits([])).toBe(false);
         expect(has_any_pending_edits([undefined, { cells: {} }])).toBe(false);
         expect(has_any_pending_edits([undefined, { cells: { '0:0': entry('x') } }])).toBe(true);
+        expect(has_any_pending_edits([{ cells: {}, ...structural_changes() }])).toBe(true);
     });
 });
 

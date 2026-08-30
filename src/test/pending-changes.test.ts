@@ -9,7 +9,12 @@ import {
     is_valid_editable_value,
     is_valid_hyperlink,
     is_valid_hyperlink_change,
+    has_pending_structural_changes,
+    MAX_PENDING_CHANGES_ENCODED_BYTES,
+    MAX_PENDING_USER_CHANGES_ENCODED_BYTES,
+    own_pending_structural_changes,
 } from '../pending-changes';
+import { own_wire_pending_changes } from '../types';
 import type { RichText } from '../cell-content';
 
 const STYLED: RichText = { runs: [{ text: 'a' }, { text: 'b', style: { bold: true } }] };
@@ -87,5 +92,181 @@ describe('validators', () => {
         expect(is_valid_hyperlink_change({ value: null, base: null })).toBe(true);
         expect(is_valid_hyperlink_change({ value: undefined, base: null })).toBe(false);
         expect(is_valid_hyperlink_change({ value: { kind: 'x' }, base: null })).toBe(false);
+    });
+});
+
+describe('pending structural changes', () => {
+    it('normalizes a legacy cell-only worksheet to empty structural state', () => {
+        const owned = own_pending_structural_changes({});
+        expect(owned).toEqual({
+            formatTemplates: [],
+            appendedRows: [],
+            tailRemovals: [],
+            conflicts: [],
+        });
+        expect(has_pending_structural_changes(owned)).toBe(false);
+    });
+
+    it('owns appended rows, interned XLSX formatting, and tail removals', () => {
+        const owned = own_pending_structural_changes({
+            formatTemplates: [{
+                id: 'template-1',
+                format: {
+                    kind: 'xlsx',
+                    templateSourceRow: 8,
+                    styleFingerprint: 'styles:abc',
+                    cellStyleIndexes: [1, null, 3],
+                    nativeRowHeight: 18,
+                    viewerRowHeight: 24,
+                },
+            }],
+            appendedRows: [{
+                id: 'row-1',
+                cells: {
+                    0: { value: 'new' },
+                    2: {
+                        value: 'linked',
+                        link: { kind: 'external', target: 'https://example.com/' },
+                        valueEditOrder: 7,
+                    },
+                },
+                formatTemplateId: 'template-1',
+                createdOrder: 6,
+            }],
+            tailRemovals: [{
+                appendHistoryId: 'history-1',
+                sourceRow: 9,
+                savedFingerprint: 'row:def',
+                savedRow: {
+                    cells: { 0: { value: 'saved' } },
+                    format: { kind: 'none' },
+                },
+            }],
+        });
+
+        expect(owned.appendedRows[0]).toMatchObject({
+            id: 'row-1',
+            cells: { 0: { value: 'new' } },
+        });
+        expect(owned.formatTemplates[0].format).toMatchObject({
+            kind: 'xlsx',
+            cellStyleIndexes: [1, null, 3],
+        });
+        expect(has_pending_structural_changes(owned)).toBe(true);
+    });
+
+    it('rejects identities, dangling templates, malformed cells, and oversized rows', () => {
+        const template = { id: 't', format: { kind: 'none' } };
+        const row = {
+            id: 'r', cells: {}, formatTemplateId: 't', createdOrder: 1,
+        };
+        for (const value of [
+            { formatTemplates: [template, template], appendedRows: [row] },
+            { formatTemplates: [], appendedRows: [row] },
+            { formatTemplates: [template], appendedRows: [{ ...row, cells: { bad: { value: 'x' } } }] },
+            { formatTemplates: [template], appendedRows: [{ ...row, cells: { 0: { value: 3 } } }] },
+            { formatTemplates: [template], appendedRows: [row, { ...row, createdOrder: 2 }] },
+            {
+                formatTemplates: [template],
+                appendedRows: [
+                    { ...row, id: 'later', createdOrder: 2 },
+                    { ...row, id: 'earlier', createdOrder: 1 },
+                ],
+            },
+            { formatTemplates: [template], appendedRows: [{ ...row, unexpected: true }] },
+            { formatTemplates: [template], appendedRows: [{ ...row, cells: { 256: { value: 'x' } } }] },
+            { formatTemplates: [template], appendedRows: [] },
+            {
+                tailRemovals: [{
+                    appendHistoryId: 'h',
+                    sourceRow: -1,
+                    savedFingerprint: 'x',
+                    savedRow: { cells: {}, format: { kind: 'none' } },
+                }],
+            },
+            {
+                tailRemovals: [{
+                    appendHistoryId: 'h', sourceRow: 1, savedFingerprint: 'x',
+                }],
+            },
+        ]) {
+            expect(() => own_pending_structural_changes(value)).toThrow(TypeError);
+        }
+    });
+
+    it('rejects an aggregate worksheet payload beyond the durable byte bound', () => {
+        expect(() => own_pending_structural_changes({
+            formatTemplates: [{ id: 'plain', format: { kind: 'none' } }],
+            appendedRows: [{
+                id: 'large-row',
+                cells: { 0: { value: 'x'.repeat(MAX_PENDING_CHANGES_ENCODED_BYTES) } },
+                formatTemplateId: 'plain',
+                createdOrder: 1,
+            }],
+        })).toThrow('encoded-byte safety bound');
+    });
+
+    it('reserves the final four KiB from renderer-owned wire payloads', () => {
+        const leaf = {
+            sheetIndex: 0,
+            cells: { '0:0': { value: '', base: '' } },
+            formatTemplates: [],
+            appendedRows: [],
+            tailRemovals: [],
+            conflicts: [],
+        };
+        const base_bytes = Buffer.byteLength(JSON.stringify(leaf), 'utf8');
+        leaf.cells['0:0'].value = 'x'.repeat(
+            MAX_PENDING_USER_CHANGES_ENCODED_BYTES - base_bytes + 1,
+        );
+        const bytes = Buffer.byteLength(JSON.stringify(leaf), 'utf8');
+        expect(bytes).toBeGreaterThan(MAX_PENDING_USER_CHANGES_ENCODED_BYTES);
+        expect(bytes).toBeLessThanOrEqual(MAX_PENDING_CHANGES_ENCODED_BYTES);
+        expect(own_wire_pending_changes(leaf)).toBeUndefined();
+    });
+
+    it('allows an authenticated conflict-shaped overlay to use the host reserve', () => {
+        const leaf = {
+            sheetIndex: 0,
+            cells: { '0:0': { value: '', base: '' } },
+            formatTemplates: [],
+            appendedRows: [],
+            tailRemovals: [],
+            conflicts: [] as unknown[],
+        };
+        const base_bytes = Buffer.byteLength(JSON.stringify(leaf), 'utf8');
+        leaf.cells['0:0'].value = 'x'.repeat(
+            MAX_PENDING_USER_CHANGES_ENCODED_BYTES - base_bytes - 16,
+        );
+        leaf.conflicts = [{
+            reason: 'ambiguousPendingFormula',
+            pendingRowIds: [],
+            tailRemovalIds: [],
+            formulaCells: [{
+                rowIdentity: { kind: 'source', sourceRow: 0 },
+                sourceColumn: 0,
+            }],
+        }];
+        const bytes = Buffer.byteLength(JSON.stringify(leaf), 'utf8');
+        expect(bytes).toBeGreaterThan(MAX_PENDING_USER_CHANGES_ENCODED_BYTES);
+        expect(bytes).toBeLessThanOrEqual(MAX_PENDING_CHANGES_ENCODED_BYTES);
+        expect(own_wire_pending_changes(leaf)?.conflicts).toEqual(leaf.conflicts);
+    });
+
+    it('accepts more than ten thousand formula conflict cells within the byte bound', () => {
+        const formulaCells = Array.from({ length: 10_001 }, (_, sourceRow) => ({
+            rowIdentity: { kind: 'source' as const, sourceRow },
+            sourceColumn: 0,
+        }));
+        const owned = own_pending_structural_changes({
+            conflicts: [{
+                reason: 'ambiguousPendingFormula',
+                pendingRowIds: [],
+                tailRemovalIds: [],
+                formulaCells,
+            }],
+        });
+
+        expect(owned.conflicts[0].formulaCells).toHaveLength(10_001);
     });
 });

@@ -14,4 +14,5 @@ export type {
     XlsxCellEdit,
     XlsxHyperlinkEdit,
     XlsxWriteOptions,
+    XlsxWorksheetRowChanges,
 } from './types';

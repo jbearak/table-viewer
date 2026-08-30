@@ -5,8 +5,10 @@ import { createRoot, type Root } from 'react-dom/client';
 import { readFileSync } from 'node:fs';
 import { afterEach, describe, expect, it, onTestFinished, vi } from 'vitest';
 import type {
+    AppendRowsAdmission,
     EditingHandle,
     GridFocusHandle,
+    HighlightSelectionHandle,
     GridShellProps,
 } from '../webview/grid-shell';
 import { matches_filter } from '../table-transform';
@@ -17,6 +19,7 @@ import {
     type DirtyEntry,
 } from '../webview/edit-session-store';
 import { create_history_store, type HistoryStore } from '../webview/history-store';
+import { create_pending_row_store } from '../webview/pending-row-store';
 import {
     LAST_COLUMN_RESIZE_GUTTER_PX,
     MAX_AUTO_FIT_COLUMN_WIDTH_PX,
@@ -38,6 +41,7 @@ const make_compact = vi.hoisted(() => {
     type Compact = {
         length: number;
         toArray: () => number[];
+        toRanges: () => readonly [number, number][];
         hasIndex: (index: number) => boolean;
         first: () => number | undefined;
         last: () => number | undefined;
@@ -51,6 +55,15 @@ const make_compact = vi.hoisted(() => {
         return {
             length: sorted.length,
             toArray: () => [...sorted],
+            toRanges: () => {
+                const ranges: [number, number][] = [];
+                for (const value of sorted) {
+                    const last = ranges.at(-1);
+                    if (last !== undefined && last[1] === value) last[1] = value + 1;
+                    else ranges.push([value, value + 1]);
+                }
+                return ranges;
+            },
             hasIndex: (index: number) => sorted.includes(index),
             first: () => sorted[0],
             last: () => sorted[sorted.length - 1],
@@ -287,6 +300,7 @@ function props(overrides: Partial<GridShellProps> = {}): GridShellProps {
         },
         sheet_index: 0,
         generation: 1,
+        source_generation: 1,
         show_formatting: false,
         edit_activation_id: 0,
         column_projection: {
@@ -437,10 +451,1271 @@ describe('GridShell cell wrapping', () => {
         expect([0, 1, 2].map(row_markers.getRowNumber)).toEqual([9, 2, 5]);
     });
 
-    it('keeps ordinary row markers for non-Excel sources', async () => {
-        await render_grid(props());
+    it('uses projection-aware physical row markers for non-Excel sources', async () => {
+        grid_mock.source_row_for_display = (display_row: number) => [6, 2, 9][display_row];
+        await render_grid(props({
+            sheet_meta: {
+                ...props().sheet_meta,
+                rowCount: 3,
+                sourceRowCount: 10,
+            },
+            row_count: 3,
+        }));
 
-        expect(grid_mock.props!.rowMarkers).toBe('clickable-number');
+        const row_markers = grid_mock.props!.rowMarkers as {
+            kind: string;
+            getRowNumber(row: number): number;
+        };
+        expect(row_markers.kind).toBe('clickable-number');
+        expect([0, 1, 2].map(row_markers.getRowNumber)).toEqual([7, 3, 10]);
+    });
+
+    it('renders pending XLSX rows with inherited font style and row height', async () => {
+        const pending = create_pending_row_store({ session_id: 'session' });
+        const template = {
+            id: 'xlsx-template',
+            format: {
+                kind: 'xlsx' as const,
+                templateSourceRow: 0,
+                styleFingerprint: 'style-fingerprint',
+                cellStyleIndexes: [1, 0, 0],
+                cellFontStyles: [
+                    { bold: true, italic: true },
+                    { bold: false, italic: false },
+                    { bold: false, italic: false },
+                ],
+                viewerRowHeight: 60,
+            },
+        };
+        pending.append_rows('session', ['pending-row-1'], template, 1);
+        pending.set_cell('session', 'pending-row-1', 0, { value: 'Styled' });
+        await render_grid(props({
+            show_formatting: true,
+            edit_mode: true,
+            csv_editable: true,
+            edit_session_id: 'session',
+            pending_row_store: pending,
+        }));
+
+        const cell = (grid_mock.props!.getCellContent as (
+            location: [number, number],
+        ) => { displayData: string; themeOverride?: { baseFontStyle?: string } })([0, 1]);
+        expect(cell.displayData).toBe('Styled');
+        expect(cell.themeOverride?.baseFontStyle).toContain('italic');
+        expect(cell.themeOverride?.baseFontStyle).toContain('600');
+        expect((grid_mock.props!.rowHeight as (row: number) => number)(1)).toBe(60);
+    });
+
+    it('uses the retargeted pending formula for editing and clipboard metadata', async () => {
+        const pending = create_pending_row_store({ session_id: 'session' });
+        pending.append_rows('session', ['pending-row-1'], {
+            id: 'xlsx-template',
+            format: {
+                kind: 'xlsx',
+                templateSourceRow: 0,
+                styleFingerprint: 'style-fingerprint',
+                cellStyleIndexes: [null, null, null],
+            },
+        }, 1);
+        pending.set_cell('session', 'pending-row-1', 0, {
+            value: '=A1',
+            valueEditOrder: 7,
+        });
+        const retarget = vi.fn((_formula: string, _sheet: number, order?: number) => (
+            order === 7 ? '=B1' : '=A1'
+        ));
+        await render_grid(props({
+            edit_mode: true,
+            csv_editable: true,
+            edit_syntax: 'markdown',
+            edit_session_id: 'session',
+            pending_row_store: pending,
+            formula_move_retargeter: retarget,
+        }));
+
+        const cell = (grid_mock.props!.getCellContent as (
+            location: [number, number],
+        ) => {
+            data?: { edit_value?: string };
+            clipboardData?: { formula?: string };
+        })([0, 1]);
+        expect(cell.data?.edit_value).toBe('=B1');
+        expect(cell.clipboardData?.formula).toBe('=B1');
+        expect(retarget).toHaveBeenCalledWith('=A1', 0, 7);
+    });
+
+    it('preserves pending cut provenance when its destination is edited', async () => {
+        const pending = create_pending_row_store({ session_id: 'session' });
+        pending.append_rows('session', ['pending-row-1'], {
+            id: 'plain', format: { kind: 'none' },
+        }, 1);
+        const movedFrom = {
+            row: 0,
+            col: 0,
+            order: 4,
+            rowIdentity: { kind: 'source' as const, sourceRow: 0 },
+        };
+        pending.set_cell('session', 'pending-row-1', 0, { value: 'moved', movedFrom });
+        await render_grid(props({
+            edit_mode: true,
+            csv_editable: true,
+            edit_session_id: 'session',
+            pending_row_store: pending,
+        }));
+
+        await act(async () => edit_one(grid_mock.props!.onCellsEdited)(
+            [0, 1],
+            { kind: 'text', data: 'retyped' },
+        ));
+        expect(pending.snapshot().appendedRows[0].cells[0]).toMatchObject({
+            value: 'retyped',
+            movedFrom,
+        });
+    });
+
+    it('discards a source-to-pending cut and its formula conflict atomically', async () => {
+        const cells = create_edit_session_store({ session_id: 'session' }, {
+            '0:0': { value: '', base: 'source-a', valueEditOrder: 4 },
+        });
+        const pending = create_pending_row_store({ session_id: 'session' });
+        pending.install({ session_id: 'session' }, {
+            formatTemplates: [{ id: 'plain', format: { kind: 'none' } }],
+            appendedRows: [{
+                id: 'pending-row-1',
+                formatTemplateId: 'plain',
+                createdOrder: 1,
+                cells: { 0: { value: '=A1', movedFrom: {
+                    row: 0,
+                    col: 0,
+                    order: 4,
+                    rowIdentity: { kind: 'source', sourceRow: 0 },
+                } } },
+            }],
+            tailRemovals: [],
+            conflicts: [{
+                reason: 'ambiguousPendingFormula',
+                pendingRowIds: ['pending-row-1'],
+                tailRemovalIds: [],
+                formulaCells: [{
+                    rowIdentity: { kind: 'pending', pendingRowId: 'pending-row-1' },
+                    sourceColumn: 0,
+                }],
+            }],
+        });
+        await render_grid(props({
+            edit_mode: true,
+            csv_editable: true,
+            edit_session_id: 'session',
+            edit_session: cells,
+            pending_row_store: pending,
+        }));
+        const on_context = grid_mock.props!.onCellContextMenu as (
+            cell: [number, number], event: Record<string, unknown>,
+        ) => void;
+        await act(async () => on_context([0, 1], {
+            preventDefault: vi.fn(),
+            bounds: { x: 0, y: 24, width: 100, height: 24 },
+            localEventX: 10,
+            localEventY: 10,
+        }));
+        const discard = find_button((text) =>
+            text === 'Discard all pending edits in 2 related cells');
+        expect(discard).toBeDefined();
+        await act(async () => discard!.click());
+
+        expect(cells.snapshot()).toEqual(new Map());
+        expect(pending.snapshot().appendedRows[0].cells).toEqual({});
+        expect(pending.snapshot().conflicts).toEqual([]);
+    });
+
+    it('loads and sizes source rows through a compressed tail-removal gap', async () => {
+        const pending = create_pending_row_store({ session_id: 'session' });
+        pending.install({ session_id: 'session' }, {
+            formatTemplates: [],
+            appendedRows: [],
+            tailRemovals: [{
+                appendHistoryId: 'saved-tail',
+                sourceRow: 4,
+                savedFingerprint: 'fingerprint',
+                savedRow: { cells: {}, format: { kind: 'none' } },
+            }],
+            conflicts: [],
+        });
+        // The physical suffix row is currently sorted into raw display row 1.
+        grid_mock.source_row_for_display = (display_row: number) => [0, 4, 1, 2, 3][display_row];
+        await render_grid(props({
+            sheet_meta: {
+                ...props().sheet_meta,
+                rowCount: 5,
+                sourceRowCount: 5,
+            },
+            row_count: 5,
+            edit_mode: true,
+            csv_editable: true,
+            edit_session_id: 'session',
+            pending_row_store: pending,
+            transform_state: { sort: [{ colIndex: 0, direction: 'asc' }], filters: [] },
+            row_heights: { 2: 48 },
+        }));
+
+        grid_mock.ensure_rows.mockClear();
+        const on_visible = grid_mock.props!.onVisibleRegionChanged as (
+            range: { x: number; y: number; width: number; height: number },
+        ) => void;
+        act(() => on_visible({ x: 0, y: 1, width: 2, height: 2 }));
+        // Compressed rows 1–2 are raw source-display rows 2–3, not 1–2.
+        expect(grid_mock.ensure_rows).toHaveBeenCalledWith(2, 3);
+        const row_height = grid_mock.props!.rowHeight as (row: number) => number;
+        expect(row_height(1)).toBe(48);
+    });
+
+    it('changes the paste topology when a transformed tail removal resolves', async () => {
+        const pending = create_pending_row_store({ session_id: 'session' });
+        pending.append_rows('session', ['pending-a'], {
+            id: 'plain', format: { kind: 'none' },
+        }, 1);
+        pending.replace_tail_removals('session', [{
+            appendHistoryId: 'saved-tail',
+            sourceRow: 0,
+            savedFingerprint: 'fingerprint',
+            savedRow: { cells: {}, format: { kind: 'none' } },
+        }]);
+        grid_mock.source_row_for_display = () => undefined;
+        await render_grid(props({
+            edit_mode: true,
+            csv_editable: true,
+            edit_session_id: 'session',
+            pending_row_store: pending,
+            mapping_generation: 7,
+            transform_state: { sort: [{ colIndex: 0, direction: 'asc' }], filters: [] },
+        }));
+        await vi.waitUntil(() => grid_mock.post_message.mock.calls.some(
+            ([message]) => message?.type === 'requestSourceDisplayRows',
+        ));
+        const request = grid_mock.post_message.mock.calls
+            .map(([message]) => message)
+            .find((message) => message?.type === 'requestSourceDisplayRows');
+        const before = grid_mock.props!.pasteTopologyKey;
+        expect(grid_mock.props!.rows).toBe(2);
+
+        await act(async () => window.dispatchEvent(new MessageEvent('message', { data: {
+            type: 'sourceDisplayRows',
+            requestId: request.requestId,
+            sheetIndex: 0,
+            generation: 1,
+            mappingGeneration: 7,
+            sourceRows: [0],
+            displayRows: [0],
+        } })));
+        await vi.waitUntil(() => grid_mock.props!.pasteTopologyKey !== before);
+
+        expect(grid_mock.props!.rows).toBe(1);
+    });
+
+    it('changes the paste topology when natural-order pending rows are removed', async () => {
+        const pending = create_pending_row_store({ session_id: 'session' });
+        pending.append_rows('session', ['pending-a', 'pending-b'], {
+            id: 'plain', format: { kind: 'none' },
+        }, 1);
+        await render_grid(props({
+            edit_mode: true,
+            csv_editable: true,
+            edit_session_id: 'session',
+            pending_row_store: pending,
+        }));
+        const before = grid_mock.props!.pasteTopologyKey;
+
+        act(() => {
+            pending.remove_rows('session', new Set(['pending-a']));
+        });
+        await vi.waitUntil(() => grid_mock.props!.pasteTopologyKey !== before);
+
+        expect(grid_mock.props!.rows).toBe(2);
+    });
+
+    it('keeps the selected pending-row identity when replay inserts before it', async () => {
+        const pending = create_pending_row_store({ session_id: 'session' });
+        pending.append_rows('session', ['pending-a', 'pending-b', 'pending-c'], {
+            id: 'plain', format: { kind: 'none' },
+        }, 1);
+        const before_removal = pending.snapshot();
+        pending.remove_rows('session', new Set(['pending-b']));
+        await render_grid(props({
+            edit_mode: true,
+            csv_editable: true,
+            edit_session_id: 'session',
+            pending_row_store: pending,
+        }));
+        const on_selection_change = grid_mock.props!.onGridSelectionChange as
+            (selection: unknown) => void;
+        await act(async () => on_selection_change({
+            columns: compact([]),
+            rows: compact([]),
+            current: {
+                cell: [0, 2],
+                range: { x: 0, y: 2, width: 1, height: 1 },
+                rangeStack: [],
+            },
+        }));
+
+        await act(async () => {
+            expect(pending.install({ session_id: 'session' }, before_removal)).toBe(true);
+        });
+
+        expect((grid_mock.props!.gridSelection as {
+            current?: { cell: [number, number] };
+        }).current?.cell).toEqual([0, 3]);
+    });
+
+    it('clears a selected final append when replay removes its identity', async () => {
+        const pending = create_pending_row_store({ session_id: 'session' });
+        pending.append_rows('session', ['pending-final'], {
+            id: 'plain', format: { kind: 'none' },
+        }, 1);
+        await render_grid(props({
+            edit_mode: true,
+            csv_editable: true,
+            edit_session_id: 'session',
+            pending_row_store: pending,
+        }));
+        const on_selection_change = grid_mock.props!.onGridSelectionChange as
+            (selection: unknown) => void;
+        await act(async () => on_selection_change({
+            columns: compact([]),
+            rows: compact([]),
+            current: {
+                cell: [0, 1],
+                range: { x: 0, y: 1, width: 1, height: 1 },
+                rangeStack: [],
+            },
+        }));
+
+        await act(async () => {
+            expect(pending.install({ session_id: 'session' }, {
+                formatTemplates: [],
+                appendedRows: [],
+                tailRemovals: [],
+                conflicts: [],
+            })).toBe(true);
+        });
+
+        expect((grid_mock.props!.gridSelection as { current?: unknown }).current)
+            .toBeUndefined();
+    });
+
+    it('keeps an active interior pending row inside the range when the endpoint is removed', async () => {
+        const pending = create_pending_row_store({ session_id: 'session' });
+        pending.append_rows('session', ['pending-a', 'pending-b', 'pending-c'], {
+            id: 'plain', format: { kind: 'none' },
+        }, 1);
+        await render_grid(props({
+            edit_mode: true,
+            csv_editable: true,
+            edit_session_id: 'session',
+            pending_row_store: pending,
+        }));
+        const on_selection_change = grid_mock.props!.onGridSelectionChange as
+            (selection: unknown) => void;
+        await act(async () => on_selection_change({
+            columns: compact([]),
+            rows: compact([]),
+            current: {
+                cell: [0, 2],
+                range: { x: 0, y: 1, width: 1, height: 3 },
+                rangeStack: [],
+            },
+        }));
+        const before = pending.snapshot();
+
+        await act(async () => {
+            expect(pending.install({ session_id: 'session' }, {
+                ...before,
+                appendedRows: before.appendedRows.slice(0, 2),
+            })).toBe(true);
+        });
+
+        expect((grid_mock.props!.gridSelection as {
+            current?: { cell: [number, number]; range: unknown };
+        }).current).toEqual({
+            cell: [0, 2],
+            range: { x: 0, y: 1, width: 1, height: 2 },
+            rangeStack: [],
+        });
+    });
+
+    it('keeps surviving row-marker identities when the selected endpoint is removed', async () => {
+        const pending = create_pending_row_store({ session_id: 'session' });
+        pending.append_rows('session', ['pending-a', 'pending-b', 'pending-c'], {
+            id: 'plain', format: { kind: 'none' },
+        }, 1);
+        await render_grid(props({
+            edit_mode: true,
+            csv_editable: true,
+            edit_session_id: 'session',
+            pending_row_store: pending,
+        }));
+        const on_selection_change = grid_mock.props!.onGridSelectionChange as
+            (selection: unknown) => void;
+        await act(async () => on_selection_change({
+            columns: compact([]),
+            rows: compact([1, 2, 3]),
+        }));
+        const before = pending.snapshot();
+
+        await act(async () => {
+            expect(pending.install({ session_id: 'session' }, {
+                ...before,
+                appendedRows: before.appendedRows.slice(0, 2),
+            })).toBe(true);
+        });
+
+        expect((grid_mock.props!.gridSelection as {
+            rows: { toArray(): number[] };
+        }).rows.toArray()).toEqual([1, 2]);
+    });
+
+    it('keeps an interior sorted source row when it moves into the deletion band', async () => {
+        const pending = create_pending_row_store({ session_id: 'session' });
+        // Source 2 starts between the selected endpoints in display order even
+        // though it is the physical suffix row that the replay removes.
+        grid_mock.source_row_for_display = (display_row) => [0, 2, 1][display_row];
+        await render_grid(props({
+            sheet_meta: {
+                ...props().sheet_meta,
+                rowCount: 3,
+                sourceRowCount: 3,
+            },
+            row_count: 3,
+            edit_mode: true,
+            csv_editable: true,
+            edit_session_id: 'session',
+            pending_row_store: pending,
+            transform_state: { sort: [{ colIndex: 0, direction: 'asc' }], filters: [] },
+        }));
+        const on_selection_change = grid_mock.props!.onGridSelectionChange as
+            (selection: unknown) => void;
+        await act(async () => on_selection_change({
+            columns: compact([]),
+            rows: compact([0, 1, 2]),
+            current: {
+                cell: [0, 0],
+                range: { x: 0, y: 0, width: 1, height: 3 },
+                rangeStack: [],
+            },
+        }));
+
+        await act(async () => {
+            expect(pending.replace_tail_removals('session', [{
+                appendHistoryId: 'saved-tail',
+                sourceRow: 2,
+                savedFingerprint: 'fingerprint',
+                savedRow: { cells: {}, format: { kind: 'none' } },
+            }])).toBe(true);
+        });
+
+        const selection = grid_mock.props!.gridSelection as {
+            rows: { toArray(): number[] };
+            current?: { range: unknown };
+        };
+        expect(selection.rows.toArray()).toEqual([0, 1, 2]);
+        expect(selection.current?.range).toEqual({ x: 0, y: 0, width: 1, height: 3 });
+    });
+
+    it('keeps both selections when a deletion row coalesces into a replacement', async () => {
+        const pending = create_pending_row_store({ session_id: 'session' });
+        expect(pending.replace_tail_removals('session', [{
+            appendHistoryId: 'saved-tail',
+            sourceRow: 2,
+            savedFingerprint: 'fingerprint',
+            savedRow: { cells: {}, format: { kind: 'none' } },
+        }])).toBe(true);
+        await render_grid(props({
+            sheet_meta: {
+                ...props().sheet_meta,
+                rowCount: 3,
+                sourceRowCount: 3,
+            },
+            row_count: 3,
+            edit_mode: true,
+            csv_editable: true,
+            edit_session_id: 'session',
+            pending_row_store: pending,
+        }));
+        const on_selection_change = grid_mock.props!.onGridSelectionChange as
+            (selection: unknown) => void;
+        await act(async () => on_selection_change({
+            columns: compact([]),
+            rows: compact([2]),
+            current: {
+                cell: [0, 2],
+                range: { x: 0, y: 2, width: 1, height: 1 },
+                rangeStack: [],
+            },
+        }));
+
+        await act(async () => {
+            expect(pending.append_rows('session', ['pending-a'], {
+                id: 'plain', format: { kind: 'none' },
+            }, 1)).toBe(true);
+        });
+
+        const selection = grid_mock.props!.gridSelection as {
+            rows: { toArray(): number[] };
+            current?: { cell: [number, number]; range: unknown };
+        };
+        expect(selection.rows.toArray()).toEqual([2]);
+        expect(selection.current).toEqual({
+            cell: [0, 2],
+            range: { x: 0, y: 2, width: 1, height: 1 },
+            rangeStack: [],
+        });
+    });
+
+    it('keeps a nonresident sorted tail row when its inverse lookup resolves', async () => {
+        const pending = create_pending_row_store({ session_id: 'session' });
+        // The selected endpoints are resident, but source 2's interior display
+        // position is known only to the host until the inverse response lands.
+        grid_mock.source_row_for_display = (display_row) => [0, undefined, 1][display_row];
+        await render_grid(props({
+            sheet_meta: {
+                ...props().sheet_meta,
+                rowCount: 3,
+                sourceRowCount: 3,
+            },
+            row_count: 3,
+            edit_mode: true,
+            csv_editable: true,
+            edit_session_id: 'session',
+            pending_row_store: pending,
+            mapping_generation: 7,
+            transform_state: { sort: [{ colIndex: 0, direction: 'asc' }], filters: [] },
+        }));
+        const on_selection_change = grid_mock.props!.onGridSelectionChange as
+            (selection: unknown) => void;
+        await act(async () => on_selection_change({
+            columns: compact([]),
+            rows: compact([0, 1, 2]),
+            current: {
+                cell: [0, 0],
+                range: { x: 0, y: 0, width: 1, height: 3 },
+                rangeStack: [],
+            },
+        }));
+        await act(async () => {
+            expect(pending.replace_tail_removals('session', [{
+                appendHistoryId: 'saved-tail',
+                sourceRow: 2,
+                savedFingerprint: 'fingerprint',
+                savedRow: { cells: {}, format: { kind: 'none' } },
+            }])).toBe(true);
+        });
+        await vi.waitUntil(() => grid_mock.post_message.mock.calls.some(
+            ([message]) => message?.type === 'requestSourceDisplayRows',
+        ));
+        const request = grid_mock.post_message.mock.calls
+            .map(([message]) => message)
+            .find((message) => message?.type === 'requestSourceDisplayRows');
+
+        await act(async () => window.dispatchEvent(new MessageEvent('message', { data: {
+            type: 'sourceDisplayRows',
+            requestId: request.requestId,
+            sheetIndex: 0,
+            generation: 1,
+            mappingGeneration: 7,
+            sourceRows: [2],
+            displayRows: [1],
+        } })));
+        await vi.waitUntil(() => grid_mock.props!.rows === 3);
+
+        const selection = grid_mock.props!.gridSelection as {
+            rows: { toArray(): number[] };
+            current?: { range: unknown };
+        };
+        expect(selection.rows.toArray()).toEqual([0, 1, 2]);
+        expect(selection.current?.range).toEqual({ x: 0, y: 0, width: 1, height: 3 });
+    });
+
+    it('keeps a nonresident tail row selected when it moves from an endpoint', async () => {
+        const pending = create_pending_row_store({ session_id: 'session' });
+        grid_mock.source_row_for_display = (display_row) => [0, undefined, 1][display_row];
+        await render_grid(props({
+            sheet_meta: {
+                ...props().sheet_meta,
+                rowCount: 3,
+                sourceRowCount: 3,
+            },
+            row_count: 3,
+            edit_mode: true,
+            csv_editable: true,
+            edit_session_id: 'session',
+            pending_row_store: pending,
+            mapping_generation: 7,
+            transform_state: { sort: [{ colIndex: 0, direction: 'asc' }], filters: [] },
+        }));
+        const on_selection_change = grid_mock.props!.onGridSelectionChange as
+            (selection: unknown) => void;
+        await act(async () => on_selection_change({
+            columns: compact([]),
+            rows: compact([1]),
+            current: {
+                cell: [0, 1],
+                range: { x: 0, y: 1, width: 1, height: 1 },
+                rangeStack: [],
+            },
+        }));
+        await act(async () => {
+            expect(pending.replace_tail_removals('session', [{
+                appendHistoryId: 'saved-endpoint',
+                sourceRow: 2,
+                savedFingerprint: 'fingerprint',
+                savedRow: { cells: {}, format: { kind: 'none' } },
+            }])).toBe(true);
+        });
+        await vi.waitUntil(() => grid_mock.post_message.mock.calls.some(
+            ([message]) => message?.type === 'requestSourceDisplayRows',
+        ));
+        const request = grid_mock.post_message.mock.calls
+            .map(([message]) => message)
+            .find((message) => message?.type === 'requestSourceDisplayRows');
+
+        await act(async () => window.dispatchEvent(new MessageEvent('message', { data: {
+            type: 'sourceDisplayRows',
+            requestId: request.requestId,
+            sheetIndex: 0,
+            generation: 1,
+            mappingGeneration: 7,
+            sourceRows: [2],
+            displayRows: [1],
+        } })));
+        await vi.waitUntil(() => grid_mock.props!.rows === 3);
+
+        const selection = grid_mock.props!.gridSelection as {
+            rows: { toArray(): number[] };
+            current?: { cell: [number, number]; range: unknown };
+        };
+        expect(selection.rows.toArray()).toEqual([2]);
+        expect(selection.current).toEqual({
+            cell: [0, 2],
+            range: { x: 0, y: 2, width: 1, height: 1 },
+            rangeStack: [],
+        });
+    });
+
+    it('keeps a range ending at a nonresident tail row after inverse lookup', async () => {
+        const pending = create_pending_row_store({ session_id: 'session' });
+        grid_mock.source_row_for_display = (display_row) => [0, undefined, 1][display_row];
+        await render_grid(props({
+            sheet_meta: {
+                ...props().sheet_meta,
+                rowCount: 3,
+                sourceRowCount: 3,
+            },
+            row_count: 3,
+            edit_mode: true,
+            csv_editable: true,
+            edit_session_id: 'session',
+            pending_row_store: pending,
+            mapping_generation: 7,
+            transform_state: { sort: [{ colIndex: 0, direction: 'asc' }], filters: [] },
+        }));
+        const on_selection_change = grid_mock.props!.onGridSelectionChange as
+            (selection: unknown) => void;
+        await act(async () => on_selection_change({
+            columns: compact([]),
+            rows: compact([0, 1]),
+            current: {
+                cell: [0, 0],
+                range: { x: 0, y: 0, width: 1, height: 2 },
+                rangeStack: [],
+            },
+        }));
+        await act(async () => {
+            expect(pending.replace_tail_removals('session', [{
+                appendHistoryId: 'saved-range-end',
+                sourceRow: 2,
+                savedFingerprint: 'fingerprint',
+                savedRow: { cells: {}, format: { kind: 'none' } },
+            }])).toBe(true);
+        });
+        await vi.waitUntil(() => grid_mock.post_message.mock.calls.some(
+            ([message]) => message?.type === 'requestSourceDisplayRows',
+        ));
+        const request = grid_mock.post_message.mock.calls
+            .map(([message]) => message)
+            .find((message) => message?.type === 'requestSourceDisplayRows');
+
+        await act(async () => window.dispatchEvent(new MessageEvent('message', { data: {
+            type: 'sourceDisplayRows',
+            requestId: request.requestId,
+            sheetIndex: 0,
+            generation: 1,
+            mappingGeneration: 7,
+            sourceRows: [2],
+            displayRows: [1],
+        } })));
+        await vi.waitUntil(() => grid_mock.props!.rows === 3);
+
+        const selection = grid_mock.props!.gridSelection as {
+            rows: { toArray(): number[] };
+            current?: { range: unknown };
+        };
+        expect(selection.rows.toArray()).toEqual([0, 1, 2]);
+        expect(selection.current?.range).toEqual({ x: 0, y: 0, width: 1, height: 3 });
+    });
+
+    it('does not overwrite Tab navigation when a delayed inverse arrives', async () => {
+        const pending = create_pending_row_store({ session_id: 'session' });
+        grid_mock.source_row_for_display = (display_row) => [0, undefined, 1][display_row];
+        await render_grid(props({
+            sheet_meta: {
+                ...props().sheet_meta,
+                rowCount: 3,
+                sourceRowCount: 3,
+            },
+            row_count: 3,
+            edit_mode: true,
+            csv_editable: true,
+            edit_session_id: 'session',
+            pending_row_store: pending,
+            mapping_generation: 7,
+            transform_state: { sort: [{ colIndex: 0, direction: 'asc' }], filters: [] },
+        }));
+        const on_selection_change = grid_mock.props!.onGridSelectionChange as
+            (selection: unknown) => void;
+        await act(async () => on_selection_change({
+            columns: compact([]),
+            rows: compact([]),
+            current: {
+                cell: [0, 0],
+                range: { x: 0, y: 0, width: 1, height: 1 },
+                rangeStack: [],
+            },
+        }));
+        await act(async () => {
+            expect(pending.replace_tail_removals('session', [{
+                appendHistoryId: 'saved-delayed-tab',
+                sourceRow: 2,
+                savedFingerprint: 'fingerprint',
+                savedRow: { cells: {}, format: { kind: 'none' } },
+            }])).toBe(true);
+        });
+        await vi.waitUntil(() => grid_mock.post_message.mock.calls.some(
+            ([message]) => message?.type === 'requestSourceDisplayRows',
+        ));
+        const request = grid_mock.post_message.mock.calls
+            .map(([message]) => message)
+            .find((message) => message?.type === 'requestSourceDisplayRows');
+        const on_key_down = grid_mock.props!.onKeyDown as
+            (args: Record<string, unknown>) => void;
+        await act(async () => on_key_down({
+            key: 'Tab',
+            altKey: false,
+            shiftKey: false,
+            ctrlKey: false,
+            metaKey: false,
+            rawEvent: { code: 'Tab', target: document.createElement('canvas') },
+            cancel: vi.fn(),
+            preventDefault: vi.fn(),
+        }));
+        expect((grid_mock.props!.gridSelection as any).current.cell).toEqual([1, 0]);
+
+        await act(async () => window.dispatchEvent(new MessageEvent('message', { data: {
+            type: 'sourceDisplayRows',
+            requestId: request.requestId,
+            sheetIndex: 0,
+            generation: 1,
+            mappingGeneration: 7,
+            sourceRows: [2],
+            displayRows: [1],
+        } })));
+        await vi.waitUntil(() => grid_mock.props!.rows === 3);
+        expect((grid_mock.props!.gridSelection as any).current.cell).toEqual([1, 0]);
+    });
+
+    it('keeps the earliest selection through sequential unresolved removals', async () => {
+        const pending = create_pending_row_store({ session_id: 'session' });
+        grid_mock.source_row_for_display = (display_row) =>
+            [0, undefined, undefined, 1][display_row];
+        await render_grid(props({
+            sheet_meta: {
+                ...props().sheet_meta,
+                rowCount: 4,
+                sourceRowCount: 4,
+            },
+            row_count: 4,
+            edit_mode: true,
+            csv_editable: true,
+            edit_session_id: 'session',
+            pending_row_store: pending,
+            mapping_generation: 7,
+            transform_state: { sort: [{ colIndex: 0, direction: 'asc' }], filters: [] },
+        }));
+        const on_selection_change = grid_mock.props!.onGridSelectionChange as
+            (selection: unknown) => void;
+        await act(async () => on_selection_change({
+            columns: compact([]),
+            rows: compact([1]),
+            current: {
+                cell: [0, 1],
+                range: { x: 0, y: 1, width: 1, height: 1 },
+                rangeStack: [],
+            },
+        }));
+        await act(async () => {
+            expect(pending.replace_tail_removals('session', [{
+                appendHistoryId: 'saved-later-tail',
+                sourceRow: 3,
+                savedFingerprint: 'fingerprint-3',
+                savedRow: { cells: {}, format: { kind: 'none' } },
+            }])).toBe(true);
+        });
+        await act(async () => {
+            expect(pending.replace_tail_removals('session', [{
+                appendHistoryId: 'saved-earlier-tail',
+                sourceRow: 2,
+                savedFingerprint: 'fingerprint-2',
+                savedRow: { cells: {}, format: { kind: 'none' } },
+            }, {
+                appendHistoryId: 'saved-later-tail',
+                sourceRow: 3,
+                savedFingerprint: 'fingerprint-3',
+                savedRow: { cells: {}, format: { kind: 'none' } },
+            }])).toBe(true);
+        });
+        await vi.waitUntil(() => grid_mock.post_message.mock.calls.some(
+            ([message]) => message?.type === 'requestSourceDisplayRows'
+                && message.sourceRows.length === 2,
+        ));
+        const request = [...grid_mock.post_message.mock.calls]
+            .reverse()
+            .map(([message]) => message)
+            .find((message) => message?.type === 'requestSourceDisplayRows'
+                && message.sourceRows.length === 2);
+
+        await act(async () => window.dispatchEvent(new MessageEvent('message', { data: {
+            type: 'sourceDisplayRows',
+            requestId: request.requestId,
+            sheetIndex: 0,
+            generation: 1,
+            mappingGeneration: 7,
+            sourceRows: [2, 3],
+            displayRows: [2, 1],
+        } })));
+        await vi.waitUntil(() => grid_mock.props!.rows === 4);
+
+        const selection = grid_mock.props!.gridSelection as {
+            rows: { toArray(): number[] };
+            current?: { cell: [number, number]; range: unknown };
+        };
+        expect(selection.rows.toArray()).toEqual([3]);
+        expect(selection.current).toEqual({
+            cell: [0, 3],
+            range: { x: 0, y: 3, width: 1, height: 1 },
+            rangeStack: [],
+        });
+    });
+
+    it('restores an unresolved endpoint when its removal is cancelled', async () => {
+        const pending = create_pending_row_store({ session_id: 'session' });
+        grid_mock.source_row_for_display = (display_row) => [0, undefined, 1][display_row];
+        await render_grid(props({
+            sheet_meta: {
+                ...props().sheet_meta,
+                rowCount: 3,
+                sourceRowCount: 3,
+            },
+            row_count: 3,
+            edit_mode: true,
+            csv_editable: true,
+            edit_session_id: 'session',
+            pending_row_store: pending,
+            mapping_generation: 7,
+            transform_state: { sort: [{ colIndex: 0, direction: 'asc' }], filters: [] },
+        }));
+        const on_selection_change = grid_mock.props!.onGridSelectionChange as
+            (selection: unknown) => void;
+        await act(async () => on_selection_change({
+            columns: compact([]),
+            rows: compact([1]),
+            current: {
+                cell: [0, 1],
+                range: { x: 0, y: 1, width: 1, height: 1 },
+                rangeStack: [],
+            },
+        }));
+        await act(async () => {
+            expect(pending.replace_tail_removals('session', [{
+                appendHistoryId: 'saved-cancelled-before-inverse',
+                sourceRow: 2,
+                savedFingerprint: 'fingerprint',
+                savedRow: { cells: {}, format: { kind: 'none' } },
+            }])).toBe(true);
+        });
+        await vi.waitUntil(() => grid_mock.post_message.mock.calls.some(
+            ([message]) => message?.type === 'requestSourceDisplayRows',
+        ));
+        await act(async () => {
+            expect(pending.replace_tail_removals('session', [])).toBe(true);
+        });
+
+        const selection = grid_mock.props!.gridSelection as {
+            rows: { toArray(): number[] };
+            current?: { cell: [number, number]; range: unknown };
+        };
+        expect(selection.rows.toArray()).toEqual([1]);
+        expect(selection.current).toEqual({
+            cell: [0, 1],
+            range: { x: 0, y: 1, width: 1, height: 1 },
+            rangeStack: [],
+        });
+    });
+
+    it('restores a partially cancelled unresolved tail row', async () => {
+        const pending = create_pending_row_store({ session_id: 'session' });
+        grid_mock.source_row_for_display = (display_row) =>
+            [0, undefined, undefined, 1][display_row];
+        await render_grid(props({
+            sheet_meta: {
+                ...props().sheet_meta,
+                rowCount: 4,
+                sourceRowCount: 4,
+            },
+            row_count: 4,
+            edit_mode: true,
+            csv_editable: true,
+            edit_session_id: 'session',
+            pending_row_store: pending,
+            mapping_generation: 7,
+            transform_state: { sort: [{ colIndex: 0, direction: 'asc' }], filters: [] },
+        }));
+        const on_selection_change = grid_mock.props!.onGridSelectionChange as
+            (selection: unknown) => void;
+        await act(async () => on_selection_change({
+            columns: compact([]),
+            rows: compact([2]),
+            current: {
+                cell: [0, 2],
+                range: { x: 0, y: 2, width: 1, height: 1 },
+                rangeStack: [],
+            },
+        }));
+        // First remove source 3, then source 2. Both inverse positions remain
+        // held by the host. Cancelling source 2 leaves source 3 pending, so the
+        // original source-2 endpoint must stay in the deferred candidate set.
+        await act(async () => {
+            expect(pending.replace_tail_removals('session', [{
+                appendHistoryId: 'saved-source-3',
+                sourceRow: 3,
+                savedFingerprint: 'fingerprint-3',
+                savedRow: { cells: {}, format: { kind: 'none' } },
+            }])).toBe(true);
+        });
+        await act(async () => {
+            expect(pending.replace_tail_removals('session', [{
+                appendHistoryId: 'saved-source-2',
+                sourceRow: 2,
+                savedFingerprint: 'fingerprint-2',
+                savedRow: { cells: {}, format: { kind: 'none' } },
+            }, {
+                appendHistoryId: 'saved-source-3',
+                sourceRow: 3,
+                savedFingerprint: 'fingerprint-3',
+                savedRow: { cells: {}, format: { kind: 'none' } },
+            }])).toBe(true);
+        });
+        await act(async () => {
+            expect(pending.replace_tail_removals('session', [{
+                appendHistoryId: 'saved-source-3',
+                sourceRow: 3,
+                savedFingerprint: 'fingerprint-3',
+                savedRow: { cells: {}, format: { kind: 'none' } },
+            }])).toBe(true);
+        });
+        await vi.waitUntil(() => grid_mock.post_message.mock.calls.some(
+            ([message]) => message?.type === 'requestSourceDisplayRows'
+                && message.sourceRows.includes(2)
+                && message.sourceRows.includes(3),
+        ));
+        const request = [...grid_mock.post_message.mock.calls]
+            .reverse()
+            .map(([message]) => message)
+            .find((message) => message?.type === 'requestSourceDisplayRows'
+                && message.sourceRows.includes(2)
+                && message.sourceRows.includes(3));
+
+        await act(async () => window.dispatchEvent(new MessageEvent('message', { data: {
+            type: 'sourceDisplayRows',
+            requestId: request.requestId,
+            sheetIndex: 0,
+            generation: 1,
+            mappingGeneration: 7,
+            sourceRows: request.sourceRows,
+            displayRows: request.sourceRows.map((sourceRow: number) =>
+                sourceRow === 2 ? 2 : 1),
+        } })));
+        await vi.waitUntil(() => grid_mock.props!.rows === 4);
+
+        const selection = grid_mock.props!.gridSelection as {
+            rows: { toArray(): number[] };
+            current?: { cell: [number, number]; range: unknown };
+        };
+        expect(selection.rows.toArray()).toEqual([1]);
+        expect(selection.current).toEqual({
+            cell: [0, 1],
+            range: { x: 0, y: 1, width: 1, height: 1 },
+            rangeStack: [],
+        });
+    });
+
+    it('keeps an unrelated unloaded selection when a removal inverse is null', async () => {
+        const pending = create_pending_row_store({ session_id: 'session' });
+        // Raw row 1 is selected but not resident. The removed physical tail row
+        // is filtered out entirely, so its host inverse resolves to null.
+        grid_mock.source_row_for_display = (display_row) => [0, undefined, 1][display_row];
+        await render_grid(props({
+            sheet_meta: {
+                ...props().sheet_meta,
+                rowCount: 3,
+                sourceRowCount: 3,
+            },
+            row_count: 3,
+            edit_mode: true,
+            csv_editable: true,
+            edit_session_id: 'session',
+            pending_row_store: pending,
+            mapping_generation: 7,
+            transform_state: { sort: [{ colIndex: 0, direction: 'asc' }], filters: [] },
+        }));
+        const on_selection_change = grid_mock.props!.onGridSelectionChange as
+            (selection: unknown) => void;
+        await act(async () => on_selection_change({
+            columns: compact([]),
+            rows: compact([1]),
+            current: {
+                cell: [0, 1],
+                range: { x: 0, y: 1, width: 1, height: 1 },
+                rangeStack: [],
+            },
+        }));
+        await act(async () => {
+            expect(pending.replace_tail_removals('session', [{
+                appendHistoryId: 'saved-filtered-tail',
+                sourceRow: 2,
+                savedFingerprint: 'fingerprint',
+                savedRow: { cells: {}, format: { kind: 'none' } },
+            }])).toBe(true);
+        });
+        await vi.waitUntil(() => grid_mock.post_message.mock.calls.some(
+            ([message]) => message?.type === 'requestSourceDisplayRows',
+        ));
+        const request = grid_mock.post_message.mock.calls
+            .map(([message]) => message)
+            .find((message) => message?.type === 'requestSourceDisplayRows');
+
+        await act(async () => window.dispatchEvent(new MessageEvent('message', { data: {
+            type: 'sourceDisplayRows',
+            requestId: request.requestId,
+            sheetIndex: 0,
+            generation: 1,
+            mappingGeneration: 7,
+            sourceRows: [2],
+            displayRows: [null],
+        } })));
+        await vi.waitUntil(() => grid_mock.props!.rows === 4);
+
+        const selection = grid_mock.props!.gridSelection as {
+            rows: { toArray(): number[] };
+            current?: { cell: [number, number]; range: unknown };
+        };
+        expect(selection.rows.toArray()).toEqual([1]);
+        expect(selection.current).toEqual({
+            cell: [0, 1],
+            range: { x: 0, y: 1, width: 1, height: 1 },
+            rangeStack: [],
+        });
+    });
+
+    it('compresses a delayed inverse past removals already in the projection', async () => {
+        const pending = create_pending_row_store({ session_id: 'session' });
+        expect(pending.replace_tail_removals('session', [{
+            appendHistoryId: 'saved-first',
+            sourceRow: 4,
+            savedFingerprint: 'fingerprint-first',
+            savedRow: { cells: {}, format: { kind: 'none' } },
+        }])).toBe(true);
+        // Raw display order is [4, 0, 3, 1, 2]. Source 4 is resident and is
+        // already compressed out. Source 3 stays nonresident until the host
+        // answers its inverse lookup at raw row 2.
+        grid_mock.source_row_for_display = (display_row) =>
+            [4, 0, undefined, 1, 2][display_row];
+        await render_grid(props({
+            sheet_meta: {
+                ...props().sheet_meta,
+                rowCount: 5,
+                sourceRowCount: 5,
+            },
+            row_count: 5,
+            edit_mode: true,
+            csv_editable: true,
+            edit_session_id: 'session',
+            pending_row_store: pending,
+            mapping_generation: 7,
+            transform_state: { sort: [{ colIndex: 0, direction: 'asc' }], filters: [] },
+        }));
+        const on_selection_change = grid_mock.props!.onGridSelectionChange as
+            (selection: unknown) => void;
+        await act(async () => on_selection_change({
+            columns: compact([]),
+            rows: compact([0, 1, 2]),
+            current: {
+                cell: [0, 0],
+                range: { x: 0, y: 0, width: 1, height: 3 },
+                rangeStack: [],
+            },
+        }));
+
+        await act(async () => {
+            expect(pending.replace_tail_removals('session', [{
+                appendHistoryId: 'saved-delayed',
+                sourceRow: 3,
+                savedFingerprint: 'fingerprint-delayed',
+                savedRow: { cells: {}, format: { kind: 'none' } },
+            }, {
+                appendHistoryId: 'saved-first',
+                sourceRow: 4,
+                savedFingerprint: 'fingerprint-first',
+                savedRow: { cells: {}, format: { kind: 'none' } },
+            }])).toBe(true);
+        });
+        await vi.waitUntil(() => grid_mock.post_message.mock.calls.some(
+            ([message]) => message?.type === 'requestSourceDisplayRows'
+                && message.sourceRows.includes(3),
+        ));
+        const request = [...grid_mock.post_message.mock.calls]
+            .reverse()
+            .map(([message]) => message)
+            .find((message) => message?.type === 'requestSourceDisplayRows'
+                && message.sourceRows.includes(3));
+
+        await act(async () => window.dispatchEvent(new MessageEvent('message', { data: {
+            type: 'sourceDisplayRows',
+            requestId: request.requestId,
+            sheetIndex: 0,
+            generation: 1,
+            mappingGeneration: 7,
+            sourceRows: request.sourceRows,
+            displayRows: request.sourceRows.map((sourceRow: number) =>
+                sourceRow === 3 ? 2 : 0),
+        } })));
+        await vi.waitUntil(() => grid_mock.props!.rows === 5);
+
+        const selection = grid_mock.props!.gridSelection as {
+            rows: { toArray(): number[] };
+            current?: { range: unknown };
+        };
+        expect(selection.rows.toArray()).toEqual([0, 1, 2, 3]);
+        expect(selection.current?.range).toEqual({ x: 0, y: 0, width: 1, height: 4 });
+    });
+
+    it('offers no mutating cell actions on a transformed tail-removal row', async () => {
+        const cells = create_edit_session_store({ session_id: 'session' }, {
+            '1:0': { value: 'unrelated dirty row', base: 'source-a' },
+        });
+        const pending = create_pending_row_store({ session_id: 'session' });
+        pending.install({ session_id: 'session' }, {
+            formatTemplates: [],
+            appendedRows: [],
+            tailRemovals: [{
+                appendHistoryId: 'saved-tail',
+                sourceRow: 2,
+                savedFingerprint: 'fingerprint',
+                savedRow: { cells: {}, format: { kind: 'none' } },
+            }],
+            conflicts: [],
+        });
+        // Source row 2 is removed from raw display row 0. The deletion band is
+        // numeric row 2, where a fallback lookup would resolve unrelated source
+        // row 1 under this permutation.
+        grid_mock.source_row_for_display = (display_row) => [2, 0, 1][display_row];
+        await render_grid(props({
+            sheet_meta: {
+                ...props().sheet_meta,
+                rowCount: 3,
+                sourceRowCount: 3,
+            },
+            row_count: 3,
+            edit_mode: true,
+            csv_editable: true,
+            edit_syntax: 'markdown',
+            edit_session_id: 'session',
+            edit_session: cells,
+            pending_row_store: pending,
+            mapping_generation: 4,
+            transform_state: { sort: [{ colIndex: 0, direction: 'asc' }], filters: [] },
+        }));
+        await vi.waitUntil(() => grid_mock.post_message.mock.calls.some(
+            ([message]) => message?.type === 'requestSourceDisplayRows',
+        ));
+        const request = grid_mock.post_message.mock.calls
+            .map(([message]) => message)
+            .find((message) => message?.type === 'requestSourceDisplayRows');
+        await act(async () => window.dispatchEvent(new MessageEvent('message', { data: {
+            type: 'sourceDisplayRows',
+            requestId: request.requestId,
+            sheetIndex: 0,
+            generation: 1,
+            mappingGeneration: 4,
+            sourceRows: [2],
+            displayRows: [0],
+        } })));
+        await vi.waitUntil(() => grid_mock.props!.rows === 3);
+
+        const on_context = grid_mock.props!.onCellContextMenu as (
+            cell: [number, number], event: Record<string, unknown>,
+        ) => void;
+        await act(async () => on_context([0, 2], {
+            preventDefault: vi.fn(),
+            bounds: { x: 0, y: 48, width: 100, height: 24 },
+            localEventX: 10,
+            localEventY: 10,
+        }));
+
+        expect(find_button((text) => text === 'Discard edit')).toBeUndefined();
+        expect(find_button((text) => text.startsWith('Hyperlink'))).toBeUndefined();
+        expect(find_button((text) => text.startsWith('Highlight '))).toBeUndefined();
+        expect(find_button((text) => text.startsWith('Clear highlight'))).toBeUndefined();
+        expect(cells.snapshot().get('1:0')?.value).toBe('unrelated dirty row');
+    });
+
+    it('invalidates cuts after either source or pending cell payload changes', async () => {
+        const pending = create_pending_row_store({ session_id: 'session' });
+        const cells = create_edit_session_store({ session_id: 'session' });
+        pending.append_rows('session', ['pending-a'], {
+            id: 'plain', format: { kind: 'none' },
+        }, 1);
+        await render_grid(props({
+            edit_mode: true,
+            csv_editable: true,
+            edit_session_id: 'session',
+            edit_session: cells,
+            pending_row_store: pending,
+        }));
+        const before_source = grid_mock.props!.cutValidationKey;
+
+        act(() => edit_one(grid_mock.props!.onCellsEdited)(
+            [0, 0],
+            { kind: 'text', data: 'new source value' },
+        ));
+        await vi.waitUntil(() => grid_mock.props!.cutValidationKey !== before_source);
+        const before_pending = grid_mock.props!.cutValidationKey;
+
+        act(() => {
+            pending.set_cell('session', 'pending-a', 0, {
+                value: 'new pending value',
+                valueEditOrder: 2,
+            });
+        });
+        await vi.waitUntil(() => grid_mock.props!.cutValidationKey !== before_pending);
     });
 
     it('uses the promoted physical row while Excel row data is still loading', async () => {
@@ -2108,6 +3383,76 @@ describe('GridShell column projection', () => {
         expect(menu_button_labels()).not.toContain('Copy cell');
     });
 
+    it('closes a pending-row menu across topology changes', async () => {
+        const pending = create_pending_row_store({ session_id: 'session' });
+        pending.append_rows('session', ['pending-a', 'pending-b'], {
+            id: 'plain', format: { kind: 'none' },
+        }, 1);
+        await render_grid(props({
+            edit_mode: true,
+            csv_editable: true,
+            edit_session_id: 'session',
+            pending_row_store: pending,
+            transform_sections: true,
+        }));
+        const on_cell_context_menu = grid_mock.props!.onCellContextMenu as
+            (cell: [number, number], event: Record<string, unknown>) => void;
+        await act(async () => on_cell_context_menu([-1, 1], {
+            preventDefault: vi.fn(),
+            bounds: { x: 0, y: 48, width: 40, height: 24 },
+            localEventX: 10,
+            localEventY: 10,
+        }));
+        expect(menu_button_labels()).toContain('Remove pending row');
+
+        // Replacing the source tail shifts pending-a from display row 1 to 0;
+        // pending-b now occupies the coordinate the menu originally received.
+        await act(async () => {
+            pending.replace_tail_removals('session', [{
+                appendHistoryId: 'saved-tail',
+                sourceRow: 0,
+                savedFingerprint: 'fingerprint',
+                savedRow: { cells: {}, format: { kind: 'none' } },
+            }]);
+        });
+        expect(menu_button_labels()).not.toContain('Remove pending row');
+        expect(pending.snapshot().appendedRows.map((row) => row.id))
+            .toEqual(['pending-a', 'pending-b']);
+    });
+
+    it('offers both structural actions for a replacement row', async () => {
+        const pending = create_pending_row_store({ session_id: 'session' });
+        pending.append_rows('session', ['pending-a'], {
+            id: 'plain', format: { kind: 'none' },
+        }, 1);
+        pending.replace_tail_removals('session', [{
+            appendHistoryId: 'saved-tail',
+            sourceRow: 0,
+            savedFingerprint: 'fingerprint',
+            savedRow: { cells: {}, format: { kind: 'none' } },
+        }]);
+        await render_grid(props({
+            edit_mode: true,
+            csv_editable: true,
+            edit_session_id: 'session',
+            pending_row_store: pending,
+            transform_sections: true,
+        }));
+        const on_cell_context_menu = grid_mock.props!.onCellContextMenu as
+            (cell: [number, number], event: Record<string, unknown>) => void;
+        await act(async () => on_cell_context_menu([-1, 0], {
+            preventDefault: vi.fn(),
+            bounds: { x: 0, y: 24, width: 40, height: 24 },
+            localEventX: 10,
+            localEventY: 10,
+        }));
+
+        expect(menu_button_labels()).toEqual(expect.arrayContaining([
+            'Remove pending row',
+            'Cancel row removal',
+        ]));
+    });
+
     it('promotes the clicked Excel row from the row-marker menu', async () => {
         const on_promote_row_to_header = vi.fn();
         const base = props();
@@ -3006,7 +4351,7 @@ describe('GridShell column projection', () => {
         });
         expect(container!.querySelector('.data-editor-stub')).not.toBeNull();
         expect(grid_mock.loader_enabled.at(-1)).toBe(true);
-        expect(grid_mock.ensure_rows).toHaveBeenCalledWith(0, 40);
+        expect(grid_mock.ensure_rows).toHaveBeenCalledWith(0, 0);
         expect(editing_ref.current?.has_uncommitted_changes()).toBe(true);
     });
 });
@@ -3724,6 +5069,189 @@ describe('GridShell edit-admission lifetime', () => {
             (cell: [number, number]) => { allowOverlay: boolean };
         return get_cell_content([0, 0]).allowOverlay;
     };
+
+    it('drops a host append admission after the committed edit activation closes', async () => {
+        const editing_ref = React.createRef<EditingHandle | null>();
+        const pending = create_pending_row_store({ session_id: 'session-1' });
+        let settle_admission!: (result: AppendRowsAdmission | undefined) => void;
+        const on_append_rows = vi.fn(() => new Promise<
+            AppendRowsAdmission | undefined
+        >((resolve) => { settle_admission = resolve; }));
+        await render_grid(editable({
+            editing_ref,
+            pending_row_store: pending,
+            on_append_rows,
+        }));
+        const on_row_appended = grid_mock.props!.onRowAppended as
+            () => Promise<unknown>;
+        const completion = on_row_appended();
+        await vi.waitUntil(() => on_append_rows.mock.calls.length === 1);
+
+        await act(async () => editing_ref.current!.stop_edit_admission());
+        const settle = vi.fn();
+        settle_admission({
+            rowIds: ['host-row-1'],
+            formatTemplate: { id: 'plain', format: { kind: 'none' } },
+            appendBasis: {
+                sourceRowCount: 1,
+                provisionalStartRow: 1,
+                columnCount: 3,
+                schemaFingerprint: 'schema',
+            },
+            settle,
+        });
+        let result: unknown;
+        await act(async () => { result = await completion; });
+
+        expect(result).toBeUndefined();
+        expect(pending.snapshot().appendedRows).toEqual([]);
+        expect(settle).toHaveBeenCalledWith(false);
+    });
+
+    it('installs an append admission through its own committed busy affordance', async () => {
+        const pending = create_pending_row_store({ session_id: 'session-1' });
+        let settle_admission!: (result: AppendRowsAdmission | undefined) => void;
+        const on_append_rows = vi.fn(() => new Promise<
+            AppendRowsAdmission | undefined
+        >((resolve) => { settle_admission = resolve; }));
+        const initial = editable({
+            pending_row_store: pending,
+            on_append_rows,
+        });
+        const GridShell = await render_grid(initial);
+        const completion = (grid_mock.props!.onRowAppended as () => Promise<unknown>)();
+        await vi.waitUntil(() => on_append_rows.mock.calls.length === 1);
+
+        // App commits this prop while the host owns the request. It is an
+        // affordance fence, not evidence that the activation which issued the
+        // request has gone stale.
+        await act(async () => {
+            root!.render(React.createElement(GridShell, {
+                ...initial,
+                append_in_flight: true,
+            }));
+        });
+        expect(grid_mock.props!.onRowAppended).toBeUndefined();
+
+        const settle = vi.fn();
+        await act(async () => {
+            settle_admission({
+                rowIds: ['host-row-1'],
+                formatTemplate: { id: 'plain', format: { kind: 'none' } },
+                appendBasis: {
+                    sourceRowCount: 1,
+                    provisionalStartRow: 1,
+                    columnCount: 3,
+                    schemaFingerprint: 'schema',
+                },
+                settle,
+            });
+        });
+        let result: unknown;
+        await act(async () => { result = await completion; });
+
+        expect(result).toEqual(expect.objectContaining({ row: 1 }));
+        expect(pending.snapshot().appendedRows.map((row) => row.id))
+            .toEqual(['host-row-1']);
+        expect(settle).toHaveBeenCalledWith(true);
+    });
+
+    it('serializes two rapid append gestures instead of dropping the second', async () => {
+        const pending = create_pending_row_store({ session_id: 'session-1' });
+        const resolvers: Array<(result: AppendRowsAdmission | undefined) => void> = [];
+        const on_append_rows = vi.fn(() => new Promise<AppendRowsAdmission | undefined>(
+            (resolve) => { resolvers.push(resolve); },
+        ));
+        await render_grid(editable({
+            pending_row_store: pending,
+            on_append_rows,
+        }));
+        const append = grid_mock.props!.onRowAppended as () => Promise<unknown>;
+        const first = append();
+        const second = append();
+        await vi.waitUntil(() => on_append_rows.mock.calls.length === 1);
+
+        const first_settle = vi.fn();
+        await act(async () => resolvers[0]({
+            rowIds: ['host-row-1'],
+            formatTemplate: { id: 'plain', format: { kind: 'none' } },
+            appendBasis: {
+                sourceRowCount: 1,
+                provisionalStartRow: 1,
+                columnCount: 3,
+                schemaFingerprint: 'schema',
+            },
+            settle: first_settle,
+        }));
+        await vi.waitUntil(() => on_append_rows.mock.calls.length === 2);
+
+        const second_settle = vi.fn();
+        await act(async () => resolvers[1]({
+            rowIds: ['host-row-2'],
+            formatTemplate: { id: 'plain', format: { kind: 'none' } },
+            appendBasis: {
+                sourceRowCount: 1,
+                provisionalStartRow: 1,
+                provisionalRowCount: 2,
+                columnCount: 3,
+                schemaFingerprint: 'schema',
+            },
+            settle: second_settle,
+        }));
+        await act(async () => { await Promise.all([first, second]); });
+
+        expect(pending.snapshot().appendedRows.map((row) => row.id))
+            .toEqual(['host-row-1', 'host-row-2']);
+        expect(first_settle).toHaveBeenCalledWith(true);
+        expect(second_settle).toHaveBeenCalledWith(true);
+    });
+
+    it('rejects a paste admission when unrelated pending topology changes before projection', async () => {
+        const pending = create_pending_row_store({ session_id: 'session-1' });
+        pending.append_rows('session-1', ['pending-a', 'pending-b'], {
+            id: 'plain', format: { kind: 'none' },
+        }, 1);
+        let resolve_admission!: (result: AppendRowsAdmission | undefined) => void;
+        const on_append_rows = vi.fn(() => new Promise<
+            AppendRowsAdmission | undefined
+        >((resolve) => { resolve_admission = resolve; }));
+        await render_grid(editable({
+            pending_row_store: pending,
+            on_append_rows,
+        }));
+        const topology_before = grid_mock.props!.pasteTopologyKey;
+        const admit_for_paste = grid_mock.props!.onPasteRowsNeeded as (
+            count: number,
+            topology_key: unknown,
+        ) => Promise<unknown>;
+        const completion = admit_for_paste(1, topology_before);
+        await vi.waitUntil(() => on_append_rows.mock.calls.length === 1);
+
+        const settle = vi.fn((accepted: boolean) => {
+            if (accepted) pending.remove_rows('session-1', new Set(['pending-a']));
+        });
+        let result: unknown;
+        await act(async () => {
+            resolve_admission({
+                rowIds: ['host-row-1'],
+                formatTemplate: { id: 'plain', format: { kind: 'none' } },
+                appendBasis: {
+                    sourceRowCount: 1,
+                    provisionalStartRow: 1,
+                    provisionalRowCount: 3,
+                    columnCount: 3,
+                    schemaFingerprint: 'schema',
+                },
+                settle,
+            });
+            result = await completion;
+        });
+
+        expect(result).toBe(false);
+        expect(settle).toHaveBeenCalledWith(true);
+        expect(pending.snapshot().appendedRows.map((row) => row.id))
+            .toEqual(['pending-b']);
+    });
 
     it('keeps an edit admission fenced across an ordinary rerender', async () => {
         // A failed close/reload remains fenced. The boundary is a real new
@@ -5216,6 +6744,152 @@ describe('GridShell history capture', () => {
         );
     }
 
+    it('records the final pending-row removal with its append-basis transition', async () => {
+        const history = create_history_store();
+        const pending = create_pending_row_store({ session_id: 'session-1' });
+        const basis = {
+            sourceRowCount: 3,
+            provisionalStartRow: 3,
+            provisionalRowCount: 1,
+            columnCount: 3,
+            schemaFingerprint: 'schema',
+        };
+        pending.append_rows('session-1', ['pending-a'], {
+            id: 'plain', format: { kind: 'none' },
+        }, 1, basis);
+        await render_grid(capture_props(history, { pending_row_store: pending }));
+        const on_cell_context_menu = grid_mock.props!.onCellContextMenu as
+            (cell: [number, number], event: Record<string, unknown>) => void;
+        await act(async () => on_cell_context_menu([-1, 3], {
+            preventDefault: vi.fn(),
+            bounds: { x: 0, y: 96, width: 40, height: 24 },
+            localEventX: 10,
+            localEventY: 10,
+        }));
+        await act(async () => Array.from(document.querySelectorAll('button'))
+            .find((candidate) => candidate.textContent === 'Remove pending row')!.click());
+
+        expect(pending.snapshot().appendBasis).toBeUndefined();
+        const action = history.snapshot().undoStack[0].action;
+        expect(action.changes.map((change) => change.kind))
+            .toEqual(['rowAppend', 'pendingRows']);
+        const metadata = action.changes[1];
+        if (metadata.kind !== 'pendingRows') throw new Error('Expected basis history');
+        expect(metadata.delta.before.appendBasis).toEqual(basis);
+        expect(metadata.delta.after.appendBasis).toBeUndefined();
+    });
+
+    it('resolves a stable source-row target before classifying stale coordinates', async () => {
+        const history = create_history_store();
+        const pending = create_pending_row_store({ session_id: 'session-1' });
+        const cells = create_edit_session_store({ session_id: 'session-1' });
+        pending.append_rows('session-1', ['pending-a'], {
+            id: 'plain', format: { kind: 'none' },
+        }, 1);
+        await render_grid(capture_props(history, {
+            edit_session: cells,
+            pending_row_store: pending,
+        }));
+        const handler = grid_mock.props!.onCellsEdited as (
+            batch: readonly Record<string, unknown>[],
+            gesture: string,
+        ) => boolean;
+
+        // Row 3 is the pending band. The cut payload's stable identity says
+        // source row 0, because the numeric coordinate was captured before the
+        // topology changed.
+        const accepted = handler([{
+            location: [0, 3],
+            value: { kind: 'text', data: 'stable source edit' },
+            targetRowIdentity: { kind: 'source', sourceRow: 0 },
+            targetSourceColumn: 0,
+        }], 'paste');
+
+        expect(accepted).toBe(true);
+        expect(cells.snapshot().get('0:0')?.value).toBe('stable source edit');
+        expect(pending.snapshot().appendedRows[0].cells).toEqual({});
+    });
+
+    it('refuses both arms of a mixed paste when a source target is not resident', async () => {
+        const history = create_history_store();
+        const pending = create_pending_row_store({ session_id: 'session-1' });
+        const cells = create_edit_session_store({ session_id: 'session-1' });
+        pending.append_rows('session-1', ['pending-a'], {
+            id: 'plain', format: { kind: 'none' },
+        }, 1);
+        grid_mock.source_row_for_display = (display_row) => display_row + 1;
+        await render_grid(capture_props(history, {
+            edit_session: cells,
+            pending_row_store: pending,
+        }));
+        const handler = grid_mock.props!.onCellsEdited as (
+            batch: readonly Record<string, unknown>[],
+            gesture: string,
+        ) => boolean | 'refused';
+        const accepted = handler([{
+            location: [0, 0],
+            value: { kind: 'text', data: 'source edit' },
+            targetRowIdentity: { kind: 'source', sourceRow: 0 },
+            targetSourceColumn: 0,
+        }, {
+            location: [0, 3],
+            value: { kind: 'text', data: 'pending edit' },
+            targetRowIdentity: { kind: 'pending', pendingRowId: 'pending-a' },
+            targetSourceColumn: 0,
+        }], 'paste');
+
+        expect(accepted).toBe('refused');
+        expect(cells.snapshot()).toEqual(new Map());
+        expect(pending.snapshot().appendedRows[0].cells).toEqual({});
+        expect(history.snapshot().undoStack).toEqual([]);
+    });
+
+    it('commits a mixed source/pending highlight as one host-confirmed action', async () => {
+        const history = create_history_store();
+        const pending = create_pending_row_store({ session_id: 'session-1' });
+        pending.append_rows('session-1', ['pending-a'], {
+            id: 'plain', format: { kind: 'none' },
+        }, 1);
+        const highlight_ref: { current: HighlightSelectionHandle | null } = { current: null };
+        const on_highlight_selection = vi.fn();
+        await render_grid(capture_props(history, {
+            pending_row_store: pending,
+            highlight_ref,
+            on_highlight_selection,
+        }));
+        const on_selection_change = grid_mock.props!.onGridSelectionChange as
+            (selection: unknown) => void;
+        await act(async () => on_selection_change({
+            columns: compact([]),
+            rows: compact([]),
+            current: {
+                cell: [0, 2],
+                range: { x: 0, y: 2, width: 1, height: 2 },
+                rangeStack: [],
+            },
+        }));
+
+        expect(highlight_ref.current?.apply('yellow')).toBe(true);
+        expect(pending.snapshot().appendedRows[0].highlights).toBeUndefined();
+        const pending_gesture = on_highlight_selection.mock.calls[0][2];
+        expect(pending_gesture).toBeDefined();
+        expect(pending_gesture.commit([{
+            kind: 'highlight',
+            delta: {
+                worksheet: { sheetIndex: 0, sheetName: 'Sheet1', worksheetId: 'rId1' },
+                sourceRow: 2,
+                sourceColumn: 0,
+                before: null,
+                after: 'yellow',
+            },
+        }], 'Highlight cells')).toBe(true);
+
+        expect(pending.snapshot().appendedRows[0].highlights).toEqual({ 0: 'yellow' });
+        expect(history.snapshot().undoStack).toHaveLength(1);
+        expect(history.snapshot().undoStack[0].action.changes.map((change) => change.kind))
+            .toEqual(['highlight', 'rowAppend']);
+    });
+
     it('offers paste only while cells are editable and never offers the fill handle', async () => {
         const history = create_history_store();
         await render_grid(capture_props(history));
@@ -5248,6 +6922,39 @@ describe('GridShell history capture', () => {
         expect(stack).toHaveLength(1);
         expect(stack[0].action.label).toBe('Paste');
         expect(stack[0].action.changes).toHaveLength(2);
+    });
+
+    it('records formula-conflict removal in the same undoable source edit', async () => {
+        const history = create_history_store();
+        const pending = create_pending_row_store({ session_id: 'session-1' });
+        const conflict = {
+            reason: 'ambiguousPendingFormula' as const,
+            pendingRowIds: [],
+            tailRemovalIds: [],
+            formulaCells: [{
+                rowIdentity: { kind: 'source' as const, sourceRow: 0 },
+                sourceColumn: 0,
+            }],
+        };
+        expect(pending.install({ session_id: 'session-1' }, {
+            formatTemplates: [],
+            appendedRows: [],
+            tailRemovals: [],
+            conflicts: [conflict],
+        })).toBe(true);
+        await render_grid(capture_props(history, { pending_row_store: pending }));
+
+        await act(async () => {
+            cells_edited([{ location: [0, 0], value: 'resolved formula' }], 'edit');
+        });
+
+        expect(pending.snapshot().conflicts).toEqual([]);
+        const action = history.snapshot().undoStack[0].action;
+        expect(action.changes.map((change) => change.kind)).toEqual(['cell', 'pendingRows']);
+        const structural = action.changes[1];
+        if (structural.kind !== 'pendingRows') throw new Error('Expected structural history');
+        expect(structural.delta.before.conflicts).toEqual([conflict]);
+        expect(structural.delta.after.conflicts).toEqual([]);
     });
 
     it('names a gesture from what the user did, not from what the cells became', async () => {

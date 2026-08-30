@@ -24,6 +24,8 @@ import {
     commit_history_move,
     empty_history_stack,
     record_history_action,
+    rekey_saved_appended_row_history,
+    rekey_committed_tail_removal_history,
     type CommitOutcome,
     type HistoryAction,
     type HistoryActionSource,
@@ -31,6 +33,8 @@ import {
     type HistoryEntry,
     type HistoryStackState,
     type RecordOutcome,
+    type SavedHistoryRowAssignment,
+    type SavedTailRemovalCommit,
 } from './history-stack-model';
 import type { HistoryDirection } from './history-cell-state-model';
 import { stage_mutation, type StagedMutation } from './staged-mutation';
@@ -99,6 +103,10 @@ export interface HistoryStore {
         entry: HistoryEntry,
         bounds?: HistoryBounds,
     ): StagedHistoryMove;
+    /** Advance temporary appended-row identities after the host's save receipt. */
+    rekey_saved_rows(rows: readonly SavedHistoryRowAssignment[]): void;
+    /** Turn tail removals written by Save into host-admitted row restorations. */
+    rekey_saved_removals(rows: readonly SavedTailRemovalCommit[]): void;
     /**
      * Empty the history. For a different document replacing this one, where any
      * surviving action would be another file's edits waiting to be replayed
@@ -157,6 +165,20 @@ export function create_history_store(initial?: HistoryStackState): HistoryStore 
                 notify,
             );
             return { outcome, ...staged };
+        },
+
+        rekey_saved_rows: (rows) => {
+            const next = rekey_saved_appended_row_history(state, rows);
+            if (next === state) return;
+            state = next;
+            notify();
+        },
+
+        rekey_saved_removals: (rows) => {
+            const next = rekey_committed_tail_removal_history(state, rows);
+            if (next === state) return;
+            state = next;
+            notify();
         },
 
         clear: () => {

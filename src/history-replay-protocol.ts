@@ -65,7 +65,17 @@
 
 import { is_plain_record } from './plain-record';
 import { is_matching_rich_text, type CellHyperlink, type RichText } from './cell-content';
-import { is_valid_hyperlink } from './pending-changes';
+import {
+    MAX_HISTORY_ACTION_CELLS,
+    MAX_HISTORY_ACTION_ENCODED_BYTES,
+} from './history-limits';
+import {
+    assert_json_encoded_bound,
+    is_valid_hyperlink,
+    MAX_PENDING_APPENDED_ROWS,
+    own_pending_structural_changes,
+    type PendingStructuralChanges,
+} from './pending-changes';
 import { sanitize_cell_highlight_color } from './cell-highlights';
 import {
     is_strict_wire_dirty_entry,
@@ -120,6 +130,7 @@ export interface WirePresentValueDimension {
     readonly formattingKnown?: true;
     readonly movedFrom?: CsvDirtyEntry['movedFrom'];
     readonly valueEditOrder?: number;
+    readonly formulaReferenceBases?: CsvDirtyEntry['formulaReferenceBases'];
 }
 
 export interface WireUntouchedHyperlinkDimension {
@@ -204,6 +215,14 @@ export interface HistoryReplayHighlightInput {
     readonly desired: CellHighlightColor | null;
 }
 
+/** One worksheet's complete structural Pending Changes transition. */
+export interface HistoryReplayStructuralInput {
+    readonly ordinal: number;
+    readonly worksheet: WorksheetTarget;
+    readonly expected: PendingStructuralChanges;
+    readonly desired: PendingStructuralChanges;
+}
+
 /**
  * The region the replay lands in, on the action's first worksheet.
  *
@@ -262,6 +281,9 @@ export interface PrepareHistoryReplayRequest extends HistoryReplayCorrelation {
      */
     readonly cells: readonly HistoryReplayCellInput[];
     readonly highlights: readonly HistoryReplayHighlightInput[];
+    readonly structures?: readonly HistoryReplayStructuralInput[];
+    /** Unsettled saved-row restoration grants this exact replay may consume. */
+    readonly rowAdmissionRequestIds?: readonly string[];
     readonly focus: HistoryReplayFocus;
 }
 
@@ -294,6 +316,10 @@ export interface HistoryReplayPrepared extends HistoryReplayLeaseIdentity {
     readonly focusSheetIndex: number;
     readonly focus: HistoryReplayFocus;
     readonly cells: readonly HistoryReplayPreparedCell[];
+    /** Owned structural transitions the host resolved, verified, and leased. */
+    readonly structures?: readonly (HistoryReplayStructuralInput & {
+        readonly resolvedSheetIndex: number;
+    })[];
 }
 
 /**
@@ -338,6 +364,10 @@ export interface HistoryReplayHighlightWrite {
     readonly ordinal: number;
 }
 
+export interface HistoryReplayStructuralWrite {
+    readonly ordinal: number;
+}
+
 export interface CommitHistoryReplayRequest extends HistoryReplayLeaseIdentity {
     /**
      * The proposal's identity. A duplicate delivery of the same proposal is the
@@ -347,6 +377,7 @@ export interface CommitHistoryReplayRequest extends HistoryReplayLeaseIdentity {
     readonly mutationId: string;
     readonly cells: readonly HistoryReplayCellWrite[];
     readonly highlights: readonly HistoryReplayHighlightWrite[];
+    readonly structures?: readonly HistoryReplayStructuralWrite[];
 }
 
 export interface HistoryReplayAcceptedCellWrite {
@@ -356,6 +387,27 @@ export interface HistoryReplayAcceptedCellWrite {
     /** As written durably, legacy string form included. See `HistoryReplayCellWrite`. */
     readonly entry: string | CsvDirtyEntry | null;
 }
+
+export type HistoryReplayAcceptedStructuralWrite =
+    | {
+        readonly ordinal: number;
+        readonly resolvedSheetIndex: number;
+        readonly expected: PendingStructuralChanges;
+        readonly desired: PendingStructuralChanges;
+        readonly hostDerived?: never;
+    }
+    | {
+        readonly ordinal: number;
+        readonly resolvedSheetIndex: number;
+        /**
+         * A canonical conflict-only consequence on a worksheet the request did
+         * not name. Carry only the CAS patch: echoing that sheet's complete row
+         * state can amplify a bounded request into an unbounded terminal.
+         */
+        readonly hostDerived: true;
+        readonly expectedConflicts: PendingStructuralChanges['conflicts'];
+        readonly desiredConflicts: PendingStructuralChanges['conflicts'];
+    };
 
 export interface HistoryReplayCommitted extends HistoryReplayLeaseIdentity {
     readonly mutationId: string;
@@ -371,6 +423,7 @@ export interface HistoryReplayCommitted extends HistoryReplayLeaseIdentity {
      * receiver has a use for.
      */
     readonly cells: readonly HistoryReplayAcceptedCellWrite[];
+    readonly structures?: readonly HistoryReplayAcceptedStructuralWrite[];
     readonly focusSheetIndex: number;
     readonly focus: HistoryReplayFocus;
     /**
@@ -468,6 +521,14 @@ function sanitized_wire_value_dimension(
             ? value.valueEditOrder
             : null;
     if (value_edit_order === null) return undefined;
+    const formula_reference_bases = value.formulaReferenceBases === undefined
+        ? undefined
+        : sanitized_wire_dirty_entry({
+            value: '',
+            base: '',
+            formulaReferenceBases: value.formulaReferenceBases,
+        })?.formulaReferenceBases ?? null;
+    if (formula_reference_bases === null) return undefined;
     return Object.freeze({
         kind: 'present' as const,
         value: present,
@@ -478,6 +539,8 @@ function sanitized_wire_value_dimension(
         ...(value.formattingKnown === true ? { formattingKnown: true as const } : {}),
         ...(moved_from === undefined ? {} : { movedFrom: moved_from }),
         ...(value_edit_order === undefined ? {} : { valueEditOrder: value_edit_order }),
+        ...(formula_reference_bases === undefined ? {} : { formulaReferenceBases:
+            formula_reference_bases }),
     });
 }
 
@@ -638,8 +701,42 @@ function sanitized_ordinal_list<T extends { readonly ordinal: number }>(
 export function sanitized_prepare_history_replay_request(
     value: unknown,
 ): PrepareHistoryReplayRequest | undefined {
+    if (!is_plain_record(value)) return undefined;
+    const raw_cells = value.cells;
+    const raw_highlights = value.highlights;
+    const raw_structures = value.structures ?? [];
+    if (!Array.isArray(raw_cells)
+        || !Array.isArray(raw_highlights)
+        || !Array.isArray(raw_structures)) return undefined;
+    let touched_cells = raw_cells.length + raw_highlights.length;
+    if (touched_cells > MAX_HISTORY_ACTION_CELLS) return undefined;
+    if (raw_structures.length > MAX_HISTORY_ACTION_CELLS) return undefined;
+    for (const raw of raw_structures) {
+        if (!is_plain_record(raw)
+            || !is_plain_record(raw.expected)
+            || !is_plain_record(raw.desired)) return undefined;
+        const structural_count = (side: Record<string, unknown>): number => Math.max(
+            1,
+            Array.isArray(side.appendedRows) ? side.appendedRows.length : 0,
+            Array.isArray(side.tailRemovals) ? side.tailRemovals.length : 0,
+        );
+        touched_cells += Math.max(
+            structural_count(raw.expected),
+            structural_count(raw.desired),
+        );
+        if (touched_cells > MAX_HISTORY_ACTION_CELLS) return undefined;
+    }
+    try {
+        // This is deliberately before any owner below. Expected and desired
+        // structural arms may each approach the durable-leaf limit, and an
+        // untrusted renderer can send arbitrarily many of them unless the whole
+        // request is bounded before those arms are cloned and retained.
+        assert_json_encoded_bound(value, MAX_HISTORY_ACTION_ENCODED_BYTES);
+    } catch {
+        return undefined;
+    }
     const correlation = sanitized_correlation(value);
-    if (correlation === undefined || !is_plain_record(value)) return undefined;
+    if (correlation === undefined) return undefined;
     const focus = sanitized_wire_history_replay_focus(value.focus);
     if (focus === undefined) return undefined;
 
@@ -687,16 +784,49 @@ export function sanitized_prepare_history_replay_request(
             });
         },
     );
-    // Empty cells are legitimate — a highlight-only replay has none — but a
-    // request empty of BOTH names no mutation at all, and would take a lease
-    // authorizing nothing.
     if (highlights === undefined) return undefined;
-    if (cells.length === 0 && highlights.length === 0) return undefined;
+
+    const structures = sanitized_ordinal_list<HistoryReplayStructuralInput>(
+        value.structures ?? [],
+        (raw) => {
+            const worksheet = sanitized_wire_worksheet_target(raw.worksheet);
+            if (!worksheet || !is_source_index(raw.ordinal)
+                || !is_plain_record(raw.expected) || !is_plain_record(raw.desired)) {
+                return undefined;
+            }
+            try {
+                return Object.freeze({
+                    ordinal: raw.ordinal,
+                    worksheet,
+                    expected: own_pending_structural_changes(raw.expected),
+                    desired: own_pending_structural_changes(raw.desired),
+                });
+            } catch {
+                return undefined;
+            }
+        },
+    );
+    // Any one arm may be empty, but the complete replay must name a mutation.
+    if (structures === undefined) return undefined;
+    const raw_admission_ids = value.rowAdmissionRequestIds ?? [];
+    if (
+        !Array.isArray(raw_admission_ids)
+        || raw_admission_ids.length > MAX_PENDING_APPENDED_ROWS
+        || raw_admission_ids.some((id) => typeof id !== 'string'
+            || id.length === 0 || id.length > 256)
+        || new Set(raw_admission_ids).size !== raw_admission_ids.length
+    ) return undefined;
+    const rowAdmissionRequestIds = Object.freeze([...raw_admission_ids] as string[]);
+    if (cells.length === 0 && highlights.length === 0 && structures.length === 0) {
+        return undefined;
+    }
 
     return Object.freeze({
         ...correlation,
         cells,
         highlights,
+        structures,
+        ...(rowAdmissionRequestIds.length === 0 ? {} : { rowAdmissionRequestIds }),
         focus,
     });
 }
@@ -718,16 +848,29 @@ export function sanitized_prepare_history_replay_request(
 export function replay_request_requires_edit_session(
     request: PrepareHistoryReplayRequest,
 ): boolean {
-    return request.cells.length > 0;
+    return request.cells.length > 0 || (request.structures?.length ?? 0) > 0;
 }
 
 export function sanitized_commit_history_replay_request(
     value: unknown,
 ): CommitHistoryReplayRequest | undefined {
+    if (!is_plain_record(value)) return undefined;
+    const raw_cells = value.cells;
+    const raw_highlights = value.highlights;
+    const raw_structures = value.structures ?? [];
+    if (!Array.isArray(raw_cells)
+        || !Array.isArray(raw_highlights)
+        || !Array.isArray(raw_structures)) return undefined;
+    if (raw_cells.length + raw_highlights.length + raw_structures.length
+        > MAX_HISTORY_ACTION_CELLS) return undefined;
+    try {
+        assert_json_encoded_bound(value, MAX_HISTORY_ACTION_ENCODED_BYTES);
+    } catch {
+        return undefined;
+    }
     const identity = sanitized_lease_identity(value);
     if (
         identity === undefined
-        || !is_plain_record(value)
         || typeof value.mutationId !== 'string'
         || value.mutationId.length === 0
     ) return undefined;
@@ -771,7 +914,21 @@ export function sanitized_commit_history_replay_request(
     );
     if (highlights === undefined) return undefined;
 
-    return Object.freeze({ ...identity, mutationId: value.mutationId, cells, highlights });
+    const structures = sanitized_ordinal_list<HistoryReplayStructuralWrite>(
+        value.structures ?? [],
+        (raw) => (is_source_index(raw.ordinal)
+            ? Object.freeze({ ordinal: raw.ordinal })
+            : undefined),
+    );
+    if (structures === undefined) return undefined;
+
+    return Object.freeze({
+        ...identity,
+        mutationId: value.mutationId,
+        cells,
+        highlights,
+        structures,
+    });
 }
 
 export function sanitized_abandon_history_replay_request(
@@ -829,19 +986,26 @@ export function history_replay_proposal_digest(
                     write.entry.movedFrom.row,
                     write.entry.movedFrom.col,
                     write.entry.movedFrom.order,
+                    write.entry.movedFrom.rowIdentity ?? null,
                     (write.entry.movedFrom.previous ?? []).map((move) => [
                         move.sourceRow,
                         move.sourceCol,
                         move.destinationRow,
                         move.destinationCol,
                         move.order,
+                        move.sourceRowIdentity ?? null,
+                        move.destinationRowIdentity ?? null,
                     ]),
                 ],
                 write.entry.valueEditOrder ?? null,
+                write.entry.formulaReferenceBases ?? null,
             ],
         ]);
     const highlights = [...request.highlights]
         .sort((left, right) => left.ordinal - right.ordinal)
         .map((write) => write.ordinal);
-    return JSON.stringify([request.mutationId, cells, highlights]);
+    const structures = [...(request.structures ?? [])]
+        .sort((left, right) => left.ordinal - right.ordinal)
+        .map((write) => write.ordinal);
+    return JSON.stringify([request.mutationId, cells, highlights, structures]);
 }

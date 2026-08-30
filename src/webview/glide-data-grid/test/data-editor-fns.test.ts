@@ -55,7 +55,9 @@ describe("unquote", () => {
     it("should handle empty strings correctly", () => {
         const input = "";
         const output = unquote(input);
-        expect(output).toEqual([[]]);
+        expect(output).toEqual([[
+            { rawValue: "", formatted: "", format: "string" },
+        ]]);
     });
 
     it("should correctly unquote strings containing tabs within quotes", () => {

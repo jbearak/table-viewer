@@ -158,7 +158,9 @@ export function unquote(str: string): CopyBuffer {
 
         index++;
     }
-    if (start < str.length) {
+    if (str.length === 0) {
+        current.push("");
+    } else if (start < str.length) {
         current.push(descape(str.slice(start, str.length)));
     }
     result.push(current);

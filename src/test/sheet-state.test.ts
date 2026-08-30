@@ -141,6 +141,38 @@ describe('sheet-state helpers', () => {
         });
     });
 
+    it('preserves a structural-only pending-changes slot through normalization', () => {
+        const pendingEdits: NonNullable<PerFileState['pendingEdits']> = [{
+            sheetName: 'Sheet1',
+            cells: {},
+            formatTemplates: [{ id: 'plain', format: { kind: 'none' } }],
+            appendedRows: [{
+                id: 'pending-row',
+                cells: { 0: { value: 'draft' } },
+                formatTemplateId: 'plain',
+                createdOrder: 1,
+            }],
+            appendBasis: {
+                sourceRowCount: 1,
+                provisionalStartRow: 1,
+                columnCount: 1,
+                schemaFingerprint: '["Sheet1",1,null]',
+            },
+        }];
+
+        const normalized = normalize_per_file_state(
+            { activeSheetIndex: 0, pendingEdits },
+            ['Sheet1'],
+        );
+
+        expect(normalized.pendingEdits?.[0]).toMatchObject({
+            sheetName: 'Sheet1',
+            cells: {},
+            appendedRows: [{ id: 'pending-row', cells: { 0: { value: 'draft' } } }],
+            appendBasis: { provisionalStartRow: 1 },
+        });
+    });
+
     it('drops a persisted entry that is not a well-formed value/base record', () => {
         const state: PerFileState = {
             activeSheetIndex: 0,
