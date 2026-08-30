@@ -211,16 +211,22 @@ export interface ScannedWorksheetHyperlink {
 }
 
 interface HyperlinkSection {
-    readonly root: QualifiedElementSpan;
     readonly section: QualifiedElementSpan;
 }
 
-function worksheet_hyperlink_section(xml: Uint8Array): HyperlinkSection | undefined {
-    const { root, implicitNamespace } = worksheet_markup_names(xml, false);
-    const section = direct_child_elements(xml, root.element).find((candidate) =>
+function worksheet_hyperlink_section(
+    xml: Uint8Array,
+    markup: WorksheetMarkup,
+): HyperlinkSection | undefined {
+    const section = direct_child_elements(xml, markup.root.element).find((candidate) =>
         local_name(candidate.name) === 'hyperlinks'
-        && is_spreadsheet_element(xml, candidate, [root], implicitNamespace));
-    return section === undefined ? undefined : { root, section };
+        && is_spreadsheet_element(
+            xml,
+            candidate,
+            [markup.root],
+            markup.implicitNamespace,
+        ));
+    return section === undefined ? undefined : { section };
 }
 
 function namespaced_relationship_id(
@@ -242,23 +248,30 @@ export function scan_worksheet_hyperlinks(
     source: Uint8Array | string,
 ): readonly ScannedWorksheetHyperlink[] {
     const xml = typeof source === 'string' ? Buffer.from(source, 'utf8') : source;
-    const located = worksheet_hyperlink_section(xml);
+    const markup = worksheet_markup_names(xml, false);
+    const located = worksheet_hyperlink_section(xml, markup);
     if (located === undefined) return [];
-    const { root, section } = located;
-    const root_namespace = worksheet_markup_names(xml, false).implicitNamespace;
+    return scan_located_worksheet_hyperlinks(xml, markup, located.section);
+}
+
+function scan_located_worksheet_hyperlinks(
+    xml: Uint8Array,
+    markup: WorksheetMarkup,
+    section: QualifiedElementSpan,
+): readonly ScannedWorksheetHyperlink[] {
     const found: ScannedWorksheetHyperlink[] = [];
     for (const child of direct_child_elements(xml, section.element)) {
         if (local_name(child.name) !== 'hyperlink'
             || !is_spreadsheet_element(
                 xml,
                 child,
-                [root, section],
-                root_namespace,
+                [markup.root, section],
+                markup.implicitNamespace,
             )) continue;
         const open = opening_tag_text(xml, child.element);
         const ref = get_attr(open, 'ref');
         if (!ref) continue;
-        const bindings = namespace_bindings(xml, [root, section, child]);
+        const bindings = namespace_bindings(xml, [markup.root, section, child]);
         found.push({
             element: utf8_text(xml, child.element.start, child.element.end),
             r_id: namespaced_relationship_id(open, bindings),
@@ -287,16 +300,18 @@ const WORKSHEET_CHILD_ORDER = [
 ] as const;
 
 /** The byte offset in `xml` where a new `<hyperlinks>` section belongs. */
-function hyperlink_section_insert_pos(xml: Uint8Array, root: QualifiedElementSpan): number {
+function hyperlink_section_insert_pos(
+    xml: Uint8Array,
+    markup: WorksheetMarkup,
+): number {
     const hyperlink_index = WORKSHEET_CHILD_ORDER.indexOf('hyperlinks');
-    const root_namespace = worksheet_markup_names(xml, false).implicitNamespace;
     let after_predecessor: number | undefined;
-    for (const child of direct_child_elements(xml, root.element)) {
+    for (const child of direct_child_elements(xml, markup.root.element)) {
         if (!is_spreadsheet_element(
             xml,
             child,
-            [root],
-            root_namespace,
+            [markup.root],
+            markup.implicitNamespace,
         )) continue;
         const index = WORKSHEET_CHILD_ORDER.indexOf(
             local_name(child.name) as typeof WORKSHEET_CHILD_ORDER[number],
@@ -539,9 +554,11 @@ export function apply_hyperlink_edits(
 
     // Same locator the reader uses, so the two cannot disagree about which
     // `<hyperlinks>` section is the live one.
-    const located_section = worksheet_hyperlink_section(sheet_xml);
+    const located_section = worksheet_hyperlink_section(sheet_xml, markup);
     const section = located_section?.section;
-    const current = scan_worksheet_hyperlinks(sheet_xml);
+    const current = section === undefined
+        ? []
+        : scan_located_worksheet_hyperlinks(sheet_xml, markup, section);
     const section_prefix = section === undefined
         ? markup.prefix
         : qname_prefix(section.name) === '' ? '' : `${qname_prefix(section.name)}:`;
@@ -654,7 +671,7 @@ export function apply_hyperlink_edits(
             });
         } else {
             const section_text = `<${q('hyperlinks')}>${elements.join('')}</${q('hyperlinks')}>`;
-            const at = hyperlink_section_insert_pos(sheet_xml, markup.root);
+            const at = hyperlink_section_insert_pos(sheet_xml, markup);
             sheet_splices.push({ start: at, end: at, text: section_text });
         }
     }

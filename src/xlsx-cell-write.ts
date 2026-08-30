@@ -1411,42 +1411,55 @@ function span_qname(xml: Uint8Array, span: Span, fallback: string): string {
     return /^<([^\s/>]+)/.exec(opening)?.[1] ?? fallback;
 }
 
-function element_namespace_in_path(
+interface FormulaNamespaceState {
+    readonly default_namespace?: string;
+    readonly bindings: ReadonlyMap<string, string>;
+}
+
+function extend_formula_namespace_state(
     xml: Uint8Array,
-    path: readonly Span[],
-): string {
-    let default_namespace: string | undefined;
-    const bindings = new Map<string, string>();
-    for (const [index, element] of path.entries()) {
-        const declarations = namespace_declarations(opening_tag_text(xml, element));
-        if (declarations.default_namespace !== undefined) {
-            default_namespace = declarations.default_namespace;
-        } else if (index === 0 && default_namespace === undefined) {
-            const root_name = span_qname(xml, element, 'worksheet');
-            if (!root_name.includes(':')) default_namespace = SPREADSHEETML_NS;
-        }
-        for (const binding of declarations.bindings) {
-            bindings.set(binding.prefix, binding.namespace);
-        }
+    element: Span,
+    parent?: FormulaNamespaceState,
+    implicit_root = false,
+): FormulaNamespaceState {
+    const declarations = namespace_declarations(opening_tag_text(xml, element));
+    const default_namespace = declarations.default_namespace
+        ?? parent?.default_namespace
+        ?? (implicit_root && !span_qname(xml, element, '').includes(':')
+            ? SPREADSHEETML_NS
+            : undefined);
+    const bindings = new Map(parent?.bindings);
+    for (const binding of declarations.bindings) {
+        bindings.set(binding.prefix, binding.namespace);
     }
-    const name = span_qname(xml, path[path.length - 1], '');
-    const colon = name.indexOf(':');
+    return { default_namespace, bindings };
+}
+
+function element_namespace_from_state(
+    element: QualifiedElementSpan,
+    state: FormulaNamespaceState,
+): string {
+    const colon = element.name.indexOf(':');
     return colon === -1
-        ? default_namespace ?? ''
-        : bindings.get(name.slice(0, colon)) ?? '';
+        ? state.default_namespace ?? ''
+        : state.bindings.get(element.name.slice(0, colon)) ?? '';
 }
 
 function direct_spreadsheet_child(
     xml: Uint8Array,
-    path: readonly Span[],
+    parent: Span,
+    parent_namespace: FormulaNamespaceState,
     local_name: string,
 ): QualifiedElementSpan | undefined {
-    const parent = path[path.length - 1];
     return direct_child_elements(xml, parent).find((child) =>
         child.name.slice(child.name.lastIndexOf(':') + 1) === local_name
-        && is_spreadsheetml_namespace(element_namespace_in_path(
-            xml,
-            [...path, child.element],
+        && is_spreadsheetml_namespace(element_namespace_from_state(
+            child,
+            extend_formula_namespace_state(
+                xml,
+                child.element,
+                parent_namespace,
+            ),
         )));
 }
 
@@ -1454,14 +1467,15 @@ function direct_spreadsheet_child(
 function visit_formula_cache_splices(
     xml: Uint8Array,
     sheet_data: Span,
+    sheet_data_namespace: FormulaNamespaceState,
     wanted: ReadonlySet<string>,
     values: ReadonlyMap<string, string>,
     grouped_ranges: readonly GroupedRange[],
     visit: FormulaCacheSpliceVisitor,
 ): void {
     if (wanted.size === 0) return;
-    const worksheet = find_first_element_by_local_name(xml, 'worksheet');
-    if (worksheet === null) return;
+    let owner_start = -1;
+    let owner_namespace: FormulaNamespaceState | undefined;
     const selected_groups = grouped_ranges.filter((range) =>
         range.kind !== 'shared'
         && wanted.has(`${range.start_row}:${range.start_col}`));
@@ -1470,13 +1484,33 @@ function visit_formula_cache_splices(
         : undefined;
     scan_rows(xml, sheet_data.inner_start, sheet_data.inner_end, {
         on_cell: (row, col, cell, owner) => {
-            const path = [worksheet.element, sheet_data, owner, cell];
             let formula: Span | null = null;
             let key: string | undefined;
-            if (grouped?.has(row, col) !== true) {
+            const grouped_cell = grouped?.has(row, col) === true;
+            if (!grouped_cell) {
                 key = `${row}:${col}`;
                 if (!wanted.has(key)) return;
-                formula = direct_spreadsheet_child(xml, path, 'f')?.element ?? null;
+            }
+            if (owner.start !== owner_start) {
+                owner_start = owner.start;
+                owner_namespace = extend_formula_namespace_state(
+                    xml,
+                    owner,
+                    sheet_data_namespace,
+                );
+            }
+            const cell_namespace = extend_formula_namespace_state(
+                xml,
+                cell,
+                owner_namespace,
+            );
+            if (!grouped_cell) {
+                formula = direct_spreadsheet_child(
+                    xml,
+                    cell,
+                    cell_namespace,
+                    'f',
+                )?.element ?? null;
                 if (!formula) return;
             }
             key ??= `${row}:${col}`;
@@ -1488,7 +1522,12 @@ function visit_formula_cache_splices(
                     visit(cell.start, cell.inner_start, numeric_open_tag);
                 }
             }
-            const value = direct_spreadsheet_child(xml, path, 'v')?.element;
+            const value = direct_spreadsheet_child(
+                xml,
+                cell,
+                cell_namespace,
+                'v',
+            )?.element;
             if (value) {
                 if (replacement === undefined) {
                     visit(value.start, value.end, '');
@@ -1507,7 +1546,12 @@ function visit_formula_cache_splices(
                 return;
             }
             if (replacement === undefined) return;
-            formula ??= direct_spreadsheet_child(xml, path, 'f')?.element ?? null;
+            formula ??= direct_spreadsheet_child(
+                xml,
+                cell,
+                cell_namespace,
+                'f',
+            )?.element ?? null;
             if (formula) {
                 const cell_name = span_qname(xml, cell, 'c');
                 const colon = cell_name.indexOf(':');
@@ -1530,12 +1574,26 @@ function rewrite_formula_cached_values(
     values: ReadonlyMap<string, string>,
     grouped_ranges = grouped_formula_ranges(xml),
 ): Uint8Array {
+    const worksheet = find_first_element_by_local_name(xml, 'worksheet');
+    if (worksheet === null) return xml;
+    const worksheet_namespace = extend_formula_namespace_state(
+        xml,
+        worksheet.element,
+        undefined,
+        true,
+    );
+    const sheet_data_namespace = extend_formula_namespace_state(
+        xml,
+        sheet_data,
+        worksheet_namespace,
+    );
     let delta = 0;
     let splice_count = 0;
     let previous_end = 0;
     visit_formula_cache_splices(
         xml,
         sheet_data,
+        sheet_data_namespace,
         wanted,
         values,
         grouped_ranges,
@@ -1554,6 +1612,7 @@ function rewrite_formula_cached_values(
     visit_formula_cache_splices(
         xml,
         sheet_data,
+        sheet_data_namespace,
         wanted,
         values,
         grouped_ranges,
