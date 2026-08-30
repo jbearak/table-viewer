@@ -45,6 +45,7 @@ import {
     FileSizeLimitExceededError,
     MAX_CSV_ROWS,
     MAX_SHEET_ROWS,
+    UNBOUNDED_SHEET_ROWS,
     MAX_WORKBOOK_FORMULAS,
 } from './spreadsheet-safety';
 import { prepare_csv_serializer, serialize_delimited_values } from './serialize-csv';
@@ -430,6 +431,12 @@ interface ViewerProfileBase {
     ): Promise<FileSourceBuildResult>;
     /** Prefer the file-backed reader even when a whole-file read is possible. */
     prefer_file_source?: boolean;
+    /** How many worksheet body rows this format may hold after an append.
+     *  Absent means the workbook ceiling (`MAX_SHEET_ROWS`), which is the
+     *  limit `assert_safe_sheet_shape` already enforces at open time; delimited
+     *  profiles set `UNBOUNDED_SHEET_ROWS` because no such gate applies to
+     *  them. Read it through `append_row_ceiling_for`, never directly. */
+    readonly append_row_ceiling?: number;
     /** Sets previewMode on the meta envelope (read-only synced preview). */
     previewMode?: boolean;
     /** Called after each (re)load adopts a source — preview refreshes its line map. */
@@ -1806,15 +1813,8 @@ export function plan_csv_save(
         'ambiguousColumns',
         'The worksheet columns changed after rows were appended.',
     );
-    if (sheet.sourceRowCount - structural.tailRemovals.length
-        + structural.appendedRows.length > MAX_SHEET_ROWS) {
-        structural_save_error(
-            0,
-            structural,
-            'rowLimitExceeded',
-            'The pending changes exceed the worksheet row limit.',
-        );
-    }
+    // No row ceiling here: a delimited file has no workbook container to
+    // overflow, so `MAX_SHEET_ROWS` never described this format.
     const retained_row_count = sheet.rowCount - structural.tailRemovals.length;
     if (retained_row_count < 0) structural_save_error(
         0,
@@ -2000,8 +2000,15 @@ export function csv_table_profile(config?: ConfigPort): ViewerProfile {
     return {
         editing: true,
         plan_save: plan_csv_save,
+        append_row_ceiling: UNBOUNDED_SHEET_ROWS,
         build_source: csv_source_builder(config),
     };
+}
+
+/** The row ceiling an append must respect for this profile's format.
+ *  Workbook formats keep `MAX_SHEET_ROWS`; delimited formats have none. */
+export function append_row_ceiling_for(profile: ViewerProfile): number {
+    return profile.append_row_ceiling ?? MAX_SHEET_ROWS;
 }
 
 /** Whether two paths would take the same parser — the comparison `profile_for`
@@ -8068,7 +8075,7 @@ export function attach_viewer(
             - (durable?.tailRemovals?.length ?? 0)
             + admitted_ids.size
             + message.count;
-        if (prospective_rows > MAX_SHEET_ROWS) {
+        if (prospective_rows > append_row_ceiling_for(profile)) {
             await refuse('Appending these rows would exceed the worksheet row limit.');
             return;
         }
@@ -8543,7 +8550,8 @@ export function attach_viewer(
             ids.some((id) => current_ids.has(id) && !ledger.ownedRowIds.has(id))
             || current_ids.size + requested_additions.length > MAX_PENDING_APPENDED_ROWS
             || sheet.sourceRowCount - (durable?.tailRemovals?.length ?? 0)
-                + current_ids.size + requested_additions.length > MAX_SHEET_ROWS
+                + current_ids.size + requested_additions.length
+                > append_row_ceiling_for(profile)
         ) {
             await refuse('Restoring these rows would exceed the worksheet row limit.');
             return;
@@ -13547,7 +13555,8 @@ export function attach_viewer(
                 if (
                     sheet.sourceRowCount - desired.tailRemovals.length < 0
                     || sheet.sourceRowCount - desired.tailRemovals.length
-                        + desired.appendedRows.length > MAX_SHEET_ROWS
+                        + desired.appendedRows.length
+                        > append_row_ceiling_for(profile)
                 ) return false;
                 const retained_row_count = sheet.sourceRowCount
                     - desired.tailRemovals.length;

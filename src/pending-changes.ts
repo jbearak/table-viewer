@@ -15,7 +15,7 @@
 
 import { is_plain_record } from './plain-record';
 import { is_cell_highlight_color, type CellHighlightColor } from './cell-highlight-colors';
-import { MAX_SHEET_COLUMNS, MAX_SHEET_ROWS } from './spreadsheet-safety';
+import { MAX_SHEET_COLUMNS, MAX_PENDING_ROW_INDEX } from './spreadsheet-safety';
 import type { XlsxNumberFormat } from './spreadsheet-format';
 import {
     hyperlinks_equal,
@@ -136,7 +136,7 @@ export function own_pending_formula_reference_bases(
                     || entry.targetWorksheetId.length > 32_767))
             || !Number.isSafeInteger(entry.provisionalStartRow)
             || (entry.provisionalStartRow as number) < 0
-            || (entry.provisionalStartRow as number) >= MAX_SHEET_ROWS
+            || (entry.provisionalStartRow as number) >= MAX_PENDING_ROW_INDEX
             || !Number.isSafeInteger(entry.provisionalRowCount)
             || (entry.provisionalRowCount as number) <= 0
             || (entry.provisionalRowCount as number) > MAX_PENDING_APPENDED_ROWS
@@ -386,7 +386,7 @@ function own_row_identity(value: unknown): RowIdentity | undefined {
     if (value.kind === 'source'
         && Number.isSafeInteger(value.sourceRow)
         && (value.sourceRow as number) >= 0
-        && (value.sourceRow as number) < MAX_SHEET_ROWS) {
+        && (value.sourceRow as number) < MAX_PENDING_ROW_INDEX) {
         return Object.freeze({ kind: 'source', sourceRow: value.sourceRow as number });
     }
     if (value.kind === 'pending' && is_pending_id(value.pendingRowId)) {
@@ -399,7 +399,7 @@ function own_pending_move(value: unknown): PendingCellMoveProvenance | undefined
     if (!is_plain_record(value)) return undefined;
     const integer = (entry: unknown, max: number): entry is number =>
         Number.isSafeInteger(entry) && (entry as number) >= 0 && (entry as number) < max;
-    if (!integer(value.row, MAX_SHEET_ROWS)
+    if (!integer(value.row, MAX_PENDING_ROW_INDEX)
         || !integer(value.col, MAX_SHEET_COLUMNS)
         || !Number.isSafeInteger(value.order) || (value.order as number) < 0
         || (value.rowIdentity !== undefined && own_row_identity(value.rowIdentity) === undefined)
@@ -407,9 +407,9 @@ function own_pending_move(value: unknown): PendingCellMoveProvenance | undefined
             || value.previous.length > MAX_PENDING_APPENDED_ROWS))) return undefined;
     const previous = (value.previous ?? []).map((entry): PendingCellMoveIntent | undefined => {
         if (!is_plain_record(entry)
-            || !integer(entry.sourceRow, MAX_SHEET_ROWS)
+            || !integer(entry.sourceRow, MAX_PENDING_ROW_INDEX)
             || !integer(entry.sourceCol, MAX_SHEET_COLUMNS)
-            || !integer(entry.destinationRow, MAX_SHEET_ROWS)
+            || !integer(entry.destinationRow, MAX_PENDING_ROW_INDEX)
             || !integer(entry.destinationCol, MAX_SHEET_COLUMNS)
             || !Number.isSafeInteger(entry.order) || (entry.order as number) < 0
             || (entry.sourceRowIdentity !== undefined
@@ -849,7 +849,7 @@ export function own_pending_structural_changes(value: {
             ])
             || !Number.isSafeInteger(basis.sourceRowCount)
             || (basis.sourceRowCount as number) < 0
-            || (basis.sourceRowCount as number) > MAX_SHEET_ROWS
+            || (basis.sourceRowCount as number) > MAX_PENDING_ROW_INDEX
             || (basis.provisionalStartRow !== undefined && (
                 !Number.isSafeInteger(basis.provisionalStartRow)
                 || (basis.provisionalStartRow as number) < 0
@@ -861,7 +861,7 @@ export function own_pending_structural_changes(value: {
                 || (basis.provisionalRowCount as number) > MAX_PENDING_APPENDED_ROWS
                 || ((basis.provisionalStartRow as number | undefined) !== undefined
                     && (basis.provisionalStartRow as number)
-                        + (basis.provisionalRowCount as number) > MAX_SHEET_ROWS)
+                        + (basis.provisionalRowCount as number) > MAX_PENDING_ROW_INDEX)
             ))
             || !Number.isSafeInteger(basis.columnCount)
             || (basis.columnCount as number) <= 0
@@ -967,7 +967,7 @@ export function own_pending_structural_changes(value: {
             || removal_ids.has(entry.appendHistoryId)
             || !Number.isSafeInteger(entry.sourceRow)
             || (entry.sourceRow as number) < 0
-            || (entry.sourceRow as number) >= MAX_SHEET_ROWS
+            || (entry.sourceRow as number) >= MAX_PENDING_ROW_INDEX
             || removal_rows.has(entry.sourceRow as number)
             || (entry.sourceRow as number) <= previous_removal_row
             || typeof entry.savedFingerprint !== 'string'

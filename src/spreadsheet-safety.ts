@@ -16,6 +16,29 @@ export const MAX_XLSX_FORMULA_CHARACTERS = 8_192;
 export const MAX_XLSX_FORMULA_XML_BYTES = MAX_XLSX_FORMULA_CHARACTERS * 8;
 export const MAX_CSV_ROWS = 1_000_000;
 
+/**
+ * The append row ceiling for a delimited source.
+ *
+ * `MAX_SHEET_ROWS` describes a workbook container: it is what
+ * `assert_safe_sheet_shape` enforces when an XLSX/XLS/DTA worksheet is opened.
+ * A CSV or TSV file never passes that gate — its size is governed by the host's
+ * lazy-load window (`MAX_CSV_ROWS`), which the "Load all rows" banner action
+ * lifts outright — so a delimited append must not borrow a ceiling from a
+ * format that is not involved.
+ */
+export const UNBOUNDED_SHEET_ROWS = Number.POSITIVE_INFINITY;
+
+/**
+ * The widest row index the pending-changes wire format admits.
+ *
+ * Row indices arriving from the webview are bounded to keep an untrusted
+ * payload sane, not to enforce a container's shape. `MAX_SHEET_ROWS` was doing
+ * both, which refused a legitimate append to a delimited source larger than a
+ * workbook may be. The format's own ceiling is applied where the format is
+ * known — see `append_row_ceiling_for` in the viewer controller.
+ */
+export const MAX_PENDING_ROW_INDEX = Number.MAX_SAFE_INTEGER;
+
 export interface WorkbookBudget {
     total_cells: number;
     total_formulas: number;

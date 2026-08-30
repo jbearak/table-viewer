@@ -21,6 +21,7 @@ import type { WorkbookSnapshot, WorkbookSnapshotIdentity } from '../viewer-snaps
 import { InvalidPersistedTransformError } from '../panel-core';
 import { sheet_cells, sheet_edits } from './pending-edits-helper';
 import { MAX_PENDING_APPENDED_ROWS } from '../pending-changes';
+import { MAX_SHEET_ROWS, UNBOUNDED_SHEET_ROWS } from '../spreadsheet-safety';
 
 const enc = new TextEncoder();
 const empty_authority: DurableFileAuthority = {
@@ -424,10 +425,14 @@ beforeEach(() => {
 });
 
 describe('CSV edit sessions', () => {
-    function sized_editing_profile(row_count: number): ViewerProfile {
+    function sized_editing_profile(
+        row_count: number,
+        append_row_ceiling: number = UNBOUNDED_SHEET_ROWS,
+    ): ViewerProfile {
         return {
             editing: true,
             plan_save: plan_csv_save,
+            append_row_ceiling,
             build_source: async () => new class extends StubSource {
                 override meta(): WorkbookMeta {
                     return {
@@ -459,11 +464,11 @@ describe('CSV edit sessions', () => {
         ));
     }
 
-    it('enforces the application row cap during host append admission', async () => {
+    it('enforces the workbook row ceiling during host append admission', async () => {
         const panel = open_csv_table(
             uri('/tmp/append-row-limit.csv'),
             state_store().store,
-            sized_editing_profile(1_000_000),
+            sized_editing_profile(MAX_SHEET_ROWS, MAX_SHEET_ROWS),
         );
         await panel.__receive({ type: 'ready' });
         await panel.__receive({ type: 'requestEditSession', requestId: 'edit' });
@@ -478,6 +483,59 @@ describe('CSV edit sessions', () => {
         });
         expect(append_result(panel, 'over-limit')).toMatchObject({ granted: false });
     });
+
+    // The workbook ceiling is enforced when a worksheet is opened, and a
+    // delimited file never passes that gate — so an oversized CSV must not be
+    // refused an append on a limit its format never had.
+    it('admits an append to a delimited source past the workbook row ceiling', async () => {
+        const panel = open_csv_table(
+            uri('/tmp/append-past-workbook-ceiling.csv'),
+            state_store().store,
+            sized_editing_profile(MAX_SHEET_ROWS + 5),
+        );
+        await panel.__receive({ type: 'ready' });
+        await panel.__receive({ type: 'requestEditSession', requestId: 'edit' });
+        const session = latest_edit_session_message(panel)!.editSessionId!;
+        await panel.__receive({
+            type: 'requestAppendRows',
+            requestId: 'past-ceiling',
+            editSessionId: session,
+            worksheet: { sheetIndex: 0, sheetName: 'Sheet1' },
+            sourceGeneration: initial_snapshot(panel).sourceGeneration,
+            count: 1,
+        });
+        const granted = append_result(panel, 'past-ceiling');
+        expect(granted?.granted, granted?.reason).toBe(true);
+        expect(granted?.rowIds).toHaveLength(1);
+    });
+
+    // The pending-row quota is a session product limit, not a format limit, so
+    // it survives the format-aware ceiling for delimited and workbook alike.
+    it.each([
+        ['delimited', UNBOUNDED_SHEET_ROWS],
+        ['workbook', MAX_SHEET_ROWS],
+    ] as const)(
+        'keeps the pending-row quota for a %s source',
+        async (_kind, ceiling) => {
+            const panel = open_csv_table(
+                uri(`/tmp/append-quota-${_kind}.csv`),
+                state_store().store,
+                sized_editing_profile(1, ceiling),
+            );
+            await panel.__receive({ type: 'ready' });
+            await panel.__receive({ type: 'requestEditSession', requestId: 'edit' });
+            const session = latest_edit_session_message(panel)!.editSessionId!;
+            await panel.__receive({
+                type: 'requestAppendRows',
+                requestId: 'over-quota',
+                editSessionId: session,
+                worksheet: { sheetIndex: 0, sheetName: 'Sheet1' },
+                sourceGeneration: initial_snapshot(panel).sourceGeneration,
+                count: MAX_PENDING_APPENDED_ROWS + 1,
+            });
+            expect(append_result(panel, 'over-quota')).toMatchObject({ granted: false });
+        },
+    );
 
     it('enforces the pending-row quota across the whole edit session', async () => {
         const panel = open_csv_table(
