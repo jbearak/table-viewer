@@ -112,6 +112,68 @@ describe('edit session registry', () => {
         expect(registry.formula_projection().moves.at(-1)?.order).toBe(66);
     });
 
+    it('updates one move contribution without walking a maximum-size dirty store', () => {
+        const { registry } = make_session_ref('session');
+        const store = registry.for_sheet(0);
+        store.install({ session_id: 'session' }, Object.fromEntries(
+            Array.from({ length: 10_000 }, (_unused, row) => [
+                `${row}:0`,
+                {
+                    value: `move-${row}`,
+                    base: 'old',
+                    movedFrom: { row, col: 1, order: row + 1 },
+                },
+            ]),
+        ));
+        let visited = 0;
+        const snapshot = store.snapshot;
+        store.snapshot = () => {
+            const entries = snapshot();
+            return new Proxy(entries, {
+                get: (target, property) => {
+                    if (property === Symbol.iterator) {
+                        return function* counted_entries() {
+                            for (const entry of target) {
+                                visited += 1;
+                                yield entry;
+                            }
+                        };
+                    }
+                    const value = Reflect.get(target, property, target);
+                    return typeof value === 'function' ? value.bind(target) : value;
+                },
+            });
+        };
+
+        store.commit('session', '9999:0', {
+            value: 'move-9999',
+            base: 'old',
+            movedFrom: { row: 9999, col: 1, order: 10_001 },
+        });
+
+        expect(visited).toBe(0);
+        expect(registry.formula_projection().moves.at(-1)?.order).toBe(10_001);
+    });
+
+    it('preserves store traversal order when incremental moves share an order', () => {
+        const { registry } = make_session_ref('session');
+        const earlier_store = registry.for_sheet(0);
+        registry.for_sheet(1).commit('session', '4:0', {
+            value: 'later sheet',
+            base: 'old',
+            movedFrom: { row: 1, col: 0, order: 7 },
+        });
+
+        earlier_store.commit('session', '3:0', {
+            value: 'earlier sheet',
+            base: 'old',
+            movedFrom: { row: 0, col: 0, order: 7 },
+        });
+
+        expect(registry.formula_projection().moves.map((move) => move.sheetIndex))
+            .toEqual([0, 1]);
+    });
+
     it('does not rescan an unchanged pending-row store when another sheet changes', () => {
         const { registry } = make_session_ref('session');
         const unchanged = registry.pending_rows_for_sheet(0);
@@ -159,6 +221,47 @@ describe('edit session registry', () => {
         expect(unchanged_snapshots).toBe(0);
         expect(registry.formula_projection().moves.map((move) => move.order))
             .toEqual([1, 2]);
+    });
+
+    it('does not resort every cached move after one pending-row metadata edit', () => {
+        const { registry } = make_session_ref('session');
+        const pending = registry.pending_rows_for_sheet(0);
+        pending.install({ session_id: 'session' }, {
+            formatTemplates: [{ id: 'plain', format: { kind: 'none' } }],
+            appendedRows: Array.from({ length: 1_000 }, (_unused, index) => ({
+                id: `pending-${index}`,
+                cells: {
+                    0: {
+                        value: `move-${index}`,
+                        movedFrom: { row: index, col: 1, order: index + 1 },
+                    },
+                },
+                formatTemplateId: 'plain',
+                createdOrder: index + 1,
+            })),
+            tailRemovals: [],
+            appendBasis: { sourceRowCount: 10, columnCount: 2, schemaFingerprint: 'schema' },
+            conflicts: [],
+        });
+        const sort = Array.prototype.sort;
+        let large_sorts = 0;
+        Array.prototype.sort = function counted_sort(compare) {
+            if (this.length === 1_000) large_sorts += 1;
+            return sort.call(this, compare);
+        };
+        try {
+            pending.set_hyperlink('session', 'pending-500', 0, {
+                kind: 'external',
+                target: 'https://example.com',
+            });
+        } finally {
+            Array.prototype.sort = sort;
+        }
+
+        // The pending-formula output still sorts once. Move projection adds no
+        // sheet-level or workbook-level sort for unchanged move provenance.
+        expect(large_sorts).toBe(1);
+        expect(registry.formula_projection().moves).toHaveLength(1_000);
     });
 
     it('refreshes cached moves when only move provenance changes', () => {

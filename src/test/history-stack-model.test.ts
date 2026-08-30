@@ -22,13 +22,17 @@ import {
     MAX_BARRIER_LABEL_LENGTH,
     peek_history,
     record_history_action,
+    rekey_committed_tail_removal_history,
     rekey_saved_appended_row_history,
     type HistoryAction,
     type HistoryBounds,
     type HistoryChange,
     type HistoryEntry,
     type HistoryStackState,
+    type SavedHistoryRowAssignment,
+    type SavedTailRemovalCommit,
 } from '../webview/history-stack-model';
+import type { PendingTailRemoval } from '../pending-changes';
 
 const SHEET: WorksheetTarget = { sheetIndex: 0, sheetName: 'Data', worksheetId: 'rId1' };
 const LINK = { kind: 'external', target: 'https://example.com/' } as const;
@@ -967,6 +971,126 @@ describe('rekeyed history bounds', () => {
 
         expect(bounded.redoStack.map((entry) => entry.action.label)).toEqual(['B', 'A']);
         expect(top(bounded, 'redo').action.label).toBe('A');
+    });
+
+    it('stops saved-row payload expansion at the hard bound', () => {
+        const rows = Array.from({ length: 10_000 }, (_unused, index) => ({
+            id: `pending-${index}`,
+            cells: {},
+            formatTemplateId: 'plain',
+            createdOrder: index + 1,
+        }));
+        const recorded = record_history_action(empty_history_stack(), {
+            label: 'Discard changes',
+            changes: [{
+                kind: 'pendingRows',
+                delta: {
+                    worksheet: SHEET,
+                    before: {
+                        formatTemplates: [{ id: 'plain', format: { kind: 'none' } }],
+                        appendedRows: rows,
+                        tailRemovals: [],
+                        conflicts: [],
+                    },
+                    after: {
+                        formatTemplates: [],
+                        appendedRows: [],
+                        tailRemovals: [],
+                        conflicts: [],
+                    },
+                },
+            }],
+        });
+        if (recorded.kind !== 'recorded') throw new Error('Expected pending-row history');
+        let saved_row_reads = 0;
+        const assignments = rows.map((row, sourceRow) => Object.defineProperty({
+            worksheet: SHEET,
+            pendingRowId: row.id,
+            sourceRow,
+            savedFingerprint: `fingerprint-${sourceRow}`,
+        }, 'savedRow', {
+            enumerable: true,
+            get: () => {
+                saved_row_reads += 1;
+                return { cells: {}, format: { kind: 'none' as const } };
+            },
+        }) as SavedHistoryRowAssignment);
+        const tiny: HistoryBounds = {
+            maxActions: 100,
+            maxCells: 1_000_000,
+            softMaxBytes: 1,
+            hardMaxBytes: 1,
+        };
+
+        const rekeyed = rekey_saved_appended_row_history(recorded.state, assignments, tiny);
+
+        expect(rekeyed.barrier?.reason).toBe('action-too-large');
+        expect(saved_row_reads).toBeLessThanOrEqual(1);
+    });
+
+    it('indexes committed removals once and refuses before reading saved payloads', () => {
+        const removals: PendingTailRemoval[] = Array.from(
+            { length: 1_000 },
+            (_unused, index) => ({
+                appendHistoryId: `saved-${index}`,
+                sourceRow: index,
+                savedFingerprint: `fingerprint-${index}`,
+                savedRow: { cells: {}, format: { kind: 'none' } },
+            }),
+        );
+        const recorded = record_history_action(empty_history_stack(), {
+            label: 'Remove appended rows',
+            changes: removals.map((removal, index) => ({
+                kind: 'tailRemoval' as const,
+                delta: {
+                    worksheet: SHEET,
+                    appendHistoryId: removal.appendHistoryId,
+                    before: removal,
+                    after: null,
+                    beforeIndex: index,
+                    afterIndex: null,
+                },
+            })),
+        });
+        if (recorded.kind !== 'recorded') throw new Error('Expected removal history');
+        let key_reads = 0;
+        let saved_row_reads = 0;
+        const committed = removals.map((plain) => {
+            const removal = Object.defineProperties({}, {
+                appendHistoryId: {
+                    enumerable: true,
+                    get: () => { key_reads += 1; return plain.appendHistoryId; },
+                },
+                sourceRow: {
+                    enumerable: true,
+                    get: () => { key_reads += 1; return plain.sourceRow; },
+                },
+                savedFingerprint: { enumerable: true, value: plain.savedFingerprint },
+                savedRow: {
+                    enumerable: true,
+                    get: () => { saved_row_reads += 1; return plain.savedRow; },
+                },
+            }) as PendingTailRemoval;
+            return Object.defineProperties({}, {
+                worksheet: {
+                    enumerable: true,
+                    get: () => { key_reads += 1; return SHEET; },
+                },
+                removal: { enumerable: true, value: removal },
+            }) as SavedTailRemovalCommit;
+        });
+        const tiny: HistoryBounds = {
+            maxActions: 100,
+            maxCells: 1_000_000,
+            softMaxBytes: 1,
+            hardMaxBytes: 1,
+        };
+
+        const rekeyed = rekey_committed_tail_removal_history(recorded.state, committed, tiny);
+
+        expect(rekeyed.barrier?.reason).toBe('action-too-large');
+        expect(key_reads).toBe(3_000);
+        expect(saved_row_reads).toBe(0);
     });
 });
 

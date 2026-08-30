@@ -97,7 +97,7 @@ export interface EditSessionIdentity {
 
 /** Formula-input delta carried with the ordinary store notification. */
 export type EditSessionFormulaChange =
-    | { readonly kind: 'none' }
+    | { readonly kind: 'none'; readonly key?: string }
     | {
         readonly kind: 'entry';
         readonly key: string;
@@ -555,7 +555,7 @@ export function create_edit_session_store(
             const next = new Map(state.entries);
             next.set(key, copied);
             set_entries(next, state.pending_base, false, formula_inputs_equal(previous, value)
-                ? { kind: 'none' }
+                ? { kind: 'none', key }
                 : { kind: 'entry', key, previous, value });
         },
         remove: (session_id, key) => {
