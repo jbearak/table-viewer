@@ -2,7 +2,12 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 /**
  * The guided row composer: a `Compose row…` button that mounts into the append
- * dock's action row and the form panel it opens above the dock.
+ * dock's action row and the form panel it opens in the dock's place.
+ *
+ * Its open state is controlled by the shell rather than held here, because the
+ * dock hides its own quick-add controls while the composer is up. Two `add`
+ * buttons visible at once — one staging blank rows, one staging the composed
+ * values — read as alternatives to each other when they are not related at all.
  *
  * It exists for wide tables. Typing a row directly into the grid means
  * scrolling horizontally and losing sight of the column names; the composer
@@ -46,6 +51,9 @@ export interface AppendComposerProps {
     readonly remaining_capacity: number;
     /** An append reservation is outstanding; the composer waits it out. */
     readonly busy?: boolean;
+    /** Whether the form panel is up. Owned by the shell — see the note above. */
+    readonly open: boolean;
+    readonly on_open_change: (open: boolean) => void;
     /**
      * Stage the composed rows as one gesture. Resolves `true` once they are in
      * the pending band, `false` if admission refused — a refusal keeps the
@@ -75,9 +83,10 @@ export function AppendComposer({
     on_draft_change,
     remaining_capacity,
     busy = false,
+    open,
+    on_open_change,
     on_stage_rows,
 }: AppendComposerProps): React.ReactElement {
-    const [open, set_open] = useState(false);
     const [staging, set_staging] = useState(false);
     const launcher_ref = useRef<HTMLButtonElement>(null);
     const first_field_ref = useRef<HTMLInputElement>(null);
@@ -88,9 +97,16 @@ export function AppendComposer({
     );
 
     const close = useCallback(() => {
-        set_open(false);
+        on_open_change(false);
+        // Null when the whole dock closed underneath us, which focuses its own
+        // launcher instead.
         launcher_ref.current?.focus();
-    }, []);
+    }, [on_open_change]);
+
+    // The dock unmounts this component when it closes, and a closed dock has no
+    // composer showing. Without this, reopening the dock would spring the panel
+    // back up on a surface the user asked to put away.
+    useEffect(() => () => { on_open_change(false); }, [on_open_change]);
 
     useEffect(() => {
         if (open) first_field_ref.current?.focus();
@@ -117,12 +133,12 @@ export function AppendComposer({
                 // Staging consumes the draft and moves focus into the grid, so
                 // the composer has nothing left to hold.
                 on_draft_change(EMPTY_APPEND_COMPOSER_DRAFT);
-                set_open(false);
+                on_open_change(false);
             }
         } finally {
             set_staging(false);
         }
-    }, [in_flight, on_draft_change, on_stage_rows, rows, satisfiable]);
+    }, [in_flight, on_draft_change, on_open_change, on_stage_rows, rows, satisfiable]);
 
     const stage_label = rows.length === 1 ? 'Stage row' : `Stage ${rows.length} rows`;
 
@@ -141,7 +157,7 @@ export function AppendComposer({
                 type="button"
                 className="append-composer-launcher"
                 aria-expanded={open}
-                onClick={() => { set_open((was_open) => !was_open); }}
+                onClick={() => { on_open_change(!open); }}
             >
                 Compose row…
             </button>

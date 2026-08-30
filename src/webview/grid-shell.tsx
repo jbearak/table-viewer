@@ -3915,6 +3915,9 @@ export function GridShell({
     const [composer_draft, set_composer_draft] = useState<AppendComposerDraft>(
         EMPTY_APPEND_COMPOSER_DRAFT,
     );
+    // Which append surface is showing. The shell owns it because the dock has
+    // to stand its quick-add controls down while the composer is up.
+    const [composer_open, set_composer_open] = useState(false);
     /**
      * Labels for the composer's fields — the same titles the grid header
      * paints, so a field is identifiable by the column the user can see.
@@ -8105,6 +8108,7 @@ export function GridShell({
                     remaining_capacity={remaining_append_capacity}
                     busy={append_in_flight}
                     on_add_rows={add_rows_from_dock}
+                    secondary_open={composer_open}
                     secondary_actions={(
                         <AppendComposer
                             column_labels={composer_column_labels}
@@ -8112,6 +8116,8 @@ export function GridShell({
                             on_draft_change={set_composer_draft}
                             remaining_capacity={remaining_append_capacity}
                             busy={append_in_flight}
+                            open={composer_open}
+                            on_open_change={set_composer_open}
                             on_stage_rows={stage_composed_rows}
                         />
                     )}

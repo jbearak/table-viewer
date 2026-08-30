@@ -35,6 +35,12 @@ export interface AppendDockProps {
      * composer mounts its `Compose row…` button here.
      */
     readonly secondary_actions?: React.ReactNode;
+    /**
+     * A secondary surface has taken the dock over, so quick add stands down.
+     * Showing both at once puts two unrelated `add` buttons on screen together,
+     * which reads as a choice between them rather than as two separate tasks.
+     */
+    readonly secondary_open?: boolean;
 }
 
 const clamp_count = (value: number, capacity: number): number =>
@@ -45,6 +51,7 @@ export function AppendDock({
     busy = false,
     on_add_rows,
     secondary_actions,
+    secondary_open = false,
 }: AppendDockProps): React.ReactElement {
     const [open, set_open] = useState(false);
     const [count, set_count] = useState(1);
@@ -68,6 +75,9 @@ export function AppendDock({
         set_open((was_open) => !was_open);
     }, []);
 
+    // Keyed on the dock's own opening only. Keying it on `secondary_open` too
+    // would steal focus back to the count field the moment the composer closed,
+    // instead of leaving it on the button that opened the composer.
     useEffect(() => {
         if (open) count_ref.current?.focus();
     }, [open]);
@@ -105,6 +115,8 @@ export function AppendDock({
                     role="group"
                     aria-label="Add rows to the end of this worksheet"
                 >
+                    {!secondary_open && (
+                        <>
                     <label className="append-dock-count-label" htmlFor="append-dock-count">
                         Rows
                     </label>
@@ -133,8 +145,10 @@ export function AppendDock({
                     >
                         {in_flight ? 'Adding…' : add_label}
                     </button>
+                        </>
+                    )}
                     {secondary_actions}
-                    {count >= remaining_capacity && (
+                    {!secondary_open && count >= remaining_capacity && (
                         <span className="append-dock-capacity" role="status">
                             {remaining_capacity === 1
                                 ? 'Room for 1 more row.'

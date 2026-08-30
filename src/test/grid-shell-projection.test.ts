@@ -7083,6 +7083,27 @@ describe('GridShell append composer', () => {
         expect(pending.snapshot().appendedRows[0].cells[0]?.value).toBe('=SUM(A1:A2)');
     });
 
+    it('stands the quick-add controls down while the composer is open', async () => {
+        await render_grid(composer_props({
+            pending_row_store: create_pending_row_store({ session_id: 'session-1' }),
+        }));
+        await act(async () => {
+            (document.querySelector('.append-dock-launcher') as HTMLButtonElement).click();
+        });
+        expect(document.getElementById('append-dock-count')).not.toBeNull();
+
+        await act(async () => { button('Compose row…').click(); });
+        // Two `add` buttons at once read as alternatives to each other, when in
+        // fact quick add has nothing to do with the composed values.
+        expect(document.getElementById('append-dock-count')).toBeNull();
+        expect(document.querySelector('.append-dock-add')).toBeNull();
+        expect(button('Compose row…')).not.toBeNull();
+
+        await act(async () => { button('Close').click(); });
+        expect(document.getElementById('append-dock-count')).not.toBeNull();
+        expect(document.querySelector('.append-dock-add')).not.toBeNull();
+    });
+
     it('keeps an un-staged draft across close and reopen, and returns focus', async () => {
         await render_grid(composer_props({
             pending_row_store: create_pending_row_store({ session_id: 'session-1' }),
