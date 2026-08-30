@@ -395,11 +395,14 @@ export function create_edit_session_store(
     let state = normalize(edits) ?? { entries: new Map<string, DirtyEntry>(), pending_base: false };
     let next_entry_order = 0;
     const reset_entry_orders = (entries: Map<string, DirtyEntry>): void => {
-        next_entry_order = 0;
+        let order = 0;
         for (const entry of entries.values()) {
-            with_dirty_entry_insertion_order(entry, next_entry_order);
-            next_entry_order += 1;
+            with_dirty_entry_insertion_order(entry, order);
+            order += 1;
         }
+        // A value-equal reconcile keeps the existing map. Never reuse one of
+        // its possibly gapped ranks if the freshly ranked candidate is dropped.
+        next_entry_order = Math.max(next_entry_order, order);
     };
     const preserve_entry_order = (key: string, entry: DirtyEntry): DirtyEntry => {
         const order = dirty_entry_insertion_order(state.entries.get(key)) ?? next_entry_order++;

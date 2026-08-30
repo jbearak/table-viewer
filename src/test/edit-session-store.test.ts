@@ -27,6 +27,24 @@ function count_notifications(store: ReturnType<typeof create_edit_session_store>
 }
 
 describe('edit session store', () => {
+    it('does not reuse a live insertion rank after a value-equal reconcile', () => {
+        const store = create_edit_session_store({ session_id: 'session' });
+        store.commit('session', '0:0', { value: 'A', base: 'old' });
+        store.commit('session', '1:0', { value: 'B', base: 'old' });
+        store.commit('session', '2:0', { value: 'C', base: 'old' });
+        store.remove('session', '1:0');
+        store.reconcile(
+            { session_id: 'session' },
+            Object.fromEntries(store.snapshot()),
+        );
+
+        store.commit('session', '3:0', { value: 'D', base: 'old' });
+
+        expect(store.insertion_order('3:0')).toBeGreaterThan(
+            store.insertion_order('2:0') ?? -1,
+        );
+    });
+
     it('install replaces the map and stamps the identity', () => {
         const store = create_edit_session_store(
             { session_id: 'first' },
