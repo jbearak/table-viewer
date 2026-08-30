@@ -189,6 +189,11 @@ import {
     type RowResizeOverlayHandle,
 } from './row-resize-overlay';
 import { AppendDock } from './append-dock';
+import {
+    AppendComposer,
+    EMPTY_APPEND_COMPOSER_DRAFT,
+    type AppendComposerDraft,
+} from './append-composer';
 import { row_boundary_hit } from './row-resize-model';
 import { read_overlay_editor_value } from './live-editor';
 
@@ -3826,6 +3831,97 @@ export function GridShell({
     const add_rows_from_dock = useCallback(
         (count: number): Promise<boolean> => append_and_focus_rows(count, 0),
         [append_and_focus_rows],
+    );
+    /**
+     * The composer's staging path — quick add's sibling, with cell values.
+     *
+     * It appends through the same `admit_pending_rows` (there is exactly one
+     * append path) with history suppressed, seeds the composed values, and
+     * records a single gesture spanning both. Suppressing and re-recording is
+     * what keeps one staging gesture at one history entry: an append entry
+     * followed by an edit entry would take two undos to unwind what the user
+     * did once.
+     *
+     * Values are built the way `commit_pending_live_edit` builds them, so a
+     * field starting with `=` stages exactly as that text typed into a cell —
+     * there is no formula path of the composer's own.
+     */
+    const stage_composed_rows = useCallback(async (
+        rows: readonly (readonly string[])[],
+    ): Promise<boolean> => {
+        if (rows.length === 0) return false;
+        const appended = await admit_pending_rows(rows.length, false);
+        if (appended === undefined) return false;
+        const edits: {
+            readonly pendingRowId: string;
+            readonly sourceColumn: number;
+            readonly cell: PendingRowCell | undefined;
+        }[] = [];
+        rows.forEach((values, row_index) => {
+            const pending_row_id = appended.rowIds[row_index];
+            if (pending_row_id === undefined) return;
+            values.forEach((raw, display_column) => {
+                const source_column = visible_source_columns[display_column];
+                if (source_column === undefined) return;
+                const parsed = parse_cell_edit(raw, edit_syntax);
+                // A blank field is not an edit: appended rows start empty, so
+                // writing `undefined` would only churn the envelope.
+                if (parsed.text === '' && parsed.rich === undefined) return;
+                edits.push({
+                    pendingRowId: pending_row_id,
+                    sourceColumn: source_column,
+                    cell: {
+                        value: parsed.text,
+                        ...(parsed.rich === undefined ? {} : { valueRuns: parsed.rich }),
+                        valueEditOrder: issue_value_edit_order(),
+                        ...(edit_syntax === 'markdown'
+                            && formula_reference_bases !== undefined
+                            && xlsx_edit_writes_formula(parsed.text, parsed.rich?.runs)
+                            ? { formulaReferenceBases: formula_reference_bases(parsed.text) }
+                            : {}),
+                    },
+                });
+            });
+        });
+        if (edits.length > 0 && !pending_store.set_cells(edit_session_id, edits)) {
+            // The rows themselves are staged and stay staged; only the values
+            // were refused, so the gesture below still has something to record.
+            host_bridge.postMessage({
+                type: 'showWarning',
+                message: 'The composed values are too large to keep as pending changes.',
+            });
+        }
+        record_pending_row_gesture(
+            rows.length === 1 ? 'Compose row' : `Compose ${rows.length} rows`,
+            appended.before,
+            pending_store.snapshot(),
+        );
+        const display_row = await pending_display_row(appended.rowIds[0]);
+        if (display_row === undefined) return true;
+        select_active_display_cell_ref.current([0, display_row]);
+        focus_grid_ref.current();
+        return true;
+    }, [
+        admit_pending_rows,
+        edit_session_id,
+        edit_syntax,
+        formula_reference_bases,
+        issue_value_edit_order,
+        pending_display_row,
+        pending_store,
+        record_pending_row_gesture,
+        visible_source_columns,
+    ]);
+    const [composer_draft, set_composer_draft] = useState<AppendComposerDraft>(
+        EMPTY_APPEND_COMPOSER_DRAFT,
+    );
+    /**
+     * Labels for the composer's fields — the same titles the grid header
+     * paints, so a field is identifiable by the column the user can see.
+     */
+    const composer_column_labels = useMemo(
+        () => columns.map((column) => column.title),
+        [columns],
     );
     const may_append_rows_ref = useRef(may_append_rows);
     may_append_rows_ref.current = may_append_rows;
@@ -8009,6 +8105,16 @@ export function GridShell({
                     remaining_capacity={remaining_append_capacity}
                     busy={append_in_flight}
                     on_add_rows={add_rows_from_dock}
+                    secondary_actions={(
+                        <AppendComposer
+                            column_labels={composer_column_labels}
+                            draft={composer_draft}
+                            on_draft_change={set_composer_draft}
+                            remaining_capacity={remaining_append_capacity}
+                            busy={append_in_flight}
+                            on_stage_rows={stage_composed_rows}
+                        />
+                    )}
                 />
             )}
             {append_in_flight && (

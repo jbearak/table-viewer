@@ -6940,6 +6940,171 @@ describe('GridShell append dock', () => {
     });
 });
 
+// The composer is an input method on the same append path: it collects text
+// against the visible column names and hands it to the same pending band quick
+// add stages into.
+describe('GridShell append composer', () => {
+    function admit_immediately(prefix = 'host-row') {
+        let issued = 0;
+        return vi.fn(async (count: number) => ({
+            rowIds: Array.from(
+                { length: count },
+                () => `${prefix}-${(issued += 1)}`,
+            ),
+            formatTemplate: { id: 'plain', format: { kind: 'none' as const } },
+            appendBasis: {
+                sourceRowCount: 1,
+                provisionalStartRow: 1,
+                columnCount: 3,
+                schemaFingerprint: 'schema',
+            },
+            settle: () => {},
+        }));
+    }
+
+    function composer_props(overrides: Partial<GridShellProps> = {}) {
+        return props({
+            edit_mode: true,
+            edit_activation_id: 1,
+            csv_editable: true,
+            edit_session_id: 'session-1',
+            on_append_rows: admit_immediately(),
+            ...overrides,
+        });
+    }
+
+    async function open_composer(): Promise<void> {
+        await act(async () => {
+            (document.querySelector('.append-dock-launcher') as HTMLButtonElement).click();
+        });
+        await act(async () => { button('Compose row…').click(); });
+    }
+
+    function field_labels(): string[] {
+        return Array.from(document.querySelectorAll('.append-composer-field > label'))
+            .map((label) => label.textContent ?? '');
+    }
+
+    it('offers one labeled field per visible column and nothing for hidden ones', async () => {
+        await render_grid(composer_props({
+            pending_row_store: create_pending_row_store({ session_id: 'session-1' }),
+        }));
+        await open_composer();
+
+        // The default projection hides source column 1.
+        expect(field_labels()).toEqual(['A name', 'C name']);
+        expect(document.querySelector('.append-composer-panel')?.getAttribute('aria-label'))
+            .toBe('Compose a row from the visible columns');
+        // Every field is a real label/control pair, and the first one has focus.
+        for (const label of document.querySelectorAll<HTMLLabelElement>(
+            '.append-composer-field > label',
+        )) {
+            expect(document.getElementById(label.htmlFor)).not.toBeNull();
+        }
+        expect(document.activeElement).toBe(field('append-composer-0-0'));
+    });
+
+    it('stages the composed values into the pending band as one history entry', async () => {
+        const history = create_history_store();
+        const pending = create_pending_row_store({ session_id: 'session-1' });
+        await render_grid(composer_props({
+            pending_row_store: pending,
+            history_store: history,
+        }));
+        await open_composer();
+        await act(async () => set_input_value(
+            field('append-composer-0-0') as HTMLInputElement,
+            'left',
+        ));
+        await act(async () => set_input_value(
+            field('append-composer-0-1') as HTMLInputElement,
+            'right',
+        ));
+        await act(async () => { button('Stage row').click(); });
+        await vi.waitUntil(() => pending.snapshot().appendedRows.length === 1);
+
+        const [row] = pending.snapshot().appendedRows;
+        // Display column 1 is source column 2; the hidden column stages blank.
+        expect(row.cells[0]?.value).toBe('left');
+        expect(row.cells[1]).toBeUndefined();
+        expect(row.cells[2]?.value).toBe('right');
+        // One staging gesture, one entry: the append and its values undo together.
+        expect(history.snapshot().undoStack.map((entry) => entry.action.label))
+            .toEqual(['Compose row']);
+        // Focus followed the rows into the grid, as quick add does.
+        await vi.waitUntil(() => (grid_mock.props!.gridSelection as {
+            current?: { cell: [number, number] };
+        }).current !== undefined);
+        expect((grid_mock.props!.gridSelection as {
+            current?: { cell: [number, number] };
+        }).current?.cell).toEqual([0, 1]);
+    });
+
+    it('stages a batch composed with Add another row as one gesture', async () => {
+        const history = create_history_store();
+        const pending = create_pending_row_store({ session_id: 'session-1' });
+        await render_grid(composer_props({
+            pending_row_store: pending,
+            history_store: history,
+        }));
+        await open_composer();
+        await act(async () => set_input_value(
+            field('append-composer-0-0') as HTMLInputElement,
+            'first',
+        ));
+        await act(async () => { button('Add another row').click(); });
+        await act(async () => set_input_value(
+            field('append-composer-1-0') as HTMLInputElement,
+            'second',
+        ));
+        await act(async () => { button('Stage 2 rows').click(); });
+        await vi.waitUntil(() => pending.snapshot().appendedRows.length === 2);
+
+        expect(pending.snapshot().appendedRows.map((row) => row.cells[0]?.value))
+            .toEqual(['first', 'second']);
+        expect(history.snapshot().undoStack.map((entry) => entry.action.label))
+            .toEqual(['Compose 2 rows']);
+    });
+
+    it('stages a leading-equals field as the text a cell edit would produce', async () => {
+        const pending = create_pending_row_store({ session_id: 'session-1' });
+        await render_grid(composer_props({
+            pending_row_store: pending,
+        }));
+        await open_composer();
+        await act(async () => set_input_value(
+            field('append-composer-0-0') as HTMLInputElement,
+            '=SUM(A1:A2)',
+        ));
+        await act(async () => { button('Stage row').click(); });
+        await vi.waitUntil(() => pending.snapshot().appendedRows.length === 1);
+
+        // No formula path of the composer's own: the same text, verbatim.
+        expect(pending.snapshot().appendedRows[0].cells[0]?.value).toBe('=SUM(A1:A2)');
+    });
+
+    it('keeps an un-staged draft across close and reopen, and returns focus', async () => {
+        await render_grid(composer_props({
+            pending_row_store: create_pending_row_store({ session_id: 'session-1' }),
+        }));
+        await open_composer();
+        await act(async () => set_input_value(
+            field('append-composer-0-0') as HTMLInputElement,
+            'held',
+        ));
+        const launcher = button('Compose row…');
+        await act(async () => { button('Close').click(); });
+        expect(document.querySelector('.append-composer-panel')).toBeNull();
+        // Dismiss returns focus to the control that opened the composer, and
+        // the dock is still open beneath it.
+        expect(document.activeElement).toBe(launcher);
+        expect(document.getElementById('append-dock-count')).not.toBeNull();
+
+        await act(async () => { button('Compose row…').click(); });
+        expect((field('append-composer-0-0') as HTMLInputElement).value).toBe('held');
+    });
+});
+
 describe('GridShell history capture', () => {
     function capture_props(history_store: HistoryStore, overrides: Partial<GridShellProps> = {}) {
         return props({
