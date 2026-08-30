@@ -177,6 +177,35 @@ describe('append row-format capture', () => {
         expect(() => capture_xlsx_append_row_format(raw, 0, 3, 4, 2))
             .toThrow('The append format row contains an invalid style');
     });
+
+    it.each(['', '0x1', '1e2'])(
+        'rejects the coercible non-decimal cell style index %j',
+        (style) => {
+            const raw = patched_basic([[
+                '/xl/worksheets/sheet1.xml',
+                '<c r="D2" s="1">',
+                `<c r="D2" s="${style}">`,
+            ]]);
+
+            expect(() => capture_xlsx_append_row_format(raw, 0, 3, 4, 2))
+                .toThrow('The append format row contains an invalid style');
+        },
+    );
+
+    it.each(['', '0x1', '1e2'])(
+        'rejects the coercible non-decimal row style index %j',
+        (style) => {
+            const raw = patched_basic([[
+                '/xl/worksheets/sheet1.xml',
+                '<row r="2" spans="1:4" x14ac:dyDescent="0.25">',
+                '<row r="2" spans="1:4" x14ac:dyDescent="0.25" '
+                    + `s="${style}" customFormat="1">`,
+            ]]);
+
+            expect(() => capture_xlsx_append_row_format(raw, 0, 3, 4, 2))
+                .toThrow('The append format row contains an invalid row style');
+        },
+    );
 });
 
 describe('iso_to_serial', () => {

@@ -344,6 +344,13 @@ export function create_xlsx_append_style_dependency_fingerprinter(
     };
 }
 
+function parse_append_style_index(raw: string, message: string): number {
+    if (!/^[0-9]+$/.test(raw)) throw new Error(message);
+    const parsed = Number(raw);
+    if (!Number.isSafeInteger(parsed)) throw new Error(message);
+    return parsed;
+}
+
 /**
  * Capture the exact presentation dependency for rows admitted at the physical
  * worksheet tail. This reads the verified package, never the paged DataSource,
@@ -407,10 +414,10 @@ export function capture_xlsx_append_row_format(
                 seen_columns.add(col);
                 const raw_style = get_tag_attr(xml, cell.start, cell.inner_start, 's');
                 if (raw_style === null) return;
-                const style = Number(raw_style);
-                if (!Number.isSafeInteger(style) || style < 0) {
-                    throw new Error('The append format row contains an invalid style');
-                }
+                const style = parse_append_style_index(
+                    raw_style,
+                    'The append format row contains an invalid style',
+                );
                 cellStyleIndexes[col] = style;
             },
         });
@@ -437,10 +444,10 @@ export function capture_xlsx_append_row_format(
             const custom_format = boolean_attribute('customFormat');
             const raw_row_style = get_tag_attr(xml, owner.start, owner.inner_start, 's');
             if (raw_row_style !== null) {
-                const parsed = Number(raw_row_style);
-                if (!Number.isSafeInteger(parsed) || parsed < 0) {
-                    throw new Error('The append format row contains an invalid row style');
-                }
+                const parsed = parse_append_style_index(
+                    raw_row_style,
+                    'The append format row contains an invalid row style',
+                );
                 if (custom_format) rowStyleIndex = parsed;
             } else if (custom_format) {
                 rowStyleIndex = 0;
