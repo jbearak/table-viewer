@@ -727,8 +727,11 @@ body.vscode-high-contrast-light .toolbar-split-caret.open {
    Glide's horizontal scrollbar so the launcher never sits on top of it. */
 .append-dock {
     position: absolute;
-    left: 8px;
-    bottom: 20px;
+    /* One inset on both axes: the launcher is a corner control, and matching
+       the horizontal and vertical gaps is what makes it read as sitting in the
+       corner rather than floating near it. */
+    left: var(--append-dock-inset, 8px);
+    bottom: var(--append-dock-inset, 8px);
     z-index: 3;
     display: flex;
     flex-direction: column;
@@ -746,7 +749,14 @@ body.vscode-high-contrast-light .toolbar-split-caret.open {
     height: 32px;
     border-radius: 50%;
     border: 1px solid var(--vscode-button-border, transparent);
-    background: var(--vscode-button-background, #0e639c);
+    /* Semitransparent so the rows it overlays stay readable underneath, with a
+       blur behind it so the glyph keeps its contrast over dense data. */
+    background: color-mix(
+        in srgb,
+        var(--vscode-button-background, #0e639c) 82%,
+        transparent
+    );
+    backdrop-filter: blur(3px);
     color: var(--vscode-button-foreground, #fff);
     font-size: 20px;
     line-height: 1;
@@ -757,7 +767,10 @@ body.vscode-high-contrast-light .toolbar-split-caret.open {
     box-shadow: 0 2px 6px rgba(0, 0, 0, 0.35);
 }
 
-.append-dock-launcher:hover {
+/* Opaque on hover and while open: a control the pointer is on, or one holding
+   a panel open, should not look tentative. */
+.append-dock-launcher:hover,
+.append-dock-launcher.is-open {
     background: var(--vscode-button-hoverBackground, #1177bb);
 }
 
