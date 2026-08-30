@@ -878,6 +878,30 @@ describe('edit session store', () => {
     });
 
     describe('stage_writes', () => {
+        it('keeps staged insertion ranks aligned with Map order', () => {
+            const store = create_edit_session_store({ session_id: 's' });
+            const staged = store.stage_writes('s', [
+                { key: '0:0', entry: { value: 'A1', base: 'old' } },
+                { key: '1:0', entry: { value: 'B', base: 'old' } },
+                { key: '0:0', entry: { value: 'A2', base: 'old' } },
+            ]);
+            staged?.commit();
+
+            expect(store.insertion_order('0:0')).toBeLessThan(
+                store.insertion_order('1:0') ?? -1,
+            );
+
+            const reordered = store.stage_writes('s', [
+                { key: '0:0', entry: undefined },
+                { key: '0:0', entry: { value: 'A3', base: 'old' } },
+            ]);
+            reordered?.commit();
+
+            expect(store.insertion_order('0:0')).toBeGreaterThan(
+                store.insertion_order('1:0') ?? Number.MAX_SAFE_INTEGER,
+            );
+        });
+
         it('does not publish until the commit', () => {
             const store = create_edit_session_store({ session_id: 's' }, {});
             const notifications = count_notifications(store);

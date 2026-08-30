@@ -404,10 +404,15 @@ export function create_edit_session_store(
         // its possibly gapped ranks if the freshly ranked candidate is dropped.
         next_entry_order = Math.max(next_entry_order, order);
     };
-    const preserve_entry_order = (key: string, entry: DirtyEntry): DirtyEntry => {
-        const order = dirty_entry_insertion_order(state.entries.get(key)) ?? next_entry_order++;
+    const preserve_order_from = (
+        entry: DirtyEntry,
+        previous: DirtyEntry | undefined,
+    ): DirtyEntry => {
+        const order = dirty_entry_insertion_order(previous) ?? next_entry_order++;
         return with_dirty_entry_insertion_order(entry, order);
     };
+    const preserve_entry_order = (key: string, entry: DirtyEntry): DirtyEntry =>
+        preserve_order_from(entry, state.entries.get(key));
     reset_entry_orders(state.entries);
     let write_validator: {
         readonly validate: (entries: ReadonlyMap<string, DirtyEntry>) => boolean;
@@ -490,9 +495,9 @@ export function create_edit_session_store(
             // `copy_dirty_entry` rebuilds only the wire fields, so the flag is
             // carried across explicitly.
             const copied = copy_dirty_entry(entry);
-            entries.set(key, preserve_entry_order(
-                key,
+            entries.set(key, preserve_order_from(
                 entry.base_pending ? { ...copied, base_pending: true } : copied,
+                entries.get(key),
             ));
         }
         // Recomputed over the whole map, in BOTH directions. A replay adds and
