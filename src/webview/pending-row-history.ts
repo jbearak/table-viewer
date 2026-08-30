@@ -75,11 +75,17 @@ function with_row(
     ]));
     for (const template of templates) template_by_id.set(template.id, template);
     const used = new Set(rows.map((candidate) => candidate.formatTemplateId));
-    return own_pending_structural_changes({
-        ...changes,
-        appendedRows: rows,
-        formatTemplates: [...template_by_id.values()].filter((template) => used.has(template.id)),
-    });
+    try {
+        return own_pending_structural_changes({
+            ...changes,
+            appendedRows: rows,
+            formatTemplates: [...template_by_id.values()].filter(
+                (template) => used.has(template.id),
+            ),
+        });
+    } catch {
+        return undefined;
+    }
 }
 
 function with_removal(
@@ -103,7 +109,11 @@ function with_removal(
         if (resolved_index < 0 || resolved_index > removals.length) return undefined;
         removals.splice(resolved_index, 0, removal);
     }
-    return own_pending_structural_changes({ ...changes, tailRemovals: removals });
+    try {
+        return own_pending_structural_changes({ ...changes, tailRemovals: removals });
+    } catch {
+        return undefined;
+    }
 }
 
 /** Plan the structural arm of an action without mutating any worksheet store. */

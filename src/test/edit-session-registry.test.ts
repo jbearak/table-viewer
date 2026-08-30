@@ -239,6 +239,36 @@ describe('edit session registry', () => {
         }]);
     });
 
+    it('omits pending-row moves until their physical start is known', () => {
+        const { registry } = make_session_ref('session');
+        const pending = registry.pending_rows_for_sheet(0);
+        pending.append_rows(
+            'session',
+            ['source', 'destination'],
+            { id: 'plain', format: { kind: 'none' } },
+            1,
+        );
+        pending.set_cell('session', 'destination', 1, {
+            value: 'moved',
+            movedFrom: {
+                row: 0,
+                col: 0,
+                order: 7,
+                rowIdentity: { kind: 'pending', pendingRowId: 'source' },
+            },
+        });
+
+        expect(registry.formula_projection().moves).toEqual([]);
+        expect(registry.formula_projection([10]).moves).toEqual([{
+            sheetIndex: 0,
+            sourceRow: 10,
+            sourceColumn: 0,
+            destinationRow: 11,
+            destinationColumn: 1,
+            order: 7,
+        }]);
+    });
+
     it('keeps an earlier formula projection stable after a later edit', () => {
         const { registry } = make_session_ref('session');
         const store = registry.for_sheet(0);

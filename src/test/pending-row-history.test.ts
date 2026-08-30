@@ -185,6 +185,19 @@ describe('pending-row history planning', () => {
         expect(result).toEqual({ kind: 'refused', reason: 'conflict' });
     });
 
+    it('turns an invalid desired structural row into a replay conflict', () => {
+        const invalid = {
+            ...row('a', 1),
+            formatTemplateId: '',
+        } as PendingAppendedRow;
+        const result = plan_pending_row_history_replay({
+            label: 'Invalid row',
+            changes: [row_change('a', null, invalid, null, 0)],
+        }, 'redo', () => state([]));
+
+        expect(result).toEqual({ kind: 'refused', reason: 'conflict' });
+    });
+
     it('replays cancellation of a saved tail removal', () => {
         const removal: PendingTailRemoval = {
             appendHistoryId: 'history-a',

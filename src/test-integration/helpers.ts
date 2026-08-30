@@ -1,5 +1,6 @@
 import * as path from 'path';
 import * as vscode from 'vscode';
+import type { TableViewerExtensionTestApi } from '../extension';
 
 /** Marketplace id (`publisher.name`) of the extension under test. */
 export const EXT_ID = 'jbearak.table-viewer';
@@ -22,6 +23,17 @@ export async function activate_extension(): Promise<vscode.Extension<unknown>> {
     if (!ext) throw new Error(`extension ${EXT_ID} not found in host`);
     await ext.activate();
     return ext;
+}
+
+/** Test-only controller protocol exposed by an extension host launched for tests. */
+export async function integration_api(): Promise<TableViewerExtensionTestApi> {
+    const ext = vscode.extensions.getExtension<TableViewerExtensionTestApi>(EXT_ID);
+    if (!ext) throw new Error(`extension ${EXT_ID} not found in host`);
+    const api = ext.isActive ? ext.exports : await ext.activate();
+    if (!api || typeof api.integrationSession !== 'function') {
+        throw new Error('Table Viewer did not expose its integration-test API.');
+    }
+    return api;
 }
 
 /** Every open tab across all groups. */

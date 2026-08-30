@@ -22,6 +22,7 @@ import {
     MAX_BARRIER_LABEL_LENGTH,
     peek_history,
     record_history_action,
+    rekey_saved_appended_row_history,
     type HistoryAction,
     type HistoryBounds,
     type HistoryChange,
@@ -942,6 +943,30 @@ describe('bounds', () => {
         const undone = move(resumed.state, 'undo');
         expect(undone.undoStack).toHaveLength(0);
         expect(peek_history(undone, 'undo').kind).toBe('blocked');
+    });
+});
+
+describe('rekeyed history bounds', () => {
+    it('keeps the next reachable redo entries when only the redo stack exceeds bounds', () => {
+        let state = record_all(['A', 'B', 'C']);
+        state = move(move(move(state, 'undo'), 'undo'), 'undo');
+        expect(state.redoStack.map((entry) => entry.action.label)).toEqual(['C', 'B', 'A']);
+
+        const bounded = rekey_saved_appended_row_history(state, [{
+            worksheet: SHEET,
+            pendingRowId: 'unrelated-pending-row',
+            sourceRow: 10,
+            savedFingerprint: 'fingerprint',
+            savedRow: { cells: {}, format: { kind: 'none' } },
+        }], {
+            maxActions: 2,
+            maxCells: 1_000,
+            softMaxBytes: 128 * 1024 * 1024,
+            hardMaxBytes: 256 * 1024 * 1024,
+        });
+
+        expect(bounded.redoStack.map((entry) => entry.action.label)).toEqual(['B', 'A']);
+        expect(top(bounded, 'redo').action.label).toBe('A');
     });
 });
 

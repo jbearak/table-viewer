@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import {
     register_table_viewer,
     TABLE_VIEW_TYPE,
+    type TableViewerIntegrationSession,
     type TableViewerRegistration,
 } from './custom-editor';
 import {
@@ -34,6 +35,10 @@ interface ActiveExtensionRuntime {
 interface OpenWorkbookAtSheetArguments {
     readonly uri: string;
     readonly sheetName: string;
+}
+
+export interface TableViewerExtensionTestApi {
+    integrationSession(uri: vscode.Uri): TableViewerIntegrationSession | undefined;
 }
 
 function open_workbook_at_sheet_arguments(value: unknown): OpenWorkbookAtSheetArguments {
@@ -139,7 +144,9 @@ function dispose_best_effort(disposable: vscode.Disposable | undefined): void {
     }
 }
 
-export async function activate(context: vscode.ExtensionContext): Promise<void> {
+export async function activate(
+    context: vscode.ExtensionContext,
+): Promise<TableViewerExtensionTestApi | undefined> {
     const state_directory = vscode.Uri.joinPath(context.globalStorageUri, 'state');
     try {
         await vscode.workspace.fs.createDirectory(state_directory);
@@ -168,7 +175,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     const pending_native_diffs: Array<{ readonly tab: vscode.Tab; readonly diff: TableDiffUris }> = [];
     const disposables: vscode.Disposable[] = [];
     try {
+        const extension_test_mode = vscode.ExtensionMode?.Test;
         viewers = register_table_viewer(context, database.store, {
+            integrationTests: extension_test_mode !== undefined
+                && context.extensionMode === extension_test_mode,
             replaceNativeDiff: (tab, diff) => {
                 if (replace_native_diff) replace_native_diff(tab, diff);
                 else pending_native_diffs.push({ tab, diff });
@@ -323,6 +333,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             for (const tab of group.tabs) replace_table_diff(tab);
         }
         active_runtime = { viewers, disposables, database };
+        return extension_test_mode !== undefined
+            && context.extensionMode === extension_test_mode
+            ? { integrationSession: (uri) => viewers!.integrationSession(uri) }
+            : undefined;
     } catch (error) {
         // Nothing may keep the database open after a failed activation: VS Code
         // will not call deactivate for an activation that threw, and a retained

@@ -3135,6 +3135,19 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
 
             const [movX, movY] = movement;
             if (gridSelection.current !== undefined && (movX !== 0 || movY !== 0)) {
+                const entersPastLastDataRow =
+                    showTrailingBlankRow &&
+                    newValue !== undefined &&
+                    movX === 0 &&
+                    movY === 1 &&
+                    gridSelection.current.cell[1] === rows - 1;
+                if (entersPastLastDataRow) {
+                    const selectedColumn = gridSelection.current.cell[0];
+                    const customTargetColumn = getCustomNewRowTargetColumn(selectedColumn);
+                    void appendRow(customTargetColumn ?? selectedColumn);
+                    onFinishedEditing?.(newValue, movement);
+                    return true;
+                }
                 const isEditingTrailingRow =
                     gridSelection.current.cell[1] === mangledRows - 1 && newValue !== undefined;
                 updateSelectedCell(
@@ -3157,6 +3170,10 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
             mangledRows,
             updateSelectedCell,
             mangledCols.length,
+            showTrailingBlankRow,
+            rows,
+            getCustomNewRowTargetColumn,
+            appendRow,
         ]
     );
 
@@ -3930,13 +3947,6 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
                             },
                         });
                     }
-                    if (!cutPasteComplete) {
-                        rowAdmission?.rollback();
-                        onClipboardPasteError?.(
-                            "The cut source contains a cell that cannot be cleared. No cells were changed."
-                        );
-                        return;
-                    }
                     editList.unshift(...deletions);
                 }
 
@@ -4000,6 +4010,7 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
             .catch(() => undefined)
             .then(() => performPasteInternal(e, captured, topologyKeyAtStart));
         pasteTailRef.current = queued;
+        return queued;
     }, [performPasteInternal]);
 
     useEventListener("paste", onPasteInternal, safeWindow, false, true);

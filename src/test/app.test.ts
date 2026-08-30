@@ -2092,7 +2092,10 @@ describe('Excel first-row header toggle', () => {
         const items = Array.from(
             document.querySelectorAll<HTMLButtonElement>('[role="menuitem"]'),
         );
-        expect(items.map((item) => [item.textContent, item.disabled])).toEqual([
+        expect(items.map((item) => [
+            item.textContent,
+            item.getAttribute('aria-disabled') === 'true',
+        ])).toEqual([
             ['Use first row as header on all 2 sheets', true],
             ['Show first row as data on all 2 sheets', false],
         ]);
@@ -2453,7 +2456,9 @@ describe('Excel first-row header toggle', () => {
             document.querySelectorAll<HTMLButtonElement>('[role="menuitem"]'),
         );
         expect(scope_items).toHaveLength(2);
-        expect(scope_items.every((item) => item.disabled)).toBe(true);
+        expect(scope_items.every(
+            (item) => item.getAttribute('aria-disabled') === 'true',
+        )).toBe(true);
         await click_menu_item('Show first row as data on all 2 sheets');
 
         const unhide = get_button('Unhide all');
@@ -2797,7 +2802,7 @@ describe('Excel first-row header toggle', () => {
         await open_scope_menu('Header row scope');
         expect(Array.from(
             document.querySelectorAll<HTMLButtonElement>('[role="menuitem"]'),
-        ).every((item) => item.disabled)).toBe(true);
+        ).every((item) => item.getAttribute('aria-disabled') === 'true')).toBe(true);
 
         post_message.mockClear();
         await act(async () => {
@@ -4620,7 +4625,7 @@ describe('auto-fit state', () => {
 
         await open_scope_menu('Auto-fit scope');
         const restore = get_menu_item('Restore original widths on all 2 sheets');
-        expect(restore.disabled).toBe(true);
+        expect(restore.getAttribute('aria-disabled')).toBe('true');
         expect(grid_shell_mock.latest_props?.on_auto_fit_sample_change).toBeUndefined();
     });
 
@@ -8885,7 +8890,8 @@ describe('edit mode save exit', () => {
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
     });
 
-    it('clears saved appended rows before leaving edit mode', async () => {
+    for (const save_order of ['snapshot-first', 'result-first'] as const) {
+    it(`clears saved appended rows before leaving edit mode (${save_order})`, async () => {
         grid_shell_mock.has_uncommitted_changes = true;
         grid_shell_mock.pending_active_cell.mockReturnValue({
             pendingRowId: 'pending-row-1',
@@ -8893,19 +8899,20 @@ describe('edit mode save exit', () => {
         });
 
         const { post_message } = await render_app();
-        const meta = make_meta(['Sheet1'], false);
+        const meta = make_meta(['Welcome', 'Fruit Stand'], false);
         await dispatch_host_message(initial_snapshot_message(meta, {
             capabilities: { csvEditable: true, csvEditingSupported: true },
         }));
+        await click_sheet_tab('Fruit Stand');
         await click_button('Edit');
         await dispatch_host_message({
             type: 'editSessionResult',
             granted: true,
             editSessionId: 'append-session',
-            sheetIndex: 0,
+            sheetIndex: 1,
             pendingChanges: {
-                sheetIndex: 0,
-                sheetName: 'Sheet1',
+                sheetIndex: 1,
+                sheetName: 'Fruit Stand',
                 cells: {},
                 formatTemplates: [{ id: 'plain', format: { kind: 'none' } }],
                 appendedRows: [{
@@ -8920,7 +8927,7 @@ describe('edit mode save exit', () => {
                     provisionalStartRow: 1,
                     provisionalRowCount: 1,
                     columnCount: 1,
-                    schemaFingerprint: transform_schema_for_sheet(meta.sheets[0]),
+                    schemaFingerprint: transform_schema_for_sheet(meta.sheets[1]),
                 },
                 conflicts: [],
             },
@@ -8942,16 +8949,16 @@ describe('edit mode save exit', () => {
             state: 'succeeded' as const,
             operation,
         };
-        const grown = make_meta(['Sheet1'], false);
-        grown.sheets[0] = {
-            ...grown.sheets[0],
+        const grown = make_meta(['Welcome', 'Fruit Stand'], false);
+        grown.sheets[1] = {
+            ...grown.sheets[1],
             rowCount: 2,
             sourceRowCount: 2,
         };
-        await dispatch_host_message(refresh_snapshot_message(grown, {
+        const refresh = refresh_snapshot_message(grown, {
             state: {
-                pendingEdits: [{
-                    sheetName: 'Sheet1',
+                pendingEdits: [undefined, {
+                    sheetName: 'Fruit Stand',
                     cells: {},
                     formatTemplates: [{ id: 'plain', format: { kind: 'none' } }],
                     appendedRows: [{
@@ -8966,7 +8973,7 @@ describe('edit mode save exit', () => {
                         provisionalStartRow: 1,
                         provisionalRowCount: 1,
                         columnCount: 1,
-                        schemaFingerprint: transform_schema_for_sheet(meta.sheets[0]),
+                        schemaFingerprint: transform_schema_for_sheet(meta.sheets[1]),
                     },
                     conflicts: [],
                 }],
@@ -8976,31 +8983,40 @@ describe('edit mode save exit', () => {
                 csvEditingSupported: true,
                 csvSaveLifecycle: lifecycle,
             },
-        }));
-        await dispatch_host_message({
+        });
+        const result = {
             type: 'saveResult',
-            success: true,
+            success: true as const,
             lifecycle,
             receipt: {
                 appendedRows: [{
-                    sheetIndex: 0,
-                    sheetName: 'Sheet1',
+                    sheetIndex: 1,
+                    sheetName: 'Fruit Stand',
                     pendingRowId: 'pending-row-1',
                     sourceRow: 1,
                     savedFingerprint: 'saved-row-fingerprint',
                 }],
                 removedSourceRows: [],
             },
-        });
+        } as const;
+        if (save_order === 'snapshot-first') {
+            await dispatch_host_message(refresh);
+            await dispatch_host_message(result);
+        } else {
+            await dispatch_host_message(result);
+            await dispatch_host_message(refresh);
+        }
 
         expect(pending_rows().snapshot().appendedRows).toEqual([]);
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
+        expect(get_button('Edit').classList.contains('has-unsaved')).toBe(false);
         expect(grid_shell_mock.latest_props?.saved_row_focus).toMatchObject({
-            sheetIndex: 0,
+            sheetIndex: 1,
             sourceRow: 1,
             sourceColumn: 0,
         });
     });
+    }
 
     it('does not restore saved appended rows from an initial recovery snapshot', async () => {
         await render_app();

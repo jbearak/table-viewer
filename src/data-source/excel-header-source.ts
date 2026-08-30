@@ -86,12 +86,25 @@ export class ExcelHeaderDataSource implements DataSource {
     private readonly sheets: SheetProjection[];
     private _meta: WorkbookMeta;
     private closed = false;
+    readonly append_style_dependency_fingerprint?: (
+        cell_style_indexes: readonly (number | null)[],
+        row_style_index?: number,
+    ) => string;
 
     constructor(
         private readonly base: DataSource,
         overrides?: Record<string, ExcelHeaderOverride>,
         hidden_rows?: readonly (readonly number[] | undefined)[],
     ) {
+        if (base.append_style_dependency_fingerprint !== undefined) {
+            this.append_style_dependency_fingerprint = (
+                cell_style_indexes,
+                row_style_index,
+            ) => base.append_style_dependency_fingerprint!(
+                cell_style_indexes,
+                row_style_index,
+            );
+        }
         const sanitized = sanitize_excel_header_overrides(overrides);
         const physical_meta = base.meta();
         this.sheets = physical_meta.sheets.map((sheet, sheet_index) => {
@@ -140,19 +153,6 @@ export class ExcelHeaderDataSource implements DataSource {
 
     meta(): WorkbookMeta {
         return this._meta;
-    }
-
-    append_style_dependency_fingerprint(
-        cell_style_indexes: readonly (number | null)[],
-        row_style_index?: number,
-    ): string {
-        if (!this.base.append_style_dependency_fingerprint) {
-            throw new Error('This workbook cannot fingerprint append styles.');
-        }
-        return this.base.append_style_dependency_fingerprint(
-            cell_style_indexes,
-            row_style_index,
-        );
     }
 
     source_row_indices(

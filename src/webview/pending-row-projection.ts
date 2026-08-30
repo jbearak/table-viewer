@@ -175,6 +175,9 @@ export function create_pending_row_projection(
     const deleted_index_by_removal_id = new Map(
         deleted_rows.map((row, index) => [row.removal.appendHistoryId, index]),
     );
+    const deleted_index_by_source_row = new Map(
+        deleted_rows.map((row, index) => [row.identity.sourceRow, index]),
+    );
     const deletedBandStart = filtered_source_count;
     const pendingBandStart = filtered_source_count + deleted_rows.length;
     const rowCount = pendingBandStart + pending_rows.length;
@@ -220,10 +223,8 @@ export function create_pending_row_projection(
                 if (
                     filtered_display_row === undefined
                 ) {
-                    const removed_index = deleted_rows.findIndex(
-                        (row) => row.identity.sourceRow === identity.sourceRow,
-                    );
-                    if (removed_index >= 0) return deletedBandStart + removed_index;
+                    const removed_index = deleted_index_by_source_row.get(identity.sourceRow);
+                    if (removed_index !== undefined) return deletedBandStart + removed_index;
                     // A replacement row has two identities: the pending row the
                     // user edits and the saved source removal it coalesced with.
                     // Selection remapping must be able to follow either identity

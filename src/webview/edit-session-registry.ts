@@ -443,24 +443,26 @@ export function create_edit_session_registry(
         const moves = new Map<string, XlsxFormulaCellMove>();
         const pending_layout = new Map([...pending_stores].map(([sheetIndex, store]) => {
             const structural = store.snapshot();
+            const source_count = source_row_counts[sheetIndex]
+                ?? structural.appendBasis?.sourceRowCount;
             return [sheetIndex, {
                 structural,
                 indexById: new Map(structural.appendedRows.map((row, index) => [row.id, index])),
-                start: (source_row_counts[sheetIndex]
-                    ?? structural.appendBasis?.sourceRowCount
-                    ?? 0) - structural.tailRemovals.length,
+                start: source_count === undefined
+                    ? undefined
+                    : source_count - structural.tailRemovals.length,
             }] as const;
         }));
         const physical_row = (
             sheetIndex: number,
             identity: import('../pending-changes').RowIdentity | undefined,
             fallback: number,
-        ): number => {
+        ): number | undefined => {
             if (identity === undefined) return fallback;
             if (identity.kind === 'source') return identity.sourceRow;
             const layout = pending_layout.get(sheetIndex);
             const index = layout?.indexById.get(identity.pendingRowId);
-            if (index === undefined || layout === undefined) return fallback;
+            if (index === undefined || layout?.start === undefined) return undefined;
             return layout.start + index;
         };
         const add_move = (
@@ -471,28 +473,33 @@ export function create_edit_session_registry(
         ): void => {
             if (moved === undefined) return;
             for (const previous of moved.previous ?? []) {
+                const source_row = physical_row(
+                    sheetIndex,
+                    previous.sourceRowIdentity,
+                    previous.sourceRow,
+                );
+                const destination_row = physical_row(
+                    sheetIndex,
+                    previous.destinationRowIdentity,
+                    previous.destinationRow,
+                );
+                if (source_row === undefined || destination_row === undefined) continue;
                 const move = {
                     order: previous.order,
                     sheetIndex,
-                    sourceRow: physical_row(
-                        sheetIndex,
-                        previous.sourceRowIdentity,
-                        previous.sourceRow,
-                    ),
+                    sourceRow: source_row,
                     sourceColumn: previous.sourceCol,
-                    destinationRow: physical_row(
-                        sheetIndex,
-                        previous.destinationRowIdentity,
-                        previous.destinationRow,
-                    ),
+                    destinationRow: destination_row,
                     destinationColumn: previous.destinationCol,
                 };
                 moves.set(JSON.stringify(move), move);
             }
+            const source_row = physical_row(sheetIndex, moved.rowIdentity, moved.row);
+            if (source_row === undefined) return;
             const move = {
                 order: moved.order,
                 sheetIndex,
-                sourceRow: physical_row(sheetIndex, moved.rowIdentity, moved.row),
+                sourceRow: source_row,
                 sourceColumn: moved.col,
                 destinationRow,
                 destinationColumn,
@@ -513,7 +520,8 @@ export function create_edit_session_registry(
         }
         for (const [sheetIndex, store] of pending_stores) {
             const structural = store.snapshot();
-            const start = pending_layout.get(sheetIndex)?.start ?? 0;
+            const start = pending_layout.get(sheetIndex)?.start;
+            if (start === undefined) continue;
             structural.appendedRows.forEach((row, index) => {
                 for (const [column, cell] of Object.entries(row.cells)) {
                     add_move(sheetIndex, cell.movedFrom, start + index, Number(column));

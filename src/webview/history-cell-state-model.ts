@@ -922,6 +922,13 @@ function copy_transition<T>(
     };
 }
 
+const copy_row_identity = (identity: RowIdentity | undefined): RowIdentity | undefined =>
+    identity === undefined
+        ? undefined
+        : identity.kind === 'source'
+            ? { kind: 'source', sourceRow: identity.sourceRow }
+            : { kind: 'pending', pendingRowId: identity.pendingRowId };
+
 function copy_overlay(
     overlay: CellOverlayState,
     value_of: (value: HistoryValue) => HistoryValue,
@@ -1004,9 +1011,3 @@ export function delta_addresses_same_cell(
         && left.sourceColumn === right.sourceColumn
         && worksheet_target_matches(left.worksheet, right.worksheet);
 }
-    const copy_row_identity = (identity: RowIdentity | undefined): RowIdentity | undefined =>
-        identity === undefined
-            ? undefined
-            : identity.kind === 'source'
-                ? { kind: 'source', sourceRow: identity.sourceRow }
-                : { kind: 'pending', pendingRowId: identity.pendingRowId };

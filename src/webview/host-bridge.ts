@@ -111,7 +111,11 @@ function pending_changes_payload(changes: WorksheetPendingChanges): string {
     });
 }
 
-function has_structural_pending_changes(changes: WorksheetPendingChanges): boolean {
+/**
+ * Whether the structural channel must publish. Orphaned templates and a retained
+ * basis count so a publication can explicitly clear or acknowledge them.
+ */
+function has_structural_publication_state(changes: WorksheetPendingChanges): boolean {
     return changes.appendedRows.length > 0
         || changes.tailRemovals.length > 0
         || changes.formatTemplates.length > 0
@@ -120,7 +124,7 @@ function has_structural_pending_changes(changes: WorksheetPendingChanges): boole
 }
 
 function pending_changes_channel_payload(changes: WorksheetPendingChanges): string {
-    return has_structural_pending_changes(changes)
+    return has_structural_publication_state(changes)
         ? pending_changes_payload(changes)
         : pending_edit_payload(changes.cells);
 }
@@ -307,7 +311,7 @@ export const pending_changes_durability = {
         force = false,
     ): number {
         const channel = pending_edit_channel(editSessionId);
-        const structural = has_structural_pending_changes(changes);
+        const structural = has_structural_publication_state(changes);
         const payload = pending_changes_channel_payload(changes);
         const dedupe_key = worksheet_target_key(changes);
         const latest = channel.latestPublicationBySheet.get(dedupe_key);
@@ -390,7 +394,7 @@ export const pending_changes_durability = {
         // immutable publication base without retaining mutable caller objects.
         return JSON.parse(publication.payload) as WorksheetPendingChanges;
     },
-    unacknowledged_payload_matches(
+    unacknowledged_structural_payload_matches(
         editSessionId: string,
         authoritativeChanges: WorksheetPendingChanges,
         currentChanges: WorksheetPendingChanges,

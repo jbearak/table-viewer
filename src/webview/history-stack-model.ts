@@ -1735,7 +1735,7 @@ function bound_rekeyed_history(
     };
     while (exceeds() && undo.length + redo.length > 1) {
         if (undo.length > 0) undo.shift();
-        else redo.pop();
+        else redo.shift();
     }
     return {
         ...state,

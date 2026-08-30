@@ -242,6 +242,7 @@ describe('sanitized_prepare_history_replay_request', () => {
     it('rejects aggregate replay bytes before cloning repeated large overlays', () => {
         const shared = 'x'.repeat(2 * 1024 * 1024);
         const count = Math.ceil(MAX_HISTORY_ACTION_ENCODED_BYTES / shared.length) + 1;
+        expect(count).toBeLessThanOrEqual(MAX_HISTORY_ACTION_CELLS);
         const cells = Array.from({ length: count }, (_, ordinal) => ({
             ordinal,
             worksheet: SHEET,
@@ -437,6 +438,7 @@ describe('sanitized_commit_history_replay_request', () => {
 
         const shared = 'x'.repeat(2 * 1024 * 1024);
         const count = Math.ceil(MAX_HISTORY_ACTION_ENCODED_BYTES / shared.length) + 1;
+        expect(count).toBeLessThanOrEqual(MAX_HISTORY_ACTION_CELLS);
         expect(sanitized_commit_history_replay_request(commit_request({
             cells: Array.from({ length: count }, (_, ordinal) => ({
                 ordinal,

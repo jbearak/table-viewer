@@ -146,6 +146,7 @@ import {
     propose_csv_save,
     reduce_csv_save_projection,
     remove_operation_owned_pending_edits,
+    remove_operation_owned_pending_structural_changes,
     resolve_csv_save_hydration_from_worksheets,
     resolve_csv_save_structural_hydration_from_worksheets,
     save_lifecycle_correlation,
@@ -2307,14 +2308,13 @@ export function App(): React.JSX.Element {
                 if (disposition === 'tombstone' && worksheet.structuralChanges) {
                     const structural_store = edit_session_registry_ref.current!
                         .pending_rows_for_sheet(sheet_index);
-                    structural_store.clear_saved(
-                        operation.editSessionId,
-                        new Set(worksheet.structuralChanges.appendedRows.map(
-                            (row) => row.id,
-                        )),
-                        new Set(worksheet.structuralChanges.tailRemovals.map(
-                            (removal) => removal.sourceRow,
-                        )),
+                    const retained = remove_operation_owned_pending_structural_changes(
+                        structural_store.snapshot(),
+                        worksheet,
+                    );
+                    structural_store.install(
+                        { session_id: current_session_id },
+                        retained,
                     );
                 }
             }
@@ -3256,7 +3256,7 @@ export function App(): React.JSX.Element {
                                     conflicts: slot?.conflicts ?? [],
                                 };
                                 if (pending_changes_durability
-                                    .unacknowledged_payload_matches(
+                                    .unacknowledged_structural_payload_matches(
                                         edit_session_id,
                                         authoritative,
                                         current,

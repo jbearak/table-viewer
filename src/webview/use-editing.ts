@@ -744,9 +744,8 @@ export function use_editing(
                 if (change !== undefined) changes.push(change);
             }
 
-            // Every target was invalid or unavailable to the history capture.
-            // Report refusal so a caller holding a draft keeps it open instead
-            // of treating a no-op as a safely committed gesture.
+            // Every target was invalid or unavailable. Report a no-op so callers
+            // keep any draft open without treating the gesture as a busy refusal.
             if (writes.length === 0) return 'noop';
 
             const staged_writes = active_store.stage_writes(session_id, writes);

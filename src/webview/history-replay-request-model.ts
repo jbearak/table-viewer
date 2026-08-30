@@ -109,10 +109,7 @@ export interface ReplayRequestSources {
  * no session behind them.
  */
 export function action_requires_edit_session(action: HistoryEntry['action']): boolean {
-    return action_has_cell_changes(action) || action.changes.some((change) =>
-        change.kind === 'rowAppend'
-        || change.kind === 'tailRemoval'
-        || change.kind === 'pendingRows');
+    return action_has_cell_changes(action);
 }
 
 /**

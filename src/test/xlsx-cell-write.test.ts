@@ -166,6 +166,17 @@ describe('append row-format capture', () => {
         expect(format.styleFingerprint)
             .toBe(xlsx_append_style_dependency_fingerprint(raw, [null, null, null, 1], 1));
     });
+
+    it('rejects a style index with trailing non-numeric text', () => {
+        const raw = patched_basic([[
+            '/xl/worksheets/sheet1.xml',
+            '<c r="D2" s="1">',
+            '<c r="D2" s="1x">',
+        ]]);
+
+        expect(() => capture_xlsx_append_row_format(raw, 0, 3, 4, 2))
+            .toThrow('The append format row contains an invalid style');
+    });
 });
 
 describe('iso_to_serial', () => {

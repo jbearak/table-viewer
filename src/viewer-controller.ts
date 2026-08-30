@@ -376,6 +376,15 @@ export interface ViewerControllerOptions {
     /** Render read-only regardless of the profile (e.g. a git: revision URI,
      *  which has no working-tree file to write back to). */
     readonly readOnly?: boolean;
+    /** Test-host protocol seam. It is supplied only by the VS Code integration
+     * runner and observes the real controller transport without replacing it. */
+    readonly integrationTestPort?: {
+        on_host_message(message: HostMessage): void;
+        on_webview_message(message: WebviewMessage): void;
+        register_webview_message_receiver(
+            receiver: (message: WebviewMessage) => Promise<void>,
+        ): void;
+    };
 }
 
 export interface ViewerController extends Disposable {
@@ -3183,6 +3192,7 @@ export function attach_viewer(
                 && receiver_epoch !== session.current_receiver_epoch)
         ) return Promise.resolve(false);
         try {
+            options.integrationTestPort?.on_host_message(message);
             return Promise.resolve(webview.postMessage(message)).catch(() => false);
         } catch {
             return Promise.resolve(false);
@@ -9753,8 +9763,8 @@ export function attach_viewer(
         }
     }
 
-    try {
-        disposables.push(webview.onDidReceiveMessage(async (msg: WebviewMessage) => {
+    const receive_webview_message = async (msg: WebviewMessage): Promise<void> => {
+        options.integrationTestPort?.on_webview_message(msg);
         if (disposed) return;
         if (
             msg.type !== 'ready'
@@ -12387,7 +12397,12 @@ export function attach_viewer(
                 if (profile.on_message && await profile.on_message(msg)) return;
                 await core?.handle_message(msg);
         }
-        }));
+    };
+    try {
+        disposables.push(webview.onDidReceiveMessage(receive_webview_message));
+        options.integrationTestPort?.register_webview_message_receiver(
+            receive_webview_message,
+        );
     } catch (error) {
         return abort_setup(error);
     }

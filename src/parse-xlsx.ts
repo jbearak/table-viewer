@@ -977,25 +977,15 @@ function parse_worksheet_core(
         formula_cells.push(Math.floor(number / 16_384), number % 16_384);
     }
 
-    // If no cells were found, the sheet is empty regardless of what dimension says
-    if (cells.size === 0) {
-        return {
-            cells,
-            merged_cells,
-            merges: [],
-            formula_dependencies,
-            structured_formula_names,
-            structured_formula_references: packed_structured_formula_references,
-            formula_cells,
-            pending_formula_cells,
-            row_count: 0,
-            col_count: 0,
-        };
-    }
-
-    // Use dimension if available and non-degenerate, otherwise fall back to observed max
-    const row_count = dim && dim.row_count > 0 ? Math.max(dim.row_count, max_row) : max_row;
-    const col_count = dim && dim.col_count > 0 ? Math.max(dim.col_count, max_col) : max_col;
+    // A dimension alone does not create rows, but numbered blank `<row>` elements
+    // do. Columns still follow the dimension when a cell-free sheet declares one.
+    const has_physical_rows = cells.size > 0 || max_row > 0;
+    const row_count = !has_physical_rows
+        ? 0
+        : dim && dim.row_count > 0 ? Math.max(dim.row_count, max_row) : max_row;
+    const col_count = !has_physical_rows
+        ? 0
+        : dim && dim.col_count > 0 ? Math.max(dim.col_count, max_col) : max_col;
 
     // Validate final shape (catches cells beyond dimension and merge count)
     assert_safe_sheet_shape(budget, row_count, col_count, merges.length);

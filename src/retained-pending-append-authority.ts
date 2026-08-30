@@ -66,14 +66,23 @@ export class RetainedPendingAppendAuthorityStore {
         target_key: string,
         row_id: string,
         authority: RetainedPendingAppendAuthorityInput,
-    ): void {
-        this.forget(target_key, row_id);
+    ): boolean {
         const owned = Object.freeze({
             ...authority,
             byteCost: Buffer.byteLength(JSON.stringify({ row_id, ...authority }), 'utf8') + 256,
         });
+        if (owned.byteCost > this.max_bytes) return false;
+
         const rows = this.authorities.get(target_key)
             ?? new Map<string, RetainedPendingAppendAuthority>();
+        const prior = rows.get(row_id);
+        if (prior !== undefined) {
+            rows.delete(row_id);
+            this.retained_bytes -= prior.byteCost;
+        }
+        // A successful re-remember is a fresh use of the target and row. Move
+        // both map keys to the end so eviction remains recency-ordered.
+        this.authorities.delete(target_key);
         rows.set(row_id, owned);
         this.authorities.set(target_key, rows);
         this.retained_bytes += owned.byteCost;
@@ -86,5 +95,6 @@ export class RetainedPendingAppendAuthorityStore {
             if (first_target === undefined || first_row === undefined) break;
             this.forget(first_target[0], first_row);
         }
+        return this.get(target_key, row_id) !== undefined;
     }
 }

@@ -22,6 +22,7 @@ import { sanitize_column_visibility_state } from './column-projection';
 import {
     has_pending_structural_changes,
     own_pending_structural_changes,
+    type PendingStructuralChanges,
 } from '../pending-changes';
 
 export function clamp_sheet_index(
@@ -332,7 +333,7 @@ function normalize_pending_edits(
             cells?: unknown;
         };
         const cells = normalize_pending_edit_cells(record.cells);
-        let structural;
+        let structural: PendingStructuralChanges;
         try {
             structural = own_pending_structural_changes({
                 formatTemplates: record.formatTemplates,

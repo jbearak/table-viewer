@@ -1129,6 +1129,40 @@ a new line char ""more quotes"" plus a tab  ."	https://google.com`)
         );
     });
 
+    test("Enter appends when finishing the last data row", async () => {
+        const appendSpy = vi.fn();
+        vi.useFakeTimers();
+        render(
+            <EventedDataEditor
+                {...basicProps}
+                rows={2}
+                onRowAppended={appendSpy}
+                gridSelection={{
+                    columns: CompactSelection.empty(),
+                    rows: CompactSelection.empty(),
+                    current: {
+                        cell: [1, 1],
+                        range: { x: 1, y: 1, width: 1, height: 1 },
+                        rangeStack: [],
+                    },
+                }}
+            />,
+            { wrapper: Context }
+        );
+        prep();
+        const canvas = screen.getByTestId("data-grid-canvas");
+        fireEvent.keyDown(canvas, { keyCode: 74, key: "j" });
+        const overlay = await screen.findByDisplayValue("j");
+
+        vi.useFakeTimers();
+        fireEvent.keyDown(overlay, { key: "Enter" });
+        act(() => {
+            vi.runAllTimers();
+        });
+
+        expect(appendSpy).toHaveBeenCalledOnce();
+    });
+
     test("Does not edit when validation fails", async () => {
         const spy = vi.fn();
         vi.useFakeTimers();

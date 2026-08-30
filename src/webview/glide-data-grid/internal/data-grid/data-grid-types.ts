@@ -694,7 +694,7 @@ export class CompactSelection {
 
     /** The compact half-open ranges without expanding a large selection. */
     public toRanges(): CompactSelectionRanges {
-        return this.items;
+        return this.items.map(([start, end]) => [start, end]);
     }
 
     get length(): number {

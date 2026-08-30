@@ -681,4 +681,21 @@ describe('ExcelHeaderDataSource', () => {
         ds.close();
         expect(base.closed).toBe(true);
     });
+
+    it('only exposes append-style fingerprinting when its base supports it', () => {
+        const unsupported = new ExcelHeaderDataSource(new StubSource([[cell('Name')]]));
+        expect(unsupported.append_style_dependency_fingerprint).toBeUndefined();
+
+        const base = new StubSource([[cell('Name')]]) as StubSource & {
+            append_style_dependency_fingerprint(
+                cell_style_indexes: readonly (number | null)[],
+                row_style_index?: number,
+            ): string;
+        };
+        base.append_style_dependency_fingerprint = (cells, row) =>
+            `${cells.join(',')}:${row ?? 'none'}`;
+        const supported = new ExcelHeaderDataSource(base);
+        expect(supported.append_style_dependency_fingerprint?.([1, null], 2))
+            .toBe('1,:2');
+    });
 });

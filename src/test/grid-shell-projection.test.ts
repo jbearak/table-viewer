@@ -1521,6 +1521,9 @@ describe('GridShell cell wrapping', () => {
             sourceRows: [2],
             displayRows: [null],
         } })));
+        // The null inverse filters source row 2 out of the source band, but its
+        // saved-filtered-tail removal still adds one deletion row after the
+        // three retained source rows.
         await vi.waitUntil(() => grid_mock.props!.rows === 4);
 
         const selection = grid_mock.props!.gridSelection as {

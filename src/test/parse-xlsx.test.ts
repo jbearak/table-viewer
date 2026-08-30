@@ -583,6 +583,28 @@ describe('parse_xlsx', () => {
             expect(empty!.columnCount).toBe(0);
         });
 
+        it('retains numbered blank rows and dimension columns without cells', async () => {
+            const sheet = `<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <dimension ref="A1:C7"/>
+  <sheetData><row r="4"/><row r="7"/></sheetData>
+</worksheet>`;
+            const bytes = build_test_xlsx(sheet);
+
+            const parsed = await parse_xlsx(bytes);
+            expect(parsed.data.sheets[0]).toMatchObject({
+                rowCount: 7,
+                columnCount: 3,
+            });
+            expect(parsed.data.sheets[0].rows).toHaveLength(7);
+
+            const streaming = await parse_xlsx_streaming(bytes);
+            expect(streaming.sheets[0]).toMatchObject({
+                rowCount: 7,
+                columnCount: 3,
+            });
+        });
+
         it('parses filled sheet alongside empty sheet', async () => {
             const { data } = await parse_xlsx(read_fixture('empty-sheet.xlsx'));
             const filled = data.sheets.find(s => s.name === 'FilledSheet');

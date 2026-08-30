@@ -283,12 +283,10 @@ function append_style_dependency_fingerprint(
     return `sha256:${createHash('sha256').update(JSON.stringify({ root, dependency })).digest('hex')}`;
 }
 
-/** Recompute the style dependency fingerprint for an already captured template. */
-export function xlsx_append_style_dependency_fingerprint(
-    raw: Uint8Array,
+function assert_valid_append_style_request(
     cell_style_indexes: readonly (number | null)[],
     row_style_index?: number,
-): string {
+): void {
     if (
         cell_style_indexes.length > 256
         || cell_style_indexes.some((style) => style !== null && (
@@ -298,6 +296,15 @@ export function xlsx_append_style_dependency_fingerprint(
             !Number.isSafeInteger(row_style_index) || row_style_index < 0
         ))
     ) throw new Error('Invalid worksheet append style dependency request');
+}
+
+/** Recompute the style dependency fingerprint for an already captured template. */
+export function xlsx_append_style_dependency_fingerprint(
+    raw: Uint8Array,
+    cell_style_indexes: readonly (number | null)[],
+    row_style_index?: number,
+): string {
+    assert_valid_append_style_request(cell_style_indexes, row_style_index);
     let zip: ZipPackage;
     try {
         zip = ZipPackage.open(raw);
@@ -328,15 +335,7 @@ export function create_xlsx_append_style_dependency_fingerprinter(
     const styles = read_part_bytes(zip, '/xl/styles.xml');
     const styles_text = styles === null ? null : Buffer.from(styles).toString('utf8');
     return (cell_style_indexes, row_style_index) => {
-        if (
-            cell_style_indexes.length > 256
-            || cell_style_indexes.some((style) => style !== null && (
-                !Number.isSafeInteger(style) || style < 0
-            ))
-            || (row_style_index !== undefined && (
-                !Number.isSafeInteger(row_style_index) || row_style_index < 0
-            ))
-        ) throw new Error('Invalid worksheet append style dependency request');
+        assert_valid_append_style_request(cell_style_indexes, row_style_index);
         return append_style_dependency_fingerprint(
             styles_text,
             cell_style_indexes,
@@ -408,7 +407,7 @@ export function capture_xlsx_append_row_format(
                 seen_columns.add(col);
                 const raw_style = get_tag_attr(xml, cell.start, cell.inner_start, 's');
                 if (raw_style === null) return;
-                const style = parseInt(raw_style, 10);
+                const style = Number(raw_style);
                 if (!Number.isSafeInteger(style) || style < 0) {
                     throw new Error('The append format row contains an invalid style');
                 }

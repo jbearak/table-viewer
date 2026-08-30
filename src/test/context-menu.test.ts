@@ -36,22 +36,26 @@ function render_menu(items: React.ComponentProps<typeof ContextMenu>['items']) {
 }
 
 describe('ContextMenu keyboard behavior', () => {
-    it('focuses the first enabled item and navigates enabled items with arrows/Home/End', () => {
+    it('keeps disabled items in the ARIA focus order while refusing activation', () => {
+        const disabled_click = vi.fn();
         render_menu([
-            { label: 'Disabled', disabled: true, on_click: vi.fn() },
+            { label: 'Disabled', disabled: true, on_click: disabled_click },
             { label: 'First', on_click: vi.fn() },
             { kind: 'separator' },
             { label: 'Last', on_click: vi.fn() },
         ]);
+        expect(document.activeElement?.textContent).toContain('Disabled');
+        expect(document.activeElement?.getAttribute('aria-disabled')).toBe('true');
+        act(() => (document.activeElement as HTMLButtonElement).click());
+        expect(disabled_click).not.toHaveBeenCalled();
+        act(() => document.activeElement?.dispatchEvent(new KeyboardEvent('keydown', {
+            key: 'ArrowDown', bubbles: true,
+        })));
         expect(document.activeElement?.textContent).toContain('First');
         act(() => document.activeElement?.dispatchEvent(new KeyboardEvent('keydown', {
             key: 'ArrowDown', bubbles: true,
         })));
         expect(document.activeElement?.textContent).toContain('Last');
-        act(() => document.activeElement?.dispatchEvent(new KeyboardEvent('keydown', {
-            key: 'ArrowDown', bubbles: true,
-        })));
-        expect(document.activeElement?.textContent).toContain('First');
         act(() => document.activeElement?.dispatchEvent(new KeyboardEvent('keydown', {
             key: 'End', bubbles: true,
         })));
@@ -59,7 +63,7 @@ describe('ContextMenu keyboard behavior', () => {
         act(() => document.activeElement?.dispatchEvent(new KeyboardEvent('keydown', {
             key: 'Home', bubbles: true,
         })));
-        expect(document.activeElement?.textContent).toContain('First');
+        expect(document.activeElement?.textContent).toContain('Disabled');
     });
 
     it('clamps the rendered position through component state', () => {
@@ -115,8 +119,8 @@ describe('ContextMenu keyboard behavior', () => {
         const buttons = Array.from(document.querySelectorAll<HTMLButtonElement>('[role^="menuitem"]'));
         expect(buttons.map((button) => button.tabIndex)).toEqual([0, -1, -1]);
         act(() => buttons[0].dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true })));
-        expect(buttons.map((button) => button.tabIndex)).toEqual([-1, -1, 0]);
-        act(() => buttons[2].dispatchEvent(new KeyboardEvent('keydown', { key: 'Tab', bubbles: true })));
+        expect(buttons.map((button) => button.tabIndex)).toEqual([-1, 0, -1]);
+        act(() => buttons[1].dispatchEvent(new KeyboardEvent('keydown', { key: 'Tab', bubbles: true })));
         expect(on_dismiss).toHaveBeenCalledOnce();
         expect(restore_focus).not.toHaveBeenCalled();
     });
@@ -193,7 +197,7 @@ describe('ContextMenu keyboard behavior', () => {
         expect(Array.from(buttons, (button) => button.tabIndex)).toEqual([-1, 0]);
     });
 
-    it('closes an open submenu when hovering a disabled sibling without focusing it', () => {
+    it('closes an open submenu and focuses a disabled sibling on hover', () => {
         render_menu([
             {
                 kind: 'submenu',
@@ -212,7 +216,7 @@ describe('ContextMenu keyboard behavior', () => {
         act(() => disabled.dispatchEvent(new MouseEvent('pointerover', { bubbles: true })));
 
         expect(trigger.getAttribute('aria-expanded')).toBe('false');
-        expect(document.activeElement).toBe(trigger);
+        expect(document.activeElement).toBe(disabled);
     });
 
     it('activates a submenu leaf and dismisses/restores exactly once', () => {

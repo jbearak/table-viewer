@@ -1740,7 +1740,7 @@ body.vscode-high-contrast-light .toolbar-split-caret.open {
     position: static;
 }
 
-.context-menu-item:disabled {
+.context-menu-item[aria-disabled="true"] {
     cursor: default;
     opacity: 0.5;
 }
