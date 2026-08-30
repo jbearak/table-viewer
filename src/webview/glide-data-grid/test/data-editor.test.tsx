@@ -3042,6 +3042,109 @@ a new line char ""more quotes"" plus a tab  ."	https://google.com`)
         expect(rollback).not.toHaveBeenCalled();
     });
 
+    test("a delayed paste reads cell metadata only from the committed projection", async () => {
+        vi.useFakeTimers();
+        let resolveAdmission!: (value: { topologyKey: unknown; rollback: () => void }) => void;
+        const rollback = vi.fn();
+        const admit = vi.fn(() => new Promise<{
+            topologyKey: unknown;
+            rollback: () => void;
+        }>((resolve) => {
+            resolveAdmission = resolve;
+        }));
+        const editSpy = vi.fn((
+            _edits: readonly EditListItem[],
+            _source: string,
+        ) => true);
+        const pasteError = vi.fn();
+        Object.assign(navigator, {
+            clipboard: { readText: vi.fn(async () => "one\ntwo") },
+        });
+        const selection = {
+            columns: CompactSelection.empty(),
+            rows: CompactSelection.empty(),
+            current: {
+                cell: [0, 2] as Item,
+                range: { x: 0, y: 2, width: 1, height: 1 },
+                rangeStack: [],
+            },
+        };
+        const cell = (sourceRowOffset: number) => ([col, row]: Item): GridCell => ({
+            kind: GridCellKind.Text,
+            data: `${col}, ${row}`,
+            displayData: `${col}, ${row}`,
+            allowOverlay: true,
+            clipboardData: {
+                source: "sheet",
+                location: [col, row],
+                gridLocation: [col, row],
+                rowIdentity: { kind: "source", sourceRow: row + sourceRowOffset },
+            },
+        });
+        const committedCell = cell(100);
+        const abandonedCell = cell(900);
+        const never = new Promise<void>(() => undefined);
+        const suspended = vi.fn();
+        let installAdmittedRows!: () => void;
+        let interruptProjection!: () => void;
+        function Suspend(): React.JSX.Element {
+            suspended();
+            throw never;
+        }
+        function Harness(): React.JSX.Element {
+            const [phase, setPhase] = React.useState<"initial" | "admitted" | "interrupted">(
+                "initial"
+            );
+            installAdmittedRows = () => setPhase("admitted");
+            interruptProjection = () => setPhase("interrupted");
+            const admitted = phase !== "initial";
+            return (
+                <React.Suspense fallback={null}>
+                    <DataEditor
+                        {...basicProps}
+                        rows={phase === "interrupted" ? 2 : admitted ? 4 : 3}
+                        pasteTopologyKey={admitted ? "topology-2" : "topology-1"}
+                        gridSelection={selection}
+                        getCellContent={phase === "interrupted" ? abandonedCell : committedCell}
+                        onPaste={true}
+                        onPasteRowsNeeded={admit}
+                        onCellsEdited={editSpy}
+                        onClipboardPasteError={pasteError}
+                    />
+                    {phase === "interrupted" ? <Suspend /> : null}
+                </React.Suspense>
+            );
+        }
+        render(<Harness />, { wrapper: Context });
+        prep(false);
+        vi.useRealTimers();
+        const canvas = screen.getByTestId("data-grid-canvas");
+        vi.spyOn(document, "activeElement", "get").mockImplementation(() => canvas);
+
+        fireEvent.paste(window);
+        await vi.waitFor(() => expect(admit).toHaveBeenCalledOnce());
+        await act(async () => installAdmittedRows());
+        await act(async () => {
+            React.startTransition(() => interruptProjection());
+        });
+        expect(suspended).toHaveBeenCalled();
+        resolveAdmission({ topologyKey: "topology-2", rollback });
+
+        await vi.waitFor(() => expect(editSpy).toHaveBeenCalledOnce());
+        expect(editSpy.mock.calls[0]?.[0]).toEqual([
+            expect.objectContaining({
+                location: [0, 2],
+                targetRowIdentity: { kind: "source", sourceRow: 102 },
+            }),
+            expect.objectContaining({
+                location: [0, 3],
+                targetRowIdentity: { kind: "source", sourceRow: 103 },
+            }),
+        ]);
+        expect(pasteError).not.toHaveBeenCalled();
+        expect(rollback).not.toHaveBeenCalled();
+    });
+
     test("refuses a delayed clipboard read after pending-row topology changes", async () => {
         vi.useFakeTimers();
         let resolveRead!: (value: string) => void;

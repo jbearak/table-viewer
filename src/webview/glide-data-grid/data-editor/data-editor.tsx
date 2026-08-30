@@ -1235,7 +1235,9 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
     const hasJustScrolled = React.useRef(false);
 
     const [visibleRegion, setVisibleRegion, empty] = useStateWithReactiveInput<VisibleRegion>(visibleRegionInput);
-    visibleRegionRef.current = visibleRegion;
+    React.useLayoutEffect(() => {
+        visibleRegionRef.current = visibleRegion;
+    }, [visibleRegion]);
 
     const vScrollReady = (visibleRegion.height ?? 1) > 1;
     React.useLayoutEffect(() => {
@@ -1398,7 +1400,9 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
     ]);
 
     const mangledColsRef = React.useRef(mangledCols);
-    mangledColsRef.current = mangledCols;
+    React.useLayoutEffect(() => {
+        mangledColsRef.current = mangledCols;
+    }, [mangledCols]);
     const getMangledCellContent = React.useCallback(
         ([col, row]: Item, forceStrict: boolean = false): InnerGridCell => {
             const isTrailing = showTrailingBlankRow && row === mangledRows - 1;
@@ -1499,7 +1503,9 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
         ]
     );
     const getMangledCellContentRef = React.useRef(getMangledCellContent);
-    getMangledCellContentRef.current = getMangledCellContent;
+    React.useLayoutEffect(() => {
+        getMangledCellContentRef.current = getMangledCellContent;
+    }, [getMangledCellContent]);
 
     const mangledGetGroupDetails = React.useCallback<NonNullable<DataEditorProps["getGroupDetails"]>>(
         group => {
@@ -1782,9 +1788,11 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
     const focusCallback = React.useRef(focusOnRowFromTrailingBlankRow);
     const getCellContentRef = React.useRef(getCellContent);
     const rowsRef = React.useRef(rows);
-    focusCallback.current = focusOnRowFromTrailingBlankRow;
-    getCellContentRef.current = getCellContent;
-    rowsRef.current = rows;
+    React.useLayoutEffect(() => {
+        focusCallback.current = focusOnRowFromTrailingBlankRow;
+        getCellContentRef.current = getCellContent;
+        rowsRef.current = rows;
+    }, [focusOnRowFromTrailingBlankRow, getCellContent, rows]);
     const appendRow = React.useCallback(
         async (col: number, openOverlay: boolean = true): Promise<void> => {
             const c = mangledCols[col];
@@ -4212,7 +4220,9 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
     // expects unmangled indexes
     const [outCol, outRow] = gridSelectionOuter?.current?.cell ?? [];
     const scrollToRef = React.useRef(scrollTo);
-    scrollToRef.current = scrollTo;
+    React.useLayoutEffect(() => {
+        scrollToRef.current = scrollTo;
+    }, [scrollTo]);
     React.useLayoutEffect(() => {
         if (
             !hasJustScrolled.current &&

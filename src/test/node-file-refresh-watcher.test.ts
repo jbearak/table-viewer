@@ -74,11 +74,10 @@ describe('Node file refresh watcher adapter', () => {
             target,
         );
 
-        for (let attempt = 0; attempt < 100 && events.length === 0; attempt += 1) {
-            await fs.promises.appendFile(target, '.');
-            await new Promise((done) => { setTimeout(done, 10); });
-        }
-        expect(events.length).toBeGreaterThan(0);
+        await vi.waitFor(async () => {
+            if (events.length === 0) await fs.promises.appendFile(target, '.');
+            expect(events.length).toBeGreaterThan(0);
+        }, WAIT);
         await fs.promises.writeFile(replacement, 'committed version');
         const { events: replacement_events } = watch(
             new NodeFileRefreshWatcherFactory({ poll_interval_ms: POLL_MS }),
@@ -86,14 +85,10 @@ describe('Node file refresh watcher adapter', () => {
         );
         await fs.promises.rename(replacement, target);
 
-        for (
-            let attempt = 0;
-            attempt < 200 && replacement_events.length === 0;
-            attempt += 1
-        ) {
-            await new Promise((done) => { setTimeout(done, 10); });
-        }
-        expect(replacement_events.length).toBeGreaterThan(0);
+        await vi.waitFor(
+            () => expect(replacement_events.length).toBeGreaterThan(0),
+            WAIT,
+        );
         expect(replacement_events.every((kind) => ['change', 'create'].includes(kind)))
             .toBe(true);
     });
