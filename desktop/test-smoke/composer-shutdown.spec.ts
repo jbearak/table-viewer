@@ -2,10 +2,12 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { expect, test } from '@playwright/test';
 import type { ElectronApplication, Page } from '@playwright/test';
+import { parse_xlsx } from '../../src/parse-xlsx';
 import {
     isolated_user_data,
     launch_app,
     reader_tokens,
+    repo_dir,
 } from './smoke-helpers';
 
 const VIEWER_URL_PREFIX = 'tv-app://viewer';
@@ -15,8 +17,28 @@ interface LifecycleApp {
     readonly app: ElectronApplication;
     readonly root: string;
     readonly userData: string;
-    readonly csvPath: string;
+    readonly filePath: string;
+    readonly fileVariant: LifecycleFileVariant;
+    readonly initialRowCount: number;
     readonly page: Page;
+}
+
+interface LifecycleFileVariant {
+    readonly id: string;
+    readonly name: string;
+    readonly format: 'csv' | 'xlsx';
+    readonly fileName: string;
+    readonly fixturePath?: string;
+    readonly worksheetIndex: number;
+    readonly worksheetCount: number;
+    readonly worksheetName?: string;
+    readonly otherWorksheetName?: string;
+}
+
+interface LifecycleFileState {
+    readonly rowCount: number;
+    readonly values: ReadonlySet<string>;
+    readonly worksheetCount: number;
 }
 
 interface ShutdownState {
@@ -41,15 +63,92 @@ interface PendingChangeScenario {
     readonly stage: (page: Page) => Promise<void>;
 }
 
-async function launch_lifecycle_app(prefix: string): Promise<LifecycleApp> {
+const lifecycle_file_variants: readonly LifecycleFileVariant[] = [
+    {
+        id: 'csv',
+        name: 'CSV',
+        format: 'csv',
+        fileName: 'inventory.csv',
+        worksheetIndex: 0,
+        worksheetCount: 1,
+    },
+    {
+        id: 'excel-one-worksheet',
+        name: 'Excel with one worksheet',
+        format: 'xlsx',
+        fileName: 'inventory.xlsx',
+        fixturePath: path.join(repo_dir, 'src', 'test', 'fixtures', 'formatted.xlsx'),
+        worksheetIndex: 0,
+        worksheetCount: 1,
+    },
+    {
+        id: 'excel-multiple-worksheets',
+        name: 'Excel with multiple worksheets',
+        format: 'xlsx',
+        fileName: 'inventory.xlsx',
+        fixturePath: path.join(repo_dir, 'src', 'test', 'fixtures', 'basic.xlsx'),
+        worksheetIndex: 0,
+        worksheetCount: 2,
+        worksheetName: 'People',
+        otherWorksheetName: 'Inventory',
+    },
+];
+
+async function read_lifecycle_file(
+    file_path: string,
+    variant: LifecycleFileVariant,
+): Promise<LifecycleFileState> {
+    if (variant.format === 'csv') {
+        const rows = fs.readFileSync(file_path, 'utf8').trimEnd().split(/\r?\n/u);
+        return {
+            rowCount: rows.length - 1,
+            values: new Set(rows.flatMap((row) => row.split(','))),
+            worksheetCount: 1,
+        };
+    }
+    const parsed = await parse_xlsx(new Uint8Array(fs.readFileSync(file_path)));
+    const worksheet = parsed.data.sheets[variant.worksheetIndex];
+    if (!worksheet) throw new Error(`missing worksheet ${variant.worksheetIndex}`);
+    const values = new Set<string>();
+    for (const row of worksheet.rows) {
+        for (const cell of row) {
+            if (cell == null) continue;
+            values.add(cell.formatted);
+            values.add(String(cell.raw));
+        }
+    }
+    return {
+        rowCount: worksheet.rowCount,
+        values,
+        worksheetCount: parsed.data.sheets.length,
+    };
+}
+
+async function launch_lifecycle_app(
+    prefix: string,
+    variant: LifecycleFileVariant,
+): Promise<LifecycleApp> {
     const root = isolated_user_data(prefix);
     const user_data = path.join(root, 'user-data');
     fs.mkdirSync(user_data);
-    const csv_path = path.join(root, 'inventory.csv');
-    fs.writeFileSync(csv_path, 'Item,Quantity\nApples,4\n');
+    const file_path = path.join(root, variant.fileName);
+    if (variant.format === 'csv') {
+        fs.writeFileSync(file_path, 'Item,Quantity\nApples,4\n');
+    } else {
+        if (variant.fixturePath === undefined) {
+            throw new Error(`${variant.name} has no Excel fixture`);
+        }
+        fs.copyFileSync(variant.fixturePath, file_path);
+    }
+    const initial_state = await read_lifecycle_file(file_path, variant);
+    if (initial_state.worksheetCount !== variant.worksheetCount) {
+        throw new Error(
+            `${variant.name} has ${initial_state.worksheetCount} worksheets, expected ${variant.worksheetCount}`,
+        );
+    }
     let app: ElectronApplication | undefined;
     try {
-        app = await launch_app(user_data, [csv_path]);
+        app = await launch_app(user_data, [file_path]);
         await app.evaluate(({ dialog }) => {
             const main = globalThis as typeof globalThis & {
                 __tableViewerShutdownDialogs?: Array<{
@@ -82,7 +181,23 @@ async function launch_lifecycle_app(prefix: string): Promise<LifecycleApp> {
             candidate.url().startsWith(VIEWER_URL_PREFIX));
         if (!page) throw new Error('missing viewer window');
         await page.locator(GRID_CANVAS).first().waitFor({ state: 'visible' });
-        return { app, root, userData: user_data, csvPath: csv_path, page };
+        if (variant.worksheetName !== undefined) {
+            const worksheet = page.getByRole('button', {
+                name: variant.worksheetName,
+                exact: true,
+            });
+            await worksheet.click();
+            await expect(worksheet).toHaveClass(/active/);
+        }
+        return {
+            app,
+            root,
+            userData: user_data,
+            filePath: file_path,
+            fileVariant: variant,
+            initialRowCount: initial_state.rowCount,
+            page,
+        };
     } catch (error) {
         await force_exit(app).catch(() => {});
         fs.rmSync(root, { recursive: true, force: true });
@@ -243,10 +358,6 @@ async function stage_pending_change(
     await expect(edit_toggle).toHaveClass(/has-unsaved/);
 }
 
-function csv_data_row_count(csv_path: string): number {
-    return fs.readFileSync(csv_path, 'utf8').trimEnd().split(/\r?\n/u).length - 1;
-}
-
 async function force_exit(app: ElectronApplication | undefined): Promise<void> {
     if (!app) return;
     let process_handle: ReturnType<ElectronApplication['process']>;
@@ -267,11 +378,12 @@ async function force_exit(app: ElectronApplication | undefined): Promise<void> {
 
 async function with_lifecycle_app(
     prefix: string,
+    variant: LifecycleFileVariant,
     run: (launched: LifecycleApp) => Promise<void>,
 ): Promise<void> {
     let launched: LifecycleApp | undefined;
     try {
-        launched = await launch_lifecycle_app(prefix);
+        launched = await launch_lifecycle_app(prefix, variant);
         await run(launched);
     } finally {
         await force_exit(launched?.app);
@@ -324,54 +436,124 @@ async function close_viewer(launched: LifecycleApp): Promise<void> {
     }
 }
 
+async function switch_worksheets(launched: LifecycleApp): Promise<void> {
+    const { worksheetName, otherWorksheetName } = launched.fileVariant;
+    if (worksheetName === undefined || otherWorksheetName === undefined) return;
+    const other = launched.page.getByRole('button', {
+        name: otherWorksheetName,
+        exact: true,
+    });
+    await other.click();
+    await expect(other).toHaveClass(/active/);
+    const original = launched.page.getByRole('button', {
+        name: worksheetName,
+        exact: true,
+    });
+    await original.click();
+    await expect(original).toHaveClass(/active/);
+}
+
 async function leave_edit_mode(
     launched: LifecycleApp,
     scenario: PendingChangeScenario,
 ): Promise<void> {
     const edit_toggle = launched.page.getByRole('button', { name: 'Edit' });
     await edit_toggle.click();
-    await expect(edit_toggle).toHaveAttribute('aria-pressed', 'false');
-    await expect.poll(() => csv_data_row_count(launched.csvPath))
-        .toBe(1 + scenario.appendedRows);
-    const saved = fs.readFileSync(launched.csvPath, 'utf8');
-    for (const marker of scenario.savedMarkers) expect(saved).toContain(marker);
+    try {
+        await expect(edit_toggle).toHaveAttribute('aria-pressed', 'false');
+    } catch (error) {
+        const state = await shutdown_state(launched.app);
+        const detail = error instanceof Error ? error.message : String(error);
+        throw new Error(
+            `${detail}\nCaptured shutdown dialogs: ${JSON.stringify(state.dialogs)}`,
+        );
+    }
+    await expect.poll(async () => (
+        await read_lifecycle_file(launched.filePath, launched.fileVariant)
+    ).rowCount).toBe(launched.initialRowCount + scenario.appendedRows);
+    const saved = await read_lifecycle_file(launched.filePath, launched.fileVariant);
+    for (const marker of scenario.savedMarkers) expect(saved.values).toContain(marker);
     await expect(edit_toggle).not.toHaveClass(/has-unsaved/);
     const state = await shutdown_state(launched.app);
     expect(state.viewerCount).toBe(1);
     expect(state.dialogs.some((dialog) => dialog.buttons?.join('|')
         === 'Save Edits|Discard Edits|Stay in Edit Mode')).toBe(true);
+    await switch_worksheets(launched);
 }
 
-for (const scenario of pending_change_scenarios) {
-    test(`leaves edit mode after ${scenario.name}`, async () => {
-        await with_lifecycle_app(`tv-edit-exit-${scenario.id}-`, async (launched) => {
-            await stage_pending_change(launched.page, scenario);
-            await leave_edit_mode(launched, scenario);
-        });
-    });
+for (const variant of lifecycle_file_variants) {
+    test.describe(variant.name, () => {
+        for (const scenario of pending_change_scenarios) {
+            test(`leaves Edit mode after ${scenario.name}`, async () => {
+                await with_lifecycle_app(
+                    `tv-edit-exit-${variant.id}-${scenario.id}-`,
+                    variant,
+                    async (launched) => {
+                        await stage_pending_change(launched.page, scenario);
+                        await leave_edit_mode(launched, scenario);
+                    },
+                );
+            });
 
-    test(`closes the viewer after ${scenario.name}`, async () => {
-        await with_lifecycle_app(`tv-window-close-${scenario.id}-`, async (launched) => {
-            await stage_pending_change(launched.page, scenario);
-            await close_viewer(launched);
+            test(`closes the viewer after ${scenario.name}`, async () => {
+                await with_lifecycle_app(
+                    `tv-window-close-${variant.id}-${scenario.id}-`,
+                    variant,
+                    async (launched) => {
+                        await stage_pending_change(launched.page, scenario);
+                        await close_viewer(launched);
+                    },
+                );
+            });
+        }
+
+        test('leaves a clean Edit mode', async () => {
+            await with_lifecycle_app(
+                `tv-clean-edit-exit-${variant.id}-`,
+                variant,
+                async (launched) => {
+                    const edit_toggle = launched.page.getByRole('button', {
+                        name: 'Edit',
+                    });
+                    await edit_toggle.click();
+                    await expect(edit_toggle).toHaveAttribute('aria-pressed', 'true');
+                    await edit_toggle.click();
+                    await expect(edit_toggle).toHaveAttribute('aria-pressed', 'false');
+                    await expect(edit_toggle).not.toHaveClass(/has-unsaved/);
+                    const state = await shutdown_state(launched.app);
+                    expect(state.dialogs).toEqual([]);
+                    await switch_worksheets(launched);
+                },
+            );
+        });
+
+        test('the app quits after staging a filled composer row', async () => {
+            const scenario = pending_change_scenarios.find(
+                ({ id }) => id === 'composer-filled',
+            );
+            if (!scenario) throw new Error('missing filled composer scenario');
+            await with_lifecycle_app(
+                `tv-composer-quit-${variant.id}-`,
+                variant,
+                async (launched) => {
+                    await stage_pending_change(launched.page, scenario);
+                    const process_handle = launched.app.process();
+                    await launched.app.evaluate(({ app: electron_app }) => {
+                        electron_app.quit();
+                    }).catch(() => {
+                        // The quit can close the harness connection first. The
+                        // process and reader-token polls below are the shutdown signals.
+                    });
+                    await expect.poll(
+                        () => process_handle.exitCode !== null
+                            || process_handle.signalCode !== null,
+                        { timeout: 30_000 },
+                    ).toBe(true);
+                    await expect.poll(
+                        () => reader_tokens(launched.userData).length,
+                    ).toBe(0);
+                },
+            );
         });
     });
 }
-
-test('the app quits after staging a filled composer row', async () => {
-    const scenario = pending_change_scenarios.find(({ id }) => id === 'composer-filled');
-    if (!scenario) throw new Error('missing filled composer scenario');
-    await with_lifecycle_app('tv-composer-quit-', async (launched) => {
-        await stage_pending_change(launched.page, scenario);
-        const process_handle = launched.app.process();
-        await launched.app.evaluate(({ app: electron_app }) => electron_app.quit()).catch(() => {
-            // The quit can close the harness connection first. The process and
-            // reader-token polls below are the shutdown signals.
-        });
-        await expect.poll(
-            () => process_handle.exitCode !== null || process_handle.signalCode !== null,
-            { timeout: 30_000 },
-        ).toBe(true);
-        await expect.poll(() => reader_tokens(launched.userData).length).toBe(0);
-    });
-});
