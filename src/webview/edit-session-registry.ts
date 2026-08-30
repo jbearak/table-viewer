@@ -306,10 +306,8 @@ export function create_edit_session_registry(
         readonly appendBasisSourceRowCount: number | undefined;
         readonly tailRemovalCount: number;
     }
-    const source_move_contributions = new Map<
-        EditSessionStore,
-        Map<string, MoveContribution | undefined>
-    >();
+    const source_move_contributions = new Map<EditSessionStore, Map<string, MoveContribution>>();
+    const source_move_orders = new Map<EditSessionStore, Set<string>>();
     const pending_move_projections = new Map<PendingRowStore, PendingMoveProjection>();
     const resolved_move_contributions = new Map<string, readonly XlsxFormulaCellMove[]>();
     const move_contribution_ids_by_sheet = new Map<number, Set<string>>();
@@ -478,12 +476,16 @@ export function create_edit_session_registry(
     };
     const source_move_projection = (
         store: EditSessionStore,
-    ): Map<string, MoveContribution | undefined> => {
-        const contributions = new Map<string, MoveContribution | undefined>();
+    ): Map<string, MoveContribution> => {
+        const contributions = new Map<string, MoveContribution>();
+        const order = new Set<string>();
         for (const [key, entry] of store.snapshot()) {
             const contribution = source_move_contribution(key, entry);
+            if (contribution === undefined) continue;
             contributions.set(key, contribution);
+            order.add(key);
         }
+        source_move_orders.set(store, order);
         return contributions;
     };
     const pending_row_move_projection = (
@@ -653,7 +655,7 @@ export function create_edit_session_registry(
         }
         const canonical = new Map<string, XlsxFormulaCellMove>();
         for (const [sheetIndex, store] of stores) {
-            for (const key of source_move_contributions.get(store)?.keys() ?? []) {
+            for (const key of source_move_orders.get(store) ?? []) {
                 for (const move of resolved_move_contributions.get(
                     source_contribution_id(sheetIndex, key),
                 ) ?? []) canonical.set(move_key(move), move);
@@ -675,7 +677,6 @@ export function create_edit_session_registry(
         for (const [key, contribution] of source_store === undefined
             ? []
             : source_move_contributions.get(source_store) ?? []) {
-            if (contribution === undefined) continue;
             const id = source_contribution_id(sheetIndex, key);
             const moves = resolved_moves(sheetIndex, contribution);
             if (moves.length === 0) continue;
@@ -698,6 +699,7 @@ export function create_edit_session_registry(
     };
     const rebuild_all_formula_move_projections = (): void => {
         source_move_contributions.clear();
+        source_move_orders.clear();
         for (const store of stores.values()) {
             source_move_contributions.set(store, source_move_projection(store));
         }
@@ -807,10 +809,19 @@ export function create_edit_session_registry(
                     );
                 }
                 const cached = source_move_contributions.get(store) ?? new Map();
+                const order = source_move_orders.get(store) ?? new Set<string>();
                 const contribution = source_move_contribution(change.key, entry);
-                if (entry === undefined) cached.delete(change.key);
-                else cached.set(change.key, contribution);
+                if (entry === undefined) {
+                    cached.delete(change.key);
+                    order.delete(change.key);
+                } else if (contribution === undefined) {
+                    cached.delete(change.key);
+                } else {
+                    cached.set(change.key, contribution);
+                    order.add(change.key);
+                }
                 source_move_contributions.set(store, cached);
+                source_move_orders.set(store, order);
                 if (changed_sheet_index !== undefined) {
                     replace_resolved_move_contribution(
                         changed_sheet_index,
@@ -832,6 +843,7 @@ export function create_edit_session_registry(
             unsubscribe();
             subscriptions.delete(store);
             source_move_contributions.delete(store);
+            source_move_orders.delete(store);
         }
     };
     const watch_pending = (store: PendingRowStore) => {
@@ -945,6 +957,7 @@ export function create_edit_session_registry(
             });
             stores.set(sheet_index, created);
             source_move_contributions.set(created, new Map());
+            source_move_orders.set(created, new Set());
             watch(created);
             return created;
         },

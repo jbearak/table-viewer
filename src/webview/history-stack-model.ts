@@ -1258,6 +1258,11 @@ function* expand_saved_pending_snapshot(
     const worksheet_key = worksheet_target_key(change.delta.worksheet);
     const before_rows = change.delta.before.appendedRows;
     const after_rows = change.delta.after.appendedRows;
+    const templates = new Map<string, PendingRowFormatTemplate>();
+    for (const template of change.delta.before.formatTemplates) templates.set(template.id, template);
+    for (const template of change.delta.after.formatTemplates) {
+        if (!templates.has(template.id)) templates.set(template.id, template);
+    }
     const matched_after_ids = new Set<string>();
     const expanded_ids = new Set<string>();
     const row_change = (
@@ -1272,16 +1277,15 @@ function* expand_saved_pending_snapshot(
         if (assignment === undefined
             || worksheet_target_key(assignment.worksheet) !== worksheet_key) return undefined;
         expanded_ids.add(id);
-        if (JSON.stringify(before) === JSON.stringify(after)) return undefined;
+        if (structural_values_equal(before, after)) return undefined;
         const template_ids = new Set([
             before?.formatTemplateId,
             after?.formatTemplateId,
         ].filter((value): value is string => value !== undefined));
-        const templates = [
-            ...change.delta.before.formatTemplates,
-            ...change.delta.after.formatTemplates,
-        ].filter((template, index, all) => template_ids.has(template.id)
-            && all.findIndex((candidate) => candidate.id === template.id) === index);
+        const used_templates = [...template_ids].flatMap((template_id) => {
+            const template = templates.get(template_id);
+            return template === undefined ? [] : [template];
+        });
         return {
             kind: 'rowAppend',
             delta: {
@@ -1291,7 +1295,7 @@ function* expand_saved_pending_snapshot(
                 after,
                 beforeIndex,
                 afterIndex,
-                formatTemplates: templates,
+                formatTemplates: used_templates,
             },
         };
     };
@@ -1599,27 +1603,30 @@ export function rekey_committed_tail_removal_history(
         if (ids === undefined) return;
         const before = change.delta.before.tailRemovals;
         const after = change.delta.after.tailRemovals;
-        if (before.length === 0 || after.length === 0) {
-            for (const removal of before.length === 0 ? after : before) {
-                if (ids.has(removal.appendHistoryId)) visit(removal.appendHistoryId);
+        let before_index = 0;
+        let after_index = 0;
+        while (before_index < before.length || after_index < after.length) {
+            const prior = before[before_index];
+            const next = after[after_index];
+            if (prior !== undefined && next !== undefined
+                && prior.sourceRow === next.sourceRow) {
+                if (prior.appendHistoryId === next.appendHistoryId) {
+                    if (ids.has(prior.appendHistoryId)
+                        && !structural_values_equal(prior, next)) visit(prior.appendHistoryId);
+                } else {
+                    if (ids.has(prior.appendHistoryId)) visit(prior.appendHistoryId);
+                    if (ids.has(next.appendHistoryId)) visit(next.appendHistoryId);
+                }
+                before_index += 1;
+                after_index += 1;
+            } else if (next === undefined
+                || (prior !== undefined && prior.sourceRow < next.sourceRow)) {
+                if (ids.has(prior.appendHistoryId)) visit(prior.appendHistoryId);
+                before_index += 1;
+            } else {
+                if (ids.has(next.appendHistoryId)) visit(next.appendHistoryId);
+                after_index += 1;
             }
-            return;
-        }
-        const before_committed = new Map<string, PendingTailRemoval>();
-        const after_committed = new Map<string, PendingTailRemoval>();
-        for (const removal of before) {
-            if (ids.has(removal.appendHistoryId)) {
-                before_committed.set(removal.appendHistoryId, removal);
-            }
-        }
-        for (const removal of after) {
-            if (ids.has(removal.appendHistoryId)) {
-                after_committed.set(removal.appendHistoryId, removal);
-            }
-        }
-        for (const id of new Set([...before_committed.keys(), ...after_committed.keys()])) {
-            if (JSON.stringify(before_committed.get(id) ?? null)
-                !== JSON.stringify(after_committed.get(id) ?? null)) visit(id);
         }
     };
     const preflight_history = (): boolean => {
@@ -2546,15 +2553,29 @@ function structural_values_equal(left: unknown, right: unknown): boolean {
     if (typeof left !== 'object' || left === null
         || typeof right !== 'object' || right === null) return false;
     if (Array.isArray(left) || Array.isArray(right)) {
-        return Array.isArray(left) && Array.isArray(right)
-            && left.length === right.length
-            && left.every((value, index) => structural_values_equal(value, right[index]));
+        if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) {
+            return false;
+        }
+        for (let index = 0; index < left.length; index += 1) {
+            if (!structural_values_equal(left[index], right[index])) return false;
+        }
+        return true;
     }
-    const left_entries = Object.entries(left);
-    const right_entries = Object.entries(right);
-    return left_entries.length === right_entries.length
-        && left_entries.every(([key, value]) => Object.hasOwn(right, key)
-            && structural_values_equal(value, (right as Record<string, unknown>)[key]));
+    let left_count = 0;
+    let right_count = 0;
+    for (const key in left) {
+        if (!Object.hasOwn(left, key)) continue;
+        left_count += 1;
+        if (!Object.hasOwn(right, key)
+            || !structural_values_equal(
+                (left as Record<string, unknown>)[key],
+                (right as Record<string, unknown>)[key],
+            )) return false;
+    }
+    for (const key in right) {
+        if (Object.hasOwn(right, key)) right_count += 1;
+    }
+    return left_count === right_count;
 }
 
 /** Snapshot structural input once, without retaining caller-owned string views. */

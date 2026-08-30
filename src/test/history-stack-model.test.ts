@@ -32,7 +32,11 @@ import {
     type SavedHistoryRowAssignment,
     type SavedTailRemovalCommit,
 } from '../webview/history-stack-model';
-import type { PendingAppendedRow, PendingTailRemoval } from '../pending-changes';
+import type {
+    PendingAppendedRow,
+    PendingRowFormatTemplate,
+    PendingTailRemoval,
+} from '../pending-changes';
 
 const SHEET: WorksheetTarget = { sheetIndex: 0, sheetName: 'Data', worksheetId: 'rId1' };
 const LINK = { kind: 'external', target: 'https://example.com/' } as const;
@@ -1030,14 +1034,23 @@ describe('rekeyed history bounds', () => {
 
     it('stops walking saved pending rows at the hard bound', () => {
         let row_reads = 0;
+        let row_payload_reads = 0;
         const rows = Array.from({ length: 10_000 }, (_unused, index) =>
-            Object.defineProperty({
-                cells: {},
+            Object.defineProperties({
                 formatTemplateId: 'plain',
                 createdOrder: index + 1,
-            }, 'id', {
-                enumerable: true,
-                get: () => { row_reads += 1; return `pending-${index}`; },
+            }, {
+                id: {
+                    enumerable: true,
+                    get: () => { row_reads += 1; return `pending-${index}`; },
+                },
+                cells: {
+                    enumerable: true,
+                    get: () => {
+                        row_payload_reads += 1;
+                        return { 0: { value: 'x'.repeat(8 * 1024 * 1024) } };
+                    },
+                },
             }) as PendingAppendedRow);
         const action: HistoryAction = {
             label: 'Discard changes',
@@ -1081,6 +1094,63 @@ describe('rekeyed history bounds', () => {
 
         expect(rekeyed.barrier?.reason).toBe('action-too-large');
         expect(row_reads).toBeLessThanOrEqual(5);
+        expect(row_payload_reads).toBe(0);
+    });
+
+    it('indexes saved-row templates once before a bounded expansion', () => {
+        let template_id_reads = 0;
+        const templates = Array.from({ length: 10_000 }, (_unused, index) =>
+            Object.defineProperty({ format: { kind: 'none' as const } }, 'id', {
+                enumerable: true,
+                get: () => { template_id_reads += 1; return `template-${index}`; },
+            }) as PendingRowFormatTemplate);
+        const row: PendingAppendedRow = {
+            id: 'pending-0',
+            cells: {},
+            formatTemplateId: 'template-0',
+            createdOrder: 1,
+        };
+        const action: HistoryAction = {
+            label: 'Discard changes',
+            changes: [{
+                kind: 'pendingRows',
+                delta: {
+                    worksheet: SHEET,
+                    before: {
+                        formatTemplates: templates,
+                        appendedRows: [row],
+                        tailRemovals: [],
+                        conflicts: [],
+                    },
+                    after: {
+                        formatTemplates: [],
+                        appendedRows: [],
+                        tailRemovals: [],
+                        conflicts: [],
+                    },
+                },
+            }],
+        };
+        const state: HistoryStackState = {
+            ...empty_history_stack(),
+            undoStack: [{ action, cellCount: 0, byteCost: 0, epoch: 0, id: {}, moves: 0 }],
+        };
+        const tiny: HistoryBounds = {
+            maxActions: 100,
+            maxCells: 1_000_000,
+            softMaxBytes: 1,
+            hardMaxBytes: 1,
+        };
+
+        rekey_saved_appended_row_history(state, [{
+            worksheet: SHEET,
+            pendingRowId: row.id,
+            sourceRow: 0,
+            savedFingerprint: 'fingerprint-0',
+            savedRow: { cells: {}, format: { kind: 'none' } },
+        }], tiny);
+
+        expect(template_id_reads).toBeLessThanOrEqual(10_001);
     });
 
     it('indexes committed removals once and refuses before reading saved payloads', () => {
@@ -1212,6 +1282,66 @@ describe('rekeyed history bounds', () => {
         expect(rekeyed.barrier?.reason).toBe('action-too-large');
         expect(row_reads).toBeLessThanOrEqual(2);
         expect(saved_row_reads).toBe(0);
+    });
+
+    it('stops a two-sided committed-removal merge at the hard bound', () => {
+        let removal_id_reads = 0;
+        const removal = (index: number, fingerprint: string): PendingTailRemoval =>
+            Object.defineProperty({
+                sourceRow: index,
+                savedFingerprint: fingerprint,
+                savedRow: { cells: {}, format: { kind: 'none' as const } },
+            }, 'appendHistoryId', {
+                enumerable: true,
+                get: () => { removal_id_reads += 1; return `saved-${index}`; },
+            }) as PendingTailRemoval;
+        const before = Array.from(
+            { length: 10_000 },
+            (_unused, index) => removal(index, `before-${index}`),
+        );
+        const after = Array.from(
+            { length: 10_000 },
+            (_unused, index) => removal(index, index === 0 ? 'changed' : `before-${index}`),
+        );
+        const action: HistoryAction = {
+            label: 'Remove appended rows',
+            changes: [{
+                kind: 'pendingRows',
+                delta: {
+                    worksheet: SHEET,
+                    before: {
+                        formatTemplates: [],
+                        appendedRows: [],
+                        tailRemovals: before,
+                        conflicts: [],
+                    },
+                    after: {
+                        formatTemplates: [],
+                        appendedRows: [],
+                        tailRemovals: after,
+                        conflicts: [],
+                    },
+                },
+            }],
+        };
+        const state: HistoryStackState = {
+            ...empty_history_stack(),
+            undoStack: [{ action, cellCount: 0, byteCost: 0, epoch: 0, id: {}, moves: 0 }],
+        };
+        const tiny: HistoryBounds = {
+            maxActions: 100,
+            maxCells: 1_000_000,
+            softMaxBytes: 1,
+            hardMaxBytes: 1,
+        };
+
+        const rekeyed = rekey_committed_tail_removal_history(state, [{
+            worksheet: SHEET,
+            removal: before[0],
+        }], tiny);
+
+        expect(rekeyed.barrier?.reason).toBe('action-too-large');
+        expect(removal_id_reads).toBeLessThanOrEqual(10);
     });
 });
 
