@@ -87,28 +87,11 @@ async function take_dialogs(): Promise<CapturedDialog[]> {
 
 async function append_blank_row(expected_pending_row_number: number): Promise<void> {
     const rows = page.locator('tbody tr');
-    if (expected_pending_row_number === 1) {
-        const last_data_cell = page.locator(
-            `#glide-cell-1-${initial_accessible_row_count - 2}`,
-        );
-        await last_data_cell.focus();
-        await expect(last_data_cell).toBeFocused();
-        await page.keyboard.press('Enter');
-        const editor = page.locator('.cell-editor-input');
-        await expect(editor).toBeVisible();
-        await editor.press('Enter');
-        await expect(rows).toHaveCount(initial_accessible_row_count + 1);
-        return;
-    }
-    const trailing_append_cell = rows.last().locator('[id^="glide-cell-1-"]');
-    await expect(trailing_append_cell).toBeAttached();
-    // The semantic gridcell is deliberately visually hidden behind the canvas.
-    // Select and click that exact trailing row instead of guessing canvas pixels
-    // near the bottom of the window.
-    await trailing_append_cell.focus();
-    await expect(trailing_append_cell).toBeFocused();
-    await expect(trailing_append_cell).toHaveAttribute('aria-selected', 'true');
-    await trailing_append_cell.dispatchEvent('click');
+    await page.getByRole('button', { name: 'Add rows' }).click();
+    const count = page.locator('#append-dock-count');
+    await expect(count).toBeVisible();
+    await count.fill('1');
+    await page.getByRole('button', { name: 'Add row', exact: true }).click();
     await expect(rows).toHaveCount(initial_accessible_row_count + expected_pending_row_number);
 }
 
@@ -155,7 +138,7 @@ test('saved appended rows settle cleanly and an external Git reset reloads them'
     const edit_toggle = page.getByRole('button', { name: 'Edit' });
     await edit_toggle.click();
     await expect(edit_toggle).toHaveAttribute('aria-pressed', 'true');
-    await expect(page.locator('tbody tr')).toHaveCount(original_row_count);
+    await expect(page.locator('tbody tr')).toHaveCount(original_row_count - 1);
     initial_accessible_row_count = await page.locator('tbody tr').count();
 
     for (let row = 1; row <= 7; row += 1) await append_blank_row(row);
@@ -165,7 +148,7 @@ test('saved appended rows settle cleanly and an external Git reset reloads them'
     await expect.poll(workbook_row_count).toBe(original_row_count + 7);
     await expect(edit_toggle).toHaveAttribute('aria-pressed', 'false');
     await expect(page.locator('tbody tr')).toHaveCount(
-        initial_accessible_row_count + 7 - 1,
+        initial_accessible_row_count + 7,
     );
     await expect(edit_toggle).not.toHaveClass(/has-unsaved/);
     expect(await take_dialogs()).toEqual([{

@@ -3869,6 +3869,7 @@ export function GridShell({
         // two structural publications: the row reached the host blank, then
         // again filled, which the grid showed as a flicker and which left the
         // second payload outstanding.
+        let gesture_order: number | undefined;
         const seed_cells = rows.map((values) => {
             const cells: Record<number, PendingRowCell> = {};
             // Only the columns on screen: a draft keeps values for columns that
@@ -3884,7 +3885,7 @@ export function GridShell({
                 cells[source_column] = {
                     value: parsed.text,
                     ...(parsed.rich === undefined ? {} : { valueRuns: parsed.rich }),
-                    valueEditOrder: issue_value_edit_order(),
+                    valueEditOrder: gesture_order ??= issue_value_edit_order(),
                     ...(edit_syntax === 'markdown'
                         && formula_reference_bases !== undefined
                         && xlsx_edit_writes_formula(parsed.text, parsed.rich?.runs)

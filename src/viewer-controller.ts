@@ -68,7 +68,10 @@ import {
 } from './formula-calculation';
 import { is_xlsx_formula_edit, type XlsxCellEdit } from './xlsx-cell-write';
 import { pending_formula_cells_referencing_provisional_rows } from './pending-formula-rebase';
-import { validate_dirty_bases } from './csv-base-validation';
+import {
+    base_validation_save_rejection,
+    validate_dirty_bases,
+} from './csv-base-validation';
 import { cell_edit_base } from './cell-edit-model';
 import { get_raw_cell_text } from './cell-display';
 import { cell_key, parse_cell_key } from './cell-key';
@@ -385,6 +388,8 @@ export interface ViewerControllerOptions {
         register_webview_message_receiver(
             receiver: (message: WebviewMessage) => Promise<void>,
         ): void;
+        /** Observe the exact work set captured by a controller drain iteration. */
+        on_controller_drain_wait?(work: readonly string[]): void;
     };
 }
 
@@ -5482,24 +5487,7 @@ export function attach_viewer(
         if (validation.type === 'valid') return undefined;
         return {
             dirtyEdits: dirty_edits,
-            rejection: validation.type === 'removedRows'
-                ? {
-                    reason: 'rowsRemoved',
-                    worksheetOperationIndex: 0,
-                    keys: [...validation.keys, ...(validation.changedKeys ?? [])],
-                    ...(validation.changedKeys !== undefined
-                        ? {
-                            removedKeys: validation.keys,
-                            observedBases: validation.observedBases,
-                        }
-                        : {}),
-                }
-                : {
-                    reason: 'baseMismatch',
-                    worksheetOperationIndex: 0,
-                    keys: validation.keys,
-                    observedBases: validation.observedBases,
-                },
+            rejection: base_validation_save_rejection(validation, 0),
         };
     }
 
@@ -9187,24 +9175,7 @@ export function attach_viewer(
                     observedBases: {},
                 };
             if (validation.type === 'valid') continue;
-            rejection = validation.type === 'removedRows'
-                ? {
-                    reason: 'rowsRemoved',
-                    worksheetOperationIndex: index,
-                    keys: [...validation.keys, ...(validation.changedKeys ?? [])],
-                    ...(validation.changedKeys !== undefined
-                        ? {
-                            removedKeys: validation.keys,
-                            observedBases: validation.observedBases,
-                        }
-                        : {}),
-                }
-                : {
-                    reason: 'baseMismatch',
-                    worksheetOperationIndex: index,
-                    keys: validation.keys,
-                    observedBases: validation.observedBases,
-                };
+            rejection = base_validation_save_rejection(validation, index);
             break;
         }
         if (rejection) {
@@ -13856,15 +13827,30 @@ export function attach_viewer(
             const transform_tails = [...transform_commit_barriers]
                 .map((barrier) => barrier.completion);
             const compare_tails = [...compare_diff_sidecars];
-            await Promise.all([
-                edit_tail,
-                save_tail,
-                disposal_release_tail,
-                layout_tail,
-                append_tail,
-                ...transform_tails,
-                ...compare_tails,
-            ]);
+            const drain_work: Array<{
+                readonly kind: string;
+                readonly completion: Promise<unknown>;
+            }> = [
+                { kind: 'editWrites', completion: edit_tail },
+                { kind: 'save', completion: save_tail },
+                { kind: 'disposalRelease', completion: disposal_release_tail },
+                { kind: 'layoutWrite', completion: layout_tail },
+                ...transform_tails.map((completion) => ({
+                    kind: 'transformCommit',
+                    completion,
+                })),
+                ...compare_tails.map((completion) => ({
+                    kind: 'compareDiff',
+                    completion,
+                })),
+            ];
+            if (append_tail !== undefined) {
+                drain_work.push({ kind: 'appendAdmission', completion: append_tail });
+            }
+            options.integrationTestPort?.on_controller_drain_wait?.(
+                Object.freeze(drain_work.map(({ kind }) => kind)),
+            );
+            await Promise.all(drain_work.map(({ completion }) => completion));
             if (
                 edit_tail === pending_edit_writes
                 && save_tail === active_save_drain

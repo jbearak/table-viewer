@@ -39,6 +39,7 @@ import {
     dirty_entry_base_formatting_unknown,
     dirty_entry_observed_base,
     make_observed_file_base,
+    type CsvCellSaveRejection,
     type CsvDirtyMap,
     type CsvObservedFileBase,
 } from './types';
@@ -56,6 +57,36 @@ export type BaseValidationOutcome =
         readonly changedKeys?: readonly string[];
         readonly observedBases?: Readonly<Record<string, CsvObservedFileBase>>;
     };
+
+/** Convert one failed base validation into the renderer's save rejection wire shape. */
+export function base_validation_save_rejection(
+    validation: Exclude<BaseValidationOutcome, { readonly type: 'valid' }>,
+    worksheet_operation_index: number,
+): CsvCellSaveRejection {
+    switch (validation.type) {
+        case 'removedRows':
+            return {
+                reason: 'rowsRemoved',
+                worksheetOperationIndex: worksheet_operation_index,
+                keys: [...validation.keys, ...(validation.changedKeys ?? [])],
+                ...(validation.changedKeys === undefined ? {} : {
+                    removedKeys: validation.keys,
+                    observedBases: validation.observedBases,
+                }),
+            };
+        case 'conflicts':
+            return {
+                reason: 'baseMismatch',
+                worksheetOperationIndex: worksheet_operation_index,
+                keys: validation.keys,
+                observedBases: validation.observedBases,
+            };
+        default: {
+            const exhaustive: never = validation;
+            return exhaustive;
+        }
+    }
+}
 
 /** Formatting halves of a base comparison, texts already known equal. An
  *  absent side means "plain", so a plain-vs-plain cell is equal without

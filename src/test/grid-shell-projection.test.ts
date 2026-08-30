@@ -7059,6 +7059,10 @@ describe('GridShell append composer', () => {
             field('append-composer-0-0') as HTMLInputElement,
             'first',
         ));
+        await act(async () => set_input_value(
+            field('append-composer-0-1') as HTMLInputElement,
+            'first right',
+        ));
         await act(async () => { button('Add another row').click(); });
         await act(async () => set_input_value(
             field('append-composer-1-0') as HTMLInputElement,
@@ -7069,6 +7073,13 @@ describe('GridShell append composer', () => {
 
         expect(pending.snapshot().appendedRows.map((row) => row.cells[0]?.value))
             .toEqual(['first', 'second']);
+        expect(pending.snapshot().appendedRows[0]?.cells[2]?.value).toBe('first right');
+        const value_edit_orders = pending.snapshot().appendedRows.flatMap((row) =>
+            Object.values(row.cells).map((cell) => cell.valueEditOrder));
+        expect(value_edit_orders).toHaveLength(3);
+        expect(value_edit_orders.every((order) =>
+            Number.isSafeInteger(order))).toBe(true);
+        expect(new Set(value_edit_orders).size).toBe(1);
         expect(history.snapshot().undoStack.map((entry) => entry.action.label))
             .toEqual(['Compose 2 rows']);
     });

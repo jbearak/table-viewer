@@ -32,12 +32,25 @@ describe('append admission at the close boundary', () => {
 
         const store = versioned_state_store().store;
         const panel = vscode_mock.window.createWebviewPanel('tableViewer.editor', 'table');
+        const drain_reached_append_wait = deferred<readonly string[]>();
         const controller = attach_viewer(
             panel as unknown as Parameters<typeof attach_viewer>[0],
             vscode_mock.Uri.file('/tmp/composer-close-race.csv') as unknown as vscode.Uri,
             with_in_memory_authority_transactions(store),
             csv_table_profile(),
             fake_viewer_host,
+            {
+                integrationTestPort: {
+                    on_host_message() {},
+                    on_webview_message() {},
+                    register_webview_message_receiver() {},
+                    on_controller_drain_wait(work) {
+                        if (work.includes('appendAdmission')) {
+                            drain_reached_append_wait.resolve(work);
+                        }
+                    },
+                },
+            },
         );
         panel.onDidDispose(() => controller.dispose());
 
@@ -87,7 +100,7 @@ describe('append admission at the close boundary', () => {
 
         let drained = false;
         const close_drain = controller.drain().then(() => { drained = true; });
-        await new Promise<void>((resolve) => { setImmediate(resolve); });
+        expect(await drain_reached_append_wait.promise).toContain('appendAdmission');
         const drained_while_append_was_blocked = drained;
 
         delivery_gate.resolve();
