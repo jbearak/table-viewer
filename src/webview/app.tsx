@@ -90,7 +90,11 @@ import {
     retarget_renamed_structured_formula,
 } from '../xlsx-formula';
 import { xlsx_edit_writes_formula } from '../xlsx-cell-value';
-import { MAX_WORKBOOK_FORMULAS } from '../spreadsheet-safety';
+import {
+    MAX_SHEET_ROWS,
+    MAX_WORKBOOK_FORMULAS,
+    UNBOUNDED_SHEET_ROWS,
+} from '../spreadsheet-safety';
 import { capture_pending_formula_reference_bases } from '../pending-formula-rebase';
 import {
     classify_snapshot,
@@ -135,6 +139,10 @@ import {
     type PendingRowFocus,
     type SavedRowFocus,
 } from './grid-shell';
+import {
+    EMPTY_APPEND_COMPOSER_DRAFT,
+    type AppendComposerDraft,
+} from './append-composer';
 import {
     clamp_sheet_index,
     trim_sheet_state_array,
@@ -730,8 +738,18 @@ export function App(): React.JSX.Element {
     const [csv_editing_supported, set_csv_editing_supported] = useState(false);
     // 'markdown' on xlsx: cell text edits as inline markup (see cell-edit-model).
     const [edit_syntax, set_edit_syntax] = useState<'plain' | 'markdown'>('plain');
+    // The source's append row ceiling, resolved host-side by
+    // `append_row_ceiling_for`. `null` on the wire means "no ceiling" and is
+    // widened to Infinity here; absent means an older host, which reads as the
+    // worksheet ceiling every format used to be checked against.
+    const [append_row_ceiling, set_append_row_ceiling] = useState(MAX_SHEET_ROWS);
     const [csv_edit_session_id, set_csv_edit_session_id_state] = useState<string>();
     const csv_edit_session_id_ref = useRef<string>();
+    const append_composer_drafts_ref = useRef<Map<
+        string,
+        { sessionId: string; schema: string; draft: AppendComposerDraft }
+    >>(new Map());
+    const [, set_append_composer_draft_revision] = useState(0);
     /**
      * The edit *pointer*: the worksheet the workbook-scoped session is
      * currently editing on screen. The dirty maps live per sheet in the
@@ -1232,6 +1250,7 @@ export function App(): React.JSX.Element {
             pending_edit_durability.retire(previous);
             edit_session_registry_ref.current?.retire_parked();
         }
+        if (previous !== next) append_composer_drafts_ref.current.clear();
         csv_edit_session_id_ref.current = next;
         set_csv_edit_session_id_state(next);
     }, []);
@@ -4098,6 +4117,12 @@ export function App(): React.JSX.Element {
                         snapshot.capabilities.csvEditingSupported,
                     );
                     set_edit_syntax(snapshot.capabilities.editSyntax ?? 'plain');
+                    const ceiling = snapshot.capabilities.appendRowCeiling;
+                    set_append_row_ceiling(
+                        ceiling === undefined
+                            ? MAX_SHEET_ROWS
+                            : ceiling ?? UNBOUNDED_SHEET_ROWS,
+                    );
 
                     // Acknowledge the exact delivered identity before an optional
                     // corrective CAS write.
@@ -4764,7 +4789,10 @@ export function App(): React.JSX.Element {
             // outside the tree, so its cleanup releases the captured row without
             // committing the text. Fold it first, as the transform and refresh
             // remounts do; the store lives above the grid and keeps it.
-            if (editing_ref.current?.commit_live_edit() === false) return;
+            if (
+                edit_mode_ref.current
+                && editing_ref.current?.commit_live_edit() === false
+            ) return;
             set_filter_editor(null);
             set_grid_focus_restore(null);
             set_toolbar_focus_restore(null);
@@ -7318,7 +7346,10 @@ export function App(): React.JSX.Element {
     const current_sheet = meta?.sheets[active_sheet_index];
     const active_pending_row_store = edit_session_registry_ref.current!
         .pending_rows_for_sheet(active_sheet_index);
-    const formula_reference_bases = useCallback((value: string) =>
+    const formula_reference_bases = useCallback((
+        value: string,
+        additional_pending_rows = 0,
+    ) =>
         capture_pending_formula_reference_bases(
             value,
             active_sheet_index,
@@ -7327,6 +7358,7 @@ export function App(): React.JSX.Element {
                 edit_session_registry_ref.current!
                     .pending_rows_for_sheet(index)
                     .snapshot()),
+            { [active_sheet_index]: additional_pending_rows },
         ), [active_sheet_index, meta]);
     const subscribe_active_pending_conflicts = useCallback((listener: () => void) =>
         active_pending_row_store.subscribe((change) => {
@@ -8014,6 +8046,23 @@ export function App(): React.JSX.Element {
         sheetName: current_sheet.name,
         worksheetId: current_sheet.worksheetId,
     });
+    const held_composer_draft = append_composer_drafts_ref.current.get(
+        active_scroll_position_key,
+    );
+    const active_composer_draft = held_composer_draft !== undefined
+        && held_composer_draft.sessionId === csv_edit_session_id
+        && held_composer_draft.schema === current_schema
+        ? held_composer_draft.draft
+        : EMPTY_APPEND_COMPOSER_DRAFT;
+    const handle_append_composer_draft_change = (draft: AppendComposerDraft) => {
+        if (csv_edit_session_id === undefined) return;
+        append_composer_drafts_ref.current.set(active_scroll_position_key, {
+            sessionId: csv_edit_session_id,
+            schema: current_schema,
+            draft,
+        });
+        set_append_composer_draft_revision((revision) => revision + 1);
+    };
 
     const grid = (
         <GridShell
@@ -8063,6 +8112,7 @@ export function App(): React.JSX.Element {
             highlight_in_flight={highlight_request_pending}
             append_in_flight={append_request_pending}
             csv_editable={csv_editable}
+            append_row_ceiling={append_row_ceiling}
             edit_syntax={edit_syntax}
             edit_session_id={csv_edit_session_id}
             value_edit_order_floor={value_edit_order_floor}
@@ -8077,6 +8127,8 @@ export function App(): React.JSX.Element {
             pending_row_store={edit_session_registry_ref.current!.pending_rows_for_sheet(
                 active_sheet_index,
             )}
+            append_composer_draft={active_composer_draft}
+            on_append_composer_draft_change={handle_append_composer_draft_change}
             on_append_rows={request_append_rows}
             history_store={history_store_ref.current!}
             gestures_admitted={edit_gestures_admitted}

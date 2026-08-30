@@ -1,8 +1,12 @@
 import {
     dirty_entries_equal,
+    dirty_entry_observed_base,
     dirty_entry_value_changed,
+    dirty_entry_with_observed_file_base,
     is_strict_wire_dirty_entry,
     is_wire_save_correlation,
+    make_observed_file_base,
+    observed_file_bases_equal,
     sanitized_wire_save_maps,
     sanitized_wire_worksheet_target,
     save_lifecycle_correlation,
@@ -372,10 +376,43 @@ export function remove_operation_owned_pending_edits(
         // must survive the tombstone. (The legacy string form carries no runs,
         // so equal value is the whole identity there.) A malformed pending entry
         // is retained rather than throwing or being mistaken for saved state.
+        const observed_saved_value = (() => {
+            if (
+                owned === undefined
+                || valid_pending?.observedBase === undefined
+                || !dirty_entries_equal(
+                    valid_pending,
+                    dirty_entry_with_observed_file_base(
+                        owned,
+                        valid_pending.observedBase,
+                    ),
+                )
+            ) return false;
+            const before_save = dirty_entry_observed_base(owned);
+            const wrote_value = Object.prototype.hasOwnProperty.call(
+                worksheet.edits,
+                key,
+            );
+            const saved_file_side = make_observed_file_base(
+                wrote_value ? owned.value : before_save.value,
+                wrote_value ? owned.valueRuns : before_save.runs,
+                owned.link === undefined ? undefined : owned.link,
+            );
+            return observed_file_bases_equal(
+                valid_pending.observedBase,
+                saved_file_side,
+            );
+        })();
         const matches = owned !== undefined && (typeof pending === 'string'
             ? pending === owned.value
             : valid_pending !== undefined
-                && dirty_entries_equal(valid_pending, owned));
+                && (
+                    dirty_entries_equal(valid_pending, owned)
+                    // A reload can observe the file write before its success
+                    // terminal arrives. That observation is still the saved
+                    // operation's entry, not a newer user edit.
+                    || observed_saved_value
+                ));
         if (matches) {
             retained ??= { ...pending_edits };
             delete retained[key];

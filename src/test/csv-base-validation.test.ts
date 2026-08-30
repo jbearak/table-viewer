@@ -1,5 +1,8 @@
 import { describe, it, expect } from 'vitest';
-import { validate_dirty_bases } from '../csv-base-validation';
+import {
+    base_validation_save_rejection,
+    validate_dirty_bases,
+} from '../csv-base-validation';
 import type { CellHyperlink, RichText } from '../cell-content';
 import type { CsvDirtyEntry, CsvDirtyMap } from '../types';
 
@@ -16,6 +19,47 @@ function edits(entries: Record<string, CsvDirtyEntry>): CsvDirtyMap {
 
 const bold = (text: string): RichText => ({ runs: [{ text, style: { bold: true } }] });
 const underlined = (text: string): RichText => ({ runs: [{ text, style: { underline: true } }] });
+
+describe('base_validation_save_rejection', () => {
+    it('maps base mismatches with the caller worksheet index', () => {
+        expect(base_validation_save_rejection({
+            type: 'conflicts',
+            keys: ['3:1'],
+            observedBases: { '3:1': { value: 'disk' } },
+        }, 4)).toStrictEqual({
+            reason: 'baseMismatch',
+            worksheetOperationIndex: 4,
+            keys: ['3:1'],
+            observedBases: { '3:1': { value: 'disk' } },
+        });
+    });
+
+    it('omits changed-cell fields for a removed-row-only rejection', () => {
+        expect(base_validation_save_rejection({
+            type: 'removedRows',
+            keys: ['8:0'],
+        }, 1)).toStrictEqual({
+            reason: 'rowsRemoved',
+            worksheetOperationIndex: 1,
+            keys: ['8:0'],
+        });
+    });
+
+    it('preserves removed and changed subsets with the caller worksheet index', () => {
+        expect(base_validation_save_rejection({
+            type: 'removedRows',
+            keys: ['8:0'],
+            changedKeys: ['1:0'],
+            observedBases: { '1:0': { value: 'changed' } },
+        }, 2)).toStrictEqual({
+            reason: 'rowsRemoved',
+            worksheetOperationIndex: 2,
+            keys: ['8:0', '1:0'],
+            removedKeys: ['8:0'],
+            observedBases: { '1:0': { value: 'changed' } },
+        });
+    });
+});
 
 describe('validate_dirty_bases', () => {
     it('accepts a map whose every base matches the source', () => {

@@ -912,6 +912,42 @@ describe('viewer-panel adapter', () => {
         expect(settled).toBe(true);
     });
 
+    it('accepts a delivered structural-changes acknowledgement', async () => {
+        const { transport, emit, sent, acknowledge_last_delivery } = fake_transport();
+        const deadlines = controlled_deadlines();
+        const panel = create_viewer_panel(transport, deadlines.schedule);
+        emit({ type: 'ready' });
+        const flush = panel.flush_pending_edits();
+        const request = sent.at(-1);
+        if (request?.type !== 'requestPendingEditsFlush') throw new Error('missing flush request');
+
+        emit({
+            type: 'pendingEditsFlush',
+            requestId: request.requestId,
+            editSessionId: 'edit:structural',
+            highestProducedSequence: 3,
+        });
+        const result = await flush;
+        const acknowledged = panel.wait_for_pending_edit_ack(
+            result.rendererGeneration,
+            result.editSessionId,
+            result.sequence,
+        );
+        let settled = false;
+        void acknowledged.then(() => { settled = true; });
+
+        panel.webview.postMessage({
+            type: 'pendingChangesAcknowledged',
+            editSessionId: 'edit:structural',
+            sequence: 3,
+        });
+        acknowledge_last_delivery();
+        await Promise.resolve();
+        expect(settled).toBe(true);
+        await acknowledged;
+        expect(deadlines.active_count()).toBe(0);
+    });
+
     it('accepts only the exact generation, session, and sequence receipt', async () => {
         const { transport, emit, sent, last_receipt, emit_receipt } = fake_transport();
         const panel = create_viewer_panel(transport);

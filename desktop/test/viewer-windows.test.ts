@@ -3345,59 +3345,67 @@ describe('application quit coordinator', () => {
     // and only after that is the connection released. Every step before the drain
     // is what makes an acknowledged edit durable; a drain that overtook any of
     // them would close the store out from under the write it was waiting for.
-    it('acknowledges the renderer, closes the window, and only then drains', async () => {
-        const store_events: string[] = [];
-        const store = {
-            close: async (): Promise<void> => { store_events.push('store:close'); },
-        };
-        const wiring = real_shutdown(store);
-        await wiring.publish();
-        wiring.lifecycle.become_ready();
-        wiring.viewer_manager.open_file('/tmp/quit-ack-order.csv');
-        const window = latest_window();
-        emit_webview(window, { type: 'ready' });
-        const resume_quit = vi.fn(() => { store_events.push('resume'); });
-        const before_quit = create_app_quit_coordinator(
-            () => wiring.viewer_manager.close_all(),
-            resume_quit,
-            wiring.shutdown,
-        );
+    it.each([
+        ['cell edits', 'pendingEditsAcknowledged'],
+        ['structural changes', 'pendingChangesAcknowledged'],
+    ] as const)(
+        'acknowledges renderer %s, closes the window, and only then drains',
+        async (_kind, acknowledgement_type) => {
+            const store_events: string[] = [];
+            const store = {
+                close: async (): Promise<void> => { store_events.push('store:close'); },
+            };
+            const wiring = real_shutdown(store);
+            await wiring.publish();
+            wiring.lifecycle.become_ready();
+            wiring.viewer_manager.open_file('/tmp/quit-ack-order.csv');
+            const window = latest_window();
+            emit_webview(window, { type: 'ready' });
+            const resume_quit = vi.fn(() => { store_events.push('resume'); });
+            const before_quit = create_app_quit_coordinator(
+                () => wiring.viewer_manager.close_all(),
+                resume_quit,
+                wiring.shutdown,
+            );
 
-        before_quit({ preventDefault: vi.fn() });
-        // The barrier is open on the renderer, not on a timer: nothing has closed
-        // and nothing has drained while the flush request is outstanding.
-        const request = window.webContents.sent.filter(
-            ({ message }) => message.type === 'requestPendingEditsFlush',
-        ).at(-1)?.message;
-        if (request?.type !== 'requestPendingEditsFlush') throw new Error('missing flush request');
-        expect(window.destroyed).toBe(false);
-        expect(store_events).toEqual([]);
+            before_quit({ preventDefault: vi.fn() });
+            // The barrier is open on the renderer, not on a timer: nothing has closed
+            // and nothing has drained while the flush request is outstanding.
+            const request = window.webContents.sent.filter(
+                ({ message }) => message.type === 'requestPendingEditsFlush',
+            ).at(-1)?.message;
+            if (request?.type !== 'requestPendingEditsFlush') {
+                throw new Error('missing flush request');
+            }
+            expect(window.destroyed).toBe(false);
+            expect(store_events).toEqual([]);
 
-        emit_webview(window, {
-            type: 'pendingEditsFlush',
-            requestId: request.requestId,
-            editSessionId: 'edit:quit',
-            highestProducedSequence: 7,
-        });
-        // The acknowledgement has to reach the *page*, not merely be sent: the
-        // desktop receipt is what proves delivery, and the close waits for it.
-        await vi.waitFor(() => expect(controller_mock.panel).toBeDefined());
-        controller_mock.panel.webview.postMessage({
-            type: 'pendingEditsAcknowledged',
-            editSessionId: 'edit:quit',
-            sequence: 7,
-        });
-        expect(window.destroyed).toBe(false);
-        expect(store_events).toEqual([]);
+            emit_webview(window, {
+                type: 'pendingEditsFlush',
+                requestId: request.requestId,
+                editSessionId: 'edit:quit',
+                highestProducedSequence: 7,
+            });
+            // The acknowledgement has to reach the *page*, not merely be sent: the
+            // desktop receipt is what proves delivery, and the close waits for it.
+            await vi.waitFor(() => expect(controller_mock.panel).toBeDefined());
+            controller_mock.panel.webview.postMessage({
+                type: acknowledgement_type,
+                editSessionId: 'edit:quit',
+                sequence: 7,
+            });
+            expect(window.destroyed).toBe(false);
+            expect(store_events).toEqual([]);
 
-        acknowledge_last_delivery(window);
-        await vi.waitFor(() => expect(window.destroyed).toBe(true));
-        await vi.waitFor(() => expect(resume_quit).toHaveBeenCalledOnce());
-        // The window was gone before the connection was released, and the quit
-        // resumed only after both.
-        expect(store_events).toEqual(['store:close', 'resume']);
-        expect(wiring.backend.published).toBeUndefined();
-    });
+            acknowledge_last_delivery(window);
+            await vi.waitFor(() => expect(window.destroyed).toBe(true));
+            await vi.waitFor(() => expect(resume_quit).toHaveBeenCalledOnce());
+            // The window was gone before the connection was released, and the quit
+            // resumed only after both.
+            expect(store_events).toEqual(['store:close', 'resume']);
+            expect(wiring.backend.published).toBeUndefined();
+        },
+    );
 
     // The narrower half of the mid-barrier race: not a request arriving while the
     // close fence runs (covered above), but one arriving after every window has

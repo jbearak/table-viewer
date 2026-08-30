@@ -188,6 +188,12 @@ import {
     RowResizeOverlay,
     type RowResizeOverlayHandle,
 } from './row-resize-overlay';
+import { AppendDock } from './append-dock';
+import {
+    AppendComposer,
+    EMPTY_APPEND_COMPOSER_DRAFT,
+    type AppendComposerDraft,
+} from './append-composer';
 import { row_boundary_hit } from './row-resize-model';
 import { read_overlay_editor_value } from './live-editor';
 
@@ -1110,6 +1116,7 @@ export interface GridShellProps {
     ) => string;
     formula_reference_bases?: (
         value: string,
+        additional_pending_rows?: number,
     ) => readonly PendingFormulaReferenceBasis[];
     generation: number;
     /** Source revision the pending structural overlay was derived from. */
@@ -1200,6 +1207,13 @@ export interface GridShellProps {
     highlight_in_flight?: boolean;
     /** A host-backed append reservation is outstanding; all edits are fenced. */
     append_in_flight?: boolean;
+    /**
+     * The source's effective append row ceiling — `append_row_ceiling_for` on
+     * the host, delivered through the snapshot capability. Defaults to
+     * `MAX_SHEET_ROWS`, the value every format shared before the ceiling
+     * became a property of the profile; delimited sources pass Infinity.
+     */
+    append_row_ceiling?: number;
     /** How this sheet's cells are edited ('markdown' for xlsx). Default 'plain'. */
     edit_syntax?: EditSyntax;
     edit_session_id?: string;
@@ -1219,6 +1233,9 @@ export interface GridShellProps {
     edit_session?: EditSessionStore;
     /** Session-owned structural rows; never folded into source-keyed edits. */
     pending_row_store?: PendingRowStore;
+    /** App-owned so an uncommitted composer draft survives a grid remount. */
+    append_composer_draft?: AppendComposerDraft;
+    on_append_composer_draft_change?: (draft: AppendComposerDraft) => void;
     /** Admit one atomic append gesture against the current source generation. */
     on_append_rows?: (count: number) => Promise<AppendRowsAdmission | undefined>;
     /**
@@ -1354,6 +1371,7 @@ export function GridShell({
     csv_editable = false,
     highlight_in_flight = false,
     append_in_flight = false,
+    append_row_ceiling = MAX_SHEET_ROWS,
     edit_syntax = 'plain',
     edit_session_id,
     value_edit_order_floor = 0,
@@ -1363,6 +1381,8 @@ export function GridShell({
     initial_edits,
     edit_session,
     pending_row_store,
+    append_composer_draft,
+    on_append_composer_draft_change,
     on_append_rows,
     history_store,
     gestures_admitted,
@@ -3489,7 +3509,7 @@ export function GridShell({
         && pending_rows.appendedRows.length < MAX_PENDING_APPENDED_ROWS
         && sheet_meta.sourceRowCount
             - pending_rows.tailRemovals.length
-            + pending_rows.appendedRows.length < MAX_SHEET_ROWS;
+            + pending_rows.appendedRows.length < append_row_ceiling;
     const append_capacity = useCallback((count: number) => {
         const current = pending_store.snapshot();
         return Number.isSafeInteger(count)
@@ -3498,12 +3518,36 @@ export function GridShell({
             && sheet_meta.sourceRowCount
                 - current.tailRemovals.length
                 + current.appendedRows.length
-                + count <= MAX_SHEET_ROWS;
-    }, [pending_store, sheet_meta.sourceRowCount]);
+                + count <= append_row_ceiling;
+    }, [append_row_ceiling, pending_store, sheet_meta.sourceRowCount]);
+    /**
+     * How many more rows this gesture may stage right now — the smaller of the
+     * two capacities the dock clamps its count control against. Read from
+     * rendered pending state rather than the store snapshot, because it drives
+     * what the user sees; `append_capacity` re-checks the live snapshot at
+     * admission time.
+     */
+    const remaining_append_capacity = Math.max(0, Math.min(
+        MAX_PENDING_APPENDED_ROWS - pending_rows.appendedRows.length,
+        append_row_ceiling
+            - sheet_meta.sourceRowCount
+            + pending_rows.tailRemovals.length
+            - pending_rows.appendedRows.length,
+    ));
+    /**
+     * Whether the append dock is offered at all. Deliberately not
+     * `may_append_rows`: that folds in `append_in_flight`, which is the fence
+     * for the request the dock itself issued. Unmounting the dock under its own
+     * request would replace the busy state with a disappearing control, so the
+     * dock stays mounted across the round trip and renders `busy` instead.
+     */
+    const may_offer_append_dock = append_admission_active
+        && on_append_rows !== undefined
+        && edit_session_id !== undefined
+        && sheet_meta.columnCount > 0
+        && has_visible_columns
+        && remaining_append_capacity > 0;
     const get_row_accessibility_label = useCallback((row: number) => {
-        if (may_append_rows && row === row_count) {
-            return 'Append row at end of worksheet';
-        }
         const projected = pending_projection.row_at(row);
         if (projected?.kind === 'pending') {
             const label = `Pending appended row ${projected.intendedPhysicalRow + 1}`;
@@ -3521,7 +3565,7 @@ export function GridShell({
             return `Pending tail removal row ${projected.intendedPhysicalRow + 1}`;
         }
         return undefined;
-    }, [may_append_rows, pending_projection, row_count]);
+    }, [pending_projection]);
     const draw_pending_divider = useCallback<
         NonNullable<React.ComponentProps<typeof DataEditor>['drawCell']>
     >((args, draw_content) => {
@@ -3542,6 +3586,13 @@ export function GridShell({
         count: number,
         record_history = true,
         still_current: () => boolean = () => true,
+        /**
+         * Values the rows carry from birth, one entry per row, keyed by source
+         * column. Seeding them into the append keeps the gesture to a single
+         * store mutation, so the host sees one structural payload rather than a
+         * blank row followed by a filled one.
+         */
+        seed_cells?: readonly Readonly<Record<number, PendingRowCell>>[],
     ) => {
         // Capture the activation before joining the serialization tail. The
         // first request's busy affordance may render while a second gesture is
@@ -3600,6 +3651,7 @@ export function GridShell({
                 admitted.formatTemplate,
                 issue_value_edit_order(),
                 admitted.appendBasis,
+                seed_cells,
             );
             if (!added) {
                 admitted.settle(false);
@@ -3661,20 +3713,6 @@ export function GridShell({
         };
         poll();
     }), []);
-    const on_row_appended = useCallback(async () => {
-        const appended = await admit_pending_rows(1);
-        if (appended === undefined) return undefined;
-        const pending_row_id = appended.rowIds[0];
-        const display_row = await pending_display_row(pending_row_id);
-        if (display_row === undefined) return undefined;
-        return {
-            row: display_row,
-            ready: () => pending_projection_ref.current.display_row_for_identity({
-                kind: 'pending',
-                pendingRowId: pending_row_id,
-            }) === display_row,
-        };
-    }, [admit_pending_rows, pending_display_row]);
     const pending_paste_history_ref = useRef<{
         readonly before: PendingStructuralChanges;
         readonly rowIds: ReadonlySet<string>;
@@ -3774,8 +3812,18 @@ export function GridShell({
         pending_store,
         tail_removal_projection_key,
     ]);
-    const append_and_focus = useCallback(async (display_column: number): Promise<boolean> => {
-        const appended = await admit_pending_rows(1);
+    /**
+     * Stage `count` blank rows as one gesture, then put the caret in the first
+     * editable cell of the first of them. Selecting the cell is what scrolls
+     * the pending band into view — `select_active_display_cell` calls
+     * `scrollTo` — so quick add and the in-grid append paths land the user in
+     * the same place.
+     */
+    const append_and_focus_rows = useCallback(async (
+        count: number,
+        display_column: number,
+    ): Promise<boolean> => {
+        const appended = await admit_pending_rows(count);
         if (appended === undefined) return false;
         const pending_id = appended.rowIds[0];
         const display_row = await pending_display_row(pending_id);
@@ -3784,6 +3832,149 @@ export function GridShell({
         focus_grid_ref.current();
         return true;
     }, [admit_pending_rows, pending_display_row]);
+    const append_and_focus = useCallback(
+        (display_column: number): Promise<boolean> =>
+            append_and_focus_rows(1, display_column),
+        [append_and_focus_rows],
+    );
+    /**
+     * Quick add. The first editable cell of a new row is display column 0 —
+     * appended rows carry no per-cell editability of their own, and column 0 is
+     * the leftmost visible column under whatever projection is installed.
+     */
+    const add_rows_from_dock = useCallback(
+        (count: number): Promise<boolean> => append_and_focus_rows(count, 0),
+        [append_and_focus_rows],
+    );
+    /**
+     * The composer's staging path — quick add's sibling, with cell values.
+     *
+     * It appends through the same `admit_pending_rows` (there is exactly one
+     * append path) with history suppressed, seeds the composed values, and
+     * records a single gesture spanning both. Suppressing and re-recording is
+     * what keeps one staging gesture at one history entry: an append entry
+     * followed by an edit entry would take two undos to unwind what the user
+     * did once.
+     *
+     * Values are built the way `commit_pending_live_edit` builds them, so a
+     * field starting with `=` stages exactly as that text typed into a cell —
+     * there is no formula path of the composer's own.
+     */
+    const stage_composed_rows = useCallback(async (
+        rows: AppendComposerDraft,
+    ): Promise<boolean> => {
+        if (rows.length === 0) return false;
+        // Built before admission so the rows can be appended already carrying
+        // their values. Writing them afterwards was two store mutations and so
+        // two structural publications: the row reached the host blank, then
+        // again filled, which the grid showed as a flicker and which left the
+        // second payload outstanding.
+        let gesture_order: number | undefined;
+        const seed_cells = rows.map((values) => {
+            const cells: Record<number, PendingRowCell> = {};
+            // Only the columns on screen: a draft keeps values for columns that
+            // have since been hidden, and staging one the user cannot see would
+            // write a column they did not choose.
+            visible_source_columns.forEach((source_column) => {
+                const raw = values[source_column];
+                if (raw === undefined) return;
+                const parsed = parse_cell_edit(raw, edit_syntax);
+                // A blank field is not an edit: appended rows start empty, so
+                // writing one would only churn the envelope.
+                if (parsed.text === '' && parsed.rich === undefined) return;
+                cells[source_column] = {
+                    value: parsed.text,
+                    ...(parsed.rich === undefined ? {} : { valueRuns: parsed.rich }),
+                    valueEditOrder: gesture_order ??= issue_value_edit_order(),
+                    ...(edit_syntax === 'markdown'
+                        && formula_reference_bases !== undefined
+                        && xlsx_edit_writes_formula(parsed.text, parsed.rich?.runs)
+                        ? {
+                            formulaReferenceBases: formula_reference_bases(
+                                parsed.text,
+                                rows.length,
+                            ),
+                        }
+                        : {}),
+                };
+            });
+            return cells;
+        });
+        const appended = await admit_pending_rows(
+            rows.length,
+            false,
+            () => true,
+            seed_cells,
+        );
+        // An envelope too large to hold the composed values now refuses the
+        // whole gesture rather than staging blank rows beside a warning.
+        if (appended === undefined) return false;
+        record_pending_row_gesture(
+            rows.length === 1 ? 'Compose row' : `Compose ${rows.length} rows`,
+            appended.before,
+            pending_store.snapshot(),
+        );
+        const display_row = await pending_display_row(appended.rowIds[0]);
+        if (display_row === undefined) return true;
+        select_active_display_cell_ref.current([0, display_row]);
+        focus_grid_ref.current();
+        return true;
+    }, [
+        admit_pending_rows,
+        edit_session_id,
+        edit_syntax,
+        formula_reference_bases,
+        issue_value_edit_order,
+        pending_display_row,
+        pending_store,
+        record_pending_row_gesture,
+        visible_source_columns,
+    ]);
+    const [local_composer_draft, set_local_composer_draft] = useState<AppendComposerDraft>(
+        EMPTY_APPEND_COMPOSER_DRAFT,
+    );
+    const composer_draft = append_composer_draft ?? local_composer_draft;
+    const set_composer_draft = on_append_composer_draft_change
+        ?? set_local_composer_draft;
+    // Which append surface is showing. The shell owns it because the dock has
+    // to stand its quick-add controls down while the composer is up.
+    const [append_dock_open, set_append_dock_open] = useState(false);
+    const [composer_open, set_composer_open] = useState(false);
+    const previous_append_session_ref = useRef(edit_session_id);
+    useEffect(() => {
+        if (previous_append_session_ref.current === edit_session_id) return;
+        previous_append_session_ref.current = edit_session_id;
+        set_append_dock_open(false);
+        set_composer_open(false);
+        if (on_append_composer_draft_change === undefined) {
+            set_local_composer_draft(EMPTY_APPEND_COMPOSER_DRAFT);
+        }
+    }, [edit_session_id, on_append_composer_draft_change]);
+
+    useEffect(() => {
+        if (may_offer_append_dock) return;
+        set_append_dock_open(false);
+        set_composer_open(false);
+    }, [may_offer_append_dock]);
+    /**
+     * Labels for the composer's fields — the same titles the grid header
+     * paints, so a field is identifiable by the column the user can see.
+     */
+    const composer_column_labels = useMemo(
+        () => columns.map((column) => column.title),
+        [columns],
+    );
+    /**
+     * The worksheet row number the first composed row will take, 1-based — the
+     * rows already in the source, less pending tail removals, plus rows already
+     * staged, plus one. The composer labels its rows with this rather than
+     * counting from one, so a legend names the row the values will actually
+     * land on.
+     */
+    const composer_first_row_number = sheet_meta.sourceRowCount
+        - pending_rows.tailRemovals.length
+        + pending_rows.appendedRows.length
+        + 1;
     const may_append_rows_ref = useRef(may_append_rows);
     may_append_rows_ref.current = may_append_rows;
     const append_and_focus_ref = useRef(append_and_focus);
@@ -7913,12 +8104,6 @@ export function GridShell({
                 width="100%"
                 height="100%"
                 rows={row_count}
-                onRowAppended={may_append_rows ? on_row_appended : undefined}
-                trailingRowOptions={may_append_rows ? {
-                    sticky: true,
-                    hint: 'Append row',
-                    addIcon: 'plus',
-                } : undefined}
                 getRowAccessibilityLabel={get_row_accessibility_label}
                 columns={columns}
                 maxColumnWidth={MAX_COLUMN_WIDTH_PX}
@@ -7967,6 +8152,34 @@ export function GridShell({
                 onKeyDown={on_key_down}
                 provideEditor={provide_editor}
             />
+            {may_offer_append_dock && (
+                <AppendDock
+                    open={append_dock_open}
+                    on_open_change={set_append_dock_open}
+                    remaining_capacity={remaining_append_capacity}
+                    busy={append_in_flight}
+                    on_add_rows={add_rows_from_dock}
+                    secondary_open={composer_open}
+                    secondary_actions={(
+                        <AppendComposer
+                            column_labels={composer_column_labels}
+                            source_columns={visible_source_columns}
+                            first_row_number={composer_first_row_number}
+                            draft={composer_draft}
+                            on_draft_change={set_composer_draft}
+                            remaining_capacity={remaining_append_capacity}
+                            busy={append_in_flight}
+                            open={composer_open}
+                            on_open_change={set_composer_open}
+                            on_stage_rows={stage_composed_rows}
+                            on_stage_success={() => {
+                                set_composer_open(false);
+                                set_append_dock_open(false);
+                            }}
+                        />
+                    )}
+                />
+            )}
             {append_in_flight && (
                 <span className="sr-only" role="status" aria-live="polite">
                     Adding rows. Editing is temporarily unavailable.

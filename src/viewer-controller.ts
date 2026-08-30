@@ -45,6 +45,7 @@ import {
     FileSizeLimitExceededError,
     MAX_CSV_ROWS,
     MAX_SHEET_ROWS,
+    UNBOUNDED_SHEET_ROWS,
     MAX_WORKBOOK_FORMULAS,
 } from './spreadsheet-safety';
 import { prepare_csv_serializer, serialize_delimited_values } from './serialize-csv';
@@ -67,7 +68,10 @@ import {
 } from './formula-calculation';
 import { is_xlsx_formula_edit, type XlsxCellEdit } from './xlsx-cell-write';
 import { pending_formula_cells_referencing_provisional_rows } from './pending-formula-rebase';
-import { validate_dirty_bases } from './csv-base-validation';
+import {
+    base_validation_save_rejection,
+    validate_dirty_bases,
+} from './csv-base-validation';
 import { cell_edit_base } from './cell-edit-model';
 import { get_raw_cell_text } from './cell-display';
 import { cell_key, parse_cell_key } from './cell-key';
@@ -384,6 +388,8 @@ export interface ViewerControllerOptions {
         register_webview_message_receiver(
             receiver: (message: WebviewMessage) => Promise<void>,
         ): void;
+        /** Observe the exact work set captured by a controller drain iteration. */
+        on_controller_drain_wait?(work: readonly string[]): void;
     };
 }
 
@@ -430,6 +436,12 @@ interface ViewerProfileBase {
     ): Promise<FileSourceBuildResult>;
     /** Prefer the file-backed reader even when a whole-file read is possible. */
     prefer_file_source?: boolean;
+    /** How many worksheet body rows this format may hold after an append.
+     *  Absent means the workbook ceiling (`MAX_SHEET_ROWS`), which is the
+     *  limit `assert_safe_sheet_shape` already enforces at open time; delimited
+     *  profiles set `UNBOUNDED_SHEET_ROWS` because no such gate applies to
+     *  them. Read it through `append_row_ceiling_for`, never directly. */
+    readonly append_row_ceiling?: number;
     /** Sets previewMode on the meta envelope (read-only synced preview). */
     previewMode?: boolean;
     /** Called after each (re)load adopts a source — preview refreshes its line map. */
@@ -1806,15 +1818,8 @@ export function plan_csv_save(
         'ambiguousColumns',
         'The worksheet columns changed after rows were appended.',
     );
-    if (sheet.sourceRowCount - structural.tailRemovals.length
-        + structural.appendedRows.length > MAX_SHEET_ROWS) {
-        structural_save_error(
-            0,
-            structural,
-            'rowLimitExceeded',
-            'The pending changes exceed the worksheet row limit.',
-        );
-    }
+    // No row ceiling here: a delimited file has no workbook container to
+    // overflow, so `MAX_SHEET_ROWS` never described this format.
     const retained_row_count = sheet.rowCount - structural.tailRemovals.length;
     if (retained_row_count < 0) structural_save_error(
         0,
@@ -2000,8 +2005,29 @@ export function csv_table_profile(config?: ConfigPort): ViewerProfile {
     return {
         editing: true,
         plan_save: plan_csv_save,
+        append_row_ceiling: UNBOUNDED_SHEET_ROWS,
         build_source: csv_source_builder(config),
     };
+}
+
+/** The row ceiling an append must respect for this profile's format.
+ *  Workbook formats keep `MAX_SHEET_ROWS`; delimited formats have none. */
+export function append_row_ceiling_for(profile: ViewerProfile): number {
+    return profile.append_row_ceiling ?? MAX_SHEET_ROWS;
+}
+
+/**
+ * The same ceiling, shaped for the webview capability that carries it.
+ *
+ * `null` stands for "no ceiling". The resolved value is
+ * `UNBOUNDED_SHEET_ROWS` — `Number.POSITIVE_INFINITY` — and nothing guarantees
+ * a non-finite number survives the trip to the webview intact.
+ */
+export function projected_append_row_ceiling(
+    profile: ViewerProfile,
+): number | null {
+    const ceiling = append_row_ceiling_for(profile);
+    return Number.isFinite(ceiling) ? ceiling : null;
 }
 
 /** Whether two paths would take the same parser — the comparison `profile_for`
@@ -5461,24 +5487,7 @@ export function attach_viewer(
         if (validation.type === 'valid') return undefined;
         return {
             dirtyEdits: dirty_edits,
-            rejection: validation.type === 'removedRows'
-                ? {
-                    reason: 'rowsRemoved',
-                    worksheetOperationIndex: 0,
-                    keys: [...validation.keys, ...(validation.changedKeys ?? [])],
-                    ...(validation.changedKeys !== undefined
-                        ? {
-                            removedKeys: validation.keys,
-                            observedBases: validation.observedBases,
-                        }
-                        : {}),
-                }
-                : {
-                    reason: 'baseMismatch',
-                    worksheetOperationIndex: 0,
-                    keys: validation.keys,
-                    observedBases: validation.observedBases,
-                },
+            rejection: base_validation_save_rejection(validation, 0),
         };
     }
 
@@ -6911,6 +6920,9 @@ export function attach_viewer(
                                     && may_retain_capability()
                                     && !next.truncationMessage,
                                 csvSaveLifecycle: projected_save_lifecycle(),
+                                appendRowCeiling: projected_append_row_ceiling(
+                                    profile,
+                                ),
                                 ...(owns_edit_session() && active_edit_session_id
                                     ? { csvEditSessionId: active_edit_session_id }
                                     : {}),
@@ -7174,6 +7186,9 @@ export function attach_viewer(
                                             && may_retain_capability()
                                             && !source!.truncationMessage,
                                         csvSaveLifecycle: projected_save_lifecycle(),
+                                        appendRowCeiling: projected_append_row_ceiling(
+                                            profile,
+                                        ),
                                         ...(owns_edit_session() && active_edit_session_id
                                             ? { csvEditSessionId: active_edit_session_id }
                                             : {}),
@@ -8068,7 +8083,7 @@ export function attach_viewer(
             - (durable?.tailRemovals?.length ?? 0)
             + admitted_ids.size
             + message.count;
-        if (prospective_rows > MAX_SHEET_ROWS) {
+        if (prospective_rows > append_row_ceiling_for(profile)) {
             await refuse('Appending these rows would exceed the worksheet row limit.');
             return;
         }
@@ -8543,7 +8558,8 @@ export function attach_viewer(
             ids.some((id) => current_ids.has(id) && !ledger.ownedRowIds.has(id))
             || current_ids.size + requested_additions.length > MAX_PENDING_APPENDED_ROWS
             || sheet.sourceRowCount - (durable?.tailRemovals?.length ?? 0)
-                + current_ids.size + requested_additions.length > MAX_SHEET_ROWS
+                + current_ids.size + requested_additions.length
+                > append_row_ceiling_for(profile)
         ) {
             await refuse('Restoring these rows would exceed the worksheet row limit.');
             return;
@@ -9159,24 +9175,7 @@ export function attach_viewer(
                     observedBases: {},
                 };
             if (validation.type === 'valid') continue;
-            rejection = validation.type === 'removedRows'
-                ? {
-                    reason: 'rowsRemoved',
-                    worksheetOperationIndex: index,
-                    keys: [...validation.keys, ...(validation.changedKeys ?? [])],
-                    ...(validation.changedKeys !== undefined
-                        ? {
-                            removedKeys: validation.keys,
-                            observedBases: validation.observedBases,
-                        }
-                        : {}),
-                }
-                : {
-                    reason: 'baseMismatch',
-                    worksheetOperationIndex: index,
-                    keys: validation.keys,
-                    observedBases: validation.observedBases,
-                };
+            rejection = base_validation_save_rejection(validation, index);
             break;
         }
         if (rejection) {
@@ -13547,7 +13546,8 @@ export function attach_viewer(
                 if (
                     sheet.sourceRowCount - desired.tailRemovals.length < 0
                     || sheet.sourceRowCount - desired.tailRemovals.length
-                        + desired.appendedRows.length > MAX_SHEET_ROWS
+                        + desired.appendedRows.length
+                        > append_row_ceiling_for(profile)
                 ) return false;
                 const retained_row_count = sheet.sourceRowCount
                     - desired.tailRemovals.length;
@@ -13821,22 +13821,44 @@ export function attach_viewer(
             const save_tail = active_save_drain;
             const disposal_release_tail = disposal_edit_release_drain;
             const layout_tail = layout_write_tail;
+            const append_tail = append_admission_tails.get(
+                APPEND_ADMISSION_AUTHORITY_TAIL,
+            );
             const transform_tails = [...transform_commit_barriers]
                 .map((barrier) => barrier.completion);
             const compare_tails = [...compare_diff_sidecars];
-            await Promise.all([
-                edit_tail,
-                save_tail,
-                disposal_release_tail,
-                layout_tail,
-                ...transform_tails,
-                ...compare_tails,
-            ]);
+            const drain_work: Array<{
+                readonly kind: string;
+                readonly completion: Promise<unknown>;
+            }> = [
+                { kind: 'editWrites', completion: edit_tail },
+                { kind: 'save', completion: save_tail },
+                { kind: 'disposalRelease', completion: disposal_release_tail },
+                { kind: 'layoutWrite', completion: layout_tail },
+                ...transform_tails.map((completion) => ({
+                    kind: 'transformCommit',
+                    completion,
+                })),
+                ...compare_tails.map((completion) => ({
+                    kind: 'compareDiff',
+                    completion,
+                })),
+            ];
+            if (append_tail !== undefined) {
+                drain_work.push({ kind: 'appendAdmission', completion: append_tail });
+            }
+            options.integrationTestPort?.on_controller_drain_wait?.(
+                Object.freeze(drain_work.map(({ kind }) => kind)),
+            );
+            await Promise.all(drain_work.map(({ completion }) => completion));
             if (
                 edit_tail === pending_edit_writes
                 && save_tail === active_save_drain
                 && disposal_release_tail === disposal_edit_release_drain
                 && layout_tail === layout_write_tail
+                && append_tail === append_admission_tails.get(
+                    APPEND_ADMISSION_AUTHORITY_TAIL,
+                )
                 && transform_commit_barriers.size === 0
                 && compare_diff_sidecars.size === 0
             ) return;

@@ -479,6 +479,46 @@ describe('CSV save lifecycle projection', () => {
         )).toEqual({ '1:0': newer });
     });
 
+    it('tombstones an operation whose file write was observed before success', () => {
+        const succeeded = operation('saved', 'saved-session');
+        const saved_entry = succeeded.worksheets[0].dirtyEdits['0:0'];
+        const projection = {
+            authoritative: { revision: 7, state: 'succeeded', operation: succeeded } as const,
+        };
+
+        expect(hydrate(projection, succeeded.editSessionId, {
+            '0:0': {
+                ...saved_entry,
+                observedBase: { value: 'saved' },
+            },
+        })).toBeUndefined();
+
+        const unrelated_observation = {
+            '0:0': {
+                ...saved_entry,
+                observedBase: { value: 'changed again' },
+            },
+        };
+        expect(hydrate(
+            projection,
+            succeeded.editSessionId,
+            unrelated_observation,
+        )).toBe(unrelated_observation);
+
+        const newer_edit = {
+            '0:0': {
+                ...saved_entry,
+                observedBase: { value: 'saved' },
+                valueEditOrder: 2,
+            },
+        };
+        expect(hydrate(
+            projection,
+            succeeded.editSessionId,
+            newer_edit,
+        )).toBe(newer_edit);
+    });
+
     it('treats worksheet order, identity, and payload as save operation identity', () => {
         const people = worksheet('people', 0, 'People');
         const inventory = worksheet('inventory', 1, 'Inventory');

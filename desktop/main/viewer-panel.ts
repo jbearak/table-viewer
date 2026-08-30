@@ -213,6 +213,7 @@ export function create_viewer_panel(
                 if (disposed) return false;
                 const host_message = message as HostMessage;
                 const receipt = host_message.type === 'pendingEditsAcknowledged'
+                    || host_message.type === 'pendingChangesAcknowledged'
                     ? {
                         receiptId: `desktop-ack:${++next_receipt_request}`,
                         rendererGeneration: renderer_generation,

@@ -17,6 +17,7 @@ import type {
     FileStateStore,
 } from '../state';
 import type { HostMessage, PerFileState } from '../types';
+import { MAX_SHEET_ROWS } from '../spreadsheet-safety';
 import type { WorkbookSnapshot } from '../viewer-snapshot';
 import * as vscode_mock from './mocks/vscode';
 import { acquire_file_coordinator } from '../file-coordinator';
@@ -267,6 +268,7 @@ describe('Excel workbook snapshot controller', () => {
         });
         expect(initial.state.excelFirstRowHeaders).toEqual({ People: 'off' });
         expect(initial.capabilities).toEqual({
+            appendRowCeiling: MAX_SHEET_ROWS,
             csvEditable: false,
             csvEditingSupported: false,
             csvSaveLifecycle: { revision: 0, state: 'idle' },
