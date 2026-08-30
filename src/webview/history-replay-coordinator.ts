@@ -282,18 +282,18 @@ export function create_history_replay_coordinator(
                 return;
             }
             // And acquire one only for a gesture that actually writes cells.
-            // Highlights are durable workbook state, changeable outside edit mode
-            // entirely, so undoing a highlight-only gesture must not put the user
-            // into editing — while a MIXED gesture carries a cell write and still
-            // must.
+            // Highlights are durable workbook state, and structural changes have
+            // their own row-admission lease. Undoing either kind alone must not put
+            // the user into editing, while a MIXED gesture carrying a cell write
+            // still must.
             //
             // Read pre-grant, and the entry it was read from is re-checked after
             // the await. That is not belt-and-braces: a gesture already sent to the
             // host but not yet recorded — a highlight awaiting its deltas — can land
             // on top of the stack while `ensure_session` is in flight, and then the
             // entry actually replayed is not the one this decision was made about.
-            // Acquiring a session for a highlight-only undo would put the user into
-            // edit mode for a gesture that was never a content edit.
+            // Acquiring a session for a non-cell undo would put the user into edit
+            // mode for a gesture that never wrote session-owned cell state.
             const needs_session = action_requires_edit_session(before_acquiring.entry.action);
             const held: AcquiringReplay = { kind: 'acquiring', direction, settle: resolve };
             active = held;
@@ -336,7 +336,7 @@ export function create_history_replay_coordinator(
                 // into edit mode turns session acquisition into a visible no-op.
                 // We only await here when the original entry needed a session, so
                 // the session now held is sufficient for any replacement entry
-                // (and harmless for a highlight-only one).
+                // (and harmless for a replacement with no cell writes).
                 const request = build_prepare_request(peek.entry, direction, host);
                 if (request === undefined) {
                     // A cell the renderer cannot see right now. Refusing beats

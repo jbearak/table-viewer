@@ -100,8 +100,15 @@ async function append_blank_row(expected_pending_row_number: number): Promise<vo
         await expect(rows).toHaveCount(initial_accessible_row_count + 1);
         return;
     }
-    const viewport_height = await page.evaluate(() => window.innerHeight);
-    await page.mouse.click(220, viewport_height - 12);
+    const trailing_append_cell = rows.last().locator('[id^="glide-cell-1-"]');
+    await expect(trailing_append_cell).toBeAttached();
+    // The semantic gridcell is deliberately visually hidden behind the canvas.
+    // Select and click that exact trailing row instead of guessing canvas pixels
+    // near the bottom of the window.
+    await trailing_append_cell.focus();
+    await expect(trailing_append_cell).toBeFocused();
+    await expect(trailing_append_cell).toHaveAttribute('aria-selected', 'true');
+    await trailing_append_cell.dispatchEvent('click');
     await expect(rows).toHaveCount(initial_accessible_row_count + expected_pending_row_number);
 }
 

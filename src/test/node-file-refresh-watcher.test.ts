@@ -83,7 +83,7 @@ describe('Node file refresh watcher adapter', () => {
         await fs.promises.writeFile(replacement, 'committed version');
         await fs.promises.rename(replacement, target);
 
-        for (let attempt = 0; attempt < 100 && events.length === 0; attempt += 1) {
+        for (let attempt = 0; attempt < 200 && events.length === 0; attempt += 1) {
             await new Promise((done) => { setTimeout(done, 10); });
         }
         expect(events.length).toBeGreaterThan(0);

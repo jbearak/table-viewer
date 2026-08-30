@@ -9,6 +9,7 @@ import {
     is_valid_csv_save_lifecycle,
     propose_csv_save,
     reduce_csv_save_projection,
+    remove_operation_owned_pending_structural_changes,
     resolve_csv_save_hydration,
     save_lifecycle_correlation,
     save_operation_worksheet,
@@ -547,6 +548,47 @@ describe('CSV save lifecycle projection', () => {
             }]),
         )).toBe(true);
         expect(csv_save_operations_equal(with_structural, changed)).toBe(false);
+    });
+
+    it('retains a same-id appended row edited after the save captured it', () => {
+        const submitted = {
+            formatTemplates: [{ id: 'plain', format: { kind: 'none' as const } }],
+            appendedRows: [{
+                id: 'pending-row-1',
+                cells: { 0: { value: 'submitted', valueEditOrder: 1 } },
+                formatTemplateId: 'plain',
+                createdOrder: 1,
+            }],
+            tailRemovals: [],
+            appendBasis: {
+                sourceRowCount: 1,
+                provisionalStartRow: 1,
+                provisionalRowCount: 1,
+                columnCount: 1,
+                schemaFingerprint: 'schema',
+            },
+            conflicts: [],
+        };
+        const current = {
+            ...submitted,
+            appendedRows: [{
+                ...submitted.appendedRows[0],
+                cells: { 0: { value: 'newer', valueEditOrder: 2 } },
+            }],
+        };
+        const saved_worksheet = {
+            ...worksheet('saved'),
+            structuralChanges: submitted,
+        };
+
+        expect(remove_operation_owned_pending_structural_changes(
+            current,
+            saved_worksheet,
+        )?.appendedRows).toEqual(current.appendedRows);
+        expect(remove_operation_owned_pending_structural_changes(
+            submitted,
+            saved_worksheet,
+        )?.appendedRows).toEqual([]);
     });
 
     it('treats runs as part of operation identity and tombstone matching', () => {

@@ -1163,6 +1163,54 @@ a new line char ""more quotes"" plus a tab  ."	https://google.com`)
         expect(appendSpy).toHaveBeenCalledOnce();
     });
 
+    test("Enter honors a per-column append target when row markers are visible", async () => {
+        const appendSpy = vi.fn();
+        const selectionSpy = vi.fn();
+        const columns = basicProps.columns.map((column, index) => index === 1
+            ? { ...column, trailingRowOptions: { targetColumn: 0 } }
+            : column);
+        vi.useFakeTimers();
+        render(
+            <DataEditor
+                {...basicProps}
+                columns={columns}
+                rows={2}
+                rowMarkers="both"
+                onRowAppended={async () => {
+                    appendSpy();
+                    return { row: 2, ready: () => true };
+                }}
+                onGridSelectionChange={selectionSpy}
+                gridSelection={{
+                    columns: CompactSelection.empty(),
+                    rows: CompactSelection.empty(),
+                    current: {
+                        cell: [1, 1],
+                        range: { x: 1, y: 1, width: 1, height: 1 },
+                        rangeStack: [],
+                    },
+                }}
+            />,
+            { wrapper: Context }
+        );
+        prep();
+        const canvas = screen.getByTestId("data-grid-canvas");
+        fireEvent.keyDown(canvas, { keyCode: 74, key: "j" });
+        const overlay = await screen.findByDisplayValue("j");
+
+        vi.useFakeTimers();
+        await act(async () => {
+            fireEvent.keyDown(overlay, { key: "Enter" });
+            await Promise.resolve();
+            vi.runAllTimers();
+        });
+
+        expect(appendSpy).toHaveBeenCalledOnce();
+        expect(selectionSpy).toHaveBeenCalledWith(expect.objectContaining({
+            current: expect.objectContaining({ cell: [0, 2] }),
+        }));
+    });
+
     test("Does not edit when validation fails", async () => {
         const spy = vi.fn();
         vi.useFakeTimers();
@@ -2868,6 +2916,70 @@ a new line char ""more quotes"" plus a tab  ."	https://google.com`)
         await vi.waitFor(() => expect(rollback).toHaveBeenCalledTimes(1));
         expect(editSpy).not.toHaveBeenCalled();
         expect(pasteError).toHaveBeenCalledWith(expect.stringContaining("layout changed"));
+    });
+
+    test("a queued paste samples topology after the preceding paste completes", async () => {
+        vi.useFakeTimers();
+        let resolveAdmission!: (value: { topologyKey: unknown; rollback: () => void }) => void;
+        const rollback = vi.fn();
+        const admit = vi.fn(() => new Promise<{
+            topologyKey: unknown;
+            rollback: () => void;
+        }>((resolve) => {
+            resolveAdmission = resolve;
+        }));
+        const editSpy = vi.fn(() => true);
+        const pasteError = vi.fn();
+        Object.assign(navigator, {
+            clipboard: { readText: vi.fn(async () => "one\ntwo") },
+        });
+        const selection = {
+            columns: CompactSelection.empty(),
+            rows: CompactSelection.empty(),
+            current: {
+                cell: [0, 2] as Item,
+                range: { x: 0, y: 2, width: 1, height: 1 },
+                rangeStack: [],
+            },
+        };
+        const rendered = render(
+            <EventedDataEditor
+                {...basicProps}
+                rows={3}
+                pasteTopologyKey="topology-1"
+                gridSelection={selection}
+                onPaste={true}
+                onPasteRowsNeeded={admit}
+                onCellsEdited={editSpy}
+                onClipboardPasteError={pasteError}
+            />,
+            { wrapper: Context }
+        );
+        prep(false);
+        vi.useRealTimers();
+        const canvas = screen.getByTestId("data-grid-canvas");
+        vi.spyOn(document, "activeElement", "get").mockImplementation(() => canvas);
+
+        fireEvent.paste(window);
+        fireEvent.paste(window);
+        await vi.waitFor(() => expect(admit).toHaveBeenCalledOnce());
+        rendered.rerender(
+            <EventedDataEditor
+                {...basicProps}
+                rows={4}
+                pasteTopologyKey="topology-2"
+                gridSelection={selection}
+                onPaste={true}
+                onPasteRowsNeeded={admit}
+                onCellsEdited={editSpy}
+                onClipboardPasteError={pasteError}
+            />
+        );
+        resolveAdmission({ topologyKey: "topology-2", rollback });
+
+        await vi.waitFor(() => expect(editSpy).toHaveBeenCalledTimes(2));
+        expect(pasteError).not.toHaveBeenCalled();
+        expect(rollback).not.toHaveBeenCalled();
     });
 
     test("refuses a delayed clipboard read after pending-row topology changes", async () => {

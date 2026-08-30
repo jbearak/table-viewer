@@ -3143,7 +3143,9 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
                     gridSelection.current.cell[1] === rows - 1;
                 if (entersPastLastDataRow) {
                     const selectedColumn = gridSelection.current.cell[0];
-                    const customTargetColumn = getCustomNewRowTargetColumn(selectedColumn);
+                    const customTargetColumn = getCustomNewRowTargetColumn(
+                        selectedColumn - rowMarkerOffset
+                    );
                     void appendRow(customTargetColumn ?? selectedColumn);
                     onFinishedEditing?.(newValue, movement);
                     return true;
@@ -3172,6 +3174,7 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
             mangledCols.length,
             showTrailingBlankRow,
             rows,
+            rowMarkerOffset,
             getCustomNewRowTargetColumn,
             appendRow,
         ]
@@ -3995,7 +3998,6 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
     // browsers may clear its DataTransfer after the event returns.
     const pasteTailRef = React.useRef<Promise<void>>(Promise.resolve());
     const onPasteInternal = React.useCallback((e?: ClipboardEvent) => {
-        const topologyKeyAtStart = pasteTopologyKeyRef.current;
         let captured: { html?: string; text?: string } | undefined;
         if (e?.clipboardData !== null && e?.clipboardData !== undefined) {
             captured = {};
@@ -4008,7 +4010,11 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
         }
         const queued = pasteTailRef.current
             .catch(() => undefined)
-            .then(() => performPasteInternal(e, captured, topologyKeyAtStart));
+            .then(() => performPasteInternal(
+                e,
+                captured,
+                pasteTopologyKeyRef.current
+            ));
         pasteTailRef.current = queued;
         return queued;
     }, [performPasteInternal]);
