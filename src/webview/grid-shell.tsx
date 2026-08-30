@@ -3855,7 +3855,7 @@ export function GridShell({
      * there is no formula path of the composer's own.
      */
     const stage_composed_rows = useCallback(async (
-        rows: readonly (readonly string[])[],
+        rows: AppendComposerDraft,
     ): Promise<boolean> => {
         if (rows.length === 0) return false;
         // Built before admission so the rows can be appended already carrying
@@ -3865,9 +3865,12 @@ export function GridShell({
         // second payload outstanding.
         const seed_cells = rows.map((values) => {
             const cells: Record<number, PendingRowCell> = {};
-            values.forEach((raw, display_column) => {
-                const source_column = visible_source_columns[display_column];
-                if (source_column === undefined) return;
+            // Only the columns on screen: a draft keeps values for columns that
+            // have since been hidden, and staging one the user cannot see would
+            // write a column they did not choose.
+            visible_source_columns.forEach((source_column) => {
+                const raw = values[source_column];
+                if (raw === undefined) return;
                 const parsed = parse_cell_edit(raw, edit_syntax);
                 // A blank field is not an edit: appended rows start empty, so
                 // writing one would only churn the envelope.
@@ -8126,6 +8129,7 @@ export function GridShell({
                     secondary_actions={(
                         <AppendComposer
                             column_labels={composer_column_labels}
+                            source_columns={visible_source_columns}
                             first_row_number={composer_first_row_number}
                             draft={composer_draft}
                             on_draft_change={set_composer_draft}

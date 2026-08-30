@@ -28,17 +28,24 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
  */
 
 /**
- * One composed row per entry, indexed by display column. Ragged rows are
- * legal — a short row stages blank in the columns it does not reach, which is
- * what lets the draft survive a column being revealed while it is held.
+ * One composed row per entry, keyed by SOURCE column.
+ *
+ * Keyed by source rather than display position because a draft outlives the
+ * projection it was authored against: hiding or revealing a column shifts every
+ * display index, and a positional draft would silently re-pair its values with
+ * whatever columns now sit at those positions. A source key survives any
+ * projection change — a value returns to the column it was typed for when that
+ * column comes back, and is neither shown nor staged while it is hidden.
  */
-export type AppendComposerDraft = readonly (readonly string[])[];
+export type AppendComposerDraft = readonly Readonly<Record<number, string>>[];
 
 export const EMPTY_APPEND_COMPOSER_DRAFT: AppendComposerDraft = [];
 
 export interface AppendComposerProps {
     /** Visible column titles, indexed by display column. */
     readonly column_labels: readonly string[];
+    /** Source column each label belongs to, same order — the draft's keys. */
+    readonly source_columns: readonly number[];
     /**
      * Worksheet row number the first composed row will take, 1-based. Legends
      * count up from it: a draft's second row is not "Row 2" of anything the
@@ -68,23 +75,23 @@ export interface AppendComposerProps {
     readonly on_stage_rows: (rows: AppendComposerDraft) => Promise<boolean>;
 }
 
-const blank_row = (width: number): readonly string[] => new Array<string>(width).fill('');
+const blank_row = (): Readonly<Record<number, string>> => ({});
 
 /**
- * The draft as the panel renders it: at least one row, every row as wide as the
- * current visible column count. Normalizing at render rather than on change is
- * what keeps a held draft usable after a column is hidden or revealed.
+ * The draft as the panel renders it: at least one row, so an untouched composer
+ * still offers a row to fill. Values need no reshaping — they are keyed by
+ * source column, so they stay attached to their column across any projection
+ * change.
  */
 export function normalize_draft(
     draft: AppendComposerDraft,
-    width: number,
-): readonly (readonly string[])[] {
-    const rows = draft.length === 0 ? [blank_row(width)] : draft;
-    return rows.map((row) => Array.from({ length: width }, (_, index) => row[index] ?? ''));
+): readonly Readonly<Record<number, string>>[] {
+    return draft.length === 0 ? [blank_row()] : draft;
 }
 
 export function AppendComposer({
     column_labels,
+    source_columns,
     first_row_number,
     draft,
     on_draft_change,
@@ -98,10 +105,7 @@ export function AppendComposer({
     const launcher_ref = useRef<HTMLButtonElement>(null);
     const first_field_ref = useRef<HTMLInputElement>(null);
 
-    const rows = useMemo(
-        () => normalize_draft(draft, column_labels.length),
-        [draft, column_labels.length],
-    );
+    const rows = useMemo(() => normalize_draft(draft), [draft]);
 
     const close = useCallback(() => {
         on_open_change(false);
@@ -119,15 +123,19 @@ export function AppendComposer({
         if (open) first_field_ref.current?.focus();
     }, [open]);
 
-    const set_field = useCallback((row_index: number, column: number, value: string) => {
+    const set_field = useCallback((
+        row_index: number,
+        source_column: number,
+        value: string,
+    ) => {
         on_draft_change(rows.map((row, index) => (index === row_index
-            ? row.map((cell, cell_index) => (cell_index === column ? value : cell))
+            ? { ...row, [source_column]: value }
             : row)));
     }, [on_draft_change, rows]);
 
     const add_another_row = useCallback(() => {
-        on_draft_change([...rows, blank_row(column_labels.length)]);
-    }, [column_labels.length, on_draft_change, rows]);
+        on_draft_change([...rows, blank_row()]);
+    }, [on_draft_change, rows]);
 
     const in_flight = busy || staging;
     const satisfiable = rows.length >= 1 && rows.length <= remaining_capacity;
@@ -187,6 +195,8 @@ export function AppendComposer({
                                 {column_labels.map((label, column) => {
                                     const field_id
                                         = `append-composer-${row_index}-${column}`;
+                                    const source_column = source_columns[column];
+                                    if (source_column === undefined) return null;
                                     return (
                                         <div className="append-composer-field" key={field_id}>
                                             <label htmlFor={field_id}>{label}</label>
@@ -196,12 +206,12 @@ export function AppendComposer({
                                                     : undefined}
                                                 id={field_id}
                                                 type="text"
-                                                value={row[column] ?? ''}
+                                                value={row[source_column] ?? ''}
                                                 disabled={in_flight}
                                                 onChange={(event) => {
                                                     set_field(
                                                         row_index,
-                                                        column,
+                                                        source_column,
                                                         event.target.value,
                                                     );
                                                 }}

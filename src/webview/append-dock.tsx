@@ -85,6 +85,12 @@ export function AppendDock({
     const in_flight = busy || adding;
     const satisfiable = count >= 1 && count <= remaining_capacity;
 
+    // A refusal leaves the dock open, but the count input and the add button
+    // were disabled for the attempt, and the browser blurs a disabled element —
+    // so focus sat on the body and a keyboard user had to tab back in. Recorded
+    // here and acted on once the controls re-enable, since focusing a disabled
+    // input does nothing.
+    const refocus_count_ref = useRef(false);
     const add = useCallback(async () => {
         if (in_flight || !satisfiable) return;
         set_adding(true);
@@ -92,10 +98,17 @@ export function AppendDock({
             // Staging moves focus into the grid, so the dock has nothing left
             // to hold; a refusal keeps it open on the same count.
             if (await on_add_rows(count)) set_open(false);
+            else refocus_count_ref.current = true;
         } finally {
             set_adding(false);
         }
     }, [count, in_flight, on_add_rows, satisfiable]);
+
+    useEffect(() => {
+        if (in_flight || !refocus_count_ref.current) return;
+        refocus_count_ref.current = false;
+        count_ref.current?.focus();
+    }, [in_flight]);
 
     const add_label = count === 1 ? 'Add row' : `Add ${count} rows`;
 

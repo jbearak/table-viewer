@@ -7105,6 +7105,45 @@ describe('GridShell append composer', () => {
         ]);
     });
 
+    it('keys composed values by source column, not display position', async () => {
+        const pending = create_pending_row_store({ session_id: 'session-1' });
+        await render_grid(composer_props({ pending_row_store: pending }));
+        await open_composer();
+
+        // The default projection hides source column 1, so the second field on
+        // screen is source column 2. A draft keyed by display position would
+        // stage this into column 1 — a column the user never saw.
+        await act(async () => set_input_value(
+            field('append-composer-0-1') as HTMLInputElement,
+            'third column',
+        ));
+        await act(async () => { button('Stage row').click(); });
+        await vi.waitUntil(() => pending.snapshot().appendedRows.length === 1);
+
+        const { cells } = pending.snapshot().appendedRows[0];
+        expect(cells['2']?.value).toBe('third column');
+        expect(cells['1']).toBeUndefined();
+    });
+
+    it('returns focus to the count when an add is refused', async () => {
+        await render_grid(composer_props({
+            pending_row_store: create_pending_row_store({ session_id: 'session-1' }),
+            // Admission refuses, so the dock stays open. The controls were
+            // disabled for the attempt, which blurs them.
+            on_append_rows: vi.fn(async () => undefined),
+        }));
+        await act(async () => {
+            (document.querySelector('.append-dock-launcher') as HTMLButtonElement).click();
+        });
+        const count = document.getElementById('append-dock-count');
+        await act(async () => {
+            (document.querySelector('.append-dock-add') as HTMLButtonElement).click();
+        });
+
+        await vi.waitUntil(() => document.activeElement === count);
+        expect(document.querySelector('.append-dock-panel')).not.toBeNull();
+    });
+
     it('stages composed rows as one publication carrying their values', async () => {
         await render_grid(composer_props({
             pending_row_store: create_pending_row_store({ session_id: 'session-1' }),
