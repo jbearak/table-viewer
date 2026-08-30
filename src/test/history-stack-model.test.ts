@@ -1346,6 +1346,92 @@ describe('string materialization at the ownership boundary', () => {
     });
 });
 
+describe('structural action allocation', () => {
+    it('preserves the prior JSON-length charge for escaped structural text', () => {
+        const label = 'Remove row';
+        const outcome = record_history_action(empty_history_stack(), {
+            label,
+            changes: [{
+                kind: 'tailRemoval',
+                delta: {
+                    worksheet: SHEET,
+                    appendHistoryId: 'saved-row',
+                    before: null,
+                    after: {
+                        appendHistoryId: 'saved-row',
+                        sourceRow: 8,
+                        savedFingerprint: 'control:\u0001 astral:😀 lone:\ud800',
+                        savedRow: {
+                            cells: { 0: { value: 'quote:" slash:\\' } },
+                            format: { kind: 'none' },
+                        },
+                    },
+                    beforeIndex: null,
+                    afterIndex: 0,
+                },
+            }],
+        });
+        if (outcome.kind !== 'recorded') throw new Error('Expected structural history');
+        const retained = outcome.state.undoStack[0];
+        const change = retained.action.changes[0];
+        if (change.kind !== 'tailRemoval') throw new Error('Expected tail-removal history');
+
+        const worksheet_string_bytes = ((SHEET.sheetName?.length ?? 0)
+            + (SHEET.worksheetId?.length ?? 0)) * 2;
+        expect(retained.byteCost).toBe(
+            label.length * 2
+            + 1_024
+            + worksheet_string_bytes
+            + JSON.stringify(change.delta).length * 2,
+        );
+    });
+
+    it('owns and charges a maximum-row pending snapshot without serializing it', () => {
+        const structural = {
+            formatTemplates: [{ id: 'plain', format: { kind: 'none' as const } }],
+            appendedRows: Array.from({ length: 10_000 }, (_unused, index) => ({
+                id: `pending-row-${index}`,
+                cells: { 0: { value: `value-${index}` } },
+                formatTemplateId: 'plain',
+                createdOrder: index + 1,
+            })),
+            tailRemovals: [],
+            conflicts: [],
+        };
+        const stringify = JSON.stringify;
+        let structural_serializations = 0;
+        JSON.stringify = ((value: unknown, ...rest: unknown[]) => {
+            if (typeof value === 'object' && value !== null && (
+                'appendedRows' in value || ('before' in value && 'after' in value)
+            )) structural_serializations += 1;
+            return stringify(value, ...rest as []);
+        }) as typeof JSON.stringify;
+        try {
+            const outcome = record_history_action(empty_history_stack(), {
+                label: 'Discard changes',
+                changes: [{
+                    kind: 'pendingRows',
+                    delta: {
+                        worksheet: SHEET,
+                        before: structural,
+                        after: {
+                            formatTemplates: [],
+                            appendedRows: [],
+                            tailRemovals: [],
+                            conflicts: [],
+                        },
+                    },
+                }],
+            });
+            expect(outcome.kind).toBe('recorded');
+        } finally {
+            JSON.stringify = stringify;
+        }
+
+        expect(structural_serializations).toBe(0);
+    });
+});
+
 describe('history_usage', () => {
     it('counts undone actions as still retained', () => {
         const state = move(record_all(['A', 'B']), 'undo');

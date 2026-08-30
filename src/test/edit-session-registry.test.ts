@@ -75,6 +75,92 @@ describe('edit session registry', () => {
         expect(moved).toHaveLength(1);
     });
 
+    it('does not rescan an unchanged worksheet store when another sheet changes', () => {
+        const { registry } = make_session_ref('session');
+        const unchanged = Array.from({ length: 64 }, (_unused, sheetIndex) => {
+            const store = registry.for_sheet(sheetIndex);
+            store.commit('session', '2:3', {
+                value: `move ${sheetIndex}`,
+                base: 'old',
+                movedFrom: { row: 0, col: 1, order: sheetIndex + 1 },
+            });
+            return store;
+        });
+        const changed = registry.for_sheet(64);
+        changed.commit('session', '4:5', {
+            value: 'move 64',
+            base: 'old',
+            movedFrom: { row: 1, col: 2, order: 65 },
+        });
+
+        let unchanged_snapshots = 0;
+        for (const store of unchanged) {
+            const snapshot = store.snapshot;
+            store.snapshot = () => {
+                unchanged_snapshots += 1;
+                return snapshot();
+            };
+        }
+        changed.commit('session', '6:7', {
+            value: 'move 65',
+            base: 'old',
+            movedFrom: { row: 3, col: 4, order: 66 },
+        });
+
+        expect(unchanged_snapshots).toBe(0);
+        expect(registry.formula_projection().moves).toHaveLength(66);
+        expect(registry.formula_projection().moves.at(-1)?.order).toBe(66);
+    });
+
+    it('does not rescan an unchanged pending-row store when another sheet changes', () => {
+        const { registry } = make_session_ref('session');
+        const unchanged = registry.pending_rows_for_sheet(0);
+        unchanged.append_rows(
+            'session',
+            ['first-source', 'first-destination'],
+            { id: 'plain', format: { kind: 'none' } },
+            1,
+            { sourceRowCount: 10, columnCount: 2, schemaFingerprint: 'first' },
+        );
+        unchanged.set_cell('session', 'first-destination', 1, {
+            value: 'first move',
+            movedFrom: {
+                row: 10,
+                col: 0,
+                order: 1,
+                rowIdentity: { kind: 'pending', pendingRowId: 'first-source' },
+            },
+        });
+        const changed = registry.pending_rows_for_sheet(1);
+        changed.append_rows(
+            'session',
+            ['second-source', 'second-destination'],
+            { id: 'plain', format: { kind: 'none' } },
+            3,
+            { sourceRowCount: 20, columnCount: 2, schemaFingerprint: 'second' },
+        );
+
+        let unchanged_snapshots = 0;
+        const snapshot = unchanged.snapshot;
+        unchanged.snapshot = () => {
+            unchanged_snapshots += 1;
+            return snapshot();
+        };
+        changed.set_cell('session', 'second-destination', 1, {
+            value: 'second move',
+            movedFrom: {
+                row: 20,
+                col: 0,
+                order: 2,
+                rowIdentity: { kind: 'pending', pendingRowId: 'second-source' },
+            },
+        });
+
+        expect(unchanged_snapshots).toBe(0);
+        expect(registry.formula_projection().moves.map((move) => move.order))
+            .toEqual([1, 2]);
+    });
+
     it('refreshes cached moves when only move provenance changes', () => {
         const { registry } = make_session_ref('session');
         const store = registry.for_sheet(0);

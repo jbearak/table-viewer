@@ -299,6 +299,58 @@ function estimate_string_bytes(text: string): number {
     return text.length * 2;
 }
 
+function json_string_code_units(text: string): number {
+    let units = 2;
+    for (let index = 0; index < text.length; index += 1) {
+        const code = text.charCodeAt(index);
+        if (code === 0x22 || code === 0x5c || code === 0x08 || code === 0x09
+            || code === 0x0a || code === 0x0c || code === 0x0d) {
+            units += 2;
+        } else if (code < 0x20) {
+            units += 6;
+        } else if (code >= 0xd800 && code <= 0xdbff) {
+            const low = text.charCodeAt(index + 1);
+            if (low >= 0xdc00 && low <= 0xdfff) {
+                units += 2;
+                index += 1;
+            } else {
+                units += 6;
+            }
+        } else if (code >= 0xdc00 && code <= 0xdfff) {
+            units += 6;
+        } else {
+            units += 1;
+        }
+    }
+    return units;
+}
+
+/** JSON.stringify(...).length without allocating the encoded string. */
+function json_code_units(value: unknown, array_slot = false): number {
+    if (value === null) return 4;
+    if (typeof value === 'string') return json_string_code_units(value);
+    if (typeof value === 'boolean') return value ? 4 : 5;
+    if (typeof value === 'number') return Number.isFinite(value) ? String(value).length : 4;
+    if (value === undefined) return array_slot ? 4 : 0;
+    if (typeof value !== 'object') return array_slot ? 4 : 0;
+    let units = 2;
+    if (Array.isArray(value)) {
+        for (let index = 0; index < value.length; index += 1) {
+            if (index > 0) units += 1;
+            units += json_code_units(value[index], true);
+        }
+        return units;
+    }
+    let written = 0;
+    for (const [key, child] of Object.entries(value)) {
+        if (child === undefined) continue;
+        if (written > 0) units += 1;
+        units += json_string_code_units(key) + 1 + json_code_units(child);
+        written += 1;
+    }
+    return units;
+}
+
 interface ActionCharger {
     value: (value: HistoryValue) => number;
     link: (link: CellHyperlink | null) => number;
@@ -367,7 +419,7 @@ function action_charger(): ActionCharger {
         worksheet: (worksheet) => once(worksheet, (target) =>
             string_bytes(target.sheetName ?? '') + string_bytes(target.worksheetId ?? '')),
         structural: (value) => once(value, (payload) =>
-            estimate_string_bytes(JSON.stringify(payload))),
+            json_code_units(payload) * 2),
     };
 }
 
@@ -413,10 +465,10 @@ function estimate_cell_delta_bytes(delta: CellHistoryDelta, charge: ActionCharge
 
 function estimate_change_bytes(change: HistoryChange, charge: ActionCharger): number {
     const structural_bytes = change.kind === 'rowAppend'
-        ? estimate_string_bytes(JSON.stringify({
+        ? json_code_units({
             ...change.delta,
             formatTemplates: [],
-        })) + change.delta.formatTemplates.reduce(
+        }) * 2 + change.delta.formatTemplates.reduce(
             (total, template) => total + charge.structural(template),
             0,
         )
@@ -2225,7 +2277,56 @@ export function action_is_single_worksheet(action: HistoryAction): boolean {
  * there is least of it.
  */
 interface StructuralHistoryOwner {
-    readonly templates: Map<string, PendingRowFormatTemplate>;
+    readonly templates: Map<string, PendingRowFormatTemplate[]>;
+}
+
+function structural_values_equal(left: unknown, right: unknown): boolean {
+    if (left === right) return true;
+    if (typeof left !== 'object' || left === null
+        || typeof right !== 'object' || right === null) return false;
+    if (Array.isArray(left) || Array.isArray(right)) {
+        return Array.isArray(left) && Array.isArray(right)
+            && left.length === right.length
+            && left.every((value, index) => structural_values_equal(value, right[index]));
+    }
+    const left_entries = Object.entries(left);
+    const right_entries = Object.entries(right);
+    return left_entries.length === right_entries.length
+        && left_entries.every(([key, value]) => Object.hasOwn(right, key)
+            && structural_values_equal(value, (right as Record<string, unknown>)[key]));
+}
+
+/** Snapshot structural input once, without retaining caller-owned string views. */
+function snapshot_structural_input<T>(value: T, ancestors = new Set<object>()): T {
+    if (typeof value === 'string') return materialized_string(value) as T;
+    if (typeof value !== 'object' || value === null) return value;
+    if (ancestors.has(value)) throw new TypeError('Structural history cannot contain cycles');
+    ancestors.add(value);
+    if (Array.isArray(value)) {
+        const copied = value.map((entry) => snapshot_structural_input(entry, ancestors));
+        ancestors.delete(value);
+        return Object.freeze(copied) as T;
+    }
+    const copied: Record<string, unknown> = {};
+    for (const [key, child] of Object.entries(value)) {
+        copied[key] = snapshot_structural_input(child, ancestors);
+    }
+    ancestors.delete(value);
+    return Object.freeze(copied) as T;
+}
+
+function own_structural_template(
+    value: PendingRowFormatTemplate,
+    structural_owner: StructuralHistoryOwner,
+): PendingRowFormatTemplate {
+    const normalized = own_pending_row_format_template(snapshot_structural_input(value));
+    const candidates = structural_owner.templates.get(normalized.id) ?? [];
+    const retained = candidates.find((candidate) =>
+        structural_values_equal(candidate.format, normalized.format));
+    if (retained !== undefined) return retained;
+    candidates.push(normalized);
+    structural_owner.templates.set(normalized.id, candidates);
+    return normalized;
 }
 
 function own_history_change(
@@ -2243,21 +2344,8 @@ function own_history_change(
         });
     }
     if (change.kind === 'rowAppend') {
-        const copied = JSON.parse(JSON.stringify({
-            before: change.delta.before,
-            after: change.delta.after,
-        })) as {
-            before: PendingAppendedRow | null;
-            after: PendingAppendedRow | null;
-        };
-        const owned_templates = change.delta.formatTemplates.map((template) => {
-            const key = `${template.id}\u0000${JSON.stringify(template.format)}`;
-            const retained = structural_owner.templates.get(key);
-            if (retained !== undefined) return retained;
-            const owned = own_pending_row_format_template(JSON.parse(JSON.stringify(template)));
-            structural_owner.templates.set(key, owned);
-            return owned;
-        });
+        const owned_templates = change.delta.formatTemplates.map((template) =>
+            own_structural_template(template, structural_owner));
         const own_row = (row: PendingAppendedRow | null): PendingAppendedRow | null => {
             if (row === null) return null;
             const template = owned_templates.find(
@@ -2268,11 +2356,11 @@ function own_history_change(
             }
             return own_pending_structural_changes({
                 formatTemplates: [template],
-                appendedRows: [row],
+                appendedRows: [snapshot_structural_input(row)],
             }).appendedRows[0];
         };
-        const before = own_row(copied.before);
-        const after = own_row(copied.after);
+        const before = own_row(change.delta.before);
+        const after = own_row(change.delta.after);
         const formats_by_id = new Map<string, PendingRowFormatTemplate>();
         for (const row of [before, after]) {
             if (row === null || formats_by_id.has(row.formatTemplateId)) continue;
@@ -2306,37 +2394,32 @@ function own_history_change(
         });
     }
     if (change.kind === 'pendingRows') {
-        const copied = JSON.parse(JSON.stringify({
-            before: change.delta.before,
-            after: change.delta.after,
-        })) as {
-            before: PendingStructuralChanges;
-            after: PendingStructuralChanges;
-        };
         return Object.freeze({
             kind: 'pendingRows',
             delta: Object.freeze({
                 worksheet: owner.own_worksheet_target(change.delta.worksheet),
-                before: own_pending_structural_changes(copied.before),
-                after: own_pending_structural_changes(copied.after),
+                before: own_pending_structural_changes(
+                    snapshot_structural_input(change.delta.before),
+                ),
+                after: own_pending_structural_changes(
+                    snapshot_structural_input(change.delta.after),
+                ),
             }),
         });
     }
-    const copied = JSON.parse(JSON.stringify({
-        before: change.delta.before,
-        after: change.delta.after,
-    })) as { before: PendingTailRemoval | null; after: PendingTailRemoval | null };
     const own_removal = (removal: PendingTailRemoval | null): PendingTailRemoval | null => {
         if (removal === null) return null;
-        return own_pending_structural_changes({ tailRemovals: [removal] }).tailRemovals[0];
+        return own_pending_structural_changes({
+            tailRemovals: [snapshot_structural_input(removal)],
+        }).tailRemovals[0];
     };
     return Object.freeze({
         kind: 'tailRemoval',
         delta: Object.freeze({
             worksheet: owner.own_worksheet_target(change.delta.worksheet),
             appendHistoryId: owner.own_string(change.delta.appendHistoryId),
-            before: own_removal(copied.before),
-            after: own_removal(copied.after),
+            before: own_removal(change.delta.before),
+            after: own_removal(change.delta.after),
             beforeIndex: change.delta.beforeIndex,
             afterIndex: change.delta.afterIndex,
         }),
