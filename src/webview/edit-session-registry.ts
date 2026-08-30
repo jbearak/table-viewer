@@ -306,7 +306,10 @@ export function create_edit_session_registry(
         readonly appendBasisSourceRowCount: number | undefined;
         readonly tailRemovalCount: number;
     }
-    const source_move_contributions = new Map<EditSessionStore, Map<string, MoveContribution>>();
+    const source_move_contributions = new Map<
+        EditSessionStore,
+        Map<string, MoveContribution | undefined>
+    >();
     const pending_move_projections = new Map<PendingRowStore, PendingMoveProjection>();
     const resolved_move_contributions = new Map<string, readonly XlsxFormulaCellMove[]>();
     const move_contribution_ids_by_sheet = new Map<number, Set<string>>();
@@ -475,11 +478,11 @@ export function create_edit_session_registry(
     };
     const source_move_projection = (
         store: EditSessionStore,
-    ): Map<string, MoveContribution> => {
-        const contributions = new Map<string, MoveContribution>();
+    ): Map<string, MoveContribution | undefined> => {
+        const contributions = new Map<string, MoveContribution | undefined>();
         for (const [key, entry] of store.snapshot()) {
             const contribution = source_move_contribution(key, entry);
-            if (contribution !== undefined) contributions.set(key, contribution);
+            contributions.set(key, contribution);
         }
         return contributions;
     };
@@ -672,6 +675,7 @@ export function create_edit_session_registry(
         for (const [key, contribution] of source_store === undefined
             ? []
             : source_move_contributions.get(source_store) ?? []) {
+            if (contribution === undefined) continue;
             const id = source_contribution_id(sheetIndex, key);
             const moves = resolved_moves(sheetIndex, contribution);
             if (moves.length === 0) continue;
@@ -804,7 +808,7 @@ export function create_edit_session_registry(
                 }
                 const cached = source_move_contributions.get(store) ?? new Map();
                 const contribution = source_move_contribution(change.key, entry);
-                if (contribution === undefined) cached.delete(change.key);
+                if (entry === undefined) cached.delete(change.key);
                 else cached.set(change.key, contribution);
                 source_move_contributions.set(store, cached);
                 if (changed_sheet_index !== undefined) {

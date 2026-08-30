@@ -1256,61 +1256,71 @@ function* expand_saved_pending_snapshot(
     assignments: ReadonlyMap<string, SavedHistoryRowAssignment>,
 ): IterableIterator<HistoryChange> {
     const worksheet_key = worksheet_target_key(change.delta.worksheet);
-    const before_rows = new Map(change.delta.before.appendedRows.map((row, index) => [
-        row.id,
-        { row, index },
-    ]));
-    const after_rows = new Map(change.delta.after.appendedRows.map((row, index) => [
-        row.id,
-        { row, index },
-    ]));
-    const ids = new Set([...before_rows.keys(), ...after_rows.keys()]);
-    for (const id of [...ids]) {
-        const row = before_rows.get(id)?.row ?? after_rows.get(id)?.row;
-        if (row === undefined) continue;
-        const assignment = assignments.get(row.id);
+    const before_rows = change.delta.before.appendedRows;
+    const after_rows = change.delta.after.appendedRows;
+    const matched_after_ids = new Set<string>();
+    const expanded_ids = new Set<string>();
+    const row_change = (
+        before: PendingAppendedRow | null,
+        after: PendingAppendedRow | null,
+        beforeIndex: number | null,
+        afterIndex: number | null,
+    ): HistoryChange | undefined => {
+        const id = before?.id ?? after?.id;
+        if (id === undefined) return undefined;
+        const assignment = assignments.get(id);
         if (assignment === undefined
-            || worksheet_target_key(assignment.worksheet) !== worksheet_key) ids.delete(id);
-    }
-    if (ids.size === 0) {
-        yield change;
-        return;
-    }
-    const templates = new Map<string, PendingRowFormatTemplate>();
-    for (const template of [
-        ...change.delta.before.formatTemplates,
-        ...change.delta.after.formatTemplates,
-    ]) {
-        if (!templates.has(template.id)) templates.set(template.id, template);
-    }
-    for (const id of ids) {
-        const before_entry = before_rows.get(id);
-        const after_entry = after_rows.get(id);
-        const before = before_entry?.row ?? null;
-        const after = after_entry?.row ?? null;
-        if (JSON.stringify(before) === JSON.stringify(after)) continue;
+            || worksheet_target_key(assignment.worksheet) !== worksheet_key) return undefined;
+        expanded_ids.add(id);
+        if (JSON.stringify(before) === JSON.stringify(after)) return undefined;
         const template_ids = new Set([
             before?.formatTemplateId,
             after?.formatTemplateId,
         ].filter((value): value is string => value !== undefined));
-        yield {
+        const templates = [
+            ...change.delta.before.formatTemplates,
+            ...change.delta.after.formatTemplates,
+        ].filter((template, index, all) => template_ids.has(template.id)
+            && all.findIndex((candidate) => candidate.id === template.id) === index);
+        return {
             kind: 'rowAppend',
             delta: {
                 worksheet: change.delta.worksheet,
                 pendingRowId: id,
                 before,
                 after,
-                beforeIndex: before_entry?.index ?? null,
-                afterIndex: after_entry?.index ?? null,
-                formatTemplates: [...template_ids].flatMap((template_id) => {
-                    const template = templates.get(template_id);
-                    return template === undefined ? [] : [template];
-                }),
+                beforeIndex,
+                afterIndex,
+                formatTemplates: templates,
             },
         };
+    };
+    let after_cursor = 0;
+    for (const [before_index, before] of before_rows.entries()) {
+        while (after_cursor < after_rows.length
+            && after_rows[after_cursor].createdOrder < before.createdOrder) after_cursor += 1;
+        const after_index = after_rows[after_cursor]?.id === before.id ? after_cursor : -1;
+        const after = after_index < 0 ? null : after_rows[after_index];
+        if (after !== null) matched_after_ids.add(after.id);
+        const expanded = row_change(
+            before,
+            after,
+            before_index,
+            after_index < 0 ? null : after_index,
+        );
+        if (expanded !== undefined) yield expanded;
     }
-    const before = structural_snapshot_without(change.delta.before, ids, new Set());
-    const after = structural_snapshot_without(change.delta.after, ids, new Set());
+    for (const [after_index, after] of after_rows.entries()) {
+        if (matched_after_ids.has(after.id)) continue;
+        const expanded = row_change(null, after, null, after_index);
+        if (expanded !== undefined) yield expanded;
+    }
+    if (expanded_ids.size === 0) {
+        yield change;
+        return;
+    }
+    const before = structural_snapshot_without(change.delta.before, expanded_ids, new Set());
+    const after = structural_snapshot_without(change.delta.after, expanded_ids, new Set());
     if (JSON.stringify(before) !== JSON.stringify(after)) {
         yield {
             kind: 'pendingRows' as const,
@@ -1571,10 +1581,116 @@ export function rekey_committed_tail_removal_history(
         };
     });
     const committed_ids_by_sheet = new Map<string, Set<string>>();
+    const committed_ids_by_source = new Map<string, Set<string>>();
     for (const item of committed_rows) {
         const ids = committed_ids_by_sheet.get(item.worksheetKey) ?? new Set<string>();
         ids.add(item.appendHistoryId);
         committed_ids_by_sheet.set(item.worksheetKey, ids);
+        const source_key = `${item.worksheetKey}\u0000${item.sourceRow}`;
+        const source_ids = committed_ids_by_source.get(source_key) ?? new Set<string>();
+        source_ids.add(item.appendHistoryId);
+        committed_ids_by_source.set(source_key, source_ids);
+    }
+    const visit_committed_pending_transitions = (
+        change: Extract<HistoryChange, { kind: 'pendingRows' }>,
+        visit: (id: string) => void,
+    ): void => {
+        const ids = committed_ids_by_sheet.get(worksheet_target_key(change.delta.worksheet));
+        if (ids === undefined) return;
+        const before = change.delta.before.tailRemovals;
+        const after = change.delta.after.tailRemovals;
+        if (before.length === 0 || after.length === 0) {
+            for (const removal of before.length === 0 ? after : before) {
+                if (ids.has(removal.appendHistoryId)) visit(removal.appendHistoryId);
+            }
+            return;
+        }
+        const before_committed = new Map<string, PendingTailRemoval>();
+        const after_committed = new Map<string, PendingTailRemoval>();
+        for (const removal of before) {
+            if (ids.has(removal.appendHistoryId)) {
+                before_committed.set(removal.appendHistoryId, removal);
+            }
+        }
+        for (const removal of after) {
+            if (ids.has(removal.appendHistoryId)) {
+                after_committed.set(removal.appendHistoryId, removal);
+            }
+        }
+        for (const id of new Set([...before_committed.keys(), ...after_committed.keys()])) {
+            if (JSON.stringify(before_committed.get(id) ?? null)
+                !== JSON.stringify(after_committed.get(id) ?? null)) visit(id);
+        }
+    };
+    const preflight_history = (): boolean => {
+        try {
+            const entries = [...state.undoStack, ...state.redoStack];
+            const meters = new Map<object, {
+                readonly retain: () => void;
+                readonly seen: Set<string>;
+            }>();
+            const meter_for = (entry: HistoryEntry) => {
+                let meter = meters.get(entry.id);
+                if (meter === undefined) {
+                    meter = {
+                        retain: rekey_output_meter(entry.action.label, bounds.hardMaxBytes),
+                        seen: new Set(),
+                    };
+                    meters.set(entry.id, meter);
+                }
+                return meter;
+            };
+            const transitioning_keys = new Set<string>();
+            for (const entry of entries) {
+                const retain_replacement = (key: string): void => {
+                    transitioning_keys.add(key);
+                    const meter = meter_for(entry);
+                    if (meter.seen.has(key)) return;
+                    meter.seen.add(key);
+                    meter.retain();
+                };
+                for (const change of entry.action.changes) {
+                    const worksheet_key = worksheet_target_key(change.delta.worksheet);
+                    if (change.kind === 'pendingRows') {
+                        visit_committed_pending_transitions(
+                            change,
+                            (id) => retain_replacement(`${worksheet_key}\u0000${id}`),
+                        );
+                    } else if (change.kind === 'tailRemoval') {
+                        const ids = committed_ids_by_sheet.get(worksheet_key);
+                        if (ids?.has(change.delta.appendHistoryId)
+                            && JSON.stringify(change.delta.before)
+                                !== JSON.stringify(change.delta.after)) {
+                            retain_replacement(
+                                `${worksheet_key}\u0000${change.delta.appendHistoryId}`,
+                            );
+                        }
+                    }
+                }
+            }
+            for (const entry of entries) {
+                for (const change of entry.action.changes) {
+                    if (change.kind !== 'cell' && change.kind !== 'highlight') continue;
+                    const worksheet_key = worksheet_target_key(change.delta.worksheet);
+                    const meter = meter_for(entry);
+                    for (const id of committed_ids_by_source.get(
+                        `${worksheet_key}\u0000${change.delta.sourceRow}`,
+                    ) ?? []) {
+                        const key = `${worksheet_key}\u0000${id}`;
+                        if (!transitioning_keys.has(key) || meter.seen.has(key)) continue;
+                        meter.seen.add(key);
+                        meter.retain();
+                    }
+                }
+            }
+            return true;
+        } catch (error) {
+            if (!(error instanceof BudgetExhausted)) throw error;
+            return false;
+        }
+    };
+    if (!preflight_history()) {
+        return refused(state, 'Remove appended rows', bounds.hardMaxBytes).state;
     }
     const expand_stack = (entries: readonly HistoryEntry[]): readonly HistoryEntry[] =>
         entries.map((entry) => ({
