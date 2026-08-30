@@ -5930,6 +5930,30 @@ describe('edit mode save exit', () => {
         );
     });
 
+    it('switches worksheets after a clean Edit exit fences the mounted editor', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['People', 'Inventory'], false), {
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                },
+            }),
+        );
+        await enter_edit_mode(post_message, 'clean-exit-session');
+        grid_shell_mock.stop_edit_admission.mockImplementation(() => {
+            // The real editing controller refuses commits after the exit fence.
+            grid_shell_mock.commit_live_edit.mockReturnValue(false);
+        });
+
+        await click_button('Edit');
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
+        expect(grid_shell_mock.stop_edit_admission).toHaveBeenCalledOnce();
+        await click_sheet_tab('Inventory');
+
+        expect(grid_stub().getAttribute('data-sheet-index')).toBe('1');
+    });
+
     it('moves every worksheet’s store to where its sheet went on a reorder', async () => {
         // An external reorder moves the sheets under all of the stores at once.
         // A store left at its old index would paint its edits onto whatever
@@ -8843,6 +8867,52 @@ describe('edit mode save exit', () => {
         ));
 
         expect(latest_store_edits()).toEqual({});
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
+    });
+
+    it('clears a saved cell observed from disk before its success terminal', async () => {
+        const operation: CsvSaveOperation = {
+            editSessionId: 'saved-session',
+            saveRequestId: 'saved-operation',
+            worksheets: [{
+                sheetIndex: 0,
+                edits: { '0:0': 'saved' },
+                dirtyEdits: { '0:0': { value: 'saved', base: 'base' } },
+            }],
+        };
+        await render_app();
+        await dispatch_host_message(initial_snapshot_message(
+            make_meta(['Sheet1'], false),
+            {
+                state: { pendingEdits: sheet_edits(operation.worksheets[0].dirtyEdits) },
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                    csvEditSessionId: operation.editSessionId,
+                    csvSaveLifecycle: {
+                        revision: 1,
+                        state: 'active',
+                        operation,
+                    },
+                },
+            },
+        ));
+        const store = grid_shell_mock.latest_props?.edit_session as EditSessionStore;
+        await act(async () => {
+            store.observe_file_bases(operation.editSessionId, new Map([
+                ['0:0', { value: 'saved' }],
+            ]));
+        });
+        expect(get_button('Edit').classList.contains('has-unsaved')).toBe(true);
+
+        await dispatch_host_message({
+            type: 'saveResult',
+            success: true,
+            lifecycle: { revision: 2, state: 'succeeded', operation },
+        });
+
+        expect(Object.fromEntries(store.snapshot())).toEqual({});
+        expect(get_button('Edit').classList.contains('has-unsaved')).toBe(false);
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
     });
 

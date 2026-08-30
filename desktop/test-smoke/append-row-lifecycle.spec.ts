@@ -159,11 +159,24 @@ test('saved appended rows settle cleanly and an external Git reset reloads them'
         buttons: undefined,
     }]);
 
+    const other_sheet_name = await page.locator('.sheet-tab:not(.active)').first().textContent();
+    if (!other_sheet_name) throw new Error('missing inactive worksheet tab');
+    const other_sheet = page.getByRole('button', { name: other_sheet_name, exact: true });
+    await other_sheet.click();
+    await expect(other_sheet).toHaveClass(/active/);
+    const fruit_sheet = page.getByRole('button', { name: 'Fruit Stand', exact: true });
+    await fruit_sheet.click();
+    await expect(fruit_sheet).toHaveClass(/active/);
+
     await edit_toggle.click();
     await expect(edit_toggle).toHaveAttribute('aria-pressed', 'true');
     await edit_toggle.click();
     await expect(edit_toggle).toHaveAttribute('aria-pressed', 'false');
     expect(await take_dialogs()).toEqual([]);
+    await other_sheet.click();
+    await expect(other_sheet).toHaveClass(/active/);
+    await fruit_sheet.click();
+    await expect(fruit_sheet).toHaveClass(/active/);
 
     await edit_toggle.click();
     await expect(edit_toggle).toHaveAttribute('aria-pressed', 'true');

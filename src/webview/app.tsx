@@ -4789,7 +4789,10 @@ export function App(): React.JSX.Element {
             // outside the tree, so its cleanup releases the captured row without
             // committing the text. Fold it first, as the transform and refresh
             // remounts do; the store lives above the grid and keeps it.
-            if (editing_ref.current?.commit_live_edit() === false) return;
+            if (
+                edit_mode_ref.current
+                && editing_ref.current?.commit_live_edit() === false
+            ) return;
             set_filter_editor(null);
             set_grid_focus_restore(null);
             set_toolbar_focus_restore(null);
