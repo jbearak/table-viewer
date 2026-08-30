@@ -2025,8 +2025,13 @@ body.vscode-high-contrast-light .toolbar-split-caret.open {
     display: flex;
     flex-direction: column;
     gap: 8px;
-    width: 280px;
-    max-height: 320px;
+    /* Content-driven within bounds: a two-column table should not open a panel
+       sized for a twenty-column one, and no table should open one wider than
+       the window. The lower bound keeps the action row on a single line. */
+    width: max-content;
+    min-width: 360px;
+    max-width: min(620px, calc(100vw - 24px));
+    max-height: min(420px, calc(100vh - 120px));
     padding: 10px;
     border: 1px solid var(--vscode-contrastBorder, rgba(127, 127, 127, 0.65));
     border-radius: 4px;
@@ -2058,10 +2063,14 @@ body.vscode-high-contrast-light .toolbar-split-caret.open {
     color: var(--vscode-descriptionForeground, #999);
 }
 
+/* Label beside its input rather than above it. Stacking them spends a line per
+   column on a panel whose whole purpose is showing many columns at once, and a
+   name as ordinary as "Elevation (m)" already fills that line. */
 .append-composer-field {
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
+    display: grid;
+    grid-template-columns: minmax(88px, 32%) minmax(0, 1fr);
+    align-items: center;
+    gap: 4px 10px;
 }
 
 .append-composer-field > label {
@@ -2070,6 +2079,7 @@ body.vscode-high-contrast-light .toolbar-split-caret.open {
 }
 
 .append-composer-field > input {
+    min-width: 0;
     padding: 2px 4px;
     background: var(--vscode-input-background, #3c3c3c);
     color: var(--vscode-input-foreground, #ccc);
@@ -2079,7 +2089,12 @@ body.vscode-high-contrast-light .toolbar-split-caret.open {
 
 .append-composer-actions {
     display: flex;
+    flex-wrap: wrap;
     gap: 8px;
+}
+
+.append-composer-panel button {
+    white-space: nowrap;
 }
 
 .append-composer-panel button {
