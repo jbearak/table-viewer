@@ -307,7 +307,7 @@ export function create_edit_session_registry(
         readonly tailRemovalCount: number;
     }
     const source_move_contributions = new Map<EditSessionStore, Map<string, MoveContribution>>();
-    const source_move_orders = new Map<EditSessionStore, Set<string>>();
+    const source_move_orders = new Map<EditSessionStore, Map<string, number>>();
     const pending_move_projections = new Map<PendingRowStore, PendingMoveProjection>();
     const resolved_move_contributions = new Map<string, readonly XlsxFormulaCellMove[]>();
     const move_contribution_ids_by_sheet = new Map<number, Set<string>>();
@@ -478,12 +478,12 @@ export function create_edit_session_registry(
         store: EditSessionStore,
     ): Map<string, MoveContribution> => {
         const contributions = new Map<string, MoveContribution>();
-        const order = new Set<string>();
+        const order = new Map<string, number>();
         for (const [key, entry] of store.snapshot()) {
             const contribution = source_move_contribution(key, entry);
             if (contribution === undefined) continue;
             contributions.set(key, contribution);
-            order.add(key);
+            order.set(key, store.insertion_order(key) ?? order.size);
         }
         source_move_orders.set(store, order);
         return contributions;
@@ -655,7 +655,9 @@ export function create_edit_session_registry(
         }
         const canonical = new Map<string, XlsxFormulaCellMove>();
         for (const [sheetIndex, store] of stores) {
-            for (const key of source_move_orders.get(store) ?? []) {
+            const ordered_keys = [...(source_move_orders.get(store) ?? [])]
+                .sort((left, right) => left[1] - right[1]);
+            for (const [key] of ordered_keys) {
                 for (const move of resolved_move_contributions.get(
                     source_contribution_id(sheetIndex, key),
                 ) ?? []) canonical.set(move_key(move), move);
@@ -809,7 +811,7 @@ export function create_edit_session_registry(
                     );
                 }
                 const cached = source_move_contributions.get(store) ?? new Map();
-                const order = source_move_orders.get(store) ?? new Set<string>();
+                const order = source_move_orders.get(store) ?? new Map<string, number>();
                 const contribution = source_move_contribution(change.key, entry);
                 if (entry === undefined) {
                     cached.delete(change.key);
@@ -818,7 +820,10 @@ export function create_edit_session_registry(
                     cached.delete(change.key);
                 } else {
                     cached.set(change.key, contribution);
-                    order.add(change.key);
+                    order.set(
+                        change.key,
+                        store.insertion_order(change.key) ?? order.size,
+                    );
                 }
                 source_move_contributions.set(store, cached);
                 source_move_orders.set(store, order);
@@ -957,7 +962,7 @@ export function create_edit_session_registry(
             });
             stores.set(sheet_index, created);
             source_move_contributions.set(created, new Map());
-            source_move_orders.set(created, new Set());
+            source_move_orders.set(created, new Map());
             watch(created);
             return created;
         },

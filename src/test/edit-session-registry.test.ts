@@ -198,6 +198,25 @@ describe('edit session registry', () => {
             .toEqual([10, 11]);
     });
 
+    it('uses store order when an earlier key gains its first tied move', () => {
+        const { registry } = make_session_ref('session');
+        const store = registry.for_sheet(0);
+        store.commit('session', '0:0', { value: 'A', base: 'old' });
+        store.commit('session', '1:0', {
+            value: 'B',
+            base: 'old',
+            movedFrom: { row: 11, col: 0, order: 7 },
+        });
+        store.commit('session', '0:0', {
+            value: 'A',
+            base: 'old',
+            movedFrom: { row: 10, col: 0, order: 7 },
+        });
+
+        expect(registry.formula_projection().moves.map((move) => move.sourceRow))
+            .toEqual([10, 11]);
+    });
+
     it('does not rescan an unchanged pending-row store when another sheet changes', () => {
         const { registry } = make_session_ref('session');
         const unchanged = registry.pending_rows_for_sheet(0);

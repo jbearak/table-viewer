@@ -35,6 +35,18 @@ export interface DirtyEntry extends CsvDirtyEntry {
     base_pending?: boolean;
 }
 
+const DIRTY_ENTRY_INSERTION_ORDER = Symbol('dirty-entry-insertion-order');
+type OrderedDirtyEntry = DirtyEntry & { [DIRTY_ENTRY_INSERTION_ORDER]?: number };
+
+function dirty_entry_insertion_order(entry: DirtyEntry | undefined): number | undefined {
+    return (entry as OrderedDirtyEntry | undefined)?.[DIRTY_ENTRY_INSERTION_ORDER];
+}
+
+function with_dirty_entry_insertion_order(entry: DirtyEntry, order: number): DirtyEntry {
+    Object.defineProperty(entry, DIRTY_ENTRY_INSERTION_ORDER, { value: order });
+    return entry;
+}
+
 /**
  * Reads a cell's current persisted raw text from the paged cache, addressed by
  * **canonical source row** — the same row space durable edit keys are in, which
@@ -142,6 +154,8 @@ export interface EditSessionStore {
     /** Single-key read for the Glide hot paths, which must not take the
      *  subscribed value. */
     get(key: string): DirtyEntry | undefined;
+    /** Stable Map insertion rank, stored on the owned entry rather than in a parallel key map. */
+    insertion_order(key: string): number | undefined;
     size(): number;
     /** Read imperatively, never subscribed: the base-capture effect's early
      *  return must cost one field read (get_cell_raw rebinds every page load). */
@@ -379,6 +393,19 @@ export function create_edit_session_store(
 ): EditSessionStore {
     let stamp: EditSessionIdentity | null = identity ?? null;
     let state = normalize(edits) ?? { entries: new Map<string, DirtyEntry>(), pending_base: false };
+    let next_entry_order = 0;
+    const reset_entry_orders = (entries: Map<string, DirtyEntry>): void => {
+        next_entry_order = 0;
+        for (const entry of entries.values()) {
+            with_dirty_entry_insertion_order(entry, next_entry_order);
+            next_entry_order += 1;
+        }
+    };
+    const preserve_entry_order = (key: string, entry: DirtyEntry): DirtyEntry => {
+        const order = dirty_entry_insertion_order(state.entries.get(key)) ?? next_entry_order++;
+        return with_dirty_entry_insertion_order(entry, order);
+    };
+    reset_entry_orders(state.entries);
     let write_validator: {
         readonly validate: (entries: ReadonlyMap<string, DirtyEntry>) => boolean;
         readonly on_refused: () => void;
@@ -460,7 +487,10 @@ export function create_edit_session_store(
             // `copy_dirty_entry` rebuilds only the wire fields, so the flag is
             // carried across explicitly.
             const copied = copy_dirty_entry(entry);
-            entries.set(key, entry.base_pending ? { ...copied, base_pending: true } : copied);
+            entries.set(key, preserve_entry_order(
+                key,
+                entry.base_pending ? { ...copied, base_pending: true } : copied,
+            ));
         }
         // Recomputed over the whole map, in BOTH directions. A replay adds and
         // removes, so it can clear the last pending entry — and, undoing a
@@ -511,6 +541,7 @@ export function create_edit_session_store(
         },
         identity: () => stamp,
         get: (key: string) => state.entries.get(key),
+        insertion_order: (key: string) => dirty_entry_insertion_order(state.entries.get(key)),
         size: () => state.entries.size,
         has_pending_base: () => state.pending_base,
         set_write_validator: (validator, on_refused) => {
@@ -531,8 +562,10 @@ export function create_edit_session_store(
             // restore, never on a keystroke, so there is no cost to buy by
             // guessing. A malformed candidate retains the current valid state but
             // still crosses that identity boundary and therefore still notifies.
+            const next_entries = next?.entries ?? state.entries;
+            if (next !== undefined) reset_entry_orders(next_entries);
             set_entries(
-                next?.entries ?? state.entries,
+                next_entries,
                 next?.pending_base ?? state.pending_base,
                 true,
             );
@@ -541,6 +574,7 @@ export function create_edit_session_store(
             stamp = next_identity;
             const next = normalize(next_edits);
             if (!next) return;
+            reset_entry_orders(next.entries);
             set_entries(next.entries, next.pending_base);
         },
         adopt_session: (session_id) => {
@@ -550,7 +584,7 @@ export function create_edit_session_store(
         commit: (session_id, key, entry) => {
             if (!owns(session_id)) return;
             const previous = formula_input(state.entries.get(key));
-            const copied = copy_dirty_entry(entry);
+            const copied = preserve_entry_order(key, copy_dirty_entry(entry));
             const value = formula_input(copied);
             const next = new Map(state.entries);
             next.set(key, copied);
@@ -581,6 +615,7 @@ export function create_edit_session_store(
             if (!owns(session_id)) return;
             const next = normalize(entries, false);
             if (!next) return;
+            reset_entry_orders(next.entries);
             set_entries(next.entries, next.pending_base);
         },
         retain: (session_id, keep) => {
@@ -593,7 +628,13 @@ export function create_edit_session_store(
         },
         clear_saved: (session_id, saved) => {
             if (!owns(session_id)) return;
-            set_entries_recomputed(clear_saved_dirty_entries(state.entries, saved));
+            const next = clear_saved_dirty_entries(state.entries, saved);
+            for (const [key, entry] of next) {
+                if (dirty_entry_insertion_order(entry) === undefined) {
+                    next.set(key, preserve_entry_order(key, entry));
+                }
+            }
+            set_entries_recomputed(next);
         },
         observe_file_bases: (session_id, bases) => {
             if (!owns(session_id) || bases.size === 0) return;
@@ -601,7 +642,10 @@ export function create_edit_session_store(
             for (const [key, observed] of bases) {
                 const entry = next.get(key);
                 if (!entry || entry.base_pending) continue;
-                next.set(key, dirty_entry_with_observed_file_base(entry, observed));
+                next.set(key, preserve_entry_order(
+                    key,
+                    dirty_entry_with_observed_file_base(entry, observed),
+                ));
             }
             // The pending value did not move, so formula inputs are unchanged.
             set_entries(next, state.pending_base, false, { kind: 'none' });
@@ -653,7 +697,7 @@ export function create_edit_session_store(
                     const [r, c] = key.split(':').map(Number);
                     const cur = get_cell_base(r, c);
                     if (cur !== undefined) {
-                        next.set(key, copy_dirty_entry(entry, {
+                        next.set(key, preserve_entry_order(key, copy_dirty_entry(entry, {
                             base: cur.value,
                             baseRuns: cur.runs,
                             // A legacy scalar recorded only text. When that
@@ -665,7 +709,7 @@ export function create_edit_session_store(
                                 ? cur.runs
                                 : entry.valueRuns,
                             formattingKnown: true,
-                        }));
+                        })));
                         changed = true;
                         continue;
                     }

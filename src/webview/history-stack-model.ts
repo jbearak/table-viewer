@@ -1325,7 +1325,7 @@ function* expand_saved_pending_snapshot(
     }
     const before = structural_snapshot_without(change.delta.before, expanded_ids, new Set());
     const after = structural_snapshot_without(change.delta.after, expanded_ids, new Set());
-    if (JSON.stringify(before) !== JSON.stringify(after)) {
+    if (!structural_values_equal(before, after)) {
         yield {
             kind: 'pendingRows' as const,
             delta: { worksheet: change.delta.worksheet, before, after },
@@ -1489,7 +1489,7 @@ function expand_committed_pending_snapshot(
     const present_ids = new Set([...ids].filter((id) => {
         const before = before_removals.get(id)?.removal ?? null;
         const after = after_removals.get(id)?.removal ?? null;
-        return JSON.stringify(before) !== JSON.stringify(after);
+        return !structural_values_equal(before, after);
     }));
     if (present_ids.size === 0) return [change];
     const removal_changes: HistoryChange[] = [];
@@ -1498,7 +1498,7 @@ function expand_committed_pending_snapshot(
         const after_entry = after_removals.get(id);
         const before = before_entry?.removal ?? null;
         const after = after_entry?.removal ?? null;
-        if (JSON.stringify(before) === JSON.stringify(after)) continue;
+        if (structural_values_equal(before, after)) continue;
         removal_changes.push({
             kind: 'tailRemoval',
             delta: {
@@ -1515,7 +1515,7 @@ function expand_committed_pending_snapshot(
     const after = structural_snapshot_without(change.delta.after, new Set(), present_ids);
     return [
         ...removal_changes,
-        ...(JSON.stringify(before) === JSON.stringify(after) ? [] : [{
+        ...(structural_values_equal(before, after) ? [] : [{
             kind: 'pendingRows' as const,
             delta: { worksheet: change.delta.worksheet, before, after },
         }]),
@@ -1666,8 +1666,10 @@ export function rekey_committed_tail_removal_history(
                     } else if (change.kind === 'tailRemoval') {
                         const ids = committed_ids_by_sheet.get(worksheet_key);
                         if (ids?.has(change.delta.appendHistoryId)
-                            && JSON.stringify(change.delta.before)
-                                !== JSON.stringify(change.delta.after)) {
+                            && !structural_values_equal(
+                                change.delta.before,
+                                change.delta.after,
+                            )) {
                             retain_replacement(
                                 `${worksheet_key}\u0000${change.delta.appendHistoryId}`,
                             );
@@ -1757,7 +1759,8 @@ export function rekey_committed_tail_removal_history(
             }
         }
     }
-    const formats = new Map<string, PendingRowFormatTemplate>();
+    const formats: PendingRowFormatTemplate[] = [];
+    const formats_by_identity = new WeakMap<object, PendingRowFormatTemplate>();
     const replacements = new Map<object, Array<{
         readonly key: string;
         readonly sourceRow: number;
@@ -1792,14 +1795,19 @@ export function rekey_committed_tail_removal_history(
             replacement_floors.set(entry.id, floor);
         }
 
-        const format_key = JSON.stringify(removal.savedRow.format);
-        let template = formats.get(format_key);
+        const format = removal.savedRow.format;
+        let template = formats_by_identity.get(format);
         if (template === undefined) {
-            template = Object.freeze({
-                id: `restored-format:${append_history_id}`,
-                format: removal.savedRow.format,
-            });
-            formats.set(format_key, template);
+            template = formats.find((candidate) =>
+                structural_values_equal(candidate.format, format));
+            if (template === undefined) {
+                template = Object.freeze({
+                    id: `restored-format:${append_history_id}`,
+                    format,
+                });
+                formats.push(template);
+            }
+            formats_by_identity.set(format, template);
         }
         const cell_transitions = new Map<number, Array<{
             index: number;
