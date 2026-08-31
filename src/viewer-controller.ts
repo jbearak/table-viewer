@@ -599,6 +599,15 @@ function log_sanitized_failure(message: string, error: unknown): void {
     console.error(message, { code: sanitized_error_code(error) });
 }
 
+/**
+ * The edit session id's host suffix (`host:N`), without the file-key prefix.
+ * Session ids embed the workbook's filesystem path; diagnostics must not.
+ */
+function sanitized_edit_session_suffix(edit_session_id: string): string {
+    const marker = edit_session_id.lastIndexOf(':host:');
+    return marker === -1 ? 'host:?' : edit_session_id.slice(marker + 1);
+}
+
 function is_abort_error(error: unknown): boolean {
     return error instanceof Error && error.name === 'AbortError';
 }
@@ -2779,7 +2788,8 @@ export function attach_viewer(
         const refuse = (reason: string, detail?: Record<string, unknown>) => {
             console.warn('Refused a pending structural publication plan', {
                 reason,
-                ledgerKey: ledger_key,
+                editSessionId: sanitized_edit_session_suffix(edit_session_id),
+                targetKey: worksheet_target_key(target),
                 hasLedger: prior_ledger !== undefined,
                 ownedRows: prior_ledger?.ownedRowIds.size ?? 0,
                 postedRows: changes.appendedRows.length,
@@ -11687,7 +11697,7 @@ export function attach_viewer(
                 ) => {
                     console.warn('Dropped a pending structural publication', {
                         reason,
-                        editSessionId: msg.editSessionId,
+                        editSessionId: sanitized_edit_session_suffix(msg.editSessionId),
                         sequence: msg.sequence,
                         ...detail,
                     });
