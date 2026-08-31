@@ -355,6 +355,18 @@ vi.mock('../webview/grid-shell', () => ({
             React.createElement(
                 'button',
                 {
+                    className: 'stub-saved-row-focus-hidden',
+                    onClick: () => props.saved_row_focus
+                        && props.on_saved_row_focus_applied?.(
+                            props.saved_row_focus.sequence,
+                            false,
+                        ),
+                },
+                'saved row hidden'
+            ),
+            React.createElement(
+                'button',
+                {
                     className: 'stub-row-resize',
                     // Display-row intervals, the way the real shell coalesces a row
                     // selection before handing it up: rows 3, 5 and 8 as three of them.
@@ -9015,7 +9027,11 @@ describe('edit mode save exit', () => {
     });
 
     for (const save_order of ['snapshot-first', 'result-first'] as const) {
-    it(`clears saved appended rows before leaving edit mode (${save_order})`, async () => {
+    for (const [row_kind, row_cells] of [
+        ['blank', {}],
+        ['filled', { 0: { value: 'Pear', valueEditOrder: 1 } }],
+    ] as const) {
+    it(`clears a saved ${row_kind} appended row before leaving edit mode (${save_order})`, async () => {
         grid_shell_mock.has_uncommitted_changes = true;
         grid_shell_mock.pending_active_cell.mockReturnValue({
             pendingRowId: 'pending-row-1',
@@ -9041,7 +9057,7 @@ describe('edit mode save exit', () => {
                 formatTemplates: [{ id: 'plain', format: { kind: 'none' } }],
                 appendedRows: [{
                     id: 'pending-row-1',
-                    cells: {},
+                    cells: row_cells,
                     formatTemplateId: 'plain',
                     createdOrder: 1,
                 }],
@@ -9063,6 +9079,10 @@ describe('edit mode save exit', () => {
 
         post_message.mockClear();
         await click_button('Edit');
+        // The native Save/Discard dialog can outlive the grid render that owned
+        // this pending-row selection. Save must use the identity captured when
+        // the dialog opened, not sample the possibly remounted grid afterwards.
+        grid_shell_mock.pending_active_cell.mockReturnValue(undefined);
         await dispatch_host_message({ type: 'saveDialogResult', choice: 'save' });
         const operation = grid_shell_mock.latest_props?.save_operation as CsvSaveOperation;
         expect(operation.worksheets[0].structuralChanges?.appendedRows.map((row) => row.id))
@@ -9087,7 +9107,7 @@ describe('edit mode save exit', () => {
                     formatTemplates: [{ id: 'plain', format: { kind: 'none' } }],
                     appendedRows: [{
                         id: 'pending-row-1',
-                        cells: {},
+                        cells: row_cells,
                         formatTemplateId: 'plain',
                         createdOrder: 1,
                     }],
@@ -9139,7 +9159,14 @@ describe('edit mode save exit', () => {
             sourceRow: 1,
             sourceColumn: 0,
         });
+        post_message.mockClear();
+        await click_stub_button('.stub-saved-row-focus-hidden');
+        expect(post_message).toHaveBeenCalledWith({
+            type: 'showWarning',
+            message: 'Saved row is hidden by the current filters.',
+        });
     });
+    }
     }
 
     it('does not restore saved appended rows from an initial recovery snapshot', async () => {

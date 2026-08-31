@@ -1565,6 +1565,14 @@ export function App(): React.JSX.Element {
         requestId: string;
         editSessionId: string;
     } | null>(null);
+    const pending_save_dialog_grid_focus_ref = useRef<{
+        editSessionId: string;
+        pendingCell?: {
+            readonly pendingRowId: string;
+            readonly sourceColumn: number;
+        };
+        restoreFocus: boolean;
+    } | null>(null);
     // GridShell blurs the active element once a save is admitted. Remember that
     // the grid owned focus before that intentional blur so a later rejection can
     // hand keyboard focus to the worksheet it reveals. Keyed to the operation so
@@ -2045,6 +2053,7 @@ export function App(): React.JSX.Element {
         renderer_publication_fenced_session_ref.current = edit_session_id;
         editing_ref.current?.stop_edit_admission();
         pending_save_dialog_ref.current = null;
+        pending_save_dialog_grid_focus_ref.current = null;
     }, []);
 
     const release_edit_session = useCallback(() => {
@@ -2190,8 +2199,17 @@ export function App(): React.JSX.Element {
         });
         const projection = propose_csv_save(save_projection_ref.current, operation);
         save_projection_ref.current = projection;
-        const pending_cell = grid_focus_ref.current?.pending_active_cell?.();
-        const restore_focus = grid_focus_ref.current?.has_focus() === true;
+        const dialog_focus = pending_save_dialog_grid_focus_ref.current
+            ?.editSessionId === operation.editSessionId
+            ? pending_save_dialog_grid_focus_ref.current
+            : undefined;
+        pending_save_dialog_grid_focus_ref.current = null;
+        const pending_cell = dialog_focus !== undefined
+            ? dialog_focus.pendingCell
+            : grid_focus_ref.current?.pending_active_cell?.();
+        const restore_focus = dialog_focus !== undefined
+            ? dialog_focus.restoreFocus
+            : grid_focus_ref.current?.has_focus() === true;
         pending_save_grid_focus_ref.current = pending_cell !== undefined || restore_focus
             ? {
                 editSessionId: operation.editSessionId,
@@ -2378,6 +2396,7 @@ export function App(): React.JSX.Element {
                 // switching stays blocked for the life of the window, and any
                 // switch deferred behind it never runs.
                 pending_save_dialog_ref.current = null;
+                pending_save_dialog_grid_focus_ref.current = null;
                 set_csv_edit_session_id(undefined);
                 set_edit_session_pending(false);
                 set_edit_mode(false);
@@ -3553,6 +3572,7 @@ export function App(): React.JSX.Element {
                         set_edit_session_pending(false);
                         pending_edit_request_ref.current = null;
                         pending_save_dialog_ref.current = null;
+                        pending_save_dialog_grid_focus_ref.current = null;
                         // The document is being replaced, which clears history with
                         // it: every part of a replay cursor destination describes a
                         // workbook that is no longer loaded.
@@ -5922,6 +5942,12 @@ export function App(): React.JSX.Element {
                 editSessionId: csv_edit_session_id,
             };
             pending_save_dialog_ref.current = request;
+            const pending_cell = grid_focus_ref.current?.pending_active_cell?.();
+            pending_save_dialog_grid_focus_ref.current = {
+                editSessionId: csv_edit_session_id,
+                restoreFocus: grid_focus_ref.current?.has_focus() === true,
+                ...(pending_cell === undefined ? {} : { pendingCell: pending_cell }),
+            };
             host_bridge.postMessage({
                 type: 'showSaveDialog',
                 requestId: request.requestId,
@@ -6524,10 +6550,14 @@ export function App(): React.JSX.Element {
                     if (request_save_or_remain_dirty()) {
                         pending_exit_ref.current = true;
                     } else {
+                        pending_save_dialog_grid_focus_ref.current = null;
                         leave_edit_mode();
                     }
                 } else if (msg.choice === 'discard') {
+                    pending_save_dialog_grid_focus_ref.current = null;
                     discard_edit_session();
+                } else {
+                    pending_save_dialog_grid_focus_ref.current = null;
                 }
                 // 'cancel' → stay in edit mode, keep edits.
             } else if (msg.type === 'saveResult') {
@@ -7424,12 +7454,12 @@ export function App(): React.JSX.Element {
     }, []);
     const handle_saved_row_focus_applied = useCallback((
         sequence: number,
-        visible: boolean,
+        visible: boolean | null,
     ) => {
         set_saved_row_focus((current) => (
             current?.sequence === sequence ? null : current
         ));
-        if (!visible) {
+        if (visible === false) {
             host_bridge.postMessage({
                 type: 'showWarning',
                 message: 'Saved row is hidden by the current filters.',

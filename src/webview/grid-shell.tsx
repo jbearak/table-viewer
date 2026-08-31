@@ -1288,7 +1288,10 @@ export interface GridShellProps {
     on_history_focus_applied?: (sequence: number, outcome: HistoryFocusOutcome) => void;
     /** One-shot source-keyed cursor restoration after a saved pending row is rekeyed. */
     saved_row_focus?: SavedRowFocus | null;
-    on_saved_row_focus_applied?: (sequence: number, visible: boolean) => void;
+    on_saved_row_focus_applied?: (
+        sequence: number,
+        visible: boolean | null,
+    ) => void;
     /** Stable pending-row cursor captured before a source-refresh remount. */
     pending_row_focus?: PendingRowFocus | null;
     on_pending_row_focus_applied?: (sequence: number, visible: boolean) => void;
@@ -3213,6 +3216,12 @@ export function GridShell({
         unloaded_display_row_for_source,
     ]);
     const applied_saved_row_focus_ref = useRef<number | null>(null);
+    const saved_row_focus_attempt_ref = useRef<string | null>(null);
+    const saved_row_focus_retries_ref = useRef({ sequence: -1, count: 0 });
+    const [saved_row_focus_retry_revision, set_saved_row_focus_retry_revision] = useState(0);
+    useEffect(() => () => {
+        saved_row_focus_attempt_ref.current = null;
+    }, []);
     useLayoutEffect(() => {
         if (saved_row_focus === null || saved_row_focus.sheetIndex !== sheet_index) return;
         if (applied_saved_row_focus_ref.current === saved_row_focus.sequence) return;
@@ -3229,22 +3238,69 @@ export function GridShell({
                 || !resolved_source_display_rows.rows.has(saved_row_focus.sourceRow)
             )
         ) return;
-        applied_saved_row_focus_ref.current = saved_row_focus.sequence;
+        const attempt = [
+            saved_row_focus.sequence,
+            generation,
+            source_generation,
+            mapping_generation,
+            pending_payload_revision,
+            saved_row_focus_retry_revision,
+        ].join(':');
+        if (saved_row_focus_attempt_ref.current === attempt) return;
+        saved_row_focus_attempt_ref.current = attempt;
         if (!can_reveal_source_cell(
             saved_row_focus.sourceRow,
             saved_row_focus.sourceColumn,
         )) {
+            applied_saved_row_focus_ref.current = saved_row_focus.sequence;
             if (saved_row_focus.restoreFocus) focus_grid();
-            on_saved_row_focus_applied(saved_row_focus.sequence, false);
+            on_saved_row_focus_applied(
+                saved_row_focus.sequence,
+                false,
+            );
             return;
         }
         void reveal_source_cell(
             saved_row_focus.sourceRow,
             saved_row_focus.sourceColumn,
-            undefined,
+            () => saved_row_focus_attempt_ref.current === attempt
+                && applied_saved_row_focus_ref.current !== saved_row_focus.sequence,
             saved_row_focus.restoreFocus,
         ).then((visible) => {
-            on_saved_row_focus_applied(saved_row_focus.sequence, visible);
+            if (saved_row_focus_attempt_ref.current !== attempt) return;
+            if (!visible) {
+                // A source refresh can invalidate an in-flight page load. Keep
+                // the focus request alive and retry from the latest loader.
+                saved_row_focus_attempt_ref.current = null;
+                const retries = saved_row_focus_retries_ref.current;
+                const count = retries.sequence === saved_row_focus.sequence
+                    ? retries.count
+                    : 0;
+                if (count < 3) {
+                    saved_row_focus_retries_ref.current = {
+                        sequence: saved_row_focus.sequence,
+                        count: count + 1,
+                    };
+                    set_saved_row_focus_retry_revision((revision) => revision + 1);
+                    return;
+                }
+                applied_saved_row_focus_ref.current = saved_row_focus.sequence;
+                if (saved_row_focus.restoreFocus) focus_grid();
+                on_saved_row_focus_applied(
+                    saved_row_focus.sequence,
+                    null,
+                );
+                return;
+            }
+            saved_row_focus_retries_ref.current = {
+                sequence: saved_row_focus.sequence,
+                count: 0,
+            };
+            applied_saved_row_focus_ref.current = saved_row_focus.sequence;
+            on_saved_row_focus_applied(
+                saved_row_focus.sequence,
+                true,
+            );
         });
     }, [
         on_saved_row_focus_applied,
@@ -3253,12 +3309,15 @@ export function GridShell({
         generation,
         get_display_row_for_source,
         mapping_generation,
+        pending_payload_revision,
         reveal_source_cell,
         resolved_source_display_rows,
         rows_are_projected,
         saved_row_focus,
+        saved_row_focus_retry_revision,
         sheet_index,
         sheet_meta.sourceRowCount,
+        source_generation,
         transform_pending,
     ]);
     const applied_pending_row_focus_ref = useRef<number | null>(null);
