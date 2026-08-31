@@ -122,12 +122,21 @@ const RESIZE_SETTLE_MS = 250;
 
 /**
  * Fence diagnostics must not leak where the document lives: a renderer-loss
- * error can embed the failed navigation's URL (`on_failed_load`). The fence's
- * own errors carry no locations, so replacing URLs keeps every message useful.
+ * error can embed the failed navigation's URL (`on_failed_load`), and a drain
+ * rejection can carry a filesystem error naming the file's path. The fence's
+ * own errors carry no locations, so the replacements keep them verbatim.
  */
 function sanitized_fence_error(error: unknown): string {
     const message = error instanceof Error ? error.message : String(error);
-    return message.replace(/[a-z][a-z0-9+.-]*:\/\/\S*/gi, '<url>');
+    return message
+        .replace(/[a-z][a-z0-9+.-]*:\/\/\S*/gi, '<url>')
+        // A quoted path first, whole: Node fs errors quote the path, and a
+        // space inside a filename would otherwise leave its tail behind.
+        .replace(/(['"`])[^'"`]*[\\/][^'"`]*\1/g, '<path>')
+        // An absolute path: optional drive letter, then at least two
+        // slash-separated segments, so prose like "close/reload" survives.
+        .replace(/(?:[A-Za-z]:)?[\\/](?:[^\s'"`)\]]+[\\/])+[^\s'"`)\]]*/g, '<path>')
+        .slice(0, 512);
 }
 
 /** Feeds the per-window viewer host (see `viewer_url`); never reused, so a
