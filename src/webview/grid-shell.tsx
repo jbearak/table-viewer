@@ -188,7 +188,7 @@ import {
     RowResizeOverlay,
     type RowResizeOverlayHandle,
 } from './row-resize-overlay';
-import { AppendDock } from './append-dock';
+import { AppendDock, type AppendDockAnchor } from './append-dock';
 import {
     AppendComposer,
     EMPTY_APPEND_COMPOSER_DRAFT,
@@ -244,6 +244,11 @@ import {
 
 /** Pixel proximity to a row border that arms the resize strip. */
 const ROW_RESIZE_TOLERANCE_PX = 5;
+
+/** The append launcher's phantom row never rises into the header band. */
+const APPEND_ANCHOR_HEADER_CLEARANCE_PX = 36;
+/** Nor does it sit under Glide's overlay horizontal scrollbar. */
+const APPEND_ANCHOR_SCROLLBAR_CLEARANCE_PX = 12;
 
 /** Module-level so the DataEditor prop is referentially stable. */
 const custom_renderers = [rich_text_cell_renderer];
@@ -4016,6 +4021,64 @@ export function GridShell({
         set_composer_open(false);
     }, [may_offer_append_dock]);
     /**
+     * Where the append launcher sits. The phantom-row anchor parks it in the
+     * row-number gutter directly below the last display row, so it never
+     * covers a real row marker. 'corner' is the legacy fixed bottom-left inset,
+     * kept for when grid geometry is unavailable (headless test DOMs, zero-size
+     * layouts). 'hidden' means the end of the table is scrolled out of view;
+     * like a spreadsheet's trailing blank row, the affordance lives at the
+     * bottom of the data rather than floating over the middle of it.
+     */
+    const [append_anchor, set_append_anchor] = useState<
+        AppendDockAnchor | 'corner' | 'hidden'
+    >('corner');
+    const append_row_count_ref = useRef(row_count);
+    append_row_count_ref.current = row_count;
+    const append_dock_open_ref = useRef(append_dock_open);
+    append_dock_open_ref.current = append_dock_open;
+    const append_marker_width_ref = useRef(row_marker_options.width);
+    append_marker_width_ref.current = row_marker_options.width;
+    const update_append_anchor = useCallback(() => {
+        const root_rect = grid_root_ref.current?.getBoundingClientRect();
+        const grid = grid_ref.current;
+        // No usable geometry (jsdom, collapsed layout): keep the corner
+        // fallback so the affordance always exists somewhere.
+        if (!root_rect || root_rect.height <= 0 || grid === null) {
+            set_append_anchor('corner');
+            return;
+        }
+        const last_row = append_row_count_ref.current - 1;
+        const bounds = last_row >= 0 ? grid.getBounds(0, last_row) : undefined;
+        if (bounds === undefined || bounds.height <= 0) {
+            set_append_anchor(append_dock_open_ref.current ? 'corner' : 'hidden');
+            return;
+        }
+        const height = Math.min(Math.max(Math.round(bounds.height), 22), 32);
+        const width = Math.max(append_marker_width_ref.current, 28);
+        // Keep clear of the header band above and Glide's overlay horizontal
+        // scrollbar below; outside that window the phantom row is off screen.
+        const min_top = APPEND_ANCHOR_HEADER_CLEARANCE_PX;
+        const max_top = Math.round(root_rect.height)
+            - height
+            - APPEND_ANCHOR_SCROLLBAR_CLEARANCE_PX;
+        let top = Math.round(bounds.y + bounds.height - root_rect.top);
+        if (top < min_top || top > max_top) {
+            // While the dock is open the user is mid-gesture (typing a count),
+            // so pin it to the nearest edge instead of unmounting under them.
+            if (!append_dock_open_ref.current || max_top < min_top) {
+                set_append_anchor('hidden');
+                return;
+            }
+            top = Math.min(Math.max(top, min_top), max_top);
+        }
+        set_append_anchor({
+            left: 0,
+            bottom: Math.round(root_rect.height) - top - height,
+            width,
+            height,
+        });
+    }, []);
+    /**
      * Labels for the composer's fields — the same titles the grid header
      * paints, so a field is identifiable by the column the user can see.
      */
@@ -4843,6 +4906,20 @@ export function GridShell({
         };
     }, [
         effective_row_height,
+    ]);
+
+    // Scroll and viewport changes reach the append anchor through Glide's
+    // visible-region callback; everything else that moves the last row's pixel
+    // position — appended/removed rows, row-height edits, dock availability —
+    // lands here after layout.
+    useLayoutEffect(() => {
+        update_append_anchor();
+    }, [
+        update_append_anchor,
+        row_count,
+        may_offer_append_dock,
+        append_dock_open,
+        get_row_height,
     ]);
 
     const get_cell_height = useCallback((row: number, display_column: number): number => {
@@ -7678,6 +7755,9 @@ export function GridShell({
     const on_visible_region_changed = useCallback(
         (range: Rectangle) => {
             visible_ref.current = range;
+            // The append launcher tracks the last row like one more row slot;
+            // any scroll or viewport resize can move it or scroll it away.
+            update_append_anchor();
             if (!preview_mode) {
                 const scroller = grid_root_ref.current?.querySelector<HTMLElement>(
                     '.dvn-scroller',
@@ -7756,6 +7836,7 @@ export function GridShell({
             restore_pending_preview_row,
             pending_projection.sourceRowCount,
             pending_projection,
+            update_append_anchor,
             vertical_merged_ranges,
         ],
     );
@@ -8211,8 +8292,9 @@ export function GridShell({
                 onKeyDown={on_key_down}
                 provideEditor={provide_editor}
             />
-            {may_offer_append_dock && (
+            {may_offer_append_dock && (append_anchor !== 'hidden' || append_dock_open) && (
                 <AppendDock
+                    anchor={typeof append_anchor === 'object' ? append_anchor : undefined}
                     open={append_dock_open}
                     on_open_change={set_append_dock_open}
                     remaining_capacity={remaining_append_capacity}

@@ -721,10 +721,12 @@ body.vscode-high-contrast-light .toolbar-split-caret.open {
     overflow: hidden;
 }
 
-/* The append dock overlays the grid's bottom-left corner. It is positioned,
-   never laid out in flow: reserving vertical space here would reflow the
-   virtualized scroller every time the dock opened. The bottom offset clears
-   Glide's horizontal scrollbar so the launcher never sits on top of it. */
+/* The append dock overlays the grid. It is positioned, never laid out in
+   flow: reserving vertical space here would reflow the virtualized scroller
+   every time the dock opened. Normally the shell measures a phantom-row
+   anchor (inline left/bottom, `.is-row-anchored`) that parks the launcher in
+   the row-number gutter just below the last row; these corner insets are the
+   fallback when no grid geometry is available. */
 .append-dock {
     position: absolute;
     /* One inset on both axes: the launcher is a corner control, and matching
@@ -772,6 +774,15 @@ body.vscode-high-contrast-light .toolbar-split-caret.open {
 .append-dock-launcher:hover,
 .append-dock-launcher.is-open {
     background: var(--vscode-button-hoverBackground, #1177bb);
+}
+
+/* Row-anchored: the launcher is a phantom row slot — gutter-wide, row-tall,
+   square-cornered — so it reads as the next row number cell rather than a
+   floating button. Width and height arrive inline from the shell's measure. */
+.append-dock.is-row-anchored .append-dock-launcher {
+    border-radius: 3px;
+    font-size: 16px;
+    box-shadow: none;
 }
 
 .append-dock-launcher > span {

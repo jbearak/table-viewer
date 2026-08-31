@@ -1,20 +1,41 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 
 /**
- * The append dock: a round launcher in the grid's bottom-left corner and the
- * quick-add surface it opens.
+ * The append dock: a launcher and the quick-add surface it opens.
  *
- * It replaces Glide's trailing append row, which read as a cell rather than a
- * control and appended exactly one row wherever the sheet happened to be
- * scrolled. The dock overlays the grid — it is positioned inside
- * `.grid-shell-root` and reserves no space, because reserving space would
- * reflow the virtualized scroller every time it opened.
+ * The launcher renders as a phantom row slot — a strip the width of the
+ * row-number gutter, anchored directly below the last display row — so it
+ * never covers a real row number the way the earlier fixed bottom-left corner
+ * button did (which made the rows under it impossible to select or delete by
+ * their markers). The shell measures the anchor from the grid and hands it in
+ * as `anchor`; when no geometry is available (headless tests, zero-size
+ * layouts) the dock falls back to the old corner placement via CSS defaults.
+ *
+ * The dock overlays the grid — it is positioned inside `.grid-shell-root` and
+ * reserves no space, because reserving space would reflow the virtualized
+ * scroller every time it opened.
  *
  * The component owns no append machinery. It clamps a count against the
  * capacity the shell hands it and calls `on_add_rows`; refusal handling,
  * history, and the pending band all stay where they were.
  */
+
+/**
+ * Measured placement for the row-anchored launcher, in `.grid-shell-root`
+ * coordinates. `left`/`bottom` position the dock; `width`/`height` size the
+ * launcher to the row-number gutter and the last row's height, so it reads as
+ * one more row slot rather than a floating control.
+ */
+export interface AppendDockAnchor {
+    readonly left: number;
+    readonly bottom: number;
+    readonly width: number;
+    readonly height: number;
+}
+
 export interface AppendDockProps {
+    /** Phantom-row placement; undefined falls back to the corner inset. */
+    readonly anchor?: AppendDockAnchor;
     readonly open: boolean;
     readonly on_open_change: (open: boolean) => void;
     /**
@@ -49,6 +70,7 @@ const clamp_count = (value: number, capacity: number): number =>
     Math.min(Math.max(1, Math.trunc(value)), Math.max(1, capacity));
 
 export function AppendDock({
+    anchor,
     open,
     on_open_change,
     remaining_capacity,
@@ -117,7 +139,10 @@ export function AppendDock({
 
     return (
         <div
-            className="append-dock"
+            className={anchor === undefined ? 'append-dock' : 'append-dock is-row-anchored'}
+            style={anchor === undefined
+                ? undefined
+                : { left: anchor.left, bottom: anchor.bottom }}
             onKeyDown={(event) => {
                 if (event.key !== 'Escape' || !open) return;
                 event.preventDefault();
@@ -182,6 +207,9 @@ export function AppendDock({
                     ref={launcher_ref}
                     type="button"
                     className={open ? 'append-dock-launcher is-open' : 'append-dock-launcher'}
+                    style={anchor === undefined
+                        ? undefined
+                        : { width: anchor.width, height: anchor.height }}
                     aria-expanded={open}
                     aria-label={open ? 'Close add rows' : 'Add rows'}
                     onClick={toggle}
