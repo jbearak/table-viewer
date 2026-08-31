@@ -3285,6 +3285,7 @@ export function GridShell({
                     return;
                 }
                 applied_saved_row_focus_ref.current = saved_row_focus.sequence;
+                if (saved_row_focus.restoreFocus) focus_grid();
                 on_saved_row_focus_applied(
                     saved_row_focus.sequence,
                     null,
