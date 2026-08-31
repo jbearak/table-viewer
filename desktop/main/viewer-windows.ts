@@ -1384,9 +1384,13 @@ export class ViewerWindowManager {
                 else entry.window.webContents.reload();
                 return true;
             })
-            .catch(() => {
+            .catch((error: unknown) => {
                 if (!entry.window.isDestroyed()) {
                     const closing = lifecycle.intent === 'close';
+                    console.warn('Viewer lifecycle fence failed', {
+                        intent: lifecycle.intent,
+                        error: error instanceof Error ? error.message : String(error),
+                    });
                     void dialog.showMessageBox(entry.window, {
                         type: 'error',
                         message: closing
