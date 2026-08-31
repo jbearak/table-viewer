@@ -189,7 +189,6 @@ import {
     type RowResizeOverlayHandle,
 } from './row-resize-overlay';
 import { AppendDock } from './append-dock';
-import { append_anchor_key, compute_append_anchor } from './append-anchor';
 import {
     AppendComposer,
     EMPTY_APPEND_COMPOSER_DRAFT,
@@ -247,23 +246,13 @@ import {
 const ROW_RESIZE_TOLERANCE_PX = 5;
 
 /**
- * After a scroll or resize event, keep re-measuring the append slot on each
- * animation frame until this many consecutive frames agree — Glide's own
- * scroll state (cell offsets, translate) lands a frame or two after the
- * scroller's event, so a single measure reads a canvas that has not painted.
+ * Vertical overscroll reserved while the dock is offered. The launcher sits
+ * fixed in the bottom-left corner and overlays the last visible row markers;
+ * this lets the grid scroll past its last row far enough that every marker
+ * the launcher covers can be scrolled clear of it — at least twice the
+ * launcher's occupied band (32px button + 8px insets on both sides).
  */
-const APPEND_MEASURE_SETTLE_FRAMES = 3;
-/** Frames to keep retrying the `.dvn-scroller` lookup — Glide can mount it
- *  after the effect that wants to listen to it. */
-const APPEND_MEASURE_ATTACH_RETRY_FRAMES = 120;
-/**
- * Vertical overscroll reserved while the dock is offered, so a sheet taller
- * than the viewport can scroll past its last row far enough to expose the
- * phantom-row launcher: its maximum height (32), the scrollbar clearance, and
- * a small gap. Without this the launcher's slot ends exactly at the viewport
- * bottom and is unreachable.
- */
-const APPEND_ANCHOR_OVERSCROLL_PX = 48;
+const APPEND_DOCK_OVERSCROLL_PX = 96;
 
 /** Module-level so the DataEditor prop is referentially stable. */
 const custom_renderers = [rich_text_cell_renderer];
@@ -4036,145 +4025,6 @@ export function GridShell({
         set_composer_open(false);
     }, [may_offer_append_dock]);
     /**
-     * How the append launcher is placed. 'anchored' parks it as a phantom row
-     * slot in the row-number gutter directly below the last display row, so it
-     * never covers a real row marker; 'corner' is the legacy fixed bottom-left
-     * inset, kept for when grid geometry is unavailable (headless test DOMs,
-     * zero-size layouts).
-     *
-     * Only the *mode* lives in React state. The slot's pixel geometry is
-     * written imperatively onto the dock element every measured frame: routing
-     * a per-scroll-frame position through setState re-renders this whole shell
-     * per frame and paints the launcher one frame behind the canvas — the
-     * visible "jumpiness". Off-screen is an imperative visibility toggle for
-     * the same reason (crossing the viewport edge mid-scroll must not mount or
-     * unmount anything).
-     */
-    const [append_dock_mode, set_append_dock_mode] = useState<'corner' | 'anchored'>('corner');
-    const append_dock_el_ref = useRef<HTMLDivElement | null>(null);
-    const append_row_count_ref = useRef(row_count);
-    append_row_count_ref.current = row_count;
-    const append_dock_open_ref = useRef(append_dock_open);
-    append_dock_open_ref.current = append_dock_open;
-    /** Measure, apply imperatively, and return the result's identity key. */
-    const apply_append_anchor = useCallback((): string => {
-        const root_rect = grid_root_ref.current?.getBoundingClientRect();
-        const grid = grid_ref.current;
-        const last_row = append_row_count_ref.current - 1;
-        // The gutter cell itself (column -1 is the row-marker column), not the
-        // first data cell: a merge in the first column would report the union
-        // rect and inflate the slot, and the marker cell is exactly the
-        // rectangle the launcher pretends to be the next instance of.
-        const marker = root_rect && root_rect.height > 0 && grid !== null && last_row >= 0
-            ? grid.getBounds(-1, last_row)
-            : undefined;
-        const anchor = compute_append_anchor({
-            root_height: root_rect?.height ?? 0,
-            slot: marker === undefined || root_rect === undefined
-                ? undefined
-                : {
-                    left: marker.x - root_rect.left,
-                    top: marker.y + marker.height - root_rect.top,
-                    width: marker.width,
-                    height: marker.height,
-                },
-            dock_open: append_dock_open_ref.current,
-        });
-        const el = append_dock_el_ref.current;
-        if (anchor === 'corner') {
-            set_append_dock_mode('corner');
-            if (el) {
-                el.style.visibility = '';
-                el.style.left = '';
-                el.style.top = '';
-            }
-        } else {
-            set_append_dock_mode('anchored');
-            if (el) {
-                if (anchor === 'hidden') {
-                    el.style.visibility = 'hidden';
-                } else {
-                    el.style.visibility = '';
-                    el.style.left = `${anchor.left}px`;
-                    el.style.top = `${anchor.top}px`;
-                    el.style.setProperty('--append-slot-width', `${anchor.width}px`);
-                    el.style.setProperty('--append-slot-height', `${anchor.height}px`);
-                    el.style.setProperty('--append-panel-lift', `${anchor.panel_lift}px`);
-                }
-            }
-        }
-        return append_anchor_key(anchor);
-    }, []);
-    /**
-     * Kick the measuring loop. Stable identity (a ref) so scroll handlers and
-     * Glide callbacks can call it without effect churn; replaced by the effect
-     * below while the dock is offered.
-     */
-    const schedule_append_measure_ref = useRef<() => void>(() => {});
-    // Glide's visible-region callback only fires when the visible cell *range*
-    // changes, and its own scroll state (cell offsets, translate) lands a
-    // frame after the scroller's scroll event — a single measure per event
-    // reads geometry the canvas hasn't painted yet and strands the launcher at
-    // a stale position ("sometimes doesn't appear"). So: native scroll events
-    // and root resizes start a per-frame measuring loop that runs until the
-    // measurement is identical on consecutive frames, i.e. the canvas settled.
-    useLayoutEffect(() => {
-        if (!may_offer_append_dock) {
-            schedule_append_measure_ref.current = () => {};
-            return;
-        }
-        const root = grid_root_ref.current;
-        let disposed = false;
-        let frame = 0;
-        let last_key = '';
-        let settle_frames = 0;
-        const run = () => {
-            frame = 0;
-            if (disposed) return;
-            const key = apply_append_anchor();
-            settle_frames = key === last_key ? settle_frames - 1 : APPEND_MEASURE_SETTLE_FRAMES;
-            last_key = key;
-            if (settle_frames > 0) frame = requestAnimationFrame(run);
-        };
-        const schedule = () => {
-            settle_frames = APPEND_MEASURE_SETTLE_FRAMES;
-            if (frame === 0) frame = requestAnimationFrame(run);
-        };
-        schedule_append_measure_ref.current = schedule;
-        // The scroller is rendered by Glide and can mount after this effect
-        // runs; a missed querySelector must not silently disable scroll
-        // tracking for the rest of the session, so retry until it appears.
-        let attached_scroller: HTMLElement | null = null;
-        let attach_frame = 0;
-        let attach_attempts = 0;
-        const attach = () => {
-            attach_frame = 0;
-            if (disposed || attached_scroller) return;
-            attached_scroller = root?.querySelector<HTMLElement>('.dvn-scroller') ?? null;
-            if (attached_scroller) {
-                attached_scroller.addEventListener('scroll', schedule, { passive: true });
-                schedule();
-            } else if (attach_attempts < APPEND_MEASURE_ATTACH_RETRY_FRAMES) {
-                attach_attempts += 1;
-                attach_frame = requestAnimationFrame(attach);
-            }
-        };
-        attach();
-        const observer = root && typeof ResizeObserver !== 'undefined'
-            ? new ResizeObserver(schedule)
-            : undefined;
-        if (root) observer?.observe(root);
-        schedule();
-        return () => {
-            disposed = true;
-            schedule_append_measure_ref.current = () => {};
-            if (frame !== 0) cancelAnimationFrame(frame);
-            if (attach_frame !== 0) cancelAnimationFrame(attach_frame);
-            attached_scroller?.removeEventListener('scroll', schedule);
-            observer?.disconnect();
-        };
-    }, [may_offer_append_dock, apply_append_anchor]);
-    /**
      * Labels for the composer's fields — the same titles the grid header
      * paints, so a field is identifiable by the column the user can see.
      */
@@ -5002,19 +4852,6 @@ export function GridShell({
         };
     }, [
         effective_row_height,
-    ]);
-
-    // Scroll and resize reach the append anchor through its own listeners;
-    // everything else that moves the last row's pixel position — appended or
-    // removed rows, row-height edits, the dock opening — lands here after
-    // layout.
-    useLayoutEffect(() => {
-        schedule_append_measure_ref.current();
-    }, [
-        row_count,
-        may_offer_append_dock,
-        append_dock_open,
-        get_row_height,
     ]);
 
     const get_cell_height = useCallback((row: number, display_column: number): number => {
@@ -7850,9 +7687,6 @@ export function GridShell({
     const on_visible_region_changed = useCallback(
         (range: Rectangle) => {
             visible_ref.current = range;
-            // The append launcher tracks the last row like one more row slot;
-            // a changed visible region can move it or scroll it away.
-            schedule_append_measure_ref.current();
             if (!preview_mode) {
                 const scroller = grid_root_ref.current?.querySelector<HTMLElement>(
                     '.dvn-scroller',
@@ -8343,7 +8177,7 @@ export function GridShell({
                 maxColumnWidth={MAX_COLUMN_WIDTH_PX}
                 maxColumnAutoWidth={MAX_AUTO_FIT_COLUMN_WIDTH_PX}
                 overscrollX={LAST_COLUMN_RESIZE_GUTTER_PX}
-                overscrollY={may_offer_append_dock ? APPEND_ANCHOR_OVERSCROLL_PX : 0}
+                overscrollY={may_offer_append_dock ? APPEND_DOCK_OVERSCROLL_PX : 0}
                 mergedRanges={merged_ranges}
                 getCellContent={get_cell_content}
                 rowHeight={get_row_height}
@@ -8389,8 +8223,12 @@ export function GridShell({
             />
             {may_offer_append_dock && (
                 <AppendDock
-                    dock_ref={append_dock_el_ref}
-                    anchored={append_dock_mode === 'anchored'}
+                    style={{
+                        '--append-slot-width': `${typeof row_marker_options === 'string'
+                            ? 32
+                            : row_marker_options.width}px`,
+                        '--append-slot-height': `${default_row_height}px`,
+                    } as React.CSSProperties}
                     open={append_dock_open}
                     on_open_change={set_append_dock_open}
                     remaining_capacity={remaining_append_capacity}

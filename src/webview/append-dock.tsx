@@ -3,15 +3,13 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 /**
  * The append dock: a launcher and the quick-add surface it opens.
  *
- * The launcher renders as a phantom row slot — a strip the width of the
- * row-number gutter, anchored directly below the last display row — so it
- * never covers a real row number the way the earlier fixed bottom-left corner
- * button did (which made the rows under it impossible to select or delete by
- * their markers). The shell measures the slot from the grid (append-anchor.ts)
- * and writes the geometry imperatively onto this component's root element;
- * `anchored` only switches the styling mode. When no geometry is available
- * (headless tests, zero-size layouts) the dock falls back to the old corner
- * placement via CSS defaults.
+ * The launcher is pinned flush with the grid's bottom-left corner, over the
+ * row-number gutter, and styled as one more gutter cell (gutter-wide,
+ * row-high, square) — the shell hands the gutter geometry in via `style`
+ * custom properties. It overlays the row markers scrolled under it, so the
+ * shell reserves vertical overscroll while the dock is offered: the grid
+ * scrolls past its last row far enough that any marker the launcher covers
+ * can be scrolled clear of it.
  *
  * The dock overlays the grid — it is positioned inside `.grid-shell-root` and
  * reserves no space, because reserving space would reflow the virtualized
@@ -24,15 +22,11 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 
 export interface AppendDockProps {
     /**
-     * Row-anchored placement is active. The shell writes the slot's pixel
-     * geometry imperatively onto the dock element (inline `left`/`top` plus
-     * the `--append-slot-*` and `--append-panel-lift` custom properties), so
-     * this prop only switches the styling mode; false falls back to the fixed
-     * corner inset.
+     * Gutter geometry for the launcher, as the `--append-slot-width` and
+     * `--append-slot-height` custom properties — stable per layout, never
+     * per scroll frame.
      */
-    readonly anchored: boolean;
-    /** The dock's root element, for the shell's imperative geometry writes. */
-    readonly dock_ref?: React.Ref<HTMLDivElement>;
+    readonly style?: React.CSSProperties;
     readonly open: boolean;
     readonly on_open_change: (open: boolean) => void;
     /**
@@ -67,8 +61,7 @@ const clamp_count = (value: number, capacity: number): number =>
     Math.min(Math.max(1, Math.trunc(value)), Math.max(1, capacity));
 
 export function AppendDock({
-    anchored,
-    dock_ref,
+    style,
     open,
     on_open_change,
     remaining_capacity,
@@ -137,8 +130,8 @@ export function AppendDock({
 
     return (
         <div
-            ref={dock_ref}
-            className={anchored ? 'append-dock is-row-anchored' : 'append-dock'}
+            className="append-dock"
+            style={style}
             onKeyDown={(event) => {
                 if (event.key !== 'Escape' || !open) return;
                 event.preventDefault();
