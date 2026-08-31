@@ -7,9 +7,11 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
  * row-number gutter, anchored directly below the last display row — so it
  * never covers a real row number the way the earlier fixed bottom-left corner
  * button did (which made the rows under it impossible to select or delete by
- * their markers). The shell measures the anchor from the grid and hands it in
- * as `anchor`; when no geometry is available (headless tests, zero-size
- * layouts) the dock falls back to the old corner placement via CSS defaults.
+ * their markers). The shell measures the slot from the grid (append-anchor.ts)
+ * and writes the geometry imperatively onto this component's root element;
+ * `anchored` only switches the styling mode. When no geometry is available
+ * (headless tests, zero-size layouts) the dock falls back to the old corner
+ * placement via CSS defaults.
  *
  * The dock overlays the grid — it is positioned inside `.grid-shell-root` and
  * reserves no space, because reserving space would reflow the virtualized
@@ -20,25 +22,17 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
  * history, and the pending band all stay where they were.
  */
 
-/**
- * Measured placement for the row-anchored launcher, in `.grid-shell-root`
- * coordinates. `left`/`top` position the dock (top-anchored, because rows keep
- * a stable top edge while the window resizes); `width`/`height` size the
- * launcher to the row-number gutter and the last row's height, so it reads as
- * one more row slot rather than a floating control. The quick-add panel opens
- * to the right of the slot, in the phantom row's own line, so it never covers
- * the real rows above.
- */
-export interface AppendDockAnchor {
-    readonly left: number;
-    readonly top: number;
-    readonly width: number;
-    readonly height: number;
-}
-
 export interface AppendDockProps {
-    /** Phantom-row placement; undefined falls back to the corner inset. */
-    readonly anchor?: AppendDockAnchor;
+    /**
+     * Row-anchored placement is active. The shell writes the slot's pixel
+     * geometry imperatively onto the dock element (inline `left`/`top` plus
+     * the `--append-slot-*` and `--append-panel-lift` custom properties), so
+     * this prop only switches the styling mode; false falls back to the fixed
+     * corner inset.
+     */
+    readonly anchored: boolean;
+    /** The dock's root element, for the shell's imperative geometry writes. */
+    readonly dock_ref?: React.Ref<HTMLDivElement>;
     readonly open: boolean;
     readonly on_open_change: (open: boolean) => void;
     /**
@@ -73,7 +67,8 @@ const clamp_count = (value: number, capacity: number): number =>
     Math.min(Math.max(1, Math.trunc(value)), Math.max(1, capacity));
 
 export function AppendDock({
-    anchor,
+    anchored,
+    dock_ref,
     open,
     on_open_change,
     remaining_capacity,
@@ -142,10 +137,8 @@ export function AppendDock({
 
     return (
         <div
-            className={anchor === undefined ? 'append-dock' : 'append-dock is-row-anchored'}
-            style={anchor === undefined
-                ? undefined
-                : { left: anchor.left, top: anchor.top, bottom: 'auto' }}
+            ref={dock_ref}
+            className={anchored ? 'append-dock is-row-anchored' : 'append-dock'}
             onKeyDown={(event) => {
                 if (event.key !== 'Escape' || !open) return;
                 event.preventDefault();
@@ -210,9 +203,6 @@ export function AppendDock({
                     ref={launcher_ref}
                     type="button"
                     className={open ? 'append-dock-launcher is-open' : 'append-dock-launcher'}
-                    style={anchor === undefined
-                        ? undefined
-                        : { width: anchor.width, height: anchor.height }}
                     aria-expanded={open}
                     aria-label={open ? 'Close add rows' : 'Add rows'}
                     onClick={toggle}

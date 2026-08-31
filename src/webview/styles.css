@@ -724,7 +724,7 @@ body.vscode-high-contrast-light .toolbar-split-caret.open {
 /* The append dock overlays the grid. It is positioned, never laid out in
    flow: reserving vertical space here would reflow the virtualized scroller
    every time the dock opened. Normally the shell measures a phantom-row
-   anchor (inline left/bottom, `.is-row-anchored`) that parks the launcher in
+   anchor (inline left/top, `.is-row-anchored`) that parks the launcher in
    the row-number gutter just below the last row; these corner insets are the
    fallback when no grid geometry is available. */
 .append-dock {
@@ -780,23 +780,31 @@ body.vscode-high-contrast-light .toolbar-split-caret.open {
    row-tall (inline, from the shell's measure), square-cornered — so it reads
    as the next row number cell rather than a floating button. */
 .append-dock.is-row-anchored {
-    /* The dock box is the slot itself; the panel hangs off it absolutely. */
+    /* The dock box IS the slot: sized to it, positioned by the shell's inline
+       left/top (bottom must yield or the inline top would stretch the box),
+       with the panel hanging off it absolutely. */
     display: block;
+    bottom: auto;
+    width: var(--append-slot-width, 32px);
+    height: var(--append-slot-height, 26px);
 }
 
 .append-dock.is-row-anchored .append-dock-launcher {
+    width: var(--append-slot-width, 32px);
+    height: var(--append-slot-height, 26px);
     border-radius: 2px;
     font-size: 14px;
     box-shadow: none;
 }
 
-/* The quick-add panel opens to the right of the slot, on the phantom row's
-   own line, so it never covers the real rows above it. */
+/* The quick-add panel opens to the right of the slot. Bottom-anchored to the
+   slot's bottom edge, growing upward — and when the slot itself is clipped by
+   the viewport, the shell raises --append-panel-lift by the clipped amount so
+   the panel's bottom lands on the screen edge instead of below it. */
 .append-dock.is-row-anchored .append-dock-panel {
     position: absolute;
     left: 100%;
-    top: 50%;
-    transform: translateY(-50%);
+    bottom: var(--append-panel-lift, 0px);
     margin-left: 8px;
 }
 
