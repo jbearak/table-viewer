@@ -4360,6 +4360,87 @@ describe('GridShell column projection', () => {
 });
 
 describe('GridShell pending-edit Diff painting', () => {
+    it('retries saved-row selection when a source refresh invalidates its first load', async () => {
+        let finish_first_load: ((loaded: boolean) => void) | undefined;
+        grid_mock.ensure_rows_loaded
+            .mockImplementationOnce(() => new Promise<boolean>((resolve) => {
+                finish_first_load = resolve;
+            }))
+            .mockImplementationOnce(async (start = 0) => {
+                additionally_loaded_source_rows.set(75, start);
+                return true;
+            });
+        const on_applied = vi.fn();
+        const saved_row_focus = {
+            sequence: 1,
+            sheetIndex: 0,
+            sourceRow: 75,
+            sourceColumn: 0,
+            restoreFocus: false,
+        };
+        const initial = props({
+            row_count: 100,
+            sheet_meta: {
+                ...props().sheet_meta,
+                rowCount: 100,
+                sourceRowCount: 100,
+            },
+            saved_row_focus,
+            on_saved_row_focus_applied: on_applied,
+        });
+        const GridShell = await render_grid(initial);
+        expect(grid_mock.ensure_rows_loaded).toHaveBeenCalledTimes(1);
+
+        await act(async () => {
+            root!.render(React.createElement(GridShell, {
+                ...initial,
+                generation: 2,
+                source_generation: 2,
+            }));
+        });
+        finish_first_load?.(false);
+        await act(async () => {});
+
+        expect(grid_mock.ensure_rows_loaded).toHaveBeenCalledTimes(2);
+        expect(grid_mock.scroll_to).toHaveBeenCalledWith(0, 75);
+        expect(on_applied).toHaveBeenCalledExactlyOnceWith(1, true);
+    });
+
+    it('retries saved-row selection when the current loader rejects a stale request', async () => {
+        let finish_first_load: ((loaded: boolean) => void) | undefined;
+        grid_mock.ensure_rows_loaded
+            .mockImplementationOnce(() => new Promise<boolean>((resolve) => {
+                finish_first_load = resolve;
+            }))
+            .mockImplementationOnce(async (start = 0) => {
+                additionally_loaded_source_rows.set(75, start);
+                return true;
+            });
+        const on_applied = vi.fn();
+        await render_grid(props({
+            row_count: 100,
+            sheet_meta: {
+                ...props().sheet_meta,
+                rowCount: 100,
+                sourceRowCount: 100,
+            },
+            saved_row_focus: {
+                sequence: 1,
+                sheetIndex: 0,
+                sourceRow: 75,
+                sourceColumn: 0,
+                restoreFocus: false,
+            },
+            on_saved_row_focus_applied: on_applied,
+        }));
+
+        await act(async () => finish_first_load?.(false));
+
+        expect(grid_mock.ensure_rows_loaded).toHaveBeenCalledTimes(2);
+        expect(grid_mock.scroll_to).toHaveBeenCalledWith(0, 75);
+        expect(on_applied).toHaveBeenCalledExactlyOnceWith(1, true);
+    });
+
     it('loads and reveals a nonresident source row in an identity view', async () => {
         const editing_ref = React.createRef<EditingHandle | null>();
         grid_mock.ensure_rows_loaded.mockImplementation(async (start = 0, end = start) => {

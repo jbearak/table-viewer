@@ -85,14 +85,23 @@ async function take_dialogs(): Promise<CapturedDialog[]> {
     });
 }
 
-async function append_blank_row(expected_pending_row_number: number): Promise<void> {
+async function compose_rows(count: number, first_value = ''): Promise<void> {
     const rows = page.locator('tbody tr');
     await page.getByRole('button', { name: 'Add rows' }).click();
-    const count = page.locator('#append-dock-count');
-    await expect(count).toBeVisible();
-    await count.fill('1');
-    await page.getByRole('button', { name: 'Add row', exact: true }).click();
-    await expect(rows).toHaveCount(initial_accessible_row_count + expected_pending_row_number);
+    await page.getByRole('button', { name: 'Compose row…' }).click();
+    const composer = page.getByRole('dialog', {
+        name: 'Compose a row from the visible columns',
+    });
+    await expect(composer).toBeVisible();
+    for (let row = 1; row < count; row += 1) {
+        await composer.getByRole('button', { name: 'Add another row' }).click();
+    }
+    if (first_value !== '') {
+        await composer.locator('#append-composer-0-0').fill(first_value);
+    }
+    await composer.getByRole('button', { name: `Stage ${count} rows` }).click();
+    await expect(composer).toHaveCount(0);
+    await expect(rows).toHaveCount(initial_accessible_row_count + count);
 }
 
 test.beforeAll(async () => {
@@ -141,8 +150,12 @@ test('saved appended rows settle cleanly and an external Git reset reloads them'
     await expect(page.locator('tbody tr')).toHaveCount(original_row_count - 1);
     initial_accessible_row_count = await page.locator('tbody tr').count();
 
-    for (let row = 1; row <= 7; row += 1) await append_blank_row(row);
+    await compose_rows(7, 'Composer Saved');
     await expect(edit_toggle).toHaveClass(/has-unsaved/);
+    const saved_row = page.locator(`#glide-cell-1-${original_row_count - 1}`);
+    await expect(saved_row).toHaveAttribute('aria-selected', 'true');
+    const scroller = page.locator('.dvn-scroller');
+    const scroll_top_before_save = await scroller.evaluate((element) => element.scrollTop);
 
     await edit_toggle.click();
     await expect.poll(workbook_row_count).toBe(original_row_count + 7);
@@ -151,12 +164,14 @@ test('saved appended rows settle cleanly and an external Git reset reloads them'
         initial_accessible_row_count + 7,
     );
     await expect(edit_toggle).not.toHaveClass(/has-unsaved/);
+    await expect(saved_row).toHaveText('Composer Saved');
+    await expect(saved_row).toHaveAttribute('aria-selected', 'true');
+    await expect.poll(
+        () => scroller.evaluate((element) => element.scrollTop),
+    ).toBe(scroll_top_before_save);
     expect(await take_dialogs()).toEqual([{
         message: 'Leave edit mode?',
         buttons: ['Save Edits', 'Discard Edits', 'Stay in Edit Mode'],
-    }, {
-        message: 'Saved row is hidden by the current filters.',
-        buttons: undefined,
     }]);
 
     const other_sheet_name = await page.locator('.sheet-tab:not(.active)').first().textContent();
@@ -180,7 +195,7 @@ test('saved appended rows settle cleanly and an external Git reset reloads them'
 
     await edit_toggle.click();
     await expect(edit_toggle).toHaveAttribute('aria-pressed', 'true');
-    const first_saved_blank = page.locator(`#glide-cell-1-${original_row_count - 1}`);
+    const first_saved_blank = page.locator(`#glide-cell-1-${original_row_count}`);
     await expect(first_saved_blank).toBeAttached();
     await expect(first_saved_blank).toHaveAttribute('aria-readonly', 'false');
     await first_saved_blank.focus();
@@ -194,7 +209,7 @@ test('saved appended rows settle cleanly and an external Git reset reloads them'
     await expect(editor).toBeHidden();
 
     await edit_toggle.click();
-    await expect.poll(() => workbook_cell(original_row_count, 0)).toBe('a');
+    await expect.poll(() => workbook_cell(original_row_count + 1, 0)).toBe('a');
     await expect(edit_toggle).toHaveAttribute('aria-pressed', 'false');
     await expect(first_saved_blank).toHaveText('a');
     expect(await take_dialogs()).toEqual([{
