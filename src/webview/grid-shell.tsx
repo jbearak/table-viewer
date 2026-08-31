@@ -249,6 +249,14 @@ const ROW_RESIZE_TOLERANCE_PX = 5;
 const APPEND_ANCHOR_HEADER_CLEARANCE_PX = 36;
 /** Nor does it sit under Glide's overlay horizontal scrollbar. */
 const APPEND_ANCHOR_SCROLLBAR_CLEARANCE_PX = 12;
+/**
+ * Vertical overscroll reserved while the dock is offered, so a sheet taller
+ * than the viewport can scroll past its last row far enough to expose the
+ * phantom-row launcher: its maximum height (32), the scrollbar clearance, and
+ * a small gap. Without this the launcher's slot ends exactly at the viewport
+ * bottom and is unreachable.
+ */
+const APPEND_ANCHOR_OVERSCROLL_PX = 48;
 
 /** Module-level so the DataEditor prop is referentially stable. */
 const custom_renderers = [rich_text_cell_renderer];
@@ -8249,6 +8257,7 @@ export function GridShell({
                 maxColumnWidth={MAX_COLUMN_WIDTH_PX}
                 maxColumnAutoWidth={MAX_AUTO_FIT_COLUMN_WIDTH_PX}
                 overscrollX={LAST_COLUMN_RESIZE_GUTTER_PX}
+                overscrollY={may_offer_append_dock ? APPEND_ANCHOR_OVERSCROLL_PX : 0}
                 mergedRanges={merged_ranges}
                 getCellContent={get_cell_content}
                 rowHeight={get_row_height}
