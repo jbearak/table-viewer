@@ -1,20 +1,32 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 
 /**
- * The append dock: a round launcher in the grid's bottom-left corner and the
- * quick-add surface it opens.
+ * The append dock: a launcher and the quick-add surface it opens.
  *
- * It replaces Glide's trailing append row, which read as a cell rather than a
- * control and appended exactly one row wherever the sheet happened to be
- * scrolled. The dock overlays the grid — it is positioned inside
- * `.grid-shell-root` and reserves no space, because reserving space would
- * reflow the virtualized scroller every time it opened.
+ * The launcher is pinned flush with the grid's bottom-left corner, over the
+ * row-number gutter, and styled as one more gutter cell (gutter-wide,
+ * row-high, square) — the shell hands the gutter geometry in via `style`
+ * custom properties. It overlays the row markers scrolled under it, so the
+ * shell reserves vertical overscroll while the dock is offered: the grid
+ * scrolls past its last row far enough that any marker the launcher covers
+ * can be scrolled clear of it.
+ *
+ * The dock overlays the grid — it is positioned inside `.grid-shell-root` and
+ * reserves no space, because reserving space would reflow the virtualized
+ * scroller every time it opened.
  *
  * The component owns no append machinery. It clamps a count against the
  * capacity the shell hands it and calls `on_add_rows`; refusal handling,
  * history, and the pending band all stay where they were.
  */
+
 export interface AppendDockProps {
+    /**
+     * Gutter geometry for the launcher, as the `--append-slot-width` and
+     * `--append-slot-height` custom properties — stable per layout, never
+     * per scroll frame.
+     */
+    readonly style?: React.CSSProperties;
     readonly open: boolean;
     readonly on_open_change: (open: boolean) => void;
     /**
@@ -49,6 +61,7 @@ const clamp_count = (value: number, capacity: number): number =>
     Math.min(Math.max(1, Math.trunc(value)), Math.max(1, capacity));
 
 export function AppendDock({
+    style,
     open,
     on_open_change,
     remaining_capacity,
@@ -118,6 +131,7 @@ export function AppendDock({
     return (
         <div
             className="append-dock"
+            style={style}
             onKeyDown={(event) => {
                 if (event.key !== 'Escape' || !open) return;
                 event.preventDefault();

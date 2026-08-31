@@ -721,22 +721,24 @@ body.vscode-high-contrast-light .toolbar-split-caret.open {
     overflow: hidden;
 }
 
-/* The append dock overlays the grid's bottom-left corner. It is positioned,
-   never laid out in flow: reserving vertical space here would reflow the
-   virtualized scroller every time the dock opened. The bottom offset clears
-   Glide's horizontal scrollbar so the launcher never sits on top of it. */
+/* The append dock overlays the grid, pinned flush with the bottom-left
+   corner over the row-number gutter. It is positioned, never laid out in
+   flow: reserving vertical space here would reflow the virtualized scroller
+   every time the dock opened. The row markers the launcher covers stay
+   reachable because the shell reserves overscroll past the last row while
+   the dock is offered. */
 .append-dock {
     position: absolute;
-    /* One inset on both axes: the launcher is a corner control, and matching
-       the horizontal and vertical gaps is what makes it read as sitting in the
-       corner rather than floating near it. */
-    left: var(--append-dock-inset, 8px);
-    bottom: var(--append-dock-inset, 8px);
+    left: 0;
+    bottom: 0;
     z-index: 3;
+    /* The quick-add panel opens to the right of the launcher, both bottom-
+       aligned — pinned at the screen bottom, the panel always fits without
+       obscuring the rows above the launcher. */
     display: flex;
-    flex-direction: column;
-    align-items: flex-start;
-    gap: 6px;
+    flex-direction: row;
+    align-items: flex-end;
+    gap: 8px;
     pointer-events: none;
 }
 
@@ -744,10 +746,14 @@ body.vscode-high-contrast-light .toolbar-split-caret.open {
     pointer-events: auto;
 }
 
+/* Styled as one more row-number gutter cell — exactly gutter-wide and
+   row-tall (custom properties from the shell), square-cornered — so it reads
+   as the next row's slot rather than a floating button. */
 .append-dock-launcher {
-    width: 32px;
-    height: 32px;
-    border-radius: 50%;
+    order: -1;
+    width: var(--append-slot-width, 32px);
+    height: var(--append-slot-height, 26px);
+    border-radius: 2px;
     border: 1px solid var(--vscode-button-border, transparent);
     /* Semitransparent so the rows it overlays stay readable underneath, with a
        blur behind it so the glyph keeps its contrast over dense data. */
@@ -758,13 +764,12 @@ body.vscode-high-contrast-light .toolbar-split-caret.open {
     );
     backdrop-filter: blur(3px);
     color: var(--vscode-button-foreground, #fff);
-    font-size: 20px;
+    font-size: 14px;
     line-height: 1;
     display: flex;
     align-items: center;
     justify-content: center;
     cursor: pointer;
-    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.35);
 }
 
 /* Opaque on hover and while open: a control the pointer is on, or one holding

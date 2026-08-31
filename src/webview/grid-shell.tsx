@@ -245,6 +245,15 @@ import {
 /** Pixel proximity to a row border that arms the resize strip. */
 const ROW_RESIZE_TOLERANCE_PX = 5;
 
+/**
+ * Vertical overscroll reserved while the dock is offered. The launcher sits
+ * fixed in the bottom-left corner and overlays the last visible row markers;
+ * this lets the grid scroll past its last row far enough that every marker
+ * the launcher covers can be scrolled clear of it — at least twice the
+ * launcher's occupied band (32px button + 8px insets on both sides).
+ */
+const APPEND_DOCK_OVERSCROLL_PX = 96;
+
 /** Module-level so the DataEditor prop is referentially stable. */
 const custom_renderers = [rich_text_cell_renderer];
 
@@ -8168,6 +8177,7 @@ export function GridShell({
                 maxColumnWidth={MAX_COLUMN_WIDTH_PX}
                 maxColumnAutoWidth={MAX_AUTO_FIT_COLUMN_WIDTH_PX}
                 overscrollX={LAST_COLUMN_RESIZE_GUTTER_PX}
+                overscrollY={may_offer_append_dock ? APPEND_DOCK_OVERSCROLL_PX : 0}
                 mergedRanges={merged_ranges}
                 getCellContent={get_cell_content}
                 rowHeight={get_row_height}
@@ -8213,6 +8223,12 @@ export function GridShell({
             />
             {may_offer_append_dock && (
                 <AppendDock
+                    style={{
+                        '--append-slot-width': `${typeof row_marker_options === 'string'
+                            ? 32
+                            : row_marker_options.width}px`,
+                        '--append-slot-height': `${default_row_height}px`,
+                    } as React.CSSProperties}
                     open={append_dock_open}
                     on_open_change={set_append_dock_open}
                     remaining_capacity={remaining_append_capacity}

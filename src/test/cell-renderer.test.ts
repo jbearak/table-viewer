@@ -273,6 +273,26 @@ describe('build_grid_cell — edit overlay (CSV edit mode)', () => {
             .toBe('?? (unsupported function)');
     });
 
+    it('shows a calculated result plainly when the workbook cached none', () => {
+        // No diff presentation: the persisted "??" is a formula with no cached
+        // display value, not a value the user changed, so a strikethrough
+        // "?? → result" would misread as an edit the user never made.
+        const uncached: RenderedCell = {
+            ...rc('=E5*F5'),
+            formatted: '??',
+            rawType: 'number',
+            formula: '=E5*F5',
+            formulaResultPending: true,
+        };
+        const c = build_grid_cell(0, [uncached], true, {
+            formula_result: '$166.50',
+        }) as unknown as { data: { lines: unknown[] }; copyData: string };
+        expect(c.data.lines).toEqual([[
+            { text: '$166.50', diff_color: 'green' },
+        ]]);
+        expect(c.copyData).toBe('=E5*F5');
+    });
+
     it('stays read-only (allowOverlay false) with no overlay', () => {
         const c = build_grid_cell(1, plain_rows, true);
         expect((c as { allowOverlay: boolean }).allowOverlay).toBe(false);

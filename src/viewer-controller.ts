@@ -599,6 +599,15 @@ function log_sanitized_failure(message: string, error: unknown): void {
     console.error(message, { code: sanitized_error_code(error) });
 }
 
+/**
+ * The edit session id's host suffix (`host:N`), without the file-key prefix.
+ * Session ids embed the workbook's filesystem path; diagnostics must not.
+ */
+function sanitized_edit_session_suffix(edit_session_id: string): string {
+    const marker = edit_session_id.lastIndexOf(':host:');
+    return marker === -1 ? 'host:?' : edit_session_id.slice(marker + 1);
+}
+
 function is_abort_error(error: unknown): boolean {
     return error instanceof Error && error.name === 'AbortError';
 }
@@ -2774,13 +2783,27 @@ export function attach_viewer(
         const next_ledger = prior_ledger === undefined
             ? undefined
             : clone_append_admission_ledger(prior_ledger);
+        // A refused plan is a silently dropped publication upstream, so each
+        // refusal names its check; the caller logs the sequence and session.
+        const refuse = (reason: string, detail?: Record<string, unknown>) => {
+            console.warn('Refused a pending structural publication plan', {
+                reason,
+                editSessionId: sanitized_edit_session_suffix(edit_session_id),
+                targetKey: worksheet_target_key(target),
+                hasLedger: prior_ledger !== undefined,
+                ownedRows: prior_ledger?.ownedRowIds.size ?? 0,
+                postedRows: changes.appendedRows.length,
+                ...detail,
+            });
+            return undefined;
+        };
         if (changes_use_unsettled_row_authority(
             prior_ledger,
             ledger_key,
             changes.appendedRows,
             changes.formatTemplates,
             changes.appendBasis,
-        )) return undefined;
+        )) return refuse('unsettled-row-authority');
 
         const retiring_reservations = reservations_for_ledger(ledger_key).filter(
             ([, reservation]) => reservation.state === 'accepted'
@@ -2790,7 +2813,7 @@ export function attach_viewer(
         if (!row_admission_gestures_are_complete(
             retiring_reservations.map(([, reservation]) => reservation),
             changes.appendedRows,
-        )) return undefined;
+        )) return refuse('split-admission-gesture');
         const published_row_ids = new Set(changes.appendedRows.map((row) => row.id));
 
         const staged_templates = new Map(project_retained_pending_rows(
@@ -2803,27 +2826,39 @@ export function attach_viewer(
             next_ledger,
             ledger_key,
         );
+        if (!appended_rows_match_ledger(next_ledger, changes.appendedRows)) {
+            return refuse('rows-not-owned-by-ledger', {
+                unowned: changes.appendedRows
+                    .filter((row) => !next_ledger?.ownedRowIds.has(row.id)).length,
+                templateMismatched: changes.appendedRows
+                    .filter((row) => next_ledger?.ownedRowIds.has(row.id)
+                        && next_ledger.templateIdByRowId.get(row.id)
+                            !== row.formatTemplateId).length,
+            });
+        }
+        if (changes.formatTemplates.some((template) => {
+            const issued = staged_templates.get(template.id)
+                ?? issued_append_template(
+                    next_ledger,
+                    ledger_key,
+                    template.id,
+                );
+            return issued === undefined
+                || JSON.stringify(issued) !== JSON.stringify(template);
+        })) return refuse('unissued-format-template');
         if (
-            !appended_rows_match_ledger(next_ledger, changes.appendedRows)
-            || changes.formatTemplates.some((template) => {
-                const issued = staged_templates.get(template.id)
-                    ?? issued_append_template(
-                        next_ledger,
-                        ledger_key,
-                        template.id,
-                    );
-                return issued === undefined
-                    || JSON.stringify(issued) !== JSON.stringify(template);
-            })
-            || (
-                changes.appendBasis !== undefined
-                && JSON.stringify(changes.appendBasis)
-                    !== JSON.stringify(provisional_ledger_basis)
-            )
-            || changes.tailRemovals.some(
-                (removal) => !tail_removal_matches_authority(target, removal),
-            )
-        ) return undefined;
+            changes.appendBasis !== undefined
+            && JSON.stringify(changes.appendBasis)
+                !== JSON.stringify(provisional_ledger_basis)
+        ) {
+            return refuse('append-basis-mismatch', {
+                posted: changes.appendBasis,
+                authorized: provisional_ledger_basis,
+            });
+        }
+        if (changes.tailRemovals.some(
+            (removal) => !tail_removal_matches_authority(target, removal),
+        )) return refuse('tail-removal-unauthorized');
 
         const retiring_ids = new Set(retiring_reservations.map(([request_id]) => request_id));
         for (const [, reservation] of retiring_reservations) {
@@ -3151,6 +3186,77 @@ export function attach_viewer(
         }
         for (const key of append_admission_tails.keys()) {
             if (key.startsWith(prefix)) append_admission_tails.delete(key);
+        }
+    };
+    /**
+     * Seed the append-admission ledgers from durable pending changes.
+     *
+     * An edit-session grant seeds the granted sheet's slot inline, but a
+     * rehydration claim (`project_state_for_panel`) acquires the session with
+     * no grant round-trip at all. Without this seeding, the restored appended
+     * rows republish against an empty ledger, the publication is refused as
+     * unsettled row authority and silently dropped, and closing the window
+     * times the acknowledgment fence out into the unsafe-close dialog — on
+     * every launch, because the durable rows come back each time.
+     */
+    const seed_durable_append_admissions = (
+        edit_session_id: string,
+        slots: PerFileState['pendingEdits'],
+        sheets: readonly WorksheetIdentityInput[],
+    ): void => {
+        const reconciled = reconcile_pending_edit_sheets(slots, sheets);
+        if (!reconciled) return;
+        for (let sheet_index = 0; sheet_index < reconciled.length; sheet_index += 1) {
+            const sheet = sheets[sheet_index];
+            const identity = sheet === undefined ? undefined : worksheet_identity(sheet);
+            const slot = pending_changes_for_sheet(
+                reconciled,
+                sheet_index,
+                identity?.name,
+                identity?.worksheetId,
+            );
+            if (!slot) continue;
+            let structural: PendingStructuralChanges;
+            try {
+                structural = own_pending_structural_changes(slot);
+            } catch {
+                continue;
+            }
+            if (
+                structural.appendedRows.length === 0
+                && structural.tailRemovals.length === 0
+                && structural.appendBasis === undefined
+            ) continue;
+            const target: WorksheetTarget = {
+                sheetIndex: sheet_index,
+                ...(identity?.name === undefined ? {} : { sheetName: identity.name }),
+                ...(identity?.worksheetId === undefined
+                    ? {}
+                    : { worksheetId: identity.worksheetId }),
+            };
+            const key = append_ledger_key(edit_session_id, target);
+            const ledger = append_admission_ledgers.get(key) ?? {
+                ownedRowIds: new Set<string>(),
+                templateIdByRowId: new Map<string, string>(),
+                reservedRowIds: new Map<string, number>(),
+                unsettledRequestByRowId: new Map<string, string>(),
+                sourceGeneration: core?.source_generation ?? 0,
+            };
+            for (const row of structural.appendedRows) {
+                ledger.ownedRowIds.add(row.id);
+                ledger.templateIdByRowId.set(row.id, row.formatTemplateId);
+            }
+            for (const template of structural.formatTemplates) {
+                append_admission_template_authorities.remember(
+                    ledger_template_authority_owner(key),
+                    template,
+                );
+            }
+            ledger.appendBasis = structural.appendBasis;
+            for (const removal of structural.tailRemovals) {
+                seed_durable_tail_removal_authority(target, removal);
+            }
+            append_admission_ledgers.set(key, ledger);
         }
     };
     // The worksheet currently shown in edit mode and worksheets with a pending
@@ -5410,6 +5516,17 @@ export function attach_viewer(
                 owns_session
                 || (rehydratable && try_claim_edit_session(false))
             );
+        // A rehydration claim acquires the session with no grant round-trip,
+        // so the grant-time ledger seeding never runs for it. Seed here, once,
+        // at the moment the claim succeeds — publications of the restored
+        // structural rows are otherwise refused as unsettled row authority.
+        if (represents_session && !owns_session && active_edit_session_id !== undefined) {
+            seed_durable_append_admissions(
+                active_edit_session_id,
+                state.pendingEdits,
+                sheets ?? source?.meta().sheets ?? [],
+            );
+        }
         if (represents_session) {
             const pending_edits = leaf_pending_edits_for_current_session(
                 state.pendingEdits,
@@ -11568,11 +11685,35 @@ export function attach_viewer(
                 }
                 return;
             case 'pendingChangesChanged': {
+                // Every refusal below is a silent drop from the renderer's point
+                // of view: no acknowledgment is ever sent for the sequence, and a
+                // native close waiting on that acknowledgment times out into the
+                // "could not safely close" dialog. The drops are intentional —
+                // stale or unauthorized publications must not be persisted — but
+                // they must be observable, or that dialog is undiagnosable.
+                const drop_publication = (
+                    reason: string,
+                    detail?: Record<string, unknown>,
+                ) => {
+                    console.warn('Dropped a pending structural publication', {
+                        reason,
+                        editSessionId: sanitized_edit_session_suffix(msg.editSessionId),
+                        sequence: msg.sequence,
+                        ...detail,
+                    });
+                };
                 if (
                     !editing_supported
                     || !edit_message_is_current(msg.editSessionId)
                     || active_replay_commit !== undefined
-                ) return;
+                ) {
+                    drop_publication('inactive', {
+                        editingSupported: editing_supported,
+                        sessionCurrent: edit_message_is_current(msg.editSessionId),
+                        replayActive: active_replay_commit !== undefined,
+                    });
+                    return;
+                }
                 const publication_source = source;
                 const publication_core = core;
                 if (
@@ -11580,9 +11721,18 @@ export function attach_viewer(
                     || publication_core === undefined
                     || !Number.isSafeInteger(msg.sourceGeneration)
                     || msg.sourceGeneration !== publication_core.source_generation
-                ) return;
+                ) {
+                    drop_publication('source-generation-mismatch', {
+                        messageGeneration: msg.sourceGeneration,
+                        currentGeneration: publication_core?.source_generation,
+                    });
+                    return;
+                }
                 const changes = own_wire_pending_changes(msg.changes);
-                if (!changes) return;
+                if (!changes) {
+                    drop_publication('malformed-changes');
+                    return;
+                }
                 const message_target: WorksheetTarget = {
                     sheetIndex: changes.sheetIndex,
                     sheetName: changes.sheetName,
@@ -11591,13 +11741,21 @@ export function attach_viewer(
                 if (active_save_operation?.durableTargets.some((target) => (
                     worksheet_target_matches(target, message_target)
                     || worksheet_target_matches(message_target, target)
-                ))) return;
+                ))) {
+                    drop_publication('save-owns-target', {
+                        saveTargets: active_save_operation.durableTargets,
+                    });
+                    return;
+                }
                 if (pending_edit_sequence_session_id !== msg.editSessionId) {
                     pending_edit_sequence_session_id = msg.editSessionId;
                     highest_pending_edit_sequence = 0;
                     highest_acknowledged_edit_sequence = 0;
                 }
-                if (!Number.isSafeInteger(msg.sequence) || msg.sequence <= 0) return;
+                if (!Number.isSafeInteger(msg.sequence) || msg.sequence <= 0) {
+                    drop_publication('invalid-sequence');
+                    return;
+                }
                 const sequence = msg.sequence;
                 if (sequence <= highest_pending_edit_sequence) {
                     if (sequence <= highest_acknowledged_edit_sequence) {
@@ -11605,6 +11763,15 @@ export function attach_viewer(
                             type: 'pendingChangesAcknowledged',
                             editSessionId: msg.editSessionId,
                             sequence,
+                        });
+                    } else {
+                        // The sequence was claimed by an earlier publication
+                        // whose write later dropped; that publication logged its
+                        // own reason, but this replay dying quietly is what a
+                        // waiter actually observes.
+                        drop_publication('sequence-claimed-but-unacknowledged', {
+                            highestPending: highest_pending_edit_sequence,
+                            highestAcknowledged: highest_acknowledged_edit_sequence,
                         });
                     }
                     return;
@@ -11615,7 +11782,10 @@ export function attach_viewer(
                     requires_identity
                     && changes.sheetName === undefined
                     && changes.worksheetId === undefined
-                ) return;
+                ) {
+                    drop_publication('worksheet-identity-required');
+                    return;
+                }
                 const live_posted_sheet = sheets?.[changes.sheetIndex];
                 if (
                     !Number.isSafeInteger(changes.sheetIndex)
@@ -11626,7 +11796,12 @@ export function attach_viewer(
                         && sheets !== undefined
                         && !live_posted_sheet
                     )
-                ) return;
+                ) {
+                    drop_publication('worksheet-index-unresolved', {
+                        sheetIndex: changes.sheetIndex,
+                    });
+                    return;
+                }
 
                 const posted_sheet_index = changes.sheetIndex;
                 const posted_sheet_name = changes.sheetName;
@@ -11642,7 +11817,12 @@ export function attach_viewer(
                 };
                 const posted_target = canonical_worksheet_target(requested_posted_target);
                 if (posted_target === undefined
-                    || posted_target.sheetIndex !== requested_posted_target.sheetIndex) return;
+                    || posted_target.sheetIndex !== requested_posted_target.sheetIndex) {
+                    drop_publication('worksheet-target-uncanonical', {
+                        requested: requested_posted_target,
+                    });
+                    return;
+                }
                 const publication_authority_revision = source_authority.authorityRevision;
                 if (
                     source !== publication_source
@@ -11652,7 +11832,12 @@ export function attach_viewer(
                     || !file_coordinator.state_write_is_current(
                         publication_authority_revision,
                     )
-                ) return;
+                ) {
+                    drop_publication('stale-authority', {
+                        authorityRevision: publication_authority_revision,
+                    });
+                    return;
+                }
                 const ledger_key = append_ledger_key(msg.editSessionId, posted_target);
                 // Refuse malformed or partial admission batches before claiming
                 // the renderer sequence. The same pure plan is rebuilt after
@@ -11662,7 +11847,14 @@ export function attach_viewer(
                     posted_target,
                     changes,
                     sequence,
-                ) === undefined) return;
+                ) === undefined) {
+                    drop_publication('admission-plan-refused', {
+                        appendedRows: changes.appendedRows.length,
+                        tailRemovals: changes.tailRemovals.length,
+                        hasAppendBasis: changes.appendBasis !== undefined,
+                    });
+                    return;
+                }
                 const receiver_epoch = session.current_receiver_epoch;
                 const edit_session_id = msg.editSessionId;
                 const admission = Symbol(edit_session_id);
@@ -11685,9 +11877,15 @@ export function attach_viewer(
                     prior_pending_write,
                     prior_append_admission,
                 ]).then(async () => {
-                    if (!publication_is_current()) return;
+                    if (!publication_is_current()) {
+                        drop_publication('stale-before-queued-write');
+                        return;
+                    }
                     const queued_snapshot = await read_file_state(false);
-                    if (!publication_is_current()) return;
+                    if (!publication_is_current()) {
+                        drop_publication('stale-after-state-read');
+                        return;
+                    }
                     const queued_durable_state = normalize_host_state(
                         queued_snapshot.state,
                         publication_source.meta().sheets,
@@ -11725,8 +11923,16 @@ export function attach_viewer(
                             expected: EMPTY_PENDING_STRUCTURAL_CHANGES,
                             desired: posted_structural,
                         })], publication_source)
-                    ) return;
-                    if (!publication_is_current()) return;
+                    ) {
+                        drop_publication('structural-replay-unauthorized', {
+                            hostStructuralEcho: host_structural_echo,
+                        });
+                        return;
+                    }
+                    if (!publication_is_current()) {
+                        drop_publication('stale-after-authorization');
+                        return;
+                    }
                     const authority_plan = plan_pending_structural_publication(
                         edit_session_id,
                         posted_target,
@@ -11734,7 +11940,10 @@ export function attach_viewer(
                         sequence,
                         true,
                     );
-                    if (authority_plan === undefined) return;
+                    if (authority_plan === undefined) {
+                        drop_publication('authority-plan-refused');
+                        return;
+                    }
                     let conflict_overlay_authorized = false;
                     const result = await update_edit_session_state(
                         edit_session_id,
@@ -11820,7 +12029,14 @@ export function attach_viewer(
                         || !conflict_overlay_authorized
                         || !publication_is_current()
                         || !commit_pending_structural_publication(authority_plan)
-                    ) return;
+                    ) {
+                        drop_publication('durable-commit-refused', {
+                            aborted: result.type === 'aborted',
+                            overlayAuthorized: conflict_overlay_authorized,
+                            current: publication_is_current(),
+                        });
+                        return;
+                    }
                     retire_pending_edit_target(edit_session_id, posted_target, sequence);
                     const committed = result.snapshot.state as PerFileState;
                     const supersedes = (operation: CsvSaveOperation) => operation.worksheets

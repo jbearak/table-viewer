@@ -198,7 +198,19 @@ export function create_viewer_panel(
             || expected.sequence !== receipt.sequence
             || receipt.rendererGeneration !== renderer_generation
             || !Number.isSafeInteger(receipt.sequence)
-        ) return;
+        ) {
+            // A rejected receipt means a durable acknowledgment happened but the
+            // desktop refuses to count it; a close waiting on this sequence will
+            // time out into the unsafe-close dialog, so say why.
+            console.warn('Rejected a pending-edit acknowledgment receipt', {
+                disposed,
+                known: expected !== undefined,
+                receiptGeneration: receipt.rendererGeneration,
+                currentGeneration: renderer_generation,
+                sequence: receipt.sequence,
+            });
+            return;
+        }
         pending_ack_receipts.delete(receipt.receiptId);
         highest_acknowledged.set(
             receipt.editSessionId,

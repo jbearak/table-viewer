@@ -194,16 +194,16 @@ function formula_result_lines(
     result: string,
     colors: DiffColors,
 ): RichTextLine[] {
-    return formula_result_replaces_base(base, result)
+    return formula_result_replaces_base(base)
         ? [[{ text: result, diff_color: colors.added }]]
         : diff_lines(base, result, 'number', colors);
 }
 
-function formula_result_replaces_base(base: string, result: string): boolean {
-    return base === '' || (
-        base === UNKNOWN_XLSX_FORMULA_RESULT
-        && result.startsWith(UNKNOWN_XLSX_FORMULA_RESULT)
-    );
+function formula_result_replaces_base(base: string): boolean {
+    // An unknown base is a formula the workbook carries no cached display
+    // value for, not a value the user changed — a strikethrough "?? → result"
+    // would misread as a diff, so the calculated result simply stands in.
+    return base === '' || base === UNKNOWN_XLSX_FORMULA_RESULT;
 }
 
 function persisted_displayed_text(
@@ -254,7 +254,7 @@ export function displayed_text(
     if (overlay?.formula_result !== undefined || overlay?.formula_result_pending) {
         const base = persisted_displayed_text(c, show_formatting);
         const result = overlay.formula_result ?? UNKNOWN_XLSX_FORMULA_RESULT;
-        return formula_result_replaces_base(base, result)
+        return formula_result_replaces_base(base)
             ? result
             : `${base}${DIFF_ARROW}${result}`;
     }
