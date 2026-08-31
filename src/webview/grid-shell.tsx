@@ -4061,31 +4061,60 @@ export function GridShell({
             set_append_anchor(append_dock_open_ref.current ? 'corner' : 'hidden');
             return;
         }
-        const height = Math.min(Math.max(Math.round(bounds.height), 22), 32);
-        const width = Math.max(append_marker_width_ref.current, 28);
-        // Keep clear of the header band above and Glide's overlay horizontal
-        // scrollbar below; outside that window the phantom row is off screen.
+        // Exactly one row slot: the last row's own height and the row-number
+        // gutter's own width, so the launcher lines up with the grid it joins.
+        const height = Math.max(Math.round(bounds.height), 16);
+        const width = Math.max(append_marker_width_ref.current, 16);
+        const root_height = Math.round(root_rect.height);
         const min_top = APPEND_ANCHOR_HEADER_CLEARANCE_PX;
-        const max_top = Math.round(root_rect.height)
-            - height
-            - APPEND_ANCHOR_SCROLLBAR_CLEARANCE_PX;
         let top = Math.round(bounds.y + bounds.height - root_rect.top);
-        if (top < min_top || top > max_top) {
-            // While the dock is open the user is mid-gesture (typing a count),
-            // so pin it to the nearest edge instead of unmounting under them.
-            if (!append_dock_open_ref.current || max_top < min_top) {
-                set_append_anchor('hidden');
+        if (append_dock_open_ref.current) {
+            // Mid-gesture (a count is being typed): pin the slot inside the
+            // viewport instead of letting it scroll away under the user.
+            const max_top = root_height
+                - height
+                - APPEND_ANCHOR_SCROLLBAR_CLEARANCE_PX;
+            if (max_top < min_top) {
+                set_append_anchor('corner');
                 return;
             }
             top = Math.min(Math.max(top, min_top), max_top);
+        } else if (top >= root_height - 2 || top + height <= min_top) {
+            // Fully below the viewport, or fully behind the header band. A
+            // partially visible slot stays mounted and clips at the root edge,
+            // exactly the way a real row does.
+            set_append_anchor('hidden');
+            return;
         }
-        set_append_anchor({
-            left: 0,
-            bottom: Math.round(root_rect.height) - top - height,
-            width,
-            height,
-        });
+        set_append_anchor({ left: 0, top, width, height });
     }, []);
+    // Glide's visible-region callback only fires when the visible cell range
+    // changes, and React re-measures a beat after layout — both leave the
+    // launcher trailing the canvas. Track the scroller's own scroll events and
+    // the root's resizes instead, coalesced to one measure per frame.
+    useLayoutEffect(() => {
+        if (!may_offer_append_dock) return;
+        const root = grid_root_ref.current;
+        const scroller = root?.querySelector<HTMLElement>('.dvn-scroller');
+        let frame = 0;
+        const schedule = () => {
+            if (frame !== 0) return;
+            frame = requestAnimationFrame(() => {
+                frame = 0;
+                update_append_anchor();
+            });
+        };
+        scroller?.addEventListener('scroll', schedule, { passive: true });
+        const observer = root && typeof ResizeObserver !== 'undefined'
+            ? new ResizeObserver(schedule)
+            : undefined;
+        if (root) observer?.observe(root);
+        return () => {
+            if (frame !== 0) cancelAnimationFrame(frame);
+            scroller?.removeEventListener('scroll', schedule);
+            observer?.disconnect();
+        };
+    }, [may_offer_append_dock, update_append_anchor]);
     /**
      * Labels for the composer's fields — the same titles the grid header
      * paints, so a field is identifiable by the column the user can see.

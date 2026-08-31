@@ -776,13 +776,28 @@ body.vscode-high-contrast-light .toolbar-split-caret.open {
     background: var(--vscode-button-hoverBackground, #1177bb);
 }
 
-/* Row-anchored: the launcher is a phantom row slot — gutter-wide, row-tall,
-   square-cornered — so it reads as the next row number cell rather than a
-   floating button. Width and height arrive inline from the shell's measure. */
+/* Row-anchored: the launcher is a phantom row slot — exactly gutter-wide and
+   row-tall (inline, from the shell's measure), square-cornered — so it reads
+   as the next row number cell rather than a floating button. */
+.append-dock.is-row-anchored {
+    /* The dock box is the slot itself; the panel hangs off it absolutely. */
+    display: block;
+}
+
 .append-dock.is-row-anchored .append-dock-launcher {
-    border-radius: 3px;
-    font-size: 16px;
+    border-radius: 2px;
+    font-size: 14px;
     box-shadow: none;
+}
+
+/* The quick-add panel opens to the right of the slot, on the phantom row's
+   own line, so it never covers the real rows above it. */
+.append-dock.is-row-anchored .append-dock-panel {
+    position: absolute;
+    left: 100%;
+    top: 50%;
+    transform: translateY(-50%);
+    margin-left: 8px;
 }
 
 .append-dock-launcher > span {

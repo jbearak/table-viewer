@@ -22,13 +22,16 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 
 /**
  * Measured placement for the row-anchored launcher, in `.grid-shell-root`
- * coordinates. `left`/`bottom` position the dock; `width`/`height` size the
+ * coordinates. `left`/`top` position the dock (top-anchored, because rows keep
+ * a stable top edge while the window resizes); `width`/`height` size the
  * launcher to the row-number gutter and the last row's height, so it reads as
- * one more row slot rather than a floating control.
+ * one more row slot rather than a floating control. The quick-add panel opens
+ * to the right of the slot, in the phantom row's own line, so it never covers
+ * the real rows above.
  */
 export interface AppendDockAnchor {
     readonly left: number;
-    readonly bottom: number;
+    readonly top: number;
     readonly width: number;
     readonly height: number;
 }
@@ -142,7 +145,7 @@ export function AppendDock({
             className={anchor === undefined ? 'append-dock' : 'append-dock is-row-anchored'}
             style={anchor === undefined
                 ? undefined
-                : { left: anchor.left, bottom: anchor.bottom }}
+                : { left: anchor.left, top: anchor.top, bottom: 'auto' }}
             onKeyDown={(event) => {
                 if (event.key !== 'Escape' || !open) return;
                 event.preventDefault();
