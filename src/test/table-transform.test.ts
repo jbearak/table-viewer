@@ -1009,6 +1009,32 @@ describe('table transforms', () => {
         })).resolves.toMatchObject({ indices: Uint32Array.from([1, 2]) });
     });
 
+    it('sorts and range-filters adjacent signed and unsigned 64-bit values exactly', async () => {
+        const source = new Source([
+            [cell('18446744073709551615', 'number')],
+            [cell('-9223372036854775807', 'number')],
+            [cell('18446744073709551614', 'number')],
+            [cell('-9223372036854775808', 'number')],
+            [cell('1', 'number')],
+        ]);
+        const ascending = await compute_transform(source, 0, {
+            sort: [{ colIndex: 0, direction: 'asc' }], filters: [],
+        });
+        expect([...ascending.indices!]).toEqual([3, 1, 4, 2, 0]);
+        const descending = await compute_transform(source, 0, {
+            sort: [{ colIndex: 0, direction: 'desc' }], filters: [],
+        });
+        expect([...descending.indices!]).toEqual([0, 2, 4, 1, 3]);
+        const between = await compute_transform(source, 0, {
+            sort: [{ colIndex: 0, direction: 'asc' }],
+            filters: [{
+                ...filter('between', '-9223372036854775807'),
+                secondValue: '18446744073709551614',
+            }],
+        });
+        expect([...between.indices!]).toEqual([1, 4, 2]);
+    });
+
     it('filters mixed canonical integers, decimals, and scientific notation exactly', async () => {
         const source = new Source([
             [cell('9007199254740993')],

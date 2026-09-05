@@ -110,6 +110,44 @@ class HistogramSource implements DataSource {
 }
 
 describe('compute_column_histogram', () => {
+    it.each([
+        ['signed minimum', ['-9223372036854775808', '-9223372036854775807']],
+        ['signed maximum', ['9223372036854775806', '9223372036854775807']],
+        ['unsigned maximum', ['18446744073709551614', '18446744073709551615']],
+        ['safe then unsafe', ['0', '9007199254740991', '9007199254740992']],
+        ['unsafe then safe', ['9007199254740993', '9007199254740992', '-1']],
+    ])('keeps %s integers exact without publishing rounded or partial bins', async (_name, values) => {
+        for (const rawType of ['number', 'string'] as const) {
+            const source = new HistogramSource(values.map((raw) => ({ raw, rawType })));
+            let analysis: ColumnAnalysis | undefined;
+            const histogram = await compute_column_histogram(source, 0, 0, () => false, {
+                get: () => undefined,
+                set: (_sheet, _column, value) => { analysis = value; },
+            });
+            expect(analysis?.numericSummary).toBeUndefined();
+            expect(analysis?.values).toEqual(values);
+            expect(histogram).toMatchObject({
+                columnKind: 'numeric',
+                bins: [],
+                distinctValues: values.map((value) => ({ value })),
+                distinctValuesExceeded: false,
+            });
+        }
+    });
+
+    it('retains numeric summaries at both safe-integer boundaries', async () => {
+        let analysis: ColumnAnalysis | undefined;
+        await compute_column_histogram(new HistogramSource([
+            '-9007199254740991', '9007199254740991',
+        ]), 0, 0, () => false, {
+            get: () => undefined,
+            set: (_sheet, _column, value) => { analysis = value; },
+        });
+        expect(analysis?.numericSummary).toEqual({
+            min: Number.MIN_SAFE_INTEGER, max: Number.MAX_SAFE_INTEGER, count: 2,
+        });
+    });
+
     it('builds 50 bounded bins and ignores blank values', async () => {
         const source = new HistogramSource([
             '0', '25', '50', '75', '100', null, '',

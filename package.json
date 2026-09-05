@@ -1,7 +1,7 @@
 {
   "name": "table-viewer",
   "displayName": "Table Viewer",
-  "description": "View and diff Excel, Stata, CSV, and TSV tables; edit XLSX, CSV, and TSV",
+  "description": "View and diff Excel, Stata, Arrow, CSV, and TSV tables; edit XLSX, CSV, and TSV",
   "keywords": [
     "excel",
     "xlsx",
@@ -9,6 +9,7 @@
     "tsv",
     "stata",
     "dta",
+    "arrow",
     "spreadsheet",
     "diff",
     "compare",
@@ -126,22 +127,22 @@
       "scm/resourceState/context": [
         {
           "command": "tableViewer.openTableDiff",
-          "when": "scmProvider == git && scmResourceGroup == workingTree && resourceExtname =~ /\\.(csv|tsv|xlsx|xls|dta)$/i",
+          "when": "scmProvider == git && scmResourceGroup == workingTree && resourceExtname =~ /\\.(csv|tsv|xlsx|xls|dta|arrow)$/i",
           "group": "inline"
         },
         {
           "command": "tableViewer.openTableDiff",
-          "when": "scmProvider == git && scmResourceGroup == workingTree && resourceExtname =~ /\\.(csv|tsv|xlsx|xls|dta)$/i",
+          "when": "scmProvider == git && scmResourceGroup == workingTree && resourceExtname =~ /\\.(csv|tsv|xlsx|xls|dta|arrow)$/i",
           "group": "navigation"
         },
         {
           "command": "tableViewer.openStagedTableDiff",
-          "when": "scmProvider == git && scmResourceGroup == index && resourceExtname =~ /\\.(csv|tsv|xlsx|xls|dta)$/i",
+          "when": "scmProvider == git && scmResourceGroup == index && resourceExtname =~ /\\.(csv|tsv|xlsx|xls|dta|arrow)$/i",
           "group": "inline"
         },
         {
           "command": "tableViewer.openStagedTableDiff",
-          "when": "scmProvider == git && scmResourceGroup == index && resourceExtname =~ /\\.(csv|tsv|xlsx|xls|dta)$/i",
+          "when": "scmProvider == git && scmResourceGroup == index && resourceExtname =~ /\\.(csv|tsv|xlsx|xls|dta|arrow)$/i",
           "group": "navigation"
         }
       ],
@@ -170,7 +171,7 @@
         "displayName": "Table Viewer",
         "selector": [
           {
-            "filenamePattern": "*.{[xX][lL][sS][xX],[xX][lL][sS],[cC][sS][vV],[tT][sS][vV],[dD][tT][aA]}"
+            "filenamePattern": "*.{[xX][lL][sS][xX],[xX][lL][sS],[cC][sS][vV],[tT][sS][vV],[dD][tT][aA],[aA][rR][rR][oO][wW]}"
           }
         ],
         "priority": "default"
@@ -222,7 +223,7 @@
           "type": "number",
           "default": 256,
           "minimum": 1,
-          "description": "File-size threshold in MiB above which Table Viewer asks for confirmation before opening an xlsx, xls, csv, tsv, or dta file."
+          "description": "File-size threshold in MiB above which Table Viewer asks for confirmation before opening an xlsx, xls, csv, tsv, dta, or arrow file."
         }
       }
     }
@@ -272,7 +273,7 @@
     "package": "vsce package --no-dependencies"
   },
   "dependencies": {
-    "@jbearak/dta-parser": "^0.6.0",
+    "@jbearak/dta-parser": "^0.7.0",
     "canvas-hypertxt": "^1.0.3",
     "cfb": "^1.2.2",
     "electron-updater": "6.8.9",

@@ -90,6 +90,11 @@ mac:
       description: Legacy Excel workbook
       role: Viewer
       rank: Alternate
+    - ext: arrow
+      name: Arrow IPC File
+      description: Arrow IPC file
+      role: Viewer
+      rank: Alternate
     - ext: dta
       name: Stata Dataset
       description: Stata dataset

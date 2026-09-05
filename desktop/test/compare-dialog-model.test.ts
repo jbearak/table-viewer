@@ -148,4 +148,14 @@ describe('dialog_state', () => {
         expect(dialog_state(ok('/a.csv', 'csv'), ok('/b.tsv', 'tsv')).warning)
             .not.toMatch(/single sheet/u);
     });
+
+    it('treats Arrow as a single table when comparing it with a workbook', () => {
+        expect(dialog_state(ok('/a.arrow', 'arrow'), ok('/b.xlsx')).warning)
+            .toMatch(/show as added/u);
+        expect(dialog_state(ok('/a.xlsx'), ok('/b.arrow', 'arrow')).warning)
+            .toMatch(/show as deleted/u);
+        const state = dialog_state(ok('/a.arrow', 'arrow'), ok('/b.dta', 'dta'));
+        expect(state.canCompare).toBe(true);
+        expect(state.warning).not.toMatch(/single sheet/u);
+    });
 });

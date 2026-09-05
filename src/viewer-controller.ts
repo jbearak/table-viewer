@@ -1737,6 +1737,15 @@ function dta_profile(): ViewerProfile {
     };
 }
 
+function arrow_profile(): ViewerProfile {
+    return {
+        editing: false,
+        build_source(raw, file_path) {
+            return build_source_from_buffer(raw, file_path);
+        },
+    };
+}
+
 /** Build the editable CSV/TSV DataSource shared by the table and preview hosts.
  *  `csv_max_rows` comes from the host's ConfigPort; it is normalized to a
  *  finite non-negative integer. Non-finite host values fall back to the default,
@@ -2053,6 +2062,8 @@ export function profile_for(file_path: string, config?: ConfigPort): ViewerProfi
         ? csv_table_profile(config)
         : ext.endsWith('.dta')
             ? dta_profile()
+        : ext.endsWith('.arrow')
+            ? arrow_profile()
         : excel_profile(file_path);
 }
 

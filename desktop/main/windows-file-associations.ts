@@ -6,6 +6,7 @@ export const WINDOWS_FILE_ASSOCIATIONS = [
     { extension: 'xlsx', description: 'Excel workbook' },
     { extension: 'xls', description: 'Legacy Excel workbook' },
     { extension: 'dta', description: 'Stata dataset' },
+    { extension: 'arrow', description: 'Arrow IPC file' },
 ] as const;
 
 export const SUPPORTED_FILE_EXTENSIONS = WINDOWS_FILE_ASSOCIATIONS.map(

@@ -1,5 +1,6 @@
 import { Buffer } from 'node:buffer';
 import { createHash } from 'node:crypto';
+import { raw_stata_missing_cell } from './stata-missing-cell';
 import {
     apply_display_format,
     decode_gso_entry,
@@ -1012,7 +1013,7 @@ export class DtaDataSource implements DataSource {
             return raw_cell;
         }
         if (is_missing_value_object(cell)) {
-            return { raw: cell.missing_type, rawType: 'number' };
+            return raw_stata_missing_cell(cell.missing_type);
         }
         if (typeof cell === 'string') return { raw: cell, rawType: 'string' };
         return { raw: String(cell), rawType: 'number' };

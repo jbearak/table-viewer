@@ -1,6 +1,6 @@
 # Table Viewer setup and 10-minute try-out
 
-Table Viewer is available in two forms. Both open Excel, Stata, CSV, and TSV files, remember your viewing choices, and automatically refresh when a file changes on disk. Choose the one that best fits how you work:
+Table Viewer is available in two forms. Both open Excel, Stata, Arrow, CSV, and TSV files, remember your viewing choices, and automatically refresh when a file changes on disk. Choose the one that best fits how you work:
 
 - [**Standalone desktop app**](setup-guide-desktop-app.md) — if you want Table Viewer to behave like a regular spreadsheet app, with each file in its own window.
 - [**VS Code extension**](setup-guide-vscode-extension.md) — if you already work in VS Code, open files on a remote system, or would rather keep several spreadsheets in tabs than in separate windows.

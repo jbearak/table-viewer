@@ -147,6 +147,7 @@ describe('portable Windows file associations', () => {
             xlsx: 'Viewer',
             xls: 'Viewer',
             dta: 'Viewer',
+            arrow: 'Viewer',
         };
         const expected_associations = Object.fromEntries(
             WINDOWS_FILE_ASSOCIATIONS.map(({ extension, description }) => [
