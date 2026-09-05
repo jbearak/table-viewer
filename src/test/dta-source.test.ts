@@ -165,7 +165,7 @@ function build_dta_fixture(
     writer.text('<stata_dta><header><release>118</release><byteorder>LSF</byteorder><K>');
     writer.u16(variables.length);
     writer.text('</K><N>');
-    writer.i32(observations.length);
+    writer.u64(observations.length);
     writer.text('</N><label>');
     writer.u16(0);
     writer.text('</label><timestamp>');
@@ -722,19 +722,23 @@ describe('DtaDataSource', () => {
         expect(fast).toEqual(rendered.map((row) => row.map((cell) =>
             cell === null
                 ? null
-                : { raw: cell.raw, rawType: cell.rawType },
+                : {
+                    raw: cell.raw,
+                    rawType: cell.rawType,
+                    ...(cell.comparisonKey === undefined ? {} : { comparisonKey: cell.comparisonKey }),
+                },
         )));
         expect(fast.map((row) => row[3])).toEqual([
-            { raw: '.', rawType: 'number' },
-            { raw: '.a', rawType: 'number' },
-            { raw: '.b', rawType: 'number' },
-            { raw: '.z', rawType: 'number' },
+            { raw: '.', rawType: 'number', comparisonKey: 'stata:missing:.' },
+            { raw: '.a', rawType: 'number', comparisonKey: 'stata:missing:.a' },
+            { raw: '.b', rawType: 'number', comparisonKey: 'stata:missing:.b' },
+            { raw: '.z', rawType: 'number', comparisonKey: 'stata:missing:.z' },
         ]);
         expect(fast[0]).toEqual([
             { raw: '1', rawType: 'number' },
             { raw: '12.5', rawType: 'number' },
             { raw: 'alpha', rawType: 'string' },
-            { raw: '.', rawType: 'number' },
+            { raw: '.', rawType: 'number', comparisonKey: 'stata:missing:.' },
             { raw: 'a long first value', rawType: 'string' },
         ]);
         expect(rendered[0][0]?.formatted).toBe('Zulu');
@@ -2801,7 +2805,7 @@ describe('DtaDataSource', () => {
         const data_entry = map + 9 * 8;
         view.setBigUint64(data_entry, view.getBigUint64(data_entry, true) + 1n, true);
         await expect(DtaDataSource.create(corrupt)).rejects.toThrow(
-            /invalid data section tag/,
+            /Characteristics section does not end at the mapped data offset/,
         );
     });
 

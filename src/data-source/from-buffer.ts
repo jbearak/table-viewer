@@ -35,7 +35,8 @@ export function csv_source_from_buffer(
 /**
  * Build a DataSource for raw file bytes, dispatched on the path's extension the
  * same way `profile_for` dispatches profiles: `.csv`/`.tsv` → CSV (first row is
- * the header), `.dta` → Stata, `.xlsx` → OOXML, anything else → BIFF `.xls`.
+ * the header), `.dta` → Stata, `.arrow` → Arrow IPC, `.xlsx` → OOXML,
+ * anything else → BIFF `.xls`.
  */
 export async function build_source_from_buffer(
     raw: Uint8Array,
@@ -49,6 +50,10 @@ export async function build_source_from_buffer(
     if (ext.endsWith('.dta')) {
         const { DtaDataSource } = await import('./dta-source');
         return DtaDataSource.create(raw);
+    }
+    if (ext.endsWith('.arrow')) {
+        const { ArrowDataSource } = await import('./arrow-source');
+        return ArrowDataSource.create(raw);
     }
     const physical = ext.endsWith('.xlsx')
         ? await XlsxDataSource.create(raw)

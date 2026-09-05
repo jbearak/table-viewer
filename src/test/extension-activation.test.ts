@@ -199,7 +199,7 @@ describe('table_diff_uris', () => {
         });
     });
 
-    it.each(['csv', 'TSV', 'xls', 'XLSX'])(
+    it.each(['csv', 'TSV', 'xls', 'XLSX', 'dta', 'arrow', 'ArRoW'])(
         'recognizes a Source Control Graph %s commit diff',
         (extension) => {
             const file_path = `/repo/tables/data.${extension}`;
@@ -209,6 +209,19 @@ describe('table_diff_uris', () => {
             expect(table_diff_uris(original, modified)).toEqual({ original, modified });
         },
     );
+
+    it.each(['arrow', 'ARROW', 'ArRoW'])('recognizes staged and unstaged %s files', (extension) => {
+        const file_path = `/repo/data.${extension}`;
+        const file = vscode_mock.Uri.file(file_path) as unknown as vscode.Uri;
+        const unstaged = git_uri(file_path, '~');
+        expect(table_diff_uris(unstaged, file)).toEqual({ original: unstaged, modified: file });
+        const original = git_uri(file_path, 'HEAD');
+        const modified = git_uri(file_path, '');
+        expect(table_diff_uris(original, modified)).toEqual({ original, modified });
+        const document = table_diff_document_uri({ original, modified });
+        expect(table_diff_document_uri(table_diff_document_uris(document)!).toString())
+            .toBe(document.toString());
+    });
 
     it('orients uppercase Git revisions from a canonical merge base in both orders', async () => {
         const file_path = '/repo/data.csv';

@@ -103,7 +103,7 @@ export function dialog_state(
     }
     if (original.extension !== modified.extension) {
         const single_table = (extension: string) =>
-            ['csv', 'tsv', 'dta'].includes(extension);
+            ['csv', 'tsv', 'dta', 'arrow'].includes(extension);
         const original_is_single_table = single_table(original.extension);
         const modified_is_single_table = single_table(modified.extension);
         let warning = 'These files are in different formats.';

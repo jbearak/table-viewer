@@ -75,6 +75,7 @@ describe('open supported formats', () => {
             ['basic.csv', 'selector.CsV'],
             ['basic.tsv', 'selector.TsV'],
             ['all_types_v118.dta', 'selector.DtA'],
+            ['arrow/profile-zstd.arrow', 'selector.ArRoW'],
         ] as const;
 
         try {
@@ -85,7 +86,7 @@ describe('open supported formats', () => {
 
                 const opened = await wait_for(() => has_custom_tab('tableViewer.editor'));
                 assert.ok(opened, `expected Table Viewer to be discovered for ${target_name}`);
-                if (target_name === 'selector.DtA') {
+                if (target_name === 'selector.DtA' || target_name === 'selector.ArRoW') {
                     const loaded = await vscode.commands.executeCommand<boolean>(
                         'tableViewer.openWorkbookAtSheet',
                         { uri: target.toString(), sheetName: 'Sheet1' },
@@ -93,7 +94,7 @@ describe('open supported formats', () => {
                     assert.strictEqual(
                         loaded,
                         true,
-                        'expected the mixed-case DTA fixture to finish loading',
+                        `expected ${target_name} to finish loading`,
                     );
                 }
 

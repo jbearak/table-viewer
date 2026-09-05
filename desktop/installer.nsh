@@ -51,6 +51,7 @@
   !insertmacro TV_REGISTER_TYPE "xlsx"    "Excel workbook"
   !insertmacro TV_REGISTER_TYPE "xls"     "Legacy Excel workbook"
   !insertmacro TV_REGISTER_TYPE "dta"     "Stata dataset"
+  !insertmacro TV_REGISTER_TYPE "arrow"   "Arrow IPC file"
   ; Tell the shell to reload associations so "Open with…" is correct without a
   ; sign-out. SHCNE_ASSOCCHANGED | SHCNF_FLUSH.
   System::Call 'shell32::SHChangeNotify(i 0x08000000, i 0x1000, i 0, i 0)'
@@ -62,5 +63,6 @@
   !insertmacro TV_UNREGISTER_TYPE "xlsx"
   !insertmacro TV_UNREGISTER_TYPE "xls"
   !insertmacro TV_UNREGISTER_TYPE "dta"
+  !insertmacro TV_UNREGISTER_TYPE "arrow"
   System::Call 'shell32::SHChangeNotify(i 0x08000000, i 0x1000, i 0, i 0)'
 !macroend

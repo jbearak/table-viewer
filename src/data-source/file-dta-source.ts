@@ -1,5 +1,6 @@
 import * as fs from 'node:fs';
 import { createHash } from 'node:crypto';
+import { raw_stata_missing_cell } from './stata-missing-cell';
 import {
     DtaFile,
     apply_display_format,
@@ -433,7 +434,7 @@ function label_key_from_raw(raw: string): number | undefined {
 
 function raw_stata_cell(cell: RowCell): RawCell {
     if (is_missing_value_object(cell)) {
-        return { raw: cell.missing_type, rawType: 'number' };
+        return raw_stata_missing_cell(cell.missing_type);
     }
     return typeof cell === 'string'
         ? { raw: cell, rawType: 'string' }

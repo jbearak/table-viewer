@@ -57,7 +57,7 @@ Windows builds are always unsigned: there is no Authenticode certificate, so not
 
 The config lives in `desktop/electron-builder.yml`:
 
-- File associations declare the app as *a* handler for `csv`/`tsv`/`xlsx`/`xls`/`dta` (`rank: Alternate`) so it appears in "Open with…" without claiming default-handler status.
+- File associations declare the app as *a* handler for `csv`/`tsv`/`xlsx`/`xls`/`dta`/`arrow` (`rank: Alternate`) so it appears in "Open with…" without claiming default-handler status.
 - The app bundle contains only the esbuild outputs (`dist/desktop`, `dist/webview`) plus `package.json` — no `node_modules`; runtime packages such as `electron-updater` are bundled into the main-process output.
 - Signed packaged macOS builds and packaged Windows builds use GitHub update metadata. Installed Windows builds retain electron-updater's NSIS channels; portable Windows builds use separate project-owned channels and an architecture-matched replacement helper. Startup checks stay silent when current or unsuccessful; **Table Viewer → Check for Updates…** on macOS and **Help → Check for Updates…** on Windows give explicit feedback that distinguishes an offline device, an unreachable GitHub update service, and missing or invalid release files. Unsigned macOS local installs are check-only and direct available updates to GitHub Releases because Squirrel.Mac cannot install over an unsigned app. Installation in supported builds always waits for the normal viewer/SQLite quit fence.
 - `artifactName` names the dmg/zip `table-viewer-<version>-<arch>` rather than after `productName`, which has a space — those filenames are part of the download URL the Homebrew cask pins.
@@ -166,7 +166,9 @@ The display name in the markup is hardcoded, because `app.name` is the package n
 
 ## Editing `.xlsx`, `.csv`, and `.tsv` files
 
-Modern Excel (`.xlsx`), `.csv`, and `.tsv` files support the same editing workflow as the VS Code extension; legacy Excel (`.xls`) and Stata (`.dta`) files are read-only. Click **Edit** to change cell values; `Cmd/Ctrl+S` saves back to the opened file, and leaving edit mode with changes offers Save, Discard, or Cancel. Desktop state is stored separately from the VS Code extension, as described above.
+Modern Excel (`.xlsx`), `.csv`, and `.tsv` files support the same editing workflow as the VS Code extension; legacy Excel (`.xls`), Stata (`.dta`), and Arrow (`.arrow`) files are read-only. Click **Edit** to change cell values; `Cmd/Ctrl+S` saves back to the opened file, and leaving edit mode with changes offers Save, Discard, or Cancel. Desktop state is stored separately from the VS Code extension, as described above.
+
+Arrow files use the same [supported types, value display, and memory behavior](../docs/arrow-files.md) in the desktop app and the VS Code extension.
 
 Unsaved edits are durable: the shared controller persists `pendingEdits` per file in the state store and hands them back when the file is reopened, so closing a window does not lose a draft — it comes back where you left it (hot-exit semantics, the same as the VS Code extension). Closing therefore does not prompt.
 

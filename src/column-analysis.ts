@@ -115,7 +115,7 @@ function iso_date_string(value: string): boolean {
 }
 
 type ClassifiedValue =
-    | { kind: 'numeric'; numericValue?: number }
+    | { kind: 'numeric'; numericValue?: number; unsafeInteger?: boolean }
     | { kind: 'orderedText' | 'text' }
     | undefined;
 
@@ -129,6 +129,9 @@ function classify_value(
     }
     if (cell_can_be_numeric(cell)) {
         const numericValue = Number(raw);
+        if (/^[+-]?\d+$/.test(raw.trim()) && !Number.isSafeInteger(numericValue)) {
+            return { kind: 'numeric', unsafeInteger: true };
+        }
         return Number.isFinite(numericValue)
             ? { kind: 'numeric', numericValue }
             : { kind: 'numeric' };
@@ -241,6 +244,7 @@ export async function acquire_column_analysis(
     let min = Number.POSITIVE_INFINITY;
     let max = Number.NEGATIVE_INFINITY;
     let numeric_count = 0;
+    let has_unsafe_integer = false;
     let distinct: MutableDistinctValues | undefined = {
         entries: new Map(),
         serializedByteCount: 0,
@@ -327,6 +331,9 @@ export async function acquire_column_analysis(
             const classified = classify_value(source_cell, raw);
             if (classified === undefined) continue;
             column_kind = combine_kind(column_kind, classified.kind);
+            if (classified.kind === 'numeric' && classified.unsafeInteger) {
+                has_unsafe_integer = true;
+            }
             if (
                 classified.kind === 'numeric'
                 && classified.numericValue !== undefined
@@ -348,7 +355,8 @@ export async function acquire_column_analysis(
                 Object.freeze({ value, rawValue }))),
             serializedByteCount: distinct.serializedByteCount,
         });
-    const numeric_summary = numeric_count === 0
+    // A partial summary would hide unsafe integers and produce misleading bins.
+    const numeric_summary = numeric_count === 0 || has_unsafe_integer
         ? undefined
         : Object.freeze({ min, max, count: numeric_count });
     const frozen_values = Object.freeze(values);

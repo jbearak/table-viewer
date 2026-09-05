@@ -78,7 +78,7 @@ describe('extension runtime manifest', () => {
             type: 'number',
             default: 256,
             minimum: 1,
-            description: 'File-size threshold in MiB above which Table Viewer asks for confirmation before opening an xlsx, xls, csv, tsv, or dta file.',
+            description: 'File-size threshold in MiB above which Table Viewer asks for confirmation before opening an xlsx, xls, csv, tsv, dta, or arrow file.',
         });
     });
 
@@ -220,5 +220,15 @@ describe('extension custom-editor manifest', () => {
         expect(editor.priority).toBe('default');
         expect(editor.selector).toHaveLength(1);
         expect(custom_editors).toHaveLength(1);
+    });
+
+    it('registers every casing of the Arrow extension', () => {
+        const pattern = String(contribution('tableViewer.editor').selector?.[0]?.filenamePattern);
+        expect(pattern).toContain('[aA][rR][rR][oO][wW]');
+        for (const extension of ['arrow', 'ARROW', 'ArRoW']) {
+            expect(TABLE_FILE_EXTENSION_PATTERN.test(`/tmp/data.${extension}`)).toBe(true);
+        }
+        expect(TABLE_FILE_EXTENSION_PATTERN.test('/tmp/data.notarrow')).toBe(false);
+        expect(TABLE_FILE_EXTENSION_PATTERN.test('/tmp/data.arrow.txt')).toBe(false);
     });
 });
