@@ -54,6 +54,11 @@ const MAX_BINARY_CACHE_ENTRIES = 256;
 const MAX_BINARY_CACHE_BYTES = 16 * 1024 * 1024;
 const MISSING_CODE = /^\.[a-z]?$/u;
 
+/** Whether a raw number is a missing code. Formatted numbers never start with `.`. */
+function is_missing_code(raw: string): boolean {
+    return raw.charCodeAt(0) === 0x2e && MISSING_CODE.test(raw);
+}
+
 /** Bytes one observation occupies on disk, from its variables' storage types. */
 export function stata_observation_bytes(variables: readonly Variable[]): number {
     let bytes = 0;
@@ -69,7 +74,7 @@ export function stata_observation_bytes(variables: readonly Variable[]): number 
 
 function label_for(labels: ValueLabels | undefined, raw: string): string | undefined {
     if (labels === undefined) return undefined;
-    if (MISSING_CODE.test(raw)) return labels.get(MISSING[raw]);
+    if (is_missing_code(raw)) return labels.get(MISSING[raw]);
     const numeric = Number(raw);
     return Number.isFinite(numeric) ? labels.get(numeric) : undefined;
 }
@@ -132,7 +137,11 @@ function binary_gso(bytes: Uint8Array): BinaryGso {
 }
 
 function rendered_stata_cell(raw_cell: RawCell, formatted: string): RenderedCell {
-    return Object.assign(raw_cell, { formatted, bold: false, italic: false });
+    const cell = raw_cell as RenderedCell;
+    cell.formatted = formatted;
+    cell.bold = false;
+    cell.italic = false;
+    return cell;
 }
 
 interface CachedWindow {
@@ -496,7 +505,7 @@ export class StataReaderSource implements DataSource {
         decoded.forEach((column, k) => {
             const strl = this.variables[columns[k]].type === 'strL';
             for (let i = 0; i < count; i++) {
-                rows[i][k] = this.canonicalize(cell_of(column, i), strl, `${start + i}:${columns[k]}`);
+                rows[i][k] = this.canonicalize(cell_of(column, i), strl, start + i, columns[k]);
             }
         });
         return rows;
@@ -516,9 +525,9 @@ export class StataReaderSource implements DataSource {
     }
 
     /** Canonical raw representation shared by rendered and raw-only reads. */
-    private canonicalize(cell: Cell, strl: boolean, location: string): RawCell {
+    private canonicalize(cell: Cell, strl: boolean, row: number, column: number): RawCell {
         if (cell instanceof Uint8Array) {
-            const identity = this.binary_identity(location, cell);
+            const identity = this.binary_identity(`${row}:${column}`, cell);
             const binary = identity.binary;
             const raw_cell: RawCell = {
                 raw: binary.formatted,
@@ -579,16 +588,38 @@ export class StataReaderSource implements DataSource {
             this.windows.set(key, cached);
             return cached;
         }
-        const raw_rows = this.read_raw_range(start, start + count, columns);
-        const labels = columns.map((column) => this.labels_of(column));
+        // Render straight from the parser's values: numbers are labelled and
+        // formatted as numbers, without a second pass over raw cells.
+        const rows: (RenderedCell | null)[][] = Array.from(
+            { length: count }, () => new Array<RenderedCell | null>(columns.length),
+        );
         let bytes = 0;
-        const rows = raw_rows.map((row) => row.map((cell, index) => {
-            if (cell === null) return null;
-            bytes += (cell.raw?.length ?? 0) * 2 + (cell.rawByteLength ?? 0);
-            const rendered = this.render_raw_cell(cell, this.variables[columns[index]], labels[index]);
-            if (rendered.formatted !== rendered.raw) bytes += rendered.formatted.length * 2;
-            return rendered;
-        }));
+        const decoded = columns.length === 0 ? [] : this.decode(columns, start, count);
+        decoded.forEach((column, k) => {
+            const variable = this.variables[columns[k]];
+            const labels = this.labels_of(columns[k]);
+            const strl = variable.type === 'strL';
+            for (let i = 0; i < count; i++) {
+                let raw_cell: RawCell;
+                let formatted: string;
+                if (column.kind === 'number' && column.missing[i] === 0) {
+                    const value = column.values[i];
+                    raw_cell = { raw: String(value), rawType: 'number' };
+                    formatted = labels?.get(value) ?? formatValue(value, variable.format);
+                } else if (column.kind === 'number') {
+                    const missing = missingValue(column.missing[i]);
+                    raw_cell = raw_stata_missing_cell(missing.missing);
+                    formatted = labels?.get(missing) ?? missing.missing;
+                } else {
+                    raw_cell = this.canonicalize(column.values[i], strl, start + i, columns[k]);
+                    formatted = raw_cell.raw ?? '';
+                }
+                const raw = raw_cell.raw ?? '';
+                bytes += raw.length * 2 + (raw_cell.rawByteLength ?? 0);
+                if (formatted !== raw) bytes += formatted.length * 2;
+                rows[i][k] = rendered_stata_cell(raw_cell, formatted);
+            }
+        });
         const window: CachedWindow = { rows, cellCount: count * columns.length, byteCount: bytes };
         if (window.cellCount <= MAX_DECODED_CELLS && window.byteCount <= MAX_DECODED_CACHE_BYTES) {
             this.windows.set(key, window);
@@ -617,7 +648,7 @@ export class StataReaderSource implements DataSource {
         const raw = raw_cell.raw ?? '';
         if (raw_cell.rawType !== 'number') return rendered_stata_cell(raw_cell, raw);
         const label = label_for(labels, raw);
-        if (MISSING_CODE.test(raw)) return rendered_stata_cell(raw_cell, label ?? raw);
+        if (is_missing_code(raw)) return rendered_stata_cell(raw_cell, label ?? raw);
         return rendered_stata_cell(raw_cell, label ?? formatValue(Number(raw), variable.format));
     }
 

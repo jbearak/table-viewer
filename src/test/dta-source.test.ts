@@ -1,5 +1,4 @@
 import { Buffer } from 'node:buffer';
-import { createHash } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -25,7 +24,7 @@ vi.mock('@jbearak/dta-parser', async (import_original) => {
     ) {
         decode_spy(...args);
         return read_columns.apply(this, args);
-    };
+    } as typeof read_columns;
     return actual;
 });
 
