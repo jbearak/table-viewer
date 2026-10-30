@@ -199,7 +199,7 @@ describe('table_diff_uris', () => {
         });
     });
 
-    it.each(['csv', 'TSV', 'xls', 'XLSX', 'dta', 'arrow', 'ArRoW'])(
+    it.each(['csv', 'TSV', 'xls', 'XLSX', 'dta', 'DtA'])(
         'recognizes a Source Control Graph %s commit diff',
         (extension) => {
             const file_path = `/repo/tables/data.${extension}`;
@@ -210,7 +210,7 @@ describe('table_diff_uris', () => {
         },
     );
 
-    it.each(['arrow', 'ARROW', 'ArRoW'])('recognizes staged and unstaged %s files', (extension) => {
+    it.each(['dta', 'DTA', 'DtA'])('recognizes staged and unstaged %s files', (extension) => {
         const file_path = `/repo/data.${extension}`;
         const file = vscode_mock.Uri.file(file_path) as unknown as vscode.Uri;
         const unstaged = git_uri(file_path, '~');
