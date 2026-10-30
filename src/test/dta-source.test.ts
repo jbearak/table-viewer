@@ -627,6 +627,32 @@ function build_large_release119_binary_fixture(content: Uint8Array): Uint8Array 
     return result;
 }
 
+/** The dta-parser error code behind `error`, following table-viewer's `cause` wrapping. */
+function dta_error_code(error: unknown): string | undefined {
+    for (let at = error; at instanceof Error; at = at.cause) {
+        if ('code' in at && typeof at.code === 'string' && at.code.startsWith('DTA_')) return at.code;
+    }
+    return undefined;
+}
+
+function thrown_code(run: () => unknown): string | undefined {
+    try {
+        run();
+    } catch (error) {
+        return dta_error_code(error) ?? 'no dta-parser code';
+    }
+    return 'did not throw';
+}
+
+async function rejected_code(promise: Promise<unknown>): Promise<string | undefined> {
+    try {
+        await promise;
+    } catch (error) {
+        return dta_error_code(error) ?? 'no dta-parser code';
+    }
+    return 'did not reject';
+}
+
 function find_tag_end(bytes: Uint8Array, tag: string): number {
     const encoded = new TextEncoder().encode(tag);
     for (let offset = 0; offset <= bytes.length - encoded.length; offset++) {
@@ -1005,8 +1031,29 @@ describe('DtaDataSource', () => {
         new DataView(fixture.buffer).setUint32(pointer + 2, 2, true);
         const source = await DtaDataSource.create(fixture);
 
-        await expect(source.read_raw_columns_async(0, 0, 1, [4], () => false))
-            .rejects.toThrow();
+        expect(await rejected_code(source.read_raw_columns_async(0, 0, 1, [4], () => false))).toBe('DTA_CORRUPT');
+    });
+
+    it('calls a read failure corrupt only when dta-parser says so', async () => {
+        const source = await DtaDataSource.create(build_dta_fixture());
+        const reader = (source as unknown as { reader_handle: { readColumns: () => unknown } }).reader_handle;
+        for (const [code, message] of [
+            ['DTA_CORRUPT', /^Corrupt \.dta file: /u],
+            ['DTA_TOO_LARGE', /^Could not read Stata file: /u],
+        ] as const) {
+            const failure = Object.assign(new Error('parser failure'), { code });
+            vi.spyOn(reader, 'readColumns').mockImplementationOnce(() => {
+                throw failure;
+            });
+            let caught: unknown;
+            try {
+                source.read_raw_columns(0, 0, 1, [0]);
+            } catch (error) {
+                caught = error;
+            }
+            expect((caught as Error).message).toMatch(message);
+            expect((caught as Error).cause).toBe(failure);
+        }
     });
 
     it('dispatches .dta directly without an Excel header projection', async () => {
@@ -1016,8 +1063,7 @@ describe('DtaDataSource', () => {
     });
 
     it('rejects negative legacy expansion lengths', async () => {
-        await expect(DtaDataSource.create(build_legacy_dta_fixture(-5)))
-            .rejects.toThrow();
+        expect(await rejected_code(DtaDataSource.create(build_legacy_dta_fixture(-5)))).toBe('DTA_CORRUPT');
     });
 
     it('allows exactly 10,000 zero-length legacy expansion fields', async () => {
@@ -1068,7 +1114,7 @@ describe('DtaDataSource', () => {
         expect(offset).toBeGreaterThanOrEqual(0);
         malformed[offset] = '!'.charCodeAt(0);
         await with_temporary_dta(malformed, async (file_path) => {
-            await expect(FileDtaDataSource.open(file_path)).rejects.toThrow();
+            expect(await rejected_code(FileDtaDataSource.open(file_path))).toBe('DTA_CORRUPT');
         });
     });
 
@@ -1084,7 +1130,7 @@ describe('DtaDataSource', () => {
         const length_offset = table_offset + '<lbl>'.length;
         view.setInt32(length_offset, view.getInt32(length_offset, true) + 1, true);
         await with_temporary_dta(malformed, async (file_path) => {
-            await expect(FileDtaDataSource.open(file_path)).rejects.toThrow();
+            expect(await rejected_code(FileDtaDataSource.open(file_path))).toBe('DTA_CORRUPT');
         });
     });
 
@@ -1094,7 +1140,7 @@ describe('DtaDataSource', () => {
         expect(close_offset).toBeGreaterThanOrEqual(0);
         malformed[close_offset] = '!'.charCodeAt(0);
         await with_temporary_dta(malformed, async (file_path) => {
-            await expect(FileDtaDataSource.open(file_path)).rejects.toThrow();
+            expect(await rejected_code(FileDtaDataSource.open(file_path))).toBe('DTA_CORRUPT');
         });
     });
 
@@ -1161,7 +1207,7 @@ describe('DtaDataSource', () => {
         const pointer = find_tag_end(fixture, '<data>') + 15;
         fixture[pointer + 6] = 1;
         const source = await DtaDataSource.create(fixture);
-        expect(() => source.read_rows(0, 0, 1)).toThrow();
+        expect(thrown_code(() => source.read_rows(0, 0, 1))).toBe('DTA_CORRUPT');
     });
 
     it.each([
@@ -1172,7 +1218,7 @@ describe('DtaDataSource', () => {
         const pointer = find_tag_end(fixture, '<data>') + 15;
         new DataView(fixture.buffer).setUint16(pointer + offset, value, true);
         const source = await DtaDataSource.create(fixture);
-        expect(() => source.read_rows(0, 0, 1)).toThrow();
+        expect(thrown_code(() => source.read_rows(0, 0, 1))).toBe('DTA_CORRUPT');
     });
 
     it('resolves physically out-of-order strL objects', async () => {
@@ -1199,7 +1245,7 @@ describe('DtaDataSource', () => {
         const first_gso_variable = find_tag_end(fixture, '<strls>') + 3;
         new DataView(fixture.buffer).setUint32(first_gso_variable, 6, true);
         const source = await DtaDataSource.create(fixture);
-        expect(() => source.read_rows(0, 0, 1)).toThrow();
+        expect(thrown_code(() => source.read_rows(0, 0, 1))).toBe('DTA_CORRUPT');
     });
 
     it('rejects nonadjacent duplicate strL ids', async () => {
@@ -1217,7 +1263,7 @@ describe('DtaDataSource', () => {
         }
         expect(first_rows === 'rejected' || JSON.stringify(first_rows)
             === JSON.stringify(['a long first value', 'second long value'])).toBe(true);
-        expect(() => source.read_raw_columns(0, 0, 4, [4])).toThrow();
+        expect(thrown_code(() => source.read_raw_columns(0, 0, 4, [4]))).toBe('DTA_CORRUPT');
     });
 
     it.each([
@@ -1239,7 +1285,7 @@ describe('DtaDataSource', () => {
         fixture[find_tag_end(fixture, '<data>') + 1] = 1;
         const source = await DtaDataSource.create(fixture);
 
-        expect(() => source.read_rows(0, 0, 1)).toThrow();
+        expect(thrown_code(() => source.read_rows(0, 0, 1))).toBe('DTA_CORRUPT');
     });
 
     it('does not consume the strls closing tag as binary GSO content', async () => {
@@ -1249,7 +1295,7 @@ describe('DtaDataSource', () => {
         view.setUint32(gso + 16, view.getUint32(gso + 16, true) + 8, true);
         const source = await DtaDataSource.create(fixture);
 
-        expect(() => source.read_rows(0, 0, 1)).toThrow();
+        expect(thrown_code(() => source.read_rows(0, 0, 1))).toBe('DTA_CORRUPT');
     });
 
     it('decodes release 117 fixed and strL strings as Windows-1252', async () => {
@@ -1278,7 +1324,7 @@ describe('DtaDataSource', () => {
     it('rejects metadata-complete files with truncated observations', async () => {
         const fixture = build_dta_fixture();
         const data_start = find_tag_end(fixture, '<data>');
-        await expect(DtaDataSource.create(fixture.slice(0, data_start + 1))).rejects.toThrow();
+        expect(await rejected_code(DtaDataSource.create(fixture.slice(0, data_start + 1)))).toBe('DTA_CORRUPT');
     });
 
     it('copies nonzero-offset Node Buffer views before parsing', async () => {
@@ -1310,7 +1356,7 @@ describe('DtaDataSource', () => {
         const view = new DataView(corrupt.buffer);
         const data_entry = map + 9 * 8;
         view.setBigUint64(data_entry, view.getBigUint64(data_entry, true) + 1n, true);
-        await expect(DtaDataSource.create(corrupt)).rejects.toThrow();
+        expect(await rejected_code(DtaDataSource.create(corrupt))).toBe('DTA_CORRUPT');
     });
 
     // dta-parser 1.0 does not need the map's end-of-file offset, and reads on.
@@ -1334,7 +1380,7 @@ describe('DtaDataSource', () => {
         corrupt[closing_tag] = 'X'.charCodeAt(0);
         const source = await DtaDataSource.create(corrupt);
 
-        expect(() => source.column_filter_metadata(0, 0)).toThrow();
+        expect(thrown_code(() => source.column_filter_metadata(0, 0))).toBe('DTA_CORRUPT');
     });
 
     it('verifies the modern terminal before returning a requested descriptor', async () => {
@@ -1343,7 +1389,7 @@ describe('DtaDataSource', () => {
             - '</value_labels>'.length;
         corrupt[closing_tag] = 'X'.charCodeAt(0);
         // dta-parser 1.0 checks the section terminal when the file is opened.
-        await expect(DtaDataSource.create(corrupt)).rejects.toThrow();
+        expect(await rejected_code(DtaDataSource.create(corrupt))).toBe('DTA_CORRUPT');
     });
 
     it('does not let a modern value-label entry consume the section terminal', async () => {
@@ -1356,7 +1402,7 @@ describe('DtaDataSource', () => {
         new DataView(corrupt.buffer).setInt32(first_lbl + '<lbl>'.length, entry_length, true);
         const source = await DtaDataSource.create(corrupt);
 
-        expect(() => source.column_filter_metadata(0, 0)).toThrow();
+        expect(thrown_code(() => source.column_filter_metadata(0, 0))).toBe('DTA_CORRUPT');
     });
 
     it('requires the complete modern value-label closing tag inside the section', async () => {
@@ -1369,7 +1415,7 @@ describe('DtaDataSource', () => {
         new DataView(corrupt.buffer).setInt32(first_lbl + '<lbl>'.length, entry_length, true);
         const source = await DtaDataSource.create(corrupt);
 
-        expect(() => source.column_filter_metadata(0, 0)).toThrow();
+        expect(thrown_code(() => source.column_filter_metadata(0, 0))).toBe('DTA_CORRUPT');
     });
 
     it('rejects a negative value-label text offset', async () => {
@@ -1378,7 +1424,7 @@ describe('DtaDataSource', () => {
         new DataView(corrupt.buffer).setInt32(payload_start + 8, -1, true);
         const source = await DtaDataSource.create(corrupt);
 
-        expect(() => source.column_filter_metadata(0, 0)).toThrow();
+        expect(thrown_code(() => source.column_filter_metadata(0, 0))).toBe('DTA_CORRUPT');
     });
 
     // dta-parser 1.0 reads label text leniently: text starting at the end of
@@ -1420,7 +1466,7 @@ describe('DtaDataSource', () => {
         );
         const source = await DtaDataSource.create(corrupt);
 
-        expect(() => source.column_filter_metadata(0, 0)).toThrow();
+        expect(thrown_code(() => source.column_filter_metadata(0, 0))).toBe('DTA_CORRUPT');
     });
 
     it('rejects pre-Unicode value-label payloads beyond their declared entry length', async () => {
@@ -1433,7 +1479,7 @@ describe('DtaDataSource', () => {
             true,
         );
         const source = await DtaDataSource.create(corrupt);
-        expect(() => source.read_rows(0, 0, 1)).toThrow();
+        expect(thrown_code(() => source.read_rows(0, 0, 1))).toBe('DTA_CORRUPT');
     });
 
     it('surfaces rejected releases as a clean open error', async () => {

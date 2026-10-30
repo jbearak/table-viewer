@@ -9,6 +9,7 @@ import {
     openDta,
     type Cell,
     type Column,
+    type DtaError,
     type DtaReader,
     type Options,
     type ValueLabels,
@@ -507,7 +508,10 @@ export class StataReaderSource implements DataSource {
         } catch (error) {
             if (this.reader_handle === undefined) throw error;
             const detail = error instanceof Error ? error.message : String(error);
-            throw new Error(`Corrupt .dta file: ${detail}`, { cause: error });
+            const what = (error as Partial<DtaError>).code === 'DTA_CORRUPT'
+                ? 'Corrupt .dta file'
+                : 'Could not read Stata file';
+            throw new Error(`${what}: ${detail}`, { cause: error });
         }
     }
 
@@ -614,7 +618,7 @@ export class StataReaderSource implements DataSource {
         if (raw_cell.rawType !== 'number') return rendered_stata_cell(raw_cell, raw);
         const label = label_for(labels, raw);
         if (MISSING_CODE.test(raw)) return rendered_stata_cell(raw_cell, label ?? raw);
-        return rendered_stata_cell(raw_cell, label ?? display_format(Number(raw), variable.format));
+        return rendered_stata_cell(raw_cell, label ?? formatValue(Number(raw), variable.format));
     }
 
     private capture_lifecycle_epoch(): number {
@@ -669,16 +673,6 @@ export class DtaDataSource extends StataReaderSource {
             const detail = error instanceof Error ? error.message : String(error);
             throw new Error(`Could not open Stata file: ${detail}`, { cause: error });
         }
-    }
-}
-
-/** formatValue throws on dates outside JavaScript's Date range (dta-parser
- * 1.0.0); show the plain number there, as 0.7's apply_display_format did. */
-function display_format(value: number, format: string): string {
-    try {
-        return formatValue(value, format);
-    } catch {
-        return String(value);
     }
 }
 

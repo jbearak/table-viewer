@@ -11,11 +11,7 @@
     "rootDir": "src",
     "sourceMap": true,
     "resolveJsonModule": true,
-    "types": ["vscode", "node", "mocha"],
-    // See tsconfig.json: @jbearak/dta-parser 1.0's "./node" subpath is exports-only.
-    "paths": {
-      "@jbearak/dta-parser/node": ["./node_modules/@jbearak/dta-parser/dist/node"]
-    }
+    "types": ["vscode", "node", "mocha"]
   },
   "include": ["src/test-integration/**/*"],
   "exclude": ["node_modules", "dist", "out"]
