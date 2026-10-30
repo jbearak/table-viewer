@@ -13,7 +13,12 @@
     "resolveJsonModule": true,
     "declaration": false,
     "sourceMap": true,
-    "types": ["vscode", "node"]
+    "types": ["vscode", "node"],
+    // @jbearak/dta-parser 1.0 declares its "./node" subpath only in "exports",
+    // which "module": "commonjs" (node10 resolution) does not read.
+    "paths": {
+      "@jbearak/dta-parser/node": ["./node_modules/@jbearak/dta-parser/dist/node"]
+    }
   },
   "include": ["src/**/*"],
   // Integration tests use ambient Mocha globals (describe/it/before) and are

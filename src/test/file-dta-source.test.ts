@@ -7,10 +7,8 @@ import { DtaDataSource } from '../data-source/dta-source';
 import {
     FileDtaDataSource,
     MAX_FILE_BACKED_DTA_ROWS,
-    assert_file_backed_dta_layout,
     assert_file_backed_dta_row_size,
 } from '../data-source/file-dta-source';
-import { parse_metadata } from '@jbearak/dta-parser';
 
 const fixture = path.join(__dirname, 'fixtures', 'all_types_v118.dta');
 
@@ -115,141 +113,52 @@ describe('FileDtaDataSource', () => {
     });
 
     it('rejects byte-heavy fixed-width observation layouts', () => {
-        const metadata = parse_metadata(new Uint8Array(fs.readFileSync(fixture)).buffer);
-        expect(() => assert_file_backed_dta_row_size({
-            ...metadata,
-            obs_length: 1024 * 1024 + 1,
-        })).toThrow(/per-row safety limit/u);
-    });
-
-    it('rejects oversized strL layouts before the parser can load their strL section', () => {
-        const metadata = parse_metadata(new Uint8Array(fs.readFileSync(fixture)).buffer);
-        expect(() => assert_file_backed_dta_layout(
-            metadata,
-            2 * 1024 * 1024 * 1024,
-        )).toThrow(/larger than 2 GiB.*strL variables/u);
-    });
-
-    it('fails clearly when the parser random-access interface is unavailable', () => {
-        const UnsafeConstructor = FileDtaDataSource as unknown as new (
-            file: unknown,
-            file_path: string,
-        ) => FileDtaDataSource;
-        expect(() => new UnsafeConstructor({
-            nobs: 0,
-            nvar: 0,
-            variables: [],
-        }, fixture)).toThrow(/parser.*random-access file interface/u);
+        const variable = { name: 'v', type: 'str2045', format: '%9s', label: '', valueLabels: '' };
+        expect(() => assert_file_backed_dta_row_size(
+            Array.from({ length: 513 }, () => variable),
+        )).toThrow(/per-row safety limit/u);
+        expect(() => assert_file_backed_dta_row_size(
+            Array.from({ length: 512 }, () => variable),
+        )).not.toThrow();
     });
 
     it('accepts paged datasets beyond the eager worksheet row budget', () => {
         const close = vi.fn();
-        const decode_range = vi.fn((
-            _data: Uint8Array,
-            _start: number,
-            _count: number,
-            _column_start: number,
-            _column_end: number,
-            out: string[][],
-        ) => { out[0] = ['tail']; });
+        const read_columns = vi.fn((_columns: number[], range: { start: number; count: number }) =>
+            [{ kind: 'string', values: Array.from({ length: range.count }, () => 'tail') }]);
         const UnsafeConstructor = FileDtaDataSource as unknown as new (
-            file: unknown,
+            reader: unknown,
+            fd: number | null,
             file_path: string,
         ) => FileDtaDataSource;
         const source = new UnsafeConstructor({
-            nobs: 1_274_250,
-            nvar: 1,
-            variables: [{ name: 'value' }],
+            info: { nobs: 1_274_250 },
+            variables: [{ name: 'value', type: 'str4', format: '%9s', label: '', valueLabels: '' }],
+            readColumns: read_columns,
+            valueLabels: () => undefined,
             close,
-            _fd: 1,
-            _metadata: {
-                format_version: 118,
-                obs_length: 0,
-                section_offsets: { data: 0 },
-            },
-            _decode_rows_range: decode_range,
-        }, fixture);
+        }, null, fixture);
 
         expect(source.meta().sheets[0].rowCount).toBe(1_274_250);
         expect(source.read_raw_columns(0, 1_274_249, 1, [0])).toMatchObject({
             startRow: 1_274_249,
             rows: [[{ raw: 'tail' }]],
         });
-        expect(decode_range).toHaveBeenCalledWith(
-            expect.any(Uint8Array),
-            1_274_249,
-            1,
-            0,
-            1,
-            expect.any(Array),
-            0,
-        );
+        expect(read_columns).toHaveBeenCalledWith([0], { start: 1_274_249, count: 1 });
         source.close();
         expect(close).toHaveBeenCalledOnce();
     });
 
-    it('decodes large row ranges in bounded byte batches', () => {
-        const observation_bytes = 4096;
-        const count = 3000;
-        const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'tv-dta-batches-'));
-        const data_file = path.join(directory, 'observations.dta');
-        fs.writeFileSync(data_file, Buffer.alloc(count * observation_bytes + '<data>'.length));
-        const fd = fs.openSync(data_file, 'r');
-        const decode_range = vi.fn((
-            data: Uint8Array,
-            start: number,
-            batch_count: number,
-            _column_start: number,
-            _column_end: number,
-            out: string[][],
-            out_offset: number,
-        ) => {
-            for (let index = 0; index < batch_count; index += 1) {
-                out[out_offset + index] = [`${start + index}`];
-            }
-            expect(data.byteLength).toBeLessThanOrEqual(8 * 1024 * 1024);
-        });
-        const UnsafeConstructor = FileDtaDataSource as unknown as new (
-            file: unknown,
-            file_path: string,
-        ) => FileDtaDataSource;
-        const source = new UnsafeConstructor({
-            nobs: count,
-            nvar: 1,
-            variables: [{ name: 'value' }],
-            close: () => fs.closeSync(fd),
-            _fd: fd,
-            _metadata: {
-                format_version: 117,
-                obs_length: observation_bytes,
-                section_offsets: { data: 0 },
-            },
-            _decode_rows_range: decode_range,
-        }, fixture);
-        try {
-            expect(source.read_raw_columns(0, 0, count, [0])).toMatchObject({
-                rows: Array.from({ length: count }, (_, index) => [{ raw: `${index}` }]),
-            });
-            expect(decode_range).toHaveBeenCalledTimes(2);
-            for (const [data] of decode_range.mock.calls) {
-                expect((data as Uint8Array).byteLength).toBeLessThanOrEqual(8 * 1024 * 1024);
-            }
-        } finally {
-            source.close();
-            fs.rmSync(directory, { recursive: true, force: true });
-        }
-    });
-
     it('bounds paged rows by whole-sheet rendering and transform work', () => {
         const UnsafeConstructor = FileDtaDataSource as unknown as new (
-            file: unknown,
+            reader: unknown,
+            fd: number | null,
             file_path: string,
         ) => FileDtaDataSource;
         expect(() => new UnsafeConstructor({
-            nobs: MAX_FILE_BACKED_DTA_ROWS + 1,
-            nvar: 0,
+            info: { nobs: MAX_FILE_BACKED_DTA_ROWS + 1 },
             variables: [],
-        }, fixture)).toThrow(/too many observations.*2,000,000/u);
+        }, null, fixture)).toThrow(/too many observations.*2,000,000/u);
     });
 
     it('preserves reordered and duplicate sparse column projections', async () => {

@@ -2,9 +2,9 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { parse_metadata } from '@jbearak/dta-parser';
+import { openDta } from '@jbearak/dta-parser';
 import { cells_exactly_equal, materialize_cell_comparison_text } from '../cell-display';
-import { DtaDataSource } from '../data-source/dta-source';
+import { DtaDataSource, stata_observation_bytes } from '../data-source/dta-source';
 import { FileDtaDataSource } from '../data-source/file-dta-source';
 
 describe('Stata missing comparison across sources', () => {
@@ -12,14 +12,19 @@ describe('Stata missing comparison across sources', () => {
         // missing-values.dta is tests/fixtures/dta/missing_values.dta from dta-tools
         // commit 75bf5ec88c6e6fde090f07a8684f9916ff48e34c, unchanged.
         const bytes = new Uint8Array(readFileSync(join(__dirname, 'fixtures/missing-values.dta')));
-        const metadata = parse_metadata(bytes.buffer);
-        const column = metadata.variables.findIndex(variable => variable.type === 'byte');
+        const reader = openDta(bytes);
+        const variables = reader.variables;
+        const nobs = reader.info.nobs;
+        reader.close();
+        const column = variables.findIndex(variable => variable.type === 'byte');
         expect(column).toBeGreaterThanOrEqual(0);
-        expect(metadata.nobs).toBeGreaterThanOrEqual(27);
+        expect(nobs).toBeGreaterThanOrEqual(27);
         // Expand the fixture's sampled missings to every code in its byte column.
-        const data = metadata.section_offsets.data + '<data>'.length;
+        const obs_length = stata_observation_bytes(variables);
+        const byte_offset = stata_observation_bytes(variables.slice(0, column));
+        const data = Buffer.from(bytes).indexOf('<data>') + '<data>'.length;
         for (let i = 0; i < 27; i++) {
-            bytes[data + i * metadata.obs_length + metadata.variables[column].byte_offset] = 101 + i;
+            bytes[data + i * obs_length + byte_offset] = 101 + i;
         }
         const directory = mkdtempSync(join(tmpdir(), 'table-viewer-stata-missing-'));
         const file = join(directory, 'all-missing.dta');
