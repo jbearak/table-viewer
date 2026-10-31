@@ -53,6 +53,11 @@ const BINARY_GSO_COMPARISON_PREFIX = 'stata-binary:sha256:';
 const MAX_BINARY_CACHE_ENTRIES = 256;
 const MAX_BINARY_CACHE_BYTES = 16 * 1024 * 1024;
 const MISSING_CODE = /^\.[a-z]?$/u;
+// Called once per cell. Bundled, a call to an import goes through a getter
+// for the CommonJS package's export; local bindings skip it (about 10% of a
+// rendered page).
+const format_value = formatValue;
+const missing_value = missingValue;
 
 /** Whether a raw number is a missing code. Formatted numbers never start with `.`. */
 function is_missing_code(raw: string): boolean {
@@ -600,14 +605,21 @@ export class StataReaderSource implements DataSource {
             const labels = this.labels_of(columns[k]);
             const strl = variable.type === 'strL';
             for (let i = 0; i < count; i++) {
+                if (column.kind === 'number' && column.missing[i] === 0) {
+                    // The common cell, built whole: one object of one shape,
+                    // not a raw cell that grows three more fields.
+                    const value = column.values[i];
+                    const raw = String(value);
+                    const formatted = labels?.get(value) ?? format_value(value, variable.format);
+                    bytes += raw.length * 2;
+                    if (formatted !== raw) bytes += formatted.length * 2;
+                    rows[i][k] = { raw, rawType: 'number', formatted, bold: false, italic: false };
+                    continue;
+                }
                 let raw_cell: RawCell;
                 let formatted: string;
-                if (column.kind === 'number' && column.missing[i] === 0) {
-                    const value = column.values[i];
-                    raw_cell = { raw: String(value), rawType: 'number' };
-                    formatted = labels?.get(value) ?? formatValue(value, variable.format);
-                } else if (column.kind === 'number') {
-                    const missing = missingValue(column.missing[i]);
+                if (column.kind === 'number') {
+                    const missing = missing_value(column.missing[i]);
                     raw_cell = raw_stata_missing_cell(missing.missing);
                     formatted = labels?.get(missing) ?? missing.missing;
                 } else {
@@ -649,7 +661,7 @@ export class StataReaderSource implements DataSource {
         if (raw_cell.rawType !== 'number') return rendered_stata_cell(raw_cell, raw);
         const label = label_for(labels, raw);
         if (is_missing_code(raw)) return rendered_stata_cell(raw_cell, label ?? raw);
-        return rendered_stata_cell(raw_cell, label ?? formatValue(Number(raw), variable.format));
+        return rendered_stata_cell(raw_cell, label ?? format_value(Number(raw), variable.format));
     }
 
     private capture_lifecycle_epoch(): number {
@@ -710,7 +722,7 @@ export class DtaDataSource extends StataReaderSource {
 function cell_of(column: Column, row: number): Cell {
     if (column.kind === 'string') return column.values[row];
     const code = column.missing[row];
-    return code === 0 ? column.values[row] : missingValue(code);
+    return code === 0 ? column.values[row] : missing_value(code);
 }
 
 /** Contiguous runs of the unique sorted rows, each at most `max` long. */
