@@ -272,7 +272,7 @@
     "package": "vsce package --no-dependencies"
   },
   "dependencies": {
-    "@jbearak/dta-parser": "file:../.tv-tarballs/jbearak-dta-parser-1.0.0-1ee16cd.tgz",
+    "@jbearak/dta-parser": "file:../.tv-tarballs/jbearak-dta-parser-1.0.0-a7a2589.tgz",
     "canvas-hypertxt": "^1.0.3",
     "cfb": "^1.2.2",
     "electron-updater": "6.8.9",
