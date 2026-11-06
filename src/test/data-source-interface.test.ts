@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from 'vitest';
 import type { RenderedCell, RowWindow, SheetMeta, WorkbookMeta, DataSource } from '../data-source/interface';
 import {
     read_source_columns,
+    read_source_filter_metadata,
     read_source_raw_columns,
     read_source_raw_columns_async,
     read_source_raw_columns_indexed_async,
@@ -37,6 +38,38 @@ describe('data-source interface shapes', () => {
             close: () => {},
         };
         expect(ds.meta().sheets).toEqual([]);
+    });
+    it('reads filter metadata through the cancellable path first', async () => {
+        const base: DataSource = {
+            meta: () => ({ hasFormatting: false, sheets: [] }),
+            read_rows: () => ({ startRow: 0, rows: [] }),
+            close: () => {},
+        };
+        const labels = { valueLabels: [] } as never;
+        const sync = vi.fn(() => labels);
+        const async_reader = vi.fn(async () => labels);
+        const never = () => false;
+        expect(await read_source_filter_metadata(base, 0, 1, never)).toBeUndefined();
+        expect(await read_source_filter_metadata(
+            { ...base, column_filter_metadata: sync }, 0, 1, never,
+        )).toBe(labels);
+        expect(sync).toHaveBeenCalledWith(0, 1);
+        sync.mockClear();
+        expect(await read_source_filter_metadata(
+            { ...base, column_filter_metadata: sync, column_filter_metadata_async: async_reader },
+            0,
+            1,
+            never,
+        )).toBe(labels);
+        expect(async_reader).toHaveBeenCalledWith(0, 1, never);
+        expect(sync).not.toHaveBeenCalled();
+        // A synchronous startup failure is thrown, not turned into a rejection.
+        expect(() => read_source_filter_metadata(
+            { ...base, column_filter_metadata: () => { throw new Error('boom'); } },
+            0,
+            1,
+            never,
+        )).toThrow('boom');
     });
     it('projects full rows for legacy sources without read_columns', () => {
         const ds: DataSource = {

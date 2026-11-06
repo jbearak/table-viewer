@@ -13,6 +13,8 @@ import {
     read_source_raw_columns_async,
     read_source_raw_columns_indexed_async,
     read_source_raw_rows_indexed_async,
+    projected_row_for_source,
+    read_source_filter_metadata,
     read_source_row_indices,
     read_source_rows_indexed,
     read_source_rows_indexed_async,
@@ -848,33 +850,25 @@ export class CompareDataSource implements DataSource {
         const fence = this.operation_fence(is_cancelled);
         fence.assertActive();
         const contributions = this.filter_metadata_contributions(sheet_index, column_index);
-        const read_modified = (cancelled: () => boolean) => Promise.resolve(
+        const read_modified = (cancelled: () => boolean) => (
             contributions.modified === undefined
-                ? undefined
-                : this.modified.column_filter_metadata_async
-                    ? this.modified.column_filter_metadata_async(
-                        contributions.modified.sheetIndex,
-                        column_index,
-                        cancelled,
-                    )
-                    : this.modified.column_filter_metadata?.(
-                        contributions.modified.sheetIndex,
-                        column_index,
-                    ),
+                ? Promise.resolve(undefined)
+                : read_source_filter_metadata(
+                    this.modified,
+                    contributions.modified.sheetIndex,
+                    column_index,
+                    cancelled,
+                )
         );
-        const read_original = (cancelled: () => boolean) => Promise.resolve(
+        const read_original = (cancelled: () => boolean) => (
             contributions.original === undefined
-                ? undefined
-                : this.original.column_filter_metadata_async
-                    ? this.original.column_filter_metadata_async(
-                        contributions.original.sheetIndex,
-                        column_index,
-                        cancelled,
-                    )
-                    : this.original.column_filter_metadata?.(
-                        contributions.original.sheetIndex,
-                        column_index,
-                    ),
+                ? Promise.resolve(undefined)
+                : read_source_filter_metadata(
+                    this.original,
+                    contributions.original.sheetIndex,
+                    column_index,
+                    cancelled,
+                )
         );
         let modified: ColumnFilterMetadata | undefined;
         let original: ColumnFilterMetadata | undefined;
@@ -1538,24 +1532,18 @@ export class CompareDataSource implements DataSource {
     projected_row_index(sheet_index: number, source_row: number): number | undefined {
         const deleted_index = this.deleted_original_index(sheet_index);
         if (deleted_index !== undefined) {
-            return this.original.projected_row_index
-                ? this.original.projected_row_index(deleted_index, source_row)
-                : source_row;
+            return projected_row_for_source(this.original, deleted_index, source_row);
         }
         const alignment = this.alignment_of(sheet_index);
         if (!alignment) {
-            return this.modified.projected_row_index
-                ? this.modified.projected_row_index(sheet_index, source_row)
-                : source_row;
+            return projected_row_for_source(this.modified, sheet_index, source_row);
         }
         const real = this.modified_meta.sheets[sheet_index];
         if (!real) return source_row;
         if (source_row >= real.sourceRowCount) {
             return this.deleted_grid_row(sheet_index, source_row);
         }
-        const modified_row = this.modified.projected_row_index
-            ? this.modified.projected_row_index(sheet_index, source_row)
-            : source_row;
+        const modified_row = projected_row_for_source(this.modified, sheet_index, source_row);
         if (modified_row === undefined) return undefined;
         const grid_row = this.grid_row_by_modified(sheet_index)[modified_row];
         return grid_row === 0xffff_ffff ? undefined : grid_row;
