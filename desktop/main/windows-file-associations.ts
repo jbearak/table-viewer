@@ -5,6 +5,7 @@ export const WINDOWS_FILE_ASSOCIATIONS = [
     { extension: 'tsv', description: 'Tab-separated values' },
     { extension: 'xlsx', description: 'Excel workbook' },
     { extension: 'xls', description: 'Legacy Excel workbook' },
+    { extension: 'parquet', description: 'Apache Parquet file' },
     { extension: 'dta', description: 'Stata dataset' },
 ] as const;
 
