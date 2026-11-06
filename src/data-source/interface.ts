@@ -398,6 +398,21 @@ export function projected_row_for_source(
     return projected;
 }
 
+/** One column's filter metadata, through the source's cancellable path when it
+ *  has one and its synchronous path otherwise; undefined when it has neither.
+ *  Not `async`: a source that fails while starting still throws synchronously,
+ *  which paired compare reads rely on to cancel the peer before it starts. */
+export function read_source_filter_metadata(
+    source: DataSource,
+    sheet_index: number,
+    column_index: number,
+    is_cancelled: () => boolean,
+): Promise<ColumnFilterMetadata | undefined> {
+    return source.column_filter_metadata_async
+        ? source.column_filter_metadata_async(sheet_index, column_index, is_cancelled)
+        : Promise.resolve(source.column_filter_metadata?.(sheet_index, column_index));
+}
+
 function validate_row_indices(
     source: DataSource,
     sheet_index: number,

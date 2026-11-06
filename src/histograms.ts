@@ -1,7 +1,8 @@
 import { Buffer } from 'node:buffer';
-import type {
-    ColumnFilterMetadata,
-    DataSource,
+import {
+    read_source_filter_metadata,
+    type ColumnFilterMetadata,
+    type DataSource,
 } from './data-source/interface';
 import {
     acquire_column_analysis,
@@ -152,13 +153,12 @@ async function build_result(
 ): Promise<ColumnHistogram> {
     const metadata: ColumnFilterMetadata | undefined = distinct.exceeded
         ? undefined
-        : source.column_filter_metadata_async
-            ? await source.column_filter_metadata_async(
-                sheet_index,
-                column_index,
-                is_cancelled,
-            )
-            : source.column_filter_metadata?.(sheet_index, column_index);
+        : await read_source_filter_metadata(
+            source,
+            sheet_index,
+            column_index,
+            is_cancelled,
+        );
     if (is_cancelled()) throw abort_error();
 
     let options: FilterValueOption[] = [];
