@@ -3123,6 +3123,36 @@ describe('write_xlsx_cell_edits', () => {
             },
         );
 
+        it('is detached completely when its references space out the `=`', () => {
+            // XML allows whitespace around `=`. A regex that required `Target="`
+            // missed the relationship, and the part was deleted anyway, leaving
+            // the package pointing at a part it no longer contains.
+            const spaced = CFB.read(with_calc_chain(
+                with_formula_at_b2(readFileSync(SAMPLE)),
+            ), { type: 'buffer' });
+            for (const [path, from, to] of [
+                ['/[Content_Types].xml', 'PartName="/xl/calcChain.xml"', 'PartName = "/xl/calcChain.xml"'],
+                ['/xl/_rels/workbook.xml.rels', 'Target="calcChain.xml"', 'Target\n  =\t"calcChain.xml"'],
+            ] as const) {
+                const entry = CFB.find(spaced, path)!;
+                const text = Buffer.from(entry.content as Uint8Array).toString('utf8');
+                expect(text).toContain(from);
+                const next = Buffer.from(text.replace(from, to), 'utf8');
+                entry.content = next;
+                entry.size = next.length;
+            }
+            const written = CFB.write(spaced, { type: 'buffer', fileType: 'zip', compression: true });
+            const raw = written instanceof Uint8Array
+                ? written
+                : new Uint8Array(written as ArrayBufferLike);
+
+            const out = write_xlsx_cell_edits(raw, 2, [{ row: 1, col: 1, value: '42' }]);
+
+            expect(part(out, '/xl/calcChain.xml')).toBeNull();
+            expect(text_part(out, '/[Content_Types].xml')).not.toContain('/xl/calcChain.xml');
+            expect(text_part(out, '/xl/_rels/workbook.xml.rels')).not.toContain('calcChain.xml');
+        });
+
         it('is detached completely when an edit drops a formula', () => {
             // The chain caches recalculation order; a literal written over a
             // formula makes it stale, and a stale chain is what Excel offers to
