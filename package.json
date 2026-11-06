@@ -250,7 +250,7 @@
     "probe:windows:durability": "npm run desktop:ensure-electron && npm run bundle:desktop && electron dist/runtime-probes/windows-durability-probe.js",
     "gate:sqlite:recovery": "npm run desktop:ensure-electron && npm run bundle:desktop && electron dist/runtime-probes/packaged-recovery-gate.js",
     "vscode:prepublish": "npm run bundle && npm run bundle:webview && npm run bundle:state-inspector",
-    "bundle": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --external:node:sqlite --platform=node --format=cjs --target=es2022 --minify",
+    "bundle": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --external:node:sqlite --platform=node --format=cjs --target=es2022 --minify && node scripts/copy-dta-parser-notices.mjs",
     "bundle:webview": "esbuild src/webview/index.tsx --bundle --outdir=dist/webview --platform=browser --format=iife --target=es2022 --loader:.css=css --minify",
     "bundle:state-inspector": "esbuild src/state-inspector/vscode-entry.ts --bundle --outfile=dist/webview/state-inspector.js --platform=browser --format=iife --target=es2022 --minify",
     "bundle:desktop": "node desktop/build.mjs",
@@ -272,7 +272,7 @@
     "package": "vsce package --no-dependencies"
   },
   "dependencies": {
-    "@jbearak/dta-parser": "^1.0.0",
+    "@jbearak/dta-parser": "file:vendor/dta-parser/jbearak-dta-parser-1.1.0.tgz",
     "canvas-hypertxt": "^1.0.3",
     "cfb": "^1.2.2",
     "electron-updater": "6.8.9",

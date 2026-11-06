@@ -13,9 +13,14 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const repo_dir = join(dirname(fileURLToPath(import.meta.url)), '..');
-const out_file = join(repo_dir, 'dist', 'desktop', 'THIRD_PARTY_NOTICES.txt');
+// Tests write elsewhere through TABLE_VIEWER_NOTICES_OUT.
+const out_file = process.env.TABLE_VIEWER_NOTICES_OUT
+    ?? join(repo_dir, 'dist', 'desktop', 'THIRD_PARTY_NOTICES.txt');
 
 const LICENSE_FILE_RE = /^(licen[cs]e|copying|notice)(\.|$)/i;
+// Notices for code a package bundles from elsewhere, such as the crates in
+// @jbearak/dta-parser's wasm module, published beside its own licence.
+const THIRD_PARTY_NOTICES_RE = /^third[-_]party[-_]notices(\.|$)/i;
 
 async function license_text(pkg_dir) {
     let entries;
@@ -24,13 +29,17 @@ async function license_text(pkg_dir) {
     } catch {
         return undefined;
     }
-    const name = entries.find((entry) => LICENSE_FILE_RE.test(entry));
-    if (!name) return undefined;
-    try {
-        return await readFile(join(pkg_dir, name), 'utf8');
-    } catch {
-        return undefined;
+    const texts = [];
+    for (const pattern of [LICENSE_FILE_RE, THIRD_PARTY_NOTICES_RE]) {
+        const name = entries.find((entry) => pattern.test(entry));
+        if (!name) continue;
+        try {
+            texts.push((await readFile(join(pkg_dir, name), 'utf8')).trim());
+        } catch {
+            // Unreadable: leave it out, as a missing file.
+        }
     }
+    return texts.length > 0 ? texts.join('\n\n') : undefined;
 }
 
 const lock = JSON.parse(
