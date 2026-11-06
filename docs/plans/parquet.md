@@ -15,9 +15,12 @@ from other libraries (pyarrow, pandas, polars, DuckDB, arrow for R, and
 so on) opens with its own types: dates, timestamps with time zones,
 64-bit integers, categoricals, and binary values.
 
-## Where things stand
+## Where things stood when this plan was written
 
-- **`.dta` today.** `main` reads Stata files through
+This section describes `main` at fd48610, before PR 1 (#310) moved the
+dependency to the vendored 1.1.0.
+
+- **`.dta`.** `main` read Stata files through
   `@jbearak/dta-parser` 1.0.0 from npm (#309). `StataReaderSource`
   (`src/data-source/dta-source.ts`) is a thin `DataSource` over a 1.0
   `DtaReader`: it caches rendered 256-row windows (8 windows, 16 MiB),
