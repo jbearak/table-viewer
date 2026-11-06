@@ -62,3 +62,10 @@ allows up to 1,000,000 rows and 256 columns, as for `.dta` files.
 Wide files (hundreds of columns) scroll more slowly than the same data
 as `.dta`: Parquet stores each column in compressed pages, so every
 visible row needs a page from each column.
+
+Sorted and filtered views of long files are slower still. Their rows
+are scattered through the file, and each needs its own page from every
+column. On a file of a million rows, or of a few hundred thousand rows
+with many columns, a screenful can take several seconds to appear (about
+2 s for 1,000,000 rows by 26 columns, and 5 s for 200,000 rows by 100
+columns, on an Apple silicon Mac).
