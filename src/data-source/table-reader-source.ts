@@ -32,6 +32,40 @@ import {
     type WorkbookMeta,
 } from './interface';
 
+/** Budget for the decoded value labels a table's variables use, shared by
+ *  every reader-backed format (Stata and Parquet, in memory or on disk). */
+export const MAX_VALUE_LABEL_BYTES = 16 * 1024 * 1024;
+export const MAX_VALUE_LABEL_ENTRIES = 65_536;
+
+/**
+ * Decoded value labels of every set a variable uses must stay within budget.
+ * `format` names the file's format in the message ("Stata", "Parquet").
+ */
+export function assert_value_label_limits(
+    reader: Pick<TableReader, 'valueLabels'>,
+    variables: readonly Variable[],
+    format = 'Stata',
+): void {
+    let entries = 0;
+    let characters = 0;
+    const names = new Set(variables.map((variable) => variable.valueLabels));
+    for (const name of names) {
+        const labels = name ? reader.valueLabels(name) : undefined;
+        if (!labels) continue;
+        entries += labels.size;
+        for (const label of labels.values()) characters += label.length;
+    }
+    if (entries > MAX_VALUE_LABEL_ENTRIES) {
+        throw new Error(
+            `${format} value-label data exceeds the `
+            + `${MAX_VALUE_LABEL_ENTRIES.toLocaleString('en-US')} entry safety limit`,
+        );
+    }
+    if (characters * 2 > MAX_VALUE_LABEL_BYTES) {
+        throw new Error(`Decoded ${format} value-label data exceeds the memory safety limit`);
+    }
+}
+
 export const DECODE_WINDOW_ROWS = 256;
 const MAX_DECODED_WINDOWS = 8;
 const MAX_DECODED_CELLS = DECODE_WINDOW_ROWS * MAX_SHEET_COLUMNS;

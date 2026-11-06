@@ -20,7 +20,6 @@ import {
     create_workbook_budget,
 } from '../spreadsheet-safety';
 import { capped_column_details, list_text } from './column-details';
-import { assert_value_label_limits } from './file-dta-source';
 import type {
     ColumnDetails,
     IndexedRawColumns,
@@ -34,6 +33,7 @@ import {
     DECODE_WINDOW_ROWS,
     MAX_TEXT_STRL_BYTES,
     TableReaderSource,
+    assert_value_label_limits,
     is_missing_code,
     label_for,
     rendered_cell,

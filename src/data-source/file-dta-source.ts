@@ -2,7 +2,7 @@ import type { DtaReader, Variable } from '@jbearak/dta-parser';
 import { openDtaFile } from '@jbearak/dta-parser/node';
 import { stata_observation_bytes, stata_table_shape } from './dta-source';
 import { open_file_source, type ObservedFileSource, SourceFile } from './source-file';
-import { TableReaderSource } from './table-reader-source';
+import { TableReaderSource, assert_value_label_limits } from './table-reader-source';
 
 /**
  * A wide DTA remains cheap to address because rows stay on disk, but every row
@@ -16,8 +16,6 @@ export const MAX_FILE_BACKED_DTA_COLUMNS = 10_000;
 // dataset that motivated this source while bounding each typed row-index array
 // to 8 MiB and keeping those whole-sheet passes finite.
 export const MAX_FILE_BACKED_DTA_ROWS = 2_000_000;
-export const MAX_FILE_BACKED_VALUE_LABEL_BYTES = 16 * 1024 * 1024;
-export const MAX_FILE_BACKED_VALUE_LABEL_ENTRIES = 65_536;
 const MAX_FILE_BACKED_DTA_OBSERVATION_BYTES = 1024 * 1024;
 
 export type ObservedFileDtaSource = ObservedFileSource<FileDtaDataSource>;
@@ -28,35 +26,6 @@ export function assert_file_backed_dta_row_size(variables: readonly Variable[]):
             `Stata observations exceed the `
             + `${MAX_FILE_BACKED_DTA_OBSERVATION_BYTES / 1024 / 1024} MiB per-row safety limit`,
         );
-    }
-}
-
-/**
- * Decoded value labels of every set a variable uses must stay within budget.
- * `format` names the file's format in the message ("Stata", "Parquet").
- */
-export function assert_value_label_limits(
-    reader: Pick<DtaReader, 'valueLabels'>,
-    variables: readonly Variable[],
-    format = 'Stata',
-): void {
-    let entries = 0;
-    let characters = 0;
-    const names = new Set(variables.map((variable) => variable.valueLabels));
-    for (const name of names) {
-        const labels = name ? reader.valueLabels(name) : undefined;
-        if (!labels) continue;
-        entries += labels.size;
-        for (const label of labels.values()) characters += label.length;
-    }
-    if (entries > MAX_FILE_BACKED_VALUE_LABEL_ENTRIES) {
-        throw new Error(
-            `${format} value-label data exceeds the `
-            + `${MAX_FILE_BACKED_VALUE_LABEL_ENTRIES.toLocaleString('en-US')} entry safety limit`,
-        );
-    }
-    if (characters * 2 > MAX_FILE_BACKED_VALUE_LABEL_BYTES) {
-        throw new Error(`Decoded ${format} value-label data exceeds the memory safety limit`);
     }
 }
 
