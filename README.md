@@ -83,6 +83,7 @@ It also removes other friction from reading tables:
 - Conservatively detects Excel column-name rows, with remembered per-sheet controls for promoting the first non-hidden row or a chosen row, including column names inherited from simple two-row vertical merges
 - Uses an active Excel Header Row as a logical table for formulas such as `=SUM([Revenue])` and `=[@Revenue]*2`, without requiring an Excel table region
 - Hover briefly over horizontally truncated or vertically clipped cell content to see the displayed value in a tooltip
+- Hover over a Stata or Parquet column header to see the variable label, type, and value label set, and, for Parquet, the null count and range of values from the file's footer
 - Stable, multi-column sorting with missing values kept last
 - Per-column filters for text, comparisons, ranges, distinct-value checklists, and empty/non-empty values
 
@@ -191,7 +192,7 @@ To choose a different header row, right-click its row number and select **Use ro
 - The **preview icon** opens a read-only synced side-by-side preview (alt-click opens it in the same tab)
 - The **table icon** opens the file again as an editable table view
 
-**Stata files** open automatically as single read-only tables.
+**Stata files** open automatically as single read-only tables. Hovering over a column header shows the variable's label, storage type, display format, and value label set.
 
 **Parquet files** open automatically as single read-only tables, with dates, times, time zones, and 64-bit integers shown as they are stored. Columns Table Viewer cannot show, such as lists and structs, are left out with a warning naming them. See [Parquet files](docs/parquet-files.md).
 

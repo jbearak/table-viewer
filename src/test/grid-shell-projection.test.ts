@@ -1837,6 +1837,47 @@ describe('GridShell cell wrapping', () => {
         expect(container!.querySelector('[role="tooltip"]')).toBeNull();
     });
 
+    it('shows a column\'s details in its header tooltip, one per line', async () => {
+        vi.useFakeTimers();
+        await render_grid(props({
+            sheet_meta: {
+                ...props().sheet_meta,
+                // The hidden middle column has details; the last column has none.
+                columnDetails: [
+                    {
+                        label: 'Did you answer?',
+                        type: 'byte, %8.0g; Parquet DOUBLE; snappy',
+                        valueLabels: 'yesno',
+                        statistics: '1 null; between No and Yes',
+                    },
+                    { type: 'double, %10.0g' },
+                ],
+            },
+        }));
+        const hover = async (display_column: number) => {
+            const on_item_hovered = grid_mock.props!.onItemHovered as
+                (args: Record<string, unknown>) => void;
+            await act(async () => {
+                on_item_hovered({
+                    kind: 'header', location: [display_column, -1], buttons: 0,
+                    bounds: { x: 30 + display_column * 120, y: 0, width: 120, height: 36 },
+                    localEventX: 60, localEventY: 18,
+                });
+                await vi.runAllTimersAsync();
+            });
+            return container!.querySelector('[role="tooltip"]');
+        };
+
+        expect((await hover(0))?.textContent).toBe([
+            'Did you answer?',
+            'byte, %8.0g; Parquet DOUBLE; snappy',
+            'Value labels: yesno',
+            '1 null; between No and Yes',
+        ].join('\n'));
+        // Display column 1 is source column 2, past the end of the details.
+        expect(await hover(1)).toBeNull();
+    });
+
     it('does not tooltip fitted produce cells when canvas scaling makes bounds fractional', async () => {
         vi.useFakeTimers();
         const canvas_context = vi.spyOn(HTMLCanvasElement.prototype, 'getContext')

@@ -141,6 +141,21 @@ export interface ExcelFirstRowHeaderMeta {
     sourceRow?: number;
 }
 
+/**
+ * What the column header tooltip says about one column, built when the source
+ * opens. Each field is one line of the tooltip, in this order.
+ */
+export interface ColumnDetails {
+    /** The variable label. */
+    label?: string;
+    /** The column's type: for Stata, its storage type and display format. */
+    type?: string;
+    /** The name of the value label set the column uses. */
+    valueLabels?: string;
+    /** For Parquet, from the footer: the null count and the range of values. */
+    statistics?: string;
+}
+
 export interface SheetMeta {
     name: string;
     /** Stable format-neutral worksheet identity when the source exposes one. */
@@ -176,6 +191,10 @@ export interface SheetMeta {
     columnHeaderEditable?: boolean[];
     /** Present only for Excel sheets that support first-row header projection. */
     excelFirstRowHeader?: ExcelFirstRowHeaderMeta;
+    /** Per-column details for the header tooltip (`.dta` and Parquet). It may
+     *  be shorter than `columnCount`: its size is capped, and columns past the
+     *  cap, or with nothing to say, have none. */
+    columnDetails?: (ColumnDetails | null)[];
 }
 
 export interface WorkbookMeta {

@@ -1,13 +1,16 @@
 // Parquet in the desktop app: a .parquet file opened from argv renders its
 // cells, with Formatting on (value labels, dates, and zoned timestamps as
-// text) and off (the stored values).
+// text) and off (the stored values), and a column header's tooltip shows the
+// column's label, type, value label set, and footer statistics.
 //
 // Glide's accessibility table holds each cell's raw value whatever the
 // Formatting toggle says (TextCell's accessibility string is its `data`), so
 // the table shows that the rows loaded and what they store, and the displayed
 // text is read the way a user gets it out of the grid: Edit > Select All, then
 // Edit > Copy, which copies formatted text when Formatting is on. Every check
-// is a poll on that text or on the clipboard; nothing waits a fixed delay.
+// is a poll on that text or on the clipboard; nothing waits a fixed delay. The
+// header is hovered through the page's input events, which reach the window
+// whether or not it has focus, and the tooltip's text is polled.
 //
 // CI runs only the relaunch spec from this directory; run this one locally:
 //   npm run desktop:prepackage
@@ -89,7 +92,10 @@ test('opens a Parquet file and shows labels, .a, dates, and zoned timestamps', a
             yesno: new Map<number | Missing, string>([[0, 'No'], [1, 'Yes'], [MISSING['.a'], 'Refused']]),
         },
         variables: [
-            { name: 'answer', type: 'byte', valueLabels: 'yesno', values: [1, MISSING['.a'], 0] },
+            {
+                name: 'answer', type: 'byte', label: 'Did you answer?', valueLabels: 'yesno',
+                values: [1, MISSING['.a'], 0],
+            },
             { name: 'code', type: 'byte', values: [MISSING['.a'], 2, null] },
             { name: 'day', type: 'date', values: [19_783, 0, null] },
             {
@@ -114,6 +120,17 @@ test('opens a Parquet file and shows labels, .a, dates, and zoned timestamps', a
         for (const [column, row, text] of stored) {
             await expect(cell(page, column, row)).toHaveText(text);
         }
+
+        // The first data column's header: the same x as a click on its first
+        // cell, half a header high.
+        const canvas = (await page.locator(GRID_CANVAS).first().boundingBox())!;
+        await page.mouse.move(canvas.x + 120, canvas.y + 18);
+        await expect.poll(() => page.locator('.cell-overflow-tooltip').textContent()).toBe([
+            'Did you answer?',
+            'byte; Parquet DOUBLE; snappy',
+            'Value labels: yesno',
+            'No nulls; between No and Yes',
+        ].join('\n'));
 
         await expect(copied_grid(launched)).resolves.toBe([
             'Yes\t.a\t2024-03-01\t2024-03-01T09:00:00.123456-05:00[America/New_York]',
