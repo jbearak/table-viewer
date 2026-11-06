@@ -1,7 +1,7 @@
 import * as fs from 'node:fs';
 import type { ParquetReader } from '@jbearak/dta-parser';
 import { openParquetFile } from '@jbearak/dta-parser/node';
-import { assert_value_label_limits } from './file-dta-source';
+import { assert_value_label_limits } from './table-reader-source';
 import {
     ParquetReaderSource,
     assert_parquet_footer_length,
