@@ -95,6 +95,7 @@ import {
 } from './excel-header-plan';
 import { parse_http_external_url } from './external-url';
 import { is_plain_record } from './plain-record';
+import { parser_format_for, type TableFormat } from './table-format';
 import {
     acquire_file_coordinator,
     type ExcelHeaderOperationReceipt,
@@ -1700,7 +1701,7 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
     };
 }
 
-function excel_profile(file_path: string): ViewerProfile {
+function excel_profile(format: TableFormat): ViewerProfile {
     const base: ViewerProfileBase = {
         build_source(raw, file_path, state) {
             return build_source_from_buffer(raw, file_path, {
@@ -1712,45 +1713,28 @@ function excel_profile(file_path: string): ViewerProfile {
             });
         },
     };
-    // .xls is out of scope for editing: the writer above is an OOXML package
-    // splice, and the binary BIFF container shares nothing with it.
-    return file_path.toLowerCase().endsWith('.xlsx')
+    return format.editable
         ? { ...base, editing: true, plan_save: plan_xlsx_save, edit_syntax: 'markdown' as const }
         : { ...base, editing: false };
 }
 
-function dta_profile(): ViewerProfile {
+/** A read-only format that opens straight from disk when it can — Stata and
+ *  Parquet readers seek rather than hold the whole file — and from bytes
+ *  otherwise (git revisions, compare originals). */
+function file_backed_profile(
+    open: (
+        file_path: string,
+        is_cancelled: (() => boolean) | undefined,
+    ) => Promise<FileSourceBuildResult>,
+): ViewerProfile {
     return {
         editing: false,
         prefer_file_source: true,
         build_source(raw, file_path) {
             return build_source_from_buffer(raw, file_path);
         },
-        async build_file_source(file_path, _state, options) {
-            const { FileDtaDataSource } = await import('./data-source/file-dta-source');
-            return FileDtaDataSource.open_observed(
-                file_path,
-                true,
-                options?.isCancelled,
-            );
-        },
-    };
-}
-
-function parquet_profile(): ViewerProfile {
-    return {
-        editing: false,
-        prefer_file_source: true,
-        build_source(raw, file_path) {
-            return build_source_from_buffer(raw, file_path);
-        },
-        async build_file_source(file_path, _state, options) {
-            const { FileParquetDataSource } = await import('./data-source/file-parquet-source');
-            return FileParquetDataSource.open_observed(
-                file_path,
-                true,
-                options?.isCancelled,
-            );
+        build_file_source(file_path, _state, options) {
+            return open(file_path, options?.isCancelled);
         },
     };
 }
@@ -2057,23 +2041,28 @@ export function projected_append_row_ceiling(
     return Number.isFinite(ceiling) ? ceiling : null;
 }
 
-/** Whether two paths would take the same parser — the comparison `profile_for`
- *  makes, without building anything. */
-function same_extension(left: string, right: string): boolean {
-    const extension = (path: string) => path.toLowerCase().slice(path.lastIndexOf('.'));
-    return extension(left) === extension(right);
-}
-
-/** Profile for a path: CSV/TSV are editable; all other registered formats are read-only unless their profile opts into editing. */
+/** Profile for a path, dispatched on `parser_format_for`: CSV/TSV are
+ *  editable, and every other format follows its `TableFormat.editable`. */
 export function profile_for(file_path: string, config?: ConfigPort): ViewerProfile {
-    const ext = file_path.toLowerCase();
-    return ext.endsWith('.csv') || ext.endsWith('.tsv')
-        ? csv_table_profile(config)
-        : ext.endsWith('.dta')
-            ? dta_profile()
-        : ext.endsWith('.parquet')
-            ? parquet_profile()
-        : excel_profile(file_path);
+    const format = parser_format_for(file_path);
+    switch (format.id) {
+        case 'csv':
+        case 'tsv':
+            return csv_table_profile(config);
+        case 'dta':
+            return file_backed_profile(async (path, is_cancelled) => {
+                const { FileDtaDataSource } = await import('./data-source/file-dta-source');
+                return FileDtaDataSource.open_observed(path, true, is_cancelled);
+            });
+        case 'parquet':
+            return file_backed_profile(async (path, is_cancelled) => {
+                const { FileParquetDataSource } = await import('./data-source/file-parquet-source');
+                return FileParquetDataSource.open_observed(path, true, is_cancelled);
+            });
+        case 'xlsx':
+        case 'xls':
+            return excel_profile(format);
+    }
 }
 
 /**
@@ -2094,6 +2083,7 @@ export function attach_viewer(
 ): ViewerController {
     const uri = create_resource_identity(resource).uri;
     const file_path = uri.fsPath;
+    const file_format = parser_format_for(file_path);
     const compare_original_uri = options.compare
         ? create_resource_identity(options.compare.originalUri).uri
         : undefined;
@@ -4238,7 +4228,7 @@ export function attach_viewer(
             }
             projected = next_slots ?? projected;
         }
-        if (projected && file_path.toLowerCase().endsWith('.xlsx')) {
+        if (projected && file_format.id === 'xlsx') {
             let next_slots: typeof projected | undefined;
             for (let formula_index = 0; formula_index < projected.length; formula_index += 1) {
                 const slot = projected[formula_index];
@@ -6457,12 +6447,12 @@ export function attach_viewer(
             // would report every row beyond the other's cap as added/deleted.
             // The window is attached for the modified file, so its profile
             // parses the modified format. Feeding the original's bytes to it
-            // is right whenever the two share an extension — and that profile
+            // is right whenever the two share a format — and that profile
             // may be host-supplied (preview, git compare), so it is kept — but
             // across formats it fed CSV bytes to the XLSX parser, and between
             // .csv and .tsv split one side on the wrong delimiter. Those are
             // exactly the pairings the Compare dialog offers.
-            const original_profile = same_extension(original_path, file_path)
+            const original_profile = parser_format_for(original_path) === file_format
                 ? profile
                 : profile_for(original_path, host.config);
             return {
@@ -8236,7 +8226,7 @@ export function attach_viewer(
         }
 
         let format: PendingRowFormatTemplate['format'];
-        if (file_path.toLowerCase().endsWith('.xlsx')) {
+        if (file_format.id === 'xlsx') {
             const observation = source_observation;
             if (!observation) {
                 await refuse('The workbook source is not ready for an append.');
@@ -8493,7 +8483,7 @@ export function attach_viewer(
                         || authority.sourceRow !== source_row
                         || authority.savedFingerprint !== saved_fingerprint
                     ) throw new Error('unauthorized');
-                    const format = file_path.toLowerCase().endsWith('.xlsx')
+                    const format = file_format.id === 'xlsx'
                         ? capture_xlsx_append_row_format(
                             raw,
                             sheet_index,
@@ -8725,7 +8715,7 @@ export function attach_viewer(
             await refuse('Pending rows need review because their worksheet basis changed.');
             return;
         }
-        if (file_path.toLowerCase().endsWith('.xlsx')) {
+        if (file_format.id === 'xlsx') {
             const observation = source_observation;
             if (!observation) {
                 await refuse('The workbook source is not ready for a restoration.');
@@ -9436,7 +9426,7 @@ export function attach_viewer(
             if (
                 save_receipt !== undefined
                 && save_receipt.appendedRows.length > 0
-                && file_path.toLowerCase().endsWith('.xlsx')
+                && file_format.id === 'xlsx'
             ) {
                 // The XLSX writer canonicalizes values (for example `1.0` to a
                 // numeric `1`) and external links before they reach disk. A
@@ -13691,7 +13681,7 @@ export function attach_viewer(
         writes: readonly ReplayCellWrite[] = [],
         include_source_cells = true,
     ): boolean {
-        if (!file_path.toLowerCase().endsWith('.xlsx')) return false;
+        if (file_format.id !== 'xlsx') return false;
         const desired_by_sheet = new Map(structures.map(
             (structural) => [structural.resolvedSheetIndex, structural.desired] as const,
         ));
@@ -13748,7 +13738,7 @@ export function attach_viewer(
     ): Promise<boolean> {
         const edit_session_id = active_edit_session_id;
         if (structures.length > 0 && edit_session_id === undefined) return false;
-        const is_xlsx = file_path.toLowerCase().endsWith('.xlsx');
+        const is_xlsx = file_format.id === 'xlsx';
         let xlsx_bytes: Uint8Array | undefined;
         if (is_xlsx && structures.some(
             (structural) => structural.desired.tailRemovals.length > 0,

@@ -4,6 +4,8 @@
  * withdraws editing capabilities, answers row requests with compareDiff pages,
  * and degrades to a plain open (with a warning) when the original is unreadable.
  */
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type * as vscode from 'vscode';
 import {
@@ -118,6 +120,27 @@ describe('compare mode controller', () => {
         // and column 0 would read as renamed from 'h\tk'.
         expect(snapshot.configuration.gitCompare?.changedColumnNames[0])
             .toEqual([{ col: 1, base: 'k' }]);
+    });
+
+    it('parses a workbook original with the workbook parser, not the modified CSV one', async () => {
+        const workbook = readFileSync(join(__dirname, 'fixtures', 'basic.xlsx'));
+        vscode_mock.__setReadFileImplementation(async (uri) =>
+            String(uri.fsPath ?? uri).includes('original')
+                ? new Uint8Array(workbook)
+                : enc.encode(MODIFIED));
+        const panel = open_compare_table('/tmp/original.xlsx');
+        await panel.__receive({ type: 'ready' });
+        await vi.waitFor(() => expect(posted(panel, 'workbookSnapshot').length).toBeGreaterThan(0));
+        const snapshot = posted(panel, 'workbookSnapshot')[0].snapshot as {
+            configuration: { gitCompare?: { pairings: unknown[] } };
+        };
+        // The workbook parser yields both named worksheets, so the one the
+        // CSV lacks reads as deleted. Fed to the modified side's CSV parser,
+        // the zip's bytes came back as a single garbled sheet instead.
+        expect(snapshot.configuration.gitCompare?.pairings).toEqual([
+            { status: 'matched', name: 'Sheet1', modifiedIndex: 0, originalIndex: 0 },
+            { status: 'deleted', name: 'Inventory', originalIndex: 1 },
+        ]);
     });
 
     it('answers a row request with a compareDiff page beside rowData', async () => {

@@ -5,6 +5,7 @@
 import type { FileRefreshWatcherFactory } from './file-refresh-watcher';
 import type { GitLfsPointer } from './git-lfs-pointer';
 import type { ResourceUriLike } from './resource-identity';
+import { table_format_for } from './table-format';
 
 /** Minimal disposable, structurally compatible with vscode.Disposable. */
 export interface Disposable {
@@ -181,5 +182,5 @@ export interface ViewerHost {
 
 /** ',' for .csv (and anything else), '\t' for .tsv — chosen by extension. */
 export function get_delimiter(file_path: string): ',' | '\t' {
-    return file_path.toLowerCase().endsWith('.tsv') ? '\t' : ',';
+    return table_format_for(file_path)?.id === 'tsv' ? '\t' : ',';
 }
