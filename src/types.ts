@@ -861,73 +861,15 @@ function validate_cell_highlights(value: unknown): void {
     }
 }
 
-/** Validate one sheet's cell map, rejecting the whole leaf on any malformed entry. */
+/** Validate one sheet's cell map, rejecting the whole leaf on any malformed entry.
+ *  Durable state is ours, so a malformed field there is corruption: entries
+ *  are held to the same strict shape as lifecycle wire identities, rejected
+ *  rather than repaired the way save-ingress sanitizing repairs them. */
 function validate_edit_cells(value: unknown): Record<string, string | CsvDirtyEntry> {
     if (!is_plain_record(value)) invalid_leaf('pendingEdits');
     for (const [key, entry] of Object.entries(value)) {
         if (!is_canonical_cell_key(key)) invalid_leaf('pendingEdits');
-        if (typeof entry === 'string') continue;
-        if (!is_plain_record(entry) || typeof entry.value !== 'string' || typeof entry.base !== 'string') {
-            invalid_leaf('pendingEdits');
-        }
-        // Optional styled-run sides of a rich edit. Rejected (not dropped) when
-        // malformed, like every other field: silently stripping runs would turn
-        // a formatting edit into a no-op that still overwrites the cell. The
-        // text-agreement half of the predicate is the smuggling boundary — see
-        // `is_matching_rich_text`.
-        for (const [runs, text] of [
-            [entry.valueRuns, entry.value],
-            [entry.baseRuns, entry.base],
-        ] as const) {
-            if (runs === undefined) continue;
-            if (!is_matching_rich_text(runs, text)) invalid_leaf('pendingEdits');
-        }
-        // The optional link dimension: both sides present together, each a
-        // structurally valid hyperlink or null. Rejected (not dropped) like
-        // the run sides — durable state is ours, so a malformed link there is
-        // corruption, not a compatibility case.
-        if ((entry.link === undefined) !== (entry.baseLink === undefined)) {
-            invalid_leaf('pendingEdits');
-        }
-        for (const side of [entry.link, entry.baseLink]) {
-            if (side === undefined || side === null) continue;
-            if (!is_valid_hyperlink(side)) invalid_leaf('pendingEdits');
-        }
-        if (entry.observedBase !== undefined) {
-            const observed = entry.observedBase;
-            if (!is_plain_record(observed) || typeof observed.value !== 'string') {
-                invalid_leaf('pendingEdits');
-            }
-            if (
-                observed.runs !== undefined
-                && !is_matching_rich_text(observed.runs, observed.value)
-            ) invalid_leaf('pendingEdits');
-            if ((entry.link !== undefined) !== (observed.link !== undefined)) {
-                invalid_leaf('pendingEdits');
-            }
-            if (
-                observed.link !== undefined
-                && observed.link !== null
-                && !is_valid_hyperlink(observed.link)
-            ) invalid_leaf('pendingEdits');
-        }
-        if (entry.writeValue !== undefined && entry.writeValue !== true) {
-            invalid_leaf('pendingEdits');
-        }
-        if (entry.retainValue !== undefined && entry.retainValue !== true) {
-            invalid_leaf('pendingEdits');
-        }
-        if (entry.formattingKnown !== undefined && entry.formattingKnown !== true) {
-            invalid_leaf('pendingEdits');
-        }
-        if (entry.movedFrom !== undefined && !is_valid_move_provenance(entry.movedFrom)) {
-            invalid_leaf('pendingEdits');
-        }
-        if (entry.valueEditOrder !== undefined && !is_valid_value_edit_order(entry.valueEditOrder)) {
-            invalid_leaf('pendingEdits');
-        }
-        if (entry.formulaReferenceBases !== undefined
-            && own_pending_formula_reference_bases(entry.formulaReferenceBases) === undefined) {
+        if (typeof entry !== 'string' && !is_strict_wire_dirty_entry(entry)) {
             invalid_leaf('pendingEdits');
         }
     }
@@ -2303,8 +2245,13 @@ export function sanitized_wire_dirty_entry(entry: unknown): CsvDirtyEntry | unde
     });
 }
 
-/** Runtime shape guard for an exact lifecycle identity. Unlike the save-ingress
- * sanitizer, this rejects malformed optional metadata instead of dropping it. */
+/** Runtime shape guard for an exact lifecycle identity, and for each durable
+ * pending-edit entry. Unlike the save-ingress sanitizer, this rejects malformed
+ * optional metadata instead of dropping it: silently stripping runs, say, would
+ * turn a formatting edit into a no-op that still overwrites the cell. The
+ * text-agreement half of the run check is the smuggling boundary — see
+ * `is_matching_rich_text`. Links come in pairs, each a valid hyperlink or null,
+ * and an observed base carries a link exactly when the entry does. */
 export function is_strict_wire_dirty_entry(value: unknown): value is CsvDirtyEntry {
     if (
         !is_plain_record(value)

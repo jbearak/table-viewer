@@ -111,6 +111,26 @@ describe('decode_stored_per_file_state — pendingEdits migration', () => {
         }
     });
 
+    it('holds durable link sides to the lifecycle pairing rules', () => {
+        const link = { kind: 'external', target: 'https://example.com/' };
+        const valid = {
+            ...entry('x', 'y'),
+            link,
+            baseLink: null,
+            observedBase: { value: 'y', link: null },
+        };
+        expect(decoded_edits({ pendingEdits: { '1:2': valid } }))
+            .toEqual([{ cells: { '1:2': valid } }]);
+        for (const malformed of [
+            { ...entry('x', 'y'), link },
+            { ...entry('x', 'y'), link: { kind: 'external' }, baseLink: null },
+            { ...entry('x', 'y'), link, baseLink: null, observedBase: { value: 'y' } },
+            { ...entry('x', 'y'), observedBase: { value: 'y', link: null } },
+        ]) {
+            expect(() => decoded_edits({ pendingEdits: { '1:2': malformed } })).toThrow();
+        }
+    });
+
     it('rebases exhausted edit orders across worksheets and reserves zero', () => {
         const decoded = decoded_edits({
             pendingEdits: [
