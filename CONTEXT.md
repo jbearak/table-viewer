@@ -7,6 +7,10 @@ Table Viewer presents workbook data as reviewable tables while preserving the wo
 **Workbook**:
 A spreadsheet file containing one or more worksheets.
 
+**Table format**:
+A file type Table Viewer opens: CSV, TSV, XLSX, XLS, Parquet, or Stata. A single-table format holds one table, compared as one unnamed sheet; a workbook format holds worksheets. Only CSV, TSV, and XLSX are editable.
+_Avoid_: File type, extension (an extension names a format; it is not one)
+
 **Worksheet**:
 One grid within a workbook. A worksheet whose Header Row is active forms one logical table in Table Viewer.
 _Avoid_: Sheet, Excel table

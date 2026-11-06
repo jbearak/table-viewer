@@ -2,6 +2,7 @@
 // themselves, whether Compare is offerable, and what it should be called.
 // Separated from the renderer so it is testable without Electron or a DOM.
 import type { ComparePathCheck } from './ipc';
+import { table_format_for_extension } from '../../src/table-format';
 
 export type ComparePathState =
     | { readonly kind: 'empty' }
@@ -103,7 +104,7 @@ export function dialog_state(
     }
     if (original.extension !== modified.extension) {
         const single_table = (extension: string) =>
-            ['csv', 'tsv', 'parquet', 'dta'].includes(extension);
+            table_format_for_extension(extension)?.singleTable === true;
         const original_is_single_table = single_table(original.extension);
         const modified_is_single_table = single_table(modified.extension);
         let warning = 'These files are in different formats.';

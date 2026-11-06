@@ -7,6 +7,7 @@ import { XlsDataSource } from './xls-source';
 import { ExcelHeaderDataSource } from './excel-header-source';
 import { get_delimiter } from '../host-ports';
 import type { ExcelHeaderOverride } from './interface';
+import { parser_format_for } from '../table-format';
 
 export interface FromBufferOptions {
     /** CSV/TSV row cap; callers pass the configured limit. Default: unlimited. */
@@ -33,34 +34,41 @@ export function csv_source_from_buffer(
 }
 
 /**
- * Build a DataSource for raw file bytes, dispatched on the path's extension the
- * same way `profile_for` dispatches profiles: `.csv`/`.tsv` → CSV (first row is
- * the header), `.dta` → Stata, `.parquet` → Parquet, `.xlsx` → OOXML,
- * anything else → BIFF `.xls`.
+ * Build a DataSource for raw file bytes, dispatched on the path's
+ * `parser_format_for` — the same dispatch `profile_for` makes: CSV/TSV (first
+ * row is the header), Stata, Parquet, OOXML `.xlsx`, and BIFF `.xls` for
+ * everything else.
  */
 export async function build_source_from_buffer(
     raw: Uint8Array,
     file_path: string,
     options: FromBufferOptions = {},
 ): Promise<DataSource> {
-    const ext = file_path.toLowerCase();
-    if (ext.endsWith('.csv') || ext.endsWith('.tsv')) {
-        return csv_source_from_buffer(raw, file_path, options.csvMaxRows);
+    const format = parser_format_for(file_path);
+    switch (format.id) {
+        case 'csv':
+        case 'tsv':
+            return csv_source_from_buffer(raw, file_path, options.csvMaxRows);
+        case 'dta': {
+            const { DtaDataSource } = await import('./dta-source');
+            return DtaDataSource.create(raw);
+        }
+        case 'parquet': {
+            const { ParquetDataSource } = await import('./parquet-source');
+            return ParquetDataSource.create(raw);
+        }
+        case 'xlsx':
+        case 'xls': {
+            const physical = format.id === 'xlsx'
+                ? await XlsxDataSource.create(raw)
+                : await XlsDataSource.create(
+                    Buffer.from(raw.buffer, raw.byteOffset, raw.byteLength),
+                );
+            return new ExcelHeaderDataSource(
+                physical,
+                options.excelHeaderOverrides,
+                options.excelHiddenRows?.(physical.meta().sheets),
+            );
+        }
     }
-    if (ext.endsWith('.dta')) {
-        const { DtaDataSource } = await import('./dta-source');
-        return DtaDataSource.create(raw);
-    }
-    if (ext.endsWith('.parquet')) {
-        const { ParquetDataSource } = await import('./parquet-source');
-        return ParquetDataSource.create(raw);
-    }
-    const physical = ext.endsWith('.xlsx')
-        ? await XlsxDataSource.create(raw)
-        : await XlsDataSource.create(Buffer.from(raw.buffer, raw.byteOffset, raw.byteLength));
-    return new ExcelHeaderDataSource(
-        physical,
-        options.excelHeaderOverrides,
-        options.excelHiddenRows?.(physical.meta().sheets),
-    );
 }

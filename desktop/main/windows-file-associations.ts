@@ -1,17 +1,11 @@
 import { execFile } from 'node:child_process';
+import { TABLE_FILE_EXTENSIONS, TABLE_FORMATS } from '../../src/table-format';
 
-export const WINDOWS_FILE_ASSOCIATIONS = [
-    { extension: 'csv', description: 'Comma-separated values' },
-    { extension: 'tsv', description: 'Tab-separated values' },
-    { extension: 'xlsx', description: 'Excel workbook' },
-    { extension: 'xls', description: 'Legacy Excel workbook' },
-    { extension: 'parquet', description: 'Apache Parquet file' },
-    { extension: 'dta', description: 'Stata dataset' },
-] as const;
-
-export const SUPPORTED_FILE_EXTENSIONS = WINDOWS_FILE_ASSOCIATIONS.map(
-    ({ extension }) => extension,
+export const WINDOWS_FILE_ASSOCIATIONS = TABLE_FORMATS.map(
+    ({ extension, description }) => ({ extension, description }),
 );
+
+export const SUPPORTED_FILE_EXTENSIONS = TABLE_FILE_EXTENSIONS;
 
 export type RegistryCommandRunner = (args: readonly string[]) => Promise<void>;
 
