@@ -482,7 +482,7 @@ describe('Parquet limits and damage', () => {
     it.each([
         ['rows', { nobs: MAX_PARQUET_ROWS + 1 }, /too many rows.*2,000,000/u],
         ['columns', { columns: MAX_PARQUET_COLUMNS + 1 }, /too many columns.*10,000/u],
-        ['column chunks', { columns: 1001, groups: 1000, nobs: 1000 }, /too many column chunks.*1,000,000/u],
+        ['column chunks', { columns: 401, groups: 1000, nobs: 1000 }, /too many column chunks.*400,000/u],
         ['dta profile', { profile_bytes: 16 * 1024 * 1024 + 1 }, /dta metadata is larger than the 16 MiB/u],
         ['bytes per row', { nobs: 1, uncompressed: 1024 * 1024 + 1 }, /1 MiB per-row safety limit/u],
         ['dictionary page', { dictionary_page: 16 * 1024 * 1024 + 1 }, /"v0" has a dictionary page larger than the 16 MiB/u],

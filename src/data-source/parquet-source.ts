@@ -44,8 +44,13 @@ export const PARQUET_NAMING: SourceNaming = {
 export const MAX_PARQUET_FOOTER_BYTES = 64 * 1024 * 1024;
 export const MAX_PARQUET_ROWS = 2_000_000;
 export const MAX_PARQUET_COLUMNS = 10_000;
-/** Column chunks (columns times row groups): their statistics are parsed at once. */
-export const MAX_PARQUET_COLUMN_CHUNKS = 1_000_000;
+/**
+ * Column chunks (columns times row groups): their statistics are parsed at
+ * once and kept until the reader closes. 400,000 hold about 61 MiB of heap
+ * (1,000,000, the plan's first limit, held 152 MiB; see
+ * docs/plans/parquet-measurements.md).
+ */
+export const MAX_PARQUET_COLUMN_CHUNKS = 400_000;
 /** The dta profile, from which value labels are parsed on first use. */
 export const MAX_PARQUET_PROFILE_BYTES = 16 * 1024 * 1024;
 export const MAX_PARQUET_ROW_BYTES = 1024 * 1024;
@@ -56,7 +61,7 @@ export const MAX_PARQUET_DICTIONARY_PAGE_BYTES = 16 * 1024 * 1024;
  * source (docs/plans/parquet-measurements.md): the smallest size within 10%
  * of the best of 8, 16, and 32 MiB.
  */
-export const PARQUET_PAGE_CACHE_BYTES = 8 * 1024 * 1024;
+export const PARQUET_PAGE_CACHE_BYTES = 32 * 1024 * 1024;
 
 /** Rows decoded at a time for rendered windows, at most. */
 export const PARQUET_BLOCK_ROWS = 2048;
@@ -69,13 +74,15 @@ export const PARQUET_SCAN_ROWS = 2048;
 /** Columns one read asks for, at most. */
 export const PARQUET_BATCH_COLUMNS = 16;
 
-// Bytes counted per decoded value, as the save counts them: a number or
-// bigint and its missing code; a text value's array slot and string header
-// (plus twice its length); a binary value's Uint8Array object and backing
-// store (plus its length).
+// Bytes counted per decoded value: a number or bigint and its missing code;
+// a text value's array slot and string header (plus twice its length); a
+// binary value's Uint8Array, ArrayBuffer, and backing store (plus its
+// length). The plan's 160 bytes for a binary value was low: 32,768 copies
+// of 16 bytes took 549 bytes each of RSS (240 of heap and array buffers),
+// so 544 is counted (docs/plans/parquet-measurements.md).
 const NUMBER_VALUE_BYTES = 9;
 const TEXT_VALUE_BYTES = 16;
-const BINARY_VALUE_BYTES = 160;
+const BINARY_VALUE_BYTES = 544;
 /** Encodings with which a stored value may decode more than once. */
 const REPEATING_ENCODINGS = new Set(['RLE_DICTIONARY', 'PLAIN_DICTIONARY', 'DELTA_BYTE_ARRAY']);
 /** Comparison key of a null in a text, categorical, or binary column. */

@@ -50,7 +50,7 @@ the visible rows need. Sorting, filtering, and comparing read whole
 columns, in chunks you can cancel between.
 
 A file does not open when it has more than 2,000,000 rows, more than
-10,000 columns, or more than 1,000,000 column chunks (columns times row
+10,000 columns, or more than 400,000 column chunks (columns times row
 groups); when its footer is larger than 64 MiB, its rows average more
 than 1 MiB, a dictionary page is larger than 16 MiB, or its Stata
 metadata or value labels pass the same limits as for `.dta` files. The
