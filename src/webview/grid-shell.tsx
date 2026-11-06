@@ -56,7 +56,6 @@ import {
 } from './column-projection';
 import {
     build_grid_columns,
-    column_letter,
     LAST_COLUMN_RESIZE_GUTTER_PX,
     MAX_AUTO_FIT_COLUMN_WIDTH_PX,
     MAX_COLUMN_WIDTH_PX,
@@ -135,6 +134,7 @@ import {
     clamp_tooltip_text,
     text_overflows_cell,
 } from './cell-overflow-model';
+import { header_tooltip_size, header_tooltip_text } from './header-tooltip';
 import { browserIsOSX } from './glide-data-grid/common/browser-detect.js';
 import { count_lines, has_line_break } from './line-breaks';
 import {
@@ -5278,28 +5278,29 @@ export function GridShell({
     ) => {
         cell_tooltip_hover_ref.current = null;
         const source_column = source_column_for_display(display_column);
-        if (
-            sheet_meta.excelFirstRowHeader?.active !== true
-            || source_column === undefined
-        ) {
+        const text = source_column === undefined
+            ? null
+            : header_tooltip_text(
+                source_column,
+                sheet_meta.excelFirstRowHeader?.active === true,
+                sheet_meta.columnDetails?.[source_column],
+            );
+        if (text === null) {
             hide_cell_tooltip();
             return;
         }
-        const key = `header:${display_column}`;
+        // The text is part of the key, so details that change under a hovered
+        // header (a refreshed snapshot) are shown rather than kept.
+        const key = `header:${display_column}:${text}`;
         if (cell_tooltip_key_ref.current === key) return;
 
         clear_cell_tooltip_timer();
         cell_tooltip_key_ref.current = key;
         set_cell_tooltip(null);
-        const text = `Excel column ${column_letter(source_column)}`;
         cell_tooltip_timer_ref.current = window.setTimeout(() => {
             cell_tooltip_timer_ref.current = null;
             if (cell_tooltip_key_ref.current !== key) return;
-            const estimated = {
-                width: Math.max(80, text.length * 7),
-                height: 28,
-            };
-            const pos = cell_tooltip_position(bounds, estimated);
+            const pos = cell_tooltip_position(bounds, header_tooltip_size(text));
             set_cell_tooltip({
                 text,
                 bounds,
@@ -5310,6 +5311,7 @@ export function GridShell({
     }, [
         clear_cell_tooltip_timer,
         hide_cell_tooltip,
+        sheet_meta.columnDetails,
         sheet_meta.excelFirstRowHeader?.active,
         source_column_for_display,
     ]);

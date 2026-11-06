@@ -38,6 +38,19 @@ Stata. A missing text, categorical, or binary value shows as an empty
 cell, and compares as different from a text value that is an empty
 string.
 
+**Column header tooltip.** Hovering over a column header shows, one per
+line: the variable label (for files written from Stata data); the type,
+with Parquet's physical and logical type and the compression; the value
+label set; and, from the file's footer, the number of nulls and the
+range, as "between <min> and <max>". The footer gives these without
+reading any rows. The count is shown only when every row group records
+one, and the range only when every row group records both bounds; a
+writer may record bounds that are not values in the column, which is why
+it says "between". The range is shown for numbers, dates, times,
+timestamps, and text, formatted as the cells are (text in quotes), but
+not for binary values, or for text longer than 64 characters. In a very
+wide file, columns past the first 1 MiB of these details show none.
+
 **Columns that are not shown.** Lists, maps, and structs, and FLOAT16
 and INTERVAL columns, are left out of the table, and a warning names
 them when the file opens.

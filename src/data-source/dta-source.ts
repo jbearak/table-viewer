@@ -8,7 +8,8 @@ import {
     assert_safe_sheet_shape,
     create_workbook_budget,
 } from '../spreadsheet-safety';
-import { TableReaderSource, type SourceNaming } from './table-reader-source';
+import { capped_column_details, stata_column_details } from './column-details';
+import { TableReaderSource, type SourceNaming, type TableShape } from './table-reader-source';
 
 export const STATA_NAMING: SourceNaming = {
     format: 'Stata',
@@ -30,11 +31,15 @@ export function stata_observation_bytes(variables: readonly Variable[]): number 
 }
 
 /** The table a Stata reader shows: every variable, in file order. */
-export function stata_table_shape(reader: DtaReader) {
+export function stata_table_shape(reader: DtaReader): TableShape {
+    const variables = reader.variables;
     return {
-        variables: reader.variables,
-        estimatedRowBytes: stata_observation_bytes(reader.variables),
+        variables,
+        estimatedRowBytes: stata_observation_bytes(variables),
         naming: STATA_NAMING,
+        columnDetails: capped_column_details(
+            variables.length, (column) => stata_column_details(variables[column]),
+        ),
     };
 }
 

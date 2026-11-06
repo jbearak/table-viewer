@@ -18,6 +18,7 @@ import { MAX_SHEET_COLUMNS } from '../spreadsheet-safety';
 import {
     DEFERRED_COMPARISON_IDENTITY,
     DEFERRED_FILTER_IDENTITY,
+    type ColumnDetails,
     type ColumnFilterMetadata,
     type ColumnWindow,
     type DataSource,
@@ -146,6 +147,8 @@ export interface TableShape {
     readonly variables: readonly Variable[];
     readonly estimatedRowBytes: number;
     readonly naming: SourceNaming;
+    /** The header tooltip's details, by column (see `SheetMeta.columnDetails`). */
+    readonly columnDetails?: (ColumnDetails | null)[];
 }
 
 /**
@@ -190,6 +193,7 @@ export class TableReaderSource<R extends TableReader = TableReader> implements D
                 merges: [],
                 hasFormatting: true,
                 columnNames: this.variables.map((variable) => variable.name),
+                ...(shape.columnDetails === undefined ? {} : { columnDetails: shape.columnDetails }),
             }],
         };
     }

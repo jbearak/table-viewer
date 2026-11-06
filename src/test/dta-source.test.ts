@@ -698,6 +698,13 @@ describe('DtaDataSource', () => {
                 merges: [],
                 hasFormatting: true,
                 columnNames: ['status', 'amount', 'name', 'missing', 'long_text'],
+                columnDetails: [
+                    { type: 'byte, %8.0g', valueLabels: 'status_lbl' },
+                    { type: 'double, %9.2f' },
+                    { type: 'str5, %-5s' },
+                    { type: 'byte, %8.0g', valueLabels: 'missing_lbl' },
+                    { type: 'strL, %9s' },
+                ],
             }],
         });
         expect(decode_spy).not.toHaveBeenCalled();

@@ -10,6 +10,7 @@ import {
     type ParquetOptions,
     type ParquetReader,
     type ParquetVariable,
+    type Statistic,
     type TableCell,
     type TableColumn,
     type ValueLabels,
@@ -18,8 +19,15 @@ import {
     assert_safe_sheet_shape,
     create_workbook_budget,
 } from '../spreadsheet-safety';
+import { capped_column_details, list_text } from './column-details';
 import { assert_value_label_limits } from './file-dta-source';
-import type { IndexedRawColumns, IndexedRows, RawCell, RenderedCell } from './interface';
+import type {
+    ColumnDetails,
+    IndexedRawColumns,
+    IndexedRows,
+    RawCell,
+    RenderedCell,
+} from './interface';
 import { temporal_text, type TemporalColumn } from './parquet-temporal';
 import { raw_stata_missing_cell } from './stata-missing-cell';
 import {
@@ -88,6 +96,8 @@ const REPEATING_ENCODINGS = new Set(['RLE_DICTIONARY', 'PLAIN_DICTIONARY', 'DELT
 /** Comparison key of a null in a text, categorical, or binary column. */
 export const PARQUET_NULL_KEY = 'parquet:null';
 const MAX_WARNING_NAMES = 20;
+/** A text bound longer than this, in characters, is left out of the tooltip. */
+export const MAX_TEXT_BOUND_CHARACTERS = 64;
 
 const format_value = formatValue;
 const missing_value = missingValue;
@@ -220,6 +230,207 @@ function chunk_repeats(chunk: ColumnChunk | null): boolean {
     if (chunk === null) return true;
     if (chunk.dictionaryPageBytes !== null) return true;
     return chunk.encodings.some((encoding) => REPEATING_ENCODINGS.has(encoding));
+}
+
+/**
+ * The text a value of a planned column shows with Formatting on: its value
+ * label, else its date or time, `true` or `false`, or display format.
+ */
+function format_cell(
+    plan: ColumnPlan,
+    labels: ValueLabels | undefined,
+    raw_cell: RawCell,
+    value: TableCell,
+): string {
+    const raw = raw_cell.raw ?? '';
+    if (isMissing(value)) return raw_cell.raw === null ? '' : labels?.get(value) ?? raw;
+    if (typeof value === 'bigint') {
+        return plan.temporal === undefined ? raw : temporal_text(value, plan.temporal);
+    }
+    if (typeof value !== 'number') return raw;
+    const label = labels?.get(value);
+    if (label !== undefined) return label;
+    switch (plan.cell) {
+        case 'bool':
+            return value === 1 ? 'true' : value === 0 ? 'false' : raw;
+        case 'temporal':
+            return temporal_text(value, plan.temporal!);
+        case 'number':
+            return plan.format !== '' && Number.isFinite(value)
+                ? format_value(value, plan.format)
+                : raw;
+        default:
+            return raw;
+    }
+}
+
+// ------------------------------------------------------------ column details
+
+/**
+ * The tooltip's type line: the reader's type and display format, then
+ * Parquet's physical and logical type, then the codecs the chunks use, as
+ * `byte, %8.0g; Parquet DOUBLE; snappy`.
+ */
+function parquet_type_text(variable: ParquetVariable): string {
+    const parquet = [variable.physicalType, variable.logicalType]
+        .filter((type) => type !== '')
+        .join(' ');
+    let text = variable.format === '' ? variable.type : `${variable.type}, ${variable.format}`;
+    if (parquet !== '') text += `; Parquet ${parquet}`;
+    const codecs = new Set<string>();
+    for (const chunk of variable.chunks) {
+        if (chunk !== null) codecs.add(chunk.codec === 'none' ? 'uncompressed' : chunk.codec);
+    }
+    if (codecs.size > 0) text += `; ${list_text([...codecs])}`;
+    return text;
+}
+
+/** Nulls in every row group, when each reports its count. */
+function null_count(chunks: readonly (ColumnChunk | null)[]): number | undefined {
+    if (chunks.length === 0) return undefined;
+    let nulls = 0;
+    for (const chunk of chunks) {
+        if (chunk === null || chunk.nullCount === null) return undefined;
+        nulls += chunk.nullCount;
+    }
+    return nulls;
+}
+
+/**
+ * Compare two strings by code point, which is the order of their UTF-8
+ * bytes, the order Parquet's statistics use for text (UTF-16 code units
+ * order characters past U+FFFF before U+E000 to U+FFFF).
+ */
+export function compare_utf8(a: string, b: string): number {
+    const length = Math.min(a.length, b.length);
+    for (let i = 0; i < length;) {
+        const x = a.codePointAt(i)!;
+        const y = b.codePointAt(i)!;
+        if (x !== y) return x < y ? -1 : 1;
+        i += x > 0xffff ? 2 : 1;
+    }
+    return a.length - b.length;
+}
+
+type Bound = number | bigint | string;
+
+/** How a column's bounds are combined: by value, by UTF-8 bytes, or not at all. */
+function bound_order(cell: CellKind): 'value' | 'text' | undefined {
+    switch (cell) {
+        case 'number':
+        case 'bigint':
+        case 'temporal':
+            return 'value';
+        case 'text':
+        case 'categorical':
+            return 'text';
+        default:
+            // Binary bounds are not shown; decimals and bools have no range.
+            return undefined;
+    }
+}
+
+function is_bound(value: Statistic | null, order: 'value' | 'text'): value is Bound {
+    if (order === 'text') return typeof value === 'string';
+    return typeof value === 'bigint' || (typeof value === 'number' && !Number.isNaN(value));
+}
+
+function bound_less(a: Bound, b: Bound, order: 'value' | 'text'): boolean {
+    return order === 'text' ? compare_utf8(a as string, b as string) < 0 : a < b;
+}
+
+/**
+ * The least and greatest bound over every row group, when each reports both
+ * and the column's bounds can be combined. Text bounds that are not valid
+ * UTF-8 come from the package as bytes, and are not combined.
+ */
+function combined_range(plan: ColumnPlan): [Bound, Bound] | undefined {
+    const order = bound_order(plan.cell);
+    const chunks = plan.variable.chunks;
+    if (order === undefined || chunks.length === 0) return undefined;
+    let low: Bound | undefined;
+    let high: Bound | undefined;
+    for (const chunk of chunks) {
+        if (chunk === null) return undefined;
+        const { min, max } = chunk;
+        if (!is_bound(min, order) || !is_bound(max, order)) return undefined;
+        if (low === undefined || bound_less(min, low, order)) low = min;
+        if (high === undefined || bound_less(high, max, order)) high = max;
+    }
+    return [low!, high!];
+}
+
+/** Whether `text` has more than `limit` characters (code points). */
+function longer_than(text: string, limit: number): boolean {
+    if (text.length <= limit) return false;
+    let characters = 0;
+    for (const _ of text) {
+        if (++characters > limit) return true;
+    }
+    return false;
+}
+
+/**
+ * A bound as the column's cells show it with Formatting on; text in quotes,
+ * so the range reads unambiguously and a line break stays on one line.
+ * Undefined for text longer than `MAX_TEXT_BOUND_CHARACTERS`.
+ */
+function bound_text(plan: ColumnPlan, labels: ValueLabels | undefined, bound: Bound): string | undefined {
+    if (typeof bound === 'string') {
+        return longer_than(bound, MAX_TEXT_BOUND_CHARACTERS) ? undefined : JSON.stringify(bound);
+    }
+    let value: number | bigint = bound;
+    if (typeof value === 'number' && plan.cell === 'bigint' && Number.isSafeInteger(value)) {
+        value = BigInt(value);
+    } else if (typeof value === 'bigint' && plan.cell !== 'bigint') {
+        const number = Number(value);
+        if (Number.isSafeInteger(number)) value = number;
+    }
+    return format_cell(plan, labels, { raw: String(value), rawType: 'number' }, value);
+}
+
+/**
+ * The tooltip's statistics line, from the footer: the null count when every
+ * row group reports one, and the range ("between <min> and <max>", since a
+ * writer may record bounds that are not values) when every row group
+ * reports both.
+ */
+function statistics_text(plan: ColumnPlan, labels: ValueLabels | undefined): string | undefined {
+    const parts: string[] = [];
+    const nulls = null_count(plan.variable.chunks);
+    if (nulls !== undefined) {
+        parts.push(nulls === 0
+            ? 'no nulls'
+            : `${nulls.toLocaleString('en-US')} ${nulls === 1 ? 'null' : 'nulls'}`);
+    }
+    const range = combined_range(plan);
+    if (range !== undefined) {
+        const low = bound_text(plan, labels, range[0]);
+        const high = bound_text(plan, labels, range[1]);
+        if (low !== undefined && high !== undefined) parts.push(`between ${low} and ${high}`);
+    }
+    if (parts.length === 0) return undefined;
+    const text = parts.join('; ');
+    return text.charAt(0).toUpperCase() + text.slice(1);
+}
+
+function column_details_of(plan: ColumnPlan, labels: ValueLabels | undefined): ColumnDetails {
+    const variable = plan.variable;
+    const details: ColumnDetails = {};
+    if (variable.label !== '') details.label = variable.label;
+    details.type = parquet_type_text(variable);
+    if (variable.valueLabels !== '') details.valueLabels = variable.valueLabels;
+    const statistics = statistics_text(plan, labels);
+    if (statistics !== undefined) details.statistics = statistics;
+    return details;
+}
+
+/** A readable Parquet variable's header tooltip details; `labels` is its value label set. */
+export function parquet_column_details(
+    variable: ParquetVariable,
+    labels?: ValueLabels,
+): ColumnDetails {
+    return column_details_of(plan_column(variable, 0), labels);
 }
 
 /** Each left-out column named, in one warning; then the profile's warnings. */
@@ -360,13 +571,19 @@ export class ParquetReaderSource extends TableReaderSource<ParquetReader> {
         const uncompressed = reader.info.rowGroups.reduce(
             (sum, group) => sum + group.uncompressedBytes, 0,
         );
+        // Every column's chunks (and their statistics) are parsed here, once.
+        const plans = readable.map(({ variable, index }) => plan_column(variable, index));
         super(reader, {
             variables: readable.map(({ variable }) => variable),
             estimatedRowBytes: reader.info.nobs > 0 ? Math.ceil(uncompressed / reader.info.nobs) : 0,
             naming: PARQUET_NAMING,
+            columnDetails: capped_column_details(plans.length, (column) => {
+                const name = plans[column].variable.valueLabels;
+                return column_details_of(plans[column], name ? reader.valueLabels(name) : undefined);
+            }),
         });
         this.warnings = parquet_warnings(reader);
-        this.plans = readable.map(({ variable, index }) => plan_column(variable, index));
+        this.plans = plans;
         this.group_starts = reader.info.rowGroups.map((group) => group.firstRow);
         this.block_rows = this.choose_block_rows();
     }
@@ -661,7 +878,7 @@ export class ParquetReaderSource extends TableReaderSource<ParquetReader> {
         column: number,
     ): RenderedCell {
         const raw_cell = this.raw_value(plan, value, row, column);
-        return rendered_cell(raw_cell, this.formatted(plan, labels, raw_cell, value));
+        return rendered_cell(raw_cell, format_cell(plan, labels, raw_cell, value));
     }
 
     /** The raw cell of one value of a planned column. */
@@ -680,34 +897,6 @@ export class ParquetReaderSource extends TableReaderSource<ParquetReader> {
         return { raw: String(value), rawType: 'number' };
     }
 
-    private formatted(
-        plan: ColumnPlan,
-        labels: ValueLabels | undefined,
-        raw_cell: RawCell,
-        value: TableCell,
-    ): string {
-        const raw = raw_cell.raw ?? '';
-        if (isMissing(value)) return raw_cell.raw === null ? '' : labels?.get(value) ?? raw;
-        if (typeof value === 'bigint') {
-            return plan.temporal === undefined ? raw : temporal_text(value, plan.temporal);
-        }
-        if (typeof value !== 'number') return raw;
-        const label = labels?.get(value);
-        if (label !== undefined) return label;
-        switch (plan.cell) {
-            case 'bool':
-                return value === 1 ? 'true' : value === 0 ? 'false' : raw;
-            case 'temporal':
-                return temporal_text(value, plan.temporal!);
-            case 'number':
-                return plan.format !== '' && Number.isFinite(value)
-                    ? format_value(value, plan.format)
-                    : raw;
-            default:
-                return raw;
-        }
-    }
-
     protected override render_raw_cell(
         raw_cell: RawCell,
         column: number,
@@ -720,9 +909,9 @@ export class ParquetReaderSource extends TableReaderSource<ParquetReader> {
         if (is_missing_code(raw)) return rendered_cell(raw_cell, label_for(labels, raw) ?? raw);
         if (plan.cell === 'decimal') return rendered_cell(raw_cell, raw);
         if (plan.cell === 'bigint') {
-            return rendered_cell(raw_cell, this.formatted(plan, labels, raw_cell, BigInt(raw)));
+            return rendered_cell(raw_cell, format_cell(plan, labels, raw_cell, BigInt(raw)));
         }
-        return rendered_cell(raw_cell, this.formatted(plan, labels, raw_cell, Number(raw)));
+        return rendered_cell(raw_cell, format_cell(plan, labels, raw_cell, Number(raw)));
     }
 
     // ------------------------------------------------------------ raw reads
