@@ -294,7 +294,6 @@ export async function compute_transform(
                             column.values[a] ?? null,
                             column.values[b] ?? null,
                             key.direction,
-                            false,
                         );
                 survivors = await cooperative_stable_sort(
                     survivors,
@@ -510,27 +509,10 @@ function release_numeric_column_keys(
     }
 }
 
-export function compare_cells(
-    a: RenderedCell | null,
-    b: RenderedCell | null,
-    direction: SortDirection,
-    infer_numeric_strings = false,
-): number {
-    const a_raw = raw_value(a);
-    const b_raw = raw_value(b);
-    const numeric = infer_numeric_strings
-        || (
-            cell_can_be_numeric(a)
-            && cell_can_be_numeric(b)
-        );
-    return compare_values(a_raw, b_raw, direction, numeric);
-}
-
 function compare_values(
     a: string | null,
     b: string | null,
     direction: SortDirection,
-    numeric: boolean,
 ): number {
     const a_missing = a === null;
     const b_missing = b === null;
@@ -538,9 +520,7 @@ function compare_values(
     if (a_missing) return 1;
     if (b_missing) return -1;
 
-    const ascending = numeric
-        ? compare_numeric_text(a, b)
-        : COLLATOR.compare(a, b);
+    const ascending = COLLATOR.compare(a, b);
     return direction === 'asc' ? ascending : -ascending;
 }
 
@@ -1002,23 +982,6 @@ function validate_column(col: number, count: number): void {
     if (!Number.isInteger(col) || col < 0 || col >= count) {
         throw new RangeError(`column index ${col} out of range`);
     }
-}
-
-function compare_numeric_text(a: string, b: string): number {
-    const a_missing = stata_missing_rank(a);
-    const b_missing = stata_missing_rank(b);
-    if (a_missing !== undefined || b_missing !== undefined) {
-        if (a_missing !== undefined && b_missing !== undefined) {
-            return a_missing - b_missing;
-        }
-        return a_missing !== undefined ? 1 : -1;
-    }
-    const a_decimal = parse_canonical_decimal(a);
-    const b_decimal = parse_canonical_decimal(b);
-    if (a_decimal && b_decimal) {
-        return compare_exact_decimals(a_decimal, b_decimal);
-    }
-    return Math.sign(Number(a) - Number(b));
 }
 
 interface ExactDecimal {
