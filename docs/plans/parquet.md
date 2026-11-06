@@ -126,6 +126,28 @@ different build was published, compares the registry tarball's `dist/`
 files with the vendored ones and reruns the suites below. It deletes
 `vendor/dta-parser/` and the release guard.
 
+**What happened.** #310 merged the vendored tarball on 2026-11-06. The
+user published 1.1.0 to npm the same day (18:05 UTC), through GitHub
+Actions trusted publishing from jbearak/dta-parser tag v1.1.0 (commit
+499637f), with a SLSA provenance attestation; `npm audit signatures`
+verifies it. That build is not the vendored one. It was built on Linux
+with Debian's clang, and `js/package.json` gained a `repository` field
+(dta-parser #71); nothing else in `js/` or `crates/` changed between
+394562f and 499637f. Comparing the two tarballs, 15 of their 17 files
+are identical. `package.json` differs by the `repository` field.
+`dist/index.js` differs only in its embedded, compressed wasm module
+(685,961 bytes vendored, 689,785 from npm); the rest of the file is
+identical. With the registry build, every rendered cell of the `.dta`
+fixtures and of 200 random pages of both large files hashes as it did
+under the vendored build and under 1.0.0, and reading every column,
+the metadata, and the footer statistics of eight Parquet fixtures from
+other libraries and both large Parquet files gives identical results
+under both builds, as does writing `long.dta` to Parquet (the same
+bytes). The follow-up PR depends on `^1.1.0` from npm and deletes
+`vendor/dta-parser/`, `scripts/check-release-dependencies.mjs`, its
+steps in `release-build.yml`, and its test. The notices step stays:
+the registry package ships the same `THIRD-PARTY-NOTICES`.
+
 **Licences.** 1.1's wasm module includes crates from crates.io (zstd,
 snappy, LZ4, miniz, brotli, and their dependencies), and the package
 ships their licences as `THIRD-PARTY-NOTICES`. Today neither the VSIX
@@ -726,6 +748,9 @@ untested. Results go in a comment on each PR.
    the desktop smoke suite, and a sha256 of every rendered cell of the
    `.dta` fixtures and of 200 random pages of two large files,
    identical under 1.0.0 and 1.1.0.
+   **1a. 1.1.0 from npm**, after the user published it: the
+   dependency moves to `^1.1.0`, and the vendored tarball and the
+   release guard go (see "What happened" above).
 2. **Open Parquet files.** `TableReaderSource`, the Parquet sources and
    their block cache, the profile, the limits, the warnings,
    registration, docs, the tests above, the measurements, the `.dta`

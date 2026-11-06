@@ -19,8 +19,6 @@ docs/**
 .claude/**
 .github/**
 scripts/**
-# The vendored @jbearak/dta-parser tarball; the bundle already holds the package.
-vendor/**
 vitest.config.ts
 test-results/**
 # Desktop icon master (electron-builder buildResources); media/icon-128.png is
