@@ -128,8 +128,7 @@ describe('FileDtaDataSource', () => {
             [{ kind: 'string', values: Array.from({ length: range.count }, () => 'tail') }]);
         const UnsafeConstructor = FileDtaDataSource as unknown as new (
             reader: unknown,
-            fd: number | null,
-            file_path: string,
+            file: null,
         ) => FileDtaDataSource;
         const source = new UnsafeConstructor({
             info: { nobs: 1_274_250 },
@@ -137,7 +136,7 @@ describe('FileDtaDataSource', () => {
             readColumns: read_columns,
             valueLabels: () => undefined,
             close,
-        }, null, fixture);
+        }, null);
 
         expect(source.meta().sheets[0].rowCount).toBe(1_274_250);
         expect(source.read_raw_columns(0, 1_274_249, 1, [0])).toMatchObject({
@@ -152,13 +151,12 @@ describe('FileDtaDataSource', () => {
     it('bounds paged rows by whole-sheet rendering and transform work', () => {
         const UnsafeConstructor = FileDtaDataSource as unknown as new (
             reader: unknown,
-            fd: number | null,
-            file_path: string,
+            file: null,
         ) => FileDtaDataSource;
         expect(() => new UnsafeConstructor({
             info: { nobs: MAX_FILE_BACKED_DTA_ROWS + 1 },
             variables: [],
-        }, null, fixture)).toThrow(/too many observations.*2,000,000/u);
+        }, null)).toThrow(/too many observations.*2,000,000/u);
     });
 
     it('preserves reordered and duplicate sparse column projections', async () => {

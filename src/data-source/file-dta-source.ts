@@ -1,8 +1,8 @@
-import * as fs from 'node:fs';
-import { createHash } from 'node:crypto';
 import type { DtaReader, Variable } from '@jbearak/dta-parser';
 import { openDtaFile } from '@jbearak/dta-parser/node';
-import { StataReaderSource, stata_observation_bytes } from './dta-source';
+import { stata_observation_bytes, stata_table_shape } from './dta-source';
+import { open_file_source, type ObservedFileSource, SourceFile } from './source-file';
+import { TableReaderSource } from './table-reader-source';
 
 /**
  * A wide DTA remains cheap to address because rows stay on disk, but every row
@@ -16,17 +16,11 @@ export const MAX_FILE_BACKED_DTA_COLUMNS = 10_000;
 // dataset that motivated this source while bounding each typed row-index array
 // to 8 MiB and keeping those whole-sheet passes finite.
 export const MAX_FILE_BACKED_DTA_ROWS = 2_000_000;
-const MAX_FILE_BACKED_DTA_VALUE_LABEL_BYTES = 16 * 1024 * 1024;
-const MAX_FILE_BACKED_DTA_VALUE_LABEL_ENTRIES = 65_536;
+export const MAX_FILE_BACKED_VALUE_LABEL_BYTES = 16 * 1024 * 1024;
+export const MAX_FILE_BACKED_VALUE_LABEL_ENTRIES = 65_536;
 const MAX_FILE_BACKED_DTA_OBSERVATION_BYTES = 1024 * 1024;
-const FILE_DIGEST_CHUNK_BYTES = 4 * 1024 * 1024;
 
-export interface ObservedFileDtaSource {
-    readonly source: FileDtaDataSource;
-    readonly digest: string;
-    readonly size: number;
-    readonly mtime: number;
-}
+export type ObservedFileDtaSource = ObservedFileSource<FileDtaDataSource>;
 
 export function assert_file_backed_dta_row_size(variables: readonly Variable[]): void {
     if (stata_observation_bytes(variables) > MAX_FILE_BACKED_DTA_OBSERVATION_BYTES) {
@@ -37,64 +31,33 @@ export function assert_file_backed_dta_row_size(variables: readonly Variable[]):
     }
 }
 
-/** Decoded value labels of every set a variable uses must stay within budget. */
-function assert_value_label_limits(reader: DtaReader): void {
+/**
+ * Decoded value labels of every set a variable uses must stay within budget.
+ * `format` names the file's format in the message ("Stata", "Parquet").
+ */
+export function assert_value_label_limits(
+    reader: Pick<DtaReader, 'valueLabels'>,
+    variables: readonly Variable[],
+    format = 'Stata',
+): void {
     let entries = 0;
     let characters = 0;
-    const names = new Set(reader.variables.map((variable) => variable.valueLabels));
+    const names = new Set(variables.map((variable) => variable.valueLabels));
     for (const name of names) {
         const labels = name ? reader.valueLabels(name) : undefined;
         if (!labels) continue;
         entries += labels.size;
         for (const label of labels.values()) characters += label.length;
     }
-    if (entries > MAX_FILE_BACKED_DTA_VALUE_LABEL_ENTRIES) {
+    if (entries > MAX_FILE_BACKED_VALUE_LABEL_ENTRIES) {
         throw new Error(
-            `Stata value-label data exceeds the `
-            + `${MAX_FILE_BACKED_DTA_VALUE_LABEL_ENTRIES.toLocaleString('en-US')} entry safety limit`,
+            `${format} value-label data exceeds the `
+            + `${MAX_FILE_BACKED_VALUE_LABEL_ENTRIES.toLocaleString('en-US')} entry safety limit`,
         );
     }
-    if (characters * 2 > MAX_FILE_BACKED_DTA_VALUE_LABEL_BYTES) {
-        throw new Error('Decoded Stata value-label data exceeds the memory safety limit');
+    if (characters * 2 > MAX_FILE_BACKED_VALUE_LABEL_BYTES) {
+        throw new Error(`Decoded ${format} value-label data exceeds the memory safety limit`);
     }
-}
-
-function abort_error(): Error {
-    const error = new Error('Stata source open was cancelled.');
-    error.name = 'AbortError';
-    return error;
-}
-
-async function digest_descriptor(
-    fd: number,
-    size: number,
-    is_cancelled: () => boolean,
-): Promise<string> {
-    const digest = createHash('sha256');
-    const chunk = Buffer.allocUnsafe(Math.min(FILE_DIGEST_CHUNK_BYTES, Math.max(1, size)));
-    let position = 0;
-    while (position < size) {
-        if (is_cancelled()) throw abort_error();
-        const length = Math.min(chunk.byteLength, size - position);
-        const bytes_read = await new Promise<number>((resolve, reject) => {
-            fs.read(fd, chunk, 0, length, position, (error, read) => {
-                if (error) reject(error);
-                else resolve(read);
-            });
-        });
-        if (bytes_read === 0) throw new Error('Unexpected EOF while hashing Stata file');
-        digest.update(chunk.subarray(0, bytes_read));
-        position += bytes_read;
-    }
-    if (is_cancelled()) throw abort_error();
-    return digest.digest('hex');
-}
-
-function same_descriptor(left: fs.Stats, right: fs.Stats): boolean {
-    return left.dev === right.dev
-        && left.ino === right.ino
-        && left.size === right.size
-        && left.mtimeMs === right.mtimeMs;
 }
 
 /**
@@ -102,13 +65,10 @@ function same_descriptor(left: fs.Stats, right: fs.Stats): boolean {
  * `readFile()` result. The reader keeps this source's descriptor and reads
  * the byte ranges it needs on demand.
  */
-export class FileDtaDataSource extends StataReaderSource {
-    private fd: number | null;
-
+export class FileDtaDataSource extends TableReaderSource<DtaReader> {
     private constructor(
         reader: DtaReader,
-        fd: number | null,
-        private readonly file_path: string,
+        private readonly file: SourceFile | null,
     ) {
         if (reader.info.nobs > MAX_FILE_BACKED_DTA_ROWS) {
             throw new Error(
@@ -122,97 +82,42 @@ export class FileDtaDataSource extends StataReaderSource {
                 + `(max ${MAX_FILE_BACKED_DTA_COLUMNS.toLocaleString('en-US')})`,
             );
         }
-        super(reader);
-        this.fd = fd;
+        super(reader, stata_table_shape(reader));
     }
 
     static async open(file_path: string): Promise<FileDtaDataSource> {
         return (await FileDtaDataSource.open_observed(file_path, false)).source;
     }
 
-    static async open_observed(
+    static open_observed(
         file_path: string,
         include_digest = true,
         is_cancelled: () => boolean = () => false,
     ): Promise<ObservedFileDtaSource> {
-        let fd: number | undefined;
-        let reader: DtaReader | undefined;
-        try {
-            if (is_cancelled()) throw abort_error();
-            const opened_fd = fs.openSync(file_path, 'r');
-            fd = opened_fd;
-            const opened = openDtaFile(opened_fd);
-            reader = opened;
-            assert_file_backed_dta_row_size(opened.variables);
-            assert_value_label_limits(opened);
-            if (is_cancelled()) throw abort_error();
-            const source = new FileDtaDataSource(opened, opened_fd, file_path);
-            reader = undefined;
-            fd = undefined;
+        return open_file_source(file_path, 'Stata', include_digest, is_cancelled, (file) => {
+            const reader = openDtaFile(file.descriptor);
             try {
-                return include_digest
-                    ? await source.observe_file(is_cancelled)
-                    : source.observe_file_without_digest();
+                assert_file_backed_dta_row_size(reader.variables);
+                assert_value_label_limits(reader, reader.variables);
+                return new FileDtaDataSource(reader, file);
             } catch (error) {
-                source.close();
+                reader.close();
                 throw error;
             }
-        } catch (error) {
-            reader?.close();
-            if (fd !== undefined) fs.closeSync(fd);
-            if (error instanceof Error && error.name === 'AbortError') throw error;
-            const detail = error instanceof Error ? error.message : String(error);
-            throw new Error(`Could not open Stata file: ${detail}`, { cause: error });
-        }
+        });
     }
 
     close(): void {
         super.close();
-        if (this.fd !== null) {
-            const fd = this.fd;
-            this.fd = null;
-            fs.closeSync(fd);
-        }
+        this.file?.close();
     }
 
     async physical_content_matches(
         expected_digest: string,
         is_cancelled: () => boolean,
     ): Promise<boolean> {
-        const fd = this.open_fd();
-        const before = fs.fstatSync(fd);
-        const digest = await digest_descriptor(fd, before.size, is_cancelled);
-        const after = fs.fstatSync(fd);
-        const path_stat = fs.statSync(this.file_path);
-        return digest === expected_digest
-            && same_descriptor(before, after)
-            && same_descriptor(after, path_stat);
-    }
-
-    private open_fd(): number {
         this.open_reader();
-        if (this.fd === null) throw new Error('Stata source is closed');
-        return this.fd;
-    }
-
-    private observe_file_without_digest(): ObservedFileDtaSource {
-        const descriptor = fs.fstatSync(this.open_fd());
-        const path_stat = fs.statSync(this.file_path);
-        if (!same_descriptor(descriptor, path_stat)) {
-            throw new Error('The file changed while it was being opened.');
-        }
-        return { source: this, digest: '', size: descriptor.size, mtime: descriptor.mtime.getTime() };
-    }
-
-    private async observe_file(is_cancelled: () => boolean): Promise<ObservedFileDtaSource> {
-        const fd = this.open_fd();
-        const before = fs.fstatSync(fd);
-        const digest = await digest_descriptor(fd, before.size, is_cancelled);
-        const after = fs.fstatSync(fd);
-        const path_stat = fs.statSync(this.file_path);
-        if (!same_descriptor(before, after) || !same_descriptor(after, path_stat)) {
-            throw new Error('The file changed while it was being opened.');
-        }
-        return { source: this, digest, size: after.size, mtime: after.mtime.getTime() };
+        if (this.file === null) throw new Error('Stata source is closed');
+        return this.file.physical_content_matches(expected_digest, is_cancelled);
     }
 }
