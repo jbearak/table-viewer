@@ -97,6 +97,14 @@ import { parse_http_external_url } from './external-url';
 import { is_plain_record } from './plain-record';
 import { parser_format_for, type TableFormat } from './table-format';
 import {
+    persisted_saved_row_snapshot,
+    physical_row_format,
+    saved_pending_row_fingerprint,
+    saved_row_snapshot_fingerprint,
+    saved_row_unchanged,
+    source_row_cells_for_fingerprint,
+} from './saved-append-row';
+import {
     acquire_file_coordinator,
     type ExcelHeaderOperationReceipt,
     type FileAuthoritySnapshot,
@@ -175,7 +183,6 @@ import {
     own_pending_structural_changes,
     type PendingAppendedRow,
     type PendingAppendBasis,
-    type PendingRowFormat,
     type PendingRowFormatTemplate,
     type PendingTailRemoval,
     type PendingStructuralChanges,
@@ -879,183 +886,6 @@ function materialize_replay_cells(
     return observed;
 }
 
-function canonical_saved_row_physical_cells(
-    cells: Readonly<Record<string, import('./pending-changes').PendingRowCell>>,
-): readonly unknown[] {
-    return Object.entries(cells)
-        .map(([column, cell]) => [Number(column), cell] as const)
-        .filter(([, cell]) => cell.value !== '' || cell.valueRuns !== undefined || cell.link != null)
-        .sort(([left], [right]) => left - right)
-        .map(([column, cell]) => [column, {
-            value: cell.value,
-            ...(cell.valueRuns === undefined ? {} : { valueRuns: cell.valueRuns }),
-            ...(cell.link == null ? {} : { link: cell.link }),
-        }]);
-}
-
-function canonical_saved_row_format(
-    format: import('./pending-changes').PendingRowFormat,
-    include_viewer_height = true,
-): unknown {
-    if (format.kind === 'none') return format;
-    return {
-        kind: format.kind,
-        templateSourceRow: format.templateSourceRow,
-        styleFingerprint: format.styleFingerprint,
-        cellStyleIndexes: format.cellStyleIndexes,
-        ...(format.cellStyleFingerprints === undefined ? {} : {
-            cellStyleFingerprints: format.cellStyleFingerprints,
-        }),
-        ...(format.cellNumberFormats === undefined ? {} : {
-            cellNumberFormats: format.cellNumberFormats,
-        }),
-        ...(format.cellFontStyles === undefined ? {} : {
-            cellFontStyles: format.cellFontStyles,
-        }),
-        ...(format.rowStyleIndex === undefined ? {} : {
-            rowStyleIndex: format.rowStyleIndex,
-        }),
-        ...(format.rowNumberFormat === undefined ? {} : {
-            rowNumberFormat: format.rowNumberFormat,
-        }),
-        ...(format.rowFontStyle === undefined ? {} : {
-            rowFontStyle: format.rowFontStyle,
-        }),
-        ...(format.thickTop === undefined ? {} : { thickTop: true }),
-        ...(format.thickBottom === undefined ? {} : { thickBottom: true }),
-        ...(format.phonetic === undefined ? {} : { phonetic: true }),
-        ...(format.nativeRowHeight === undefined ? {} : {
-            nativeRowHeight: format.nativeRowHeight,
-        }),
-        ...(!include_viewer_height || format.viewerRowHeight === undefined ? {} : {
-            viewerRowHeight: format.viewerRowHeight,
-        }),
-    };
-}
-
-function saved_row_physical_fingerprint(
-    row: Pick<import('./pending-changes').SavedAppendedRowSnapshot, 'cells' | 'format'>,
-): string {
-    return content_digest(new TextEncoder().encode(JSON.stringify({
-        cells: canonical_saved_row_physical_cells(row.cells),
-        format: canonical_saved_row_format(row.format, false),
-    })));
-}
-
-function saved_row_snapshot_fingerprint(
-    row: import('./pending-changes').SavedAppendedRowSnapshot,
-): string {
-    const cells = Object.entries(row.cells)
-        .map(([column, cell]) => [Number(column), cell] as const)
-        .sort(([left], [right]) => left - right);
-    const highlights = Object.entries(row.highlights ?? {})
-        .map(([column, color]) => [Number(column), color] as const)
-        .sort(([left], [right]) => left - right);
-    return content_digest(new TextEncoder().encode(JSON.stringify({
-        cells,
-        format: canonical_saved_row_format(row.format),
-        ...(row.viewerRowHeight === undefined ? {} : {
-            viewerRowHeight: row.viewerRowHeight,
-        }),
-        ...(highlights.length === 0 ? {} : { highlights }),
-    })));
-}
-
-function saved_pending_row_fingerprint(
-    row: import('./pending-changes').PendingAppendedRow,
-    format: import('./pending-changes').PendingRowFormat,
-): string {
-    return saved_row_snapshot_fingerprint({
-        cells: row.cells,
-        format,
-        ...(row.viewerRowHeight === undefined ? {} : {
-            viewerRowHeight: row.viewerRowHeight,
-        }),
-        ...(row.highlights === undefined ? {} : { highlights: row.highlights }),
-    });
-}
-
-function persisted_saved_row_snapshot(
-    row: Pick<
-        import('./pending-changes').PendingAppendedRow,
-        'cells' | 'viewerRowHeight' | 'highlights'
-    >,
-    format: import('./pending-changes').PendingRowFormat,
-    physical_cells: Readonly<Record<string, import('./pending-changes').PendingRowCell>>,
-): import('./pending-changes').SavedAppendedRowSnapshot {
-    const cells: Record<string, import('./pending-changes').PendingRowCell> = {};
-    const columns = new Set([
-        ...Object.keys(row.cells),
-        ...Object.keys(physical_cells),
-    ]);
-    for (const column of columns) {
-        const physical = physical_cells[column] ?? { value: '' };
-        const metadata = row.cells[column];
-        cells[column] = Object.freeze({
-            value: physical.value,
-            ...(physical.valueRuns === undefined ? {} : { valueRuns: physical.valueRuns }),
-            ...(physical.link === undefined ? {} : { link: physical.link }),
-            ...(metadata?.valueEditOrder === undefined ? {} : {
-                valueEditOrder: metadata.valueEditOrder,
-            }),
-            ...(metadata?.formulaReferenceBases === undefined ? {} : {
-                formulaReferenceBases: metadata.formulaReferenceBases,
-            }),
-            ...(metadata?.movedFrom === undefined ? {} : { movedFrom: metadata.movedFrom }),
-        });
-    }
-    const viewer_row_height = row.viewerRowHeight
-        ?? (format.kind === 'xlsx' ? format.viewerRowHeight : undefined);
-    return Object.freeze({
-        cells: Object.freeze(cells),
-        format,
-        ...(viewer_row_height === undefined ? {} : {
-            viewerRowHeight: viewer_row_height,
-        }),
-        ...(row.highlights === undefined ? {} : { highlights: row.highlights }),
-    });
-}
-
-function source_row_cells_for_fingerprint(
-    src: DataSource,
-    sheet_index: number,
-    source_row: number,
-): Readonly<Record<string, import('./pending-changes').PendingRowCell>> {
-    const projected_row = projected_row_for_source(src, sheet_index, source_row);
-    const row = projected_row === undefined
-        ? (() => {
-            const column_count = src.meta().sheets[sheet_index]?.columnCount ?? 0;
-            if (!src.read_canonical_columns || column_count === 0) return undefined;
-            return src.read_canonical_columns(
-                sheet_index,
-                source_row,
-                1,
-                Array.from({ length: column_count }, (_, column) => column),
-            ).rows[0];
-        })()
-        : (() => {
-            const window = src.read_rows(sheet_index, projected_row, 1);
-            return window.startRow === projected_row && window.rows.length === 1
-                ? window.rows[0]
-                : undefined;
-        })();
-    if (row === undefined) {
-        throw new Error('A saved appended row is no longer available.');
-    }
-    const cells: Record<string, import('./pending-changes').PendingRowCell> = {};
-    for (const [column, cell] of row.entries()) {
-        if (cell === null) continue;
-        const value = cell.formula ?? get_raw_cell_text(cell.raw);
-        if (value === '' && cell.richText === undefined && cell.hyperlink == null) continue;
-        cells[column] = {
-            value,
-            ...(cell.richText === undefined ? {} : { valueRuns: cell.richText }),
-            ...(cell.hyperlink == null ? {} : { link: cell.hyperlink }),
-        };
-    }
-    return cells;
-}
-
 /**
  * `putexcel`-shaped save: rewrite exactly the edited cells, leave the rest of
  * the package alone.
@@ -1594,26 +1424,8 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
         observed_links: planned.map(({ observed_links }) => observed_links),
         produce: (raw) => {
             for (const worksheet of planned) {
-                const sheet = src.meta().sheets[worksheet.sheetIndex];
                 for (const removal of worksheet.structural.tailRemovals) {
-                    const format = capture_xlsx_append_row_format(
-                        raw,
-                        worksheet.sheetIndex,
-                        removal.sourceRow + 1,
-                        sheet.columnCount,
-                        sheet.excelFirstRowHeader?.active === true
-                            ? sheet.excelFirstRowHeader.sourceRow
-                            : undefined,
-                    );
-                    const current = saved_row_physical_fingerprint({
-                        cells: source_row_cells_for_fingerprint(
-                            src,
-                            worksheet.sheetIndex,
-                            removal.sourceRow,
-                        ),
-                        format,
-                    });
-                    if (current !== saved_row_physical_fingerprint(removal.savedRow)) {
+                    if (!saved_row_unchanged(src, worksheet.sheetIndex, removal, raw)) {
                         structural_save_error(
                             worksheet.worksheetOperationIndex,
                             worksheet.structural,
@@ -1848,11 +1660,7 @@ export function plan_csv_save(
                 { pendingRowIds: [], tailRemovalIds: [removal.appendHistoryId] },
             );
         }
-        const current = saved_row_physical_fingerprint({
-            cells: source_row_cells_for_fingerprint(src, 0, removal.sourceRow),
-            format: { kind: 'none' },
-        });
-        if (current !== saved_row_physical_fingerprint(removal.savedRow)) {
+        if (!saved_row_unchanged(src, 0, removal, undefined)) {
             structural_save_error(
                 0,
                 structural,
@@ -8483,27 +8291,11 @@ export function attach_viewer(
                         || authority.sourceRow !== source_row
                         || authority.savedFingerprint !== saved_fingerprint
                     ) throw new Error('unauthorized');
-                    const format = file_format.id === 'xlsx'
-                        ? capture_xlsx_append_row_format(
-                            raw,
-                            sheet_index,
-                            source_row + 1,
-                            sheet.columnCount,
-                            sheet.excelFirstRowHeader?.active === true
-                                ? sheet.excelFirstRowHeader.sourceRow
-                                : undefined,
-                        )
-                        : { kind: 'none' as const };
-                    const fingerprint = saved_row_physical_fingerprint({
-                        cells: source_row_cells_for_fingerprint(
-                            source,
-                            sheet_index,
-                            source_row,
-                        ),
-                        format,
-                    });
-                    if (fingerprint !== saved_row_physical_fingerprint(
-                        authority.savedRow,
+                    if (!saved_row_unchanged(
+                        source,
+                        sheet_index,
+                        { sourceRow: source_row, savedRow: authority.savedRow },
+                        file_format.id === 'xlsx' ? raw : undefined,
                     )) throw new Error('changed');
                 }
             }
@@ -9443,14 +9235,11 @@ export function attach_viewer(
                     const appendedRows = save_receipt.appendedRows.map((assignment) => {
                         const sheet = persisted_source.meta().sheets[assignment.sheetIndex];
                         if (!sheet) throw new Error('A saved row receipt lost its worksheet.');
-                        const physical_format = capture_xlsx_append_row_format(
-                            saved_bytes,
+                        const physical_format = physical_row_format(
+                            persisted_source,
                             assignment.sheetIndex,
-                            assignment.sourceRow + 1,
-                            sheet.columnCount,
-                            sheet.excelFirstRowHeader?.active === true
-                                ? sheet.excelFirstRowHeader.sourceRow
-                                : undefined,
+                            assignment.sourceRow,
+                            saved_bytes,
                         );
                         const inherited_viewer_height = assignment.savedRow?.format.kind === 'xlsx'
                             ? assignment.savedRow.format.viewerRowHeight
@@ -13813,28 +13602,12 @@ export function attach_viewer(
                     ))
                 ) return false;
                 for (const removal of desired.tailRemovals) {
-                    const current_format: PendingRowFormat = is_xlsx
-                        ? capture_xlsx_append_row_format(
-                            xlsx_bytes!,
-                            structural.resolvedSheetIndex,
-                            removal.sourceRow + 1,
-                            sheet.columnCount,
-                            sheet.excelFirstRowHeader?.active === true
-                                ? sheet.excelFirstRowHeader.sourceRow
-                                : undefined,
-                        )
-                        : { kind: 'none' };
-                    const current = saved_row_physical_fingerprint({
-                        cells: source_row_cells_for_fingerprint(
-                            replay_source,
-                            structural.resolvedSheetIndex,
-                            removal.sourceRow,
-                        ),
-                        format: current_format,
-                    });
-                    if (current !== saved_row_physical_fingerprint(removal.savedRow)) {
-                        return false;
-                    }
+                    if (!saved_row_unchanged(
+                        replay_source,
+                        structural.resolvedSheetIndex,
+                        removal,
+                        is_xlsx ? xlsx_bytes! : undefined,
+                    )) return false;
                 }
             }
         } catch {
