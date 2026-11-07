@@ -24,16 +24,43 @@ Every physical row after the active Header Row through the worksheet's last exis
 _Avoid_: Visible rows, displayed rows
 
 **Appended Row**:
-A new Worksheet body row placed after every existing body row without shifting any existing row.
-_Avoid_: Added row, inserted row
+A new Worksheet body row placed after every existing body row. Appending never shifts an existing row; inserting, deleting, and moving rows do.
+_Avoid_: Added row
 
 **Pending Appended Row**:
 An Appended Row held in an editing session that is not yet part of the workbook on disk.
 _Avoid_: Unsaved physical row, temporary row
 
 **Pending Change**:
-An unsaved change owned by an editing session: a cell change, a Pending Appended Row, or a Pending Tail Removal.
+An unsaved change owned by an editing session: a cell change, a Pending Row, a Pending Column, a Pending Row Removal, a Pending Column Removal, a Moved Row or Column, or a Pending Tail Removal.
 _Avoid_: Pending edit, dirty edit
+
+**Pending Row**:
+A row held in an editing session that is not yet part of the workbook on disk. A Pending Appended Row is a Pending Row created by Append Row; a **Pending Inserted Row** is one created by Insert. A Pending Row keeps its origin wherever it is later moved.
+_Avoid_: New row, blank row
+
+**Worksheet Layout**:
+The prospective order of a worksheet's body rows and of its columns, recorded by row and column identity rather than by position, including tombstones for rows and columns removed during the session. Pending Appended Rows follow it, outside it.
+_Avoid_: Row order, permutation
+
+**Pending Row Removal**:
+A source body row that the session will delete at save. It stays visible in place, read-only, until save.
+_Avoid_: Deleted row (it is not deleted until save)
+
+**Moved Row** / **Moved Column**:
+A source row or column outside the longest run of source rows or columns that kept their relative order.
+
+**Pending Column**:
+A column held in an editing session that is not yet part of the workbook on disk.
+
+**Pending Column Removal**:
+A source column that the session will delete at save.
+
+**Formula Anchor**:
+The row and column identities a formula reference names, recorded when the formula is authored, from which its text is rendered for any Worksheet Layout.
+
+**Structural Basis**:
+The file content that a worksheet's layout changes were authored against.
 
 **Pending Tail Removal**:
 The pending removal, through Undo, of an unchanged physical worksheet suffix previously created by a recorded Append Row.
