@@ -273,6 +273,34 @@ describe('scan_xlsx_structural_support', () => {
             expect(refused(support)).toMatchObject({ code: 'unsupported-extension', element: 'conditionalFormatting' });
         });
 
+        it('refuses an extension inside a row or cell', () => {
+            const [row, cell] = scan({
+                sheets: [
+                    sheet('R', '<sheetData><row r="1"><c r="A1"><v>1</v></c><extLst><ext uri="urn:unreviewed"/></extLst></row></sheetData>'),
+                    sheet('C', '<sheetData><row r="1"><c r="A1"><v>1</v><extLst><ext uri="urn:unreviewed"/></extLst></c></row></sheetData>'),
+                ],
+            });
+            expect(refused(row)).toMatchObject({ code: 'unsupported-extension', uri: 'urn:unreviewed', element: 'sheetData' });
+            expect(refused(cell)).toMatchObject({ code: 'unsupported-extension', uri: 'urn:unreviewed', element: 'sheetData' });
+        });
+
+        it('refuses a conditional-formatting threshold given as a formula', () => {
+            const scale = (cfvo: string) => `${PLAIN_DATA}<conditionalFormatting sqref="A1:A5"><cfRule type="colorScale" priority="1"><colorScale>`
+                + `<cfvo type="min"/>${cfvo}<color rgb="FFF8696B"/><color rgb="FF63BE7B"/></colorScale></cfRule></conditionalFormatting>`;
+            const [formula, cell_value, number] = scan({
+                sheets: [
+                    sheet('F', scale('<cfvo type="formula" val="INDEX(A:A,1)"/>')),
+                    sheet('V', scale('<cfvo type="num" val="$B$1"/>')),
+                    sheet('N', scale('<cfvo type="percentile" val="50"/>')),
+                ],
+            });
+            const reason = refused(formula);
+            expect(reason).toMatchObject({ code: 'conditional-formatting-threshold', sqref: 'A1:A5', value: 'INDEX(A:A,1)' });
+            expect(reason.message).toBe("Can't insert, delete, or move rows on this sheet: the conditional formatting on A1:A5 has a threshold formula Table Viewer can't adjust (INDEX(A:A,1)).");
+            expect(refused(cell_value)).toMatchObject({ code: 'conditional-formatting-threshold', value: '$B$1' });
+            expect_supported(number);
+        });
+
         it('refuses mc:AlternateContent wrapping a worksheet child', () => {
             const [support] = scan({
                 sheets: [sheet('S', `${PLAIN_DATA}<mc:AlternateContent><mc:Choice Requires="x14"><pageMargins left="1" right="1" top="1" bottom="1" header="0" footer="0"/></mc:Choice></mc:AlternateContent>`, {

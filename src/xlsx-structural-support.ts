@@ -154,6 +154,12 @@ export type StructuralRefusalReason =
         readonly location?: StructuralFormulaLocation;
     }
     | {
+        /** A color-scale, data-bar, or icon-set threshold given as a formula. */
+        readonly code: 'conditional-formatting-threshold';
+        readonly sqref: string;
+        readonly value: string;
+    }
+    | {
         /** A range attribute the writer would have to shift but cannot read. */
         readonly code: 'invalid-range';
         readonly element: string;
@@ -485,6 +491,8 @@ function refusal_clause(reason: StructuralRefusalReason): string {
         case 'unanchorable-formula':
             return `Table Viewer can't adjust ${location_text(reason.location)}`
                 + (reason.construct === undefined ? '' : ` (${reason.construct})`);
+        case 'conditional-formatting-threshold':
+            return `the conditional formatting on ${reason.sqref} has a threshold formula Table Viewer can't adjust (${reason.value})`;
         case 'invalid-range':
             return `it has a range Table Viewer can't read in <${reason.element}> (${reason.value})`;
         case 'unwritable-worksheet':
@@ -835,6 +843,7 @@ interface ScannedWorksheet {
     readonly otherFormulas: readonly { readonly location: StructuralFormulaLocation; readonly text: string }[];
 }
 
+const NUMERIC_LITERAL = /^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$/;
 const SQREF_RANGE_RE = /^\$?([A-Z]{1,3})\$?([1-9]\d{0,6})(?::\$?([A-Z]{1,3})\$?([1-9]\d{0,6}))?$/;
 
 function column_number(letters: string): number {
@@ -961,6 +970,12 @@ function nested_extension_refusal(
 ): StructuralRefusalReason | undefined {
     const { element } = child;
     if (element.inner_start === element.end) return undefined;
+    // Neither construct can appear without one of these byte sequences, so a
+    // large sheetData without them skips the per-tag walk.
+    if (
+        index_of_bytes(xml, 'ext', element.inner_start, element.inner_end) === -1
+        && index_of_bytes(xml, 'AlternateContent', element.inner_start, element.inner_end) === -1
+    ) return undefined;
     const ranges = ignorable_ranges(xml, element.inner_start, element.inner_end);
     for (const tag of start_tags(xml, element.inner_start, element.inner_end, ranges)) {
         if (has_local_name(xml, tag.start, tag.nameEnd, 'AlternateContent')) {
@@ -1047,8 +1062,8 @@ function scan_worksheet(
                 consider({ code: 'unsupported-worksheet-child', element: row.element as RefusedWorksheetChild });
                 continue;
             }
-            if (local === 'sheetData') continue;
             consider(nested_extension_refusal(xml, child));
+            if (local === 'sheetData') continue;
 
             if (local === 'autoFilter') {
                 const ref = get_attr(child_open, 'ref') ?? '';
@@ -1079,6 +1094,18 @@ function scan_worksheet(
                     consider({ code: 'invalid-range', element: 'conditionalFormatting', value: sqref });
                 }
                 for (const rule of children_named(xml, child.element, 'cfRule')) {
+                    // Color scales, data bars, and icon sets keep thresholds in
+                    // `<cfvo val>`, which may be a formula; the writer does not
+                    // rewrite those, so anything but a number refuses.
+                    const ranges = ignorable_ranges(xml, rule.element.inner_start, rule.element.inner_end);
+                    for (const tag of start_tags(xml, rule.element.inner_start, rule.element.inner_end, ranges)) {
+                        if (!has_local_name(xml, tag.start, tag.nameEnd, 'cfvo')) continue;
+                        const type = get_tag_attr(xml, tag.start, tag.tagEnd + 1, 'type');
+                        const value = get_tag_attr(xml, tag.start, tag.tagEnd + 1, 'val');
+                        if (type === 'formula' || (value !== null && !NUMERIC_LITERAL.test(value.trim()))) {
+                            consider({ code: 'conditional-formatting-threshold', sqref, value: value ?? '' });
+                        }
+                    }
                     const formulas = children_named(xml, rule.element, 'formula')
                         .map((formula) => element_text(xml, formula.element));
                     relative_rules.push({ sqref, formulas });
