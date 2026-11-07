@@ -707,29 +707,6 @@ function read_style_write_context(zip: ZipPackage): StyleWriteContext {
 }
 
 /**
- * The decoded value of `tag`'s `name` attribute, or null if it has none.
- *
- * Both quote styles, because XML allows either and calling one of them malformed
- * is this module's own invention: `formatCode='yyyy-mm-dd'` is an ordinary date
- * format, and reading only `"…"` left it unseen, so the style did not look like a
- * date and a typed date was written as text. The worksheet parts get away with a
- * double-quote-only scan because `assert_writable_sheet_data` refuses anything it
- * cannot read that way; these parts are read, never spliced, and have no such
- * guard — so they have to actually handle it.
- *
- * Decoded on the way out for the same reason every other value here is.
- *
- * `name` is spliced into the pattern, so a caller may pass a fragment — `r:[iI]d`
- * for the relationship reference, which is spelled both ways in the wild. Every
- * caller here is a literal in this file; none is user input.
- */
-function attr(tag: string, name: string): string | null {
-    const m = new RegExp(`\\b${name}=(?:"([^"]*)"|'([^']*)')`).exec(tag);
-    if (!m) return null;
-    return decode_xml(m[1] ?? m[2]);
-}
-
-/**
  * The workbook's date epoch, read exactly as `parse_xlsx` reads it.
  *
  * Shared for the same reason as {@link read_style_write_context}. This module's
@@ -1434,10 +1411,10 @@ function content_type_override_removed(
             'http://schemas.openxmlformats.org/package/2006/content-types',
             'http://purl.oclc.org/ooxml/package/content-types',
         ]),
-        // `attr` decodes, as in `worksheet_part_path`: an encoded spelling of the
+        // `get_xml_attr` decodes, as in `worksheet_part_path`: an encoded spelling of the
         // same part name is the same part, and missing it leaves an override for a
         // part that is no longer in the package.
-        (tag) => attr(tag, 'PartName') === part_name,
+        (tag) => get_xml_attr(tag, 'PartName') === part_name,
     );
     return stripped === xml ? null : stripped;
 }
@@ -1464,7 +1441,7 @@ function workbook_relationship_removed(
     const bytes = Buffer.from(xml, 'utf8');
     const stripped = utf8_text(apply_utf8_splices(bytes, document.relationships.flatMap(
         (relationship) => {
-            const path = attr(relationship.openTag, 'Target');
+            const path = get_xml_attr(relationship.openTag, 'Target');
             if (path === null || resolve_part_path(path) !== wanted) return [];
             return [{
                 start: relationship.element.start,
