@@ -964,14 +964,20 @@ function live_source_mapping(index: AxisIndexInternals): { source: number; count
     return out;
 }
 
-/** Live entries of `selection` in full order, as positions. */
-function live_positions<I>(index: AxisLayoutIndex<I>, selection: readonly I[]): number[] {
-    const positions: number[] = [];
+/** First and last full-order positions of the live entries of `selection`, if any. */
+function live_span<I>(
+    index: AxisLayoutIndex<I>,
+    selection: readonly I[],
+): { first: number; last: number } | undefined {
+    let first = Infinity;
+    let last = -Infinity;
     for (const identity of selection) {
         if (!index.is_live(identity)) continue;
-        positions.push(index.position_of(identity)!);
+        const position = index.position_of(identity)!;
+        if (position < first) first = position;
+        if (position > last) last = position;
     }
-    return positions;
+    return last < 0 ? undefined : { first, last };
 }
 
 /**
@@ -986,10 +992,9 @@ export function insert_anchor_for_selection<I>(
     selection: readonly I[],
     side: 'before' | 'after',
 ): I | undefined {
-    const positions = live_positions(index, selection);
-    if (positions.length === 0) return undefined;
-    const position = side === 'before' ? Math.min(...positions) : Math.max(...positions);
-    return index.identity_at_position(position);
+    const span = live_span(index, selection);
+    if (span === undefined) return undefined;
+    return index.identity_at_position(side === 'before' ? span.first : span.last);
 }
 
 /**
@@ -1003,14 +1008,14 @@ export function step_move_target<I>(
     selection: readonly I[],
     direction: 'backward' | 'forward',
 ): I | 'end' | undefined {
-    const positions = live_positions(index, selection);
-    if (positions.length === 0) return undefined;
+    const span = live_span(index, selection);
+    if (span === undefined) return undefined;
     if (direction === 'backward') {
-        const first = index.identity_at_position(Math.min(...positions))!;
+        const first = index.identity_at_position(span.first)!;
         const body_index = index.body_index_of(first)!;
         return body_index > 1 ? index.identity_at_body_index(body_index - 1) : undefined;
     }
-    const last = index.identity_at_position(Math.max(...positions))!;
+    const last = index.identity_at_position(span.last)!;
     const body_index = index.body_index_of(last)!;
     if (body_index >= index.liveCount) return undefined;
     return body_index + 1 >= index.liveCount ? 'end' : index.identity_at_body_index(body_index + 2);

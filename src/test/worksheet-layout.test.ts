@@ -651,6 +651,16 @@ describe('row operations', () => {
         ]);
     });
 
+    it('anchors and steps a selection larger than the argument-spread limit', () => {
+        const layout = source_row_layout(0, 300_000);
+        const index = index_row_layout(layout);
+        const selection = Array.from({ length: 150_000 }, (_, i) => src(100_000 + i));
+        expect(insert_anchor_for_selection(index, selection, 'before')).toEqual(src(100_000));
+        expect(insert_anchor_for_selection(index, selection, 'after')).toEqual(src(249_999));
+        expect(step_move_target(index, selection, 'backward')).toEqual(src(99_999));
+        expect(step_move_target(index, selection, 'forward')).toEqual(src(250_001));
+    });
+
     it('refuses an insert or move past the run limit', () => {
         const at_limit = rows_from(Array.from({ length: MAX_ROW_LAYOUT_RUNS }, (_, i) => String(MAX_ROW_LAYOUT_RUNS - 1 - i)));
         expect(at_limit.runs.length).toBe(MAX_ROW_LAYOUT_RUNS);
