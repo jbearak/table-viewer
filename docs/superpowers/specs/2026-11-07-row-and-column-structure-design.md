@@ -186,7 +186,7 @@ The column header menu and the multi-column menu gain, in Edit mode:
 |---|---|---|
 | Insert column left / Insert N columns left | contiguous columns | N blank Pending Columns before the first selected column |
 | Insert column right / Insert N columns right | contiguous columns | N blank Pending Columns after the last selected column |
-| Delete column / Delete N columns | any columns | Source columns become Pending Column Removals; Pending Columns are discarded |
+| Delete column / Delete N columns | any columns, leaving at least one live column | Source columns become Pending Column Removals; Pending Columns are discarded |
 | Restore column / Restore N columns | only Pending Column Removals | Cancels those removals |
 | Move columns left / Move columns right | contiguous columns | Moves the block past one neighboring displayed column |
 
@@ -203,6 +203,10 @@ dialog's validation. The dialog also refuses the name of a column removed in
 this session on the same worksheet ("A deleted column on this sheet is named
 Price. Restore it or choose another name."), because structured references
 such as `[Price]` follow the name and would silently rebind to the new column.
+
+Delete is disabled when it would leave no live column, with "A sheet needs at
+least one column." Insert always needs a live column to anchor on, so this
+keeps an insertion path open on every worksheet.
 
 Hidden columns stay hidden. Inserting next to a visible column places the new
 column immediately beside that column's identity. Moving a block past "one
@@ -958,6 +962,8 @@ interface WorksheetStructuralSupport {
     readonly columns: StructuralAxisSupport;
     /** Merged ranges, for action-time merge checks. */
     readonly merges: readonly string[];
+    /** The worksheet AutoFilter, for the action-time filtered-column check. */
+    readonly autoFilter?: { readonly ref: string; readonly filteredColumns: readonly number[] };
     /** Conditional-formatting and validation rules with relative references. */
     readonly relativeRules: readonly { readonly sqref: string; readonly formulas: readonly string[] }[];
 }
@@ -1051,7 +1057,7 @@ Two reference semantics apply, chosen per structure:
 | `<conditionalFormatting>` `<formula>` (every worksheet) | interval, anchor-relative | see below | same |
 | `<dataValidations>` `sqref` | cell-set | shift | same |
 | `<dataValidations>` `<formula1>`/`<formula2>` (every worksheet) | interval, anchor-relative | see below | same |
-| `<autoFilter ref>` | interval | shift | shift; renumber every `<filterColumn colId>` relative to the new start; drop one for a removed column |
+| `<autoFilter ref>` | interval | shift | shift; renumber every `<filterColumn colId>` relative to the new start; drop one for a removed column; a move that would carry a filtered column outside the rendered range is refused at action time (below) |
 | `<sortState ref>`, inside `<autoFilter>` or on the worksheet | interval | shift; drop the `sortState` if its `ref` renders `#REF!` | shift; same |
 | `<sortCondition ref>` | interval | shift | shift; drop a condition on a removed column |
 | `<sheetView topLeftCell>`, `pane topLeftCell`, `selection activeCell`/`sqref` | interval | shift; a removed target resets to the first live body cell | same |
@@ -1059,7 +1065,7 @@ Two reference semantics apply, chosen per structure:
 | `<rowBreaks>` / `<colBreaks>` | cell-set | shift; breaks on removed rows dropped | same |
 | `<ignoredErrors>` `sqref` | cell-set | shift; empty entries dropped | same |
 | Cell formulas, every worksheet | interval | render | render |
-| Shared formula groups | — | unshare any group whose rendered text changes or whose cells move apart; write each follower's formula explicitly | same |
+| Shared formula groups | — | a group whose cells all shift together, keeping their relative positions, and whose rendered master text is unchanged gets its master's `ref` re-rendered by cell-set semantics; unshare any other affected group, writing each follower's formula explicitly | same |
 | `<definedNames>`, including `_xlnm.Print_Area`, `_xlnm.Print_Titles`, `_xlnm._FilterDatabase` | interval | render | render |
 | `calcChain.xml` | — | remove (existing path) | same |
 | Formula caches | — | invalidate (existing path) | same |
@@ -1119,6 +1125,16 @@ conditional formatting on B2:B500 into 70 rules. Save will refuse it."
   value; this version does not.
 - Moving a block that contains part of a merge is refused: "Can't move part of
   a merged cell."
+- Moving a block to a destination strictly inside a merge's span on the move
+  axis, between two of its rows or columns, is refused: "Can't move rows into a
+  merged cell." Insertion inside a merge still expands it.
+
+**AutoFilter** columns follow the same pattern. A column move whose result
+would leave a column that has a `<filterColumn>` outside the rendered
+`autoFilter` range is refused at action time: "Can't move a filtered column
+outside the sheet's filter range." The structural support ships each
+worksheet's `autoFilter` range and its filtered column indexes for that
+check.
 
 **Unsharing** is capped. If unsharing would write more than 1,000,000 follower
 formulas or more than 64 MiB of formula text in one save, the save is refused
