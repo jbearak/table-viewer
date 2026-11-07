@@ -8,7 +8,6 @@ import {
     type WorkbookMeta,
 } from '../data-source/interface';
 import {
-    compare_cells,
     compute_transform,
     InvalidNumericFilterOperandError,
     matches_filter,
@@ -162,15 +161,19 @@ describe('transform_read_columns', () => {
 });
 
 describe('table transforms', () => {
-    it('sorts numeric values stably and keeps missing values last in both directions', () => {
-        const ten = cell('10', 'number');
-        const two = cell('2', 'number');
-        const empty = cell('', 'empty');
+    it('sorts numeric values and keeps missing values last in both directions', async () => {
+        const source = new Source([
+            [cell('', 'empty')],
+            [cell('10', 'number')],
+            [cell('2', 'number')],
+        ]);
+        const sorted = async (direction: 'asc' | 'desc') => [...(await compute_transform(source, 0, {
+            sort: [{ colIndex: 0, direction }],
+            filters: [],
+        })).indices!];
 
-        expect(compare_cells(ten, two, 'asc')).toBeGreaterThan(0);
-        expect(compare_cells(ten, two, 'desc')).toBeLessThan(0);
-        expect(compare_cells(empty, two, 'asc')).toBeGreaterThan(0);
-        expect(compare_cells(empty, two, 'desc')).toBeGreaterThan(0);
+        expect(await sorted('asc')).toEqual([2, 1, 0]);
+        expect(await sorted('desc')).toEqual([1, 2, 0]);
     });
 
     it('applies enabled filters with AND and then a stable multi-key sort', async () => {
@@ -278,11 +281,6 @@ describe('table transforms', () => {
     });
 
     it('compares and sorts canonical text integers exactly beyond safe 64-bit ranges', async () => {
-        const safe_boundary = cell('9007199254740992');
-        const just_over = cell('9007199254740993');
-        expect(compare_cells(just_over, safe_boundary, 'asc', true)).toBeGreaterThan(0);
-        expect(compare_cells(just_over, safe_boundary, 'desc', true)).toBeLessThan(0);
-
         const source = new Source([
             [cell('9223372036854775808')],
             [cell('-9223372036854775809')],
@@ -300,7 +298,6 @@ describe('table transforms', () => {
     it('sorts mixed canonical integers, decimals, and scientific notation exactly', async () => {
         const integer = cell('9007199254740993');
         const scientific = cell('9.007199254740992e15');
-        expect(compare_cells(integer, scientific, 'asc', true)).toBeGreaterThan(0);
 
         const source = new Source([
             [integer],
@@ -1259,8 +1256,14 @@ describe('table transforms', () => {
             secondValue: '.z',
         })).resolves.toMatchObject({ indices: Uint32Array.from([2, 3]) });
         expect(matches_filter(cell('.a', 'number'), filter('greaterThan', '.'))).toBe(true);
-        expect(compare_cells(cell('.a', 'number'), cell('100', 'number'), 'asc'))
-            .toBeGreaterThan(0);
+        // Stata missing values sort after every number.
+        await expect(compute_transform(new Source([
+            [cell('.a', 'number')],
+            [cell('100', 'number')],
+        ]), 0, {
+            sort: [{ colIndex: 0, direction: 'asc' }],
+            filters: [],
+        })).resolves.toMatchObject({ indices: Uint32Array.from([1, 0]) });
     });
 
     it('excludes exact raw values with isOneOf and passes everything else', async () => {
