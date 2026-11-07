@@ -27,6 +27,7 @@ import {
     prepare_refusal_reason,
     replayed_store_entry,
     type ReplayRequestSources,
+    wire_entry_for_destination,
 } from '../webview/history-replay-request-model';
 import type { HistoryReplayPrepared, PrepareHistoryReplayRequest } from '../history-replay-protocol';
 
@@ -437,9 +438,16 @@ describe('build_commit_request', () => {
         const prepared = prepared_for(request);
         const full = plan_for(changes, prepared);
         const partial: ReplayPlan = { ...full, writes: full.writes.slice(0, 1) };
+        const formula_reference_bases = [{
+            targetSheetIndex: 0,
+            targetSheetName: 'Sheet1',
+            provisionalStartRow: 10,
+            provisionalRowCount: 2,
+        }];
         const overlay = wire_overlay_from_cell_overlay_state(value_only_overlay(
             history_value('a'), history_value('base'), false,
             true, undefined, true, { row: 4, col: 3, order: 7 }, 8,
+            formula_reference_bases,
         ));
         const enriched: HistoryReplayPrepared = {
             ...prepared,
@@ -459,6 +467,7 @@ describe('build_commit_request', () => {
                 observedBase: { value: 'current file' },
                 movedFrom: { row: 4, col: 3, order: 7 },
                 valueEditOrder: 8,
+                formulaReferenceBases: formula_reference_bases,
             });
     });
 });
@@ -499,6 +508,24 @@ describe('replayed_store_entry', () => {
         // next save would compare the edit against a base nobody ever saw.
         expect(replayed_store_entry('typed'))
             .toEqual({ value: 'typed', base: '', base_pending: true });
+    });
+
+    it('refuses a base-pending destination it cannot send without its formula reference bases', () => {
+        // The bare-string form has nowhere to keep them; sending it would drop
+        // them silently.
+        expect(wire_entry_for_destination({
+            value: '=A1',
+            base: '',
+            base_pending: true,
+            formulaReferenceBases: [{
+                targetSheetIndex: 0,
+                targetSheetName: 'Sheet1',
+                provisionalStartRow: 10,
+                provisionalRowCount: 2,
+            }],
+        })).toBeUndefined();
+        expect(wire_entry_for_destination({ value: '=A1', base: '', base_pending: true }))
+            .toBe('=A1');
     });
 
     it('inverts wire_entry_for_destination for a plain base-pending cell', () => {

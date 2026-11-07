@@ -16,6 +16,7 @@
  */
 
 import {
+    cell_overlay_state_from_wire,
     history_replay_cell_input,
     prepared_cell_ordinals,
 } from './history-replay-wire-model';
@@ -31,10 +32,11 @@ import {
     type PendingRowHistoryPlan,
 } from './pending-row-history';
 import type { PendingStructuralChanges } from '../pending-changes';
-import type {
-    CellOverlayState,
-    HistoryDirection,
-    HistoryDirtyEntry,
+import {
+    dirty_entry_from_overlay_state,
+    type CellOverlayState,
+    type HistoryDirection,
+    type HistoryDirtyEntry,
 } from './history-cell-state-model';
 import type {
     CommitHistoryReplayRequest,
@@ -337,37 +339,11 @@ export function build_commit_request(
 function entry_for_unwritten_cell(
     cell: HistoryReplayPrepared['cells'][number],
 ): CommitHistoryReplayRequest['cells'][number]['entry'] | undefined {
-    const { overlay } = cell;
+    // Through the canonical converters, so every overlay field the store keeps
+    // (formula reference bases included) survives the no-op write.
+    const overlay = cell_overlay_state_from_wire(cell.overlay);
     if (overlay.kind === 'absent') return null;
-    const dimension = overlay.value;
-    const value = dimension.kind === 'untouched' ? dimension.anchor : dimension.value;
-    const base = dimension.kind === 'untouched' ? dimension.anchor : dimension.base;
-    const link = overlay.hyperlink;
-    const entry: HistoryDirtyEntry = {
-        value: value.text,
-        base: base.text,
-        ...(dimension.kind === 'present' && dimension.basePending
-            ? { base_pending: true }
-            : {}),
-        ...(dimension.kind === 'present' && dimension.writeValue === true
-            ? { writeValue: true as const }
-            : {}),
-        ...(dimension.kind === 'present' && dimension.retainValue === true
-            ? { retainValue: true as const }
-            : {}),
-        ...(dimension.kind === 'present' && dimension.formattingKnown === true
-            ? { formattingKnown: true as const }
-            : {}),
-        ...(dimension.kind === 'present' && dimension.movedFrom !== undefined
-            ? { movedFrom: dimension.movedFrom }
-            : {}),
-        ...(dimension.kind === 'present' && dimension.valueEditOrder !== undefined
-            ? { valueEditOrder: dimension.valueEditOrder }
-            : {}),
-        ...(value.runs !== undefined ? { valueRuns: value.runs } : {}),
-        ...(base.runs !== undefined ? { baseRuns: base.runs } : {}),
-        ...(link.kind === 'present' ? { link: link.value, baseLink: link.base } : {}),
-    };
+    const entry = dirty_entry_from_overlay_state(overlay);
     if (entry.base_pending === true) return wire_entry_for_destination(entry);
     if (entry.link !== undefined && cell.persistedHyperlink === undefined) {
         return wire_entry_for_destination(entry);
@@ -408,7 +384,8 @@ export function wire_entry_for_destination(
         && entry.retainValue === undefined
         && entry.formattingKnown === undefined
         && entry.movedFrom === undefined
-        && entry.valueEditOrder === undefined;
+        && entry.valueEditOrder === undefined
+        && entry.formulaReferenceBases === undefined;
     return plain ? entry.value : undefined;
 }
 
