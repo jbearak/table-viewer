@@ -1,9 +1,17 @@
 import { describe, expect, it } from 'vitest';
-import type {
-    PendingAppendedRow,
-    PendingStructuralChanges,
-    PendingTailRemoval,
+import {
+    own_pending_structural_changes,
+    type PendingAppendedRow,
+    type PendingStructuralChanges,
+    type PendingTailRemoval,
 } from '../pending-changes';
+import {
+    delete_columns,
+    delete_rows,
+    insert_rows,
+    type StructureResult,
+    type WorksheetStructureContext,
+} from '../webview/pending-row-store';
 import type { WorksheetTarget } from '../types';
 import {
     absent_overlay,
@@ -23,6 +31,8 @@ import {
     rekey_committed_tail_removal_history,
     rekey_saved_appended_row_history,
     retained_saved_append_authorities,
+    retained_pending_row_authorities,
+    measure_history_action,
     type HistoryAction,
     type HistoryChange,
     type HistoryStackState,
@@ -706,5 +716,137 @@ describe('pending-row history planning', () => {
         if (moved.kind !== 'moved') throw new Error('Expected history move');
         expect(retained_saved_append_authorities(moved.state)[0].appendHistoryIds)
             .toEqual(['saved-a']);
+    });
+});
+
+describe('layout history arms', () => {
+    const structure_context = (overrides: Partial<WorksheetStructureContext> = {}): WorksheetStructureContext => ({
+        worksheet,
+        bodyStart: 0,
+        sourceRowCount: 4,
+        sourceColumnCount: 2,
+        bodyViewTransformed: false,
+        structuralBasis: {
+            kind: 'delimited',
+            byteLength: 8,
+            digest: 'sha256:x',
+            sourceRowCount: 4,
+            sourceColumnCount: 2,
+        },
+        ...overrides,
+    });
+    const planned = (result: StructureResult) => {
+        if (!result.ok) throw new Error(result.refusal.message);
+        return result.outcome;
+    };
+    const recorded = (action: HistoryAction): HistoryAction => {
+        const outcome = record_history_action(empty_history_stack(), action);
+        if (outcome.kind !== 'recorded') throw new Error('not recorded');
+        return outcome.state.undoStack[0].action;
+    };
+
+    it('undoes and redoes a delete, restoring layout and discarded content atomically', () => {
+        const inserted = planned(insert_rows(
+            state([row('x', 1, 'appended')]),
+            structure_context(),
+            { kind: 'source', sourceRow: 1 },
+            'after',
+            ['ins'],
+            template,
+            2,
+        )).next;
+        const typed: PendingStructuralChanges = {
+            ...inserted,
+            appendedRows: inserted.appendedRows.map((candidate) => candidate.id === 'ins'
+                ? { ...candidate, cells: { 0: { value: 'typed', valueEditOrder: 3 } } }
+                : candidate),
+        };
+        const deleted = planned(delete_rows(typed, structure_context(), [
+            { kind: 'source', sourceRow: 0 },
+            { kind: 'pending', pendingRowId: 'ins' },
+            { kind: 'pending', pendingRowId: 'x' },
+        ]));
+        const action = recorded({ label: 'Delete 3 rows', changes: [deleted.change] });
+        expect(action.changes[0].kind).toBe('rowLayout');
+
+        const undone = replay(action, 'undo', deleted.next);
+        expect(undone).toEqual(own_pending_structural_changes(typed));
+        expect(replay(action, 'redo', undone)).toEqual(deleted.next);
+    });
+
+    it('refuses a replay when the store moved since the action (compare-and-swap)', () => {
+        const deleted = planned(delete_rows(state([]), structure_context(), [{ kind: 'source', sourceRow: 2 }]));
+        const action = recorded({ label: 'Delete row', changes: [deleted.change] });
+        // The layout changed under the action.
+        const moved_on = planned(delete_rows(deleted.next, structure_context(), [{ kind: 'source', sourceRow: 3 }])).next;
+        expect(plan_pending_row_history_replay(action, 'undo', () => moved_on))
+            .toEqual({ kind: 'refused', reason: 'conflict' });
+        // A Pending Row the action brings back is already present.
+        const inserted = planned(insert_rows(state([]), structure_context(), { kind: 'source', sourceRow: 0 },
+            'before', ['ins'], template, 1));
+        const insert_action = recorded({ label: 'Insert row', changes: [inserted.change] });
+        expect(plan_pending_row_history_replay(insert_action, 'redo', () => inserted.next))
+            .toEqual({ kind: 'refused', reason: 'conflict' });
+        expect(replay(insert_action, 'undo', inserted.next)).toEqual(own_pending_structural_changes(state([])));
+    });
+
+    it('undoes a column delete with the Pending Row cells it dropped and its cell deltas', () => {
+        const start = state([row('x', 1, 'kept')]);
+        const with_cells: PendingStructuralChanges = {
+            ...start,
+            appendedRows: [{ ...start.appendedRows[0], cells: {
+                0: { value: 'kept', valueEditOrder: 1 },
+                1: { value: 'gone', valueEditOrder: 2 },
+            } }],
+        };
+        const deleted = planned(delete_columns(with_cells, structure_context(), [{ kind: 'source', sourceColumn: 1 }]));
+        const cell_delta: HistoryChange = {
+            kind: 'cell',
+            delta: build_cell_history_delta({
+                worksheet,
+                sourceRow: 0,
+                sourceColumn: 1,
+                before: value_only_overlay(history_value('edited'), history_value('base')),
+                after: absent_overlay(),
+                persistedValue: history_value('base'),
+                persistedHyperlink: null,
+            })!,
+        };
+        const action = recorded({ label: 'Delete column', changes: [deleted.change, cell_delta] });
+        const result = plan_pending_row_history_replay(action, 'undo', () => deleted.next);
+        if (result.kind !== 'plan') throw new Error(result.kind);
+        expect(result.plans[0].next).toEqual(own_pending_structural_changes(with_cells));
+        expect(replay(action, 'redo', result.plans[0].next)).toEqual(deleted.next);
+    });
+
+    it('counts layout arms against the history byte budget', () => {
+        const removals = Array.from({ length: 500 }, (_, index) => ({ kind: 'source' as const, sourceRow: index * 2 }));
+        const big = planned(delete_rows(state([]), structure_context({
+            sourceRowCount: 1_000,
+            structuralBasis: {
+                kind: 'delimited', byteLength: 8, digest: 'sha256:x', sourceRowCount: 1_000, sourceColumnCount: 2,
+            },
+        }), removals));
+        const small = planned(delete_rows(state([]), structure_context(), [{ kind: 'source', sourceRow: 1 }]));
+        const big_cost = measure_history_action({ label: 'Delete', changes: [big.change] }).byteCost;
+        const small_cost = measure_history_action({ label: 'Delete', changes: [small.change] }).byteCost;
+        expect(big_cost - small_cost).toBeGreaterThan(500 * 2 * 20);
+        const outcome = record_history_action(empty_history_stack(), { label: 'Delete', changes: [big.change] }, {
+            maxActions: 10, maxCells: 1_000, softMaxBytes: small_cost * 2, hardMaxBytes: small_cost * 2,
+        });
+        expect(outcome.kind).toBe('refused');
+    });
+
+    it('keeps admissions alive for rows a layout arm created, discarded, or tombstoned', () => {
+        const inserted = planned(insert_rows(state([]), structure_context(), { kind: 'source', sourceRow: 0 },
+            'before', ['ins', 'kept'], template, 1));
+        const deleted = planned(delete_rows(inserted.next, structure_context({ isRowReferenced: (id) => id === 'kept' }),
+            [{ kind: 'pending', pendingRowId: 'ins' }, { kind: 'pending', pendingRowId: 'kept' }]));
+        const history = record_actions([
+            { label: 'Insert 2 rows', changes: [inserted.change] },
+            { label: 'Delete 2 rows', changes: [deleted.change] },
+        ]);
+        expect(new Set(retained_pending_row_authorities(history)[0].pendingRowIds))
+            .toEqual(new Set(['ins', 'kept']));
     });
 });

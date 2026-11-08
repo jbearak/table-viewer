@@ -13487,6 +13487,9 @@ export function attach_viewer(
                             ? {}
                             : { appendBasis: structural.appendBasis }),
                         conflicts: retained_conflicts,
+                        // `with_pending_changes_for_sheet` replaces the slot,
+                        // so a layout left off here would be dropped.
+                        ...pending_layout_fields(structural),
                     };
                     // The conflict reserve is host-only. Measure the complete
                     // renderer-owned worksheet envelope, including live cell
@@ -13571,6 +13574,7 @@ export function attach_viewer(
                         ...(value.appendBasis === undefined
                             ? {}
                             : { appendBasis: value.appendBasis }),
+                        ...pending_layout_fields(value),
                     });
                     // A replay may make a formula diagnostic on a sibling sheet
                     // appear or disappear. That transition is derived from the
@@ -13893,6 +13897,15 @@ export function attach_viewer(
             if (target === undefined || edit_session_id === undefined) return false;
             const ledger_key = append_ledger_key(edit_session_id, target);
             const live_ledger = append_admission_ledgers.get(ledger_key);
+            // A replayed layout meets the publication's layout rules: the
+            // release gate, the ledger origin rule, issued Pending Columns,
+            // and the recorded Structural Basis. The commit's own decode of
+            // the resulting slot refuses a cell left in a removed row.
+            if (pending_layout_publication_refusal(
+                target,
+                { ...target, cells: {}, ...structural.desired },
+                live_ledger,
+            ) !== undefined) return false;
             if (!accepted_row_admission_gestures_are_complete(
                 ledger_key,
                 pending_rows(structural.desired),

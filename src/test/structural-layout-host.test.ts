@@ -1,6 +1,7 @@
 // Host rules for Worksheet Layout state (row and column structure design,
 // delivery step 3): peer compatibility rules 1-3, the admission ledger's
-// origin rule, and layout validation at publication.
+// origin rule, layout validation at publication, and the history replay
+// commit carrying a stored layout (step 4).
 import { createHash } from 'node:crypto';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type * as vscode from 'vscode';
@@ -11,6 +12,8 @@ import type { StructuralBasis } from '../pending-changes';
 import { versioned_state_store } from './helpers/versioned-state-store';
 import * as vscode_mock from './mocks/vscode';
 import { fake_viewer_host } from './mocks/host-ports';
+import { history_value, value_only_overlay } from '../webview/history-cell-state-model';
+import { wire_overlay_from_cell_overlay_state } from '../webview/history-replay-wire-model';
 
 const enc = new TextEncoder();
 // One header and three body rows: canonical source rows 0-2, one column.
@@ -498,6 +501,127 @@ describe('publication validation and the ledger origin rule', () => {
         })).toBe(true);
         expect(viewer.durable()?.appendedRows?.[0]?.origin).toBeUndefined();
         expect(viewer.durable()?.rowLayout).toBeUndefined();
+        await viewer.dispose();
+    });
+});
+
+describe('history replay commit', () => {
+    const worksheet = { sheetIndex: 0, sheetName: 'Sheet1' };
+    const EMPTY_STRUCTURE = { formatTemplates: [], appendedRows: [], tailRemovals: [], conflicts: [] };
+
+    /** Prepare and commit one replay; whether the host committed it. */
+    async function replay(
+        viewer: Awaited<ReturnType<typeof open_viewer>>,
+        id: string,
+        request: {
+            cells?: unknown[];
+            structures?: { expected: unknown; desired: unknown }[];
+        },
+    ): Promise<boolean> {
+        const messages = () => viewer.panel.__messages as Message[];
+        const latest = [...messages()].reverse().find((message) =>
+            message.type === 'workbookSnapshot') as unknown as { snapshot: { identity: unknown } };
+        await viewer.panel.__receive({
+            type: 'snapshotApplied',
+            identity: latest.snapshot.identity,
+            disposition: 'applied',
+        });
+        const cells = request.cells ?? [];
+        const structures = request.structures ?? [];
+        await viewer.panel.__receive({
+            type: 'prepareHistoryReplay',
+            request: {
+                requestId: `${id}-prepare`,
+                replayId: id,
+                cells,
+                highlights: [],
+                structures: structures.map((structural, ordinal) => ({ ordinal, worksheet, ...structural })),
+                focus: {
+                    worksheet,
+                    sourceRowStart: 0,
+                    sourceRowEnd: 0,
+                    sourceColumnStart: 0,
+                    sourceColumnEnd: 0,
+                },
+            },
+        });
+        await viewer.controller.drain();
+        const prepared = (messages().find((message) => message.type === 'historyReplayPrepared'
+            && (message as { prepared?: { replayId?: string } }).prepared?.replayId === id) as {
+            prepared?: { requestId: string; replayId: string; leaseId: string };
+        } | undefined)?.prepared;
+        if (prepared === undefined) return false;
+        await viewer.panel.__receive({
+            type: 'commitHistoryReplay',
+            request: {
+                requestId: prepared.requestId,
+                replayId: prepared.replayId,
+                leaseId: prepared.leaseId,
+                mutationId: `${id}-mutation`,
+                cells: cells.map((_cell, ordinal) => ({ ordinal, entry: null })),
+                highlights: [],
+                structures: structures.map((_structural, ordinal) => ({ ordinal })),
+            },
+        });
+        await viewer.controller.drain();
+        return messages().some((message) => message.type === 'historyReplayCommitted'
+            && (message as { committed?: { replayId?: string } }).committed?.replayId === id);
+    }
+
+    const undo_cell = (sourceRow: number, value: string, base: string) => ({
+        ordinal: 0,
+        worksheet,
+        sourceRow,
+        sourceColumn: 0,
+        overlay: wire_overlay_from_cell_overlay_state(value_only_overlay(
+            history_value(value),
+            history_value(base),
+        )),
+    });
+
+    it('keeps the stored layout when it replays a cell edit on a worksheet with a layout', async () => {
+        const viewer = await open_viewer({
+            initial: slot({
+                cells: { '0:0': { value: 'x', base: 'a' } },
+                rowLayout: REMOVAL_LAYOUT,
+                structuralBasis: BASIS,
+            }),
+            structuralEditingEnabled: true,
+        });
+        expect(viewer.session).toMatchObject({ granted: true });
+        expect(await replay(viewer, 'cell', { cells: [undo_cell(0, 'x', 'a')] })).toBe(true);
+        expect(viewer.durable()).toMatchObject({ rowLayout: REMOVAL_LAYOUT, structuralBasis: BASIS });
+        expect(viewer.durable()?.cells ?? {}).toEqual({});
+        await viewer.dispose();
+    });
+
+    it('refuses a replayed layout while structural editing is disabled', async () => {
+        const viewer = await open_viewer({ initial: slot({ cells: { '0:0': { value: 'x', base: 'a' } } }) });
+        expect(viewer.session).toMatchObject({ granted: true });
+        expect(await replay(viewer, 'layout', {
+            structures: [{
+                expected: EMPTY_STRUCTURE,
+                desired: { ...EMPTY_STRUCTURE, rowLayout: REMOVAL_LAYOUT, structuralBasis: BASIS },
+            }],
+        })).toBe(false);
+        expect(viewer.durable()?.rowLayout).toBeUndefined();
+        expect(viewer.durable()?.structuralBasis).toBeUndefined();
+        await viewer.dispose();
+    });
+
+    it('refuses a replayed layout whose Structural Basis the session did not record', async () => {
+        const viewer = await open_viewer({
+            initial: slot({ rowLayout: REMOVAL_LAYOUT, structuralBasis: BASIS }),
+            structuralEditingEnabled: true,
+        });
+        const current = { ...EMPTY_STRUCTURE, rowLayout: REMOVAL_LAYOUT, structuralBasis: BASIS };
+        expect(await replay(viewer, 'basis', {
+            structures: [{
+                expected: current,
+                desired: { ...current, structuralBasis: { ...BASIS, digest: 'sha256:forged' } },
+            }],
+        })).toBe(false);
+        expect(viewer.durable()).toMatchObject({ structuralBasis: BASIS });
         await viewer.dispose();
     });
 });

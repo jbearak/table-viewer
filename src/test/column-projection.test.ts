@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { transform_schema_for_sheet } from '../types';
 import {
     create_column_projection,
+    create_layout_column_projection,
     hide_all_columns,
     hide_source_columns,
     sanitize_column_visibility_state,
@@ -172,5 +173,42 @@ describe('compact visibility state', () => {
         expect(projection.visible_to_source).toHaveLength(0);
         expect(projection.source_to_visible).toHaveLength(0);
         expect(projection.hidden_count).toBe(1_000_000);
+    });
+});
+
+describe('create_layout_column_projection', () => {
+    const source = (sourceColumn: number) => ({ kind: 'source' as const, sourceColumn });
+    const pending = (pendingColumnId: string) => ({ kind: 'pending' as const, pendingColumnId });
+
+    it('matches create_column_projection without a layout', () => {
+        const visibility = { hiddenColumns: [1, 3] };
+        const plain = create_column_projection(5, visibility);
+        const layout = create_layout_column_projection(5, undefined, visibility);
+        expect(layout.columns.map((column) => column.identity)).toEqual(plain.visible_to_source.map(source));
+        expect(layout.columns.map((column) => column.key)).toEqual(['s:0', 's:2', 's:4']);
+        expect(layout.columns.every((column) => column.state === 'source')).toBe(true);
+        expect(layout.source_to_visible).toEqual(plain.source_to_visible);
+        expect(layout.hidden_count).toBe(plain.hidden_count);
+    });
+
+    it('shows layout columns minus hidden source columns and discarded tombstones', () => {
+        const projection = create_layout_column_projection(5, {
+            columns: [source(0), pending('new'), pending('gone'), source(4), source(1), source(2), source(3)],
+            removedSourceColumns: [2],
+            discardedPendingColumns: [{ id: 'gone', createdOrder: 2 }],
+        }, { hiddenColumns: [1] });
+        expect(projection.columns).toEqual([
+            { identity: source(0), key: 's:0', state: 'source' },
+            { identity: pending('new'), key: 'p:new', state: 'inserted' },
+            { identity: source(4), key: 's:4', state: 'moved' },
+            { identity: source(2), key: 's:2', state: 'removed' },
+            { identity: source(3), key: 's:3', state: 'source' },
+        ]);
+        expect(projection.source_to_visible[1]).toBeUndefined();
+        expect(projection.source_to_visible[2]).toBe(3);
+        expect(projection.hidden_count).toBe(1);
+        expect(projection.display_column_for_identity(pending('new'))).toBe(1);
+        expect(projection.display_column_for_identity(pending('gone'))).toBeUndefined();
+        expect(projection.display_column_for_key('s:3')).toBe(4);
     });
 });

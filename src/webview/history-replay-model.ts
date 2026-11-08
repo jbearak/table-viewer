@@ -37,6 +37,7 @@ import {
 } from './history-cell-state-model';
 import {
     action_replay_changes,
+    is_structural_history_change,
     type HighlightHistoryDelta,
     type HistoryAction,
 } from './history-stack-model';
@@ -158,8 +159,7 @@ export function plan_history_replay(
     for (const change of replay_changes) {
         // Structural-only actions are replayed synchronously against the
         // session-owned PendingRowStore. They never enter the source-cell lease.
-        if (change.kind === 'rowAppend' || change.kind === 'tailRemoval'
-            || change.kind === 'pendingRows') continue;
+        if (is_structural_history_change(change)) continue;
         if (change.kind === 'highlight') {
             highlights.push(change.delta);
             continue;

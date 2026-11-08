@@ -1,4 +1,17 @@
-/** Display-only composition of immutable source rows and structural overlays. */
+/**
+ * Display-only composition of immutable source rows and structural overlays.
+ *
+ * Two modes. The **band mode** is today's: source rows in the host's display
+ * order (sorted, filtered, or with hidden rows), then the deleted band of
+ * Pending Tail Removals, then the append band. A Pending Row Removal stays at
+ * its display position there, classified `removed`. The **layout mode** is
+ * used when the worksheet has a row layout, its body view is untransformed,
+ * and it has no Pending Tail Removal: fixed rows (at or above the Header Row)
+ * first, then the row layout in prospective order with removals in place,
+ * discarded tombstones skipped, and Pending Inserted Rows inline, then the
+ * append band behind the existing boundary. Every lookup in layout mode is
+ * `O(log R)` over the layout's segments.
+ */
 
 import type {
     PendingAppendedRow,
@@ -6,7 +19,26 @@ import type {
     PendingTailRemoval,
     RowIdentity,
 } from '../pending-changes';
-import { appended_rows } from '../pending-changes';
+import { appended_rows, pending_rows } from '../pending-changes';
+import {
+    index_row_layout,
+    moved_source_rows,
+    type RowLayoutIndex,
+    type SourceInterval,
+} from '../worksheet-layout';
+
+/**
+ * What a displayed row is: an unchanged `source` row, a Pending Inserted Row,
+ * a Pending Row Removal, a Moved Row, a Pending Appended Row (including one
+ * coalesced with a tail removal), or a Pending Tail Removal.
+ */
+export type ProjectedRowState =
+    | 'source'
+    | 'inserted'
+    | 'removed'
+    | 'moved'
+    | 'appended'
+    | 'tail-removal';
 
 export type PendingProjectedRow =
     | {
@@ -37,11 +69,22 @@ export type PendingProjectedRow =
     };
 
 export interface PendingRowProjection {
+    /** Rows before the deleted band: source rows, and in layout mode inserted rows too. */
     readonly sourceRowCount: number;
     readonly deletedBandStart: number;
     readonly pendingBandStart: number;
     readonly rowCount: number;
+    /** Whether the layout mode is in use (see the module comment). */
+    readonly layoutMode: boolean;
     row_at(display_row: number): PendingProjectedRow | undefined;
+    /** Undefined outside the grid, or for a source row whose identity is not yet resident. */
+    row_state(display_row: number): ProjectedRowState | undefined;
+    /**
+     * The canonical row the displayed row will occupy after save, 0-based like
+     * `RowIdentity.sourceRow`; undefined for rows save removes.
+     */
+    prospective_row(display_row: number): number | undefined;
+    display_row_for_prospective_row(prospective_row: number): number | undefined;
     display_row_for_identity(identity: RowIdentity): number | undefined;
     /** Compress one host/source-display coordinate into the current source band. */
     display_row_for_source_display(source_display_row: number): number | undefined;
@@ -67,9 +110,37 @@ export interface PendingRowProjectionInput {
     readonly removedSourceDisplayRows?: readonly number[];
     /** Removal identities whose transformed inverse lookup has completed. */
     readonly projectedTailRemovalIds?: ReadonlySet<string>;
+    /** First body source row: the Header Row's 1-based number, or 0 without one. Default 0. */
+    readonly bodyStart?: number;
+    /**
+     * Whether the body view is sorted, filtered, or hides rows. The layout mode
+     * needs an explicit `false`; absent keeps the band mode.
+     */
+    readonly bodyViewTransformed?: boolean;
+}
+
+/** Live rows the layout adds to the body: live inserted rows minus removals. */
+function layout_size_change(index: RowLayoutIndex): number {
+    let change = 0;
+    for (const segment of index.segments) {
+        if (segment.kind === 'pending' && segment.status === 'live') change += 1;
+        else if (segment.kind === 'source' && segment.status === 'removed') change -= segment.count;
+    }
+    return change;
 }
 
 export function create_pending_row_projection(
+    input: PendingRowProjectionInput,
+): PendingRowProjection {
+    const layout = input.changes.rowLayout;
+    if (layout !== undefined && input.bodyViewTransformed === false
+        && input.changes.tailRemovals.length === 0) {
+        return create_layout_row_projection(input, index_row_layout(layout));
+    }
+    return create_band_row_projection(input);
+}
+
+function create_band_row_projection(
     input: PendingRowProjectionInput,
 ): PendingRowProjection {
     const removed_source_display_rows = [...new Set(
@@ -119,7 +190,14 @@ export function create_pending_row_projection(
         const filtered = raw_row - removed_before;
         return filtered >= 0 && filtered < filtered_source_count ? filtered : undefined;
     };
-    const prospective_start = input.sourceRowCount - input.changes.tailRemovals.length;
+    const layout_index = input.changes.rowLayout === undefined
+        ? undefined
+        : index_row_layout(input.changes.rowLayout);
+    const body_start = input.bodyStart ?? 0;
+    // Pending Row Removals and live inserted rows move the append band; with
+    // neither this is today's start.
+    const prospective_start = input.sourceRowCount - input.changes.tailRemovals.length
+        + (layout_index === undefined ? 0 : layout_size_change(layout_index));
     const projected_tail_removals = input.projectedTailRemovalIds === undefined
         ? input.changes.tailRemovals
         : input.changes.tailRemovals.filter((removal) =>
@@ -188,11 +266,44 @@ export function create_pending_row_projection(
         ...projected,
         row: input.appendedRowAt?.(projected.rowIndex) ?? projected.row,
     });
+    const source_prospective_row = (source_row: number): number | undefined => {
+        if (layout_index === undefined || source_row < body_start) return source_row;
+        const body_index = layout_index.body_index_of({ kind: 'source', sourceRow: source_row });
+        return body_index === undefined ? undefined : body_start + body_index - 1;
+    };
     const projection: PendingRowProjection = {
         sourceRowCount: filtered_source_count,
         deletedBandStart,
         pendingBandStart,
         rowCount,
+        layoutMode: false,
+        row_state: (display_row) => {
+            const projected = projection.row_at(display_row);
+            if (projected === undefined) return undefined;
+            if (projected.kind === 'removal') return 'tail-removal';
+            if (projected.kind !== 'source') return 'appended';
+            if (projected.identity === undefined) return undefined;
+            return layout_index?.status_of(projected.identity) === 'removed' ? 'removed' : 'source';
+        },
+        prospective_row: (display_row) => {
+            const projected = projection.row_at(display_row);
+            if (projected === undefined || projected.kind === 'removal') return undefined;
+            if (projected.kind !== 'source') return projected.intendedPhysicalRow;
+            return projected.identity === undefined
+                ? undefined
+                : source_prospective_row(projected.identity.sourceRow);
+        },
+        display_row_for_prospective_row: (row) => {
+            if (!Number.isSafeInteger(row) || row < 0) return undefined;
+            if (row >= prospective_start) {
+                const index = row - prospective_start;
+                return index < pending_rows.length ? pendingBandStart + index : undefined;
+            }
+            const identity = layout_index === undefined || row < body_start
+                ? { kind: 'source' as const, sourceRow: row }
+                : layout_index.identity_at_body_index(row - body_start + 1);
+            return identity === undefined ? undefined : projection.display_row_for_identity(identity);
+        },
         row_at: (display_row: number): PendingProjectedRow | undefined => {
             if (!Number.isSafeInteger(display_row) || display_row < 0 || display_row >= rowCount) {
                 return undefined;
@@ -271,6 +382,184 @@ export function create_pending_row_projection(
             if (segment_start <= raw_end) out.push({ start: segment_start, end: raw_end });
             return out;
         }),
+    };
+    return Object.freeze(projection);
+}
+
+function create_layout_row_projection(
+    input: PendingRowProjectionInput,
+    index: RowLayoutIndex,
+): PendingRowProjection {
+    const layout = input.changes.rowLayout!;
+    const body_start = input.bodyStart ?? 0;
+    const body_row_count = Math.max(0, input.sourceRowCount - body_start);
+    // Untransformed, so the host shows every source row in source order:
+    // fixed rows first, then the body, one source-display row per source row.
+    const fixed_count = Math.max(0, input.sourceDisplayRowCount - body_row_count);
+    const layout_end = fixed_count + index.displayCount;
+    const band = appended_rows(input.changes);
+    const band_start_row = body_start + index.liveCount;
+    const rowCount = layout_end + band.length;
+    const moved: readonly SourceInterval[] = moved_source_rows(layout);
+    const pending_by_id = new Map(pending_rows(input.changes).map((row) => [row.id, row]));
+    const band_index_by_id = new Map(band.map((row, band_index) => [row.id, band_index]));
+    const displayed = index.segments.filter((segment) => segment.status !== 'discarded');
+
+    const is_moved = (source_row: number): boolean => {
+        let low = 0;
+        let high = moved.length;
+        while (low < high) {
+            const middle = (low + high) >>> 1;
+            const entry = moved[middle]!;
+            if (entry.start + entry.count <= source_row) low = middle + 1;
+            else high = middle;
+        }
+        const entry = moved[low];
+        return entry !== undefined && entry.start <= source_row;
+    };
+    const source_display_row_of = (source_row: number): number | undefined =>
+        source_row < body_start
+            ? input.displayRowForSource(source_row)
+            : fixed_count + source_row - body_start;
+    const band_row = (band_index: number): Extract<PendingProjectedRow, { kind: 'pending' }> => {
+        const row = input.appendedRowAt?.(band_index) ?? band[band_index]!;
+        return {
+            kind: 'pending',
+            identity: { kind: 'pending', pendingRowId: band[band_index]!.id },
+            row,
+            intendedPhysicalRow: band_start_row + band_index,
+        };
+    };
+    const layout_identity_at = (display_row: number): RowIdentity | undefined =>
+        display_row >= fixed_count && display_row < layout_end
+            ? index.identity_at_display_index(display_row - fixed_count)
+            : undefined;
+
+    const projection: PendingRowProjection = {
+        sourceRowCount: layout_end,
+        deletedBandStart: layout_end,
+        pendingBandStart: layout_end,
+        rowCount,
+        layoutMode: true,
+        row_at: (display_row) => {
+            if (!Number.isSafeInteger(display_row) || display_row < 0 || display_row >= rowCount) {
+                return undefined;
+            }
+            if (display_row < fixed_count) {
+                const sourceRow = input.sourceRowAt(display_row);
+                return {
+                    kind: 'source',
+                    ...(sourceRow === undefined ? {} : { identity: { kind: 'source', sourceRow } }),
+                    sourceDisplayRow: display_row,
+                };
+            }
+            if (display_row >= layout_end) return band_row(display_row - layout_end);
+            const identity = layout_identity_at(display_row)!;
+            if (identity.kind === 'source') {
+                return {
+                    kind: 'source',
+                    identity,
+                    sourceDisplayRow: source_display_row_of(identity.sourceRow)!,
+                };
+            }
+            return {
+                kind: 'pending',
+                identity,
+                row: pending_by_id.get(identity.pendingRowId)!,
+                intendedPhysicalRow: body_start + index.body_index_of(identity)! - 1,
+            };
+        },
+        row_state: (display_row) => {
+            if (!Number.isSafeInteger(display_row) || display_row < 0 || display_row >= rowCount) {
+                return undefined;
+            }
+            if (display_row < fixed_count) return 'source';
+            if (display_row >= layout_end) return 'appended';
+            const identity = layout_identity_at(display_row)!;
+            if (identity.kind === 'pending') return 'inserted';
+            if (index.status_of(identity) === 'removed') return 'removed';
+            return is_moved(identity.sourceRow) ? 'moved' : 'source';
+        },
+        prospective_row: (display_row) => {
+            if (!Number.isSafeInteger(display_row) || display_row < 0 || display_row >= rowCount) {
+                return undefined;
+            }
+            if (display_row < fixed_count) return input.sourceRowAt(display_row);
+            if (display_row >= layout_end) return band_start_row + display_row - layout_end;
+            const body_index = index.body_index_of(layout_identity_at(display_row)!);
+            return body_index === undefined ? undefined : body_start + body_index - 1;
+        },
+        display_row_for_prospective_row: (row) => {
+            if (!Number.isSafeInteger(row) || row < 0) return undefined;
+            if (row < body_start) return input.displayRowForSource(row);
+            if (row < band_start_row) {
+                const identity = index.identity_at_body_index(row - body_start + 1);
+                return identity === undefined ? undefined : projection.display_row_for_identity(identity);
+            }
+            const band_index = row - band_start_row;
+            return band_index < band.length ? layout_end + band_index : undefined;
+        },
+        display_row_for_identity: (identity) => {
+            if (identity.kind === 'pending') {
+                const band_index = band_index_by_id.get(identity.pendingRowId);
+                if (band_index !== undefined) return layout_end + band_index;
+            } else if (identity.sourceRow < body_start) {
+                return input.displayRowForSource(identity.sourceRow);
+            }
+            const display_index = index.display_index_of(identity);
+            return display_index === undefined ? undefined : fixed_count + display_index;
+        },
+        display_row_for_source_display: (source_display_row) => {
+            if (!Number.isSafeInteger(source_display_row) || source_display_row < 0) return undefined;
+            if (source_display_row < fixed_count) return source_display_row;
+            const sourceRow = body_start + source_display_row - fixed_count;
+            if (sourceRow >= input.sourceRowCount) return undefined;
+            const display_index = index.display_index_of({ kind: 'source', sourceRow });
+            return display_index === undefined ? undefined : fixed_count + display_index;
+        },
+        display_row_for_tail_removal_id: () => undefined,
+        source_display_intervals: (intervals) => {
+            const out: { start: number; end: number }[] = [];
+            for (const interval of intervals) {
+                const start = Math.max(0, interval.start);
+                const end = Math.min(layout_end - 1, interval.end);
+                if (end < start) continue;
+                if (start < fixed_count) out.push({ start, end: Math.min(end, fixed_count - 1) });
+                const first = Math.max(start, fixed_count) - fixed_count;
+                const last = end - fixed_count;
+                if (last < first) continue;
+                // The last displayed segment starting at or before `first`.
+                let low = 0;
+                let high = displayed.length;
+                while (low < high) {
+                    const middle = (low + high) >>> 1;
+                    if (displayed[middle]!.displayBefore <= first) low = middle + 1;
+                    else high = middle;
+                }
+                for (let at = Math.max(0, low - 1); at < displayed.length; at++) {
+                    const segment = displayed[at]!;
+                    if (segment.displayBefore > last) break;
+                    if (segment.kind !== 'source') continue;
+                    const low_index = Math.max(first, segment.displayBefore);
+                    const high_index = Math.min(last, segment.displayBefore + segment.count - 1);
+                    if (high_index < low_index) continue;
+                    const offset = fixed_count + segment.start - body_start - segment.displayBefore;
+                    out.push({ start: low_index + offset, end: high_index + offset });
+                }
+            }
+            // A range across run boundaries covers the union of its runs' rows.
+            out.sort((left, right) => left.start - right.start);
+            const merged: { start: number; end: number }[] = [];
+            for (const interval of out) {
+                const previous = merged[merged.length - 1];
+                if (previous !== undefined && interval.start <= previous.end + 1) {
+                    previous.end = Math.max(previous.end, interval.end);
+                } else {
+                    merged.push({ ...interval });
+                }
+            }
+            return merged;
+        },
     };
     return Object.freeze(projection);
 }
