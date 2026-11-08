@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
     a1_formula_references,
+    formula_reference_tokens,
     is_xlsx_formula_text,
     local_a1_formula_references,
     retarget_moved_a1_formula,
@@ -260,5 +261,173 @@ describe('workbook_a1_formula_references', () => {
                 lastColumn: 2,
             },
         ]);
+    });
+});
+
+describe('formula reference tokenizer', () => {
+    const shapes = (formula: string) => formula_reference_tokens(formula).references.map(
+        (token) => ({
+            kind: token.kind,
+            text: formula.slice(token.start, token.end),
+            sheet: token.sheetName,
+            corners: token.corners.map((corner) => ({
+                text: formula.slice(corner.start, corner.end),
+                sheet: corner.sheet && formula.slice(corner.sheet.start, corner.sheet.end),
+                row: corner.row && `${corner.row.absolute ? '$' : ''}${corner.row.value}`
+                    + `@${formula.slice(corner.row.start, corner.row.end)}`,
+                column: corner.column && `${corner.column.absolute ? '$' : ''}${corner.column.value}`
+                    + `@${formula.slice(corner.column.start, corner.column.end)}`,
+            })),
+        }),
+    );
+    const issues = (formula: string) => formula_reference_tokens(formula).issues.map(
+        (issue) => ({
+            kind: issue.kind,
+            text: formula.slice(issue.start, issue.end),
+            worksheets: issue.worksheets,
+        }),
+    );
+
+    it('keeps each corner, its spans, and its $ flags in authored order', () => {
+        expect(shapes('=SUM($b5:A$2)+c3')).toEqual([
+            {
+                kind: 'range',
+                text: '$b5:A$2',
+                sheet: undefined,
+                corners: [
+                    { text: '$b5', sheet: undefined, row: '5@5', column: '$2@b' },
+                    { text: 'A$2', sheet: undefined, row: '$2@2', column: '1@A' },
+                ],
+            },
+            {
+                kind: 'cell',
+                text: 'c3',
+                sheet: undefined,
+                corners: [{ text: 'c3', sheet: undefined, row: '3@3', column: '3@c' }],
+            },
+        ]);
+    });
+
+    it('reads whole-row and whole-column references', () => {
+        expect(shapes('=SUM(3:$5)+SUM($A:C)')).toEqual([
+            {
+                kind: 'rows',
+                text: '3:$5',
+                sheet: undefined,
+                corners: [
+                    { text: '3', sheet: undefined, row: '3@3', column: undefined },
+                    { text: '$5', sheet: undefined, row: '$5@5', column: undefined },
+                ],
+            },
+            {
+                kind: 'columns',
+                text: '$A:C',
+                sheet: undefined,
+                corners: [
+                    { text: '$A', sheet: undefined, row: undefined, column: '$1@A' },
+                    { text: 'C', sheet: undefined, row: undefined, column: '3@C' },
+                ],
+            },
+        ]);
+    });
+
+    it('reads unquoted, quoted, and per-corner sheet qualifiers', () => {
+        const formula = "=Sheet1!A1:Sheet1!B2+'Sales Q1'!C3+'It''s'!D4:E5+sheet1!1:SHEET1!2";
+        expect(shapes(formula).map(({ kind, text, sheet, corners }) => ({
+            kind,
+            text,
+            sheet,
+            sheets: corners.map((corner) => corner.sheet),
+        }))).toEqual([
+            { kind: 'range', text: 'Sheet1!A1:Sheet1!B2', sheet: 'Sheet1', sheets: ['Sheet1!', 'Sheet1!'] },
+            { kind: 'cell', text: "'Sales Q1'!C3", sheet: 'Sales Q1', sheets: ["'Sales Q1'!"] },
+            { kind: 'range', text: "'It''s'!D4:E5", sheet: "It's", sheets: ["'It''s'!", undefined] },
+            { kind: 'rows', text: 'sheet1!1:SHEET1!2', sheet: 'sheet1', sheets: ['sheet1!', 'SHEET1!'] },
+        ]);
+        const quoted = formula_reference_tokens("='Sales Q1'!C3").references[0].corners[0].sheet;
+        expect(quoted).toEqual({ name: 'Sales Q1', quoted: true, start: 1, end: 12 });
+    });
+
+    it('skips strings, functions, names, external workbooks, and structured references', () => {
+        expect(shapes(
+            '="A1"&LOG10(2)&[1]Sheet1!A1:B2&\'[Book.xlsx]Data\'!C3&[Revenue]&[@Cost]'
+            + '&Data![Revenue]&Table1[[#Data],[A1]]&Name1&TRUE&D4',
+        ).map((token) => token.text)).toEqual(['D4']);
+        expect(issues('=[Book.xlsx]Sheet1!A1:B2+[Book.xlsx]Sheet1![Revenue]')).toEqual([]);
+    });
+
+    it('reports a range operator with a non-reference operand', () => {
+        expect(issues('=SUM(INDEX(A:A,1):B5)')).toEqual([
+            { kind: 'rangeOperand', text: 'INDEX(A:A,1):B5', worksheets: [undefined] },
+        ]);
+        expect(shapes('=SUM(INDEX(A:A,1):B5)').map((token) => token.text)).toEqual(['A:A']);
+        expect(issues('=SUM(B5:INDEX(Data!A:A,2))')).toEqual([
+            { kind: 'rangeOperand', text: 'B5:INDEX(Data!A:A,2)', worksheets: [undefined, 'Data'] },
+        ]);
+        expect(issues('=INDEX(Data!A:A,MATCH(")",A:A,0)):B5')).toEqual([{
+            kind: 'rangeOperand',
+            text: 'INDEX(Data!A:A,MATCH(")",A:A,0)):B5',
+            worksheets: [undefined, 'Data'],
+        }]);
+        expect(issues("=INDEX(Data!A:A,MATCH(1,'Da(ta'!A:A,0)):B5")).toEqual([{
+            kind: 'rangeOperand',
+            text: "INDEX(Data!A:A,MATCH(1,'Da(ta'!A:A,0)):B5",
+            worksheets: [undefined, 'Data', 'Da(ta'],
+        }]);
+        expect(issues('=SUM(A1:B2:Data!C3)')).toEqual([
+            { kind: 'rangeOperand', text: 'A1:B2:Data!C3', worksheets: [undefined, 'Data'] },
+        ]);
+        expect(issues('=SUM(Total:B5)')).toEqual([
+            { kind: 'rangeOperand', text: 'Total:B5', worksheets: [undefined] },
+        ]);
+        expect(shapes('=SUM(A1:B2:C3)')).toEqual([]);
+    });
+
+    it('reports ranges whose corners name different worksheets', () => {
+        expect(issues('=SUM(Sheet1!A1:Sheet2!B2)+SUM(A1:Sheet2!B2)')).toEqual([
+            { kind: 'mixedSheets', text: 'Sheet1!A1:Sheet2!B2', worksheets: ['Sheet1', 'Sheet2'] },
+            { kind: 'mixedSheets', text: 'A1:Sheet2!B2', worksheets: [undefined, 'Sheet2'] },
+        ]);
+    });
+
+    it('reports 3D, spill, and R1C1 references', () => {
+        expect(issues("=SUM(Sheet1:Sheet3!A1)+SUM('Jan:Mar'!B2:B4)")).toEqual([
+            { kind: 'threeDimensional', text: 'Sheet1:Sheet3!A1', worksheets: ['Sheet1', 'Sheet3'] },
+            { kind: 'threeDimensional', text: "'Jan:Mar'!B2:B4", worksheets: ['Jan', 'Mar'] },
+        ]);
+        expect(issues('=SUM(A1#)+Data!B2#')).toEqual([
+            { kind: 'spill', text: 'A1#', worksheets: [undefined] },
+            { kind: 'spill', text: 'Data!B2#', worksheets: ['Data'] },
+        ]);
+        expect(issues('=R1C1+R[1]C[-2]+RC+Data!R2C+C[1]')).toEqual([
+            { kind: 'r1c1', text: 'R1C1', worksheets: [undefined] },
+            { kind: 'r1c1', text: 'R[1]C[-2]', worksheets: [undefined] },
+            { kind: 'r1c1', text: 'RC', worksheets: [undefined] },
+            { kind: 'r1c1', text: 'Data!R2C', worksheets: ['Data'] },
+            { kind: 'r1c1', text: 'C[1]', worksheets: [undefined] },
+        ]);
+        // `RC4` is an A1 cell, and `ROUND` is a function.
+        expect(shapes('=RC4+ROUND(R2,0)').map((token) => token.text)).toEqual(['RC4', 'R2']);
+        expect(issues('=RC4+ROUND(R2,0)')).toEqual([]);
+    });
+
+    it('finds the same references as the existing lexer wherever both read them', () => {
+        for (const formula of [
+            '=SUM(A1:B2)+$C$3+Sheet2!D4:E5',
+            "='My Sheet'!A:A+1:3+XFD1048576",
+            '=IF(A1>0,"B2",C3)&[Revenue]',
+        ]) {
+            expect(formula_reference_tokens(formula).references.map((token) => {
+                const rows = token.corners.map((corner) => corner.row?.value);
+                const columns = token.corners.map((corner) => corner.column?.value);
+                return {
+                    ...(token.sheetName === undefined ? {} : { sheetName: token.sheetName }),
+                    firstRow: Math.min(...rows.map((row) => row ?? 1)) - 1,
+                    firstColumn: Math.min(...columns.map((column) => column ?? 1)) - 1,
+                    lastRow: Math.max(...rows.map((row) => row ?? 1_048_576)) - 1,
+                    lastColumn: Math.max(...columns.map((column) => column ?? 16_384)) - 1,
+                };
+            })).toEqual(a1_formula_references(formula));
+        }
     });
 });

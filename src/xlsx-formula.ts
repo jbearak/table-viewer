@@ -18,6 +18,11 @@ function column_index(letters: string): number {
     return index;
 }
 
+/** Letters of a 1-based A1 column number (1 → A, 27 → AA). */
+export function a1_column_letters(column: number): string {
+    return column_letters(column);
+}
+
 function column_letters(index: number): string {
     let out = '';
     for (let value = index; value > 0; value = Math.floor((value - 1) / 26)) {
@@ -550,6 +555,491 @@ export function a1_formula_references(formula: string): A1FormulaReference[] {
         index += token.length;
     }
     return references;
+}
+
+/** One axis of a reference corner, as the author wrote it. */
+export interface FormulaReferenceAxis {
+    /** 1-based worksheet row number, or 1-based column number (A = 1). */
+    readonly value: number;
+    readonly absolute: boolean;
+    /** UTF-16 span of the coordinate characters, after any `$`. */
+    readonly start: number;
+    readonly end: number;
+}
+
+/** A worksheet qualifier such as `Sheet1!` or `'Sales Q1'!`. */
+export interface FormulaReferenceSheet {
+    /** Unescaped worksheet name. */
+    readonly name: string;
+    readonly quoted: boolean;
+    /** UTF-16 span of the qualifier, including any quotes and the `!`. */
+    readonly start: number;
+    readonly end: number;
+}
+
+export interface FormulaReferenceCorner {
+    /** UTF-16 span of the corner, including its own sheet qualifier. */
+    readonly start: number;
+    readonly end: number;
+    readonly sheet?: FormulaReferenceSheet;
+    /** Absent for whole-column references. */
+    readonly row?: FormulaReferenceAxis;
+    /** Absent for whole-row references. */
+    readonly column?: FormulaReferenceAxis;
+}
+
+export type FormulaReferenceKind = 'cell' | 'range' | 'rows' | 'columns';
+
+/** One direct A1 reference with each corner kept as written. */
+export interface FormulaReferenceToken {
+    readonly kind: FormulaReferenceKind;
+    /** UTF-16 span of the whole reference, qualifiers included. */
+    readonly start: number;
+    readonly end: number;
+    /** The qualified worksheet; absent for the formula's own worksheet. */
+    readonly sheetName?: string;
+    /** In the order the author wrote them; one corner for a single cell. */
+    readonly corners: readonly FormulaReferenceCorner[];
+}
+
+/**
+ * A construct the tokenizer will not turn into a reference token, because a
+ * structural change could not adjust it without guessing:
+ *
+ * - `rangeOperand`: a range operator with an operand that is not a direct
+ *   reference, such as `INDEX(A:A,1):B5`, or a chain such as `A1:B2:C3`;
+ * - `mixedSheets`: a range whose corners name different worksheets, such as
+ *   `A1:Sheet2!B2`;
+ * - `threeDimensional`: a reference across worksheets, such as
+ *   `Sheet1:Sheet3!A1`;
+ * - `spill`: a spilled-range reference, such as `A1#`;
+ * - `r1c1`: R1C1 reference text, such as `R1C1` or `R[1]C`.
+ */
+export type FormulaReferenceIssueKind =
+    | 'rangeOperand'
+    | 'mixedSheets'
+    | 'threeDimensional'
+    | 'spill'
+    | 'r1c1';
+
+export interface FormulaReferenceIssue {
+    readonly kind: FormulaReferenceIssueKind;
+    /** UTF-16 span of the construct, for messages. */
+    readonly start: number;
+    readonly end: number;
+    /**
+     * Worksheets the construct names: a qualifier's unescaped name, or
+     * `undefined` for the formula's own worksheet. A 3D reference lists its
+     * first and last worksheet.
+     */
+    readonly worksheets: readonly (string | undefined)[];
+}
+
+export interface FormulaReferenceLex {
+    readonly references: readonly FormulaReferenceToken[];
+    readonly issues: readonly FormulaReferenceIssue[];
+}
+
+function string_literal_end(formula: string, offset: number): number {
+    let index = offset + 1;
+    while (index < formula.length) {
+        if (formula[index] !== '"') {
+            index += 1;
+            continue;
+        }
+        if (formula[index + 1] === '"') {
+            index += 2;
+            continue;
+        }
+        return index + 1;
+    }
+    return index;
+}
+
+function sheet_qualifier_at(formula: string, offset: number): FormulaReferenceSheet | undefined {
+    const prefix = sheet_prefix_at(formula, offset).prefix;
+    return prefix === undefined ? undefined : {
+        name: prefix.name,
+        quoted: formula[offset] === "'",
+        start: offset,
+        end: offset + prefix.length,
+    };
+}
+
+function reference_axis_at(
+    formula: string,
+    offset: number,
+    parse: (value: string, offset: number) => ParsedA1Axis | undefined,
+): FormulaReferenceAxis | undefined {
+    const parsed = parse(formula, offset);
+    if (parsed === undefined) return undefined;
+    const absolute = formula[offset] === '$';
+    return {
+        value: parsed.value,
+        absolute,
+        start: absolute ? offset + 1 : offset,
+        end: parsed.end,
+    };
+}
+
+/** A corner after a range colon, optionally with its own sheet qualifier. */
+function second_corner_at(
+    formula: string,
+    offset: number,
+    kind: 'cell' | 'rows' | 'columns',
+): FormulaReferenceCorner | undefined {
+    const sheet = sheet_qualifier_at(formula, offset);
+    const start = sheet?.end ?? offset;
+    if (kind === 'cell') {
+        const cell = parse_a1_cell_at(formula, start);
+        if (cell === undefined) return undefined;
+        const column = reference_axis_at(formula, start, parse_a1_column_at)!;
+        const row = reference_axis_at(formula, column.end, parse_a1_row_at)!;
+        return { start: offset, end: row.end, ...(sheet ? { sheet } : {}), row, column };
+    }
+    const axis = reference_axis_at(
+        formula,
+        start,
+        kind === 'rows' ? parse_a1_row_at : parse_a1_column_at,
+    );
+    if (
+        axis === undefined
+        || identifier_character(formula[axis.end])
+        || formula[axis.end] === '$'
+    ) return undefined;
+    return {
+        start: offset,
+        end: axis.end,
+        ...(sheet ? { sheet } : {}),
+        ...(kind === 'rows' ? { row: axis } : { column: axis }),
+    };
+}
+
+interface LexedReference {
+    readonly kind: FormulaReferenceKind;
+    readonly corners: readonly FormulaReferenceCorner[];
+}
+
+/**
+ * Decompose the direct reference at `offset` into corners. The grammar is
+ * {@link a1_formula_reference_at}'s, extended only by a sheet qualifier on the
+ * second corner (`Sheet1!A1:Sheet1!B2`).
+ */
+function lexed_reference_at(formula: string, offset: number): LexedReference | undefined {
+    const sheet = sheet_qualifier_at(formula, offset);
+    const start = sheet?.end ?? offset;
+    const first_corner = (axes: Pick<FormulaReferenceCorner, 'row' | 'column'>, end: number) => ({
+        start: offset,
+        end,
+        ...(sheet ? { sheet } : {}),
+        ...axes,
+    });
+    const base = a1_formula_reference_at(formula, offset);
+    if (base === undefined) {
+        // Only a per-corner qualifier can make a whole-row or whole-column
+        // range unreadable to the base grammar: `Sheet1!1:Sheet1!3`.
+        if (sheet === undefined) return undefined;
+        for (const kind of ['columns', 'rows'] as const) {
+            const axis = reference_axis_at(
+                formula,
+                start,
+                kind === 'rows' ? parse_a1_row_at : parse_a1_column_at,
+            );
+            if (axis === undefined || formula[axis.end] !== ':') continue;
+            const second = second_corner_at(formula, axis.end + 1, kind);
+            if (second?.sheet === undefined) continue;
+            return {
+                kind,
+                corners: [
+                    first_corner(kind === 'rows' ? { row: axis } : { column: axis }, axis.end),
+                    second,
+                ],
+            };
+        }
+        return undefined;
+    }
+    const end = offset + base.length;
+    const axis_range = parse_a1_axis_range_at(formula, start);
+    if (axis_range !== undefined && start + axis_range.length === end) {
+        const first_column = reference_axis_at(formula, start, parse_a1_column_at);
+        if (first_column !== undefined && formula[first_column.end] === ':') {
+            const last = reference_axis_at(formula, first_column.end + 1, parse_a1_column_at);
+            if (last !== undefined && last.end === end) {
+                return {
+                    kind: 'columns',
+                    corners: [
+                        first_corner({ column: first_column }, first_column.end),
+                        { start: first_column.end + 1, end, column: last },
+                    ],
+                };
+            }
+        }
+        const first_row = reference_axis_at(formula, start, parse_a1_row_at)!;
+        const last_row = reference_axis_at(formula, first_row.end + 1, parse_a1_row_at)!;
+        return {
+            kind: 'rows',
+            corners: [
+                first_corner({ row: first_row }, first_row.end),
+                { start: first_row.end + 1, end, row: last_row },
+            ],
+        };
+    }
+    const column = reference_axis_at(formula, start, parse_a1_column_at)!;
+    const row = reference_axis_at(formula, column.end, parse_a1_row_at)!;
+    const first = first_corner({ row, column }, row.end);
+    if (row.end < end) {
+        const last_column = reference_axis_at(formula, row.end + 1, parse_a1_column_at)!;
+        const last_row = reference_axis_at(formula, last_column.end, parse_a1_row_at)!;
+        return {
+            kind: 'range',
+            corners: [first, { start: row.end + 1, end, row: last_row, column: last_column }],
+        };
+    }
+    if (formula[end] === ':') {
+        const second = second_corner_at(formula, end + 1, 'cell');
+        if (second?.sheet !== undefined) return { kind: 'range', corners: [first, second] };
+    }
+    return { kind: 'cell', corners: [first] };
+}
+
+function same_sheet_name(left: string, right: string): boolean {
+    return left.localeCompare(right, undefined, { sensitivity: 'accent' }) === 0;
+}
+
+/** Start of the range-operator operand that ends just before `colon`. */
+function operand_start_before(formula: string, colon: number): number {
+    let index = colon;
+    if (formula[index - 1] === ')') {
+        // Parentheses inside string literals and quoted sheet names do not nest.
+        const in_string = new Uint8Array(colon);
+        for (let at = 0; at < colon; at++) {
+            const quote = formula[at];
+            if (quote !== '"' && quote !== "'") continue;
+            let end = at + 1;
+            while (end < formula.length) {
+                if (formula[end] !== quote) {
+                    end += 1;
+                } else if (formula[end + 1] === quote) {
+                    end += 2;
+                } else {
+                    end += 1;
+                    break;
+                }
+            }
+            end = Math.min(end, colon);
+            in_string.fill(1, at, end);
+            at = end - 1;
+        }
+        let depth = 0;
+        while (index > 0) {
+            index -= 1;
+            if (in_string[index] === 1) continue;
+            if (formula[index] === ')') depth += 1;
+            if (formula[index] === '(' && --depth === 0) break;
+        }
+    }
+    while (index > 0 && (identifier_character(formula[index - 1]) || /[$!'\\]/.test(formula[index - 1]))) {
+        index -= 1;
+    }
+    return index;
+}
+
+/** End of the range-operator operand that starts just after `colon`. */
+function operand_end_after(
+    formula: string,
+    colon: number,
+    sheets: (string | undefined)[],
+): number {
+    const start = colon + 1;
+    const reference = a1_formula_reference_at(formula, start);
+    if (reference !== undefined) {
+        sheets.push(reference.reference.sheetName);
+        return start + reference.length;
+    }
+    let index = start + (sheet_prefix_at(formula, start).prefix?.length ?? 0);
+    while (index < formula.length && (identifier_character(formula[index]) || formula[index] === '$')) {
+        index += 1;
+    }
+    if (formula[index] !== '(') return index;
+    let depth = 0;
+    while (index < formula.length) {
+        if (formula[index] === '"') {
+            index = string_literal_end(formula, index);
+            continue;
+        }
+        if (formula[index] === '(') depth += 1;
+        if (formula[index] === ')' && --depth === 0) return index + 1;
+        index += 1;
+    }
+    return index;
+}
+
+const R1C1_REFERENCE = /^(?:[Rr](?:\[-?\d+\]|\d+)?[Cc](?:\[-?\d+\]|\d+)?|[Rr]\[-?\d+\]|[Cc]\[-?\d+\])/;
+
+/** End of R1C1 reference text at `offset`, after any sheet qualifier. */
+function r1c1_reference_end_at(formula: string, offset: number): number | undefined {
+    const start = sheet_qualifier_at(formula, offset)?.end ?? offset;
+    const match = formula.slice(start, start + 24).match(R1C1_REFERENCE);
+    if (match === null) return undefined;
+    const end = start + match[0].length;
+    return identifier_character(formula[end]) || formula[end] === '(' || formula[end] === '['
+        ? undefined
+        : end;
+}
+
+/** An unquoted 3D prefix such as `Sheet1:Sheet3!`, returned with both names. */
+function unquoted_3d_prefix_at(
+    formula: string,
+    offset: number,
+): { readonly first: string; readonly last: string; readonly end: number } | undefined {
+    if (!/[A-Za-z_\\]/.test(formula[offset] ?? '')) return undefined;
+    let index = offset + 1;
+    while (index < formula.length && (identifier_character(formula[index]) || formula[index] === '\\')) {
+        index += 1;
+    }
+    if (formula[index] !== ':') return undefined;
+    const last = sheet_qualifier_at(formula, index + 1);
+    if (last === undefined || last.quoted) return undefined;
+    return { first: formula.slice(offset, index), last: last.name, end: last.end };
+}
+
+/**
+ * Lex every direct A1 reference with its corners as written, and report
+ * every construct that a structural change could not adjust. Strings,
+ * external-workbook references, and structured references are skipped, not
+ * reported. Formula Anchors, the structural support scan, and the writer
+ * share this one reading of a formula.
+ */
+export function formula_reference_tokens(formula: string): FormulaReferenceLex {
+    const references: FormulaReferenceToken[] = [];
+    const issues: FormulaReferenceIssue[] = [];
+    let index = formula.startsWith('=') ? 1 : 0;
+    let bracket_depth = 0;
+    const report = (
+        kind: FormulaReferenceIssueKind,
+        start: number,
+        end: number,
+        worksheets: readonly (string | undefined)[],
+    ) => {
+        issues.push({ kind, start, end, worksheets });
+        index = Math.max(end, index + 1);
+    };
+    while (index < formula.length) {
+        const char = formula[index];
+        if (char === '"') {
+            index = string_literal_end(formula, index);
+            continue;
+        }
+        if (bracket_depth > 0) {
+            if (char === '[') bracket_depth += 1;
+            if (char === ']') bracket_depth -= 1;
+            index += 1;
+            continue;
+        }
+        const previous = formula[index - 1];
+        if (identifier_character(previous) || previous === ']' || previous === '!') {
+            if (char === '[') bracket_depth = 1;
+            index += 1;
+            continue;
+        }
+        const external_end = external_workbook_reference_end_at(formula, index);
+        if (external_end !== undefined) {
+            // `[1]Sheet1!A1:B2`: the reference after the book belongs to it.
+            const tail = formula[external_end - 1] === '!'
+                ? a1_formula_reference_at(formula, external_end)
+                : undefined;
+            index = external_end + (tail?.length ?? 0);
+            continue;
+        }
+        const structured = structured_formula_reference_at(formula, index);
+        if (structured !== undefined) {
+            index += structured.length;
+            continue;
+        }
+        const lexed = lexed_reference_at(formula, index);
+        if (lexed === undefined) {
+            const three_d = unquoted_3d_prefix_at(formula, index);
+            if (three_d !== undefined) {
+                const tail = a1_formula_reference_at(formula, three_d.end);
+                report(
+                    'threeDimensional',
+                    index,
+                    three_d.end + (tail?.length ?? 0),
+                    [three_d.first, three_d.last],
+                );
+                continue;
+            }
+            const r1c1_end = r1c1_reference_end_at(formula, index);
+            if (r1c1_end !== undefined) {
+                report('r1c1', index, r1c1_end, [sheet_qualifier_at(formula, index)?.name]);
+                continue;
+            }
+            if (char === '[') {
+                bracket_depth = 1;
+                index += 1;
+                continue;
+            }
+            index = Math.max(index + 1, sheet_prefix_at(formula, index).scannedEnd);
+            continue;
+        }
+        const start = index;
+        const end = lexed.corners[lexed.corners.length - 1].end;
+        const [first, second] = lexed.corners;
+        const first_sheet = first.sheet?.name;
+        if (first_sheet !== undefined && first_sheet.startsWith('[')) {
+            // A quoted external-workbook reference: `'[Book.xlsx]Sheet1'!A1`.
+            index = end;
+            continue;
+        }
+        if (
+            second?.sheet !== undefined
+            && (first_sheet === undefined || !same_sheet_name(first_sheet, second.sheet.name))
+        ) {
+            report('mixedSheets', start, end, [first_sheet, second.sheet.name]);
+            continue;
+        }
+        if (
+            (first_sheet !== undefined && first_sheet.includes(':'))
+            || formula[end] === '!'
+        ) {
+            const tail = formula[end] === '!' ? a1_formula_reference_at(formula, end + 1) : undefined;
+            report(
+                'threeDimensional',
+                start,
+                formula[end] === '!' ? end + 1 + (tail?.length ?? 0) : end,
+                first_sheet?.includes(':') ? first_sheet.split(':') : [undefined],
+            );
+            continue;
+        }
+        if (formula[end] === '#') {
+            report('spill', start, end + 1, [first_sheet]);
+            continue;
+        }
+        if (previous === ':' || formula[end] === ':') {
+            const sheets: (string | undefined)[] = [first_sheet];
+            const issue_start = previous === ':' ? operand_start_before(formula, start - 1) : start;
+            let issue_end = end;
+            while (formula[issue_end] === ':') {
+                issue_end = Math.max(issue_end + 1, operand_end_after(formula, issue_end, sheets));
+            }
+            // A function operand's result lies on the sheets its own
+            // references name: `INDEX(Data!A:A,1):B5`.
+            for (const inner of a1_formula_references(formula.slice(issue_start, issue_end))) {
+                sheets.push(inner.sheetName);
+            }
+            report('rangeOperand', issue_start, issue_end, [...new Set(sheets)]);
+            continue;
+        }
+        references.push({
+            kind: lexed.kind,
+            start,
+            end,
+            ...(first_sheet !== undefined ? { sheetName: first_sheet } : {}),
+            corners: lexed.corners,
+        });
+        index = end;
+    }
+    return { references, issues };
 }
 
 /** Backward-compatible projection used by worksheet-only callers and tests. */

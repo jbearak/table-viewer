@@ -802,6 +802,12 @@ delete, and move cases. Every case outside those two classes must match Excel
 exactly, or the step does not merge. Cases inside them are recorded in this
 document with both results.
 
+Step 2 had no Excel or LibreOffice to run, so its insert and delete fixtures
+(`src/test/formula-anchors.test.ts`, "Excel oracle fixtures") are hand-written
+from Excel's documented insert and delete adjustment rules and labeled as
+such. Move cases rely on the flagged superset above until an Excel run can
+confirm them.
+
 Because rendering is a function of the anchors and the full layouts, two
 operation sequences that produce the same full layouts produce the same text.
 That is the rendering module's central property test.
