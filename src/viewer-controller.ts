@@ -5452,16 +5452,25 @@ export function attach_viewer(
         const predates_completed_clear = file_edit_state?.clearedStateRevision !== undefined
             && snapshot.revision <= file_edit_state.clearedStateRevision;
         const owns_session = owns_edit_session();
+        // Peer compatibility rule 1 for the claim that needs no grant: version-2
+        // state is rehydrated only for a renderer that declared layouts. Before
+        // its ready message nothing has declared anything, so the claim waits
+        // for the ready path, which claims (or refuses) with the answer known.
+        const layout_peer_blocked = !renderer_understands_layout
+            && stored_pending_edits_version(state) === 2;
         // A claim is only worth making when some slot describes a worksheet this
         // workbook actually has. Already-owned projections never need this scan.
         const rehydratable = !owns_session && allow_claim && editing_supported
             && has_rehydratable_pending_edits(state.pendingEdits, sheets);
+        if (rehydratable && layout_peer_blocked && renderer_ready) {
+            show_owner_warning('Reload this window to keep editing this file.');
+        }
         const represents_session = !predates_completed_clear
             && !edit_cleanup_blocked()
             && editing_supported
             && (
                 owns_session
-                || (rehydratable && try_claim_edit_session(false))
+                || (rehydratable && !layout_peer_blocked && try_claim_edit_session(false))
             );
         // A rehydration claim acquires the session with no grant round-trip,
         // so the grant-time ledger seeding never runs for it. Seed here, once,
@@ -5508,6 +5517,8 @@ export function attach_viewer(
             // drafts are not dropped either — they stay durable, and reappear the
             // moment the workbook has those names again.
             && rehydratable
+            // Withheld from a renderer that cannot read the layout; durable.
+            && !layout_peer_blocked
             && edit_phase().type === 'free'
         ) {
             console.error('Dropped durable CSV pending edits with no panel holding the session');
@@ -9013,18 +9024,29 @@ export function attach_viewer(
         // surviving edit is the folded live-editor value the user never posted.
         persisted_save_targets.set(operation.identity, operation.durableTargets);
         let conflict_overlays_authenticated = false;
+        let drops_stored_layout = false;
         const committed = await update_file_state((current) => {
             conflict_overlays_authenticated = false;
+            drops_stored_layout = false;
             for (const [index, worksheet] of operation.identity.worksheets.entries()) {
                 const target = operation.durableTargets[index];
-                const canonical = own_pending_structural_changes(
-                    pending_changes_for_sheet(
-                        current.pendingEdits,
-                        target.sheetIndex,
-                        target.sheetName,
-                        target.worksheetId,
-                    ) ?? {},
-                ).conflicts;
+                const durable_slot = pending_changes_for_sheet(
+                    current.pendingEdits,
+                    target.sheetIndex,
+                    target.sheetName,
+                    target.worksheetId,
+                );
+                // A submission without the slot's layout fields would replace
+                // the slot (or save around it and then clear it) and lose the
+                // layout. Only a stale or older renderer sends one.
+                if (
+                    pending_changes_carry_layout(durable_slot)
+                    && !pending_changes_carry_layout(worksheet.structuralChanges)
+                ) {
+                    drops_stored_layout = true;
+                    return current;
+                }
+                const canonical = own_pending_structural_changes(durable_slot ?? {}).conflicts;
                 const submitted = worksheet.structuralChanges?.conflicts ?? [];
                 if (JSON.stringify(submitted) !== JSON.stringify(canonical)) {
                     return current;
@@ -9058,6 +9080,9 @@ export function attach_viewer(
             });
             return { ...current, pendingEdits: pending };
         }, undefined, () => save_operation_is_current(operation));
+        if (drops_stored_layout) {
+            throw new Error('Reload this window to keep editing this file.');
+        }
         if (
             !conflict_overlays_authenticated
             || !committed

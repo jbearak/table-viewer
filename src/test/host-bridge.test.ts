@@ -294,6 +294,42 @@ describe('host-bridge', () => {
         expect(injected.postMessage).toHaveBeenCalledTimes(1);
     });
 
+    it('records a complete snapshot when a cells-only publication clears a layout', async () => {
+        const injected = { postMessage: vi.fn() };
+        (globalThis as { __tableViewerHostBridge?: unknown })
+            .__tableViewerHostBridge = injected;
+        const { pending_changes_durability } = await import('../webview/host-bridge');
+        const base = {
+            sheetIndex: 0,
+            sheetName: 'Sheet1',
+            formatTemplates: [],
+            appendedRows: [],
+            tailRemovals: [],
+            conflicts: [],
+        };
+        pending_changes_durability.publish('session:layout', {
+            ...base,
+            cells: {},
+            rowLayout: {
+                runs: [{ kind: 'source', start: 0, count: 2 }],
+                removedSourceRows: [{ start: 1, count: 1 }],
+                discardedPendingRows: [],
+            },
+        }, 3);
+        const cleared = { ...base, cells: { '0:0': { value: 'v', base: 'a' } } };
+        pending_changes_durability.publish('session:layout', cleared, 3);
+
+        // The clearing publication must go out as a structural snapshot, and the
+        // retained base a refresh merges against must be that same snapshot.
+        expect(injected.postMessage).toHaveBeenLastCalledWith(expect.objectContaining({
+            type: 'pendingChangesChanged',
+            changes: cleared,
+        }));
+        expect(pending_changes_durability.unacknowledged_structural_payload(
+            'session:layout', 0, 'Sheet1',
+        )).toEqual(cleared);
+    });
+
     it('prefers an injected global bridge over acquireVsCodeApi', async () => {
         const injected = { postMessage: vi.fn() };
         (globalThis as { __tableViewerHostBridge?: unknown })

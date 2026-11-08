@@ -322,14 +322,17 @@ export const pending_changes_durability = {
         force = false,
     ): number {
         const channel = pending_edit_channel(editSessionId);
-        const payload = pending_changes_channel_payload(changes);
         const dedupe_key = worksheet_target_key(changes);
         const latest = channel.latestPublicationBySheet.get(dedupe_key);
         const layout = pending_changes_carry_layout(changes);
         // The legacy cell-only shape keeps the host's stored layout fields, so
-        // the publication that drops a published layout must be structural.
+        // the publication that drops a published layout must be structural,
+        // and its retained payload the complete snapshot a refresh merges with.
         const structural = has_structural_publication_state(changes)
             || latest?.layout === true;
+        const payload = structural
+            ? pending_changes_payload(changes)
+            : pending_edit_payload(changes.cells);
         if (
             !force
             && latest?.payload === payload

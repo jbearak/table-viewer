@@ -863,9 +863,13 @@ function serialized_states_equal(left: StoredPerFileState, right: StoredPerFileS
     return JSON.stringify(left) === JSON.stringify(right);
 }
 
+/** Pending work canonicalization must not lose: the slots and any rekey intent. */
 function pending_json(state: StoredPerFileState): string | undefined {
     const pending = (state as PerFileState).pendingEdits;
-    return has_any_pending_edits(pending) ? JSON.stringify(pending) : undefined;
+    const intent = (state as PerFileState).structuralRekeyIntent;
+    const has_slots = has_any_pending_edits(pending);
+    if (intent === undefined) return has_slots ? JSON.stringify(pending) : undefined;
+    return JSON.stringify({ pendingEdits: has_slots ? pending : null, structuralRekeyIntent: intent });
 }
 
 function authorities_exactly_equal(left: DurableFileAuthority, right: DurableFileAuthority): boolean {

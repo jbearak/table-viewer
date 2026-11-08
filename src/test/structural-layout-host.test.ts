@@ -98,6 +98,7 @@ async function open_viewer(options: {
     );
     panel.onDidDispose(() => controller.dispose());
     const warning = vi.spyOn(vscode_mock.window, 'showWarningMessage');
+    warning.mockClear();
     await panel.__receive(options.declaresLayout === false
         ? { type: 'ready' }
         : { type: 'ready', structuralLayout: 1 });
@@ -206,6 +207,31 @@ describe('peer compatibility rule 1: the ready declaration', () => {
         await viewer.dispose();
     });
 
+    it('does not rehydrate a version-2 session for a renderer that does not declare layouts', async () => {
+        const rehydrated = async (declaresLayout: boolean) => {
+            const viewer = await open_viewer({
+                initial: slot({
+                    cells: { '0:0': { value: 'x', base: 'a' } },
+                    rowLayout: REMOVAL_LAYOUT,
+                    structuralBasis: BASIS,
+                }),
+                declaresLayout,
+            });
+            const snapshots = (viewer.panel.__messages as Message[]).filter((message) =>
+                message.type === 'workbookSnapshot') as unknown as {
+                snapshot: { capabilities: { csvEditSessionId?: string } };
+            }[];
+            const claimed = snapshots.some((message) =>
+                message.snapshot.capabilities.csvEditSessionId !== undefined);
+            const warned = viewer.warning.mock.calls.some(([message]) =>
+                message === 'Reload this window to keep editing this file.');
+            await viewer.dispose();
+            return { claimed, warned };
+        };
+        expect(await rehydrated(false)).toEqual({ claimed: false, warned: true });
+        expect(await rehydrated(true)).toEqual({ claimed: true, warned: false });
+    });
+
     it('still grants version-1 durable state to an older renderer (upgrade path)', async () => {
         const viewer = await open_viewer({
             initial: slot({ cells: { '0:0': { value: 'x', base: 'a' } } }),
@@ -273,6 +299,45 @@ describe('peer compatibility rule 2: layout-free full snapshots', () => {
             tailRemovals: [],
             conflicts: [],
         });
+        await viewer.dispose();
+    });
+});
+
+describe('saves that would drop a stored layout', () => {
+    it.each([
+        ['with structural changes', { structuralChanges: { formatTemplates: [], appendedRows: [], tailRemovals: [], conflicts: [] } }],
+        ['in the cell-only shape', {}],
+    ])('are refused %s, without writing or replacing the slot', async (_label, structural) => {
+        const viewer = await open_viewer({
+            initial: slot({ cells: { '0:0': { value: 'x', base: 'a' } } }),
+            declaresLayout: false,
+        });
+        expect(viewer.session).toMatchObject({ granted: true });
+        const current = viewer.state.get_state(FILE);
+        await viewer.state.store.compare_and_set(FILE, viewer.state.revision(FILE), {
+            ...current,
+            pendingEdits: [{ ...current.pendingEdits![0]!, rowLayout: REMOVAL_LAYOUT, structuralBasis: BASIS }],
+        });
+        const write = vi.spyOn(vscode_mock.workspace.fs, 'writeFile');
+        await viewer.panel.__receive({
+            type: 'saveCsv',
+            operation: {
+                editSessionId: viewer.session.editSessionId!,
+                saveRequestId: 'save',
+                worksheets: [{
+                    sheetIndex: 0,
+                    sheetName: 'Sheet1',
+                    edits: { '0:0': 'x' },
+                    dirtyEdits: { '0:0': { value: 'x', base: 'a' } },
+                    ...structural,
+                }],
+            },
+        });
+        await viewer.controller.drain();
+        expect((viewer.panel.__messages as Message[]).find((message) =>
+            message.type === 'saveResult')).toMatchObject({ success: false });
+        expect(write).not.toHaveBeenCalled();
+        expect(viewer.durable()).toMatchObject({ rowLayout: REMOVAL_LAYOUT, structuralBasis: BASIS });
         await viewer.dispose();
     });
 });

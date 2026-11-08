@@ -320,6 +320,26 @@ export function file_state_store_contract(
             expect((await store.read(canonical)).state).toEqual({ activeSheetIndex: 2 });
         });
 
+        it('fails closed rather than deleting a candidate holding only a rekey intent', async () => {
+            const backend = fixture();
+            const store = backend.create();
+            const alias = 'C:\\Data\\intent.csv';
+            const canonical = 'c:\\data\\intent.csv';
+            const intent = {
+                saveId: 'save',
+                beforeDigest: 'before',
+                afterDigest: 'after',
+                worksheets: [{ sheetIndex: 0, acceptedSequence: 1 }],
+                receipt: { appendedRows: [], removedSourceRows: [] },
+            };
+            await store.compare_and_set(alias, 0, { structuralRekeyIntent: intent });
+            await store.compare_and_set(canonical, 0, { activeSheetIndex: 2 });
+
+            await expect(store.canonicalize_path!(canonical, (path) => path.toLowerCase()))
+                .rejects.toThrow(/pending/i);
+            expect((await store.read(alias)).state).toEqual({ structuralRekeyIntent: intent });
+        });
+
         it('replays copy provenance before consulting an evicted source', async () => {
             const backend = fixture();
             const store = backend.create(1);
