@@ -1,8 +1,10 @@
 import type { SheetMeta } from './data-source/interface';
-import type {
-    PendingFormulaReferenceBasis,
-    PendingStructuralChanges,
-    RowIdentity,
+import {
+    appended_rows,
+    pending_rows,
+    type PendingFormulaReferenceBasis,
+    type PendingStructuralChanges,
+    type RowIdentity,
 } from './pending-changes';
 import { is_xlsx_formula_edit } from './xlsx-cell-write';
 import { workbook_a1_formula_references } from './xlsx-formula';
@@ -48,7 +50,7 @@ export function capture_pending_formula_reference_bases(
     for (const [target_index, structural] of structural_by_sheet.entries()) {
         const sheet = sheets[target_index];
         const additional = additional_appended_rows[target_index] ?? 0;
-        const appended_row_count = structural.appendedRows.length + additional;
+        const appended_row_count = appended_rows(structural).length + additional;
         if (!sheet || appended_row_count === 0) continue;
         const provisionalStartRow = sheet.sourceRowCount - structural.tailRemovals.length;
         const provisionalRowCount = appended_row_count;
@@ -82,7 +84,7 @@ export function pending_formula_cells_referencing_provisional_rows(
     sheets: readonly SheetMeta[],
 ): readonly PendingFormulaConflictCell[] {
     const basis = target_structural.appendBasis;
-    if (!basis || target_structural.appendedRows.length === 0) return [];
+    if (!basis || appended_rows(target_structural).length === 0) return [];
     const target = sheets[target_sheet_index];
     if (!target) return [];
     const first_provisional_row = basis.provisionalStartRow
@@ -90,7 +92,7 @@ export function pending_formula_cells_referencing_provisional_rows(
     const current_provisional_row = target.sourceRowCount
         - target_structural.tailRemovals.length;
     const last_provisional_row = first_provisional_row
-        + (basis.provisionalRowCount ?? target_structural.appendedRows.length) - 1;
+        + (basis.provisionalRowCount ?? appended_rows(target_structural).length) - 1;
     const sheet_names = sheets.map((sheet) => sheet.name);
     const references_provisional = (
         value: string,
@@ -113,7 +115,7 @@ export function pending_formula_cells_referencing_provisional_rows(
                 && reference.firstRow <= last_provisional_row);
     };
     const conflicts: PendingFormulaConflictCell[] = [];
-    for (const row of formula_structural.appendedRows) {
+    for (const row of pending_rows(formula_structural)) {
         for (const [column, cell] of Object.entries(row.cells)) {
             if (!references_provisional(cell.value, cell.formulaReferenceBases)) continue;
             conflicts.push({

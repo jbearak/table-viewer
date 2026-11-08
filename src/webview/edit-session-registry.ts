@@ -67,6 +67,8 @@ import {
     type PendingCellMoveProvenance,
     type RowIdentity,
     type PendingStructuralChanges,
+    pending_rows,
+    appended_rows,
 } from '../pending-changes';
 import {
     create_pending_row_store,
@@ -334,7 +336,7 @@ export function create_edit_session_registry(
     ): readonly RelativePendingFormulaEdit[] => {
         const snapshot = store.snapshot();
         const pendingRowIndex = store.row_index(row_id);
-        const row = pendingRowIndex === undefined ? undefined : snapshot.appendedRows[pendingRowIndex];
+        const row = pendingRowIndex === undefined ? undefined : pending_rows(snapshot)[pendingRowIndex];
         if (row === undefined) return [];
         const row_index = pendingRowIndex!;
         return Object.entries(row.cells).flatMap(([column_text, cell]) => {
@@ -368,7 +370,7 @@ export function create_edit_session_registry(
     };
     const rebuild_pending_formula_store = (store: PendingRowStore): void => {
         const rows = new Map<string, readonly RelativePendingFormulaEdit[]>();
-        for (const row of store.snapshot().appendedRows) {
+        for (const row of pending_rows(store.snapshot())) {
             const edits = pending_formula_row(store, row.id);
             if (edits.length > 0) rows.set(row.id, edits);
         }
@@ -500,11 +502,13 @@ export function create_edit_session_registry(
     const pending_move_projection = (store: PendingRowStore): PendingMoveProjection => {
         const structural = store.snapshot();
         return {
-            rows: new Map(structural.appendedRows.map((row) => [
+            // Band positions: a pending cell move cannot coexist with a live
+            // layout change, so no inserted row reaches this projection.
+            rows: new Map(appended_rows(structural).map((row) => [
                 row.id,
                 pending_row_move_projection(row),
             ])),
-            indexById: new Map(structural.appendedRows.map((row, index) => [row.id, index])),
+            indexById: new Map(appended_rows(structural).map((row, index) => [row.id, index])),
             appendBasisSourceRowCount: structural.appendBasis?.sourceRowCount,
             tailRemovalCount: structural.tailRemovals.length,
         };
@@ -863,7 +867,7 @@ export function create_edit_session_registry(
             }
             const rows = change.kind === 'rows'
                 ? change.rows
-                : store.snapshot().appendedRows;
+                : pending_rows(store.snapshot());
             for (const row of rows) {
                 value_edit_order_floor = Math.max(value_edit_order_floor, row.createdOrder);
                 for (const cell of Object.values(row.cells)) {

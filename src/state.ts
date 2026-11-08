@@ -382,8 +382,11 @@ function decode_stage(value: unknown): PersistedAuthorityStage {
 export function state_has_pending_edits(state: StoredPerFileState): boolean {
     // Not `Object.keys(...).length`: the worksheet-scoped leaf is a positional
     // array whose empty slots are holes, so `[undefined]` has length 1 while
-    // holding nothing. Ask whether any *slot* has cells.
-    return has_any_pending_edits((state as PerFileState).pendingEdits);
+    // holding nothing. Ask whether any *slot* has cells. A stored structural
+    // rekey intent counts too: it is persisted inside the `pendingEdits`
+    // envelope, and it is unfinished save work that must not be evicted.
+    return has_any_pending_edits((state as PerFileState).pendingEdits)
+        || (state as PerFileState).structuralRekeyIntent !== undefined;
 }
 
 function max_timestamp(existing: number | undefined, captured: number): number {

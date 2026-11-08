@@ -5,6 +5,7 @@ import {
     type WorksheetPendingChanges,
     worksheet_target_key,
 } from '../types';
+import { pending_changes_carry_layout, pending_rows } from '../pending-changes';
 
 /**
  * Host bridge: a narrow abstraction over the channel the webview uses to talk
@@ -56,6 +57,8 @@ interface PendingEditPublication {
     readonly sheetIndex: number;
     readonly sequence: number;
     readonly structural: boolean;
+    /** Carried layout fields, which only the structural shape can clear. */
+    readonly layout?: boolean;
     readonly sourceGeneration?: number;
 }
 
@@ -104,19 +107,27 @@ function pending_changes_payload(changes: WorksheetPendingChanges): string {
         cells,
         // Array order is semantic. Never sort these for dedupe.
         formatTemplates: changes.formatTemplates,
-        appendedRows: changes.appendedRows,
+        appendedRows: pending_rows(changes),
         tailRemovals: changes.tailRemovals,
         ...(changes.appendBasis === undefined ? {} : { appendBasis: changes.appendBasis }),
         conflicts: changes.conflicts,
+        ...(changes.rowLayout === undefined ? {} : { rowLayout: changes.rowLayout }),
+        ...(changes.columnLayout === undefined ? {} : { columnLayout: changes.columnLayout }),
+        ...(changes.pendingColumns === undefined ? {} : { pendingColumns: changes.pendingColumns }),
+        ...(changes.structuralBasis === undefined
+            ? {}
+            : { structuralBasis: changes.structuralBasis }),
     });
 }
 
 /**
  * Whether the structural channel must publish. Orphaned templates and a retained
- * basis count so a publication can explicitly clear or acknowledge them.
+ * basis count so a publication can explicitly clear or acknowledge them. Layout
+ * fields count too: the legacy cell-only shape cannot carry them.
  */
 function has_structural_publication_state(changes: WorksheetPendingChanges): boolean {
-    return changes.appendedRows.length > 0
+    return pending_rows(changes).length > 0
+        || pending_changes_carry_layout(changes)
         || changes.tailRemovals.length > 0
         || changes.formatTemplates.length > 0
         || changes.conflicts.length > 0
@@ -311,10 +322,14 @@ export const pending_changes_durability = {
         force = false,
     ): number {
         const channel = pending_edit_channel(editSessionId);
-        const structural = has_structural_publication_state(changes);
         const payload = pending_changes_channel_payload(changes);
         const dedupe_key = worksheet_target_key(changes);
         const latest = channel.latestPublicationBySheet.get(dedupe_key);
+        const layout = pending_changes_carry_layout(changes);
+        // The legacy cell-only shape keeps the host's stored layout fields, so
+        // the publication that drops a published layout must be structural.
+        const structural = has_structural_publication_state(changes)
+            || latest?.layout === true;
         if (
             !force
             && latest?.payload === payload
@@ -331,6 +346,7 @@ export const pending_changes_durability = {
             sheetIndex: changes.sheetIndex,
             sequence,
             structural,
+            ...(layout ? { layout } : {}),
             ...(structural ? { sourceGeneration } : {}),
         });
         channel.unacknowledgedSequences.add(sequence);

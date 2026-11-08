@@ -1028,9 +1028,11 @@ describe('initial render', () => {
         expect(container!.querySelector('.grid-shell-stub')).toBeNull();
     });
 
-    it('posts a ready message on mount', async () => {
+    it('posts a ready message on mount that declares layout support', async () => {
         const { post_message } = await render_app();
-        expect(post_message).toHaveBeenCalledWith({ type: 'ready' });
+        // Peer compatibility rule 1: the host grants editing on version-2
+        // Pending Changes only to a renderer that declares this.
+        expect(post_message).toHaveBeenCalledWith({ type: 'ready', structuralLayout: 1 });
     });
 
     it('applies and clears live font updates', async () => {

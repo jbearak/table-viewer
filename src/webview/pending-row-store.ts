@@ -13,6 +13,7 @@ import {
     MAX_PENDING_CHANGES_ENCODED_BYTES,
     MAX_PENDING_USER_CHANGES_ENCODED_BYTES,
     own_pending_structural_changes,
+    pending_rows,
     type PendingAppendedRow,
     type PendingAppendBasis,
     type PendingRowCell,
@@ -172,15 +173,19 @@ function json_array_bytes(values: readonly unknown[]): number {
 }
 
 function structural_byte_measure(changes: PendingStructuralChanges): StructuralByteMeasure {
-    const appendedRowsBytes = json_array_bytes(changes.appendedRows);
+    const appendedRowsBytes = json_array_bytes(pending_rows(changes));
     const properties: Array<readonly [string, unknown]> = [
         ['formatTemplates', changes.formatTemplates],
-        ['appendedRows', changes.appendedRows],
+        ['appendedRows', pending_rows(changes)],
         ['tailRemovals', changes.tailRemovals],
         ['conflicts', changes.conflicts],
     ];
     if (changes.appendBasis !== undefined) {
         properties.splice(3, 0, ['appendBasis', changes.appendBasis]);
+    }
+    // Layout fields count against the same envelope bound.
+    for (const key of ['rowLayout', 'columnLayout', 'pendingColumns', 'structuralBasis'] as const) {
+        if (changes[key] !== undefined) properties.push([key, changes[key]]);
     }
     return {
         propertyBytes: properties.reduce((total, [key, value]) => total + (
@@ -238,7 +243,7 @@ export function create_pending_row_store(
     const session_matches = (session_id: string | undefined): boolean =>
         stamp !== null && stamp.session_id === session_id;
     const rebuild_row_index = (): void => {
-        row_index_by_id = new Map(state.appendedRows.map((row, index) => [row.id, index]));
+        row_index_by_id = new Map(pending_rows(state).map((row, index) => [row.id, index]));
     };
     const envelope_bytes = (
         cells: CsvDirtyMap,
@@ -471,7 +476,7 @@ export function create_pending_row_store(
         ) => {
             if (
                 row_ids.length === 0
-                || state.appendedRows.length + row_ids.length > MAX_PENDING_APPENDED_ROWS
+                || pending_rows(state).length + row_ids.length > MAX_PENDING_APPENDED_ROWS
                 || !Number.isSafeInteger(first_created_order)
                 || first_created_order < 0
             ) return false;
@@ -506,7 +511,7 @@ export function create_pending_row_store(
             return mutate(session_id, () => ({
                 ...state,
                 formatTemplates: templates,
-                appendedRows: [...state.appendedRows, ...rows],
+                appendedRows: [...pending_rows(state), ...rows],
                 ...(next_basis === undefined
                     ? {}
                     : { appendBasis: next_basis }),
@@ -516,11 +521,11 @@ export function create_pending_row_store(
             const index = row_index_by_id.get(pending_row_id);
             if (index === undefined || !Number.isSafeInteger(source_column)
                 || source_column < 0 || source_column >= MAX_SHEET_COLUMNS) return false;
-            const current = state.appendedRows[index];
+            const current = pending_rows(state)[index];
             const cells = { ...current.cells };
             if (cell === undefined) delete cells[source_column];
             else cells[source_column] = cell;
-            const rows = state.appendedRows.slice();
+            const rows = pending_rows(state).slice();
             rows[index] = { ...current, cells };
             const conflicts = without_formula_cell_conflict(
                 { kind: 'pending', pendingRowId: pending_row_id },
@@ -547,7 +552,7 @@ export function create_pending_row_store(
             const index = row_index_by_id.get(pending_row_id);
             if (index === undefined || !Number.isSafeInteger(source_column)
                 || source_column < 0 || source_column >= MAX_SHEET_COLUMNS) return false;
-            const current = state.appendedRows[index];
+            const current = pending_rows(state)[index];
             const previous_cell = current.cells[source_column];
             const next_cell = link === null && previous_cell === undefined
                 ? undefined
@@ -556,7 +561,7 @@ export function create_pending_row_store(
             if (next_cell === undefined) delete cells[source_column];
             else cells[source_column] = next_cell;
             const row = { ...current, cells };
-            const appendedRows = state.appendedRows.slice();
+            const appendedRows = pending_rows(state).slice();
             appendedRows[index] = row;
             return publish_local(
                 { ...state, appendedRows },
@@ -569,7 +574,7 @@ export function create_pending_row_store(
             if (!session_matches(session_id) || (edits.length === 0 && row_heights.size === 0)) {
                 return false;
             }
-            const rows = state.appendedRows.slice();
+            const rows = pending_rows(state).slice();
             const copied = new Set<number>();
             for (const edit of edits) {
                 const index = row_index_by_id.get(edit.pendingRowId);
@@ -597,7 +602,7 @@ export function create_pending_row_store(
                 rows[index] = { ...rows[index], viewerRowHeight: height };
             }
             const next_measure = measure_with_row_replacements([...copied].map((index) => ({
-                before: state.appendedRows[index],
+                before: pending_rows(state)[index],
                 after: rows[index],
             })));
             let conflicts = state.conflicts;
@@ -665,9 +670,9 @@ export function create_pending_row_store(
             }
             const indexes = [...pending_row_ids].map((id) => row_index_by_id.get(id));
             if (indexes.some((index) => index === undefined)) return false;
-            const appendedRows = state.appendedRows.slice();
+            const appendedRows = pending_rows(state).slice();
             const replacements = indexes.map((index) => {
-                const before = state.appendedRows[index!];
+                const before = pending_rows(state)[index!];
                 const after = { ...before, viewerRowHeight: height };
                 appendedRows[index!] = after;
                 return { before, after };
@@ -690,9 +695,9 @@ export function create_pending_row_store(
             ) return false;
             const indexes = [...pending_row_ids].map((id) => row_index_by_id.get(id));
             if (indexes.some((index) => index === undefined)) return false;
-            const appendedRows = state.appendedRows.slice();
+            const appendedRows = pending_rows(state).slice();
             const replacements = indexes.map((index) => {
-                const row = state.appendedRows[index!];
+                const row = pending_rows(state)[index!];
                 const highlights: Record<string, CellHighlightColor> = {
                     ...(row.highlights ?? {}),
                 };
@@ -718,9 +723,9 @@ export function create_pending_row_store(
         },
         remove_rows: (session_id, pending_row_ids) => {
             if (!session_matches(session_id)) return undefined;
-            const removed = state.appendedRows.filter((row) => pending_row_ids.has(row.id));
+            const removed = pending_rows(state).filter((row) => pending_row_ids.has(row.id));
             if (removed.length === 0) return [];
-            const appendedRows = state.appendedRows.filter((row) => !pending_row_ids.has(row.id));
+            const appendedRows = pending_rows(state).filter((row) => !pending_row_ids.has(row.id));
             const next = own({
                 ...state,
                 formatTemplates: retained_templates(state.formatTemplates, appendedRows),
@@ -745,7 +750,7 @@ export function create_pending_row_store(
         restore_rows: (session_id, rows, templates) => {
             const by_id = new Map(state.formatTemplates.map((template) => [template.id, template]));
             for (const template of templates) if (!by_id.has(template.id)) by_id.set(template.id, template);
-            const appendedRows = [...state.appendedRows, ...rows]
+            const appendedRows = [...pending_rows(state), ...rows]
                 .sort((left, right) => left.createdOrder - right.createdOrder);
             return mutate(session_id, () => ({
                 ...state,
@@ -784,7 +789,7 @@ export function create_pending_row_store(
         ),
         clear_saved: (session_id, pending_row_ids, removed_source_rows) => {
             if (!session_matches(session_id)) return;
-            const appendedRows = state.appendedRows.filter(
+            const appendedRows = pending_rows(state).filter(
                 (row) => !pending_row_ids.has(row.id),
             );
             const tailRemovals = state.tailRemovals.filter(
