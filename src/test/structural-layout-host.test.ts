@@ -234,6 +234,49 @@ describe('peer compatibility rule 2: legacy-shaped publications', () => {
     });
 });
 
+describe('peer compatibility rule 2: layout-free full snapshots', () => {
+    it('keep the stored layout when the renderer never declared layouts', async () => {
+        const viewer = await open_viewer({
+            initial: slot({ cells: { '0:0': { value: 'x', base: 'a' } } }),
+            declaresLayout: false,
+        });
+        expect(viewer.session).toMatchObject({ granted: true });
+        // A layout stored while this older renderer still holds the session.
+        const current = viewer.state.get_state(FILE);
+        await viewer.state.store.compare_and_set(FILE, viewer.state.revision(FILE), {
+            ...current,
+            pendingEdits: [{ ...current.pendingEdits![0]!, rowLayout: REMOVAL_LAYOUT, structuralBasis: BASIS }],
+        });
+
+        expect(await viewer.publish({ cells: { '0:0': { value: 'typed', base: 'a' } } })).toBe(true);
+        expect(viewer.durable()).toMatchObject({
+            cells: { '0:0': { value: 'typed', base: 'a' } },
+            rowLayout: REMOVAL_LAYOUT,
+            structuralBasis: BASIS,
+        });
+        expect(await viewer.publish({ cells: { '1:0': { value: 'lost', base: 'b' } } })).toBe(false);
+        expect(viewer.durable()?.cells).toEqual({ '0:0': { value: 'typed', base: 'a' } });
+        await viewer.dispose();
+    });
+
+    it('mean the source layout from a renderer that declared layouts', async () => {
+        const viewer = await open_viewer({
+            initial: slot({ rowLayout: REMOVAL_LAYOUT, structuralBasis: BASIS }),
+            structuralEditingEnabled: true,
+        });
+        expect(await viewer.publish({ cells: { '1:0': { value: 'v', base: 'b' } } })).toBe(true);
+        expect(viewer.durable()).toEqual({
+            sheetName: 'Sheet1',
+            cells: { '1:0': { value: 'v', base: 'b' } },
+            formatTemplates: [],
+            appendedRows: [],
+            tailRemovals: [],
+            conflicts: [],
+        });
+        await viewer.dispose();
+    });
+});
+
 describe('peer compatibility rule 3: the release gate', () => {
     it('refuses a publication that carries layout fields while the flag is off', async () => {
         const viewer = await open_viewer();

@@ -11694,6 +11694,9 @@ export function attach_viewer(
                     return;
                 }
                 const changes = own_wire_pending_changes(msg.changes);
+                // Captured now: a reload before the queued write must not
+                // change how this renderer's publication is read.
+                const publisher_understands_layout = renderer_understands_layout;
                 if (!changes) {
                     drop_publication('malformed-changes');
                     return;
@@ -11957,6 +11960,31 @@ export function attach_viewer(
                             conflict_overlay_authorized = true;
                             const parked = has_identity && live_target_index === undefined;
                             const durable_changes = authority_plan.durableChanges;
+                            // Peer compatibility rule 2: from a renderer that
+                            // never declared layouts, a snapshot without layout
+                            // fields is legacy-shaped and keeps the stored ones.
+                            // A declaring renderer publishes complete snapshots,
+                            // where absence means the source layout (Discard).
+                            const kept_layout = !publisher_understands_layout
+                                && !pending_changes_carry_layout(durable_changes)
+                                ? pending_layout_fields(current_structural)
+                                : {};
+                            if (
+                                Object.keys(kept_layout).length > 0
+                                && pending_layout_validation_refusal(
+                                    {
+                                        sheetIndex: target_index,
+                                        sheetName: current_sheets[target_index]?.name,
+                                        worksheetId: current_sheets[target_index]?.worksheetId,
+                                    },
+                                    { ...durable_changes, ...kept_layout },
+                                    durable_changes.cells,
+                                    append_admission_ledgers.get(authority_plan.ledgerKey),
+                                ) !== undefined
+                            ) {
+                                conflict_overlay_authorized = false;
+                                return current;
+                            }
                             const next = with_pending_changes_for_sheet(
                                 current.pendingEdits,
                                 target_index,
@@ -11980,6 +12008,7 @@ export function attach_viewer(
                                     ...(durable_changes.structuralBasis === undefined
                                         ? {}
                                         : { structuralBasis: durable_changes.structuralBasis }),
+                                    ...kept_layout,
                                     // Conflicts consume the host reserve. Echo the
                                     // authenticated durable overlay, never a
                                     // renderer-authored replacement.
