@@ -240,6 +240,18 @@ describe('restructure_worksheet: sheetData', () => {
             + '<row r="3" ht="20"><c r="A3"><v>1</v></c></row>');
     });
 
+    it('carries a row\'s own namespace declarations onto a split fragment', () => {
+        const owner = worksheet(`<sheetData><row r="1"><c r="A1"><v>0</v></c></row>`
+            + `<y:row xmlns:y="${NS}" r="2"><y:c r="A2"><y:v>1</y:v></y:c><y:c r="A3"><y:v>2</y:v></y:c></y:row></sheetData>`);
+        const result = restructure(owner, {
+            bodyRows: 2,
+            columns: 1,
+            rowLayout: (layout) => ok(move_rows(layout, [source(2)], source(1))),
+        });
+        expect(result.text).toContain(`<y:row r="2" xmlns:y="${NS}"><y:c r="A2"><y:v>2</y:v></y:c></y:row>`
+            + `<y:row xmlns:y="${NS}" r="3"><y:c r="A3"><y:v>1</y:v></y:c></y:row>`);
+    });
+
     it('keeps a self-closing row and expands it only when it gains cells', () => {
         const rows = worksheet('<sheetData><row r="1"><c r="A1" s="1"><v>0</v></c></row>'
             + '<row r="2" ht="25" customHeight="1"/><row r="3"><c r="A3" s="2"><v>2</v></c></row></sheetData>');

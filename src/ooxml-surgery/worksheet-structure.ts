@@ -1192,7 +1192,12 @@ function restructure_sheet_data(
             }
         } else {
             if (cells === '') return;
-            text = `<${element.name} r="${new_row + 1}">${cells}</${element.name}>`;
+            // The cells may use prefixes the original row declared; carry its declarations.
+            const declarations = tag_attributes(opening_tag_text(xml, element.span))
+                .filter(({ name }) => name === 'xmlns' || name.startsWith('xmlns:'))
+                .map(({ name, value }) => ` ${name}="${encode_xml_attr(value)}"`)
+                .join('');
+            text = `<${element.name} r="${new_row + 1}"${declarations}>${cells}</${element.name}>`;
         }
         items.push({ row: new_row, order, text });
     });
