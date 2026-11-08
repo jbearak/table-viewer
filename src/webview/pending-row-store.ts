@@ -1143,7 +1143,7 @@ function merge_move_refusal<I>(
     removed: readonly SourceInterval[],
     after: AxisLayoutIndex<I>,
     moved_identities: readonly I[],
-    source_of: (identity: I) => number | undefined,
+    identity_of: (source: number) => I,
 ): StructureResult | undefined {
     const merges = (context.merges ?? []).filter((merge) => {
         const span = merge_span(merge, axis);
@@ -1168,16 +1168,21 @@ function merge_move_refusal<I>(
         last = Math.max(last, body_index);
     }
     if (first === Infinity) return undefined;
-    const previous = after.identity_at_body_index(first - 1);
-    const next = after.identity_at_body_index(last + 1);
-    const previous_source = previous === undefined ? undefined : source_of(previous);
-    const next_source = next === undefined ? undefined : source_of(next);
-    if (previous_source === undefined || next_source === undefined
-        || moved_set.has(previous_source) || moved_set.has(next_source)) return undefined;
+    // A merge's span is everything between its first and last live rows in
+    // the layout, inserted rows included: Insert inside a merge expands it.
+    const live_body_index = (from: number, to: number, step: 1 | -1): number | undefined => {
+        for (let source = from; step > 0 ? source <= to : source >= to; source += step) {
+            if (moved_set.has(source)) continue;
+            const body_index = after.body_index_of(identity_of(source));
+            if (body_index !== undefined) return body_index;
+        }
+        return undefined;
+    };
     for (const merge of merges) {
         const span = merge_span(merge, axis);
-        if (previous_source >= span.start && previous_source <= span.end
-            && next_source >= span.start && next_source <= span.end) {
+        const low = live_body_index(span.start, span.end, 1);
+        const high = live_body_index(span.end, span.start, -1);
+        if (low !== undefined && high !== undefined && low < first && last < high) {
             return refuse_structure('merge-destination', merge_destination_message(axis));
         }
     }
@@ -1259,6 +1264,21 @@ function finish_structure(
     const templates_by_id = new Map((draft.templates ?? before.formatTemplates).map((template) =>
         [template.id, template]));
     const used = new Set(rows.map((row) => row.formatTemplateId));
+    // Any gesture that grows the sheet (insert, or restore after an insert)
+    // must stay under the prospective row ceiling; one that shrinks it may not
+    // be refused by it.
+    if (context.maxProspectiveRows !== undefined) {
+        const prospective_rows = (layout: RowLayout, band: number): number =>
+            context.bodyStart + index_row_layout(layout).liveCount + band;
+        const after_rows = prospective_rows(
+            draft.rowLayout,
+            draft.rows.filter((row) => !is_inserted_row(row)).length,
+        );
+        if (after_rows > context.maxProspectiveRows
+            && after_rows > prospective_rows(row_layout_of(before, context), appended_rows(before).length)) {
+            return refuse_structure('too-many-rows', too_many_rows_message(context.maxProspectiveRows));
+        }
+    }
     const live = has_live_row_layout_change(draft.rowLayout)
         || has_live_column_layout_change(draft.columnLayout);
     const structuralBasis = live ? before.structuralBasis ?? context.structuralBasis : undefined;
@@ -1365,11 +1385,6 @@ export function insert_rows(
     if (pending_rows(changes).length + layout.discardedPendingRows.length + ids.length
         > MAX_PENDING_APPENDED_ROWS) {
         return refuse_structure('too-many-pending-rows', TOO_MANY_PENDING_ROWS_MESSAGE);
-    }
-    if (context.maxProspectiveRows !== undefined
-        && context.bodyStart + index_row_layout(layout).liveCount + appended_rows(changes).length + ids.length
-            > context.maxProspectiveRows) {
-        return refuse_structure('too-many-rows', too_many_rows_message(context.maxProspectiveRows));
     }
     if (!Number.isSafeInteger(first_created_order) || first_created_order < 0) {
         return refuse_structure('invalid-created-order', 'New rows need a creation order.');
@@ -1528,7 +1543,7 @@ export function move_rows(
         layout.removedSourceRows,
         index_row_layout(result.layout),
         moved,
-        (identity) => identity.kind === 'source' ? identity.sourceRow : undefined,
+        (sourceRow): RowIdentity => ({ kind: 'source', sourceRow }),
     );
     if (merge !== undefined) return merge;
     return finish_structure(changes, context, 'rows', {
@@ -1667,7 +1682,7 @@ export function move_columns(
         intervals_of_columns(layout.removedSourceColumns),
         index_column_layout(result.layout),
         moved,
-        (identity) => identity.kind === 'source' ? identity.sourceColumn : undefined,
+        (sourceColumn): ColumnIdentity => ({ kind: 'source', sourceColumn }),
     );
     if (merge !== undefined) return merge;
     return finish_structure(changes, context, 'columns', {

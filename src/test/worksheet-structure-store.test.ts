@@ -298,8 +298,11 @@ describe('row refusals', () => {
         ok(move_rows(EMPTY_PENDING_STRUCTURAL_CHANGES, with_merges, [source(1), source(2)], source(5)));
         expect(refusal(move_rows(EMPTY_PENDING_STRUCTURAL_CHANGES, with_merges, [source(4)], source(2))))
             .toEqual({ reason: 'merge-destination', message: merge_destination_message('rows') });
-        // Inserting inside a merge expands it.
-        ok(insert_rows(EMPTY_PENDING_STRUCTURAL_CHANGES, with_merges, source(2), 'before', ['a'], template, 1));
+        // Inserting inside a merge expands it, so the row it adds is inside too.
+        const expanded = ok(insert_rows(EMPTY_PENDING_STRUCTURAL_CHANGES, with_merges, source(2), 'before', ['a'], template, 1)).next;
+        expect(refusal(move_rows(expanded, with_merges, [source(4)], source(2))).reason).toBe('merge-destination');
+        expect(refusal(move_rows(expanded, with_merges, [source(4)], pending('a'))).reason).toBe('merge-destination');
+        ok(move_rows(expanded, with_merges, [source(4)], source(1)));
         expect(refusal(delete_columns(EMPTY_PENDING_STRUCTURAL_CHANGES, with_merges, [column(0)])))
             .toEqual({ reason: 'merge-anchor', message: merge_anchor_message('columns') });
         expect(refusal(move_columns(EMPTY_PENDING_STRUCTURAL_CHANGES, with_merges, [column(2)], column(1))))
@@ -331,6 +334,13 @@ describe('row refusals', () => {
             .toEqual({ reason: 'too-many-runs', message: TOO_MANY_ROW_RUNS_MESSAGE });
         expect(refusal(insert_rows(EMPTY_PENDING_STRUCTURAL_CHANGES, context({ maxProspectiveRows: 7 }),
             source(0), 'before', ['a', 'b'], template, 1)).reason).toBe('too-many-rows');
+        // Restoring a row after an insert took its place grows the sheet too.
+        const ceiling = context({ maxProspectiveRows: 6 });
+        const deleted = ok(delete_rows(EMPTY_PENDING_STRUCTURAL_CHANGES, ceiling, [source(1)])).next;
+        const refilled = ok(insert_rows(deleted, ceiling, source(0), 'after', ['a'], template, 1)).next;
+        expect(refusal(restore_rows(refilled, ceiling, [1])).reason).toBe('too-many-rows');
+        // A gesture that shrinks an over-ceiling sheet is never refused by it.
+        ok(delete_rows(refilled, context({ maxProspectiveRows: 3 }), [source(2)]));
         const full = with_appended(...Array.from({ length: 10_000 }, (_, index) => appended(`x${index}`, index)));
         expect(refusal(insert_rows(full, context(), source(0), 'before', ['a'], template, 20_000)).reason)
             .toBe('too-many-pending-rows');
