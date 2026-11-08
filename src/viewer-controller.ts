@@ -124,6 +124,8 @@ import {
     has_any_pending_edits,
     own_wire_pending_changes,
     pending_changes_for_sheet,
+    stored_pending_edits_version,
+    WEBVIEW_STRUCTURAL_LAYOUT_VERSION,
     pending_edits_for_sheet,
     reconcile_pending_edit_sheets,
     sanitize_excel_header_overrides,
@@ -181,8 +183,17 @@ import {
     EMPTY_PENDING_STRUCTURAL_CHANGES,
     MAX_PENDING_APPENDED_ROWS,
     own_pending_structural_changes,
+    appended_rows,
+    inserted_rows,
+    pending_rows,
+    has_live_layout_change,
+    pending_changes_carry_layout,
+    pending_layout_fields,
+    pending_structure_error,
+    STRUCTURAL_EDITING_ENABLED,
     type PendingAppendedRow,
     type PendingAppendBasis,
+    type StructuralBasis,
     type PendingRowFormatTemplate,
     type PendingTailRemoval,
     type PendingStructuralChanges,
@@ -337,7 +348,7 @@ function structural_save_error(
         Object.freeze({
             reason,
             pendingRowIds: Object.freeze([...(affected?.pendingRowIds
-                ?? structural.appendedRows.map((row) => row.id))]),
+                ?? pending_rows(structural).map((row) => row.id))]),
             tailRemovalIds: Object.freeze([...(affected?.tailRemovalIds
                 ?? structural.tailRemovals.map((removal) => removal.appendHistoryId))]),
             ...(affected?.formulaCells === undefined ? {} : {
@@ -388,6 +399,11 @@ export interface ViewerControllerOptions {
     /** Render read-only regardless of the profile (e.g. a git: revision URI,
      *  which has no working-tree file to write back to). */
     readonly readOnly?: boolean;
+    /**
+     * Test-only override of `STRUCTURAL_EDITING_ENABLED`, so tests can drive
+     * the layout publication and save gates before the flag ships on.
+     */
+    readonly structuralEditingEnabled?: boolean;
     /** Test-host protocol seam. It is supplied only by the VS Code integration
      * runner and observes the real controller transport without replacing it. */
     readonly integrationTestPort?: {
@@ -925,7 +941,7 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
             );
         }
         if (
-            structural.appendedRows.length > 0
+            pending_rows(structural).length > 0
             && structural.appendBasis === undefined
         ) structural_save_error(
             worksheet_operation_index,
@@ -947,7 +963,7 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
         const retained_row_count = sheet_meta.sourceRowCount
             - structural.tailRemovals.length;
         if (retained_row_count < 0
-            || retained_row_count + structural.appendedRows.length > MAX_SHEET_ROWS) {
+            || retained_row_count + appended_rows(structural).length > MAX_SHEET_ROWS) {
             structural_save_error(
                 worksheet_operation_index,
                 structural,
@@ -966,7 +982,7 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
                 );
             }
         });
-        const pending_index_by_id = new Map(structural.appendedRows.map(
+        const pending_index_by_id = new Map(appended_rows(structural).map(
             (row, index) => [row.id, index],
         ));
         const physical_row_for_identity = (identity: import('./pending-changes').RowIdentity):
@@ -1111,7 +1127,7 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
         const append_shells: Array<NonNullable<
             import('./xlsx-package').XlsxWorksheetCellEdits['row_changes']
         >['appendRows'][number]> = [];
-        for (const [index, row] of structural.appendedRows.entries()) {
+        for (const [index, row] of appended_rows(structural).entries()) {
             const format = templates.get(row.formatTemplateId);
             if (!format || format.kind !== 'xlsx') {
                 structural_save_error(
@@ -1325,7 +1341,7 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
         || calculation_edits.length > 0
         || planned.some((worksheet) =>
             worksheet.structural.tailRemovals.length > 0
-            || worksheet.structural.appendedRows.length > 0)
+            || appended_rows(worksheet.structural).length > 0)
     ) {
         const sheets = src.meta().sheets;
         const planned_by_sheet = new Map(planned.map((worksheet) => [
@@ -1336,7 +1352,7 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
             const worksheet = planned_by_sheet.get(sheetIndex);
             return worksheet === undefined
                 ? sheet.sourceRowCount
-                : worksheet.retainedRowCount + worksheet.structural.appendedRows.length;
+                : worksheet.retainedRowCount + appended_rows(worksheet.structural).length;
         });
         const removed_rows = planned.flatMap((worksheet) =>
             worksheet.structural.tailRemovals.map(({ sourceRow }) => ({
@@ -1378,7 +1394,7 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
             (worksheet) => worksheet.structural.tailRemovals.length > 0,
         );
         const has_structural_appends = planned.some(
-            (worksheet) => worksheet.structural.appendedRows.length > 0,
+            (worksheet) => appended_rows(worksheet.structural).length > 0,
         );
         const formula_plan = too_many_calculation_edits
             || structured_column_renames.length > 0
@@ -1438,7 +1454,7 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
                         );
                     }
                 }
-                if (worksheet.structural.appendedRows.length === 0) continue;
+                if (appended_rows(worksheet.structural).length === 0) continue;
                 for (const template of worksheet.structural.formatTemplates) {
                     if (
                         template.format.kind !== 'xlsx'
@@ -1454,7 +1470,7 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
                         'templateChanged',
                         'The workbook style table changed after rows were appended.',
                         {
-                            pendingRowIds: worksheet.structural.appendedRows
+                            pendingRowIds: appended_rows(worksheet.structural)
                                 .filter((row) => row.formatTemplateId === template.id)
                                 .map((row) => row.id),
                             tailRemovalIds: [],
@@ -1479,7 +1495,7 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
                 const templates = new Map(worksheet.structural.formatTemplates.map(
                     (template) => [template.id, template.format],
                 ));
-                return worksheet.structural.appendedRows.map((row, index) => {
+                return appended_rows(worksheet.structural).map((row, index) => {
                     const format = templates.get(row.formatTemplateId);
                     if (!format) throw new Error('A pending row lost its format template.');
                     return Object.freeze({
@@ -1622,7 +1638,7 @@ export function plan_csv_save(
     if (structural.formatTemplates.some((template) => template.format.kind !== 'none')) {
         throw new Error('Delimited pending rows contain an XLSX format template.');
     }
-    if (structural.appendedRows.length > 0 && structural.appendBasis === undefined) {
+    if (pending_rows(structural).length > 0 && structural.appendBasis === undefined) {
         structural_save_error(
             0,
             structural,
@@ -1762,7 +1778,7 @@ export function plan_csv_save(
     if (pending_prefix.length > 0) chunks.push(encoder.encode(pending_prefix));
     const delimiter = get_delimiter(input.file_path);
     const line_ending = src.lineEnding ?? '\n';
-    for (const row of structural.appendedRows) {
+    for (const row of appended_rows(structural)) {
         const values = Array<string>(sheet.columnCount).fill('');
         for (const [column_text, cell] of Object.entries(row.cells)) {
             const column = Number(column_text);
@@ -1790,7 +1806,7 @@ export function plan_csv_save(
         observed_bases: [observed_bases],
         produce: fixed_csv_bytes_producer(bytes),
         receipt: Object.freeze({
-            appendedRows: Object.freeze(structural.appendedRows.map((row, index) => ({
+            appendedRows: Object.freeze(appended_rows(structural).map((row, index) => ({
                 sheetIndex: 0,
                 sheetName: sheet.name,
                 ...(sheet.worksheetId === undefined ? {} : { worksheetId: sheet.worksheetId }),
@@ -1982,6 +1998,8 @@ export function attach_viewer(
         0,
         options.pendingEditFlushTimeoutMs ?? PENDING_EDIT_FLUSH_TIMEOUT_MS,
     );
+    const structural_editing_enabled = options.structuralEditingEnabled
+        ?? STRUCTURAL_EDITING_ENABLED;
     // VS Code may make panel.webview throw as soon as the panel is disposed.
     // Capture the live transport once; every later post is liveness-gated below.
     const webview = panel.webview;
@@ -2095,6 +2113,8 @@ export function attach_viewer(
     let highest_acknowledged_edit_sequence = 0;
     const pending_edit_admissions = new Set<symbol>();
     let renderer_ready = false;
+    /** Whether the current renderer declared `structuralLayout` in its ready message. */
+    let renderer_understands_layout = false;
     const pending_sheet_selections = new Set<{
         readonly sheetName: string;
         readonly resolve: (found: boolean) => void;
@@ -2147,6 +2167,16 @@ export function attach_viewer(
     interface AppendAdmissionLedger {
         /** All row identities this host has ever issued in the live edit session. */
         readonly ownedRowIds: Set<string>;
+        /**
+         * The request kind that minted each identity: the IDs an insert minted.
+         * Every other owned ID was minted by an append or restored from durable
+         * appends. Publication accepts origin `insert` only for these IDs.
+         */
+        readonly insertMintedRowIds: Set<string>;
+        /** Pending Column identities restored from durable state for this session. */
+        readonly ownedColumnIds: Set<string>;
+        /** The Structural Basis recorded for this worksheet in the session. */
+        structuralBasis?: StructuralBasis;
         /** Exact format-template capability issued for each row identity. */
         readonly templateIdByRowId: Map<string, string>;
         /** Issued rows not yet observed in a complete renderer publication. */
@@ -2371,7 +2401,7 @@ export function attach_viewer(
             ));
             for (const assignment of receipt?.appendedRows ?? []) {
                 if (!worksheet_target_matches(assignment, target)) continue;
-                const row = structural.appendedRows.find(
+                const row = appended_rows(structural).find(
                     (candidate) => candidate.id === assignment.pendingRowId,
                 );
                 const format = row === undefined
@@ -2398,6 +2428,29 @@ export function attach_viewer(
     };
     const append_ledger_key = (session_id: string, target: WorksheetTarget) =>
         `${session_id}\u0000${worksheet_target_key(target)}`;
+    /**
+     * Restore the layout half of a ledger from durable Pending Changes the
+     * session inherited: those IDs were admitted and published by an earlier
+     * session, so an inserted row or a discarded tombstone keeps its insert
+     * origin, and the recorded Structural Basis stays the one later
+     * publications must match.
+     */
+    const seed_ledger_structure = (
+        ledger: AppendAdmissionLedger,
+        structural: PendingStructuralChanges,
+    ): void => {
+        for (const row of inserted_rows(structural)) ledger.insertMintedRowIds.add(row.id);
+        for (const row of structural.rowLayout?.discardedPendingRows ?? []) {
+            ledger.insertMintedRowIds.add(row.id);
+        }
+        for (const column of structural.pendingColumns ?? []) ledger.ownedColumnIds.add(column.id);
+        for (const column of structural.columnLayout?.discardedPendingColumns ?? []) {
+            ledger.ownedColumnIds.add(column.id);
+        }
+        if (structural.structuralBasis !== undefined) {
+            ledger.structuralBasis = structural.structuralBasis;
+        }
+    };
     const pending_append_history_key = (target_key: string, row_id: string): string =>
         `${target_key}\u0000${row_id}`;
     const appended_rows_match_ledger = (
@@ -2534,6 +2587,11 @@ export function attach_viewer(
         ledger: AppendAdmissionLedger,
     ): AppendAdmissionLedger => ({
         ownedRowIds: new Set(ledger.ownedRowIds),
+        insertMintedRowIds: new Set(ledger.insertMintedRowIds),
+        ownedColumnIds: new Set(ledger.ownedColumnIds),
+        ...(ledger.structuralBasis === undefined
+            ? {}
+            : { structuralBasis: ledger.structuralBasis }),
         templateIdByRowId: new Map(ledger.templateIdByRowId),
         reservedRowIds: new Map(ledger.reservedRowIds),
         unsettledRequestByRowId: new Map(ledger.unsettledRequestByRowId),
@@ -2586,6 +2644,69 @@ export function attach_viewer(
     };
 
     /**
+     * Check one worksheet's complete Pending Changes against the layout
+     * invariants with everything the host knows: the live worksheet's Header
+     * Row and dimensions (or the Structural Basis the layout was authored
+     * against), and the ledger's record of which IDs an insert minted. Returns
+     * a refusal reason, or undefined when the changes carry no layout or pass.
+     */
+    const pending_layout_validation_refusal = (
+        target: WorksheetTarget,
+        changes: PendingStructuralChanges,
+        cells: Readonly<Record<string, unknown>>,
+        ledger: AppendAdmissionLedger | undefined,
+    ): string | undefined => {
+        if (!pending_changes_carry_layout(changes)) return undefined;
+        const sheet = source?.meta().sheets[target.sheetIndex];
+        if (sheet === undefined) return 'layout-worksheet-unresolved';
+        const header = sheet.excelFirstRowHeader;
+        const error = pending_structure_error(changes, cells, {
+            bodyStart: header?.active === true && header.sourceRow !== undefined
+                ? header.sourceRow + 1
+                : 0,
+            sourceRowCount: changes.structuralBasis?.sourceRowCount ?? sheet.sourceRowCount,
+            sourceColumnCount: changes.structuralBasis?.sourceColumnCount ?? sheet.columnCount,
+            mintedAsInsert: (id) => ledger?.insertMintedRowIds.has(id) === true,
+        });
+        if (error === undefined) return undefined;
+        console.warn('Refused pending layout state', { reason: error });
+        return 'layout-invalid';
+    };
+
+    /**
+     * The layout rules a new-protocol publication must meet beyond the append
+     * rules: the release gate, the ledger origin rule (origin `insert` only for
+     * an ID an insert minted; origin `append` for any admitted ID), host-issued
+     * Pending Column IDs, the recorded Structural Basis, and the invariants.
+     */
+    const pending_layout_publication_refusal = (
+        target: WorksheetTarget,
+        changes: WorksheetPendingChanges,
+        ledger: AppendAdmissionLedger | undefined,
+    ): string | undefined => {
+        if (!pending_changes_carry_layout(changes)) return undefined;
+        if (!structural_editing_enabled) return 'structural-editing-disabled';
+        if (inserted_rows(changes).some((row) => ledger?.insertMintedRowIds.has(row.id) !== true)) {
+            return 'insert-origin-not-minted-by-insert';
+        }
+        const column_ids = [
+            ...(changes.pendingColumns ?? []).map((column) => column.id),
+            ...(changes.columnLayout?.discardedPendingColumns ?? []).map((column) => column.id),
+        ];
+        if (column_ids.some((id) => ledger?.ownedColumnIds.has(id) !== true)) {
+            return 'pending-column-not-owned-by-ledger';
+        }
+        if (
+            changes.structuralBasis !== undefined
+            && JSON.stringify(changes.structuralBasis) !== JSON.stringify(ledger?.structuralBasis)
+        ) return 'structural-basis-mismatch';
+        if (has_live_layout_change(changes) && changes.structuralBasis === undefined) {
+            return 'structural-basis-missing';
+        }
+        return pending_layout_validation_refusal(target, changes, changes.cells, ledger);
+    };
+
+    /**
      * Validate and project one renderer publication without consuming authority.
      * The returned transition is installed only after its durable state write.
      */
@@ -2610,15 +2731,17 @@ export function attach_viewer(
                 targetKey: worksheet_target_key(target),
                 hasLedger: prior_ledger !== undefined,
                 ownedRows: prior_ledger?.ownedRowIds.size ?? 0,
-                postedRows: changes.appendedRows.length,
+                postedRows: pending_rows(changes).length,
                 ...detail,
             });
             return undefined;
         };
+        const layout_refusal = pending_layout_publication_refusal(target, changes, prior_ledger);
+        if (layout_refusal !== undefined) return refuse(layout_refusal);
         if (changes_use_unsettled_row_authority(
             prior_ledger,
             ledger_key,
-            changes.appendedRows,
+            pending_rows(changes),
             changes.formatTemplates,
             changes.appendBasis,
         )) return refuse('unsettled-row-authority');
@@ -2630,25 +2753,25 @@ export function attach_viewer(
         );
         if (!row_admission_gestures_are_complete(
             retiring_reservations.map(([, reservation]) => reservation),
-            changes.appendedRows,
+            pending_rows(changes),
         )) return refuse('split-admission-gesture');
-        const published_row_ids = new Set(changes.appendedRows.map((row) => row.id));
+        const published_row_ids = new Set(pending_rows(changes).map((row) => row.id));
 
         const staged_templates = new Map(project_retained_pending_rows(
             next_ledger,
             target,
-            changes.appendedRows,
+            pending_rows(changes),
         ));
 
         const provisional_ledger_basis = accepted_append_basis_for_ledger(
             next_ledger,
             ledger_key,
         );
-        if (!appended_rows_match_ledger(next_ledger, changes.appendedRows)) {
+        if (!appended_rows_match_ledger(next_ledger, pending_rows(changes))) {
             return refuse('rows-not-owned-by-ledger', {
-                unowned: changes.appendedRows
+                unowned: pending_rows(changes)
                     .filter((row) => !next_ledger?.ownedRowIds.has(row.id)).length,
-                templateMismatched: changes.appendedRows
+                templateMismatched: pending_rows(changes)
                     .filter((row) => next_ledger?.ownedRowIds.has(row.id)
                         && next_ledger.templateIdByRowId.get(row.id)
                             !== row.formatTemplateId).length,
@@ -2727,8 +2850,8 @@ export function attach_viewer(
             );
             if (advanced !== undefined) authorized_basis = advanced;
         }
-        if (changes.appendedRows.length === 0) authorized_basis = undefined;
-        if (changes.appendedRows.length > 0 && authorized_basis === undefined) return undefined;
+        if (pending_rows(changes).length === 0) authorized_basis = undefined;
+        if (pending_rows(changes).length > 0 && authorized_basis === undefined) return undefined;
         const { appendBasis: _posted_basis, ...changes_without_basis } = changes;
         const durable_changes: WorksheetPendingChanges = Object.freeze({
             ...changes_without_basis,
@@ -2827,8 +2950,8 @@ export function attach_viewer(
                 || reservation.state !== 'unsettled'
                 || reservation.replayLeaseId !== replay_lease_id
             ) return undefined;
-            const expected_ids = new Set(structural.expected.appendedRows.map((row) => row.id));
-            const desired_rows = new Map(structural.desired.appendedRows.map(
+            const expected_ids = new Set(pending_rows(structural.expected).map((row) => row.id));
+            const desired_rows = new Map(pending_rows(structural.desired).map(
                 (row) => [row.id, row],
             ));
             for (const row_id of reservation.gestureRowIds) {
@@ -3041,9 +3164,10 @@ export function attach_viewer(
                 continue;
             }
             if (
-                structural.appendedRows.length === 0
+                pending_rows(structural).length === 0
                 && structural.tailRemovals.length === 0
                 && structural.appendBasis === undefined
+                && !pending_changes_carry_layout(structural)
             ) continue;
             const target: WorksheetTarget = {
                 sheetIndex: sheet_index,
@@ -3055,15 +3179,18 @@ export function attach_viewer(
             const key = append_ledger_key(edit_session_id, target);
             const ledger = append_admission_ledgers.get(key) ?? {
                 ownedRowIds: new Set<string>(),
+                insertMintedRowIds: new Set<string>(),
+                ownedColumnIds: new Set<string>(),
                 templateIdByRowId: new Map<string, string>(),
                 reservedRowIds: new Map<string, number>(),
                 unsettledRequestByRowId: new Map<string, string>(),
                 sourceGeneration: core?.source_generation ?? 0,
             };
-            for (const row of structural.appendedRows) {
+            for (const row of pending_rows(structural)) {
                 ledger.ownedRowIds.add(row.id);
                 ledger.templateIdByRowId.set(row.id, row.formatTemplateId);
             }
+            seed_ledger_structure(ledger, structural);
             for (const template of structural.formatTemplates) {
                 append_admission_template_authorities.remember(
                     ledger_template_authority_owner(key),
@@ -3775,7 +3902,7 @@ export function attach_viewer(
                 if (!slot || !sheet) continue;
                 const structural = own_pending_structural_changes(slot);
                 const basis = structural.appendBasis;
-                if (basis === undefined || structural.appendedRows.length === 0) continue;
+                if (basis === undefined || appended_rows(structural).length === 0) continue;
                 const schema_fingerprint = worksheet_append_schema_fingerprint(sheet);
                 const schema_changed = basis.columnCount !== sheet.columnCount
                     || basis.schemaFingerprint !== schema_fingerprint;
@@ -3784,7 +3911,7 @@ export function attach_viewer(
                 // not carry pending content. Content in retained columns does
                 // not make a presentation-only width reconciliation ambiguous.
                 const has_truncated_content = sheet.columnCount < basis.columnCount
-                    && structural.appendedRows.some((row) =>
+                    && appended_rows(structural).some((row) =>
                         Object.entries(row.cells).some(([column, cell]) =>
                             Number(column) >= sheet.columnCount
                             && (cell.value !== ''
@@ -3825,7 +3952,7 @@ export function attach_viewer(
                     next_slots ??= projected.slice();
                     next_slots[sheet_index] = reconciliation_conflict_slot(
                         'ambiguousColumns',
-                        structural.appendedRows.map((row) => row.id),
+                        appended_rows(structural).map((row) => row.id),
                     );
                     continue;
                 }
@@ -3882,7 +4009,7 @@ export function attach_viewer(
                     next_slots ??= projected.slice();
                     next_slots[sheet_index] = reconciliation_conflict_slot(
                         'templateChanged',
-                        structural.appendedRows
+                        appended_rows(structural)
                             .filter((row) => changed_template_ids.has(row.formatTemplateId))
                             .map((row) => row.id),
                     );
@@ -4017,7 +4144,7 @@ export function attach_viewer(
                 if (!candidate_is_bounded) {
                     next_slots[sheet_index] = reconciliation_conflict_slot(
                         'templateChanged',
-                        structural.appendedRows
+                        appended_rows(structural)
                             .filter((row) => reconciled_template_ids.has(
                                 row.formatTemplateId,
                             ))
@@ -5105,10 +5232,11 @@ export function attach_viewer(
         const structural = operation.structuralChanges;
         return JSON.stringify({
             formatTemplates: slot.formatTemplates ?? [],
-            appendedRows: slot.appendedRows ?? [],
+            appendedRows: pending_rows(slot),
             tailRemovals: slot.tailRemovals ?? [],
             ...(slot.appendBasis === undefined ? {} : { appendBasis: slot.appendBasis }),
             conflicts: slot.conflicts ?? [],
+            ...pending_layout_fields(slot),
         }) === JSON.stringify(structural ?? {
             formatTemplates: [],
             appendedRows: [],
@@ -5208,8 +5336,9 @@ export function attach_viewer(
                 continue;
             }
             projected_slots ??= pending_edits.slice(0, index);
-            const has_structural = (slot.appendedRows?.length ?? 0) > 0
-                || (slot.tailRemovals?.length ?? 0) > 0;
+            const has_structural = pending_rows(slot).length > 0
+                || (slot.tailRemovals?.length ?? 0) > 0
+                || pending_changes_carry_layout(slot);
             projected_slots.push(projected || has_structural
                 ? { ...slot, cells: projected ?? {} }
                 : undefined);
@@ -5323,16 +5452,25 @@ export function attach_viewer(
         const predates_completed_clear = file_edit_state?.clearedStateRevision !== undefined
             && snapshot.revision <= file_edit_state.clearedStateRevision;
         const owns_session = owns_edit_session();
+        // Peer compatibility rule 1 for the claim that needs no grant: version-2
+        // state is rehydrated only for a renderer that declared layouts. Before
+        // its ready message nothing has declared anything, so the claim waits
+        // for the ready path, which claims (or refuses) with the answer known.
+        const layout_peer_blocked = !renderer_understands_layout
+            && stored_pending_edits_version(state) === 2;
         // A claim is only worth making when some slot describes a worksheet this
         // workbook actually has. Already-owned projections never need this scan.
         const rehydratable = !owns_session && allow_claim && editing_supported
             && has_rehydratable_pending_edits(state.pendingEdits, sheets);
+        if (rehydratable && layout_peer_blocked && renderer_ready) {
+            show_owner_warning('Reload this window to keep editing this file.');
+        }
         const represents_session = !predates_completed_clear
             && !edit_cleanup_blocked()
             && editing_supported
             && (
                 owns_session
-                || (rehydratable && try_claim_edit_session(false))
+                || (rehydratable && !layout_peer_blocked && try_claim_edit_session(false))
             );
         // A rehydration claim acquires the session with no grant round-trip,
         // so the grant-time ledger seeding never runs for it. Seed here, once,
@@ -5379,6 +5517,8 @@ export function attach_viewer(
             // drafts are not dropped either — they stay durable, and reappear the
             // moment the workbook has those names again.
             && rehydratable
+            // Withheld from a renderer that cannot read the layout; durable.
+            && !layout_peer_blocked
             && edit_phase().type === 'free'
         ) {
             console.error('Dropped durable CSV pending edits with no panel holding the session');
@@ -7990,6 +8130,8 @@ export function attach_viewer(
         if (!ledger) {
             ledger = {
                 ownedRowIds: new Set(),
+                insertMintedRowIds: new Set<string>(),
+                ownedColumnIds: new Set<string>(),
                 templateIdByRowId: new Map(),
                 reservedRowIds: new Map(),
                 unsettledRequestByRowId: new Map(),
@@ -8005,7 +8147,7 @@ export function attach_viewer(
             ledger,
             ledger_key,
         );
-        const admitted_ids = new Set(durable?.appendedRows?.map((row) => row.id) ?? []);
+        const admitted_ids = new Set(pending_rows(durable).map((row) => row.id));
         for (const id of ledger.reservedRowIds.keys()) admitted_ids.add(id);
         // The product limit is deliberately session-lifetime, not merely the
         // number still visible. Otherwise append/remove loops retain an
@@ -8133,7 +8275,7 @@ export function attach_viewer(
             return id;
         }));
         const tentative_rows = [
-            ...(durable?.appendedRows ?? []),
+            ...pending_rows(durable),
             ...rowIds.map((id, index) => Object.freeze({
                 id,
                 cells: Object.freeze({}),
@@ -8451,6 +8593,8 @@ export function attach_viewer(
         const ledger_key = append_ledger_key(message.editSessionId, target);
         const ledger = append_admission_ledgers.get(ledger_key) ?? {
             ownedRowIds: new Set<string>(),
+            insertMintedRowIds: new Set<string>(),
+            ownedColumnIds: new Set<string>(),
             templateIdByRowId: new Map<string, string>(),
             reservedRowIds: new Map<string, number>(),
             unsettledRequestByRowId: new Map<string, string>(),
@@ -8470,7 +8614,7 @@ export function attach_viewer(
             await refuse(`A worksheet may keep at most ${MAX_PENDING_APPENDED_ROWS.toLocaleString('en-US')} pending rows.`);
             return;
         }
-        const current_ids = new Set(durable?.appendedRows?.map((row) => row.id) ?? []);
+        const current_ids = new Set(pending_rows(durable).map((row) => row.id));
         for (const id of ledger.reservedRowIds.keys()) current_ids.add(id);
         const requested_additions = ids.filter((id) => !current_ids.has(id));
         if (
@@ -8565,7 +8709,7 @@ export function attach_viewer(
             if (existing === undefined) tentative_templates.push(template);
         }
         const tentative_rows = [
-            ...(durable?.appendedRows ?? []),
+            ...pending_rows(durable),
             ...authorities.map((authority, index): PendingAppendedRow => ({
                 id: ids[index],
                 cells: authority!.savedRow.cells,
@@ -8703,20 +8847,20 @@ export function attach_viewer(
         const retained_templates = project_retained_pending_rows(
             ledger,
             target,
-            structural.appendedRows,
+            pending_rows(structural),
         );
         if (changes_use_unsettled_row_authority(
             live_ledger,
             ledger_key,
-            structural.appendedRows,
+            pending_rows(structural),
             structural.formatTemplates,
             structural.appendBasis,
         )) return false;
         return accepted_row_admission_gestures_are_complete(
             ledger_key,
-            structural.appendedRows,
+            pending_rows(structural),
         )
-            && appended_rows_match_ledger(ledger, structural.appendedRows)
+            && appended_rows_match_ledger(ledger, pending_rows(structural))
             && structural.formatTemplates.every((template) => {
                 const issued = retained_templates.get(template.id)
                     ?? issued_append_template(live_ledger, ledger_key, template.id);
@@ -8793,12 +8937,16 @@ export function attach_viewer(
                 if (!owned) return malformed();
                 structuralChanges = Object.freeze({
                     formatTemplates: owned.formatTemplates,
-                    appendedRows: owned.appendedRows,
+                    appendedRows: pending_rows(owned),
                     tailRemovals: owned.tailRemovals,
                     ...(owned.appendBasis === undefined
                         ? {}
                         : { appendBasis: owned.appendBasis }),
                     conflicts: owned.conflicts,
+                    // Kept, never stripped: a save that dropped them would write
+                    // the file without the layout and then clear it as saved.
+                    // `handle_save` refuses them (peer compatibility rule 3).
+                    ...pending_layout_fields(owned),
                 });
                 // Save parsing validates renderer claims but does not consume
                 // authority. Retained rows are projected into a clone so a Save
@@ -8876,18 +9024,29 @@ export function attach_viewer(
         // surviving edit is the folded live-editor value the user never posted.
         persisted_save_targets.set(operation.identity, operation.durableTargets);
         let conflict_overlays_authenticated = false;
+        let drops_stored_layout = false;
         const committed = await update_file_state((current) => {
             conflict_overlays_authenticated = false;
+            drops_stored_layout = false;
             for (const [index, worksheet] of operation.identity.worksheets.entries()) {
                 const target = operation.durableTargets[index];
-                const canonical = own_pending_structural_changes(
-                    pending_changes_for_sheet(
-                        current.pendingEdits,
-                        target.sheetIndex,
-                        target.sheetName,
-                        target.worksheetId,
-                    ) ?? {},
-                ).conflicts;
+                const durable_slot = pending_changes_for_sheet(
+                    current.pendingEdits,
+                    target.sheetIndex,
+                    target.sheetName,
+                    target.worksheetId,
+                );
+                // A submission without the slot's layout fields would replace
+                // the slot (or save around it and then clear it) and lose the
+                // layout. Only a stale or older renderer sends one.
+                if (
+                    pending_changes_carry_layout(durable_slot)
+                    && !pending_changes_carry_layout(worksheet.structuralChanges)
+                ) {
+                    drops_stored_layout = true;
+                    return current;
+                }
+                const canonical = own_pending_structural_changes(durable_slot ?? {}).conflicts;
                 const submitted = worksheet.structuralChanges?.conflicts ?? [];
                 if (JSON.stringify(submitted) !== JSON.stringify(canonical)) {
                     return current;
@@ -8921,6 +9080,9 @@ export function attach_viewer(
             });
             return { ...current, pendingEdits: pending };
         }, undefined, () => save_operation_is_current(operation));
+        if (drops_stored_layout) {
+            throw new Error('Reload this window to keep editing this file.');
+        }
         if (
             !conflict_overlays_authenticated
             || !committed
@@ -9015,6 +9177,21 @@ export function attach_viewer(
                     ? 'Wait for undo or redo to finish, then save again.'
                     : 'The table view is still refreshing. Please try saving again.',
             );
+            void post_to_receiver({ type: 'saveResult', success: false, lifecycle });
+            return;
+        }
+
+        // Peer compatibility rule 3. While the flag is off no layout field may
+        // reach a planner. With it on (tests only, until the structural save
+        // lands) the planners still cannot write layouts, so the save is refused
+        // rather than written without them and then cleared as saved.
+        if (identity.worksheets.some((worksheet) =>
+            pending_changes_carry_layout(worksheet.structuralChanges))) {
+            const active = begin_save_lifecycle(identity);
+            const lifecycle = finish_save_lifecycle(active.operation, 'failed');
+            show_owner_warning(structural_editing_enabled
+                ? 'Saving inserted, deleted, or moved rows and columns is not available yet.'
+                : 'Saving inserted, deleted, or moved rows and columns is not available in this version.');
             void post_to_receiver({ type: 'saveResult', success: false, lifecycle });
             return;
         }
@@ -9396,7 +9573,7 @@ export function attach_viewer(
                         (template) => [template.id, template.format],
                     ));
                     for (const assignment of assignments) {
-                        const row = structural.appendedRows.find(
+                        const row = appended_rows(structural).find(
                             (candidate) => candidate.id === assignment.pendingRowId,
                         );
                         if (!row) throw new Error('A saved row receipt has no pending source.');
@@ -9696,6 +9873,7 @@ export function attach_viewer(
                     ));
                 }
                 renderer_ready = true;
+                renderer_understands_layout = msg.structuralLayout === WEBVIEW_STRUCTURAL_LAYOUT_VERSION;
                 renderer_protocol_epoch += 1;
                 const begun = session.begin_ready();
                 // This must happen before the first await: an older receiver's
@@ -10400,7 +10578,14 @@ export function attach_viewer(
                 phase = edit_phase();
                 cleanup_blocked = phase.type === 'cleanupPending'
                     || phase.type === 'uncertain';
+                // Peer compatibility rule 1: a renderer that predates layouts
+                // would rebuild version-2 Pending Changes from the fields it
+                // knows and overwrite the layout on its first publication.
+                const denied_by_layout_peer = edit_state !== undefined
+                    && !renderer_understands_layout
+                    && stored_pending_edits_version(edit_state.state) === 2;
                 can_edit = recovery_authorized
+                    && !denied_by_layout_peer
                     && editing_supported
                     && !cleanup_blocked
                     && active_save_operation === undefined
@@ -10524,15 +10709,18 @@ export function attach_viewer(
                     const key = append_ledger_key(active_edit_session_id, target);
                     const ledger = append_admission_ledgers.get(key) ?? {
                         ownedRowIds: new Set<string>(),
+                        insertMintedRowIds: new Set<string>(),
+                        ownedColumnIds: new Set<string>(),
                         templateIdByRowId: new Map<string, string>(),
                         reservedRowIds: new Map<string, number>(),
                         unsettledRequestByRowId: new Map<string, string>(),
                         sourceGeneration: core?.source_generation ?? 0,
                     };
-                    for (const row of pendingChanges.appendedRows) {
+                    for (const row of pending_rows(pendingChanges)) {
                         ledger.ownedRowIds.add(row.id);
                         ledger.templateIdByRowId.set(row.id, row.formatTemplateId);
                     }
+                    seed_ledger_structure(ledger, pendingChanges);
                     for (const template of pendingChanges.formatTemplates) {
                         append_admission_template_authorities.remember(
                             ledger_template_authority_owner(key),
@@ -10562,14 +10750,17 @@ export function attach_viewer(
                         : {}),
                     ...(pendingEdits ? { pendingEdits } : {}),
                     ...(pendingChanges && (
-                        pendingChanges.appendedRows.length > 0
+                        pending_rows(pendingChanges).length > 0
                         || pendingChanges.tailRemovals.length > 0
                         || pendingChanges.formatTemplates.length > 0
                         || pendingChanges.conflicts.length > 0
                         || pendingChanges.appendBasis !== undefined
+                        || pending_changes_carry_layout(pendingChanges)
                     ) ? { pendingChanges } : {}),
                 }, request.receiverEpoch);
-                if (cleanup_blocked) {
+                if (denied_by_layout_peer) {
+                    show_owner_warning('Reload this window to keep editing this file.');
+                } else if (cleanup_blocked) {
                     show_owner_warning(
                         'Editing is temporarily unavailable while saved edit state is being cleared.');
                 } else if (denied_by_owner) {
@@ -11528,6 +11719,9 @@ export function attach_viewer(
                     return;
                 }
                 const changes = own_wire_pending_changes(msg.changes);
+                // Captured now: a reload before the queued write must not
+                // change how this renderer's publication is read.
+                const publisher_understands_layout = renderer_understands_layout;
                 if (!changes) {
                     drop_publication('malformed-changes');
                     return;
@@ -11648,7 +11842,7 @@ export function attach_viewer(
                     sequence,
                 ) === undefined) {
                     drop_publication('admission-plan-refused', {
-                        appendedRows: changes.appendedRows.length,
+                        appendedRows: pending_rows(changes).length,
                         tailRemovals: changes.tailRemovals.length,
                         hasAppendBasis: changes.appendBasis !== undefined,
                     });
@@ -11768,8 +11962,9 @@ export function attach_viewer(
                                 );
                                 if (target_index === undefined) {
                                     const nonempty = Object.keys(changes.cells).length > 0
-                                        || changes.appendedRows.length > 0
-                                        || changes.tailRemovals.length > 0;
+                                        || pending_rows(changes).length > 0
+                                        || changes.tailRemovals.length > 0
+                                        || pending_changes_carry_layout(changes);
                                     if (!nonempty) return current;
                                     const hole = current.pendingEdits
                                         ?.findIndex((slot) => slot === undefined) ?? -1;
@@ -11790,17 +11985,55 @@ export function attach_viewer(
                             conflict_overlay_authorized = true;
                             const parked = has_identity && live_target_index === undefined;
                             const durable_changes = authority_plan.durableChanges;
+                            // Peer compatibility rule 2: from a renderer that
+                            // never declared layouts, a snapshot without layout
+                            // fields is legacy-shaped and keeps the stored ones.
+                            // A declaring renderer publishes complete snapshots,
+                            // where absence means the source layout (Discard).
+                            const kept_layout = !publisher_understands_layout
+                                && !pending_changes_carry_layout(durable_changes)
+                                ? pending_layout_fields(current_structural)
+                                : {};
+                            if (
+                                Object.keys(kept_layout).length > 0
+                                && pending_layout_validation_refusal(
+                                    {
+                                        sheetIndex: target_index,
+                                        sheetName: current_sheets[target_index]?.name,
+                                        worksheetId: current_sheets[target_index]?.worksheetId,
+                                    },
+                                    { ...durable_changes, ...kept_layout },
+                                    durable_changes.cells,
+                                    append_admission_ledgers.get(authority_plan.ledgerKey),
+                                ) !== undefined
+                            ) {
+                                conflict_overlay_authorized = false;
+                                return current;
+                            }
                             const next = with_pending_changes_for_sheet(
                                 current.pendingEdits,
                                 target_index,
                                 {
                                     cells: durable_changes.cells,
                                     formatTemplates: durable_changes.formatTemplates,
-                                    appendedRows: durable_changes.appendedRows,
+                                    appendedRows: pending_rows(durable_changes),
                                     tailRemovals: durable_changes.tailRemovals,
                                     ...(durable_changes.appendBasis === undefined
                                         ? {}
                                         : { appendBasis: durable_changes.appendBasis }),
+                                    ...(durable_changes.rowLayout === undefined
+                                        ? {}
+                                        : { rowLayout: durable_changes.rowLayout }),
+                                    ...(durable_changes.columnLayout === undefined
+                                        ? {}
+                                        : { columnLayout: durable_changes.columnLayout }),
+                                    ...(durable_changes.pendingColumns === undefined
+                                        ? {}
+                                        : { pendingColumns: durable_changes.pendingColumns }),
+                                    ...(durable_changes.structuralBasis === undefined
+                                        ? {}
+                                        : { structuralBasis: durable_changes.structuralBasis }),
+                                    ...kept_layout,
                                     // Conflicts consume the host reserve. Echo the
                                     // authenticated durable overlay, never a
                                     // renderer-authored replacement.
@@ -12008,11 +12241,16 @@ export function attach_viewer(
                 observe_pending_edit_target(edit_session_id, posted_target, sequence);
                 highest_pending_edit_sequence = sequence;
                 const write = pending_edit_writes.catch(() => {}).then(async () => {
+                    // Peer compatibility rule 2: this legacy shape keeps the
+                    // slot's stored layout fields, so the complete result must
+                    // still satisfy the layout before it is written.
+                    let layout_refusal: string | undefined;
                     const apply = (
                         current: PerFileState,
                         sheets: readonly SheetMeta[],
                         cells: SheetPendingEditCells | undefined,
                     ): PerFileState => {
+                        layout_refusal = undefined;
                         // Resolve against the workbook at execution time so reorder
                         // follows the worksheet. An identity that no longer resolves
                         // is an outgoing editor's replacement-time flush: keep it in
@@ -12053,6 +12291,29 @@ export function attach_viewer(
                             parked ? posted_sheet_name : sheets[target_index]?.name,
                             parked ? posted_worksheet_id : sheets[target_index]?.worksheetId,
                         );
+                        const result_slot = next?.[target_index];
+                        if (result_slot !== undefined && pending_changes_carry_layout(result_slot)) {
+                            const result_target: WorksheetTarget = {
+                                sheetIndex: target_index,
+                                sheetName: parked ? posted_sheet_name : sheets[target_index]?.name,
+                                worksheetId: parked
+                                    ? posted_worksheet_id
+                                    : sheets[target_index]?.worksheetId,
+                            };
+                            try {
+                                layout_refusal = pending_layout_validation_refusal(
+                                    result_target,
+                                    own_pending_structural_changes(result_slot),
+                                    result_slot.cells,
+                                    append_admission_ledgers.get(
+                                        append_ledger_key(edit_session_id, result_target),
+                                    ),
+                                );
+                            } catch {
+                                layout_refusal = 'layout-invalid';
+                            }
+                            if (layout_refusal !== undefined) return current;
+                        }
                         if (next) return { ...current, pendingEdits: next };
                         if (!current.pendingEdits) return current;
                         const { pendingEdits: _drop, ...rest } = current;
@@ -12063,6 +12324,15 @@ export function attach_viewer(
                         admission,
                         (current, sheets) => apply(current, sheets, edits ?? undefined),
                     );
+                    if (layout_refusal !== undefined) {
+                        // Unacknowledged, like every other refused publication.
+                        console.warn('Dropped a legacy pending-edits publication', {
+                            reason: layout_refusal,
+                            editSessionId: sanitized_edit_session_suffix(edit_session_id),
+                            sequence,
+                        });
+                        return;
+                    }
                     if (result.type !== 'aborted') {
                         retire_pending_edit_target(
                             edit_session_id,
@@ -13181,7 +13451,7 @@ export function attach_viewer(
                     const updated = pending_edits_with_replay_writes(cells, sheet_writes);
                     const structural = structure_by_sheet.get(sheet_index)?.desired
                         ?? durable_structural;
-                    const pending_ids = new Set(structural.appendedRows.map((row) => row.id));
+                    const pending_ids = new Set(pending_rows(structural).map((row) => row.id));
                     const removal_ids = new Set(structural.tailRemovals.map(
                         (removal) => removal.appendHistoryId,
                     ));
@@ -13211,7 +13481,7 @@ export function attach_viewer(
                     const prospective = {
                         cells: updated ?? {},
                         formatTemplates: structural.formatTemplates,
-                        appendedRows: structural.appendedRows,
+                        appendedRows: pending_rows(structural),
                         tailRemovals: structural.tailRemovals,
                         ...(structural.appendBasis === undefined
                             ? {}
@@ -13296,7 +13566,7 @@ export function attach_viewer(
                     if (JSON.stringify(before) === JSON.stringify(after)) continue;
                     const without_conflicts = (value: PendingStructuralChanges) => ({
                         formatTemplates: value.formatTemplates,
-                        appendedRows: value.appendedRows,
+                        appendedRows: pending_rows(value),
                         tailRemovals: value.tailRemovals,
                         ...(value.appendBasis === undefined
                             ? {}
@@ -13547,7 +13817,7 @@ export function attach_viewer(
                 const desired = structural.desired;
                 const sheet = replay_source.meta().sheets[structural.resolvedSheetIndex];
                 if (sheet === undefined) return false;
-                if (desired.appendedRows.length > 0 && desired.appendBasis === undefined) {
+                if (pending_rows(desired).length > 0 && desired.appendBasis === undefined) {
                     return false;
                 }
                 if (
@@ -13561,7 +13831,7 @@ export function attach_viewer(
                 if (
                     sheet.sourceRowCount - desired.tailRemovals.length < 0
                     || sheet.sourceRowCount - desired.tailRemovals.length
-                        + desired.appendedRows.length
+                        + pending_rows(desired).length
                         > append_row_ceiling_for(profile)
                 ) return false;
                 const retained_row_count = sheet.sourceRowCount
@@ -13569,7 +13839,7 @@ export function attach_viewer(
                 if (desired.tailRemovals.some(
                     (removal, index) => removal.sourceRow !== retained_row_count + index,
                 )) return false;
-                if (desired.appendedRows.some((row) => (
+                if (pending_rows(desired).some((row) => (
                     Object.keys(row.cells).some((column) => Number(column) >= sheet.columnCount)
                     || Object.keys(row.highlights ?? {}).some(
                         (column) => Number(column) >= sheet.columnCount,
@@ -13593,7 +13863,7 @@ export function attach_viewer(
                 }
                 if (
                     is_xlsx
-                    && desired.appendedRows.length > 0
+                    && pending_rows(desired).length > 0
                     && desired.appendBasis !== undefined
                     && desired.formatTemplates.some((template) => (
                         template.format.kind !== 'xlsx'
@@ -13625,12 +13895,12 @@ export function attach_viewer(
             const live_ledger = append_admission_ledgers.get(ledger_key);
             if (!accepted_row_admission_gestures_are_complete(
                 ledger_key,
-                structural.desired.appendedRows,
+                pending_rows(structural.desired),
             )) return false;
             if (changes_use_unsettled_row_authority(
                 live_ledger,
                 ledger_key,
-                structural.desired.appendedRows,
+                pending_rows(structural.desired),
                 structural.desired.formatTemplates,
                 structural.desired.appendBasis,
                 additionally_authorized,
@@ -13641,9 +13911,9 @@ export function attach_viewer(
             const retained_templates = project_retained_pending_rows(
                 ledger,
                 target,
-                structural.desired.appendedRows,
+                pending_rows(structural.desired),
             );
-            if (!appended_rows_match_ledger(ledger, structural.desired.appendedRows)) return false;
+            if (!appended_rows_match_ledger(ledger, pending_rows(structural.desired))) return false;
             if (structural.desired.formatTemplates.some((template) => {
                 const issued = retained_templates.get(template.id)
                     ?? issued_append_template(

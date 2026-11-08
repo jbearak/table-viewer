@@ -6,6 +6,7 @@ import type {
     PendingTailRemoval,
     RowIdentity,
 } from '../pending-changes';
+import { appended_rows } from '../pending-changes';
 
 export type PendingProjectedRow =
     | {
@@ -130,7 +131,7 @@ export function create_pending_row_projection(
     const pending_rows: Array<Extract<
         PendingProjectedRow,
         { kind: 'pending' | 'replacement' }
-    > & { readonly rowIndex: number }> = input.changes.appendedRows.map((row, index) => {
+    > & { readonly rowIndex: number }> = appended_rows(input.changes).map((row, index) => {
         const intendedPhysicalRow = prospective_start + index;
         const removal = removal_by_row.get(intendedPhysicalRow);
         if (removal !== undefined) {

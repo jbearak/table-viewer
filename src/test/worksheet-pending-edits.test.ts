@@ -253,8 +253,16 @@ describe('decode_stored_per_file_state — pendingEdits migration', () => {
         // to be exactly that and nothing else — otherwise a malformed leaf could be
         // read as a wrapper and silently lose the rest of its contents.
         expect(() => decode_stored_per_file_state({ pendingEdits: { sheets: {} } })).toThrow();
+        // Versions 1 and 2 are the only envelopes; only version 2 may carry a
+        // rekey intent.
         expect(() => decode_stored_per_file_state({
-            pendingEdits: { version: 2, sheets: [{ cells: { '0:0': entry('x') } }] },
+            pendingEdits: { version: 3, sheets: [{ cells: { '0:0': entry('x') } }] },
+        })).toThrow();
+        expect(() => decode_stored_per_file_state({
+            pendingEdits: { version: 1, sheets: [], rekeyIntent: {} },
+        })).toThrow();
+        expect(() => decode_stored_per_file_state({
+            pendingEdits: { version: 2, sheets: [], extra: true },
         })).toThrow();
         expect(() => decode_stored_per_file_state({
             pendingEdits: { sheets: [{ cells: { '0:0': entry('x') } }], '0:0': entry('y') },

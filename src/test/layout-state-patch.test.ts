@@ -318,6 +318,9 @@ describe('every persisted leaf is classified', () => {
         'excelFirstRowHeaderActive',
         'excelFirstRowHeaderVersion',
         'rowHeightsVersion',
+        // A structural save's durable rekey intent: host bookkeeping between a
+        // save's write and its post-write rekey.
+        'structuralRekeyIntent',
     ] as const;
 
     it('classifies every leaf of a fully populated PerFileState', () => {
@@ -336,6 +339,13 @@ describe('every persisted leaf is classified', () => {
             excelFirstRowHeaderActive: {},
             excelFirstRowHeaderVersion: 1,
             rowHeightsVersion: 1,
+            structuralRekeyIntent: {
+                saveId: 'save',
+                beforeDigest: 'before',
+                afterDigest: 'after',
+                worksheets: [{ sheetIndex: 0, acceptedSequence: 1 }],
+                receipt: { appendedRows: [], removedSourceRows: [] },
+            },
         };
 
         expect(Object.keys(populated).sort())

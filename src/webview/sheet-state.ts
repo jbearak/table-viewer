@@ -23,6 +23,7 @@ import {
     has_pending_structural_changes,
     own_pending_structural_changes,
     type PendingStructuralChanges,
+    pending_rows,
 } from '../pending-changes';
 
 export function clamp_sheet_index(
@@ -341,6 +342,10 @@ function normalize_pending_edits(
                 tailRemovals: record.tailRemovals,
                 appendBasis: record.appendBasis,
                 conflicts: record.conflicts,
+                rowLayout: record.rowLayout,
+                columnLayout: record.columnLayout,
+                pendingColumns: record.pendingColumns,
+                structuralBasis: record.structuralBasis,
             });
         } catch {
             return undefined;
@@ -357,9 +362,9 @@ function normalize_pending_edits(
             ...(structural.formatTemplates.length === 0
                 ? {}
                 : { formatTemplates: structural.formatTemplates }),
-            ...(structural.appendedRows.length === 0
+            ...(pending_rows(structural).length === 0
                 ? {}
-                : { appendedRows: structural.appendedRows }),
+                : { appendedRows: pending_rows(structural) }),
             ...(structural.tailRemovals.length === 0
                 ? {}
                 : { tailRemovals: structural.tailRemovals }),
@@ -369,6 +374,16 @@ function normalize_pending_edits(
             ...(structural.conflicts.length === 0
                 ? {}
                 : { conflicts: structural.conflicts }),
+            ...(structural.rowLayout === undefined ? {} : { rowLayout: structural.rowLayout }),
+            ...(structural.columnLayout === undefined
+                ? {}
+                : { columnLayout: structural.columnLayout }),
+            ...(structural.pendingColumns === undefined
+                ? {}
+                : { pendingColumns: structural.pendingColumns }),
+            ...(structural.structuralBasis === undefined
+                ? {}
+                : { structuralBasis: structural.structuralBasis }),
         };
     });
     while (slots.length > 0 && slots[slots.length - 1] === undefined) slots.pop();

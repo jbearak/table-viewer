@@ -5,6 +5,7 @@ import {
     type PendingAppendedRow,
     type PendingStructuralChanges,
     type PendingTailRemoval,
+    pending_rows,
 } from '../pending-changes';
 import { worksheet_target_key, type WorksheetTarget } from '../types';
 import type { HistoryDirection } from './history-cell-state-model';
@@ -56,7 +57,7 @@ function with_row(
     index: number | null,
     templates: Extract<HistoryChange, { kind: 'rowAppend' }>['delta']['formatTemplates'],
 ): PendingStructuralChanges | undefined {
-    const rows = [...changes.appendedRows];
+    const rows = [...pending_rows(changes)];
     const current_index = rows.findIndex((candidate) => candidate.id === pending_row_id);
     if (current_index >= 0) rows.splice(current_index, 1);
     if (row !== null) {
@@ -149,10 +150,10 @@ export function plan_pending_row_history_replay(
             const desired_index = direction === 'undo'
                 ? change.delta.beforeIndex
                 : change.delta.afterIndex;
-            const index = state.current.appendedRows.findIndex(
+            const index = pending_rows(state.current).findIndex(
                 (row) => row.id === change.delta.pendingRowId,
             );
-            const current = index < 0 ? null : state.current.appendedRows[index];
+            const current = index < 0 ? null : pending_rows(state.current)[index];
             if (
                 !equal(current, expected)
                 || (expected_index !== null && (index < 0 ? null : index) !== expected_index)

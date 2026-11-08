@@ -13,6 +13,7 @@ import {
     type PendingTailRemoval,
     type RowIdentity,
     type SavedAppendedRowSnapshot,
+    pending_rows,
 } from '../pending-changes';
 import {
     worksheet_target_key,
@@ -537,8 +538,8 @@ function add_counted_cell(index: CellCountIndex, change: HistoryChange): void {
         index.count += change.kind === 'pendingRows'
             ? Math.max(
                 1,
-                change.delta.before.appendedRows.length,
-                change.delta.after.appendedRows.length,
+                pending_rows(change.delta.before).length,
+                pending_rows(change.delta.after).length,
                 change.delta.before.tailRemovals.length,
                 change.delta.after.tailRemovals.length,
             )
@@ -1109,7 +1110,7 @@ function rekey_structural_provenance(
     };
     return {
         ...snapshot,
-        appendedRows: snapshot.appendedRows.map((row) =>
+        appendedRows: pending_rows(snapshot).map((row) =>
             rekey_appended_row_provenance(row, worksheet, assignments)),
         tailRemovals: snapshot.tailRemovals.map((removal) => ({
             ...removal,
@@ -1222,7 +1223,7 @@ function structural_snapshot_without(
     pending_row_ids: ReadonlySet<string>,
     tail_removal_ids: ReadonlySet<string>,
 ): PendingStructuralChanges {
-    const appendedRows = snapshot.appendedRows.filter((row) => !pending_row_ids.has(row.id));
+    const appendedRows = pending_rows(snapshot).filter((row) => !pending_row_ids.has(row.id));
     const tailRemovals = snapshot.tailRemovals.filter(
         (removal) => !tail_removal_ids.has(removal.appendHistoryId),
     );
@@ -1260,8 +1261,8 @@ function* expand_saved_pending_snapshot(
     assignments: ReadonlyMap<string, SavedHistoryRowAssignment>,
 ): IterableIterator<HistoryChange> {
     const worksheet_key = worksheet_target_key(change.delta.worksheet);
-    const before_rows = change.delta.before.appendedRows;
-    const after_rows = change.delta.after.appendedRows;
+    const before_rows = pending_rows(change.delta.before);
+    const after_rows = pending_rows(change.delta.after);
     const templates = new Map<string, PendingRowFormatTemplate>();
     for (const template of change.delta.before.formatTemplates) templates.set(template.id, template);
     for (const template of change.delta.after.formatTemplates) {
@@ -2400,8 +2401,8 @@ export function retained_pending_row_authorities(
                 retain(change.delta.worksheet, change.delta.pendingRowId);
             } else if (change.kind === 'pendingRows') {
                 for (const row of [
-                    ...change.delta.before.appendedRows,
-                    ...change.delta.after.appendedRows,
+                    ...pending_rows(change.delta.before),
+                    ...pending_rows(change.delta.after),
                 ]) retain(change.delta.worksheet, row.id);
             }
         }
@@ -2694,10 +2695,10 @@ function own_history_change(
             if (template === undefined) {
                 throw new TypeError('Row history lost its format template');
             }
-            return own_pending_structural_changes({
+            return pending_rows(own_pending_structural_changes({
                 formatTemplates: [template],
                 appendedRows: [snapshot_structural_input(row)],
-            }).appendedRows[0];
+            }))[0];
         };
         const before = own_row(change.delta.before);
         const after = own_row(change.delta.after);

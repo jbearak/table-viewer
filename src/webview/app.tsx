@@ -23,6 +23,7 @@ import {
     worksheet_target_index,
     worksheet_target_key,
     worksheet_target_lookup,
+    WEBVIEW_STRUCTURAL_LAYOUT_VERSION,
     type CellHighlightColor,
     type CellHighlightMutation,
     type CellHighlightSelection,
@@ -62,6 +63,10 @@ import {
     EMPTY_PENDING_STRUCTURAL_CHANGES,
     type PendingAppendBasis,
     type PendingStructuralChanges,
+    pending_rows,
+    appended_rows,
+    pending_changes_carry_layout,
+    pending_layout_fields,
 } from '../pending-changes';
 import {
     hyperlinks_equal,
@@ -807,7 +812,7 @@ export function App(): React.JSX.Element {
             const changes = pending_by_sheet.get(sheetIndex)?.snapshot()
                 ?? EMPTY_PENDING_STRUCTURAL_CHANGES;
             const prospective_start = sheet.sourceRowCount - changes.tailRemovals.length;
-            return prospective_start + changes.appendedRows.length;
+            return prospective_start + pending_rows(changes).length;
         });
         for (const edit of formula_roots_projection.pendingEdits) {
             const sheet = meta?.sheets[edit.sheetIndex];
@@ -1960,7 +1965,8 @@ export function App(): React.JSX.Element {
                 if (
                     !parked
                     && snapshot.size === 0
-                    && structural.appendedRows.length === 0
+                    && pending_rows(structural).length === 0
+                    && !pending_changes_carry_layout(structural)
                     && structural.tailRemovals.length === 0
                     && structural.conflicts.length === 0
                     && !pending_changes_durability.has_publication(
@@ -2430,9 +2436,9 @@ export function App(): React.JSX.Element {
             const submitted = operation_worksheets.find(
                 (worksheet) => worksheet_target_index(sheets, worksheet) === sheet_index,
             )?.structuralChanges;
-            const row = structural.appendedRows.find(
+            const row = appended_rows(structural).find(
                 (candidate) => candidate.id === assignment.pendingRowId,
-            ) ?? submitted?.appendedRows.find(
+            ) ?? appended_rows(submitted).find(
                 (candidate) => candidate.id === assignment.pendingRowId,
             );
             const format = row === undefined
@@ -3286,12 +3292,13 @@ export function App(): React.JSX.Element {
                                     ...target,
                                     cells: authoritative_cells,
                                     formatTemplates: slot?.formatTemplates ?? [],
-                                    appendedRows: slot?.appendedRows ?? [],
+                                    appendedRows: pending_rows(slot),
                                     tailRemovals: slot?.tailRemovals ?? [],
                                     ...(slot?.appendBasis === undefined
                                         ? {}
                                         : { appendBasis: slot.appendBasis }),
                                     conflicts: slot?.conflicts ?? [],
+                                    ...pending_layout_fields(slot),
                                 };
                                 if (pending_changes_durability
                                     .unacknowledged_structural_payload_matches(
@@ -3319,9 +3326,9 @@ export function App(): React.JSX.Element {
                                             published.formatTemplates,
                                         ) ? authoritative.formatTemplates : current.formatTemplates,
                                         appendedRows: unchanged(
-                                            current.appendedRows,
-                                            published.appendedRows,
-                                        ) ? authoritative.appendedRows : current.appendedRows,
+                                            pending_rows(current),
+                                            pending_rows(published),
+                                        ) ? pending_rows(authoritative) : pending_rows(current),
                                         tailRemovals: unchanged(
                                             current.tailRemovals,
                                             published.tailRemovals,
@@ -3337,6 +3344,10 @@ export function App(): React.JSX.Element {
                                             current.conflicts,
                                             published.conflicts,
                                         ) ? authoritative.conflicts : current.conflicts,
+                                        ...pending_layout_fields(unchanged(
+                                            pending_layout_fields(current),
+                                            pending_layout_fields(published),
+                                        ) ? authoritative : current),
                                     };
                                 const cell_store = cell_stores.get(worksheet_target_key(target));
                                 try {
@@ -3778,7 +3789,8 @@ export function App(): React.JSX.Element {
                         );
                         const restored_has_structural_changes =
                             (restored_pending_changes?.formatTemplates?.length ?? 0) > 0
-                            || (restored_pending_changes?.appendedRows?.length ?? 0) > 0
+                            || pending_rows(restored_pending_changes).length > 0
+                            || pending_changes_carry_layout(restored_pending_changes)
                             || (restored_pending_changes?.tailRemovals?.length ?? 0) > 0
                             || restored_pending_changes?.appendBasis !== undefined
                             || (restored_pending_changes?.conflicts?.length ?? 0) > 0;
@@ -4617,7 +4629,10 @@ export function App(): React.JSX.Element {
     }, [active_sheet_index, toolbar_focus_restore]);
 
     useEffect(() => {
-        host_bridge.postMessage({ type: 'ready' });
+        host_bridge.postMessage({
+            type: 'ready',
+            structuralLayout: WEBVIEW_STRUCTURAL_LAYOUT_VERSION,
+        });
         return () => {
             release_edit_session();
         };

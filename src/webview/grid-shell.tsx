@@ -493,6 +493,9 @@ import {
     type PendingStructuralChanges,
     type PendingTailRemoval,
     type RowIdentity,
+    appended_rows,
+    // `pending_rows` names this shell's structural snapshot below.
+    pending_rows as stored_pending_rows,
 } from '../pending-changes';
 import {
     create_pending_row_projection,
@@ -506,7 +509,7 @@ function pending_topology_signature(
     tail_projection_key: string,
 ): string {
     return pending_topology_signature_for_rows(
-        changes.appendedRows.map((row) => row.id),
+        stored_pending_rows(changes).map((row) => row.id),
         changes.tailRemovals,
         tail_projection_key,
     );
@@ -834,16 +837,16 @@ export function pending_row_history_changes(
         };
     };
     const hinted_rows = changed_rows !== undefined
-        && before.appendedRows.length === after.appendedRows.length
-        && changed_rows.every(({ id, index }) => before.appendedRows[index]?.id === id
-            && after.appendedRows[index]?.id === id)
+        && stored_pending_rows(before).length === stored_pending_rows(after).length
+        && changed_rows.every(({ id, index }) => stored_pending_rows(before)[index]?.id === id
+            && stored_pending_rows(after)[index]?.id === id)
         ? changed_rows
         : undefined;
     let aligned = hinted_rows !== undefined
-        || before.appendedRows.length === after.appendedRows.length;
+        || stored_pending_rows(before).length === stored_pending_rows(after).length;
     if (aligned && hinted_rows === undefined) {
-        for (let index = 0; index < before.appendedRows.length; index += 1) {
-            if (before.appendedRows[index].id !== after.appendedRows[index].id) {
+        for (let index = 0; index < stored_pending_rows(before).length; index += 1) {
+            if (stored_pending_rows(before)[index].id !== stored_pending_rows(after)[index].id) {
                 aligned = false;
                 break;
             }
@@ -852,10 +855,10 @@ export function pending_row_history_changes(
     const row_changes: HistoryChange[] = [];
     if (aligned) {
         const indices = hinted_rows?.map(({ index }) => index)
-            ?? before.appendedRows.map((_, index) => index);
+            ?? stored_pending_rows(before).map((_, index) => index);
         for (const index of indices) {
-            const prior = before.appendedRows[index];
-            const next = after.appendedRows[index];
+            const prior = stored_pending_rows(before)[index];
+            const next = stored_pending_rows(after)[index];
             if (prior === next) continue;
             const change = build_row_change(
                 prior.id,
@@ -865,8 +868,8 @@ export function pending_row_history_changes(
             if (change !== undefined) row_changes.push(change);
         }
     } else {
-        const before_rows = pending_snapshot_rows_by_id(before.appendedRows);
-        const after_rows = pending_snapshot_rows_by_id(after.appendedRows);
+        const before_rows = pending_snapshot_rows_by_id(stored_pending_rows(before));
+        const after_rows = pending_snapshot_rows_by_id(stored_pending_rows(after));
         const row_ids = new Set([...before_rows.keys(), ...after_rows.keys()]);
         for (const pending_row_id of row_ids) {
             const change = build_row_change(
@@ -1917,7 +1920,7 @@ export function GridShell({
         displayRowForSource: authoritative_display_row_for_source,
         sourceRowCount: sheet_meta.sourceRowCount,
         changes: pending_rows,
-        appendedRowAt: (index) => pending_rows_ref.current.appendedRows[index],
+        appendedRowAt: (index) => appended_rows(pending_rows_ref.current)[index],
         removedSourceDisplayRows: removed_source_display_rows,
         projectedTailRemovalIds: projected_tail_removal_ids,
     }), [
@@ -1968,7 +1971,7 @@ export function GridShell({
             cache = { store: pending_store, rows: new Map() };
             pending_render_cache_ref.current = cache;
         }
-        const changed_rows = change.kind === 'reset' ? pending_rows.appendedRows : change.rows;
+        const changed_rows = change.kind === 'reset' ? stored_pending_rows(pending_rows) : change.rows;
         for (const row of changed_rows) {
             const format = pending_template_formats.get(row.formatTemplateId);
             if (format === undefined) {
@@ -2080,7 +2083,7 @@ export function GridShell({
         const before = pending_store.snapshot();
         const after: PendingStructuralChanges = {
             ...before,
-            appendedRows: before.appendedRows.map((row) => pending_ids.has(row.id)
+            appendedRows: stored_pending_rows(before).map((row) => pending_ids.has(row.id)
                 ? { ...row, viewerRowHeight: height }
                 : row),
         };
@@ -2116,7 +2119,7 @@ export function GridShell({
             sheet_meta.sourceRowCount,
             sheet_meta.sourceRowCount
                 - pending_rows.tailRemovals.length
-                + pending_rows.appendedRows.length,
+                + stored_pending_rows(pending_rows).length,
         );
         const promoted_source_row = sheet_meta.excelFirstRowHeader?.active
             ? sheet_meta.excelFirstRowHeader?.sourceRow ?? 0
@@ -2154,7 +2157,7 @@ export function GridShell({
         };
     }, [
         pending_projection,
-        pending_rows.appendedRows.length,
+        stored_pending_rows(pending_rows).length,
         pending_rows.tailRemovals.length,
         sheet_meta.excelFirstRowHeader,
         sheet_meta.sourceRowCount,
@@ -2851,7 +2854,7 @@ export function GridShell({
         const before = pending_store.snapshot();
         const after: PendingStructuralChanges = {
             ...before,
-            appendedRows: before.appendedRows.map((row) => {
+            appendedRows: stored_pending_rows(before).map((row) => {
                 if (!pending_ids.has(row.id)) return row;
                 const highlights: Record<string, CellHighlightColor> = {
                     ...(row.highlights ?? {}),
@@ -3574,18 +3577,18 @@ export function GridShell({
         && sheet_meta.columnCount > 0
         && has_visible_columns;
     const may_append_rows = can_request_append_rows
-        && pending_rows.appendedRows.length < MAX_PENDING_APPENDED_ROWS
+        && stored_pending_rows(pending_rows).length < MAX_PENDING_APPENDED_ROWS
         && sheet_meta.sourceRowCount
             - pending_rows.tailRemovals.length
-            + pending_rows.appendedRows.length < append_row_ceiling;
+            + stored_pending_rows(pending_rows).length < append_row_ceiling;
     const append_capacity = useCallback((count: number) => {
         const current = pending_store.snapshot();
         return Number.isSafeInteger(count)
             && count > 0
-            && current.appendedRows.length + count <= MAX_PENDING_APPENDED_ROWS
+            && stored_pending_rows(current).length + count <= MAX_PENDING_APPENDED_ROWS
             && sheet_meta.sourceRowCount
                 - current.tailRemovals.length
-                + current.appendedRows.length
+                + stored_pending_rows(current).length
                 + count <= append_row_ceiling;
     }, [append_row_ceiling, pending_store, sheet_meta.sourceRowCount]);
     /**
@@ -3596,11 +3599,11 @@ export function GridShell({
      * admission time.
      */
     const remaining_append_capacity = Math.max(0, Math.min(
-        MAX_PENDING_APPENDED_ROWS - pending_rows.appendedRows.length,
+        MAX_PENDING_APPENDED_ROWS - stored_pending_rows(pending_rows).length,
         append_row_ceiling
             - sheet_meta.sourceRowCount
             + pending_rows.tailRemovals.length
-            - pending_rows.appendedRows.length,
+            - stored_pending_rows(pending_rows).length,
     ));
     /**
      * Whether the append dock is offered at all. Deliberately not
@@ -3639,7 +3642,7 @@ export function GridShell({
     >((args, draw_content) => {
         draw_content();
         if (
-            pending_rows.appendedRows.length === 0
+            appended_rows(pending_rows).length === 0
             || args.row !== pending_projection.pendingBandStart
         ) return;
         args.ctx.save();
@@ -3648,7 +3651,7 @@ export function GridShell({
         // covered the first pending cell's text and click target.
         args.ctx.fillRect(args.rect.x, args.rect.y, args.rect.width, 2);
         args.ctx.restore();
-    }, [pending_projection.pendingBandStart, pending_rows.appendedRows.length]);
+    }, [pending_projection.pendingBandStart, appended_rows(pending_rows).length]);
     const append_admission_tail_ref = useRef<Promise<void>>(Promise.resolve());
     const admit_pending_rows = useCallback((
         count: number,
@@ -3685,7 +3688,7 @@ export function GridShell({
                     const current = pending_store.snapshot();
                     host_bridge.postMessage({
                         type: 'showWarning',
-                        message: current.appendedRows.length + count
+                        message: stored_pending_rows(current).length + count
                             > MAX_PENDING_APPENDED_ROWS
                             ? `A worksheet may keep at most ${MAX_PENDING_APPENDED_ROWS.toLocaleString('en-US')} pending rows.`
                             : 'Appending another row would exceed the worksheet row limit.',
@@ -3754,7 +3757,7 @@ export function GridShell({
         issue_value_edit_order,
         may_append_rows,
         on_append_rows,
-        pending_rows.appendedRows.length,
+        stored_pending_rows(pending_rows).length,
         pending_store,
         record_pending_row_gesture,
         show_pending_size_warning,
@@ -3805,7 +3808,7 @@ export function GridShell({
         const admitted_ids = new Set(appended.rowIds);
         const admitted_pending_topology_key = pending_topology_signature_for_rows(
             [
-                ...appended.before.appendedRows.map((row) => row.id),
+                ...stored_pending_rows(appended.before).map((row) => row.id),
                 ...appended.rowIds,
             ],
             appended.before.tailRemovals,
@@ -4041,7 +4044,7 @@ export function GridShell({
      */
     const composer_first_row_number = sheet_meta.sourceRowCount
         - pending_rows.tailRemovals.length
-        + pending_rows.appendedRows.length
+        + stored_pending_rows(pending_rows).length
         + 1;
     const may_append_rows_ref = useRef(may_append_rows);
     may_append_rows_ref.current = may_append_rows;
@@ -4429,7 +4432,7 @@ export function GridShell({
         }
         const parsed = parse_cell_edit(live.value, edit_syntax);
         const before = pending_store.snapshot();
-        const current = before.appendedRows.find(
+        const current = stored_pending_rows(before).find(
             (row) => row.id === live.pendingRowId,
         )?.cells[live.sourceColumn];
         const cell: PendingRowCell | undefined = parsed.text === ''
@@ -5892,7 +5895,7 @@ export function GridShell({
                 const projected_row = pending_projection.row_at(target_display_row);
                 if (projected_row?.kind === 'removal' && targetRowIdentity === undefined) continue;
                 const stable_pending_row = targetRowIdentity?.kind === 'pending'
-                    ? pending_rows.appendedRows.find(
+                    ? stored_pending_rows(pending_rows).find(
                         (candidate) => candidate.id === targetRowIdentity.pendingRowId,
                     )
                     : undefined;
@@ -7254,7 +7257,7 @@ export function GridShell({
                     value: next,
                 }])
                 : (() => {
-                    const row = pending_store.snapshot().appendedRows.find(
+                    const row = stored_pending_rows(pending_store.snapshot()).find(
                         (candidate) => candidate.id === pending_row_id,
                     );
                     if (!row) return false;

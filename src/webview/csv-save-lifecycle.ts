@@ -26,6 +26,7 @@ import {
     EMPTY_PENDING_STRUCTURAL_CHANGES,
     own_pending_structural_changes,
     type PendingStructuralChanges,
+    pending_rows,
 } from '../pending-changes';
 
 export { save_lifecycle_correlation } from '../types';
@@ -139,6 +140,12 @@ const STRUCTURAL_CHANGE_KEYS = new Set([
     'tailRemovals',
     'appendBasis',
     'conflicts',
+    // Owned strictly below; the host refuses a save carrying them until the
+    // structural save lands (peer compatibility rule 3).
+    'rowLayout',
+    'columnLayout',
+    'pendingColumns',
+    'structuralBasis',
 ]);
 
 function sanitized_structural_changes(value: unknown): PendingStructuralChanges | undefined {
@@ -432,7 +439,7 @@ export function remove_operation_owned_pending_structural_changes(
     if (pending_changes === undefined) return undefined;
     const pending = own_pending_structural_changes(pending_changes);
     if (owned === undefined) return pending;
-    const pending_row_ids = new Set(owned.appendedRows.map((row) => row.id));
+    const pending_row_ids = new Set(pending_rows(owned).map((row) => row.id));
     const removed_source_rows = new Set(
         owned.tailRemovals.map((removal) => removal.sourceRow),
     );
@@ -440,14 +447,14 @@ export function remove_operation_owned_pending_structural_changes(
     // so this pending identity cannot acquire a newer user edit while the save
     // runs. The receipt therefore settles the admitted append by ID. Retaining a
     // same-ID row here would represent the already-written row as another append.
-    const appended_rows = pending.appendedRows.filter(
+    const appended_rows = pending_rows(pending).filter(
         (row) => !pending_row_ids.has(row.id),
     );
     const tail_removals = pending.tailRemovals.filter(
         (removal) => !removed_source_rows.has(removal.sourceRow),
     );
     if (
-        appended_rows.length === pending.appendedRows.length
+        appended_rows.length === pending_rows(pending).length
         && tail_removals.length === pending.tailRemovals.length
     ) return pending;
     const retained_template_ids = new Set(

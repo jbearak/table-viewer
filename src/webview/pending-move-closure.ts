@@ -6,6 +6,7 @@ import type {
     PendingStructuralChanges,
     RowIdentity,
 } from '../pending-changes';
+import { pending_rows } from '../pending-changes';
 import type { CsvDirtyEntry } from '../types';
 
 export interface MoveCellAddress {
@@ -100,7 +101,7 @@ export function plan_pending_move_discard(
         source_key_by_node.set(node, key);
         index_provenance(address, entry);
     }
-    for (const row of pending.appendedRows) {
+    for (const row of pending_rows(pending)) {
         for (const [column_text, cell] of Object.entries(row.cells)) {
             const source_column = Number(column_text);
             const address = {
@@ -158,7 +159,7 @@ export function pending_changes_after_move_discard(
         columns.add(cell.sourceColumn);
         columns_by_row.set(cell.pendingRowId, columns);
     }
-    const appendedRows = before.appendedRows.map((row) => {
+    const appendedRows = pending_rows(before).map((row) => {
         const columns = columns_by_row.get(row.id);
         if (columns === undefined) return row;
         const cells = { ...row.cells };

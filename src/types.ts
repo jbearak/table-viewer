@@ -30,8 +30,16 @@ import {
     MAX_PENDING_APPENDED_ROWS,
     own_pending_structural_changes,
     own_pending_formula_reference_bases,
+    own_pending_row_cells,
+    own_saved_appended_row_snapshot,
+    pending_changes_carry_layout,
+    pending_rows,
+    PENDING_STRUCTURAL_CONFLICT_REASONS,
     type PendingAppendedRow,
     type PendingAppendBasis,
+    type PendingColumn,
+    type PendingRowCell,
+    type StructuralBasis,
     type PendingRowFormatTemplate,
     type SavedAppendedRowSnapshot,
     type PendingTailRemoval,
@@ -660,6 +668,14 @@ export interface PerFileState {
      * sheet, and an absent name is treated as "matches whatever is there".
      */
     pendingEdits?: (WorksheetPendingEdits | undefined)[];
+    /**
+     * A structural save's durable rekey intent, between storing it and applying
+     * it after the write. In memory it sits here; on disk it is stored only
+     * inside the version-2 `pendingEdits` envelope (see
+     * `stringify_stored_per_file_state`), so a build that cannot read version 2
+     * rejects the whole entry instead of dropping the intent on its next write.
+     */
+    structuralRekeyIntent?: StructuralRekeyIntent;
     /** Explicit Excel first-row choices keyed by worksheet name. Missing = auto. */
     excelFirstRowHeaders?: Record<string, ExcelHeaderOverride>;
     /** Last effective projection by worksheet name, used to detect closed-view changes. */
@@ -891,22 +907,33 @@ function rebase_pending_edit_orders(
         orders.add(order);
         latest = Math.max(latest, order);
     };
+    const add_cell = (cell: {
+        readonly valueEditOrder?: number;
+        readonly movedFrom?: { readonly order: number; readonly previous?: readonly { readonly order: number }[] };
+    }): void => {
+        add(cell.valueEditOrder);
+        add(cell.movedFrom?.order);
+        for (const previous of cell.movedFrom?.previous ?? []) add(previous.order);
+    };
     for (const slot of slots) {
         if (!slot) continue;
         for (const entry of Object.values(slot.cells)) {
             if (typeof entry === 'string') continue;
-            add(entry.valueEditOrder);
-            add(entry.movedFrom?.order);
-            for (const previous of entry.movedFrom?.previous ?? []) add(previous.order);
+            add_cell(entry);
         }
-        for (const row of slot.appendedRows ?? []) {
+        for (const row of pending_rows(slot)) {
             add(row.createdOrder);
-            for (const cell of Object.values(row.cells)) {
-                add(cell.valueEditOrder);
-                add(cell.movedFrom?.order);
-                for (const previous of cell.movedFrom?.previous ?? []) add(previous.order);
-            }
+            for (const cell of Object.values(row.cells)) add_cell(cell);
         }
+        // Creation orders are compared across live and discarded Pending Rows
+        // (and across Pending Columns), so every one of them is rebased by the
+        // same monotonic map or none is.
+        for (const row of slot.rowLayout?.discardedPendingRows ?? []) add(row.createdOrder);
+        for (const column of slot.pendingColumns ?? []) {
+            add(column.createdOrder);
+            for (const cell of Object.values(column.cells)) add_cell(cell);
+        }
+        for (const column of slot.columnLayout?.discardedPendingColumns ?? []) add(column.createdOrder);
     }
     if (latest < VALUE_EDIT_ORDER_REBASE_THRESHOLD) return slots;
 
@@ -915,20 +942,38 @@ function rebase_pending_edit_orders(
         .filter((order) => order > 0)
         .sort((left, right) => left - right)
         .forEach((order, index) => replacements.set(order, index + 1));
+    const rebase_moved_from = <M extends { readonly order: number; readonly previous?: readonly { readonly order: number }[] }>(
+        moved_from: M | undefined,
+    ): M | undefined => moved_from === undefined ? undefined : {
+        ...moved_from,
+        order: replacements.get(moved_from.order)!,
+        ...(moved_from.previous === undefined ? {} : {
+            previous: moved_from.previous.map((move) => ({
+                ...move,
+                order: replacements.get(move.order)!,
+            })),
+        }),
+    };
+    const rebase_pending_cell = (cell: PendingRowCell): PendingRowCell => {
+        const movedFrom = rebase_moved_from(cell.movedFrom);
+        return {
+            ...cell,
+            ...(cell.valueEditOrder === undefined ? {} : {
+                valueEditOrder: replacements.get(cell.valueEditOrder)!,
+            }),
+            ...(movedFrom === undefined ? {} : { movedFrom }),
+        };
+    };
+    const rebase_pending_cells = (
+        cells: Readonly<Record<string, PendingRowCell>>,
+    ): Record<string, PendingRowCell> => Object.fromEntries(
+        Object.entries(cells).map(([key, cell]) => [key, rebase_pending_cell(cell)]),
+    );
     return slots.map((slot) => {
         if (!slot) return undefined;
         const cells = Object.fromEntries(Object.entries(slot.cells).map(([key, entry]) => {
             if (typeof entry === 'string') return [key, entry];
-            const moved_from = entry.movedFrom === undefined ? undefined : {
-                ...entry.movedFrom,
-                order: replacements.get(entry.movedFrom.order)!,
-                ...(entry.movedFrom.previous === undefined ? {} : {
-                    previous: entry.movedFrom.previous.map((move) => ({
-                        ...move,
-                        order: replacements.get(move.order)!,
-                    })),
-                }),
-            };
+            const moved_from = rebase_moved_from(entry.movedFrom);
             return [key, {
                 ...entry,
                 ...(moved_from === undefined ? {} : { movedFrom: moved_from }),
@@ -937,36 +982,39 @@ function rebase_pending_edit_orders(
                 }),
             }];
         }));
-        const appendedRows = slot.appendedRows?.map((row) => ({
-            ...row,
-            createdOrder: replacements.get(row.createdOrder)!,
-            cells: Object.fromEntries(Object.entries(row.cells).map(([column, cell]) => [
-                column,
-                (() => {
-                    const movedFrom = cell.movedFrom === undefined ? undefined : {
-                        ...cell.movedFrom,
-                        order: replacements.get(cell.movedFrom.order)!,
-                        ...(cell.movedFrom.previous === undefined ? {} : {
-                            previous: cell.movedFrom.previous.map((move) => ({
-                                ...move,
-                                order: replacements.get(move.order)!,
-                            })),
-                        }),
-                    };
-                    return {
-                        ...cell,
-                        ...(cell.valueEditOrder === undefined ? {} : {
-                            valueEditOrder: replacements.get(cell.valueEditOrder)!,
-                        }),
-                        ...(movedFrom === undefined ? {} : { movedFrom }),
-                    };
-                })(),
-            ])),
+        const appendedRows = slot.appendedRows === undefined
+            ? undefined
+            : pending_rows(slot).map((row) => ({
+                ...row,
+                createdOrder: replacements.get(row.createdOrder)!,
+                cells: rebase_pending_cells(row.cells),
+            }));
+        const rowLayout = slot.rowLayout === undefined ? undefined : {
+            ...slot.rowLayout,
+            discardedPendingRows: slot.rowLayout.discardedPendingRows.map((row) => ({
+                ...row,
+                createdOrder: replacements.get(row.createdOrder)!,
+            })),
+        };
+        const pendingColumns = slot.pendingColumns?.map((column) => ({
+            ...column,
+            createdOrder: replacements.get(column.createdOrder)!,
+            cells: rebase_pending_cells(column.cells),
         }));
+        const columnLayout = slot.columnLayout === undefined ? undefined : {
+            ...slot.columnLayout,
+            discardedPendingColumns: slot.columnLayout.discardedPendingColumns.map((column) => ({
+                ...column,
+                createdOrder: replacements.get(column.createdOrder)!,
+            })),
+        };
         return {
             ...slot,
             cells,
             ...(appendedRows === undefined ? {} : { appendedRows }),
+            ...(rowLayout === undefined ? {} : { rowLayout }),
+            ...(pendingColumns === undefined ? {} : { pendingColumns }),
+            ...(columnLayout === undefined ? {} : { columnLayout }),
         };
     });
 }
@@ -974,11 +1022,13 @@ function rebase_pending_edit_orders(
 /**
  * Decode `pendingEdits` in any of its persisted shapes.
  *
- * Three are accepted, and all three are objects on disk:
+ * These are accepted, and all but the in-memory array are objects on disk:
  *
- *  - `{version: 1, sheets: [...]}` — what this version writes. See
- *    {@link stringify_stored_per_file_state} for why the list is wrapped rather
- *    than stored bare.
+ *  - `{version: 2, sheets: [...], rekeyIntent?}` — what this version writes
+ *    whenever any slot carries a layout field or an inserted row, or a rekey
+ *    intent is stored. See {@link stringify_stored_per_file_state}.
+ *  - `{version: 1, sheets: [...]}` — what this version writes otherwise, and
+ *    what every earlier versioned release wrote.
  *  - `{sheets: [...]}` — the first worksheet-scoped envelope.
  *  - a bare array — never persisted, but this is also the in-memory shape, and the
  *    same decoder runs over states that never went to disk.
@@ -988,25 +1038,46 @@ function rebase_pending_edit_orders(
  *
  * The wrapper is told from the flat map by its `sheets` key, which cannot collide:
  * flat-map keys are all `"<row>:<col>"` and `validate_edit_cells` rejects anything
- * else. Returns `undefined` when nothing survives, so the caller can drop the leaf.
+ * else. Version 1 and version 2 decode through the same slot decoder, so a
+ * version-1 envelope that happens to carry version-2 fields is still read whole
+ * rather than truncated. `slots` is `undefined` when nothing survives, so the
+ * caller can drop the leaf.
  */
 function decode_pending_edits(
+    value: unknown,
+): {
+    readonly slots: (WorksheetPendingEdits | undefined)[] | undefined;
+    readonly rekeyIntent?: StructuralRekeyIntent;
+} {
+    if (is_plain_record(value) && Object.hasOwn(value, 'sheets')) {
+        const versioned = Object.hasOwn(value, 'version');
+        const keys = Object.keys(value);
+        const valid_envelope = Array.isArray(value.sheets) && (
+            !versioned
+                ? keys.length === 1
+                : value.version === 1
+                    ? keys.length === 2
+                    : value.version === 2
+                        && keys.every((key) => key === 'version' || key === 'sheets' || key === 'rekeyIntent')
+        );
+        if (!valid_envelope) invalid_leaf('pendingEdits');
+        const rekeyIntent = value.rekeyIntent === undefined
+            ? undefined
+            : own_structural_rekey_intent(value.rekeyIntent);
+        return {
+            slots: decode_pending_edit_slots(value.sheets, versioned),
+            ...(rekeyIntent === undefined ? {} : { rekeyIntent }),
+        };
+    }
+    return { slots: decode_pending_edit_slots(value) };
+}
+
+function decode_pending_edit_slots(
     value: unknown,
     enforce_complete_bound = false,
 ): (WorksheetPendingEdits | undefined)[] | undefined {
     if (is_plain_record(value)) {
-        if (Object.hasOwn(value, 'sheets')) {
-            const versioned = Object.hasOwn(value, 'version');
-            if (
-                !Array.isArray(value.sheets)
-                || (versioned
-                    ? value.version !== 1 || Object.keys(value).length !== 2
-                    : Object.keys(value).length !== 1)
-            ) {
-                invalid_leaf('pendingEdits');
-            }
-            return decode_pending_edits(value.sheets, versioned);
-        }
+        if (Object.hasOwn(value, 'sheets')) invalid_leaf('pendingEdits');
         const cells = validate_edit_cells(value);
         return Object.keys(cells).length === 0
             ? undefined
@@ -1047,6 +1118,18 @@ function decode_pending_edits(
             ...(structural.conflicts.length > 0
                 ? { conflicts: structural.conflicts }
                 : {}),
+            ...(structural.rowLayout === undefined
+                ? {}
+                : { rowLayout: structural.rowLayout }),
+            ...(structural.columnLayout === undefined
+                ? {}
+                : { columnLayout: structural.columnLayout }),
+            ...(structural.pendingColumns === undefined
+                ? {}
+                : { pendingColumns: structural.pendingColumns }),
+            ...(structural.structuralBasis === undefined
+                ? {}
+                : { structuralBasis: structural.structuralBasis }),
         };
         if (
             enforce_complete_bound
@@ -1055,6 +1138,10 @@ function decode_pending_edits(
             || slot.tailRemovals !== undefined
             || slot.appendBasis !== undefined
             || slot.conflicts !== undefined
+            || slot.rowLayout !== undefined
+            || slot.columnLayout !== undefined
+            || slot.pendingColumns !== undefined
+            || slot.structuralBasis !== undefined
         ) assert_pending_changes_encoded_bound(decoded);
         return decoded;
     });
@@ -1066,10 +1153,31 @@ function decode_pending_edits(
 }
 
 /**
+ * Whether persisting `pendingEdits` needs the version-2 envelope: some slot
+ * carries a row or column layout, a Pending Column, a Structural Basis, or a
+ * Pending Row of origin `insert`. Formula Anchors join this list when they are
+ * stored.
+ */
+export function pending_edits_require_version_2(
+    pending: PerFileState['pendingEdits'],
+): boolean {
+    return !!pending?.some((slot) => slot !== undefined && pending_changes_carry_layout(slot));
+}
+
+/** The `pendingEdits` envelope version `stringify_stored_per_file_state` writes for `state`. */
+export function stored_pending_edits_version(state: StoredPerFileState): 1 | 2 {
+    const current = state as PerFileState;
+    return current.structuralRekeyIntent !== undefined
+        || pending_edits_require_version_2(current.pendingEdits)
+        ? 2
+        : 1;
+}
+
+/**
  * Serialize a state for persistence, wrapping the `pendingEdits` list.
  *
  * The leaf is a positional array in memory but goes to disk as
- * `{"sheets": [...]}`, because the SQLite `entries` table CHECKs
+ * `{"version": 1, "sheets": [...]}`, because the SQLite `entries` table CHECKs
  * `json_type(state_json, '$.pendingEdits') = 'object'` and that DDL shipped in
  * v0.8.0. `user_version` did not change for this feature,
  * `migrate_sqlite_file_state_schema` returns early when the version already
@@ -1078,11 +1186,27 @@ function decode_pending_edits(
  * failing to open, with no migration able to reach it. One wrapper key is the
  * whole cost of not breaking them.
  *
+ * The envelope is `{version: 2, sheets, rekeyIntent?}` exactly when
+ * `stored_pending_edits_version` says so: when a slot carries layout state, or
+ * a structural save's rekey intent is stored. A release that predates layouts
+ * rebuilds each slot from the fields it knows, so it would silently drop a
+ * layout and keep the rows it understands at the wrong coordinates; it rejects
+ * any version but 1 instead, so its repository reports the entry malformed and
+ * leaves it alone. The rekey intent rides inside the envelope, not as a
+ * top-level leaf, for the same reason: an older build preserves unknown
+ * top-level leaves verbatim, but would still drop a top-level intent's
+ * meaning. Version 1 stays the default so ordinary editing remains readable by
+ * the previous release.
+ *
  * Use this rather than `JSON.stringify` anywhere the result is durable. In-memory
  * comparisons may use either, as long as both sides use the same one.
  */
 export function stringify_stored_per_file_state(state: StoredPerFileState): string {
-    const pending = (state as PerFileState).pendingEdits;
+    const {
+        pendingEdits: pending,
+        structuralRekeyIntent: rekey_intent,
+        ...rest
+    } = state as PerFileState;
     // An empty leaf is dropped, not wrapped. The durable row's `has_pending_edits`
     // column comes from `has_any_pending_edits`, which is false for `[]`,
     // `[undefined]`, and a slot whose `cells` is empty — while the leaf itself was
@@ -1090,15 +1214,25 @@ export function stringify_stored_per_file_state(state: StoredPerFileState): stri
     // `decode_stored_per_file_state` already normalizes those away, so this only
     // matters for a state that reaches durability without passing through it; it is
     // the serializer's own invariant either way, and cheaper to hold here than to
-    // rely on every caller.
-    if (pending === undefined || !has_any_pending_edits(pending)) {
-        const { pendingEdits: _dropped, ...rest } = state as PerFileState;
-        return JSON.stringify(rest);
-    }
-    for (const slot of pending) {
+    // rely on every caller. A stored rekey intent keeps the envelope (and the
+    // `has_pending_edits` flag, see `state_has_pending_edits`) even with no slot.
+    const has_slots = pending !== undefined && has_any_pending_edits(pending);
+    if (!has_slots && rekey_intent === undefined) return JSON.stringify(rest);
+    const sheets = has_slots ? pending : [];
+    for (const slot of sheets) {
         if (slot !== undefined) assert_pending_changes_encoded_bound(slot);
     }
-    return JSON.stringify({ ...state, pendingEdits: { version: 1, sheets: pending } });
+    const version = stored_pending_edits_version({ pendingEdits: sheets, structuralRekeyIntent: rekey_intent });
+    return JSON.stringify({
+        ...rest,
+        pendingEdits: version === 1
+            ? { version: 1, sheets }
+            : {
+                version: 2,
+                sheets,
+                ...(rekey_intent === undefined ? {} : { rekeyIntent: rekey_intent }),
+            },
+    });
 }
 
 /** Validate known leaves while preserving unknown top-level leaves verbatim. */
@@ -1159,10 +1293,24 @@ export function decode_stored_per_file_state(value: unknown): StoredPerFileState
             invalid_leaf('excelFirstRowHeaderActive');
         }
     }
+    // In memory the intent is a top-level field; on disk it is only ever inside
+    // the version-2 envelope. Both spellings decode, but not both at once.
+    const top_level_intent = state.structuralRekeyIntent === undefined
+        ? undefined
+        : own_structural_rekey_intent(state.structuralRekeyIntent);
+    delete state.structuralRekeyIntent;
+    let enveloped_intent: StructuralRekeyIntent | undefined;
     if (state.pendingEdits !== undefined) {
-        state.pendingEdits = decode_pending_edits(state.pendingEdits);
+        const decoded = decode_pending_edits(state.pendingEdits);
+        enveloped_intent = decoded.rekeyIntent;
+        state.pendingEdits = decoded.slots;
         if (state.pendingEdits === undefined) delete state.pendingEdits;
     }
+    if (top_level_intent !== undefined && enveloped_intent !== undefined) {
+        invalid_leaf('structuralRekeyIntent');
+    }
+    const rekey_intent = top_level_intent ?? enveloped_intent;
+    if (rekey_intent !== undefined) state.structuralRekeyIntent = rekey_intent;
     return state as unknown as StoredPerFileState;
 }
 
@@ -1189,6 +1337,12 @@ export interface WorksheetPendingEdits {
     readonly appendBasis?: PendingStructuralChanges['appendBasis'];
     /** Durable save refusals for pending rows. */
     readonly conflicts?: PendingStructuralChanges['conflicts'];
+    /** Prospective body-row order; absent means the source layout. */
+    readonly rowLayout?: PendingStructuralChanges['rowLayout'];
+    /** Prospective column order; absent means the source layout. */
+    readonly columnLayout?: PendingStructuralChanges['columnLayout'];
+    readonly pendingColumns?: readonly PendingColumn[];
+    readonly structuralBasis?: StructuralBasis;
 }
 
 /** New wire/save shape: one complete, version-1 worksheet Pending Changes snapshot. */
@@ -1272,9 +1426,12 @@ export type SheetPendingEditCells = Record<string, string | CsvDirtyEntry>;
 function worksheet_slot_has_pending_changes(slot: WorksheetPendingEdits | undefined): boolean {
     return !!slot && (
         Object.keys(slot.cells).length > 0
-        || (slot.appendedRows?.length ?? 0) > 0
+        || pending_rows(slot).length > 0
         || (slot.tailRemovals?.length ?? 0) > 0
         || (slot.conflicts?.length ?? 0) > 0
+        || slot.rowLayout !== undefined
+        || slot.columnLayout !== undefined
+        || (slot.pendingColumns?.length ?? 0) > 0
     );
 }
 
@@ -1411,7 +1568,9 @@ export function with_pending_changes_for_sheet(
 
 /**
  * Replace only one worksheet's cell changes while retaining its structural
- * changes. Legacy cell-edit publishers use this during the protocol migration.
+ * changes, layout fields included. Legacy cell-edit publishers use this during
+ * the protocol migration; the host validates the complete result against the
+ * layout before writing it (peer compatibility rule 2).
  */
 export function with_pending_edits_for_sheet(
     pending: PerFileState['pendingEdits'],
@@ -1442,6 +1601,18 @@ export function with_pending_edits_for_sheet(
             : {}),
         ...(incumbent?.conflicts !== undefined
             ? { conflicts: incumbent.conflicts }
+            : {}),
+        ...(incumbent?.rowLayout !== undefined
+            ? { rowLayout: incumbent.rowLayout }
+            : {}),
+        ...(incumbent?.columnLayout !== undefined
+            ? { columnLayout: incumbent.columnLayout }
+            : {}),
+        ...(incumbent?.pendingColumns !== undefined
+            ? { pendingColumns: incumbent.pendingColumns }
+            : {}),
+        ...(incumbent?.structuralBasis !== undefined
+            ? { structuralBasis: incumbent.structuralBasis }
             : {}),
     };
     return with_pending_changes_for_sheet(
@@ -2504,14 +2675,7 @@ export function is_wire_csv_save_rejection(
         && (value.worksheetOperationIndex as number) >= 0
     )) return false;
     if (value.reason === 'structuralConflict') {
-        const reasons = new Set<PendingStructuralConflictReason>([
-            'worksheetReplaced',
-            'rowLimitExceeded',
-            'templateChanged',
-            'ambiguousColumns',
-            'ambiguousPendingFormula',
-            'savedSuffixChanged',
-        ]);
+        const reasons = PENDING_STRUCTURAL_CONFLICT_REASONS;
         let payload_within_bound = false;
         try {
             assert_pending_changes_encoded_bound({
@@ -2605,6 +2769,147 @@ export interface PendingChangesSaveReceipt {
     })[];
 }
 
+/** The layout capability a current renderer declares in its `ready` message. */
+export const WEBVIEW_STRUCTURAL_LAYOUT_VERSION = 1;
+
+/**
+ * A structural save's durable record of how it renumbers rows and columns,
+ * stored inside the version-2 Pending Changes envelope before the write and
+ * applied to durable view state after it (or on recovery).
+ */
+export interface StructuralRekeyIntent {
+    readonly saveId: string;
+    /** Digest of the verified bytes the save read. */
+    readonly beforeDigest: string;
+    /** Digest of the bytes the save writes. */
+    readonly afterDigest: string;
+    /** The accepted payload this save retires, per worksheet. */
+    readonly worksheets: readonly (WorksheetTarget & { readonly acceptedSequence: number })[];
+    /** The complete save receipt: structure entries and appended-row assignments. */
+    readonly receipt: PendingChangesSaveReceipt;
+}
+
+const MAX_REKEY_INTENT_ID_LENGTH = 256;
+const MAX_REKEY_INTENT_WORKSHEETS = 64;
+const MAX_REKEY_INTENT_RECEIPT_ROWS = 1_000_000;
+
+function rekey_intent_error(): never {
+    throw new TypeError('Persisted file state has an invalid structural rekey intent.');
+}
+
+function own_rekey_intent_target(
+    value: unknown,
+    extra_keys: readonly string[],
+): WorksheetTarget & Record<string, unknown> {
+    const allowed = new Set(['sheetIndex', 'sheetName', 'worksheetId', ...extra_keys]);
+    if (!is_plain_record(value) || Object.keys(value).some((key) => !allowed.has(key))) {
+        rekey_intent_error();
+    }
+    const target = sanitized_wire_worksheet_target(value);
+    if (target === undefined || value.sheetIndex === undefined) rekey_intent_error();
+    return { ...value, ...target };
+}
+
+function is_rekey_intent_digest(value: unknown): value is string {
+    return typeof value === 'string' && value.length > 0 && value.length <= MAX_REKEY_INTENT_ID_LENGTH;
+}
+
+/**
+ * Strictly own a stored rekey intent. Its receipt is today's receipt shape;
+ * the worksheet structure entries join it with the structural save.
+ */
+export function own_structural_rekey_intent(value: unknown): StructuralRekeyIntent {
+    if (
+        !is_plain_record(value)
+        || Object.keys(value).some((key) => ![
+            'saveId', 'beforeDigest', 'afterDigest', 'worksheets', 'receipt',
+        ].includes(key))
+        || !is_rekey_intent_digest(value.saveId)
+        || !is_rekey_intent_digest(value.beforeDigest)
+        || !is_rekey_intent_digest(value.afterDigest)
+        || !Array.isArray(value.worksheets)
+        || value.worksheets.length === 0
+        || value.worksheets.length > MAX_REKEY_INTENT_WORKSHEETS
+        || !is_plain_record(value.receipt)
+        || Object.keys(value.receipt).some((key) => key !== 'appendedRows' && key !== 'removedSourceRows')
+        || !Array.isArray(value.receipt.appendedRows)
+        || !Array.isArray(value.receipt.removedSourceRows)
+        || value.receipt.appendedRows.length > MAX_REKEY_INTENT_RECEIPT_ROWS
+        || value.receipt.removedSourceRows.length > MAX_REKEY_INTENT_WORKSHEETS
+    ) rekey_intent_error();
+    try {
+        assert_pending_changes_encoded_bound(value);
+    } catch {
+        rekey_intent_error();
+    }
+    const worksheet_keys = new Set<string>();
+    const worksheets = value.worksheets.map((entry) => {
+        const target = own_rekey_intent_target(entry, ['acceptedSequence']);
+        const key = worksheet_target_key(target);
+        if (
+            worksheet_keys.has(key)
+            || !Number.isSafeInteger(target.acceptedSequence)
+            || (target.acceptedSequence as number) < 0
+        ) rekey_intent_error();
+        worksheet_keys.add(key);
+        return Object.freeze({
+            ...sanitized_wire_worksheet_target(target)!,
+            acceptedSequence: target.acceptedSequence as number,
+        });
+    });
+    const appendedRows = (value.receipt.appendedRows as unknown[]).map((entry): AppendedRowAssignment => {
+        const target = own_rekey_intent_target(entry, [
+            'pendingRowId', 'sourceRow', 'savedFingerprint', 'savedCells', 'savedRow',
+        ]);
+        if (
+            typeof target.pendingRowId !== 'string'
+            || target.pendingRowId.length === 0
+            || target.pendingRowId.length > 128
+            || !Number.isSafeInteger(target.sourceRow)
+            || (target.sourceRow as number) < 0
+            || !is_rekey_intent_digest(target.savedFingerprint)
+        ) rekey_intent_error();
+        let savedCells: SavedAppendedRowSnapshot['cells'] | undefined;
+        let savedRow: SavedAppendedRowSnapshot | undefined;
+        try {
+            savedCells = target.savedCells === undefined ? undefined : own_pending_row_cells(target.savedCells);
+            savedRow = target.savedRow === undefined ? undefined : own_saved_appended_row_snapshot(target.savedRow);
+        } catch {
+            rekey_intent_error();
+        }
+        return Object.freeze({
+            ...sanitized_wire_worksheet_target(target)!,
+            pendingRowId: target.pendingRowId,
+            sourceRow: target.sourceRow as number,
+            savedFingerprint: target.savedFingerprint as string,
+            ...(savedCells === undefined ? {} : { savedCells }),
+            ...(savedRow === undefined ? {} : { savedRow }),
+        });
+    });
+    const removedSourceRows = (value.receipt.removedSourceRows as unknown[]).map((entry) => {
+        const target = own_rekey_intent_target(entry, ['sourceRows']);
+        if (
+            !Array.isArray(target.sourceRows)
+            || target.sourceRows.length > MAX_REKEY_INTENT_RECEIPT_ROWS
+            || target.sourceRows.some((row) => !Number.isSafeInteger(row) || (row as number) < 0)
+        ) rekey_intent_error();
+        return Object.freeze({
+            ...sanitized_wire_worksheet_target(target)!,
+            sourceRows: Object.freeze([...(target.sourceRows as number[])]),
+        });
+    });
+    return Object.freeze({
+        saveId: value.saveId,
+        beforeDigest: value.beforeDigest,
+        afterDigest: value.afterDigest,
+        worksheets: Object.freeze(worksheets),
+        receipt: Object.freeze({
+            appendedRows: Object.freeze(appendedRows),
+            removedSourceRows: Object.freeze(removedSourceRows),
+        }),
+    });
+}
+
 /** Decode one worksheet target, optionally defaulting a legacy missing index. */
 export function sanitized_wire_worksheet_target(
     value: unknown,
@@ -2664,6 +2969,10 @@ export function own_wire_pending_changes(value: unknown): WorksheetPendingChange
         'tailRemovals',
         'appendBasis',
         'conflicts',
+        'rowLayout',
+        'columnLayout',
+        'pendingColumns',
+        'structuralBasis',
     ]);
     if (
         Object.keys(value).some((key) => !allowed.has(key))
@@ -3037,7 +3346,13 @@ export type HostMessage =
 
 /** Messages from webview to extension host */
 export type WebviewMessage =
-    | { type: 'ready' }
+    /**
+     * `structuralLayout` declares that this renderer understands Worksheet
+     * Layouts. The host grants an edit session on a file whose durable Pending
+     * Changes are version 2 only to a renderer that declares it, so an older
+     * webview that outlived an update cannot overwrite layout state.
+     */
+    | { type: 'ready'; structuralLayout?: typeof WEBVIEW_STRUCTURAL_LAYOUT_VERSION }
     /**
      * Abandon a comparison that is still aligning its rows. The window has
      * nothing to show yet — alignment is what makes the diff correct, not an
