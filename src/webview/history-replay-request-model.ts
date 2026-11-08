@@ -24,6 +24,7 @@ import { cell_address, type ReplayPlan } from './history-replay-model';
 import {
     action_has_cell_changes,
     action_replay_changes,
+    is_structural_history_change,
     type HistoryEntry,
 } from './history-stack-model';
 import { MAX_SHEET_ROWS } from '../spreadsheet-safety';
@@ -134,8 +135,7 @@ export function build_prepare_request(
     let focus: HistoryReplayFocus | undefined;
 
     for (const change of action_replay_changes(entry.action, direction)) {
-        if (change.kind === 'rowAppend' || change.kind === 'tailRemoval'
-            || change.kind === 'pendingRows') continue;
+        if (is_structural_history_change(change)) continue;
         const { worksheet, sourceRow, sourceColumn } = change.delta;
         focus = extend_focus(focus, worksheet, sourceRow, sourceColumn);
         if (change.kind === 'highlight') {

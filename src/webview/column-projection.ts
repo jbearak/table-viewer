@@ -1,4 +1,18 @@
+// Display columns: which columns the grid shows, in which order. Without a
+// column layout, the source columns minus hidden ones (`create_column_projection`).
+// With one, the layout's columns in prospective order minus hidden source
+// columns and discarded Pending Column tombstones, each with its identity key
+// (`s:<n>` or `p:<id>`) for the Glide column id and its display state
+// (`create_layout_column_projection`).
 import type { SheetColumnVisibilityState } from '../types';
+import {
+    column_identity_key,
+    index_column_layout,
+    moved_source_columns,
+    source_column_layout,
+    type ColumnIdentity,
+    type ColumnLayout,
+} from '../worksheet-layout';
 
 export interface ColumnProjection {
     /** Display-column index to canonical source-column index. */
@@ -226,4 +240,73 @@ function canonical_visibility_from_visible(
         column_count,
         schema,
     );
+}
+
+/** A source column, a Pending Column, a Pending Column Removal, or a Moved Column. */
+export type ProjectedColumnState = 'source' | 'inserted' | 'removed' | 'moved';
+
+export interface ProjectedColumn {
+    readonly identity: ColumnIdentity;
+    /** The Glide column id: `s:<sourceColumn>` or `p:<pendingColumnId>`. */
+    readonly key: string;
+    readonly state: ProjectedColumnState;
+}
+
+export interface ColumnLayoutProjection {
+    /** Display columns in order. */
+    readonly columns: readonly ProjectedColumn[];
+    /** Source column to display column; hidden and absent columns have none. */
+    readonly source_to_visible: readonly (number | undefined)[];
+    /** Hidden source columns, as `create_column_projection` counts them. */
+    readonly hidden_count: number;
+    display_column_for_identity(identity: ColumnIdentity): number | undefined;
+    display_column_for_key(key: string): number | undefined;
+}
+
+/**
+ * Display columns for a worksheet whose columns may have a layout. Hidden
+ * columns are source columns from the visibility state; Pending Columns are
+ * never hidden. Pending Column Removals stay in place, classified `removed`.
+ * Without a layout the order and hidden set equal `create_column_projection`'s.
+ */
+export function create_layout_column_projection(
+    column_count: number,
+    layout: ColumnLayout | undefined,
+    visibility?: unknown,
+    expected_schema?: string,
+): ColumnLayoutProjection {
+    const safe_column_count = Number.isInteger(column_count) && column_count > 0 ? column_count : 0;
+    const hidden = new Set<number>();
+    const visible_projection = create_column_projection(safe_column_count, visibility, expected_schema);
+    for (let source_column = 0; source_column < safe_column_count; source_column++) {
+        if (visible_projection.source_to_visible[source_column] === undefined) hidden.add(source_column);
+    }
+    const effective = layout ?? source_column_layout(safe_column_count);
+    const index = index_column_layout(effective);
+    const moved = new Set<number>();
+    for (const interval of moved_source_columns(effective)) {
+        for (let offset = 0; offset < interval.count; offset++) moved.add(interval.start + offset);
+    }
+    const columns: ProjectedColumn[] = [];
+    const source_to_visible: (number | undefined)[] = [];
+    const by_key = new Map<string, number>();
+    for (const identity of index.display_identities()) {
+        if (identity.kind === 'source' && hidden.has(identity.sourceColumn)) continue;
+        const state: ProjectedColumnState = identity.kind === 'pending'
+            ? 'inserted'
+            : index.status_of(identity) === 'removed'
+                ? 'removed'
+                : moved.has(identity.sourceColumn) ? 'moved' : 'source';
+        const key = column_identity_key(identity);
+        if (identity.kind === 'source') source_to_visible[identity.sourceColumn] = columns.length;
+        by_key.set(key, columns.length);
+        columns.push(Object.freeze({ identity, key, state }));
+    }
+    return Object.freeze({
+        columns: Object.freeze(columns),
+        source_to_visible,
+        hidden_count: hidden.size,
+        display_column_for_identity: (identity: ColumnIdentity) => by_key.get(column_identity_key(identity)),
+        display_column_for_key: (key: string) => by_key.get(key),
+    });
 }

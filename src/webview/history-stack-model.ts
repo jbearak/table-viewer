@@ -4,17 +4,25 @@ import {
     MAX_HISTORY_ACTION_ENCODED_BYTES,
 } from '../history-limits';
 import {
+    own_column_layout,
+    own_pending_column,
     own_pending_row_format_template,
     own_pending_structural_changes,
+    own_row_layout,
+    own_structural_basis,
+    type PendingAppendBasis,
     type PendingAppendedRow,
+    type PendingColumn,
     type PendingRowCell,
     type PendingRowFormatTemplate,
     type PendingStructuralChanges,
     type PendingTailRemoval,
     type RowIdentity,
     type SavedAppendedRowSnapshot,
+    type StructuralBasis,
     pending_rows,
 } from '../pending-changes';
+import type { ColumnLayout, RowLayout } from '../worksheet-layout';
 import {
     worksheet_target_key,
     type CellHighlightColor,
@@ -82,12 +90,69 @@ export interface PendingRowsHistoryDelta {
     readonly after: PendingStructuralChanges;
 }
 
+/** One Pending Row or Pending Column before and after a gesture; null where absent. */
+export interface PendingEntryTransition<T> {
+    readonly id: string;
+    readonly before: T | null;
+    readonly after: T | null;
+}
+
+/** An optional basis a gesture recorded or cleared; null where absent. */
+export interface BasisTransition<T> {
+    readonly before: T | null;
+    readonly after: T | null;
+}
+
+/**
+ * One worksheet's layout on one axis before and after a structural gesture
+ * (Insert, Delete, Restore, Move), with every Pending Row and Pending Column
+ * the gesture created, discarded, or changed, and the format templates those
+ * rows name. A null layout is the source layout. Only entries that changed
+ * are listed, so the delta stays proportional to the gesture rather than to
+ * the worksheet's pending content; replay compares and swaps exactly these
+ * against the structural store.
+ */
+export interface StructuralSnapshotDelta<L> {
+    readonly worksheet: WorksheetTarget;
+    readonly before: L | null;
+    readonly after: L | null;
+    readonly pendingRows: readonly PendingEntryTransition<PendingAppendedRow>[];
+    readonly pendingColumns: readonly PendingEntryTransition<PendingColumn>[];
+    readonly formatTemplates: readonly PendingRowFormatTemplate[];
+    /** Present only when the gesture changed the worksheet's append basis. */
+    readonly appendBasis?: BasisTransition<PendingAppendBasis>;
+    /** Present only when the gesture changed the worksheet's Structural Basis. */
+    readonly structuralBasis?: BasisTransition<StructuralBasis>;
+}
+
+export type RowLayoutHistoryDelta = StructuralSnapshotDelta<RowLayout>;
+export type ColumnLayoutHistoryDelta = StructuralSnapshotDelta<ColumnLayout>;
+
 export type HistoryChange =
     | { readonly kind: 'cell'; readonly delta: CellHistoryDelta }
     | { readonly kind: 'highlight'; readonly delta: HighlightHistoryDelta }
     | { readonly kind: 'rowAppend'; readonly delta: RowAppendHistoryDelta }
     | { readonly kind: 'tailRemoval'; readonly delta: TailRemovalHistoryDelta }
-    | { readonly kind: 'pendingRows'; readonly delta: PendingRowsHistoryDelta };
+    | { readonly kind: 'pendingRows'; readonly delta: PendingRowsHistoryDelta }
+    | { readonly kind: 'rowLayout'; readonly delta: RowLayoutHistoryDelta }
+    | { readonly kind: 'columnLayout'; readonly delta: ColumnLayoutHistoryDelta };
+
+/** The arms replayed against the worksheet structural store rather than the cell lease. */
+export type StructuralHistoryChange = Extract<
+    HistoryChange,
+    { kind: 'rowAppend' | 'tailRemoval' | 'pendingRows' | 'rowLayout' | 'columnLayout' }
+>;
+
+/** The layout arms: a row or column layout transition with its pending content. */
+export type LayoutHistoryChange = Extract<HistoryChange, { kind: 'rowLayout' | 'columnLayout' }>;
+
+export function is_structural_history_change(change: HistoryChange): change is StructuralHistoryChange {
+    return change.kind === 'rowAppend'
+        || change.kind === 'tailRemoval'
+        || change.kind === 'pendingRows'
+        || change.kind === 'rowLayout'
+        || change.kind === 'columnLayout';
+}
 
 /**
  * One user gesture, undone and redone as a unit.
@@ -475,7 +540,8 @@ function estimate_change_bytes(change: HistoryChange, charge: ActionCharger): nu
         )
         : change.kind === 'tailRemoval'
             ? charge.structural(change.delta)
-            : change.kind === 'pendingRows'
+            : change.kind === 'pendingRows' || change.kind === 'rowLayout'
+                || change.kind === 'columnLayout'
                 ? charge.structural(change.delta)
             : 0;
     return charge.worksheet(change.delta.worksheet) + (change.kind === 'cell'
@@ -533,6 +599,13 @@ function cell_count_index(): CellCountIndex {
  * one counted cell.
  */
 function add_counted_cell(index: CellCountIndex, change: HistoryChange): void {
+    if (change.kind === 'rowLayout' || change.kind === 'columnLayout') {
+        index.count += Math.max(
+            1,
+            change.delta.pendingRows.length + change.delta.pendingColumns.length,
+        );
+        return;
+    }
     if (change.kind === 'rowAppend' || change.kind === 'tailRemoval'
         || change.kind === 'pendingRows') {
         index.count += change.kind === 'pendingRows'
@@ -1214,6 +1287,11 @@ function rekey_change_provenance(
                 },
             };
         case 'highlight':
+            return change;
+        // A save that writes a layout change installs a history barrier, so a
+        // layout arm only meets append-only saves, which move no source row.
+        case 'rowLayout':
+        case 'columnLayout':
             return change;
     }
 }
@@ -2404,6 +2482,25 @@ export function retained_pending_row_authorities(
                     ...pending_rows(change.delta.before),
                     ...pending_rows(change.delta.after),
                 ]) retain(change.delta.worksheet, row.id);
+                for (const layout of [change.delta.before.rowLayout, change.delta.after.rowLayout]) {
+                    for (const row of layout?.discardedPendingRows ?? []) {
+                        retain(change.delta.worksheet, row.id);
+                    }
+                }
+            } else if (change.kind === 'rowLayout' || change.kind === 'columnLayout') {
+                // Undo can bring back any row the gesture created or discarded,
+                // and a discarded Pending Inserted Row's tombstone still names
+                // its ID, so each keeps its admission alive.
+                for (const transition of change.delta.pendingRows) {
+                    retain(change.delta.worksheet, transition.id);
+                }
+                if (change.kind === 'rowLayout') {
+                    for (const layout of [change.delta.before, change.delta.after]) {
+                        for (const row of layout?.discardedPendingRows ?? []) {
+                            retain(change.delta.worksheet, row.id);
+                        }
+                    }
+                }
             }
         }
     }
@@ -2748,6 +2845,18 @@ function own_history_change(
             }),
         });
     }
+    if (change.kind === 'rowLayout') {
+        return Object.freeze({
+            kind: 'rowLayout',
+            delta: own_layout_delta(change.delta, owner, structural_owner, own_row_layout),
+        });
+    }
+    if (change.kind === 'columnLayout') {
+        return Object.freeze({
+            kind: 'columnLayout',
+            delta: own_layout_delta(change.delta, owner, structural_owner, own_column_layout),
+        });
+    }
     const own_removal = (removal: PendingTailRemoval | null): PendingTailRemoval | null => {
         if (removal === null) return null;
         return own_pending_structural_changes({
@@ -2764,6 +2873,92 @@ function own_history_change(
             beforeIndex: change.delta.beforeIndex,
             afterIndex: change.delta.afterIndex,
         }),
+    });
+}
+
+/**
+ * Own a layout delta: layouts in canonical form, every Pending Row checked
+ * against the template the delta carries for it, every Pending Column and
+ * basis checked strictly. Rows are owned one at a time, so a Pending Inserted
+ * Row is checked without the layout that places it; its origin is checked here.
+ */
+function own_layout_delta<L>(
+    delta: StructuralSnapshotDelta<L>,
+    owner: HistoryActionOwner,
+    structural_owner: StructuralHistoryOwner,
+    own_layout: (value: unknown) => L,
+): StructuralSnapshotDelta<L> {
+    const input = snapshot_structural_input(delta);
+    const templates = input.formatTemplates.map((template) =>
+        own_structural_template(template, structural_owner));
+    const template_ids = new Set<string>();
+    for (const template of templates) {
+        if (template_ids.has(template.id)) throw new TypeError('Layout history repeats a format template');
+        template_ids.add(template.id);
+    }
+    const used_templates = new Set<string>();
+    const own_row = (row: PendingAppendedRow | null): PendingAppendedRow | null => {
+        if (row === null) return null;
+        const template = templates.find((candidate) => candidate.id === row.formatTemplateId);
+        if (template === undefined) throw new TypeError('Layout history lost a format template');
+        if (row.origin !== undefined && row.origin !== 'append' && row.origin !== 'insert') {
+            throw new TypeError('Layout history holds a row with an unknown origin');
+        }
+        used_templates.add(template.id);
+        const { origin, ...rest } = row;
+        const owned = pending_rows(own_pending_structural_changes({
+            formatTemplates: [template],
+            appendedRows: [rest],
+        }))[0];
+        // Same key order as the codec, so replay's comparisons see the stored row.
+        if (origin !== 'insert') return owned;
+        const { id, ...owned_rest } = owned;
+        return Object.freeze({ id, origin, ...owned_rest });
+    };
+    const own_column = (column: PendingColumn | null): PendingColumn | null =>
+        column === null ? null : own_pending_column(column);
+    const own_transitions = <T extends { readonly id: string }>(
+        transitions: readonly PendingEntryTransition<T>[],
+        own_entry: (entry: T | null) => T | null,
+    ): readonly PendingEntryTransition<T>[] => {
+        const seen = new Set<string>();
+        return Object.freeze(transitions.map((transition) => {
+            const before = own_entry(transition.before);
+            const after = own_entry(transition.after);
+            if (seen.has(transition.id)
+                || (before === null && after === null)
+                || (before !== null && before.id !== transition.id)
+                || (after !== null && after.id !== transition.id)) {
+                throw new TypeError('Layout history holds an invalid pending entry transition');
+            }
+            seen.add(transition.id);
+            return Object.freeze({ id: owner.own_string(transition.id), before, after });
+        }));
+    };
+    const pendingRows = own_transitions(input.pendingRows, own_row);
+    const pendingColumns = own_transitions(input.pendingColumns, own_column);
+    if (used_templates.size !== template_ids.size) {
+        throw new TypeError('Layout history carries an unreferenced format template');
+    }
+    const own_basis = <T>(
+        transition: BasisTransition<T> | undefined,
+        own_value: (value: T) => T,
+    ): BasisTransition<T> | undefined => transition === undefined ? undefined : Object.freeze({
+        before: transition.before === null ? null : own_value(transition.before),
+        after: transition.after === null ? null : own_value(transition.after),
+    });
+    const appendBasis = own_basis(input.appendBasis, (basis) =>
+        own_pending_structural_changes({ appendBasis: basis }).appendBasis!);
+    const structuralBasis = own_basis(input.structuralBasis, own_structural_basis);
+    return Object.freeze({
+        worksheet: owner.own_worksheet_target(delta.worksheet),
+        before: input.before === null ? null : own_layout(input.before),
+        after: input.after === null ? null : own_layout(input.after),
+        pendingRows,
+        pendingColumns,
+        formatTemplates: Object.freeze(templates),
+        ...(appendBasis === undefined ? {} : { appendBasis }),
+        ...(structuralBasis === undefined ? {} : { structuralBasis }),
     });
 }
 
@@ -2800,9 +2995,7 @@ export function history_action(label: string, changes: readonly HistoryChange[])
  */
 export function action_has_cell_changes(action: HistoryAction): boolean {
     return action.changes.some((change) => change.kind === 'cell'
-        || change.kind === 'rowAppend'
-        || change.kind === 'tailRemoval'
-        || change.kind === 'pendingRows');
+        || is_structural_history_change(change));
 }
 
 /**

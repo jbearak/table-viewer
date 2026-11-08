@@ -943,7 +943,7 @@ function is_whole_number(value: unknown, maximum = MAX_PENDING_ROW_INDEX): value
 }
 
 /** Strict shape, then canonical form. Invariants needing the source come later. */
-function own_row_layout(value: unknown): RowLayout {
+export function own_row_layout(value: unknown): RowLayout {
     if (
         !is_plain_record(value)
         || !has_only_keys(value, ['runs', 'removedSourceRows', 'discardedPendingRows'])
@@ -997,7 +997,7 @@ function own_column_identity(value: unknown): ColumnIdentity {
     return pending_row_error('contain an invalid column layout entry');
 }
 
-function own_column_layout(value: unknown): ColumnLayout {
+export function own_column_layout(value: unknown): ColumnLayout {
     if (
         !is_plain_record(value)
         || !has_only_keys(value, ['columns', 'removedSourceColumns', 'discardedPendingColumns'])
@@ -1054,7 +1054,8 @@ function own_pending_column_format(value: unknown): PendingColumnFormat {
     return pending_row_error('contain an invalid pending column format');
 }
 
-function own_pending_column(value: unknown): PendingColumn {
+/** Own one Pending Column, strictly; throws on any malformed field. */
+export function own_pending_column(value: unknown): PendingColumn {
     if (
         !is_plain_record(value)
         || !has_only_keys(value, [
@@ -1109,7 +1110,8 @@ function is_structural_digest(value: unknown): value is string {
         && value.length <= MAX_STRUCTURAL_DIGEST_LENGTH;
 }
 
-function own_structural_basis(value: unknown): StructuralBasis {
+/** Own one Structural Basis, strictly; throws on any malformed field. */
+export function own_structural_basis(value: unknown): StructuralBasis {
     if (!is_plain_record(value)
         || !is_whole_number(value.sourceRowCount)
         || !is_whole_number(value.sourceColumnCount)) {

@@ -1,6 +1,7 @@
 // Host rules for Worksheet Layout state (row and column structure design,
 // delivery step 3): peer compatibility rules 1-3, the admission ledger's
-// origin rule, and layout validation at publication.
+// origin rule, layout validation at publication, and the history replay
+// commit carrying a stored layout (step 4).
 import { createHash } from 'node:crypto';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type * as vscode from 'vscode';
@@ -11,6 +12,8 @@ import type { StructuralBasis } from '../pending-changes';
 import { versioned_state_store } from './helpers/versioned-state-store';
 import * as vscode_mock from './mocks/vscode';
 import { fake_viewer_host } from './mocks/host-ports';
+import { history_value, value_only_overlay } from '../webview/history-cell-state-model';
+import { wire_overlay_from_cell_overlay_state } from '../webview/history-replay-wire-model';
 
 const enc = new TextEncoder();
 // One header and three body rows: canonical source rows 0-2, one column.
@@ -498,6 +501,77 @@ describe('publication validation and the ledger origin rule', () => {
         })).toBe(true);
         expect(viewer.durable()?.appendedRows?.[0]?.origin).toBeUndefined();
         expect(viewer.durable()?.rowLayout).toBeUndefined();
+        await viewer.dispose();
+    });
+});
+
+describe('history replay commit', () => {
+    it('keeps the stored layout when it replays a cell edit on a worksheet with a layout', async () => {
+        const viewer = await open_viewer({
+            initial: slot({
+                cells: { '0:0': { value: 'x', base: 'a' } },
+                rowLayout: REMOVAL_LAYOUT,
+                structuralBasis: BASIS,
+            }),
+            structuralEditingEnabled: true,
+        });
+        expect(viewer.session).toMatchObject({ granted: true });
+        const messages = () => viewer.panel.__messages as Message[];
+        const latest = [...messages()].reverse().find((message) =>
+            message.type === 'workbookSnapshot') as unknown as { snapshot: { identity: unknown } };
+        await viewer.panel.__receive({
+            type: 'snapshotApplied',
+            identity: latest.snapshot.identity,
+            disposition: 'applied',
+        });
+        const worksheet = { sheetIndex: 0, sheetName: 'Sheet1' };
+        await viewer.panel.__receive({
+            type: 'prepareHistoryReplay',
+            request: {
+                requestId: 'prepare',
+                replayId: 'replay',
+                cells: [{
+                    ordinal: 0,
+                    worksheet,
+                    sourceRow: 0,
+                    sourceColumn: 0,
+                    overlay: wire_overlay_from_cell_overlay_state(value_only_overlay(
+                        history_value('x'),
+                        history_value('a'),
+                    )),
+                }],
+                highlights: [],
+                structures: [],
+                focus: {
+                    worksheet,
+                    sourceRowStart: 0,
+                    sourceRowEnd: 0,
+                    sourceColumnStart: 0,
+                    sourceColumnEnd: 0,
+                },
+            },
+        });
+        await viewer.controller.drain();
+        const prepared = (messages().find((message) => message.type === 'historyReplayPrepared') as {
+            prepared?: { requestId: string; replayId: string; leaseId: string };
+        } | undefined)?.prepared;
+        expect(prepared).toBeDefined();
+        await viewer.panel.__receive({
+            type: 'commitHistoryReplay',
+            request: {
+                requestId: prepared!.requestId,
+                replayId: prepared!.replayId,
+                leaseId: prepared!.leaseId,
+                mutationId: 'mutation',
+                cells: [{ ordinal: 0, entry: null }],
+                highlights: [],
+                structures: [],
+            },
+        });
+        await viewer.controller.drain();
+        expect(messages().some((message) => message.type === 'historyReplayCommitted')).toBe(true);
+        expect(viewer.durable()).toMatchObject({ rowLayout: REMOVAL_LAYOUT, structuralBasis: BASIS });
+        expect(viewer.durable()?.cells ?? {}).toEqual({});
         await viewer.dispose();
     });
 });

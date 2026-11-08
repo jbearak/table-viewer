@@ -1,18 +1,34 @@
-/** Pure compare-and-swap planning for session-owned structural history. */
+/**
+ * Pure compare-and-swap planning for session-owned structural history: the
+ * append arms (`rowAppend`, `tailRemoval`, `pendingRows`) and the layout arms
+ * (`rowLayout`, `columnLayout`). Each arm checks that the worksheet's
+ * structural store still holds what the recorded side expects, then plans the
+ * other side; nothing here mutates a store.
+ */
 
 import {
     own_pending_structural_changes,
     type PendingAppendedRow,
+    type PendingColumn,
     type PendingStructuralChanges,
     type PendingTailRemoval,
     pending_rows,
 } from '../pending-changes';
 import { worksheet_target_key, type WorksheetTarget } from '../types';
+import {
+    canonical_column_layout,
+    canonical_row_layout,
+    type ColumnLayout,
+    type RowLayout,
+} from '../worksheet-layout';
 import type { HistoryDirection } from './history-cell-state-model';
 import {
     action_replay_changes,
+    is_structural_history_change,
     type HistoryAction,
     type HistoryChange,
+    type LayoutHistoryChange,
+    type PendingEntryTransition,
 } from './history-stack-model';
 
 export interface PendingRowHistoryPlan {
@@ -41,13 +57,122 @@ function equal(left: unknown, right: unknown): boolean {
     return JSON.stringify(left) === JSON.stringify(right);
 }
 
-function structural(change: HistoryChange): change is Extract<
-    HistoryChange,
-    { kind: 'rowAppend' | 'tailRemoval' | 'pendingRows' }
-> {
-    return change.kind === 'rowAppend'
-        || change.kind === 'tailRemoval'
-        || change.kind === 'pendingRows';
+const structural = is_structural_history_change;
+
+function layout_json(layout: RowLayout | ColumnLayout | null | undefined, axis: 'rows' | 'columns'): string {
+    if (layout === null || layout === undefined) return 'null';
+    return JSON.stringify(axis === 'rows'
+        ? canonical_row_layout(layout as RowLayout)
+        : canonical_column_layout(layout as ColumnLayout));
+}
+
+/**
+ * Swap entries by ID: every transition's expected side must be what `current`
+ * holds now (absent for null), and its desired side replaces it. Untouched
+ * entries keep their place; new ones are placed by `createdOrder`, which is the
+ * stored order of Pending Rows.
+ */
+function swap_entries<T extends { readonly id: string; readonly createdOrder: number }>(
+    current: readonly T[],
+    transitions: readonly PendingEntryTransition<T>[],
+    direction: HistoryDirection,
+): T[] | undefined {
+    const by_id = new Map(current.map((entry, index) => [entry.id, index]));
+    const replaced = new Map<string, T | null>();
+    for (const transition of transitions) {
+        const expected = direction === 'undo' ? transition.after : transition.before;
+        const index = by_id.get(transition.id);
+        const now = index === undefined ? null : current[index];
+        if (!equal(now, expected)) return undefined;
+        replaced.set(transition.id, direction === 'undo' ? transition.before : transition.after);
+    }
+    const out: T[] = [];
+    for (const entry of current) {
+        if (!replaced.has(entry.id)) {
+            out.push(entry);
+            continue;
+        }
+        const desired = replaced.get(entry.id)!;
+        if (desired !== null) out.push(desired);
+        replaced.delete(entry.id);
+    }
+    for (const desired of replaced.values()) {
+        if (desired === null) continue;
+        const at = out.findIndex((entry) => entry.createdOrder > desired.createdOrder);
+        out.splice(at < 0 ? out.length : at, 0, desired);
+    }
+    return out;
+}
+
+/** Plan one layout arm against `current`, or undefined on a compare-and-swap conflict. */
+function with_layout_change(
+    current: PendingStructuralChanges,
+    change: LayoutHistoryChange,
+    direction: HistoryDirection,
+): PendingStructuralChanges | undefined {
+    const { delta } = change;
+    const axis = change.kind === 'rowLayout' ? 'rows' : 'columns';
+    const expected_layout = direction === 'undo' ? delta.after : delta.before;
+    const desired_layout = direction === 'undo' ? delta.before : delta.after;
+    const current_layout = axis === 'rows' ? current.rowLayout : current.columnLayout;
+    if (layout_json(current_layout, axis) !== layout_json(expected_layout, axis)) return undefined;
+    const rows = swap_entries(pending_rows(current), delta.pendingRows, direction);
+    const columns = swap_entries<PendingColumn>(current.pendingColumns ?? [], delta.pendingColumns, direction);
+    if (rows === undefined || columns === undefined) return undefined;
+    const basis = <T>(
+        transition: { readonly before: T | null; readonly after: T | null } | undefined,
+        now: T | undefined,
+    ): { ok: true; value: T | undefined } | { ok: false } => {
+        if (transition === undefined) return { ok: true, value: now };
+        const expected = direction === 'undo' ? transition.after : transition.before;
+        if (!equal(now ?? null, expected)) return { ok: false };
+        const desired = direction === 'undo' ? transition.before : transition.after;
+        return { ok: true, value: desired ?? undefined };
+    };
+    const append_basis = basis(delta.appendBasis, current.appendBasis);
+    const structural_basis = basis(delta.structuralBasis, current.structuralBasis);
+    if (!append_basis.ok || !structural_basis.ok) return undefined;
+    const templates = new Map(current.formatTemplates.map((template) => [template.id, template]));
+    for (const template of delta.formatTemplates) {
+        if (!templates.has(template.id)) templates.set(template.id, template);
+    }
+    const used = new Set(rows.map((row) => row.formatTemplateId));
+    const row_ids = new Set(rows.map((row) => row.id));
+    // Conflicts name live rows only; the host derives them afresh after replay.
+    const conflicts = current.conflicts.flatMap((conflict) => {
+        const pendingRowIds = conflict.pendingRowIds.filter((id) => row_ids.has(id));
+        const formulaCells = conflict.formulaCells?.filter((cell) =>
+            cell.rowIdentity.kind !== 'pending' || row_ids.has(cell.rowIdentity.pendingRowId));
+        if (pendingRowIds.length === conflict.pendingRowIds.length
+            && formulaCells?.length === conflict.formulaCells?.length) return [conflict];
+        if (pendingRowIds.length === 0 && conflict.tailRemovalIds.length === 0
+            && (formulaCells?.length ?? 0) === 0) return [];
+        return [{ ...conflict, pendingRowIds, ...(formulaCells === undefined ? {} : { formulaCells }) }];
+    });
+    const { rowLayout: _rows, columnLayout: _columns, pendingColumns: _pending, structuralBasis: _basis,
+        appendBasis: _append, ...rest } = current;
+    try {
+        return own_pending_structural_changes({
+            ...rest,
+            formatTemplates: [...templates.values()].filter((template) => used.has(template.id)),
+            appendedRows: rows,
+            conflicts,
+            ...(append_basis.value === undefined ? {} : { appendBasis: append_basis.value }),
+            ...(axis === 'rows'
+                ? {
+                    ...(desired_layout === null ? {} : { rowLayout: desired_layout }),
+                    ...(current.columnLayout === undefined ? {} : { columnLayout: current.columnLayout }),
+                }
+                : {
+                    ...(current.rowLayout === undefined ? {} : { rowLayout: current.rowLayout }),
+                    ...(desired_layout === null ? {} : { columnLayout: desired_layout }),
+                }),
+            ...(columns.length === 0 ? {} : { pendingColumns: columns }),
+            ...(structural_basis.value === undefined ? {} : { structuralBasis: structural_basis.value }),
+        });
+    } catch {
+        return undefined;
+    }
 }
 
 function with_row(
@@ -167,6 +292,12 @@ export function plan_pending_row_history_replay(
                 desired_index,
                 change.delta.formatTemplates,
             );
+            if (next === undefined) return { kind: 'refused', reason: 'conflict' };
+            state.current = next;
+            continue;
+        }
+        if (change.kind === 'rowLayout' || change.kind === 'columnLayout') {
+            const next = with_layout_change(state.current, change, direction);
             if (next === undefined) return { kind: 'refused', reason: 'conflict' };
             state.current = next;
             continue;

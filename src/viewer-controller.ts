@@ -13487,6 +13487,9 @@ export function attach_viewer(
                             ? {}
                             : { appendBasis: structural.appendBasis }),
                         conflicts: retained_conflicts,
+                        // `with_pending_changes_for_sheet` replaces the slot,
+                        // so a layout left off here would be dropped.
+                        ...pending_layout_fields(structural),
                     };
                     // The conflict reserve is host-only. Measure the complete
                     // renderer-owned worksheet envelope, including live cell
@@ -13571,6 +13574,7 @@ export function attach_viewer(
                         ...(value.appendBasis === undefined
                             ? {}
                             : { appendBasis: value.appendBasis }),
+                        ...pending_layout_fields(value),
                     });
                     // A replay may make a formula diagnostic on a sibling sheet
                     // appear or disappear. That transition is derived from the

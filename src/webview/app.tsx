@@ -205,6 +205,7 @@ import {
 import {
     peek_history,
     retained_pending_row_authorities,
+    is_structural_history_change,
     retained_saved_append_authorities,
     type HistoryEntry,
 } from './history-stack-model';
@@ -1119,9 +1120,7 @@ export function App(): React.JSX.Element {
         }
         const structural = pending_row_replay_plan_ref.current;
         const action_has_structural_changes = entry.action.changes.some((change) =>
-            change.kind === 'rowAppend'
-            || change.kind === 'tailRemoval'
-            || change.kind === 'pendingRows');
+            is_structural_history_change(change));
         const accepted_structures = committed.structures ?? [];
         const requested_structures = accepted_structures.filter(
             (accepted) => accepted.hostDerived !== true,
@@ -5006,9 +5005,7 @@ export function App(): React.JSX.Element {
         const display_focus = accepted.committed.displayFocus;
         const structural_only = accepted.entry.action.changes.length > 0
             && accepted.entry.action.changes.every((change) => (
-                change.kind === 'rowAppend'
-                || change.kind === 'tailRemoval'
-                || change.kind === 'pendingRows'
+                is_structural_history_change(change)
             ));
         if (display_focus !== null) {
             const request = history_focus_request(
@@ -5132,6 +5129,11 @@ export function App(): React.JSX.Element {
             for (const removal of pending.snapshot().tailRemovals) {
                 group.ids.add(removal.appendHistoryId);
             }
+            // A discarded Pending Inserted Row is no longer published as a row,
+            // but its tombstone still names its admitted ID.
+            for (const row of pending.snapshot().rowLayout?.discardedPendingRows ?? []) {
+                group.pendingIds.add(row.id);
+            }
             grouped.set(key, group);
         }
         host_bridge.postMessage({
@@ -5197,9 +5199,7 @@ export function App(): React.JSX.Element {
         if (
             initial.kind === 'available'
             && initial.entry.action.changes.some((change) =>
-                change.kind === 'rowAppend'
-                || change.kind === 'tailRemoval'
-                || change.kind === 'pendingRows')
+                is_structural_history_change(change))
         ) {
             pending_row_replay_busy_ref.current = true;
             const restoration_settlements: ((accepted: boolean) => void)[] = [];
