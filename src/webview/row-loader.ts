@@ -122,6 +122,11 @@ export class RowLoader {
         return this._generation;
     }
 
+    /** Rows per page after the width and byte caps `configure` applies. */
+    get effective_page_size(): number {
+        return this.page_size;
+    }
+
     /** For tests: number of resident pages. */
     get page_count(): number {
         return this.pages.size;

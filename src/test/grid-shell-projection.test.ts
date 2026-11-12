@@ -239,6 +239,7 @@ vi.mock('../webview/use-row-loader', () => ({
             get_compare_base: (row: number, col: number) =>
                 grid_mock.compare_base[`${row}:${col}`],
             sample_loaded_rows: () => [],
+            get_page_size: () => 100,
             version: grid_mock.loader_version,
         };
     },
@@ -8209,5 +8210,173 @@ describe('the cursor and flash an undo leaves behind', () => {
         });
 
         expect(on_applied).not.toHaveBeenCalled();
+    });
+});
+
+describe('GridShell find', () => {
+    type Handle = import('../webview/grid-shell').GridActionsHandle;
+
+    function cell(raw: string, formatted = raw) {
+        return { raw, formatted, bold: false, italic: false };
+    }
+
+    /** Three source columns (B hidden), one row per entry. */
+    function rows_of(rows: [string, string, string][]) {
+        grid_mock.get_row.mockImplementation(((row?: number) => {
+            const values = rows[row ?? -1];
+            return values?.map((value) => cell(value));
+        }) as any);
+    }
+
+    async function render_find(overrides: Partial<GridShellProps>, row_count: number) {
+        const grid_actions_ref = React.createRef<Handle | null>() as
+            React.MutableRefObject<Handle | null>;
+        await render_grid(props({
+            row_count,
+            sheet_meta: { ...props().sheet_meta, rowCount: row_count, sourceRowCount: row_count },
+            grid_actions_ref,
+            ...overrides,
+        }));
+        return grid_actions_ref;
+    }
+
+    async function find(
+        ref: React.MutableRefObject<Handle | null>,
+        query: string,
+        direction: 1 | -1 = 1,
+        inclusive = true,
+    ) {
+        let result: Awaited<ReturnType<Handle['find']>> | undefined;
+        await act(async () => {
+            result = await ref.current!.find(query, direction, inclusive);
+        });
+        return result!;
+    }
+
+    function selected_cell() {
+        return (grid_mock.props!.gridSelection as { current?: { cell: [number, number] } })
+            .current?.cell;
+    }
+
+    it('selects the first visible cell containing the text and skips hidden columns', async () => {
+        rows_of([
+            ['alpha', 'needle', 'beta'],
+            ['gamma', 'delta', 'Needle here'],
+            ['needle again', 'x', 'y'],
+        ]);
+        const ref = await render_find({}, 3);
+
+        expect(await find(ref, 'NEEDLE')).toEqual({
+            kind: 'match',
+            position: { row: 1, column: 1 },
+        });
+        expect(selected_cell()).toEqual([1, 1]);
+        // A changed selection is scrolled into view by the grid itself; only an
+        // unchanged one (the match is already the active cell) scrolls here.
+        expect(grid_mock.scroll_to).not.toHaveBeenCalled();
+        expect(await find(ref, 'needle')).toMatchObject({ position: { row: 1, column: 1 } });
+        expect(grid_mock.scroll_to).toHaveBeenLastCalledWith(1, 1);
+        // The page the rows sit on was pinned, loaded, and released.
+        expect(grid_mock.ensure_rows_loaded).toHaveBeenCalledWith(0, 2);
+        expect(grid_mock.unpin_rows).toHaveBeenCalled();
+        expect(grid_mock.trim_rows).toHaveBeenCalled();
+
+        // Enter moves past the active cell; the walk wraps.
+        expect(await find(ref, 'needle', 1, false)).toMatchObject({
+            position: { row: 2, column: 0 },
+        });
+        expect(await find(ref, 'needle', 1, false)).toMatchObject({
+            position: { row: 1, column: 1 },
+        });
+        expect(await find(ref, 'needle', -1, false)).toMatchObject({
+            position: { row: 2, column: 0 },
+        });
+        expect(await find(ref, 'delta')).toEqual({ kind: 'none' });
+    });
+
+    it('matches the formatted text with Formatting on and the raw value with it off', async () => {
+        grid_mock.get_row.mockImplementation((() => [
+            cell('1234.5', '$1,234.50'),
+            cell('b'),
+            cell('c'),
+        ]) as any);
+        const formatted = await render_find({ show_formatting: true }, 1);
+        expect(await find(formatted, '$1,234')).toMatchObject({ kind: 'match' });
+        expect(await find(formatted, '1234.5')).toEqual({ kind: 'none' });
+
+        act(() => root?.unmount());
+        root = null;
+        const raw = await render_find({ show_formatting: false }, 1);
+        expect(await find(raw, '1234.5')).toMatchObject({ kind: 'match' });
+        expect(await find(raw, '$1,234')).toEqual({ kind: 'none' });
+    });
+
+    it('finds a pending edit by its new text, not its stored value', async () => {
+        rows_of([
+            ['stored-old', 'b', 'c'],
+            ['other', 'b', 'c'],
+        ]);
+        const cells = create_edit_session_store({ session_id: 'session' }, {
+            '0:0': { value: 'typed-new', base: 'stored-old' },
+        });
+        const ref = await render_find({
+            edit_mode: true,
+            csv_editable: true,
+            edit_session_id: 'session',
+            edit_session: cells,
+        }, 2);
+        expect(await find(ref, 'typed-new')).toEqual({
+            kind: 'match',
+            position: { row: 0, column: 0 },
+        });
+        expect(await find(ref, 'stored-old')).toEqual({ kind: 'none' });
+    });
+
+    it('finds text in a Pending Row after the source rows', async () => {
+        rows_of([['a', 'b', 'c']]);
+        const pending = create_pending_row_store({ session_id: 'session' });
+        pending.append_rows('session', ['pending-row-1'], {
+            id: 'plain', format: { kind: 'none' },
+        }, 1);
+        pending.set_cell('session', 'pending-row-1', 2, { value: 'appended needle' });
+        const ref = await render_find({
+            edit_mode: true,
+            csv_editable: true,
+            edit_session_id: 'session',
+            pending_row_store: pending,
+        }, 1);
+        expect(await find(ref, 'needle')).toEqual({
+            kind: 'match',
+            position: { row: 1, column: 1 },
+        });
+    });
+
+    it('stops without selecting when the rows cannot be loaded', async () => {
+        rows_of([['needle', 'b', 'c']]);
+        grid_mock.ensure_rows_loaded.mockImplementation(async () => false);
+        const ref = await render_find({}, 1);
+        expect(await find(ref, 'needle')).toEqual({ kind: 'stopped' });
+        expect(selected_cell()).toBeUndefined();
+        expect(grid_mock.unpin_rows).toHaveBeenCalled();
+    });
+
+    it('a superseded or cancelled search never moves the selection', async () => {
+        rows_of([['needle', 'b', 'c']]);
+        let finish_load!: (loaded: boolean) => void;
+        grid_mock.ensure_rows_loaded.mockImplementationOnce(() => new Promise((resolve) => {
+            finish_load = resolve;
+        }));
+        const ref = await render_find({}, 1);
+        let first: Promise<unknown> | undefined;
+        act(() => {
+            first = ref.current!.find('needle', 1, true);
+        });
+        await vi.waitFor(() => expect(finish_load).toBeTypeOf('function'));
+        act(() => ref.current!.cancel_find());
+        await act(async () => {
+            finish_load(true);
+            expect(await first).toEqual({ kind: 'stopped' });
+        });
+        expect(selected_cell()).toBeUndefined();
     });
 });

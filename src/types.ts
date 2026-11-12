@@ -3176,7 +3176,7 @@ export type HostMessage =
     // Undo and redo especially: the renderer's focus check when this arrives is
     // the only thing that can keep Cmd+Z inside an open cell editor meaning the
     // browser's text undo rather than the workbook's.
-    | { type: 'editCommand'; command: 'copy' | 'selectAll' | 'undo' | 'redo' }
+    | { type: 'editCommand'; command: 'copy' | 'selectAll' | 'undo' | 'redo' | 'find' }
     | { type: 'workbookSnapshot'; snapshot: WorkbookSnapshot }
     | { type: 'rowData'; sheetIndex: number; startRow: number; rows: (RenderedCell | null)[][]; sourceRows: number[]; requestId: string; generation: number }
     | {

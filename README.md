@@ -142,6 +142,12 @@ It also removes other friction from reading tables:
 - `Ctrl+Z` / `Cmd+Z` **inside** an open cell editor is ordinary text undo for what you are typing, and does not touch the workbook's history
 - History lives with the window: closing the tab, window, or app clears it. Unsaved edits are cached and survive that, so a reopened file can show edits that can no longer be undone
 
+**Find** — `Cmd+F` (macOS) or `Ctrl+F` (Windows, Linux), or **Edit → Find…** in the desktop app
+- Typing selects the first cell, from the selected cell onward, whose displayed text contains what you typed; case does not matter
+- `Enter` / `Shift+Enter` (or the arrow buttons) step to the next and previous match, wrapping around the sheet; `Escape` closes the bar and leaves the match selected
+- Searches the active worksheet as you see it: visible columns, rows left after filters, in the current sort order, including unsaved edits. The text matched is what each cell shows, so the **Formatting** toggle decides between formatted and raw values
+- Large files are read page by page until the next match turns up; the bar says **No matches** only after checking every cell
+
 **Sorting and filtering** — the [filtering guide](docs/filtering.md) explains each filter condition and how to use them
 - Right-click a column header to sort ascending or descending, add a secondary sort, or open that column's filter editor
 - Sorted headers show direction arrows and multi-column priority badges; toolbar chips let you flip, reorder, remove, enable, disable, or edit active rules

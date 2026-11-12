@@ -1018,12 +1018,14 @@ function show_state_inspector_window(): void {
  * sampling focus separately is racy and can silently drop the command.
  */
 function route_edit_command(
-    command: 'copy' | 'selectAll' | 'undo' | 'redo',
+    command: 'copy' | 'selectAll' | 'undo' | 'redo' | 'find',
     window: Electron.BaseWindow | undefined,
 ): void {
     const target = (window as BrowserWindow | undefined) ?? BrowserWindow.getFocusedWindow();
     if (!target) return;
     if (viewer_windows?.send_edit_command(target, command)) return;
+    // Windows with no viewer have nothing to search.
+    if (command === 'find') return;
     const contents = target.webContents;
     if (!contents || contents.isDestroyed()) return;
     // The native fallback, for the windows with no viewer in them — welcome,
@@ -1201,6 +1203,12 @@ function build_menu(): void {
                     label: 'Select All',
                     accelerator: 'CmdOrCtrl+A',
                     click: (_item, window) => route_edit_command('selectAll', window),
+                },
+                { type: 'separator' },
+                {
+                    label: 'Find…',
+                    accelerator: 'CmdOrCtrl+F',
+                    click: (_item, window) => route_edit_command('find', window),
                 },
             ],
         },

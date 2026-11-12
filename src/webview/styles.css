@@ -1318,6 +1318,7 @@ body.vscode-high-contrast-light .toolbar-split-caret.open {
    vertical — so the strip sits under the tabs either way and `.grid-shell-root`
    keeps taking the remaining space. */
 .sheet-pane {
+    position: relative;
     display: flex;
     flex-direction: column;
     flex: 1;
@@ -2138,4 +2139,60 @@ body.vscode-high-contrast-light .toolbar-split-caret.open {
 .append-composer-panel button:disabled {
     opacity: 0.5;
     cursor: default;
+}
+
+/* Find bar: floats over the grid's top-right corner, like VS Code's find widget. */
+.find-bar {
+    position: absolute;
+    top: 4px;
+    right: 20px;
+    z-index: 30;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 4px 6px;
+    border: 1px solid var(--vscode-widget-border, var(--vscode-panel-border, #444));
+    border-radius: 4px;
+    background: var(--vscode-editorWidget-background, #252526);
+    color: var(--vscode-editorWidget-foreground, var(--vscode-foreground, #ccc));
+    box-shadow: 0 2px 8px var(--vscode-widget-shadow, rgba(0, 0, 0, 0.36));
+    font-size: var(--tv-font-size-md);
+}
+
+.find-bar-input {
+    width: min(220px, 40vw);
+    padding: 3px 6px;
+    border: 1px solid var(--vscode-input-border, transparent);
+    border-radius: 2px;
+    background: var(--vscode-input-background, transparent);
+    color: var(--vscode-input-foreground, inherit);
+    font: inherit;
+}
+
+.find-bar-input:focus-visible,
+.find-bar-button:focus-visible {
+    outline: 1px solid var(--vscode-focusBorder, #007acc);
+    outline-offset: -1px;
+}
+
+.find-bar-status {
+    min-width: 6.5em;
+    color: var(--vscode-descriptionForeground, #999);
+    white-space: nowrap;
+}
+
+.find-bar-button {
+    min-width: 22px;
+    height: 22px;
+    padding: 0 4px;
+    border: 0;
+    border-radius: 3px;
+    background: transparent;
+    color: inherit;
+    cursor: pointer;
+    font: inherit;
+}
+
+.find-bar-button:hover {
+    background: var(--vscode-toolbar-hoverBackground, rgba(90, 93, 94, 0.31));
 }

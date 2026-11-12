@@ -95,8 +95,8 @@ source-backed rows. The `RowLoader` is indexed by *source display row* (the
 host's transformed order), not by grid row. `get_cell_content` resolves this
 through `pending_projection.row_at(row)` and `sourceDisplayRow`, and the
 viewport path loads `pending_projection.source_display_intervals(...)`. The scan
-does the same: it walks grid display rows, and before testing a chunk it maps
-the chunk through `source_display_intervals` and loads those loader rows. Rows
+does the same: it walks grid display rows, maps each source-backed row through
+`row_at(row).sourceDisplayRow`, and loads the loader pages those rows sit on. Rows
 that are not source-backed come from `pending_projection` and are already in
 memory.
 
@@ -197,16 +197,22 @@ without changing this design.
   over chunks. Unit-tested without React or a grid.
 - `src/webview/row-loader.ts`: expose `page_size`.
 - `src/webview/grid-shell.tsx`: `find_text_at` and the shared overlay helper;
-  the `find` action (epoch, single in-flight load, pin / load / trim, select
-  with `select_active_display_cell`).
+  the `find` action (epoch, single in-flight load, pin / load / trim) and
+  `select_find_match`. Not `select_active_display_cell`, which writes the
+  selection *and* scrolls: Glide already scrolls a controlled selection change
+  into view, and the second, imperative scroll in the same tick measures against
+  a visible region Glide has not updated yet, so a far match landed at twice its
+  offset (the bottom of the sheet). `select_find_match` scrolls only when the
+  selection does not change.
 - `src/webview/find-bar.tsx` (new): the bar.
 - `src/webview/app.tsx`: find state; a capture-phase `keydown` listener for
   `Cmd/Ctrl+F` beside the undo/redo listener, for the same reason (Glide eats
   key events on the way up); `run_edit_command` handles `'find'` *before* its
   text-field branch, so the menu path opens Find even from a cell editor
   instead of copying the field.
-- `src/webview/edit-command.ts`: `EditCommand` gains `'find'`; `find_hotkey`
-  (exactly one of Meta/Ctrl, no Alt, no Shift, key `f`).
+- `src/webview/edit-command.ts`: `EditCommand` gains `'find'`.
+  `is_find_hotkey` (exactly one of Meta/Ctrl, no Alt, no Shift, key `f`) lives
+  in `find-model.ts`.
 
 ### Keyboard routing per host
 
@@ -241,7 +247,7 @@ without changing this design.
   both directions; inclusive vs exclusive start; a stale scan returns
   `undefined` and loads no further chunk; `load_chunk` returning `false` ends
   the scan without a "no match" result.
-- `edit-command.test.ts`: `find_hotkey` accepts `Cmd+F` / `Ctrl+F`, rejects
+- `find-model.test.ts`: `is_find_hotkey` accepts `Cmd+F` / `Ctrl+F`, rejects
   `Cmd+Ctrl+F`, `Alt`, `Shift`.
 - Grid-level tests (existing GridShell harness): a pending edit's text is found
   and its stored value is not; a match in a row after a Pending Row is found
