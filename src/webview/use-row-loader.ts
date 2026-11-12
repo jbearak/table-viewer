@@ -50,6 +50,8 @@ export interface UseRowLoader {
     get_compare_base(row: number, col: number, show_formatting?: boolean): string | undefined;
     /** Up to `max` resident rows for sampling (column auto-fit). */
     sample_loaded_rows(max: number): (RenderedCell | null)[][];
+    /** Rows per loader page after its width and byte caps. */
+    get_page_size(): number;
     /** Bumps on every ingested page so consumers can re-key Glide redraws. */
     readonly version: number;
 }
@@ -149,6 +151,7 @@ export function use_row_loader(
             loader.get_compare_base(row, col, show_formatting),
         [loader],
     );
+    const get_page_size = useCallback(() => loader.effective_page_size, [loader]);
     const sample_loaded_rows = useCallback((max: number) => loader.sample_loaded_rows(max), [loader]);
 
     return {
@@ -166,6 +169,7 @@ export function use_row_loader(
         get_compare_status,
         get_compare_base,
         sample_loaded_rows,
+        get_page_size,
         version,
     };
 }

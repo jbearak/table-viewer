@@ -1190,7 +1190,7 @@ export class ViewerWindowManager {
      */
     send_edit_command(
         window: BrowserWindow,
-        command: 'copy' | 'selectAll' | 'undo' | 'redo',
+        command: 'copy' | 'selectAll' | 'undo' | 'redo' | 'find',
     ): boolean {
         const entry = this.windows.find((candidate) => candidate.window === window);
         if (!entry || entry.window.webContents.isDestroyed()) return false;

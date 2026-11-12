@@ -216,6 +216,14 @@ import {
 } from './grid-repaint-model';
 import { expand_glide_selection } from './selection-glide';
 import {
+    find_matcher,
+    scan_for_match,
+    type FindChunk,
+    type FindDirection,
+    type FindPosition,
+    type FindScanResult,
+} from './find-model';
+import {
     grid_selection_contains_cell,
     highlight_selection_may_have_renderable_highlight,
     highlight_selection_from_grid,
@@ -261,6 +269,11 @@ const custom_renderers = [rich_text_cell_renderer];
  *  on huge sheets; we only ever measure already-loaded text, never force a
  *  fetch). */
 const AUTO_FIT_SAMPLE_ROWS = 2000;
+/** Find loads at most this many loader pages per chunk; the loader's own page
+ *  caps (64 Ki cells, 8 MiB) keep eight pages inside its cache budget. */
+const FIND_CHUNK_PAGES = 8;
+/** Bounds one chunk's planning walk across rows that need no page. */
+const FIND_CHUNK_MAX_ROWS = 100_000;
 /** Glide exposes its ref before the internal scroller is always ready. Retry a
  * queued preview restore briefly, then leave it pending for the first visible
  * region callback to finish. */
@@ -1086,6 +1099,10 @@ export interface GridActionsHandle {
     /** Copy the current cell selection as TSV, mirroring Glide's own Ctrl+C.
      *  No-op when nothing is selected. */
     copy_selection(): void;
+    /** Select the next cell whose painted text contains `query`; see find-model.ts. */
+    find(query: string, direction: FindDirection, inclusive: boolean): Promise<FindScanResult>;
+    /** Stop any running find scan without moving the selection. */
+    cancel_find(): void;
 }
 
 export interface PendingPreviewScroll {
@@ -1633,6 +1650,7 @@ export function GridShell({
         get_compare_status,
         get_compare_base,
         sample_loaded_rows,
+        get_page_size,
         version,
     } = loader;
     const lifecycle_operation = save_lifecycle.state === 'active'
@@ -3076,6 +3094,230 @@ export function GridShell({
         write_grid_selection(selection);
         grid_ref.current?.scrollTo(cell[0], cell[1]);
     }, [merges, write_grid_selection]);
+    // ---- Find (docs/superpowers/specs/2026-11-12-find-in-cells-design.md) ----
+    // Any input that decides a cell's text or a display coordinate bumps the
+    // epoch; a scan checks it after every await and stops once it is stale.
+    // `paste_topology_key` stands in for the projection: `pending_projection`
+    // itself is rebuilt whenever a page lands, which the scan's own loads cause.
+    const find_epoch_ref = useRef(0);
+    useEffect(() => {
+        find_epoch_ref.current += 1;
+    }, [
+        diff_mode,
+        dirty_cells,
+        formula_results,
+        generation,
+        paste_topology_key,
+        pending_formula_impact,
+        // Pending Row cell edits mutate `pending_rendered_rows` in place.
+        pending_payload_revision,
+        pending_rendered_rows,
+        removal_rendered_rows,
+        show_formatting,
+        source_formula_results,
+    ]);
+    useEffect(() => () => {
+        find_epoch_ref.current += 1;
+    }, []);
+    const find_in_flight_ref = useRef<Promise<unknown>>(Promise.resolve());
+    /** The text a cell paints, from the same inputs `get_cell_content` uses. */
+    const find_text_at = useCallback((position: FindPosition): string => {
+        const source_column = visible_source_columns[position.column];
+        if (source_column === undefined) return '';
+        const projected_row = pending_projection_ref.current.row_at(position.row);
+        if (projected_row !== undefined && projected_row.kind !== 'source') {
+            const rendered_cell = projected_row.kind === 'removal'
+                ? removal_rendered_rows.get(projected_row.removal.sourceRow)?.[source_column]
+                : pending_rendered_rows.get(projected_row.row.id)?.[source_column];
+            const formula_result = rendered_cell?.formula === undefined
+                ? undefined
+                : calculated_formula_display(
+                    formula_results_ref.current?.get(
+                        `${projected_row.intendedPhysicalRow}:${source_column}`,
+                    ),
+                    show_formatting,
+                    rendered_cell,
+                );
+            return displayed_text(
+                rendered_cell,
+                show_formatting,
+                rendered_cell?.formula === undefined
+                    ? undefined
+                    : formula_result === undefined
+                        ? { editable: false, formula_result_pending: true }
+                        : { editable: false, formula_result },
+            );
+        }
+        const source_display_row = projected_row?.kind === 'source'
+            ? projected_row.sourceDisplayRow
+            : position.row;
+        const source_row = projected_row?.kind === 'source'
+            ? projected_row.identity?.sourceRow ?? get_source_row(source_display_row)
+            : get_source_row(source_display_row);
+        const loaded_cell = get_row(source_display_row)?.[source_column];
+        if (source_row === undefined) return displayed_text(loaded_cell, show_formatting, undefined);
+        const key = cell_key(source_row, source_column);
+        const overlay = value_overlay_for_cell(
+            source_row,
+            source_column,
+            key,
+            loaded_cell,
+            store.get(key),
+        );
+        return displayed_text(
+            loaded_cell,
+            show_formatting,
+            overlay === undefined ? undefined : { editable: false, ...overlay },
+        );
+    }, [
+        get_row,
+        get_source_row,
+        pending_rendered_rows,
+        removal_rendered_rows,
+        show_formatting,
+        store,
+        value_overlay_for_cell,
+        visible_source_columns,
+    ]);
+    /**
+     * Grid rows from `row` in `direction` whose loader rows touch at most
+     * FIND_CHUNK_PAGES distinct pages. Rows that are not source-backed need no
+     * page; FIND_CHUNK_MAX_ROWS bounds the planning walk over long runs of them.
+     */
+    const plan_find_chunk = useCallback((row: number, direction: FindDirection): FindChunk => {
+        const projection = pending_projection_ref.current;
+        const page_size = get_page_size();
+        const pages = new Set<number>();
+        let start = row;
+        let end = row;
+        for (
+            let next = row, walked = 0;
+            next >= 0 && next < projection.rowCount && walked < FIND_CHUNK_MAX_ROWS;
+            next += direction, walked += 1
+        ) {
+            const projected = projection.row_at(next);
+            const source_display_row = projected === undefined
+                ? next
+                : projected.kind === 'source' ? projected.sourceDisplayRow : undefined;
+            if (source_display_row !== undefined) {
+                const page = Math.floor(source_display_row / page_size);
+                if (!pages.has(page) && pages.size === FIND_CHUNK_PAGES) break;
+                pages.add(page);
+            }
+            if (direction === 1) end = next;
+            else start = next;
+        }
+        return { start, end };
+    }, [get_page_size]);
+    /** Pin and load each page the chunk's source-backed rows sit on. */
+    const load_find_chunk = useCallback(async (
+        chunk: FindChunk,
+    ): Promise<(() => void) | false> => {
+        const projection = pending_projection_ref.current;
+        const page_size = get_page_size();
+        const pages = new Set<number>();
+        for (let row = chunk.start; row <= chunk.end; row += 1) {
+            const projected = projection.row_at(row);
+            const source_display_row = projected === undefined
+                ? row
+                : projected.kind === 'source' ? projected.sourceDisplayRow : undefined;
+            if (source_display_row !== undefined && source_display_row < source_row_count) {
+                pages.add(Math.floor(source_display_row / page_size));
+            }
+        }
+        const ranges = [...pages].map((page) => ({
+            start: page * page_size,
+            end: Math.min(source_row_count, (page + 1) * page_size) - 1,
+        }));
+        const pins = ranges.map((range) => pin_rows(range.start, range.end));
+        const release = () => {
+            for (const pin of pins) unpin_rows(pin);
+            trim_rows();
+        };
+        try {
+            const loaded = await Promise.all(
+                ranges.map((range) => ensure_rows_loaded(range.start, range.end)),
+            );
+            if (loaded.every(Boolean)) return release;
+        } catch (error) {
+            console.error('Find could not load rows', error);
+        }
+        release();
+        return false;
+    }, [ensure_rows_loaded, get_page_size, pin_rows, source_row_count, trim_rows, unpin_rows]);
+    /**
+     * Select a match and bring it into view. Not `select_active_display_cell`:
+     * Glide already scrolls a cell that arrives through a controlled selection
+     * change into view, and a second, imperative scroll issued in the same tick
+     * measures against the visible region Glide has not yet updated, landing
+     * the target's offset twice (a far match ends up at the bottom of the
+     * sheet). So scroll here only when the selection does not change, which
+     * Glide does not react to.
+     */
+    const select_find_match = useCallback((target: Item) => {
+        const { cell, range } = expand_glide_selection(
+            target,
+            { x: target[0], y: target[1], width: 1, height: 1 },
+            merges,
+        );
+        const previous = grid_selection_ref.current.current?.cell;
+        write_grid_selection({
+            columns: CompactSelection.empty(),
+            rows: CompactSelection.empty(),
+            current: { cell, range, rangeStack: [] },
+        });
+        if (previous?.[0] === cell[0] && previous[1] === cell[1]) {
+            grid_ref.current?.scrollTo(cell[0], cell[1]);
+        }
+    }, [merges, write_grid_selection]);
+    const find = useCallback((
+        query: string,
+        direction: FindDirection,
+        inclusive: boolean,
+    ): Promise<FindScanResult> => {
+        const epoch = ++find_epoch_ref.current;
+        const is_stale = () => find_epoch_ref.current !== epoch;
+        const matches = find_matcher(query);
+        // One scan at a time: wait for the previous scan's in-flight load (which
+        // cannot be cancelled) to settle before loading anything. A search
+        // superseded while it waits never starts.
+        const previous = find_in_flight_ref.current;
+        const run = (async (): Promise<FindScanResult> => {
+            await previous.catch(() => undefined);
+            if (is_stale()) return { kind: 'stopped' };
+            if (matches === undefined) return { kind: 'none' };
+            const active = grid_selection_ref.current.current?.cell;
+            const result = await scan_for_match({
+                start: active === undefined ? undefined : { column: active[0], row: active[1] },
+                direction,
+                inclusive,
+                row_count: pending_projection_ref.current.rowCount,
+                column_count: visible_source_columns.length,
+                matches,
+                plan_chunk: plan_find_chunk,
+                load_chunk: load_find_chunk,
+                text_at: find_text_at,
+                is_stale,
+                yield_to_ui: () => new Promise((resolve) => setTimeout(resolve, 0)),
+            });
+            if (result.kind === 'match') {
+                if (is_stale()) return { kind: 'stopped' };
+                select_find_match([result.position.column, result.position.row]);
+            }
+            return result;
+        })();
+        find_in_flight_ref.current = run;
+        return run;
+    }, [
+        find_text_at,
+        load_find_chunk,
+        plan_find_chunk,
+        select_find_match,
+        visible_source_columns.length,
+    ]);
+    const cancel_find = useCallback(() => {
+        find_epoch_ref.current += 1;
+    }, []);
     const reveal_pending_row = useCallback((pending_row_id: string): boolean => {
         const display_row = pending_projection.display_row_for_identity({
             kind: 'pending',
@@ -7015,12 +7257,14 @@ export function GridShell({
             select_all,
             copy_sheet,
             copy_selection,
+            find,
+            cancel_find,
         };
         grid_actions_ref.current = handle;
         return () => {
             if (grid_actions_ref.current === handle) grid_actions_ref.current = null;
         };
-    }, [copy_selection, copy_sheet, grid_actions_ref, select_all, sheet_index]);
+    }, [cancel_find, copy_selection, copy_sheet, find, grid_actions_ref, select_all, sheet_index]);
 
     const hide_source_column = useCallback((source_column: number) => {
         if (display_column_count === 1) {

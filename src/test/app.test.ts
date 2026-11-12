@@ -65,6 +65,10 @@ const grid_shell_mock = vi.hoisted(() => ({
     select_all: vi.fn(),
     copy_sheet: vi.fn(async () => {}),
     copy_selection: vi.fn(),
+    find: vi.fn(async (_query: string, _direction: 1 | -1, _inclusive: boolean) => ({
+        kind: 'none',
+    }) as import('../webview/find-model').FindScanResult),
+    cancel_find: vi.fn(),
     auto_fit_result: { 0: 120 } as Record<number, number> | null,
     latest_props: null as Record<string, unknown> | null,
     mount_edits: null as Record<string, CsvDirtyEntry> | null,
@@ -178,6 +182,9 @@ vi.mock('../webview/grid-shell', () => ({
                 select_all: () => grid_shell_mock.select_all(),
                 copy_sheet: () => grid_shell_mock.copy_sheet(),
                 copy_selection: () => grid_shell_mock.copy_selection(),
+                find: (query: string, direction: 1 | -1, inclusive: boolean) =>
+                    grid_shell_mock.find(query, direction, inclusive),
+                cancel_find: () => grid_shell_mock.cancel_find(),
             };
             props.grid_actions_ref.current = handle;
             return () => {
@@ -1006,6 +1013,9 @@ function cleanup() {
     grid_shell_mock.select_all.mockReset();
     grid_shell_mock.copy_sheet.mockReset();
     grid_shell_mock.copy_selection.mockReset();
+    grid_shell_mock.find.mockReset();
+    grid_shell_mock.find.mockResolvedValue({ kind: 'none' });
+    grid_shell_mock.cancel_find.mockReset();
     grid_shell_mock.auto_fit_result = { 0: 120 };
     grid_shell_mock.mount_edits = null;
     grid_shell_mock.mount_conflicted = null;
@@ -16938,5 +16948,133 @@ describe('the Git LFS resolve lifecycle', () => {
             .map((call) => call[0] as WebviewMessage)
             .filter((message) => message.type === 'resolveLfsObject');
         expect(requests).toHaveLength(1);
+    });
+});
+
+describe('find', () => {
+    function find_input(): HTMLInputElement | null {
+        return document.querySelector('input[aria-label="Find"]');
+    }
+
+    function press_find(modifiers: Partial<KeyboardEventInit> = { metaKey: true }) {
+        return act(async () => {
+            window.dispatchEvent(new KeyboardEvent('keydown', {
+                key: 'f',
+                bubbles: true,
+                cancelable: true,
+                ...modifiers,
+            }));
+        });
+    }
+
+    async function type_query(text: string) {
+        const input = find_input()!;
+        await act(async () => {
+            Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!
+                .set!.call(input, text);
+            input.dispatchEvent(new Event('input', { bubbles: true }));
+        });
+    }
+
+    function key_in_input(key: string, init: Partial<KeyboardEventInit> = {}) {
+        return act(async () => {
+            find_input()!.dispatchEvent(new KeyboardEvent('keydown', {
+                key,
+                bubbles: true,
+                cancelable: true,
+                ...init,
+            }));
+        });
+    }
+
+    async function open_viewer() {
+        await render_app();
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1'])));
+    }
+
+    it('opens on Cmd+F or Ctrl+F, folding the open cell editor first', async () => {
+        await open_viewer();
+        expect(find_input()).toBeNull();
+        await press_find();
+        expect(grid_shell_mock.commit_live_edit).toHaveBeenCalledOnce();
+        expect(find_input()).not.toBeNull();
+        expect(document.activeElement).toBe(find_input());
+
+        await key_in_input('Escape');
+        expect(find_input()).toBeNull();
+        await press_find({ ctrlKey: true });
+        expect(find_input()).not.toBeNull();
+    });
+
+    it('opens from the desktop Edit menu command', async () => {
+        await open_viewer();
+        await dispatch_host_message({ type: 'editCommand', command: 'find' });
+        expect(find_input()).not.toBeNull();
+        expect(grid_shell_mock.copy_selection).not.toHaveBeenCalled();
+    });
+
+    it('stays closed when the open editor refuses to commit', async () => {
+        await open_viewer();
+        grid_shell_mock.commit_live_edit.mockReturnValue(false);
+        await press_find();
+        expect(find_input()).toBeNull();
+    });
+
+    it('searches as you type, steps with Enter and Shift+Enter, and reports no matches', async () => {
+        await open_viewer();
+        await press_find();
+        grid_shell_mock.find.mockResolvedValue({ kind: 'match', position: { row: 4, column: 1 } });
+        await type_query('ron');
+        expect(grid_shell_mock.find).toHaveBeenLastCalledWith('ron', 1, true);
+        expect(document.querySelector('.find-bar-status')!.textContent).toBe('');
+
+        await key_in_input('Enter');
+        expect(grid_shell_mock.find).toHaveBeenLastCalledWith('ron', 1, false);
+        // Enter that confirms an IME composition does not step.
+        const calls = grid_shell_mock.find.mock.calls.length;
+        await key_in_input('Enter', { isComposing: true });
+        expect(grid_shell_mock.find).toHaveBeenCalledTimes(calls);
+        await key_in_input('Enter', { shiftKey: true });
+        expect(grid_shell_mock.find).toHaveBeenLastCalledWith('ron', -1, false);
+
+        grid_shell_mock.find.mockResolvedValue({ kind: 'none' });
+        await type_query('zzz');
+        expect(document.querySelector('.find-bar-status')!.textContent).toBe('No matches');
+
+        grid_shell_mock.find.mockClear();
+        await type_query('');
+        expect(grid_shell_mock.find).not.toHaveBeenCalled();
+        expect(grid_shell_mock.cancel_find).toHaveBeenCalled();
+        expect(document.querySelector('.find-bar-status')!.textContent).toBe('');
+    });
+
+    it('ignores the answer of a superseded search', async () => {
+        await open_viewer();
+        await press_find();
+        let finish_first!: (result: { kind: 'none' }) => void;
+        grid_shell_mock.find.mockImplementationOnce(() => new Promise((resolve) => {
+            finish_first = resolve;
+        }));
+        await type_query('a');
+        expect(document.querySelector('.find-bar-status')!.textContent).toBe('Searching…');
+        grid_shell_mock.find.mockResolvedValueOnce({ kind: 'match', position: { row: 0, column: 0 } });
+        await type_query('ab');
+        await act(async () => finish_first({ kind: 'none' }));
+        expect(document.querySelector('.find-bar-status')!.textContent).toBe('');
+    });
+
+    it('closes on Escape, cancelling the scan and returning focus to the grid', async () => {
+        await open_viewer();
+        await press_find();
+        await type_query('ron');
+        grid_shell_mock.focus_grid.mockClear();
+        await key_in_input('Escape');
+        expect(find_input()).toBeNull();
+        expect(grid_shell_mock.cancel_find).toHaveBeenCalled();
+        expect(grid_shell_mock.focus_grid).toHaveBeenCalled();
+
+        // The query survives closing.
+        await press_find();
+        expect(find_input()!.value).toBe('ron');
     });
 });

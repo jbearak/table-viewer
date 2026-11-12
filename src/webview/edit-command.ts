@@ -20,7 +20,7 @@
  * running when the command arrives.
  */
 
-export type EditCommand = 'copy' | 'selectAll' | 'undo' | 'redo';
+export type EditCommand = 'copy' | 'selectAll' | 'undo' | 'redo' | 'find';
 
 /** Where an edit command should be applied. */
 export type EditCommandTarget = 'text' | 'grid';

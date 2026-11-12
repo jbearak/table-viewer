@@ -251,6 +251,8 @@ import {
     text_field_selection,
     type EditCommand,
 } from './edit-command';
+import { FindBar, type FindBarHandle, type FindStatus } from './find-bar';
+import { is_find_hotkey, type FindDirection } from './find-model';
 import './styles.css';
 
 type ColumnVisibilityUpdater = (
@@ -5558,10 +5560,86 @@ export function App(): React.JSX.Element {
             current === pending_sheet_action ? null : current);
     }, [active_sheet_index, generation, load_epoch, pending_sheet_action]);
 
+    // ---- Find (docs/superpowers/specs/2026-11-12-find-in-cells-design.md) ----
+    // App owns the bar's state because transforms and sheet switches remount
+    // GridShell; the scan lives in GridShell behind GridActionsHandle.find.
+    const [find_open, set_find_open] = useState(false);
+    const [find_query, set_find_query] = useState('');
+    const [find_status, set_find_status] = useState<FindStatus>('idle');
+    const [find_focus_request, set_find_focus_request] = useState(0);
+    const find_bar_ref = useRef<FindBarHandle>(null);
+    // Only the latest search may write the status.
+    const find_sequence_ref = useRef(0);
+    const run_find = useCallback((
+        query: string,
+        direction: FindDirection,
+        inclusive: boolean,
+    ) => {
+        const sequence = ++find_sequence_ref.current;
+        const handle = grid_actions_ref.current;
+        if (query === '' || !handle || handle.sheet_index !== active_sheet_index) {
+            handle?.cancel_find();
+            set_find_status('idle');
+            return;
+        }
+        set_find_status('searching');
+        handle.find(query, direction, inclusive).then((result) => {
+            if (find_sequence_ref.current !== sequence) return;
+            set_find_status(result.kind === 'none' ? 'none' : 'idle');
+        }, (error: unknown) => {
+            console.error('Find failed', error);
+            if (find_sequence_ref.current === sequence) set_find_status('idle');
+        });
+    }, [active_sheet_index]);
+    // Opening Find folds an open cell editor first, so its text is searchable
+    // and no overlay is left behind when a match moves the selection. A refused
+    // commit keeps the editor open and the bar closed.
+    const open_find = useCallback(() => {
+        if (editing_ref.current?.commit_live_edit() === false) return;
+        set_find_open(true);
+        set_find_focus_request((request) => request + 1);
+    }, []);
+    const close_find = useCallback(() => {
+        find_sequence_ref.current += 1;
+        grid_actions_ref.current?.cancel_find();
+        set_find_open(false);
+        set_find_status('idle');
+        grid_focus_ref.current?.focus();
+    }, []);
+    useEffect(() => {
+        if (find_focus_request > 0) find_bar_ref.current?.focus_and_select();
+    }, [find_focus_request]);
+    // A remount (sheet switch, reload, transform) ends any running scan; the
+    // query stays, the status clears.
+    useEffect(() => {
+        find_sequence_ref.current += 1;
+        set_find_status('idle');
+    }, [active_sheet_index, generation, load_epoch]);
+    // Capture phase, like the undo listener above: Glide consumes key events on
+    // the way up. Stopping the chord here also keeps it from VS Code's workbench.
+    // On the desktop the Edit menu's accelerator claims it first and arrives as
+    // an `editCommand` instead.
+    useEffect(() => {
+        const handler = (event: KeyboardEvent) => {
+            if (!is_find_hotkey(event)) return;
+            event.preventDefault();
+            event.stopPropagation();
+            open_find();
+        };
+        window.addEventListener('keydown', handler, true);
+        return () => window.removeEventListener('keydown', handler, true);
+    }, [open_find]);
+
     // Copy / Select All arriving from a host menu that owns the keyboard
     // shortcut (the desktop app's native Edit menu). Whatever has focus decides:
     // the CSV cell editor's text field, otherwise the grid.
     const run_edit_command = useCallback((command: EditCommand) => {
+        // Before the text-field branch: Find opens from a cell editor too,
+        // rather than copying the field.
+        if (command === 'find') {
+            open_find();
+            return;
+        }
         const active = document.activeElement;
         if (edit_command_target(active) === 'text') {
             // Decision 4, and the whole reason undo comes through here: inside an
@@ -5594,7 +5672,7 @@ export function App(): React.JSX.Element {
         const handle = grid_actions_ref.current;
         if (command === 'selectAll') handle?.select_all();
         else handle?.copy_selection();
-    }, [run_history_command]);
+    }, [open_find, run_history_command]);
 
     /**
      * The only writer, so the live array and the persisted copy cannot drift.
@@ -8275,6 +8353,20 @@ export function App(): React.JSX.Element {
                 on_cancel_transform={handle_cancel_transform}
             />
             {grid}
+            {find_open && (
+                <FindBar
+                    ref={find_bar_ref}
+                    query={find_query}
+                    status={find_status}
+                    on_query_change={(query) => {
+                        set_find_query(query);
+                        run_find(query, 1, true);
+                    }}
+                    on_next={() => run_find(find_query, 1, false)}
+                    on_previous={() => run_find(find_query, -1, false)}
+                    on_close={close_find}
+                />
+            )}
         </div>
     );
 
