@@ -104,8 +104,11 @@ memory.
 
 `GridShell` owns one scan at a time. For each chunk:
 
-1. Chunk size is `8 × loader page size`. The loader already shrinks its page so
-   one page holds at most 64 Ki cells and 8 MiB (`RowLoader.configure`); eight
+1. A chunk is the longest run of grid rows whose mapped source display
+   intervals touch at most 8 distinct loader pages (at least one grid row).
+   Grid rows alone are not a bound: after row moves or removal gaps, a few
+   grid rows can map to many pages. The loader already shrinks its page so one
+   page holds at most 64 Ki cells and 8 MiB (`RowLoader.configure`); eight
    pages therefore stay within the cache's 1 M-cell and 64 MiB caps even on a
    wide sheet, and within `MAX_PENDING_PAGE_REQUESTS`. `RowLoader` exposes its
    effective `page_size` for this.
@@ -143,8 +146,9 @@ the two cannot drift; the rest of `get_cell_content` is unchanged.
 
 A scan records a *find epoch* when it starts. The epoch changes whenever
 anything that decides text or coordinates changes: the query, Formatting, the
-column projection, `pending_projection`, the dirty store's version, the loader
-generation, or the grid remounting (reload, transform install, sheet switch).
+column projection, `pending_projection`, the dirty store's version, the
+formula result maps (`formula_results`, `source_formula_results`) and
+`pending_formula_impact`, which land asynchronously, the loader generation, or the grid remounting (reload, transform install, sheet switch).
 The scan checks the epoch after every await and every yield; a stale scan stops
 without moving the selection, and the status clears. Nothing restarts
 automatically except the query itself: a new keystroke starts a new incremental
@@ -162,7 +166,9 @@ Opening Find (by chord or menu) first calls the grid's existing
 `commit_live_edit()`, which folds the open editor's text into the dirty map and
 dismisses Glide's overlay, the same lifecycle App already uses before a
 transform or column-visibility change. The just-typed text is therefore
-searchable, and moving the selection never leaves a stale overlay.
+searchable, and moving the selection never leaves a stale overlay. If
+`commit_live_edit()` returns `false` (the edit was refused), the bar does not
+open and the editor stays open with its text.
 
 ### State across remounts
 
@@ -240,7 +246,8 @@ without changing this design.
 - Grid-level tests (existing GridShell harness): a pending edit's text is found
   and its stored value is not; a match in a row after a Pending Row is found
   (display vs loader rows); a hidden column is skipped; Formatting off matches
-  the raw value; opening Find with an open editor commits its text.
+  the raw value; opening Find with an open editor commits its text, and a
+  refused commit leaves the editor open and the bar closed.
 - Desktop smoke: open a fixture, press `Cmd/Ctrl+F`, type a value from a row far
   below the fold, poll the grid's accessibility cell until it reports the match
   selected; `Escape` returns focus to the grid.
