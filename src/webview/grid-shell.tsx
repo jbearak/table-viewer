@@ -3109,6 +3109,8 @@ export function GridShell({
         generation,
         paste_topology_key,
         pending_formula_impact,
+        // Pending Row cell edits mutate `pending_rendered_rows` in place.
+        pending_payload_revision,
         pending_rendered_rows,
         removal_rendered_rows,
         show_formatting,

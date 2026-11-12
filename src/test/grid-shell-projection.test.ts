@@ -8360,6 +8360,36 @@ describe('GridShell find', () => {
         expect(grid_mock.unpin_rows).toHaveBeenCalled();
     });
 
+    it('a Pending Row edit during a scan stops it rather than reporting stale text', async () => {
+        rows_of([['a', 'b', 'c']]);
+        const pending = create_pending_row_store({ session_id: 'session' });
+        pending.append_rows('session', ['pending-row-1'], {
+            id: 'plain', format: { kind: 'none' },
+        }, 1);
+        let finish_load!: (loaded: boolean) => void;
+        grid_mock.ensure_rows_loaded.mockImplementationOnce(() => new Promise((resolve) => {
+            finish_load = resolve;
+        }));
+        const ref = await render_find({
+            edit_mode: true,
+            csv_editable: true,
+            edit_session_id: 'session',
+            pending_row_store: pending,
+        }, 1);
+        let scan: Promise<unknown> | undefined;
+        act(() => {
+            scan = ref.current!.find('zzz', 1, true);
+        });
+        await vi.waitFor(() => expect(finish_load).toBeTypeOf('function'));
+        await act(async () => {
+            pending.set_cell('session', 'pending-row-1', 0, { value: 'zzz' });
+        });
+        await act(async () => {
+            finish_load(true);
+            expect(await scan).toEqual({ kind: 'stopped' });
+        });
+    });
+
     it('a superseded or cancelled search never moves the selection', async () => {
         rows_of([['needle', 'b', 'c']]);
         let finish_load!: (loaded: boolean) => void;
