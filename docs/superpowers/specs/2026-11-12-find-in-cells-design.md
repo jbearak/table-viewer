@@ -17,7 +17,7 @@ jump to the cells that contain it. Works the same in the VS Code extension
   full pass over the sheet before showing anything; see "Why no count".
 - Regular expressions, whole-word matching, a Match Case toggle.
 - Searching column names (the header row) or hidden rows and columns.
-- `F3` / `Cmd+G` for next match.
+- `F3` / `Cmd+G` for next match, and prefilling the query from the selection.
 
 ## What the user sees
 
@@ -29,20 +29,19 @@ widget:
 ```
 
 - `Cmd/Ctrl+F` opens the bar and focuses its input. If the bar is already open,
-  it re-focuses the input and selects its text. If a single cell is selected
-  when the bar opens fresh and the input is empty, nothing is prefilled (cell
-  values are often long; prefill is a follow-up).
+  it focuses the input and selects its text, so typing replaces the query (the
+  browser and VS Code convention).
 - Typing searches as you type: the first match at or after the active cell
   becomes the selected cell and scrolls into view. The selection outline is the
   match marker; no extra tint.
 - `Enter` / `↓` moves to the next match; `Shift+Enter` / `↑` to the previous.
-  Both wrap around the end of the sheet.
+  Both wrap around the end of the sheet. The buttons are for mouse users.
 - `Escape` or `×` closes the bar and returns focus to the grid, leaving the last
   match selected so the user can act on it (copy, edit, highlight).
 - The status text is empty while matches are found, `Searching…` while a scan
-  has run longer than a moment (the bar shows rows scanned so far, e.g.
-  `Searching… 120,000 of 1,000,000 rows`), and `No matches` after a full pass
-  finds nothing.
+  is running, and `No matches` after a full lap finds nothing. A scan that is
+  stopped (see "Invalidation") clears the status rather than leaving a stale
+  `Searching…` or `No matches`.
 
 ## What counts as a match
 
@@ -53,15 +52,16 @@ searches the view, not the file:
   current sort order, including Pending Rows and rows pending removal, which
   stay visible) crossed with its visible columns. Hidden columns and rows that
   filters or **Hide rows** remove are skipped.
-- **Text**: the text the cell paints, from the same function the grid paints
-  with (`displayed_text` in `cell-renderer.ts`): the formatted value when
-  Formatting is on and the raw value when it is off, a pending edit's text in
-  place of the stored value, and a recalculated formula result. A cell the Diff
-  toggle or git compare paints as `before → after` matches on its current
-  (after) text only, which is what `displayed_text` returns for it.
+- **Text**: the text the cell paints, as `displayed_text` in `cell-renderer.ts`
+  computes it: the formatted value when Formatting is on and the raw value when
+  it is off, a pending edit's text in place of the stored value, and a
+  recalculated formula result (which `displayed_text` renders as
+  `base → result` when the workbook cached a different base; both sides then
+  match). The Diff toggle's and git compare's `before` text is not part of
+  `displayed_text`, so it does not match.
 - **Comparison**: case-insensitive substring, folding both sides with
-  `toLocaleLowerCase()`, the same fold the **Contains** filter uses. An empty
-  query matches nothing and clears the status.
+  `toLocaleLowerCase()`, the fold the **Contains** filter uses
+  (`table-transform.ts`). No other normalization. An empty query matches nothing and clears the status.
 - **Merged cells**: only the anchor cell carries text; selecting it selects the
   whole merged block (`select_active_display_cell` already snaps).
 
@@ -71,117 +71,182 @@ tests shown text, because the user is looking for what they can see.
 ## Order and starting point
 
 Row-major in display order: left to right across visible columns, then the next
-display row. Forward search starts one cell after the active cell; typing
-(incremental search) starts *at* the active cell, so extending the query keeps
-the current match when it still matches. With no active cell, search starts at
-the top-left. Reaching the end wraps to the start; a full lap with no match
-reports `No matches`.
+display row. `Enter` starts one cell after the active cell; typing starts *at*
+the active cell, so extending the query keeps the current match when it still
+matches. With no active cell, or one no longer in the view, search starts at the
+top-left. Reaching the end wraps to the start; a full lap with no match reports
+`No matches`.
 
 ## How it works
 
 ### Why scan in the webview
 
 The host holds the data, but not what the user sees: pending edits, Pending
-Rows, recalculated formula results, and the Diff/compare text live only in the
-webview, and `displayed_text` is webview code. A host-side search would need a
-second copy of that overlay logic and a merge step for every class of pending
-change. Scanning in the webview reuses the paint path, so Find and the grid
+Rows, recalculated formula results, and Formatting state live in the webview,
+and `displayed_text` is webview code. A host-side search would need a second
+copy of that overlay logic and a merge step for every class of pending change.
+Scanning in the webview reuses the paint path's inputs, so Find and the grid
 cannot disagree about what a cell says.
 
-The webview does not hold the whole sheet — `RowLoader` pages rows on demand —
-so the scan walks display rows in chunks:
+### Display rows vs loader rows
 
-1. For chunk `[start, end]` (1,600 rows, 16 pages, which is
-   `MAX_PENDING_PAGE_REQUESTS` × `PAGE_SIZE`): pin the range, `await
-   ensure_rows_loaded(start, end)`, which requests only pages not resident.
-2. Test each row × visible column through `find_text_at(display_column,
-   display_row)`. Stop at the first match.
-3. Unpin and `trim_rows()`, so a long scan never grows the cache past its cap.
-   This is the same pin / load / trim sequence `copy_sheet` uses.
-4. Yield to the event loop between chunks so the UI stays responsive.
+The grid's display rows interleave Pending Rows and rows pending removal with
+source-backed rows. The `RowLoader` is indexed by *source display row* (the
+host's transformed order), not by grid row. `get_cell_content` resolves this
+through `pending_projection.row_at(row)` and `sourceDisplayRow`, and the
+viewport path loads `pending_projection.source_display_intervals(...)`. The scan
+does the same: it walks grid display rows, and before testing a chunk it maps
+the chunk through `source_display_intervals` and loads those loader rows. Rows
+that are not source-backed come from `pending_projection` and are already in
+memory.
 
-Pending Rows and rows pending removal come from `pending_projection` and are
-already in memory; `ensure_rows_loaded` covers source rows only.
+### The scan
 
-### Cancellation
+`GridShell` owns one scan at a time. For each chunk:
 
-Each scan carries a token. A new query, `Enter`, close, sheet switch, or a
-generation change (reload, transform install, which remount the grid) cancels
-the running scan; a cancelled scan never moves the selection. `ensure_rows_loaded`
-returning `false` (cache cleared mid-load) also ends the scan silently.
+1. Chunk size is `8 × loader page size`. The loader already shrinks its page so
+   one page holds at most 64 Ki cells and 8 MiB (`RowLoader.configure`); eight
+   pages therefore stay within the cache's 1 M-cell and 64 MiB caps even on a
+   wide sheet, and within `MAX_PENDING_PAGE_REQUESTS`. `RowLoader` exposes its
+   effective `page_size` for this.
+2. Pin the chunk's source display intervals, `await ensure_rows_loaded` for
+   each (resident pages are not re-requested).
+3. Test cells through `find_text_at(display_column, display_row)`, yielding to
+   the event loop every 20,000 cells so a wide chunk does not freeze the UI.
+   Stop at the first match.
+4. Unpin and `trim_rows()` in `finally`, the same pin / load / trim discipline
+   `copy_sheet` uses.
+
+`ensure_rows_loaded` returning `false` (cache cleared, loader disabled) ends the
+scan with the status cleared; it never reports `No matches` for rows it did not
+read.
+
+### Reading a cell's text
+
+`find_text_at` is a text-only helper, not a call into `get_cell_content`, which
+builds a Glide cell, styles, edit values, and formula retargeting for every
+call. The helper shares the pieces that decide text with `get_cell_content`:
+
+- Source-backed row with no dirty entry and no formula overlay (the common
+  case): `displayed_text(loaded_cell, show_formatting, undefined)`.
+- Otherwise it builds only the text-bearing overlay fields (`dirty_value`,
+  `dirty_display`, `formula_result`, `formula_result_pending`) through the same
+  `value_overlay_for_cell` and `calculated_formula_display` calls
+  `get_cell_content` makes, then calls `displayed_text`.
+- Pending and removal rows read `pending_rendered_rows` /
+  `removal_rendered_rows` as `get_cell_content` does.
+
+The overlay pieces move into a small shared function that both callers use, so
+the two cannot drift; the rest of `get_cell_content` is unchanged.
+
+### Invalidation and concurrency
+
+A scan records a *find epoch* when it starts. The epoch changes whenever
+anything that decides text or coordinates changes: the query, Formatting, the
+column projection, `pending_projection`, the dirty store's version, the loader
+generation, or the grid remounting (reload, transform install, sheet switch).
+The scan checks the epoch after every await and every yield; a stale scan stops
+without moving the selection, and the status clears. Nothing restarts
+automatically except the query itself: a new keystroke starts a new incremental
+search, and otherwise the user presses `Enter`.
+
+Only one chunk load is in flight per grid. A new search waits for the previous
+scan's in-flight `ensure_rows_loaded` to settle (it cannot be cancelled, and its
+pin is released in `finally`) before loading anything, so fast typing cannot
+pile up obsolete loads and pins. Only the latest requested search runs once the
+previous one settles; intermediate queries are dropped.
+
+### Open cell editor
+
+Opening Find (by chord or menu) first calls the grid's existing
+`commit_live_edit()`, which folds the open editor's text into the dirty map and
+dismisses Glide's overlay, the same lifecycle App already uses before a
+transform or column-visibility change. The just-typed text is therefore
+searchable, and moving the selection never leaves a stale overlay.
+
+### State across remounts
+
+App owns find state (open, query, status) because transforms and sheet switches
+remount `GridShell`. The scan itself lives in `GridShell` behind a
+`find(query, direction, inclusive)` action on `GridActionsHandle`. App calls it
+only through the current handle and only when the handle's `sheet_index`
+matches `active_sheet_index`, the check `pending_sheet_action_to_run` already
+makes. A remount ends any running scan (the old instance unmounts, its loader
+clears, its epoch is stale) and clears the status; the query stays in the bar.
 
 ### Why no count
 
 A count or an all-matches tint requires reading every row before showing the
 first answer. For a million-row Parquet file that is thousands of page
-round-trips. Find Next stops at the first hit, which is usually near. The
-desktop and VS Code find widgets show counts because their documents are in
-memory; ours is not. A count can be added later, computed in the background
-after the first match lands, without changing this design.
+round-trips. Find Next stops at the first hit, which is usually near. A count
+can be added later, computed in the background after the first match lands,
+without changing this design.
 
 ### Modules
 
 - `src/webview/find-model.ts` (new, pure): `find_query_matches(text, query)`,
-  the cell-order walk (`next_position`, wrap, direction), and
-  `run_find_scan({ start, direction, inclusive, row_count, column_count,
-  load_chunk, text_at, is_cancelled, on_progress })` returning the match
-  position or `undefined`. All I/O injected, so it is unit-tested without React
-  or a grid.
-- `src/webview/grid-shell.tsx`: `find_text_at`, factored out of
-  `get_cell_content` so both build the same overlay and call `displayed_text`;
-  a `find(query, direction, inclusive)` action on `GridActionsHandle` that runs
-  the scan with `ensure_rows_loaded` / `pin_rows` / `trim_rows` and selects the
-  match with `select_active_display_cell`.
-- `src/webview/find-bar.tsx` (new): the bar. Owns its input; calls back into
-  App.
-- `src/webview/app.tsx`: owns find state (open, query, status) so it survives
-  the grid remounts that transforms cause. A capture-phase `keydown` listener
-  for `Cmd/Ctrl+F`, beside the undo/redo listener and for the same reason
-  (Glide eats key events on the way up). `run_edit_command` gains `'find'`.
-- `src/webview/edit-command.ts`: `EditCommand` gains `'find'`;
-  `find_hotkey(event)` classifies the chord (exactly one of Meta/Ctrl, no Alt,
-  no Shift, key `f`).
+  the cell-order walk (next and previous position with wrap, inclusive or
+  exclusive start), and `scan_for_match({ start, direction, inclusive,
+  row_count, column_count, load_chunk, text_at, is_stale })`, an async loop
+  over chunks. Unit-tested without React or a grid.
+- `src/webview/row-loader.ts`: expose `page_size`.
+- `src/webview/grid-shell.tsx`: `find_text_at` and the shared overlay helper;
+  the `find` action (epoch, single in-flight load, pin / load / trim, select
+  with `select_active_display_cell`).
+- `src/webview/find-bar.tsx` (new): the bar.
+- `src/webview/app.tsx`: find state; a capture-phase `keydown` listener for
+  `Cmd/Ctrl+F` beside the undo/redo listener, for the same reason (Glide eats
+  key events on the way up); `run_edit_command` handles `'find'` *before* its
+  text-field branch, so the menu path opens Find even from a cell editor
+  instead of copying the field.
+- `src/webview/edit-command.ts`: `EditCommand` gains `'find'`; `find_hotkey`
+  (exactly one of Meta/Ctrl, no Alt, no Shift, key `f`).
 
 ### Keyboard routing per host
 
 - **VS Code**: the webview's capture listener handles the chord and calls
-  `preventDefault` + `stopPropagation`, exactly as undo does today, so VS Code
-  never sees it. `enableFindWidget` stays off: VS Code's widget searches DOM
-  text and the grid is a canvas.
-- **Desktop**: add **Edit → Find…** with accelerator `CmdOrCtrl+F`, routed
-  through `route_edit_command('find')` like Copy and Select All. The menu item
-  makes the feature discoverable, and the accelerator owns the chord before the
-  page, so the webview listener is a no-op there.
-- Inside a text field (cell editor, filter input), `Cmd/Ctrl+F` still opens the
-  bar. No text field in the app uses the chord for anything.
+  `preventDefault` + `stopPropagation`, as the undo listener does, so the chord
+  is not forwarded to the workbench. `enableFindWidget` stays off: VS Code's
+  widget searches DOM text and the grid is a canvas. This must be checked by
+  hand in a real VS Code window, because no automated suite drives a VS Code
+  webview's keyboard.
+- **Desktop**: add **Edit → Find…** with accelerator `CmdOrCtrl+F`. The menu
+  item makes the feature discoverable, and the accelerator owns the chord
+  before the page. The command union `'copy' | 'selectAll' | 'undo' | 'redo'`
+  gains `'find'` at its three sites: `src/types.ts` (`editCommand`),
+  `desktop/main/viewer-windows.ts` (`send_edit_command`), and
+  `desktop/main/main.ts` (`route_edit_command`). `route_edit_command`'s native
+  fallback returns early for `'find'`, so the chord does nothing in welcome,
+  preferences, or the state inspector instead of falling through to
+  `contents.redo()`.
 
 ### Edge cases
 
-- **Edit mode for CSV**: filters pause in edit mode, so display order is source
+- **CSV edit mode**: filters pause in edit mode, so display order is source
   order plus Pending Rows. Find works unchanged.
-- **Grid with no rows or no visible columns**: the bar opens; any query reports
+- **No rows or no visible columns**: the bar opens; any query reports
   `No matches`.
-- **Active cell leaves the view** (filtered away): search starts at the top.
-- **A cell editor is open** when Find moves the selection: same behavior as
-  clicking another cell.
 - **Truncated CSV** (`csvMaxRows`): searches the rows that were loaded, which is
   what the grid shows.
 
 ## Testing
 
 - `find-model.test.ts`: matching and case folding; row-major order with wrap in
-  both directions; inclusive vs exclusive start; chunk loading calls; a
-  cancelled scan returns `undefined`; `load_chunk` returning `false` ends the
-  scan.
+  both directions; inclusive vs exclusive start; a stale scan returns
+  `undefined` and loads no further chunk; `load_chunk` returning `false` ends
+  the scan without a "no match" result.
 - `edit-command.test.ts`: `find_hotkey` accepts `Cmd+F` / `Ctrl+F`, rejects
   `Cmd+Ctrl+F`, `Alt`, `Shift`.
-- Grid-level test (existing GridShell test harness): a pending edit's text is
-  found and its stored value is not; a hidden column is skipped; Formatting
-  off matches the raw value.
-- Desktop smoke: open a fixture, press `Cmd/Ctrl+F`, type a value from a row
-  far below the fold, poll the grid's accessibility cell until it reports the
-  match selected; Escape returns focus to the grid.
+- Grid-level tests (existing GridShell harness): a pending edit's text is found
+  and its stored value is not; a match in a row after a Pending Row is found
+  (display vs loader rows); a hidden column is skipped; Formatting off matches
+  the raw value; opening Find with an open editor commits its text.
+- Desktop smoke: open a fixture, press `Cmd/Ctrl+F`, type a value from a row far
+  below the fold, poll the grid's accessibility cell until it reports the match
+  selected; `Escape` returns focus to the grid.
+- Manual: the chord in a VS Code custom editor opens the bar and not VS Code's
+  find.
 
 ## Docs
 
-A short user page, `docs/find.md`, linked from the README beside filtering.
+A **Find text** section in the user docs beside filtering.
