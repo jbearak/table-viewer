@@ -47,6 +47,8 @@ export const FindBar = forwardRef<FindBarHandle, FindBarProps>(function FindBar(
                 value={query}
                 onChange={(event) => on_query_change(event.target.value)}
                 onKeyDown={(event) => {
+                    // Enter that confirms an IME composition is not a search.
+                    if (event.key === 'Enter' && event.nativeEvent.isComposing) return;
                     if (event.key === 'Enter') {
                         event.preventDefault();
                         if (event.shiftKey) on_previous();

@@ -17030,6 +17030,10 @@ describe('find', () => {
 
         await key_in_input('Enter');
         expect(grid_shell_mock.find).toHaveBeenLastCalledWith('ron', 1, false);
+        // Enter that confirms an IME composition does not step.
+        const calls = grid_shell_mock.find.mock.calls.length;
+        await key_in_input('Enter', { isComposing: true });
+        expect(grid_shell_mock.find).toHaveBeenCalledTimes(calls);
         await key_in_input('Enter', { shiftKey: true });
         expect(grid_shell_mock.find).toHaveBeenLastCalledWith('ron', -1, false);
 
