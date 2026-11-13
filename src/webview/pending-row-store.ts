@@ -1057,6 +1057,11 @@ export interface StructureOutcome {
     readonly removedSourceRows: readonly SourceInterval[];
     /** Source columns the action newly made Pending Column Removals, ascending. */
     readonly removedSourceColumns: readonly number[];
+    /**
+     * A second layout arm in the same history action, after `change`: the
+     * column half of an action that drops both axes' changes.
+     */
+    readonly additionalChanges?: readonly LayoutHistoryChange[];
 }
 
 export type StructureResult =
@@ -1450,30 +1455,108 @@ function finish_structure(
 }
 
 /**
+ * Drop the column half of a layout as the second arm of an action whose row
+ * arm `rows` already planned: the source column layout, no Pending Columns or
+ * tombstones. Without column changes the row outcome stands alone.
+ */
+function with_columns_dropped(
+    rows: StructureResult,
+    context: WorksheetStructureContext,
+): StructureResult {
+    if (!rows.ok) return rows;
+    const middle = rows.outcome.next;
+    if (middle.columnLayout === undefined && (middle.pendingColumns?.length ?? 0) === 0) return rows;
+    const columns = finish_structure(middle, { ...context, structuralBasis: undefined }, 'columns', {
+        rowLayout: row_layout_of(middle, context),
+        columnLayout: source_column_layout(context.sourceColumnCount),
+        rows: pending_rows(middle),
+        columns: [],
+        discardedColumns: middle.pendingColumns ?? [],
+    });
+    if (!columns.ok) {
+        // Nothing to drop on the column axis after all (a source layout).
+        return columns.refusal.reason === 'unchanged' ? rows : columns;
+    }
+    return {
+        ok: true,
+        outcome: Object.freeze({
+            ...rows.outcome,
+            next: columns.outcome.next,
+            discardedColumns: columns.outcome.discardedColumns,
+            additionalChanges: Object.freeze([columns.outcome.change]),
+        }),
+    };
+}
+
+/** Plan the row arm, tolerating a row axis that is already the source layout. */
+function rows_then_columns(
+    changes: PendingStructuralChanges,
+    context: WorksheetStructureContext,
+    draft: StructureDraft,
+): StructureResult {
+    const rows = finish_structure(changes, { ...context, structuralBasis: undefined }, 'rows', draft);
+    if (!rows.ok && rows.refusal.reason === 'unchanged') {
+        const columns = with_columns_dropped({
+            ok: true,
+            outcome: Object.freeze({
+                before: changes,
+                next: changes,
+                change: {
+                    kind: 'rowLayout' as const,
+                    delta: {
+                        worksheet: context.worksheet,
+                        before: changes.rowLayout ?? null,
+                        after: changes.rowLayout ?? null,
+                        pendingRows: [],
+                        pendingColumns: [],
+                        formatTemplates: [],
+                    },
+                },
+                discardedRows: Object.freeze([]),
+                discardedColumns: Object.freeze([]),
+                removedSourceRows: Object.freeze([]),
+                removedSourceColumns: Object.freeze([]),
+            }),
+        }, context);
+        if (!columns.ok || columns.outcome.additionalChanges === undefined) return rows;
+        // Only the column arm changes anything: it is the action's one change.
+        return {
+            ok: true,
+            outcome: Object.freeze({
+                ...columns.outcome,
+                change: columns.outcome.additionalChanges[0]!,
+                additionalChanges: undefined,
+            }),
+        };
+    }
+    return with_columns_dropped(rows, context);
+}
+
+/**
  * Review Changes' "Discard row and column changes on <sheet>", offered when
  * the file changed under a live layout change (`structuralBasisChanged`):
- * drop Pending Inserted Rows, removals, moves, and tombstones, leaving the
- * source layout of the file as it is now and no Structural Basis. Cell edits
- * on source cells and Pending Appended Rows are kept, and reconcile by
- * today's rules. One history action; the conflict it answers goes with it.
- *
- * Column layouts arrive with delivery step 8, whose column history arm this
- * action will then carry; until then a worksheet cannot hold one.
+ * drop Pending Inserted Rows, Pending Columns, removals, moves, and
+ * tombstones, leaving the source layout of the file as it is now and no
+ * Structural Basis. Cell edits on source cells and Pending Appended Rows are
+ * kept, and reconcile by today's rules. One history action, holding the row
+ * arm and, when columns changed, the column arm after it; the conflict it
+ * answers goes with it.
  */
 export function discard_layout_changes(
     changes: PendingStructuralChanges,
     context: WorksheetStructureContext,
 ): StructureResult {
-    if (changes.columnLayout !== undefined || (changes.pendingColumns?.length ?? 0) > 0) {
-        return refuse_structure('invalid', 'Discarding column changes is not available yet.');
-    }
-    const result = finish_structure(changes, { ...context, structuralBasis: undefined }, 'rows', {
+    const result = rows_then_columns(changes, context, {
         rowLayout: source_row_layout(context.bodyStart, body_row_count(context)),
         columnLayout: column_layout_of(changes, context),
         rows: appended_rows(changes),
-        columns: [],
+        columns: changes.pendingColumns ?? [],
         discardedRows: inserted_rows(changes),
     });
+    return without_basis_conflict(result);
+}
+
+function without_basis_conflict(result: StructureResult): StructureResult {
     if (!result.ok) return result;
     const next = own_pending_structural_changes({
         ...result.outcome.next,
@@ -1491,8 +1574,9 @@ export function discard_layout_changes(
  * Row becomes a Pending Appended Row, in layout order, with `origin` set to
  * `append` and fresh `createdOrder`s after every Pending Row's (so after the
  * band's highest), which puts it at the end of `appendedRows` and of the
- * band. Removals, moves, Pending Columns, and tombstones are dropped, leaving
- * the source layout and no Structural Basis; `appendBasis` is kept, so the
+ * band. Removals, moves, Pending Columns, and tombstones are dropped (Pending
+ * Columns by a second, column arm), leaving the source layout and no
+ * Structural Basis; `appendBasis` is kept, so the
  * band then reconciles by today's append rules. Typed content in the inserted
  * rows survives. One history action: its `pendingRows` transitions hold each
  * converted row's old origin and order, so Undo puts it back in the layout.
@@ -1505,9 +1589,6 @@ export function keep_inserted_rows_at_end(
     context: WorksheetStructureContext,
     first_created_order = 0,
 ): StructureResult {
-    if (changes.columnLayout !== undefined || (changes.pendingColumns?.length ?? 0) > 0) {
-        return refuse_structure('invalid', 'Keeping new rows with column changes is not available yet.');
-    }
     const layout = row_layout_of(changes, context);
     const inserted = new Map(inserted_rows(changes).map((row) => [row.id, row]));
     const in_layout_order = index_row_layout(layout).segments.flatMap((segment) =>
@@ -1525,18 +1606,12 @@ export function keep_inserted_rows_at_end(
         origin: 'append',
         createdOrder: next_order++,
     }));
-    const result = finish_structure(changes, { ...context, structuralBasis: undefined }, 'rows', {
+    return without_basis_conflict(rows_then_columns(changes, context, {
         rowLayout: source_row_layout(context.bodyStart, body_row_count(context)),
         columnLayout: column_layout_of(changes, context),
         rows: [...appended_rows(changes), ...converted],
-        columns: [],
-    });
-    if (!result.ok) return result;
-    const next = own_pending_structural_changes({
-        ...result.outcome.next,
-        conflicts: result.outcome.next.conflicts.filter((conflict) => conflict.reason !== 'structuralBasisChanged'),
-    });
-    return { ok: true, outcome: Object.freeze({ ...result.outcome, next }) };
+        columns: changes.pendingColumns ?? [],
+    }));
 }
 
 /** Drop Pending Column cells keyed by any of `keys`, keeping untouched columns as they are. */

@@ -11,6 +11,7 @@ export function column_rename_error(
     value: string,
     column_names: readonly string[],
     source_column: number,
+    removed_names: readonly string[] = [],
 ): string | undefined {
     const normalized = normalized_column_name(value);
     if (normalized === '') return 'Enter a column name.';
@@ -19,6 +20,12 @@ export function column_rename_error(
         && normalized_column_name(name) === normalized)) {
         return 'Another column already has that name.';
     }
+    // A Pending Column may not take a column deleted this session: structured
+    // references such as `[Price]` follow the name and would rebind to it.
+    const removed = removed_names.find((name) => normalized_column_name(name) === normalized);
+    if (removed !== undefined) {
+        return `A deleted column on this sheet is named ${removed}. Restore it or choose another name.`;
+    }
     return undefined;
 }
 
@@ -26,13 +33,15 @@ export function RenameColumnDialog(props: {
     initial: string;
     column_names: readonly string[];
     source_column: number;
+    /** Names of columns deleted this session, which a new column may not take. */
+    removed_names?: readonly string[];
     on_commit: (value: string) => boolean;
     on_cancel: () => void;
 }): React.JSX.Element {
     const [value, set_value] = useState(props.initial);
     const dialog_ref = useRef<HTMLDivElement>(null);
     const input_ref = useRef<HTMLInputElement>(null);
-    const error = column_rename_error(value, props.column_names, props.source_column);
+    const error = column_rename_error(value, props.column_names, props.source_column, props.removed_names);
     use_dismiss(dialog_ref, props.on_cancel);
     useEffect(() => {
         const timer = window.setTimeout(() => {

@@ -181,6 +181,21 @@ export function build_line_map(
  * removed) so the string indices line up byte-for-byte with the index scan.
  */
 export function split_csv_rows(text: string, delimiter: string): string[][] {
+    return split_csv_rows_with(text, delimiter, false);
+}
+
+/**
+ * The fields of the first record of `text` as their exact source text, quotes
+ * and escapes included, under the same rules as {@link split_csv_rows}: each
+ * raw field unquotes to the matching parsed field. Rewriting a header whose
+ * columns were permuted copies untouched fields byte for byte. Text with no
+ * record (empty) yields one empty field, as a blank header line has.
+ */
+export function split_csv_raw_fields(text: string, delimiter: string): string[] {
+    return split_csv_rows_with(text, delimiter, true)[0] ?? [''];
+}
+
+function split_csv_rows_with(text: string, delimiter: string, raw: boolean): string[][] {
     const rows: string[][] = [];
     const fields: string[] = [];
     let field = '';
@@ -208,17 +223,19 @@ export function split_csv_rows(text: string, delimiter: string): string[][] {
         if (in_quotes) {
             if (ch === '"') {
                 if (i + 1 < n && text[i + 1] === '"') {
-                    field += '"'; // escaped quote ("") -> one literal "
+                    field += raw ? '""' : '"'; // escaped quote ("") -> one literal "
                     i++;
                     continue;
                 }
                 in_quotes = false; // closing quote
+                if (raw) field += '"';
                 continue;
             }
             field += ch;
             continue;
         }
         if (ch === '"' && field_start) {
+            if (raw) field += '"';
             in_quotes = true;
             field_start = false;
             row_dirty = true;

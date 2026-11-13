@@ -23,12 +23,14 @@ import {
     appended_rows,
     inserted_rows,
     own_pending_structural_changes,
+    type PendingColumn,
     type PendingStructuralChanges,
     type StructuralBasis,
 } from './pending-changes';
 import {
     append_source_rows_to_layout,
     column_save_map,
+    index_column_layout,
     row_save_map,
     source_row_layout,
     type ColumnLayout,
@@ -40,6 +42,7 @@ import {
 import { parse_cell_key, cell_key } from './cell-key';
 import type { SheetMeta } from './data-source/interface';
 import { CsvDataSource } from './data-source/csv-source';
+import { split_csv_raw_fields } from './data-source/line-index';
 import { get_raw_cell_text } from './cell-display';
 import {
     pending_changes_for_sheet,
@@ -238,6 +241,84 @@ export function worksheet_structure_receipt(
             pendingColumnId: column.pendingColumnId,
             column: column.column,
         }))),
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Delimited columns
+// ---------------------------------------------------------------------------
+
+/** One live column of a delimited save, in prospective order. */
+export type DelimitedLiveColumn =
+    | { readonly kind: 'source'; readonly sourceColumn: number }
+    | { readonly kind: 'pending'; readonly column: PendingColumn };
+
+/**
+ * How a CSV/TSV save writes records under a column layout with a live change
+ * ("CSV and TSV"): every record at the prospective width, in live column
+ * order, removed columns dropped and Pending Column values taken from the
+ * Pending Column; the header line rewritten from its raw fields, so an
+ * untouched header field keeps its exact source bytes, quoting included.
+ */
+export interface DelimitedColumnWriter {
+    readonly liveColumns: readonly DelimitedLiveColumn[];
+    /** The rewritten header record, without its terminator. */
+    header(raw_header_line: string): string;
+    /** The live values of one record, given each source column's value. */
+    record(row_key: string, source_value: (source_column: number) => string): string[];
+}
+
+function quote_delimited_field(value: string, delimiter: ',' | '\t'): string {
+    return value.includes(delimiter) || value.includes('\n') || value.includes('\r') || value.includes('"')
+        ? `"${value.replace(/"/g, '""')}"`
+        : value;
+}
+
+/**
+ * The writer for a delimited worksheet whose column layout has a live change.
+ * Pending Column cells are keyed by row identity (`s:<row>` for a source row,
+ * `p:<id>` for a Pending Row); a delimited body starts at row 0, so no fixed
+ * row exists. Delimited cells hold text only.
+ */
+export function delimited_column_writer(
+    layout: ColumnLayout,
+    pending_columns: readonly PendingColumn[],
+    delimiter: ',' | '\t',
+): DelimitedColumnWriter {
+    const index = index_column_layout(layout);
+    const by_id = new Map(pending_columns.map((column) => [column.id, column]));
+    const liveColumns: DelimitedLiveColumn[] = [];
+    for (const segment of index.segments) {
+        if (segment.status !== 'live') continue;
+        if (segment.kind === 'source') {
+            for (let offset = 0; offset < segment.count; offset++) {
+                liveColumns.push(Object.freeze({ kind: 'source', sourceColumn: segment.start + offset }));
+            }
+            continue;
+        }
+        const column = by_id.get(segment.id);
+        if (column === undefined) throw new Error('A live Pending Column has no content.');
+        for (const cell of Object.values(column.cells)) {
+            if (cell.valueRuns !== undefined || cell.link || cell.formulaAnchors !== undefined) {
+                throw new Error('Delimited Pending Columns cannot contain rich text, hyperlinks, or formula anchors.');
+            }
+        }
+        liveColumns.push(Object.freeze({ kind: 'pending', column }));
+    }
+    Object.freeze(liveColumns);
+    return Object.freeze({
+        liveColumns,
+        header(raw_header_line: string): string {
+            const raw = split_csv_raw_fields(raw_header_line, delimiter);
+            return liveColumns.map((live) => live.kind === 'source'
+                ? raw[live.sourceColumn] ?? ''
+                : quote_delimited_field(live.column.header, delimiter)).join(delimiter);
+        },
+        record(row_key: string, source_value: (source_column: number) => string): string[] {
+            return liveColumns.map((live) => live.kind === 'source'
+                ? source_value(live.sourceColumn)
+                : live.column.cells[row_key]?.value ?? '');
+        },
     });
 }
 

@@ -133,6 +133,8 @@ const grid_mock = vi.hoisted(() => ({
     // two row spaces diverge — the only condition under which an assertion about
     // durable edit-key row space is non-vacuous.
     source_row_for_display: null as null | ((display_row: number) => number | undefined),
+    // Source rows whose cells read as not loaded, though a display row claims them.
+    unloaded_source_rows: new Set<number>(),
     ensure_rows: vi.fn(),
     ensure_row_intervals: vi.fn(),
     ensure_rows_loaded: vi.fn(async (_start?: number, _end?: number) => true),
@@ -234,12 +236,14 @@ vi.mock('../webview/use-row-loader', () => ({
             // Residency as the real loader's source→page index defines it: a source
             // row is readable exactly when some display row in the window claims it.
             get_cell_raw_for_source: (source_row: number, col: number) => {
+                if (grid_mock.unloaded_source_rows.has(source_row)) return undefined;
                 const display_row = resident_display_row(source_row);
                 if (display_row === undefined) return undefined;
                 const cell = grid_mock.get_row(display_row)?.[col];
                 return cell ? String(cell.raw ?? '') : '';
             },
             get_cell_for_source: (source_row: number, col: number) => {
+                if (grid_mock.unloaded_source_rows.has(source_row)) return undefined;
                 const display_row = resident_display_row(source_row);
                 if (display_row === undefined) return undefined;
                 return grid_mock.get_row(display_row)?.[col] ?? null;
@@ -2206,8 +2210,8 @@ describe('GridShell column projection', () => {
             width: number;
         }>;
         expect(columns).toEqual([
-            { id: '0', title: 'A name', width: 100 },
-            { id: '2', title: 'C name', width: 200 },
+            { id: 's:0', title: 'A name', width: 100 },
+            { id: 's:2', title: 'C name', width: 200 },
         ]);
         expect(grid_mock.props!.maxColumnWidth).toBe(MAX_COLUMN_WIDTH_PX);
         expect(grid_mock.props!.maxColumnAutoWidth).toBe(MAX_AUTO_FIT_COLUMN_WIDTH_PX);
@@ -9467,5 +9471,298 @@ describe('row Move by menu, shortcut, and drag', () => {
         expect(can_move({ start: 1, end: 1 })).toBe(true);
         expect(propose({ start: 1, end: 1 }, -1)).toBe(false);
         expect(propose({ start: 1, end: 1 }, 0)).toBe(true);
+    });
+});
+
+describe('columns: Insert, Delete, Restore, Move, rename, Pending Column cells, and drag', () => {
+    const basis = {
+        kind: 'delimited' as const,
+        byteLength: 10,
+        digest: 'digest',
+        sourceRowCount: 2,
+        sourceColumnCount: 3,
+    };
+    const supported = {
+        rows: { supported: true as const },
+        columns: { supported: true as const },
+        basis,
+    };
+    const all_columns = {
+        visible_to_source: [0, 1, 2],
+        source_to_visible: [0, 1, 2],
+        hidden_count: 0,
+    };
+    const menu_item = (label: string) => Array.from(document.querySelectorAll('button'))
+        .find((candidate) => candidate.textContent === label);
+    const announcement = () =>
+        document.querySelector('[data-testid="structure-announcement"]')?.textContent?.trim();
+    const column_ids = () => (grid_mock.props!.columns as { id: string; title: string }[])
+        .map((column) => `${column.id}=${column.title}`);
+    const open_header_menu = async (display_column: number) => {
+        const on_header_context_menu = grid_mock.props!.onHeaderContextMenu as
+            (column: number, event: Record<string, unknown>) => void;
+        await act(async () => on_header_context_menu(display_column, {
+            preventDefault: vi.fn(),
+            bounds: { x: 40 + 100 * display_column, y: 0, width: 100, height: 36 },
+            localEventX: 10,
+            localEventY: 10,
+        }));
+    };
+    const select_columns = async (columns: number[]) => {
+        const on_selection_change = grid_mock.props!.onGridSelectionChange as (selection: unknown) => void;
+        await act(async () => on_selection_change({ columns: compact(columns), rows: compact([]) }));
+    };
+    const last_action = (history: HistoryStore) => {
+        const undo = peek_history(history.snapshot(), 'undo');
+        if (undo.kind !== 'available') throw new Error('nothing recorded');
+        return undo.entry.action;
+    };
+    const render_columns = async (overrides: Partial<GridShellProps> = {}) => {
+        const pending = create_pending_row_store({ session_id: 'session' });
+        const history = create_history_store();
+        const settle = vi.fn();
+        const on_insert_columns = vi.fn(async (request: { count: number }) => ({
+            columnIds: Array.from({ length: request.count }, (_, index) => `c${index + 1}`),
+            structuralBasis: basis,
+            settle,
+        }));
+        await render_grid(props({
+            sheet_meta: { ...props().sheet_meta, rowCount: 2, sourceRowCount: 2 },
+            row_count: 2,
+            column_projection: all_columns,
+            edit_mode: true,
+            csv_editable: true,
+            edit_session_id: 'session',
+            transform_sections: true,
+            structural_support: supported,
+            edit_session: create_edit_session_store({ session_id: 'session' }),
+            pending_row_store: pending,
+            history_store: history,
+            on_insert_columns,
+            ...overrides,
+        }));
+        return { pending, history, settle, on_insert_columns };
+    };
+    const insert_right_of_first = async () => {
+        await open_header_menu(0);
+        expect(menu_button_labels()).toEqual(expect.arrayContaining([
+            'Insert column left', 'Insert column right', 'Delete column', 'Move columns left', 'Move columns right',
+        ]));
+        await act(async () => menu_item('Insert column right')!.click());
+    };
+
+    it('inserts a named Pending Column through host admission, keyed by its identity', async () => {
+        const { pending, history, settle, on_insert_columns } = await render_columns();
+        await insert_right_of_first();
+        expect(on_insert_columns).toHaveBeenCalledWith({
+            anchor: { kind: 'source', sourceColumn: 0 }, side: 'after', count: 1,
+        });
+        expect(settle).toHaveBeenCalledWith(true);
+        expect(pending.snapshot().pendingColumns).toMatchObject([{ id: 'c1', header: 'New column', format: { kind: 'none' } }]);
+        expect(pending.snapshot().structuralBasis).toEqual(basis);
+        expect(column_ids()).toEqual(['s:0=A name', 'p:c1=New column', 's:1=B name', 's:2=C name']);
+        expect(last_action(history).label).toBe('Insert column');
+        const label = grid_mock.props!.getColumnAccessibilityLabel as (column: number) => string | undefined;
+        expect(label(1)).toBe('Column B, inserted');
+        expect(label(0)).toBeUndefined();
+        // Focus lands on the first new cell, by polling.
+        await vi.waitFor(() => expect(
+            (grid_mock.props!.gridSelection as { current?: { cell: [number, number] } }).current?.cell,
+        ).toEqual([1, 0]));
+    });
+
+    it('cancels an insert whose anchor was deleted while the host answered', async () => {
+        let release!: () => void;
+        const { pending, settle } = await render_columns({
+            on_insert_columns: vi.fn(() => new Promise((resolve) => {
+                release = () => resolve({ columnIds: ['c1'], structuralBasis: basis, settle });
+            })) as never,
+        });
+        await insert_right_of_first();
+        await open_header_menu(0);
+        await act(async () => menu_item('Delete column')!.click());
+        await act(async () => release());
+        await vi.waitFor(() => expect(settle).toHaveBeenCalledWith(false));
+        expect(pending.snapshot().pendingColumns ?? []).toEqual([]);
+        expect(announcement()).toBe('Insert canceled because its column was removed.');
+    });
+
+    it('edits a Pending Column cell as its own undoable action, keyed by row identity', async () => {
+        const { pending, history } = await render_columns();
+        await insert_right_of_first();
+        const get_cell_content = grid_mock.props!.getCellContent as (cell: [number, number]) => {
+            allowOverlay?: boolean;
+            data?: unknown;
+            themeOverride?: { bgCell?: string };
+        };
+        expect(get_cell_content([1, 0]).allowOverlay).toBe(true);
+        expect(get_cell_content([1, 0]).themeOverride?.bgCell).toBe('#81b88b@0.12');
+        await act(async () => edit_one(grid_mock.props!.onCellsEdited)([1, 1], { kind: 'text', data: 'Spain' }));
+        expect(pending.snapshot().pendingColumns?.[0]?.cells).toEqual({
+            's:1': { value: 'Spain', valueEditOrder: expect.any(Number) },
+        });
+        const action = last_action(history);
+        expect(action.label).toBe('Edit cell');
+        expect(action.changes.map((change) => change.kind)).toEqual(['columnLayout']);
+        const get_after = grid_mock.props!.getCellContent as (cell: [number, number]) => { data?: unknown };
+        expect(JSON.stringify(get_after([1, 1]))).toContain('Spain');
+    });
+
+    it('records a paste across source and Pending Columns as one action', async () => {
+        const { pending, history } = await render_columns();
+        await insert_right_of_first();
+        const paste = grid_mock.props!.onCellsEdited as (
+            items: readonly { location: [number, number]; value: { kind: string; data: string } }[],
+            source: string,
+        ) => unknown;
+        await act(async () => paste([
+            { location: [0, 0], value: { kind: 'text', data: 'left' } },
+            { location: [1, 0], value: { kind: 'text', data: 'new' } },
+            { location: [2, 0], value: { kind: 'text', data: 'right' } },
+        ], 'paste'));
+        expect(pending.snapshot().pendingColumns?.[0]?.cells['s:0']?.value).toBe('new');
+        const action = last_action(history);
+        expect(action.label).toBe('Paste');
+        expect(action.changes.map((change) => change.kind).sort()).toEqual(['cell', 'cell', 'columnLayout']);
+        const undo = plan_pending_row_history_replay(action, 'undo', () => pending.snapshot());
+        if (undo.kind !== 'plan') throw new Error(undo.kind);
+        expect(undo.plans[0]!.next.pendingColumns?.[0]?.cells).toEqual({});
+    });
+
+    it('refuses the whole paste when a source cell it covers is unavailable', async () => {
+        const { pending, history } = await render_columns();
+        await insert_right_of_first();
+        grid_mock.unloaded_source_rows.add(0);
+        try {
+            const paste = grid_mock.props!.onCellsEdited as (
+                items: readonly { location: [number, number]; value: { kind: string; data: string } }[],
+                source: string,
+            ) => unknown;
+            let result: unknown;
+            await act(async () => {
+                result = paste([
+                    { location: [0, 0], value: { kind: 'text', data: 'left' } },
+                    { location: [1, 0], value: { kind: 'text', data: 'new' } },
+                ], 'paste');
+            });
+            expect(result).toBe('refused');
+        } finally {
+            grid_mock.unloaded_source_rows.clear();
+        }
+        expect(pending.snapshot().pendingColumns?.[0]?.cells).toEqual({});
+        expect(last_action(history).label).toBe('Insert column');
+    });
+
+    it('refuses renaming a Pending Column to a hidden column\'s name', async () => {
+        await render_columns({
+            column_projection: { visible_to_source: [0, 1], source_to_visible: [0, 1, undefined], hidden_count: 1 },
+        });
+        await insert_right_of_first();
+        await open_header_menu(1);
+        await act(async () => menu_item('Rename column…')!.click());
+        const input = document.querySelector<HTMLInputElement>('#rename-column-name')!;
+        await act(async () => set_input_value(input, 'C name'));
+        expect(document.body.textContent).toContain('Another column already has that name.');
+    });
+
+    it('renames a Pending Column, refusing a deleted column\'s name', async () => {
+        const { pending, history } = await render_columns();
+        await insert_right_of_first();
+        await open_header_menu(2);
+        await act(async () => menu_item('Delete column')!.click());
+        await open_header_menu(1);
+        const sort = Array.from(document.querySelectorAll('button'))
+            .find((candidate) => candidate.textContent?.startsWith('Sort ascending'))!;
+        expect(sort.getAttribute('aria-disabled')).toBe('true');
+        expect(sort.getAttribute('aria-description')).toBe('Save the new column to sort or filter by it.');
+        await act(async () => menu_item('Rename column…')!.click());
+        const input = document.querySelector<HTMLInputElement>('#rename-column-name')!;
+        await act(async () => set_input_value(input, 'B name'));
+        expect(document.body.textContent).toContain(
+            'A deleted column on this sheet is named B name. Restore it or choose another name.');
+        await act(async () => set_input_value(input, 'origin'));
+        await act(async () => find_button((text) => text === 'Rename')!.click());
+        expect(pending.snapshot().pendingColumns?.[0]?.header).toBe('origin');
+        expect(last_action(history).label).toBe('Rename column');
+        expect(column_ids()[1]).toBe('p:c1=origin');
+    });
+
+    it('deletes a column in place, read-only and labelled, and restores it', async () => {
+        const { pending, history } = await render_columns();
+        await open_header_menu(1);
+        await act(async () => menu_item('Delete column')!.click());
+        expect(pending.snapshot().columnLayout?.removedSourceColumns).toEqual([1]);
+        expect(last_action(history).label).toBe('Delete column');
+        expect(column_ids()).toEqual(['s:0=A name', 's:1=B name', 's:2=C name']);
+        const label = grid_mock.props!.getColumnAccessibilityLabel as (column: number) => string | undefined;
+        expect(label(1)).toBe('Column removed, was B name');
+        const get_cell_content = grid_mock.props!.getCellContent as (cell: [number, number]) => {
+            allowOverlay?: boolean;
+            themeOverride?: { bgCell?: string };
+        };
+        expect(get_cell_content([1, 0]).allowOverlay).toBe(false);
+        expect(get_cell_content([1, 0]).themeOverride?.bgCell).toBe('#c74e39@0.12');
+        // Titles are prospective: C becomes B, and the removal keeps its source name.
+        await open_header_menu(1);
+        expect(menu_item('Delete column')?.getAttribute('aria-disabled')).toBe('true');
+        await act(async () => menu_item('Restore column')!.click());
+        expect(pending.snapshot().columnLayout).toBeUndefined();
+        expect(last_action(history).label).toBe('Restore column');
+    });
+
+    it('moves selected columns with Alt+Shift+Right and announces it', async () => {
+        const { pending, history } = await render_columns();
+        await select_columns([0]);
+        const on_key_down = grid_mock.props!.onKeyDown as (args: Record<string, unknown>) => void;
+        const right = {
+            key: 'ArrowRight',
+            altKey: true,
+            shiftKey: true,
+            ctrlKey: false,
+            metaKey: false,
+            rawEvent: { code: 'ArrowRight', target: document.createElement('canvas') },
+            cancel: vi.fn(),
+            preventDefault: vi.fn(),
+        };
+        await act(async () => on_key_down(right));
+        expect(right.cancel).toHaveBeenCalled();
+        expect(pending.snapshot().columnLayout?.columns).toEqual([
+            { kind: 'source', sourceColumn: 1 },
+            { kind: 'source', sourceColumn: 0 },
+            { kind: 'source', sourceColumn: 2 },
+        ]);
+        expect(last_action(history).label).toBe('Move column');
+        expect(announcement()).toBe('Moved 1 column right');
+        expect(column_ids()).toEqual(['s:1=B name', 's:0=A name', 's:2=C name']);
+        // The selection follows the moved column, by polling.
+        await vi.waitFor(() => expect(
+            [...(grid_mock.props!.gridSelection as { columns: Iterable<number> }).columns],
+        ).toEqual([1]));
+        const label = grid_mock.props!.getColumnAccessibilityLabel as (column: number) => string | undefined;
+        // The tint marks the fewest columns that explain the new order.
+        expect(label(0)).toBeUndefined();
+        expect(label(1)).toBe('Column B, moved from column A');
+    });
+
+    it('wires column drag: refuses an unselectable block, and drops the selected block', async () => {
+        const { pending } = await render_columns();
+        const can_move = grid_mock.props!.canMoveColumns as (block: { start: number; end: number }) => boolean;
+        const propose = grid_mock.props!.onColumnProposeMove as (block: { start: number; end: number }, before: number) => boolean;
+        const moved = grid_mock.props!.onColumnMoved as (block: { start: number; end: number }, before: number) => void;
+        expect(can_move({ start: 0, end: 1 })).toBe(true);
+        expect(propose({ start: 0, end: 0 }, 3)).toBe(true);
+        await act(async () => moved({ start: 0, end: 0 }, 3));
+        expect(pending.snapshot().columnLayout?.columns).toEqual([
+            { kind: 'source', sourceColumn: 1 },
+            { kind: 'source', sourceColumn: 2 },
+            { kind: 'source', sourceColumn: 0 },
+        ]);
+    });
+
+    it('offers no column structure items or drag without structural support', async () => {
+        await render_columns({ structural_support: undefined });
+        expect(grid_mock.props!.onColumnMoved).toBeUndefined();
+        await open_header_menu(0);
+        expect(menu_button_labels()).not.toContain('Insert column left');
     });
 });

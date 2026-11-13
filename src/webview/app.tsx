@@ -150,6 +150,8 @@ import {
     type EditingStatus,
     type EditingHandle,
     type AppendRowsAdmission,
+    type StructuralColumnInsertAdmission,
+    type StructuralColumnInsertRequest,
     type StructuralInsertAdmission,
     type StructuralInsertRequest,
     type GridActionsHandle,
@@ -1126,7 +1128,7 @@ export function App(): React.JSX.Element {
         if (staged_store === undefined) return;
         const record = history_store_ref.current!.stage_record({
             label: `Discard row and column changes on ${sheet.name}`,
-            changes: [result.outcome.change],
+            changes: [result.outcome.change, ...(result.outcome.additionalChanges ?? [])],
         });
         commit_staged_transaction([record, staged_store]);
     }, [active_sheet_index]);
@@ -1166,7 +1168,7 @@ export function App(): React.JSX.Element {
         if (staged_store === undefined) return;
         const record = history_store_ref.current!.stage_record({
             label: 'Keep new rows at the end',
-            changes: [result.outcome.change],
+            changes: [result.outcome.change, ...(result.outcome.additionalChanges ?? [])],
         });
         commit_staged_transaction([record, staged_store]);
     }, [active_sheet_index]);
@@ -1738,6 +1740,9 @@ export function App(): React.JSX.Element {
     } | {
         readonly kind: 'insert';
         readonly resolve: (result: StructuralInsertAdmission | undefined) => void;
+    } | {
+        readonly kind: 'insertColumns';
+        readonly resolve: (result: StructuralColumnInsertAdmission | undefined) => void;
     })>());
     const [append_request_pending, set_append_request_pending] = useState(false);
     const restore_saved_rows_seq_ref = useRef(0);
@@ -6620,6 +6625,57 @@ export function App(): React.JSX.Element {
         });
     }, [active_sheet_index]);
 
+    /**
+     * Ask the host to admit a column insert. It shares the in-flight map with
+     * appends and row inserts, as the host's one reservation slot does, so
+     * every fence that waits for an append waits for it too.
+     */
+    const request_structural_column_insert = useCallback((request: StructuralColumnInsertRequest): Promise<
+        StructuralColumnInsertAdmission | undefined
+    > => {
+        const edit_session_id = csv_edit_session_id_ref.current;
+        const sheet = meta_ref.current?.sheets[active_sheet_index];
+        if (
+            edit_session_id === undefined
+            || sheet === undefined
+            || !Number.isSafeInteger(request.count)
+            || request.count <= 0
+        ) return Promise.resolve(undefined);
+        const source_generation = source_generation_ref.current;
+        const request_id = [
+            'insert-columns',
+            append_request_prefix_ref.current,
+            ++append_request_seq_ref.current,
+        ].join(':');
+        return new Promise((resolve) => {
+            pending_append_requests_ref.current.set(request_id, {
+                kind: 'insertColumns',
+                sourceGeneration: source_generation,
+                editSessionId: edit_session_id,
+                sheetIndex: active_sheet_index,
+                resolve,
+            });
+            set_append_request_pending(true);
+            host_bridge.postMessage({
+                type: 'requestStructuralInsert',
+                requestId: request_id,
+                editSessionId: edit_session_id,
+                worksheet: {
+                    sheetIndex: active_sheet_index,
+                    sheetName: sheet.name,
+                    ...(sheet.worksheetId === undefined
+                        ? {}
+                        : { worksheetId: sheet.worksheetId }),
+                },
+                sourceGeneration: source_generation,
+                axis: 'columns',
+                anchor: { column: request.anchor },
+                side: request.side,
+                count: request.count,
+            });
+        });
+    }, [active_sheet_index]);
+
     const handle_unhide_all_rows = useCallback(() => {
         const header = meta?.sheets[active_sheet_index]?.excelFirstRowHeader;
         if (header?.mode === 'on' && header.sourceRow !== 0) {
@@ -6936,6 +6992,52 @@ export function App(): React.JSX.Element {
                 // resuming here reads the stores the grant just replaced rather
                 // than the ones it is about to.
                 settle_session_grant_waiters(msg.granted && !!msg.editSessionId);
+            } else if (msg.type === 'structuralInsertResult'
+                && pending_append_requests_ref.current.get(msg.requestId)?.kind === 'insertColumns') {
+                const pending = pending_append_requests_ref.current.get(msg.requestId)!;
+                if (pending.kind !== 'insertColumns') return;
+                pending_append_requests_ref.current.delete(msg.requestId);
+                if (pending_append_requests_ref.current.size === 0) {
+                    set_append_request_pending(false);
+                }
+                if (
+                    msg.sourceGeneration !== pending.sourceGeneration
+                    || msg.sourceGeneration !== source_generation_ref.current
+                    || csv_edit_session_id_ref.current !== pending.editSessionId
+                    || rendered_sheet_index_ref.current !== pending.sheetIndex
+                    || !msg.granted
+                    || msg.columnIds === undefined
+                    || msg.structuralBasis === undefined
+                ) {
+                    if (msg.granted) {
+                        host_bridge.postMessage({
+                            type: 'settleRowAdmission',
+                            requestId: msg.requestId,
+                            editSessionId: pending.editSessionId,
+                            accepted: false,
+                        });
+                    }
+                    pending.resolve(undefined);
+                    if (msg.reason) {
+                        host_bridge.postMessage({ type: 'showWarning', message: msg.reason });
+                    }
+                    return;
+                }
+                let settled = false;
+                pending.resolve({
+                    columnIds: msg.columnIds,
+                    structuralBasis: msg.structuralBasis,
+                    settle: (accepted) => {
+                        if (settled) return;
+                        settled = true;
+                        host_bridge.postMessage({
+                            type: 'settleRowAdmission',
+                            requestId: msg.requestId,
+                            editSessionId: pending.editSessionId,
+                            accepted,
+                        });
+                    },
+                });
             } else if (msg.type === 'structuralInsertResult') {
                 const pending = pending_append_requests_ref.current.get(msg.requestId);
                 if (pending === undefined || pending.kind !== 'insert') {
@@ -7133,6 +7235,8 @@ export function App(): React.JSX.Element {
                     pending_save_dialog_grid_focus_ref.current = null;
                 }
                 // 'cancel' → stay in edit mode, keep edits.
+            } else if (msg.type === 'toolbarAnnouncement') {
+                set_excel_header_status(msg.message);
             } else if (msg.type === 'saveResult') {
                 const proposed_operation = save_projection_ref.current.operation;
                 const transition = apply_save_lifecycle(msg.lifecycle);
@@ -8801,6 +8905,7 @@ export function App(): React.JSX.Element {
             on_append_composer_draft_change={handle_append_composer_draft_change}
             on_append_rows={request_append_rows}
             on_insert_rows={request_structural_insert}
+            on_insert_columns={request_structural_column_insert}
             history_store={history_store_ref.current!}
             gestures_admitted={edit_gestures_admitted}
             host_rejected_keys={live_rejected_keys}

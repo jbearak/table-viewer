@@ -71,6 +71,8 @@ export interface DataGridProps {
 
     readonly accessibilityHeight: number;
     readonly getRowAccessibilityLabel?: (row: number) => string | undefined;
+    /** Fork addition: a column header's state in the accessibility tree, by grid column. */
+    readonly getColumnAccessibilityLabel?: (col: number) => string | undefined;
 
     readonly freezeColumns: number;
     readonly freezeTrailingRows: number;
@@ -322,6 +324,7 @@ const DataGrid: React.ForwardRefRenderFunction<DataGridRef, DataGridProps> = (p,
         height,
         accessibilityHeight,
         getRowAccessibilityLabel,
+        getColumnAccessibilityLabel,
         columns,
         cellXOffset: cellXOffsetReal,
         cellYOffset,
@@ -1767,6 +1770,7 @@ const DataGrid: React.ForwardRefRenderFunction<DataGridRef, DataGridProps> = (p,
                                     role="columnheader"
                                     aria-selected={selection.columns.hasIndex(c.sourceIndex)}
                                     aria-colindex={c.sourceIndex + 1 + colOffset}
+                                    aria-label={getColumnAccessibilityLabel?.(c.sourceIndex)}
                                     tabIndex={-1}
                                     onFocus={e => {
                                         if (e.target === focusRef.current) return;
@@ -1906,6 +1910,7 @@ const DataGrid: React.ForwardRefRenderFunction<DataGridRef, DataGridProps> = (p,
             cellYOffset,
             accessibilityHeight,
             getRowAccessibilityLabel,
+            getColumnAccessibilityLabel,
             selection,
             focusElement,
             getCellContent,
