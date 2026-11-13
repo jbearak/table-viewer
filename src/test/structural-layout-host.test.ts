@@ -675,3 +675,75 @@ describe('the structural editing capability', () => {
         await viewer.dispose();
     });
 });
+
+describe('publishing a layout across an external change', () => {
+    const basis_of = (bytes: Uint8Array, rows: number): StructuralBasis => ({
+        kind: 'delimited',
+        byteLength: bytes.length,
+        digest: createHash('sha256').update(bytes).digest('hex'),
+        sourceRowCount: rows,
+        sourceColumnCount: 1,
+    });
+
+    it('keeps accepting the basis the first delete recorded after the file changes', async () => {
+        const viewer = await open_viewer({ structuralEditingEnabled: true });
+        const recorded = basis_of(BYTES, 3);
+        expect(await viewer.publish({ rowLayout: REMOVAL_LAYOUT, structuralBasis: recorded })).toBe(true);
+
+        // The file grows outside the session; the snapshot now reports its basis.
+        const grown = enc.encode('h\na\nb\nc\nd\n');
+        vscode_mock.__setStatImplementation(async () => ({ size: grown.length, mtime: 2 }));
+        vscode_mock.__setReadFileImplementation(async () => grown);
+        await vscode_mock.__getActiveWatchers()[0].__fireChange();
+        await viewer.controller.drain();
+        const latest = [...(viewer.panel.__messages as Message[])].reverse().find((message) =>
+            message.type === 'workbookSnapshot') as {
+            snapshot: { sourceGeneration: number; capabilities: Record<string, unknown> };
+        };
+        expect(latest.snapshot.capabilities.structuralEditing).toMatchObject({
+            sheets: [{ basis: basis_of(grown, 4) }],
+        });
+
+        // The webview keeps publishing the layout it authored, with its basis.
+        await viewer.panel.__receive({
+            type: 'pendingChangesChanged',
+            editSessionId: viewer.session.editSessionId!,
+            sequence: 2,
+            sourceGeneration: latest.snapshot.sourceGeneration,
+            changes: {
+                sheetIndex: 0,
+                sheetName: 'Sheet1',
+                cells: { '0:0': { value: 'v', base: 'a' } },
+                formatTemplates: [],
+                appendedRows: [],
+                tailRemovals: [],
+                conflicts: [],
+                rowLayout: REMOVAL_LAYOUT,
+                structuralBasis: recorded,
+            },
+        });
+        await viewer.controller.drain();
+        expect((viewer.panel.__messages as Message[]).some((message) =>
+            message.type === 'pendingChangesAcknowledged' && message.sequence === 2)).toBe(true);
+        await viewer.dispose();
+    });
+
+    it('fails a pending-edit flush at once when the host refused the publication it waits on', async () => {
+        const viewer = await open_viewer({ structuralEditingEnabled: true });
+        expect(await viewer.publish({
+            rowLayout: REMOVAL_LAYOUT,
+            structuralBasis: { ...basis_of(BYTES, 3), digest: 'sha256:never' },
+        })).toBe(false);
+        const flushed = viewer.controller.flush_pending_edits();
+        const request = [...(viewer.panel.__messages as Message[])].reverse().find((message) =>
+            message.type === 'requestPendingEditsFlush') as { requestId: string };
+        await viewer.panel.__receive({
+            type: 'pendingEditsFlush',
+            requestId: request.requestId,
+            editSessionId: viewer.session.editSessionId!,
+            highestProducedSequence: 1,
+        });
+        await expect(flushed).rejects.toThrow('refused the pending changes');
+        await viewer.dispose();
+    });
+});

@@ -8536,11 +8536,36 @@ describe('row Delete and Restore in the row-gutter menu', () => {
             rows: compact([1, 2]),
         }));
         await open_row_menu(2);
+        const caret = () => (grid_mock.props!.gridSelection as {
+            current?: { cell: [number, number] };
+        }).current?.cell;
         await act(async () => menu_item('Delete 2 rows')!.click());
         expect(pending.snapshot().rowLayout?.removedSourceRows).toEqual([{ start: 1, count: 2 }]);
+        // Polling on the already-removed row 1 would land at once, against the
+        // projection from before this delete, and put the caret on row 2.
+        expect(caret()).not.toEqual([0, 2]);
         await vi.waitFor(() => expect((grid_mock.props!.gridSelection as {
             current?: { cell: [number, number] };
         }).current?.cell).toEqual([0, 3]));
+    });
+
+    it('keeps a caret after deleting only appended rows', async () => {
+        const pending = create_pending_row_store({ session_id: 'session' });
+        pending.append_rows('session', ['pending-a', 'pending-b'], {
+            id: 'plain', format: { kind: 'none' },
+        }, 1);
+        await render_grid(structure_props({
+            structural_support: supported,
+            edit_session: create_edit_session_store({ session_id: 'session' }),
+            pending_row_store: pending,
+        }));
+        await open_row_menu(4);
+        await act(async () => menu_item('Delete row')!.click());
+        expect(pending.snapshot().appendedRows.map((row) => row.id)).toEqual(['pending-b']);
+        expect(pending.snapshot().rowLayout).toBeUndefined();
+        await vi.waitFor(() => expect((grid_mock.props!.gridSelection as {
+            current?: { cell: [number, number] };
+        }).current?.cell).toEqual([0, 4]));
     });
 
     it('refuses a paste into a removed row', async () => {

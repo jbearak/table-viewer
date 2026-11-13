@@ -3640,11 +3640,13 @@ export function GridShell({
         // Pending Appended Rows alone leave the layout as it is: the existing
         // removal, under the Delete item's name.
         if (only_appended_rows(before, identities)) {
-            return remove_pending_rows(
+            if (!remove_pending_rows(
                 identities.flatMap((identity) =>
                     identity.kind === 'pending' ? [identity.pendingRowId] : []),
                 (count) => row_structure_label('Delete', count),
-            );
+            )) return false;
+            focus_after_row_delete(identities, from_row, display_column);
+            return true;
         }
         const plan = plan_row_delete(before, structure_context, identities, store.snapshot());
         if (!plan.ok) {
