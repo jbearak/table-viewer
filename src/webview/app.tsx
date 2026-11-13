@@ -223,6 +223,13 @@ import { run_discard_transaction } from './discard-transaction-model';
 import { highlight_history_source } from './highlight-capture-model';
 import { commit_staged_transaction, type StagedMutation } from './staged-mutation';
 import { discard_layout_changes } from './pending-row-store';
+
+/**
+ * Structural conflicts about a whole worksheet rather than a row or cell:
+ * they carry no row identities, and Review Changes answers them with a
+ * worksheet action ("Discard row and column changes on <sheet>").
+ */
+const WORKSHEET_LEVEL_STRUCTURAL_CONFLICTS: ReadonlySet<string> = new Set(['structuralBasisChanged']);
 import { column_letter } from './grid-model';
 import {
     clamp_row_height,
@@ -1015,6 +1022,9 @@ export function App(): React.JSX.Element {
         const sheet = meta_ref.current?.sheets[sheet_index];
         const session_id = csv_edit_session_id_ref.current;
         if (sheet === undefined || session_id === undefined) return;
+        // Admitted like every other edit gesture: not across a save, a
+        // replay, an outstanding highlight, resize, or append.
+        if (save_in_flight_ref.current || !edit_gestures_admitted()) return;
         const store = edit_session_registry_ref.current!.pending_rows_for_sheet(sheet_index);
         const before = store.snapshot();
         const header = sheet.excelFirstRowHeader;
@@ -6892,8 +6902,11 @@ export function App(): React.JSX.Element {
                                 formulaCells: Object.freeze(formula_cells),
                             }),
                         });
+                        // A Structural Basis conflict belongs to the whole
+                        // worksheet; its action is a discard, not a row.
                         if (
-                            actionable_conflict.pendingRowIds.length === 0
+                            !WORKSHEET_LEVEL_STRUCTURAL_CONFLICTS.has(actionable_conflict.reason)
+                            && actionable_conflict.pendingRowIds.length === 0
                             && actionable_conflict.tailRemovalIds.length === 0
                             && (actionable_conflict.formulaCells?.length ?? 0) === 0
                         ) {
