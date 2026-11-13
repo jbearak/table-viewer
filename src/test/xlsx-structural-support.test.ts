@@ -41,6 +41,7 @@ interface WorkbookSpec {
     readonly workbookRelationships?: readonly Relationship[];
     readonly chartsheets?: readonly { readonly name: string; readonly relationships: readonly Relationship[] }[];
     readonly parts?: Readonly<Record<string, string>>;
+    readonly rootRelationships?: readonly Relationship[];
 }
 
 function rels_xml(relationships: readonly Relationship[]): string {
@@ -60,7 +61,7 @@ function build_xlsx(spec: WorkbookSpec): Uint8Array {
 <Default Extension="xml" ContentType="application/xml"/>
 <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
 </Types>`);
-    add('_rels/.rels', rels_xml([{ type: `${OD}/officeDocument`, target: 'xl/workbook.xml' }]));
+    add('_rels/.rels', rels_xml([{ type: `${OD}/officeDocument`, target: 'xl/workbook.xml' }, ...(spec.rootRelationships ?? [])]));
     const sheet_relationships: Relationship[] = spec.sheets.map((_, index) => ({
         type: `${OD}/worksheet`,
         target: `worksheets/sheet${index + 1}.xml`,
@@ -706,6 +707,65 @@ describe('scan_xlsx_structural_support', () => {
             expect_supported(other);
         });
 
+        it('matches decoded attribute values and text joined across CDATA', () => {
+            const [data, report, other] = scan({
+                sheets: [
+                    sheet('Data'),
+                    sheet('Report', `${PLAIN_DATA}<extLst><ext uri="urn:unreviewed"><x:thing xmlns:x="urn:x" target="D&#97;ta!A1"/></ext></extLst>`),
+                    sheet('Other'),
+                ],
+            });
+            expect(refused(data)).toMatchObject({ code: 'unclassified-reference', part: 'xl/worksheets/sheet2.xml' });
+            expect(report.rows.supported).toBe(false);
+            expect_supported(other);
+
+            const [split] = scan({
+                sheets: [sheet('Data'), sheet('Other')],
+                parts: { 'xl/vendor/thing.xml': '<r>Da<![CDATA[ta!A1]]></r>' },
+            });
+            expect(refused(split)).toMatchObject({ code: 'unclassified-reference', part: 'xl/vendor/thing.xml' });
+        });
+
+        it.each([
+            ['alternate content', `<mc:AlternateContent xmlns:mc="${MC_NS}"><mc:Choice Requires="x"><definedName name="Hidden">Data!A1</definedName></mc:Choice></mc:AlternateContent>`],
+            ['an extension list', '<extLst><ext uri="urn:x"><definedName name="Hidden">Data!A1</definedName></ext></extLst>'],
+        ])('refuses a sheet named by a defined name inside %s', (_label, wrapped) => {
+            const [data, other] = scan({
+                sheets: [sheet('Data'), sheet('Other')],
+                definedNames: `<definedName name="Shown">Other!A1</definedName>${wrapped}`,
+            });
+            expect(refused(data)).toMatchObject({ code: 'unclassified-reference', part: 'xl/workbook.xml' });
+            // The collected name is rendered by the writer, so it stays exempt.
+            expect_supported(other);
+        });
+
+        it('exempts only the exact nodes the writer rewrites', () => {
+            const [ext_value, foreign_cf, theme_path] = scan({
+                sheets: [
+                    sheet('ExtValue'),
+                    sheet('ForeignCf'),
+                    sheet('ThemePath'),
+                    sheet('Report', '<sheetData><row r="1"><c r="A1"><v>1</v><extLst><ext uri="urn:x"><v>ExtValue!A1</v></ext></extLst></c></row></sheetData>'
+                        + '<conditionalFormatting xmlns="urn:foreign" sqref="A1"><cfRule type="expression" priority="1"><formula>ForeignCf!A1</formula></cfRule></conditionalFormatting>'),
+                ],
+                // Under xl/theme/ but not related as a theme: scanned like any other part.
+                parts: { 'xl/theme/notatheme.xml': '<a:x xmlns:a="urn:a">ThemePath!A1</a:x>' },
+            });
+            expect(refused(ext_value)).toMatchObject({ code: 'unclassified-reference', part: 'xl/worksheets/sheet4.xml' });
+            expect(refused(foreign_cf)).toMatchObject({ code: 'unclassified-reference', part: 'xl/worksheets/sheet4.xml' });
+            expect(refused(theme_path)).toMatchObject({ code: 'unclassified-reference', part: 'xl/theme/notatheme.xml' });
+        });
+
+        it('refuses every sheet when a part declares a DTD', () => {
+            const supports = scan({
+                sheets: [sheet('Data'), sheet('Other')],
+                parts: { 'xl/vendor/thing.xml': '<!DOCTYPE r [<!ENTITY q "Data!A1">]><r>&q;</r>' },
+            });
+            for (const support of supports) {
+                expect(refused(support)).toMatchObject({ code: 'unclassified-reference', part: 'xl/vendor/thing.xml' });
+            }
+        });
+
         it('leaves a sheet supported when it is named only where the writer renders it or in data', () => {
             const [data, report] = scan({
                 sheets: [
@@ -717,7 +777,11 @@ describe('scan_xlsx_structural_support', () => {
                         + '<hyperlinks><hyperlink ref="A1" location="Data!A1" display="Data"/></hyperlinks>'),
                 ],
                 definedNames: '<definedName name="_xlnm.Print_Area" localSheetId="0">Data!$A$1:$B$5</definedName>',
-                workbookRelationships: [{ type: `${OD}/sharedStrings`, target: 'sharedStrings.xml' }],
+                workbookRelationships: [
+                    { type: `${OD}/sharedStrings`, target: 'sharedStrings.xml' },
+                    { type: `${OD}/theme`, target: 'theme/theme1.xml' },
+                ],
+                rootRelationships: [{ type: `${OD}/extended-properties`, target: 'docProps/app.xml' }],
                 parts: {
                     'xl/sharedStrings.xml': `<sst xmlns="${MAIN_NS}"><si><t>Data!A1</t></si></sst>`,
                     'docProps/app.xml': '<Properties><TitlesOfParts><vt:lpstr xmlns:vt="urn:vt">Data!Print_Area</vt:lpstr></TitlesOfParts></Properties>',
