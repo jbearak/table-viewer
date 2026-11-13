@@ -1173,7 +1173,10 @@ export function pending_edits_require_version_2(
     return !!pending?.some((slot) => slot !== undefined && (
         pending_changes_carry_layout(slot)
         || pending_cells_carry_formula_anchors(slot.cells)
-        || pending_structure_carries_formula_anchors({ appendedRows: slot.appendedRows ?? [], pendingColumns: slot.pendingColumns })
+        || pending_structure_carries_formula_anchors({
+            appendedRows: pending_rows(slot),
+            pendingColumns: slot.pendingColumns,
+        })
     ));
 }
 

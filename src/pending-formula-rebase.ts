@@ -77,6 +77,7 @@ export function pending_formula_cells_referencing_provisional_rows(
     formula_source_cells: Readonly<Record<string, string | {
         readonly value: string;
         readonly formulaReferenceBases?: readonly PendingFormulaReferenceBasis[];
+        readonly formulaAnchors?: unknown;
     }>>,
     target_structural: PendingStructuralChanges,
     formula_sheet_index: number,
@@ -117,6 +118,8 @@ export function pending_formula_cells_referencing_provisional_rows(
     const conflicts: PendingFormulaConflictCell[] = [];
     for (const row of pending_rows(formula_structural)) {
         for (const [column, cell] of Object.entries(row.cells)) {
+            // Stored anchors already name the rows, so external growth cannot change them.
+            if (cell.formulaAnchors !== undefined) continue;
             if (!references_provisional(cell.value, cell.formulaReferenceBases)) continue;
             conflicts.push({
                 rowIdentity: { kind: 'pending', pendingRowId: row.id },
@@ -129,6 +132,7 @@ export function pending_formula_cells_referencing_provisional_rows(
         if (extra !== undefined
             || !Number.isSafeInteger(sourceRow)
             || !Number.isSafeInteger(sourceColumn)) continue;
+        if (typeof entry !== 'string' && entry.formulaAnchors !== undefined) continue;
         const value = typeof entry === 'string' ? entry : entry.value;
         const authored = typeof entry === 'string' ? undefined : entry.formulaReferenceBases;
         if (!references_provisional(value, authored)) continue;

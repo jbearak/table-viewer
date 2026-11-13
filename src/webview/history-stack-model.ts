@@ -1044,6 +1044,10 @@ function saved_row_cell_overlay(
         || !structural_values_equal(
             historical?.formulaReferenceBases ?? [],
             persisted?.formulaReferenceBases ?? [],
+        )
+        || !structural_values_equal(
+            historical?.formulaAnchors ?? null,
+            persisted?.formulaAnchors ?? null,
         );
     const value_dimension_changed = value_changed || value_metadata_changed;
     if (!value_dimension_changed && !link_changed) return absent_overlay();
@@ -1060,6 +1064,7 @@ function saved_row_cell_overlay(
             historical?.movedFrom,
             historical?.valueEditOrder,
             historical?.formulaReferenceBases,
+            historical?.formulaAnchors,
         );
     }
     if (value_dimension_changed) {
@@ -1073,6 +1078,7 @@ function saved_row_cell_overlay(
             historical?.movedFrom,
             historical?.valueEditOrder,
             historical?.formulaReferenceBases,
+            historical?.formulaAnchors,
         );
     }
     return hyperlink_only_overlay(base, link, base_link);
@@ -1654,6 +1660,9 @@ function pending_cell_at_overlay(
     const formula_reference_bases = overlay.value.kind === 'present'
         ? overlay.value.formulaReferenceBases
         : persisted?.formulaReferenceBases;
+    const formula_anchors = overlay.value.kind === 'present'
+        ? overlay.value.formulaAnchors
+        : persisted?.formulaAnchors;
     if (
         value.text === ''
         && value.runs === undefined
@@ -1661,6 +1670,7 @@ function pending_cell_at_overlay(
         && value_edit_order === undefined
         && moved_from === undefined
         && formula_reference_bases === undefined
+        && formula_anchors === undefined
     ) return undefined;
     return {
         value: value.text,
@@ -1671,6 +1681,7 @@ function pending_cell_at_overlay(
         ...(formula_reference_bases === undefined ? {} : {
             formulaReferenceBases: formula_reference_bases,
         }),
+        ...(formula_anchors === undefined ? {} : { formulaAnchors: formula_anchors }),
     };
 }
 

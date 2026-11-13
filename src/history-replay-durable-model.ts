@@ -124,7 +124,8 @@ export function entry_from_wire_overlay(
             && dimension.formattingKnown === undefined
             && dimension.movedFrom === undefined
             && dimension.valueEditOrder === undefined
-            && dimension.formulaReferenceBases === undefined;
+            && dimension.formulaReferenceBases === undefined
+            && dimension.formulaAnchors === undefined;
         return plain
             ? { kind: 'legacy', value: dimension.value.text }
             : { kind: 'unrepresentable' };
@@ -150,6 +151,7 @@ export function entry_from_wire_overlay(
             movedFrom: dimension.movedFrom,
             valueEditOrder: dimension.valueEditOrder,
             formulaReferenceBases: dimension.formulaReferenceBases,
+            formulaAnchors: dimension.formulaAnchors,
         } : {},
     );
     return { kind: 'entry', entry };

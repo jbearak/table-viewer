@@ -48,6 +48,7 @@ import {
     type PendingFormulaReferenceBasis,
     type RowIdentity,
 } from '../pending-changes';
+import type { FormulaAnchors } from '../formula-anchors';
 import {
     dirty_entry_value_dimension_present,
     make_dirty_entry,
@@ -125,6 +126,7 @@ export interface PresentValueDimension {
     readonly movedFrom?: CsvDirtyEntry['movedFrom'];
     readonly valueEditOrder?: number;
     readonly formulaReferenceBases?: readonly PendingFormulaReferenceBasis[];
+    readonly formulaAnchors?: FormulaAnchors;
 }
 
 export type OverlayValueDimension = UntouchedValueDimension | PresentValueDimension;
@@ -194,6 +196,7 @@ export function value_only_overlay(
     moved_from?: CsvDirtyEntry['movedFrom'],
     value_edit_order?: number,
     formula_reference_bases?: readonly PendingFormulaReferenceBasis[],
+    formula_anchors?: FormulaAnchors,
 ): PresentCellOverlayState {
     return {
         kind: 'present',
@@ -210,6 +213,7 @@ export function value_only_overlay(
             ...(formula_reference_bases === undefined
                 ? {}
                 : { formulaReferenceBases: formula_reference_bases }),
+            ...(formula_anchors === undefined ? {} : { formulaAnchors: formula_anchors }),
         },
         hyperlink: { kind: 'untouched' },
     };
@@ -239,6 +243,7 @@ export function combined_overlay(
     moved_from?: CsvDirtyEntry['movedFrom'],
     value_edit_order?: number,
     formula_reference_bases?: readonly PendingFormulaReferenceBasis[],
+    formula_anchors?: FormulaAnchors,
 ): PresentCellOverlayState {
     return {
         kind: 'present',
@@ -255,6 +260,7 @@ export function combined_overlay(
             ...(formula_reference_bases === undefined
                 ? {}
                 : { formulaReferenceBases: formula_reference_bases }),
+            ...(formula_anchors === undefined ? {} : { formulaAnchors: formula_anchors }),
         },
         hyperlink: { kind: 'present', value: hyperlink, base: base_hyperlink },
     };
@@ -307,6 +313,7 @@ export function overlay_state_from_dirty_entry(
         && entry.movedFrom === undefined
         && entry.valueEditOrder === undefined
         && entry.formulaReferenceBases === undefined
+        && entry.formulaAnchors === undefined
         && (
             value_intent === 'link-only'
             || !dirty_entry_value_dimension_present(entry)
@@ -328,6 +335,7 @@ export function overlay_state_from_dirty_entry(
             entry.movedFrom,
             entry.valueEditOrder,
             entry.formulaReferenceBases,
+            entry.formulaAnchors,
         );
     }
     return value_only_overlay(
@@ -340,6 +348,7 @@ export function overlay_state_from_dirty_entry(
         entry.movedFrom,
         entry.valueEditOrder,
         entry.formulaReferenceBases,
+        entry.formulaAnchors,
     );
 }
 
@@ -363,6 +372,7 @@ export function dirty_entry_from_overlay_state(
             movedFrom: state.value.movedFrom,
             valueEditOrder: state.value.valueEditOrder,
             formulaReferenceBases: state.value.formulaReferenceBases,
+            formulaAnchors: state.value.formulaAnchors,
         } : {},
     );
     const base_pending = state.value.kind === 'present' && state.value.basePending;
@@ -393,6 +403,8 @@ function value_dimensions_equal(
         && left.valueEditOrder === right.valueEditOrder
         && JSON.stringify(left.formulaReferenceBases ?? [])
             === JSON.stringify(right.formulaReferenceBases ?? [])
+        && JSON.stringify(left.formulaAnchors ?? null)
+            === JSON.stringify(right.formulaAnchors ?? null)
         && history_values_equal(left.value, right.value)
         && history_values_equal(left.base, right.base);
 }
@@ -617,6 +629,8 @@ function value_metadata_moved(before: CellOverlayState, after: CellOverlayState)
         || left.valueEditOrder !== right.valueEditOrder
         || JSON.stringify(left.formulaReferenceBases ?? [])
             !== JSON.stringify(right.formulaReferenceBases ?? [])
+        || JSON.stringify(left.formulaAnchors ?? null)
+            !== JSON.stringify(right.formulaAnchors ?? null)
         || !history_values_equal(left.base, right.base);
 }
 
@@ -972,6 +986,9 @@ function copy_overlay(
             ...(value.valueEditOrder === undefined ? {} : { valueEditOrder: value.valueEditOrder }),
             ...(value.formulaReferenceBases === undefined ? {} : {
                 formulaReferenceBases: value.formulaReferenceBases.map((basis) => ({ ...basis })),
+            }),
+            ...(value.formulaAnchors === undefined ? {} : {
+                formulaAnchors: structuredClone(value.formulaAnchors),
             }),
         }
         : { kind: 'untouched', anchor: value_of(value.anchor) };

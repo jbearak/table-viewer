@@ -385,7 +385,8 @@ export function wire_entry_for_destination(
         && entry.formattingKnown === undefined
         && entry.movedFrom === undefined
         && entry.valueEditOrder === undefined
-        && entry.formulaReferenceBases === undefined;
+        && entry.formulaReferenceBases === undefined
+        && entry.formulaAnchors === undefined;
     return plain ? entry.value : undefined;
 }
 
