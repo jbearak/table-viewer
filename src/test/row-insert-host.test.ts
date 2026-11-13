@@ -112,6 +112,7 @@ async function open_viewer(options: {
     readonly bytes?: Uint8Array;
     readonly structuralEditingEnabled?: boolean;
     readonly path?: string;
+    readonly profile?: ReturnType<typeof csv_table_profile>;
 } = {}) {
     const file = { bytes: options.bytes ?? BYTES, mtime: 1, hang_write: false, hung: false };
     vscode_mock.__setStatImplementation(async () => ({ size: file.bytes.length, mtime: file.mtime }));
@@ -138,7 +139,7 @@ async function open_viewer(options: {
                 return state.store.read(file_path);
             },
         }),
-        csv_table_profile(),
+        options.profile ?? csv_table_profile(),
         fake_viewer_host,
         { structuralEditingEnabled: options.structuralEditingEnabled ?? true },
     );
@@ -462,6 +463,29 @@ describe('insert admission', () => {
         const reply = await viewer.insert({ requestId: 'basis' });
         expect(reply.granted).toBe(false);
         expect(reply.reason).toContain('changed on disk after you inserted, deleted, or moved rows or columns');
+        await viewer.dispose();
+    });
+});
+
+describe('append admission under a row layout', () => {
+    it('counts rows with the layout: deleted rows leave, so an append up to the ceiling is granted', async () => {
+        // Three body rows and a three-row ceiling: delete two, then append two.
+        // The old count kept the deleted rows (3 + 2 > 3) and refused.
+        const viewer = await open_viewer({ profile: { ...csv_table_profile(), append_row_ceiling: 3 } });
+        expect(await viewer.publish({
+            rowLayout: {
+                runs: [{ kind: 'source', start: 0, count: 3 }],
+                removedSourceRows: [{ start: 0, count: 2 }],
+                discardedPendingRows: [],
+            },
+            structuralBasis: BASIS,
+        })).toBe(true);
+        const granted = await viewer.append('append-two', 2);
+        expect(granted.granted).toBe(true);
+        await viewer.settle('append-two', false);
+        // One more would pass the ceiling: one live body row plus three appended.
+        const refused = await viewer.append('append-three', 3);
+        expect(refused.granted).toBe(false);
         await viewer.dispose();
     });
 });

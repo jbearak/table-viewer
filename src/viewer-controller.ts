@@ -2813,6 +2813,40 @@ function layout_row_count(sheet: SheetMeta, row_layout: RowLayout, band: number)
         + index_row_layout(row_layout).liveCount + band;
 }
 
+/**
+ * The append band `layout_row_count` counts: the stored appended rows plus
+ * every reserved ID the ledger did not mint as an insert.
+ */
+function reserved_band_size(
+    durable: { readonly appendedRows?: readonly PendingAppendedRow[] } | undefined,
+    ledger: { readonly reservedRowIds: ReadonlyMap<string, unknown>; readonly insertMintedRowIds: ReadonlySet<string> },
+): number {
+    const band = new Set(appended_rows(durable).map((row) => row.id));
+    for (const [id] of ledger.reservedRowIds) {
+        if (!ledger.insertMintedRowIds.has(id)) band.add(id);
+    }
+    return band.size;
+}
+
+/**
+ * Rows a worksheet would have once `additions` more appended rows join it:
+ * without a row layout, the source rows less Pending Tail Removals plus the
+ * `pending_count` rows already pending; with one, `layout_row_count`, which
+ * leaves removed rows out and so agrees with insert admission and
+ * publication.
+ */
+function admitted_row_count(
+    sheet: SheetMeta,
+    durable: Pick<WorksheetPendingEdits, 'appendedRows' | 'tailRemovals' | 'rowLayout'> | undefined,
+    ledger: { readonly reservedRowIds: ReadonlyMap<string, unknown>; readonly insertMintedRowIds: ReadonlySet<string> },
+    pending_count: number,
+    additions: number,
+): number {
+    return durable?.rowLayout === undefined
+        ? sheet.sourceRowCount - (durable?.tailRemovals?.length ?? 0) + pending_count + additions
+        : layout_row_count(sheet, durable.rowLayout, reserved_band_size(durable, ledger) + additions);
+}
+
 export function append_row_ceiling_for(profile: ViewerProfile): number {
     return profile.append_row_ceiling ?? MAX_SHEET_ROWS;
 }
@@ -9953,10 +9987,15 @@ export function attach_viewer(
             await refuse(`A worksheet may keep at most ${MAX_PENDING_APPENDED_ROWS.toLocaleString('en-US')} pending rows.`);
             return;
         }
-        const prospective_rows = sheet.sourceRowCount
-            - (durable?.tailRemovals?.length ?? 0)
-            + admitted_ids.size
-            + message.count;
+        // With a row layout, count rows the way insert admission and
+        // publication do: removals leave, and the band follows the layout.
+        const prospective_rows = admitted_row_count(
+            sheet,
+            durable,
+            ledger,
+            admitted_ids.size,
+            message.count,
+        );
         if (prospective_rows > append_row_ceiling_for(profile)) {
             await refuse('Appending these rows would exceed the worksheet row limit.');
             return;
@@ -10371,11 +10410,11 @@ export function attach_viewer(
             await refuse(TOO_MANY_ROW_RUNS_MESSAGE);
             return;
         }
-        const reserved_band = new Set(appended_rows(durable).map((row) => row.id));
-        for (const [id] of ledger.reservedRowIds) {
-            if (!ledger.insertMintedRowIds.has(id)) reserved_band.add(id);
-        }
-        const prospective_rows = layout_row_count(sheet, row_layout, reserved_band.size + message.count);
+        const prospective_rows = layout_row_count(
+            sheet,
+            row_layout,
+            reserved_band_size(durable, ledger) + message.count,
+        );
         const row_ceiling = append_row_ceiling_for(profile);
         if (prospective_rows > row_ceiling) {
             await refuse(`Can't insert rows here: the sheet would have more than ${row_ceiling.toLocaleString('en-US')} rows.`);
@@ -10465,7 +10504,7 @@ export function attach_viewer(
             provisionalRowCount: Math.max(
                 durable?.appendBasis?.provisionalRowCount ?? 0,
                 provisional_ledger_basis?.provisionalRowCount ?? 0,
-                reserved_band.size,
+                reserved_band_size(durable, ledger),
             ),
             columnCount: sheet.columnCount,
             schemaFingerprint,
@@ -11033,9 +11072,13 @@ export function attach_viewer(
         if (
             ids.some((id) => current_ids.has(id) && !ledger.ownedRowIds.has(id))
             || current_ids.size + requested_additions.length > MAX_PENDING_APPENDED_ROWS
-            || sheet.sourceRowCount - (durable?.tailRemovals?.length ?? 0)
-                + current_ids.size + requested_additions.length
-                > append_row_ceiling_for(profile)
+            || admitted_row_count(
+                sheet,
+                durable,
+                ledger,
+                current_ids.size,
+                requested_additions.length,
+            ) > append_row_ceiling_for(profile)
         ) {
             await refuse('Restoring these rows would exceed the worksheet row limit.');
             return;
