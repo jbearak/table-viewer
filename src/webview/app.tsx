@@ -105,7 +105,17 @@ import {
     MAX_WORKBOOK_FORMULAS,
     UNBOUNDED_SHEET_ROWS,
 } from '../spreadsheet-safety';
-import { referenced_pending_ids } from '../formula-anchor-layout';
+import { prospective_cell_at, referenced_pending_ids } from '../formula-anchor-layout';
+import {
+    divergence_cell_label,
+    divergence_groups,
+    divergence_summary_text,
+    renamed_source_columns,
+    structure_counts_text,
+    worksheet_needs_structure_review,
+    worksheet_structure_counts,
+} from './structural-review-model';
+import type { FormulaDivergenceReview } from '../formula-divergence-review';
 import {
     layout_affected_formula_cells,
     needs_prospective_formula_request,
@@ -160,6 +170,7 @@ import {
     type HighlightSelectionHandle,
     type PendingPreviewScroll,
     type PendingHostGesture,
+    type CellFocus,
     type PendingRowFocus,
     type SavedRowFocus,
 } from './grid-shell';
@@ -1876,6 +1887,117 @@ export function App(): React.JSX.Element {
         // eslint-disable-next-line react-hooks/exhaustive-deps
         [formula_graph_key],
     );
+    // Review Changes for row and column structure: the worksheets Save will
+    // restructure, their counts, and the formulas that might render
+    // differently from Excel. The section stays collapsed until asked, and
+    // only then are counts and the host's divergence review computed.
+    const structure_review_sheets = useMemo(() => {
+        if (!meta || !edit_mode_on_active_sheet || structural_editing === undefined) return [];
+        const pending_by_sheet = new Map(edit_session_registry_ref.current!.pending_entries());
+        return meta.sheets.flatMap((sheet, sheetIndex) => {
+            const changes = pending_by_sheet.get(sheetIndex)?.snapshot();
+            return changes !== undefined && worksheet_needs_structure_review(changes)
+                ? [{ sheetIndex, name: sheet.name, changes }]
+                : [];
+        });
+    },
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+        [formula_roots_projection.structuralRevision, meta, structural_editing, edit_mode_on_active_sheet],
+    );
+    const [structure_review_open, set_structure_review_open] = useState(false);
+    const structure_review_counts = useMemo(() => {
+        if (!structure_review_open || !meta) return [];
+        return structure_review_sheets.map(({ sheetIndex, name, changes }) => {
+            const sheet = meta.sheets[sheetIndex]!;
+            const header = sheet.excelFirstRowHeader;
+            const store = edit_session_registry_ref.current!.for_sheet(sheetIndex);
+            const renamed = header?.active === true
+                ? renamed_source_columns(sheet.columnNames, changes, (column) => {
+                    const entry = store.get(`${header.sourceRow ?? 0}:${column}`);
+                    return entry === undefined ? undefined : committed_column_name(entry.value);
+                })
+                : 0;
+            return { sheetIndex, name, text: structure_counts_text(worksheet_structure_counts(changes, renamed)) };
+        });
+    },
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+        [structure_review_open, structure_review_sheets, meta, formula_roots_projection.calculationRevision],
+    );
+    const [formula_divergence, set_formula_divergence] = useState<{
+        readonly key: string;
+        readonly review: FormulaDivergenceReview | null;
+    }>();
+    const formula_divergence_request_ref = useRef<{ readonly requestId: string; readonly key: string }>();
+    const formula_divergence_sequence_ref = useRef(0);
+    const [cell_focus, set_cell_focus] = useState<CellFocus | null>(null);
+    const cell_focus_sequence_ref = useRef(0);
+    /** `handle_sheet_select`, defined below with the sheet tabs. */
+    const handle_sheet_select_ref = useRef<(sheet_index: number) => void>(() => {});
+    const [structure_review_status, set_structure_review_status] = useState('');
+    // Asked only while the section is open, and again only when the
+    // layouts or the edits change: the key is the calculator's own.
+    const formula_divergence_key = structure_review_open
+        && edit_syntax === 'markdown'
+        && prospective_formula_state !== undefined
+        && structure_review_sheets.length > 0
+        ? `${load_epoch}:${source_generation_ref.current}:${formula_calculation_edit_signature}`
+        : undefined;
+    useEffect(() => {
+        if (formula_divergence_key === undefined || prospective_formula_state === undefined) {
+            formula_divergence_request_ref.current = undefined;
+            return;
+        }
+        if (formula_divergence?.key === formula_divergence_key) return;
+        formula_divergence_sequence_ref.current += 1;
+        const requestId = `formula-divergence:${load_epoch}:${formula_divergence_sequence_ref.current}`;
+        formula_divergence_request_ref.current = { requestId, key: formula_divergence_key };
+        host_bridge.postMessage({
+            type: 'requestFormulaDivergence',
+            requestId,
+            sourceGeneration: source_generation_ref.current,
+            edits: formula_calculation_edits,
+            layouts: prospective_formula_state.layouts,
+        });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [formula_divergence_key]);
+    useEffect(() => {
+        const on_message = (event: MessageEvent) => {
+            const msg = event.data as HostMessage;
+            if (msg.type !== 'formulaDivergence') return;
+            const active = formula_divergence_request_ref.current;
+            if (active === undefined || active.requestId !== msg.requestId) return;
+            if (msg.sourceGeneration !== source_generation_ref.current) return;
+            formula_divergence_request_ref.current = undefined;
+            set_formula_divergence({ key: active.key, review: msg.review });
+        };
+        window.addEventListener('message', on_message);
+        return () => window.removeEventListener('message', on_message);
+    }, []);
+    const current_formula_divergence = formula_divergence !== undefined
+        && formula_divergence.key === formula_divergence_key
+        ? formula_divergence.review
+        : undefined;
+    /** Review Changes' Go to cell: select a formula's prospective cell, on its own sheet. */
+    const go_to_prospective_cell = useCallback((sheet_index: number, row: number, column: number) => {
+        const worksheet = formula_anchor_workbook?.worksheets[sheet_index];
+        const cell = worksheet === undefined ? undefined : prospective_cell_at(worksheet, row, column);
+        if (cell === undefined) {
+            set_structure_review_status('That cell is not available in the current view.');
+            return;
+        }
+        set_structure_review_status('');
+        set_cell_focus({
+            sequence: ++cell_focus_sequence_ref.current,
+            sheetIndex: sheet_index,
+            row: cell.row.kind === 'fixed' ? { kind: 'source', sourceRow: cell.row.sourceRow } : cell.row,
+            column: cell.column,
+        });
+        if (sheet_index !== active_sheet_index) handle_sheet_select_ref.current(sheet_index);
+    }, [active_sheet_index, formula_anchor_workbook]);
+    const handle_cell_focus_applied = useCallback((sequence: number, visible: boolean) => {
+        set_cell_focus((current) => current?.sequence === sequence ? null : current);
+        if (!visible) set_structure_review_status('That cell is not available in the current view.');
+    }, []);
     const source_has_formula_work = (meta?.sheets ?? []).some((sheet) =>
         (sheet.formulaCells?.length ?? 0) > 0
         || (sheet.pendingFormulaCells?.length ?? 0) > 0
@@ -5173,6 +5295,8 @@ export function App(): React.JSX.Element {
         },
         [cancel_external_change_navigation, persist_immediate]
     );
+
+    handle_sheet_select_ref.current = handle_sheet_select;
 
     useLayoutEffect(() => {
         const pending = rejected_sheet_grid_focus_ref.current;
@@ -8861,6 +8985,8 @@ export function App(): React.JSX.Element {
             on_saved_row_focus_applied={handle_saved_row_focus_applied}
             pending_row_focus={pending_row_focus}
             on_pending_row_focus_applied={handle_pending_row_focus_applied}
+            cell_focus={cell_focus}
+            on_cell_focus_applied={handle_cell_focus_applied}
             column_widths={column_widths[active_sheet_index] ?? {}}
             on_column_resize={handle_column_resize}
             // The host's display-keyed projection for this sheet — never `{}` under a
@@ -9232,6 +9358,104 @@ export function App(): React.JSX.Element {
                             <li key={message}>{message}</li>
                         ))}
                     </ul>
+                </section>
+            )}
+            {structure_review_sheets.length > 0 && (
+                // Review Changes' row and column list (design "Saving and
+                // discarding"): what Save will insert, delete, move, or rename
+                // on each worksheet, and every formula whose range might
+                // render differently from Excel ("Where this differs from
+                // Excel"), with Go to cell.
+                <section
+                    className="external-change-review structure-review"
+                    aria-label="Row and column changes"
+                >
+                    <div className="external-change-review-header">
+                        <h2>Row and column changes</h2>
+                        <button
+                            aria-expanded={structure_review_open}
+                            aria-controls="structure-review-details"
+                            onClick={() => {
+                                set_structure_review_open((open) => !open);
+                                set_structure_review_status('');
+                            }}
+                        >
+                            {structure_review_open ? 'Hide' : 'Review changes'}
+                        </button>
+                    </div>
+                    {!structure_review_open && (
+                        <p>
+                            {`Save will insert, delete, or move rows or columns on ${
+                                structure_review_sheets.map(({ name }) => name).join(', ')}.`}
+                        </p>
+                    )}
+                    {structure_review_open && (
+                        <div id="structure-review-details">
+                            <ul className="external-change-list">
+                                {structure_review_counts.map(({ sheetIndex, name, text }) => {
+                                    const groups = current_formula_divergence
+                                        ? divergence_groups(current_formula_divergence.items, sheetIndex)
+                                        : [];
+                                    const flagged = current_formula_divergence?.counts
+                                        .find((entry) => entry.targetSheetIndex === sheetIndex)?.formulas ?? 0;
+                                    const listed = new Set(groups.flatMap((group) => group.items));
+                                    const axes = new Set([...listed].flatMap((item) => item.axes));
+                                    return (
+                                        <li key={sheetIndex}>
+                                            <h3>{name}</h3>
+                                            <p>{text}</p>
+                                            {formula_divergence_key !== undefined
+                                                && current_formula_divergence === undefined && (
+                                                <p role="status">Checking formulas…</p>
+                                            )}
+                                            {current_formula_divergence === null && (
+                                                <p>Table Viewer couldn't check the formulas on this sheet.</p>
+                                            )}
+                                            {flagged > 0 && (
+                                                <>
+                                                    <p>{divergence_summary_text(flagged, axes)}</p>
+                                                    {flagged > listed.size && (
+                                                        <p>{`Showing the first ${listed.size.toLocaleString('en-US')}.`}</p>
+                                                    )}
+                                                    {groups.map((group) => (
+                                                        <div key={group.divergenceClass} className="structure-review-group">
+                                                            <h4>{group.heading}</h4>
+                                                            <ul className="structure-review-formulas">
+                                                                {group.items.map((item) => {
+                                                                    const location = divergence_cell_label(
+                                                                        meta?.sheets[item.sheetIndex]?.name ?? '',
+                                                                        item.row,
+                                                                        item.column,
+                                                                    );
+                                                                    return (
+                                                                        <li key={location}>
+                                                                            <span>{location}</span>
+                                                                            <code>{item.formula}</code>
+                                                                            <button
+                                                                                aria-label={`Go to ${location}`}
+                                                                                onClick={() => go_to_prospective_cell(
+                                                                                    item.sheetIndex,
+                                                                                    item.row,
+                                                                                    item.column,
+                                                                                )}
+                                                                            >
+                                                                                Go to cell
+                                                                            </button>
+                                                                        </li>
+                                                                    );
+                                                                })}
+                                                            </ul>
+                                                        </div>
+                                                    ))}
+                                                </>
+                                            )}
+                                        </li>
+                                    );
+                                })}
+                            </ul>
+                            <p className="external-change-review-status" role="status">{structure_review_status}</p>
+                        </div>
+                    )}
                 </section>
             )}
             {show_structural_conflicts && (

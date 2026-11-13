@@ -593,6 +593,7 @@ import {
     type PendingRowProjection,
 } from './pending-row-projection';
 import {
+    column_identities_equal,
     column_identity_key,
     header_body_start,
     index_column_layout,
@@ -1252,6 +1253,17 @@ export interface SavedRowFocus {
     readonly restoreFocus: boolean;
 }
 
+/**
+ * One-shot selection of a cell by row and column identity, such as Review
+ * Changes' Go to cell, applied once this sheet's grid can place it.
+ */
+export interface CellFocus {
+    readonly sequence: number;
+    readonly sheetIndex: number;
+    readonly row: RowIdentity;
+    readonly column: ColumnIdentity;
+}
+
 /** One-shot stable pending-row cursor restoration across a GridShell remount. */
 export interface PendingRowFocus {
     readonly sequence: number;
@@ -1529,6 +1541,9 @@ export interface GridShellProps {
     /** Stable pending-row cursor captured before a source-refresh remount. */
     pending_row_focus?: PendingRowFocus | null;
     on_pending_row_focus_applied?: (sequence: number, visible: boolean) => void;
+    /** A cell to select by identity; `visible` is false when this view cannot show it. */
+    cell_focus?: CellFocus | null;
+    on_cell_focus_applied?: (sequence: number, visible: boolean) => void;
     /**
      * This sheet's mapping generation, for checking a host-resolved focus against
      * the view actually installed. A projection resolved against a mapping that
@@ -1643,6 +1658,8 @@ export function GridShell({
     on_saved_row_focus_applied = () => {},
     pending_row_focus = null,
     on_pending_row_focus_applied = () => {},
+    cell_focus = null,
+    on_cell_focus_applied = () => {},
     mapping_generation = 1,
     pending_preview_scroll = null,
     on_preview_scroll_applied = () => {},
@@ -4384,6 +4401,41 @@ export function GridShell({
         sheet_meta.sourceRowCount,
         source_generation,
         transform_pending,
+    ]);
+    const applied_cell_focus_ref = useRef<number | null>(null);
+    useLayoutEffect(() => {
+        if (cell_focus === null || cell_focus.sheetIndex !== sheet_index) return;
+        if (applied_cell_focus_ref.current === cell_focus.sequence) return;
+        applied_cell_focus_ref.current = cell_focus.sequence;
+        const sequence = cell_focus.sequence;
+        const { row, column } = cell_focus;
+        // A source cell may be on a page not loaded yet: the source path loads it.
+        if (row.kind === 'source' && column.kind === 'source') {
+            void reveal_source_cell(row.sourceRow, column.sourceColumn).then((visible) => {
+                on_cell_focus_applied(sequence, visible);
+            });
+            return;
+        }
+        const display_row = pending_projection.display_row_for_identity(row);
+        const display_column = projected_columns.findIndex((projected) =>
+            column_identities_equal(projected.identity, column));
+        if (display_row === undefined || display_column < 0) {
+            focus_grid();
+            on_cell_focus_applied(sequence, false);
+            return;
+        }
+        select_active_display_cell([display_column, display_row]);
+        focus_grid();
+        on_cell_focus_applied(sequence, true);
+    }, [
+        cell_focus,
+        focus_grid,
+        on_cell_focus_applied,
+        pending_projection,
+        projected_columns,
+        reveal_source_cell,
+        select_active_display_cell,
+        sheet_index,
     ]);
     const applied_pending_row_focus_ref = useRef<number | null>(null);
     useLayoutEffect(() => {
