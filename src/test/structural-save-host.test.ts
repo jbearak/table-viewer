@@ -796,6 +796,35 @@ describe('rekey intent ownership across processes', () => {
     });
 });
 
+describe('a save outliving its panel', () => {
+    it('keeps renewing its lease while the write is still pending', async () => {
+        const drive = disk(BYTES);
+        const state = store_with({ pendingEdits: slot(REMOVAL) });
+        const viewer = await open_viewer({ state, disk: drive, structuralSaveLeaseMs: 300 });
+        let finish_write!: () => void;
+        drive.file.write = (content) => new Promise<void>((resolve) => {
+            finish_write = () => {
+                drive.file.bytes = content;
+                drive.file.mtime += 1;
+                resolve();
+            };
+        });
+        void viewer.send_save(REMOVAL);
+        await vi.waitFor(() => expect(drive.file.writes).toHaveLength(1));
+        const owner = () => (state.get_state(FILE) as PerFileState).structuralRekeyIntent?.owner;
+        const first = owner()!.leaseExpiresAtMs;
+        viewer.panel.dispose();
+        // Past the original expiry, the lease is still being renewed.
+        await vi.waitFor(() => expect(owner()?.leaseExpiresAtMs).toBeGreaterThan(first + 300), { timeout: 3_000 });
+        expect(owner()!.leaseExpiresAtMs).toBeGreaterThan(Date.now());
+        finish_write();
+        await viewer.controller.drain();
+        // The write landed after the panel closed; the intent waits for the next load.
+        expect(dec.decode(drive.file.bytes)).toBe('h\na\nc\n');
+        expect((state.get_state(FILE) as PerFileState).structuralRekeyIntent?.afterDigest).toBe(hex(SAVED));
+    });
+});
+
 describe('recovery after the write', () => {
     it('keeps the intent stored when the panel closes during the write', async () => {
         const drive = disk(BYTES);

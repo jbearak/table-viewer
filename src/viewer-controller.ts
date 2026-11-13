@@ -4611,13 +4611,15 @@ export function attach_viewer(
     /**
      * Keep renewing a running save's intent lease, so another process sharing
      * this state never mistakes it for an interrupted one. Answers a stop.
+     * Independent of the panel: a write still pending after the panel closes
+     * keeps its lease until `handle_save` settles and stops it.
      */
     function renew_structural_save_lease(save_id: string): () => void {
         let stopped = false;
         let handle: unknown;
         const schedule = (): void => {
             handle = scheduler.setTimeout(() => {
-                if (stopped || disposed) return;
+                if (stopped) return;
                 void update_file_state((current) => {
                     const intent = current.structuralRekeyIntent;
                     if (stopped || intent?.saveId !== save_id) return current;
@@ -4631,7 +4633,7 @@ export function attach_viewer(
                 }, undefined, undefined, null).catch((error) => {
                     log_sanitized_failure('Could not renew a structural save lease', error);
                 }).finally(() => {
-                    if (!stopped && !disposed) schedule();
+                    if (!stopped) schedule();
                 });
             }, Math.max(1, Math.floor(structural_save_lease_ms / 3)));
         };
