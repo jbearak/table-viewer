@@ -1,0 +1,263 @@
+// Shared helpers for the structural-editing smoke specs (row and column
+// structure design, "Integration and desktop smoke").
+//
+// Structural editing ships behind `STRUCTURAL_EDITING_ENABLED`. These specs turn
+// it on through `TABLE_VIEWER_TEST_STRUCTURAL_EDITING`, which main.ts honors only
+// for an unpackaged app on an isolated user-data directory.
+//
+// The grid is a canvas, so the helpers aim at row markers and column headers by
+// coordinate, then confirm the target through something the grid reports in the
+// DOM: the context menu's accessible name, a row's accessibility label, or a
+// header's text. Every wait polls; none sleeps.
+import * as fs from 'fs';
+import * as path from 'path';
+import { expect } from '@playwright/test';
+import type { ElectronApplication, Locator, Page } from '@playwright/test';
+import { CHANNEL_WEBVIEW_MESSAGE } from '../shared/ipc';
+import { history_menu_item, type HistoryMenuState } from '../main/history-menu-model';
+import { launch_app } from './smoke-helpers';
+
+export const STRUCTURAL_EDITING_ENV = { TABLE_VIEWER_TEST_STRUCTURAL_EDITING: '1' };
+
+const VIEWER_URL_PREFIX = 'tv-app://viewer';
+const GRID_CANVAS = '[data-testid="data-grid-canvas"]';
+
+// Glide's default header height and the app's default row height and column
+// width at the default font size. The row marker is 32 px wide below 100 rows.
+const HEADER_HEIGHT_PX = 36;
+const ROW_HEIGHT_PX = 24;
+const ROW_MARKER_WIDTH_PX = 32;
+const COLUMN_WIDTH_PX = 120;
+
+/** Where proof screenshots go, when the caller asks for them. Unset in CI. */
+const SCREENSHOT_DIR = process.env.TABLE_VIEWER_SMOKE_SCREENSHOTS;
+
+export async function save_screenshot(page: Page, name: string): Promise<void> {
+    if (!SCREENSHOT_DIR) return;
+    fs.mkdirSync(SCREENSHOT_DIR, { recursive: true });
+    await page.screenshot({ path: path.join(SCREENSHOT_DIR, `${name}.png`) });
+}
+
+/** Launch with structural editing on and return the app and its one viewer. */
+export async function launch_structural_viewer(
+    user_data_dir: string,
+    file: string,
+): Promise<{ app: ElectronApplication; page: Page }> {
+    const app = await launch_app(user_data_dir, [file], STRUCTURAL_EDITING_ENV);
+    const pages = () => app.windows().filter((page) => page.url().startsWith(VIEWER_URL_PREFIX));
+    await expect.poll(() => pages().length, { timeout: 30_000 }).toBe(1);
+    const page = pages()[0];
+    await page.locator(GRID_CANVAS).first().waitFor({ state: 'visible' });
+    return { app, page };
+}
+
+export async function viewer_count(app: ElectronApplication): Promise<number> {
+    return app.windows().filter((page) => page.url().startsWith(VIEWER_URL_PREFIX)).length;
+}
+
+/** Quit and wait for the process to be gone. */
+export async function exit_app(app: ElectronApplication): Promise<void> {
+    const process_handle = app.process();
+    await app.evaluate(({ app: electron_app }) => electron_app.quit()).catch(() => {});
+    await expect
+        .poll(() => process_handle.exitCode !== null || process_handle.signalCode !== null,
+            { timeout: 30_000 })
+        .toBe(true);
+    await app.close().catch(() => {});
+}
+
+export interface CapturedDialog {
+    readonly message?: string;
+    readonly buttons?: readonly string[];
+}
+
+/** Answer every message box with its first button and record it. */
+export async function install_dialog_capture(app: ElectronApplication): Promise<void> {
+    await app.evaluate(({ dialog }) => {
+        const main = globalThis as typeof globalThis & {
+            __tableViewerSmokeDialogs?: Array<{ message?: string; buttons?: readonly string[] }>;
+        };
+        main.__tableViewerSmokeDialogs = [];
+        const replacement = async (...args: unknown[]) => {
+            const options = (args.length === 1 ? args[0] : args[1]) as {
+                message?: string;
+                buttons?: readonly string[];
+            };
+            main.__tableViewerSmokeDialogs?.push({
+                message: options.message,
+                buttons: options.buttons,
+            });
+            return { response: 0, checkboxChecked: false };
+        };
+        dialog.showMessageBox = replacement as typeof dialog.showMessageBox;
+    });
+}
+
+export async function take_dialogs(app: ElectronApplication): Promise<CapturedDialog[]> {
+    return app.evaluate(() => {
+        const main = globalThis as typeof globalThis & {
+            __tableViewerSmokeDialogs?: CapturedDialog[];
+        };
+        return main.__tableViewerSmokeDialogs?.splice(0) ?? [];
+    });
+}
+
+/**
+ * Record the history state each viewer reports for the Edit menu.
+ *
+ * The application menu is rebuilt only for the focused window, and a launch
+ * from a terminal or a CI runner is not guaranteed focus. So instead of
+ * reading the native menu, this listens on the same channel main.ts does and
+ * keeps the latest `historyMenuStateChanged`; `undo_menu_label` then runs it
+ * through the menu's own label rule. desktop-smoke.spec.ts covers the native
+ * menu rebuild itself.
+ */
+export async function install_history_menu_capture(app: ElectronApplication): Promise<void> {
+    await app.evaluate(({ ipcMain }, channel) => {
+        const main = globalThis as typeof globalThis & { __tableViewerSmokeHistory?: unknown };
+        ipcMain.on(channel, (_event, envelope: { message?: { type?: string; state?: unknown } }) => {
+            if (envelope?.message?.type === 'historyMenuStateChanged') {
+                main.__tableViewerSmokeHistory = envelope.message.state;
+            }
+        });
+    }, CHANNEL_WEBVIEW_MESSAGE);
+}
+
+/** What the Edit menu's Undo item reads for the viewer's latest history. */
+export async function undo_menu_label(app: ElectronApplication): Promise<string> {
+    const state = await app.evaluate(() => (globalThis as typeof globalThis & {
+        __tableViewerSmokeHistory?: unknown;
+    }).__tableViewerSmokeHistory) as HistoryMenuState | undefined;
+    return history_menu_item('undo', state).label;
+}
+
+export function edit_toggle(page: Page): Locator {
+    return page.getByRole('button', { name: 'Edit' });
+}
+
+export async function enter_edit_mode(page: Page): Promise<void> {
+    const toggle = edit_toggle(page);
+    await toggle.click();
+    await expect(toggle).toHaveAttribute('aria-pressed', 'true');
+    // The accessibility rows mount after the toggle flips.
+    await expect.poll(() => page.locator('tbody tr').count(), { timeout: 30_000 })
+        .toBeGreaterThan(0);
+}
+
+/**
+ * Leave Edit mode with Save Edits. The dialog capture answers the first
+ * button, which is Save Edits.
+ */
+export async function leave_edit_mode_saving(app: ElectronApplication, page: Page): Promise<void> {
+    await edit_toggle(page).click();
+    await expect(edit_toggle(page)).toHaveAttribute('aria-pressed', 'false', { timeout: 30_000 });
+    expect(await take_dialogs(app)).toEqual([{
+        message: 'Leave edit mode?',
+        buttons: ['Save Edits', 'Discard Edits', 'Stay in Edit Mode'],
+    }]);
+}
+
+async function canvas_box(page: Page): Promise<{ x: number; y: number }> {
+    const box = await page.locator(GRID_CANVAS).first().boundingBox();
+    if (!box) throw new Error('the grid canvas has no box');
+    return box;
+}
+
+/** The centre of a display row's marker, in page coordinates. */
+export async function row_marker_point(page: Page, row: number): Promise<{ x: number; y: number }> {
+    const box = await canvas_box(page);
+    return {
+        x: box.x + ROW_MARKER_WIDTH_PX / 2,
+        y: box.y + HEADER_HEIGHT_PX + row * ROW_HEIGHT_PX + ROW_HEIGHT_PX / 2,
+    };
+}
+
+/** The centre of a display column's header, assuming default widths. */
+export async function header_point(page: Page, column: number): Promise<{ x: number; y: number }> {
+    const box = await canvas_box(page);
+    return {
+        x: box.x + ROW_MARKER_WIDTH_PX + column * COLUMN_WIDTH_PX + COLUMN_WIDTH_PX / 2,
+        y: box.y + HEADER_HEIGHT_PX / 2,
+    };
+}
+
+function context_menu(page: Page): Locator {
+    return page.locator('[role="menu"]').first();
+}
+
+/** Right-click a row marker and wait for the row menu. */
+export async function open_row_menu(page: Page, row: number): Promise<Locator> {
+    const point = await row_marker_point(page, row);
+    await page.mouse.click(point.x, point.y, { button: 'right' });
+    const menu = context_menu(page);
+    await expect(menu).toHaveAttribute('aria-label', /^Row actions/);
+    return menu;
+}
+
+/** Right-click a column header and wait for its menu. */
+export async function open_column_menu(page: Page, column: number): Promise<Locator> {
+    const point = await header_point(page, column);
+    await page.mouse.click(point.x, point.y, { button: 'right' });
+    const menu = context_menu(page);
+    await expect(menu).toHaveAttribute('aria-label', /^Column actions/);
+    return menu;
+}
+
+export async function choose(menu: Locator, item: string): Promise<void> {
+    const entry = menu.getByRole('menuitem', { name: item, exact: true });
+    await expect(entry).not.toHaveAttribute('aria-disabled', 'true');
+    await entry.click();
+    await expect(menu).toHaveCount(0);
+}
+
+/** A display row's accessible row, which reports whole-row selection. */
+function accessible_row(page: Page, row: number): Locator {
+    // aria-rowindex is 1-based and counts the header row.
+    return page.locator(`tbody tr[aria-rowindex="${row + 2}"]`);
+}
+
+/** Click a row marker, selecting the whole row; with `extend`, Shift+click. */
+export async function select_row(page: Page, row: number, extend = false): Promise<void> {
+    const point = await row_marker_point(page, row);
+    if (extend) await page.keyboard.down('Shift');
+    await page.mouse.click(point.x, point.y);
+    if (extend) await page.keyboard.up('Shift');
+    await expect(accessible_row(page, row)).toHaveAttribute('aria-selected', 'true');
+}
+
+/** Click a column header, selecting the whole column. */
+export async function select_column(page: Page, column: number): Promise<void> {
+    const point = await header_point(page, column);
+    await page.mouse.click(point.x, point.y);
+    await expect(page.locator(`th[aria-colindex="${column + 1}"]`))
+        .toHaveAttribute('aria-selected', 'true');
+}
+
+/** Each accessible body row as `label|cell|cell…`, the label empty for a plain row. */
+export async function grid_rows(page: Page): Promise<string[]> {
+    return page.evaluate(() => [...document.querySelectorAll('tbody tr')].map((row) => [
+        row.getAttribute('aria-label') ?? '',
+        ...[...row.querySelectorAll('td')].map((cell) => cell.textContent ?? ''),
+    ].join('|')));
+}
+
+/** Each accessible column header as `label|text`. */
+export async function grid_headers(page: Page): Promise<string[]> {
+    return page.evaluate(() => [...document.querySelectorAll('thead th')].map((header) =>
+        `${header.getAttribute('aria-label') ?? ''}|${header.textContent ?? ''}`));
+}
+
+/** Type `value` into an accessible grid cell through the cell editor. */
+export async function type_into_cell(page: Page, column: number, row: number, value: string): Promise<void> {
+    const cell = page.locator(`#glide-cell-${column}-${row}`);
+    await expect(cell).toHaveAttribute('aria-readonly', 'false');
+    await cell.focus();
+    await expect(cell).toBeFocused();
+    await page.keyboard.press('Enter');
+    const editor = page.locator('.cell-editor-input');
+    await expect(editor).toBeVisible();
+    await editor.fill(value);
+    await editor.press('Enter');
+    await expect(editor).toBeHidden();
+    await expect(cell).toHaveText(value);
+}

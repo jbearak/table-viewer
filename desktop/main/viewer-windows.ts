@@ -417,6 +417,13 @@ export class ViewerWindowManager {
          * focused window's history.
          */
         private readonly on_history_menu_changed: (window: BrowserWindow) => void = () => {},
+        /**
+         * Test-only: turn structural editing on for every viewer, ahead of
+         * `STRUCTURAL_EDITING_ENABLED`. main.ts sets it only for an unpackaged
+         * app on an isolated user-data directory (see
+         * `structural_editing_smoke_override`).
+         */
+        private readonly structural_editing_enabled?: boolean,
     ) {}
 
     /**
@@ -990,6 +997,9 @@ export class ViewerWindowManager {
                 ...(compare
                     ? { compare: { originalUri: compare.originalPath } }
                     : {}),
+                ...(this.structural_editing_enabled === undefined
+                    ? {}
+                    : { structuralEditingEnabled: this.structural_editing_enabled }),
             },
         );
 

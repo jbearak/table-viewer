@@ -1082,6 +1082,20 @@ export function append_source_rows_to_layout(
     return Object.freeze({ ...layout, runs: Object.freeze(runs) });
 }
 
+/**
+ * The first body source row: one past the active Header Row, or 0 without one.
+ *
+ * An auto-detected Header Row carries no `sourceRow`, because it is always the
+ * first row; only an explicit override names one. Reading a missing
+ * `sourceRow` as "no header" would put the Header Row inside the body layout,
+ * where Delete and Move could reach it.
+ */
+export function header_body_start(
+    header: { readonly active: boolean; readonly sourceRow?: number } | undefined,
+): number {
+    return header?.active === true ? (header.sourceRow ?? 0) + 1 : 0;
+}
+
 /** The source layout of a body: one source run covering it, or none for a header-only sheet. */
 export function source_row_layout(body_start: number, body_row_count: number): RowLayout {
     return freeze_row_layout(

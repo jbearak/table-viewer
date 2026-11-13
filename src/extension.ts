@@ -39,6 +39,9 @@ interface OpenWorkbookAtSheetArguments {
 
 export interface TableViewerExtensionTestApi {
     integrationSession(uri: vscode.Uri): TableViewerIntegrationSession | undefined;
+    /** Override `STRUCTURAL_EDITING_ENABLED` for viewers opened afterwards;
+     *  `undefined` restores the shipped default. */
+    setStructuralEditingEnabled(enabled: boolean | undefined): void;
 }
 
 function open_workbook_at_sheet_arguments(value: unknown): OpenWorkbookAtSheetArguments {
@@ -335,7 +338,11 @@ export async function activate(
         active_runtime = { viewers, disposables, database };
         return extension_test_mode !== undefined
             && context.extensionMode === extension_test_mode
-            ? { integrationSession: (uri) => viewers!.integrationSession(uri) }
+            ? {
+                integrationSession: (uri) => viewers!.integrationSession(uri),
+                setStructuralEditingEnabled: (enabled) =>
+                    viewers!.setStructuralEditingEnabled(enabled),
+            }
             : undefined;
     } catch (error) {
         // Nothing may keep the database open after a failed activation: VS Code

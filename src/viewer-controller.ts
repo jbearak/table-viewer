@@ -243,6 +243,7 @@ import {
 import {
     appended_row_source_row,
     has_live_column_layout_change,
+    header_body_start,
     has_live_row_layout_change,
     index_column_layout,
     index_row_layout,
@@ -1140,10 +1141,7 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
                 ...(sheet.worksheetId === undefined ? {} : { worksheetId: sheet.worksheetId }),
             },
             name: sheet.name,
-            bodyStart: sheet.excelFirstRowHeader?.active === true
-                && sheet.excelFirstRowHeader.sourceRow !== undefined
-                ? sheet.excelFirstRowHeader.sourceRow + 1
-                : 0,
+            bodyStart: header_body_start(sheet.excelFirstRowHeader),
             sourceRowCount: sheet.sourceRowCount,
             sourceColumnCount: sheet.columnCount,
             ...(changes === undefined ? {} : { changes }),
@@ -1348,9 +1346,7 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
         ));
         const header_row = sheet_meta?.excelFirstRowHeader?.sourceRow ?? 0;
         const header_active = sheet_meta?.excelFirstRowHeader?.active === true;
-        const body_start = header_active && sheet_meta.excelFirstRowHeader?.sourceRow !== undefined
-            ? sheet_meta.excelFirstRowHeader.sourceRow + 1
-            : 0;
+        const body_start = header_body_start(sheet_meta?.excelFirstRowHeader);
         // A live layout change: every coordinate below is prospective,
         // addressed through the coordinate map (design "Physical write").
         const structure = has_live_layout_change(structural)
@@ -2813,11 +2809,8 @@ export function csv_table_profile(config?: ConfigPort): ViewerProfile {
  * what admission granted.
  */
 function layout_row_count(sheet: SheetMeta, row_layout: RowLayout, band: number): number {
-    const header = sheet.excelFirstRowHeader;
-    const body_start = header?.active === true && header.sourceRow !== undefined
-        ? header.sourceRow + 1
-        : 0;
-    return body_start + index_row_layout(row_layout).liveCount + band;
+    return header_body_start(sheet.excelFirstRowHeader)
+        + index_row_layout(row_layout).liveCount + band;
 }
 
 export function append_row_ceiling_for(profile: ViewerProfile): number {
@@ -3721,11 +3714,8 @@ export function attach_viewer(
         if (!pending_changes_carry_layout(changes)) return undefined;
         const sheet = source?.meta().sheets[target.sheetIndex];
         if (sheet === undefined) return 'layout-worksheet-unresolved';
-        const header = sheet.excelFirstRowHeader;
         const error = pending_structure_error(changes, cells, {
-            bodyStart: header?.active === true && header.sourceRow !== undefined
-                ? header.sourceRow + 1
-                : 0,
+            bodyStart: header_body_start(sheet.excelFirstRowHeader),
             sourceRowCount: changes.structuralBasis?.sourceRowCount ?? sheet.sourceRowCount,
             sourceColumnCount: changes.structuralBasis?.sourceColumnCount ?? sheet.columnCount,
             mintedAsInsert: (id) => minted_as_insert(target, id, ledger),
@@ -10278,10 +10268,7 @@ export function attach_viewer(
             await refuse('This worksheet has no columns to insert into.');
             return;
         }
-        const header = sheet.excelFirstRowHeader;
-        const body_start = header?.active === true && header.sourceRow !== undefined
-            ? header.sourceRow + 1
-            : 0;
+        const body_start = header_body_start(sheet.excelFirstRowHeader);
         const anchor = sanitized_insert_anchor(message.anchor);
         if (
             anchor === undefined
