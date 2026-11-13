@@ -1147,7 +1147,7 @@ export function App(): React.JSX.Element {
                 sheetName: sheet.name,
                 ...(sheet.worksheetId === undefined ? {} : { worksheetId: sheet.worksheetId }),
             },
-            bodyStart: header?.active === true && header.sourceRow !== undefined ? header.sourceRow + 1 : 0,
+            bodyStart: header_body_start(header),
             sourceRowCount: sheet.sourceRowCount,
             sourceColumnCount: sheet.columnCount,
             bodyViewTransformed: false,
