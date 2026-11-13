@@ -4579,6 +4579,17 @@ export function attach_viewer(
     let unresolved_structural_sheet_names: ReadonlySet<string> = new Set();
     /** Durable state holds a structural save's intent that no running save owns. */
     let unresolved_structural_save_present = false;
+
+    /**
+     * Whether worksheet `sheet_index` was restructured by an unresolved save.
+     * Its source-keyed annotations (highlights, hidden rows, row heights,
+     * column widths) refuse writes until the user answers: the receipt cannot
+     * say which rows or columns a new one meant.
+     */
+    function unresolved_structural_sheet(sheet_index: number): boolean {
+        const sheet = source?.meta().sheets[sheet_index];
+        return sheet !== undefined && unresolved_structural_sheet_names.has(sheet.name);
+    }
     let posted_unresolved_save_id: string | undefined;
 
     /**
@@ -6316,7 +6327,14 @@ export function attach_viewer(
         }
         const basis = layout_basis;
         const incoming = complete_normalized_per_file_state(message.state, sheets);
-        const patch = derive_layout_state_patch(basis.state, incoming);
+        const derived = derive_layout_state_patch(basis.state, incoming);
+        // Column widths are keyed by source column, so an unresolved
+        // structural save's affected sheets keep theirs as stored.
+        const patch = unresolved_structural_sheet_names.size === 0 ? derived : {
+            ...derived,
+            columnWidths: derived.columnWidths.filter((entry) =>
+                !unresolved_structural_sheet(entry.sheetIndex)),
+        };
         const next_basis = complete_normalized_per_file_state(
             apply_layout_state_patch(basis.state, patch),
             sheets,
@@ -10610,6 +10628,10 @@ export function attach_viewer(
         // trust boundary: a stale or injected webview message must not
         // reach transform admission, the core, or durable state.
         if (profile.previewMode === true) return;
+        if (unresolved_structural_sheet(message.sheetIndex)) {
+            await core?.reject_transform(message, UNRESOLVED_STRUCTURAL_SAVE_EDIT_MESSAGE, 'terminal');
+            return;
+        }
         const transform_sheet = source?.meta().sheets[message.sheetIndex];
         if (transform_sheet) {
             if (
@@ -11235,6 +11257,14 @@ export function attach_viewer(
                         error,
                     }, receiver_epoch);
                 };
+                if (
+                    message.type === 'applyCellHighlights'
+                        ? unresolved_structural_sheet(message.sheetIndex)
+                        : unresolved_structural_sheet_names.size > 0
+                ) {
+                    await reject_highlight_command(UNRESOLVED_STRUCTURAL_SAVE_EDIT_MESSAGE);
+                    return;
+                }
                 if (
                     !command_source
                     || !command_core
@@ -12008,6 +12038,10 @@ export function attach_viewer(
                     return;
                 }
                 if (!source.meta().sheets[message.sheetIndex]) {
+                    settle_resize(false);
+                    return;
+                }
+                if (unresolved_structural_sheet(message.sheetIndex)) {
                     settle_resize(false);
                     return;
                 }

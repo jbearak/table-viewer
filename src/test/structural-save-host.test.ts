@@ -627,6 +627,64 @@ describe('an unresolved rekey intent', () => {
         await viewer.dispose();
     });
 
+    it('refuses writes of source-keyed annotations on an affected sheet', async () => {
+        const { viewer, state } = await open_unresolved(BYTES);
+        const snapshot = viewer.last<{
+            snapshot: { generation: number; sourceGeneration: number; identity: unknown; state: PerFileState };
+        }>('workbookSnapshot').snapshot;
+        const before = structuredClone(viewer.durable());
+        const stamp = { generation: snapshot.generation, sourceGeneration: snapshot.sourceGeneration };
+
+        await viewer.panel.__receive({
+            type: 'applyCellHighlights',
+            sheetIndex: 0,
+            sheetName: 'Sheet1',
+            selection: { displayRows: [{ start: 0, end: 0 }], sourceColumns: [0] },
+            mutation: { type: 'set', color: 'pink' },
+            requestId: 'highlight',
+            snapshotIdentity: snapshot.identity,
+            ...stamp,
+        });
+        await viewer.controller.drain();
+        expect(viewer.last<{ requestId: string; error?: string }>('cellHighlightsChanged')).toMatchObject({
+            requestId: 'highlight',
+            error: 'Choose whether your last save finished before editing this file.',
+        });
+
+        await viewer.panel.__receive({
+            type: 'setRowHeights', sheetIndex: 0, rows: [{ start: 0, end: 0 }], height: 50, requestId: 'resize', ...stamp,
+        });
+        await viewer.controller.drain();
+        expect(viewer.last<{ requestId: string; applied: boolean }>('rowHeightsChanged'))
+            .toMatchObject({ requestId: 'resize', applied: false });
+
+        await viewer.panel.__receive({
+            type: 'setTransform',
+            sheetIndex: 0,
+            state: { sort: [], filters: [], hiddenRows: [0], schema: SCHEMA },
+            requestId: 'hide',
+            intent: 'user',
+            ...stamp,
+        });
+        await viewer.controller.drain();
+        expect(viewer.last<{ requestId: string }>('transformRefused')).toMatchObject({ requestId: 'hide' });
+
+        await viewer.panel.__receive({
+            type: 'stateChanged',
+            state: { ...snapshot.state, columnWidths: [{ 0: 300 }] },
+            sourceGeneration: snapshot.sourceGeneration,
+            snapshotIdentity: snapshot.identity,
+        });
+        await viewer.controller.drain();
+
+        const after = state.get_state(FILE) as PerFileState;
+        expect(after.cellHighlights).toEqual(before.cellHighlights);
+        expect(after.rowHeights).toEqual(before.rowHeights);
+        expect(after.transforms).toEqual(before.transforms);
+        expect(after.columnWidths).toEqual(before.columnWidths);
+        await viewer.dispose();
+    });
+
     it('suggests "It didn\'t finish" when the shape does not match', async () => {
         const { viewer } = await open_unresolved(BYTES);
         // BYTES matches the payload's basis but neither intent digest.
