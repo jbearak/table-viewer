@@ -504,6 +504,52 @@ describe('scan_xlsx_structural_support', () => {
         const WS_DR = 'xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"';
         const report = (relationships: readonly Relationship[], body = PLAIN_DATA) => sheet('Report', body, { relationships });
 
+        it('refuses a sheet that an ActiveX control on another sheet links to', () => {
+            const [linked, filled, , other] = scan({
+                sheets: [
+                    sheet('Linked'),
+                    sheet('Filled'),
+                    sheet('Report', `${PLAIN_DATA}<controls><control shapeId="1025" r:id="rId9"><controlPr linkedCell="Linked!$A$1" listFillRange="'Filled'!$A$1:$A$5"/></control></controls>`),
+                    sheet('Other'),
+                ],
+            });
+            const reason = refused(linked);
+            expect(reason).toMatchObject({ code: 'unsupported-worksheet-child', element: 'controls', worksheet: 'Report' });
+            expect(reason.message).toBe("Can't insert, delete, or move rows on this sheet: a form control on Report uses data from this sheet.");
+            expect(refused(filled)).toMatchObject({ element: 'controls', worksheet: 'Report' });
+            expect_supported(other);
+        });
+
+        it('refuses a sheet that a cell extension on another sheet reads', () => {
+            const [data, report, other] = scan({
+                sheets: [
+                    sheet('Data'),
+                    sheet('Report', '<sheetData><row r="1"><c r="A1"><f>Other!A1</f><v>1</v><extLst><ext uri="urn:unreviewed" xmlns:xm="urn:xm"><xm:f>Data!A1</xm:f></ext></extLst></c></row></sheetData>'),
+                    sheet('Other'),
+                ],
+            });
+            expect(refused(data)).toMatchObject({ code: 'unsupported-extension', element: 'sheetData', worksheet: 'Report' });
+            expect(report.rows.supported).toBe(false);
+            // The cell's own formula is rendered by the writer, not an extension reference.
+            expect_supported(other);
+        });
+
+        it('refuses a sheet that a worksheet hyperlink relationship points into', () => {
+            const [data, , other] = scan({
+                sheets: [
+                    sheet('Data'),
+                    sheet('Report', `${PLAIN_DATA}<hyperlinks><hyperlink ref="A1" r:id="rId1"/></hyperlinks>`, {
+                        relationships: [{ type: `${OD}/hyperlink`, target: '#Data!A1', external: true }],
+                    }),
+                    sheet('Other'),
+                ],
+            });
+            const reason = refused(data);
+            expect(reason).toMatchObject({ code: 'unsupported-part', partKind: 'hyperlink', host: 'Report' });
+            expect(reason.message).toBe("Can't insert, delete, or move rows on this sheet: a link on Report points into this sheet.");
+            expect_supported(other);
+        });
+
         it('refuses a sheet that a shape\'s text link reads', () => {
             const [data, , other] = scan({
                 sheets: [sheet('Data'), report([DRAWING_REL()], `${PLAIN_DATA}<drawing r:id="rId1"/>`), sheet('Other')],
@@ -594,6 +640,60 @@ describe('scan_xlsx_structural_support', () => {
             expect(reason).toMatchObject({ code: 'unsupported-part', partKind: 'table', host: 'Report' });
             expect(reason.message).toBe("Can't insert, delete, or move rows on this sheet: an Excel table on Report uses data from this sheet.");
             expect_supported(other);
+        });
+    });
+
+    describe('backstop', () => {
+        it('refuses a sheet named in an attribute of an unknown extension', () => {
+            const [data, report, other] = scan({
+                sheets: [
+                    sheet('Data'),
+                    sheet('Report', `${PLAIN_DATA}<extLst><ext uri="urn:unreviewed"><x:thing xmlns:x="urn:x" target="'Data'!B2:B9"/></ext></extLst>`),
+                    sheet('Other'),
+                ],
+            });
+            const reason = refused(data);
+            expect(reason).toEqual(expect.objectContaining({ code: 'unclassified-reference', part: 'xl/worksheets/sheet2.xml' }));
+            expect(reason.message).toBe("Can't insert, delete, or move rows on this sheet: xl/worksheets/sheet2.xml refers to it in a way Table Viewer can't adjust.");
+            expect(refused(report)).toMatchObject({ code: 'unsupported-extension' });
+            expect_supported(other);
+        });
+
+        it('refuses sheets named in an unrelated part, an escaped quote, and a 3D span', () => {
+            const [first, between, last, quoted, other] = scan({
+                sheets: [sheet('First'), sheet('Between'), sheet('Last'), sheet('My Quoted'), sheet('Other')],
+                parts: {
+                    'customXml/item1.xml': '<root a="&apos;My Quoted&apos;!A1"/>',
+                    'xl/vendor/thing.xml': '<thing>SUM(First:Last!A1)</thing>',
+                },
+            });
+            for (const spanned of [first, between, last]) {
+                expect(refused(spanned)).toMatchObject({ code: 'unclassified-reference', part: 'xl/vendor/thing.xml' });
+            }
+            expect(refused(quoted)).toMatchObject({ code: 'unclassified-reference', part: 'customXml/item1.xml' });
+            expect_supported(other);
+        });
+
+        it('leaves a sheet supported when it is named only where the writer renders it or in data', () => {
+            const [data, report] = scan({
+                sheets: [
+                    sheet('Data'),
+                    sheet('Report', '<sheetData><row r="1"><c r="A1"><f>SUM(Data!A1:A3)</f><v>3</v></c>'
+                        + '<c r="B1" t="inlineStr"><is><t>See Data!A1</t></is></c><c r="C1" t="str"><f>"Data!"&amp;A1</f><v>Data!3</v></c></row></sheetData>'
+                        + '<conditionalFormatting sqref="A1"><cfRule type="expression" priority="1"><formula>Data!A1&gt;0</formula></cfRule></conditionalFormatting>'
+                        + '<dataValidations><dataValidation type="list" sqref="B1"><formula1>Data!$A$1:$A$3</formula1></dataValidation></dataValidations>'
+                        + '<hyperlinks><hyperlink ref="A1" location="Data!A1" display="Data"/></hyperlinks>'),
+                ],
+                definedNames: '<definedName name="_xlnm.Print_Area" localSheetId="0">Data!$A$1:$B$5</definedName>',
+                workbookRelationships: [{ type: `${OD}/sharedStrings`, target: 'sharedStrings.xml' }],
+                parts: {
+                    'xl/sharedStrings.xml': `<sst xmlns="${MAIN_NS}"><si><t>Data!A1</t></si></sst>`,
+                    'docProps/app.xml': '<Properties><TitlesOfParts><vt:lpstr xmlns:vt="urn:vt">Data!Print_Area</vt:lpstr></TitlesOfParts></Properties>',
+                    'xl/theme/theme1.xml': '<a:theme xmlns:a="urn:a" name="Data!"/>',
+                },
+            });
+            expect_supported(data);
+            expect_supported(report);
         });
     });
 

@@ -403,6 +403,13 @@ export class ZipPackage {
         this.by_name.set(name, entry);
     }
 
+    /** Every present part, without a leading slash; directory entries are omitted. */
+    part_names(): string[] {
+        return this.entries
+            .filter((entry) => entry.removed !== true && !entry.name.endsWith('/'))
+            .map((entry) => entry.name);
+    }
+
     remove(path: string): boolean {
         const entry = this.by_name.get(normalized_path(path));
         if (!entry || entry.removed) return false;

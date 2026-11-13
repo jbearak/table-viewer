@@ -91,6 +91,7 @@ export type UnsupportedPartKind =
     | 'dialog-sheet'
     | 'volatile-dependencies'
     | 'revisions'
+    | 'hyperlink'
     | 'unknown';
 
 /**
@@ -165,6 +166,14 @@ export type StructuralRefusalReason =
         readonly value: string;
         /** Set when the rule is on another worksheet and its threshold reads this one. */
         readonly worksheet?: string;
+    }
+    | {
+        /**
+         * The backstop: a part names this worksheet in a sheet qualifier
+         * somewhere no specific check classifies.
+         */
+        readonly code: 'unclassified-reference';
+        readonly part: string;
     }
     | {
         /** A range attribute the writer would have to shift but cannot read. */
@@ -467,6 +476,7 @@ const PART_CLAUSES: Readonly<Record<UnsupportedPartKind, string>> = {
     'dialog-sheet': 'the workbook contains dialog sheets',
     'volatile-dependencies': 'the workbook has real-time data links',
     'revisions': 'the workbook tracks changes',
+    'hyperlink': "it has a link Table Viewer can't adjust",
     'unknown': '',
 };
 
@@ -477,6 +487,7 @@ const LINKED_PART_SUBJECTS: Partial<Record<UnsupportedPartKind, string>> = {
     'legacy-drawing': 'a form control',
     'control': 'a form control',
     'table': 'an Excel table',
+    'hyperlink': 'a link',
 };
 
 function location_text(location: StructuralFormulaLocation | undefined): string {
@@ -499,7 +510,9 @@ function refusal_clause(reason: StructuralRefusalReason): string {
             return `it contains content Table Viewer doesn't recognize (<${reason.element}>)`;
         case 'unsupported-worksheet-child':
             if (reason.worksheet !== undefined) {
-                const subject = reason.element === 'dataConsolidate' ? 'a data consolidation' : `<${reason.element}>`;
+                const subject = reason.element === 'dataConsolidate'
+                    ? 'a data consolidation'
+                    : reason.element === 'controls' ? 'a form control' : `<${reason.element}>`;
                 return `${subject} on ${reason.worksheet} uses data from this sheet`;
             }
             return INVENTORY_BY_ELEMENT.get(reason.element)?.refusal ?? `it contains <${reason.element}>`;
@@ -522,7 +535,8 @@ function refusal_clause(reason: StructuralRefusalReason): string {
             }
             const subject = reason.scope === 'workbook' ? LINKED_PART_SUBJECTS[reason.partKind] : undefined;
             if (subject !== undefined) {
-                return `${subject}${reason.host === undefined ? '' : ` on ${reason.host}`} uses data from this sheet`;
+                const predicate = reason.partKind === 'hyperlink' ? 'points into this sheet' : 'uses data from this sheet';
+                return `${subject}${reason.host === undefined ? '' : ` on ${reason.host}`} ${predicate}`;
             }
             return PART_CLAUSES[reason.partKind];
         }
@@ -541,6 +555,8 @@ function refusal_clause(reason: StructuralRefusalReason): string {
             return reason.worksheet === undefined
                 ? `the conditional formatting on ${reason.sqref} has a threshold formula Table Viewer can't adjust (${reason.value})`
                 : `the conditional formatting on ${qualified(reason.worksheet, reason.sqref)} has a threshold formula that uses this sheet (${reason.value})`;
+        case 'unclassified-reference':
+            return `${reason.part} refers to it in a way Table Viewer can't adjust`;
         case 'invalid-range':
             return `it has a range Table Viewer can't read in <${reason.element}> (${reason.value})`;
         case 'unwritable-worksheet':
@@ -1236,6 +1252,16 @@ function scan_worksheet(
             if (row.disposition === 'refused') {
                 const reason = { code: 'unsupported-worksheet-child', element: row.element as RefusedWorksheetChild } as const;
                 consider(reason);
+                if (local === 'controls') {
+                    // ActiveX controls keep their cell links on `<controlPr>`.
+                    for (const properties of descendants_named(xml, child.element, 'controlPr')) {
+                        const open = opening_tag_text(xml, properties.element);
+                        for (const attribute of ['linkedCell', 'listFillRange']) {
+                            const text = get_attr(open, attribute);
+                            if (text !== null && text !== '') foreign_references.push({ targets: formula_targets(text), reason });
+                        }
+                    }
+                }
                 if (local === 'dataConsolidate') {
                     // Each source names its sheet or a defined name; one without
                     // either is on this sheet, which already refuses.
@@ -1259,12 +1285,20 @@ function scan_worksheet(
             }
             const extension = nested_extension_refusal(xml, child);
             consider(extension);
-            if (extension?.code === 'unsupported-extension' && local !== 'sheetData') {
+            if (extension?.code === 'unsupported-extension') {
                 // x14 conditional formatting, data validation, and sparklines
                 // keep formulas in `<xm:f>`; Excel writes cross-sheet rules there.
+                // Only `f` inside an `<ext>` counts, so cell formulas in
+                // sheetData stay with the formula checks.
                 const ranges = ignorable_ranges(xml, child.element.start, child.element.end);
-                for (const text of element_texts(xml, child.element.start, child.element.end, ranges, (name) => name === 'f')) {
-                    foreign_references.push({ targets: formula_targets(text), reason: extension });
+                for (const tag of start_tags(xml, child.element.start, child.element.end, ranges)) {
+                    if (!has_local_name(xml, tag.start, tag.nameEnd, 'ext') || is_self_closing(xml, tag.start, tag.tagEnd)) continue;
+                    const name = utf8_text(xml, tag.start + 1, tag.nameEnd);
+                    const close = end_tag_after(xml, name, tag.tagEnd + 1, ranges, child.element.end);
+                    if (close === null) continue;
+                    for (const text of element_texts(xml, tag.tagEnd + 1, close[0], ranges, (local_part) => local_part === 'f')) {
+                        foreign_references.push({ targets: formula_targets(text), reason: extension });
+                    }
                 }
             }
             if (local === 'sheetData') continue;
@@ -1555,8 +1589,14 @@ function scan_workbook_parts(
     for (const sheet of worksheets) {
         const host_key = sheet.name.toLowerCase();
         for (const relationship of relationships_of(zip, sheet.path)) {
-            if (relationship.external) continue;
             const key = relationship_key(relationship.type);
+            if (key === 'hyperlink' && relationship.target.startsWith('#')) {
+                // `#Data!A1` is a location in this workbook; the writer leaves
+                // relationship targets as written.
+                refuse(relationship.target.slice(1), part_reason('hyperlink', relationship, sheet.name), host_key);
+                continue;
+            }
+            if (relationship.external) continue;
             if (key === 'drawing') {
                 scan_drawing(relationship, sheet.name);
                 continue;
@@ -1657,6 +1697,154 @@ function with_worksheet(
     return { ...location, worksheet };
 }
 
+// ---------------------------------------------------------------------------
+// Backstop: any sheet qualifier anywhere in the package
+// ---------------------------------------------------------------------------
+
+/** Parts that hold no references, or only data that is never read as one. */
+const BACKSTOP_SKIPPED_RELATIONSHIPS: ReadonlySet<string> = new Set(['styles', 'sharedStrings', 'theme']);
+const BACKSTOP_BINARY_EXTENSION = /\.(?:png|jpe?g|jfif|gif|bmp|tiff?|emf|wmf|wdp|ico|bin|mp3|mp4|wav|avi|mov)$/i;
+/** Worksheet elements whose text the writer renders, or that hold cell values. */
+const BACKSTOP_WORKSHEET_TEXT = new Set(['f', 'v', 't', 'formula', 'formula1', 'formula2']);
+
+function is_backstop_name_byte(code: number): boolean {
+    return code >= 0x80
+        || (code >= 0x30 && code <= 0x39) || (code >= 0x41 && code <= 0x5a) || (code >= 0x61 && code <= 0x7a)
+        || code === 0x5f || code === 0x2e || code === 0x5c || code === 0x3a; // `_` `.` `\` `:`
+}
+
+/** Length of a single-quote token (`'` or `&apos;`) ending just before `end`, or 0. */
+function quote_ending_at(xml: Uint8Array, end: number): number {
+    if (xml[end - 1] === 0x27) return 1;
+    return starts_with_bytes(xml, '&apos;', end - 6) ? 6 : 0;
+}
+
+/** The sheet names in the qualifier that ends just before the `!` at `bang`. */
+function qualifier_names_before(xml: Uint8Array, bang: number): string[] | undefined {
+    const lower = Math.max(0, bang - 512);
+    const close = quote_ending_at(xml, bang);
+    if (close > 0) {
+        const content_end = bang - close;
+        let i = content_end;
+        while (i > lower) {
+            const quote = quote_ending_at(xml, i);
+            if (quote > 0) {
+                const doubled = quote_ending_at(xml, i - quote);
+                if (doubled > 0) { i -= quote + doubled; continue; }
+                const text = decode_xml(utf8_text(xml, i, content_end)).replace(/''/g, "'");
+                return text === '' ? undefined : text.split(':');
+            }
+            const code = xml[i - 1];
+            if (code === 0x3c || code === 0x3e || code === 0x22) return undefined; // `<` `>` `"`
+            i -= 1;
+        }
+        return undefined;
+    }
+    let start = bang;
+    while (start > lower && is_backstop_name_byte(xml[start - 1])) start -= 1;
+    if (start === bang) return undefined;
+    return utf8_text(xml, start, bang).split(':');
+}
+
+function qname_at(xml: Uint8Array, start: number): string {
+    let end = start;
+    while (end < xml.length && !is_tag_boundary(xml[end])) end += 1;
+    return utf8_text(xml, start, end);
+}
+
+/** The attribute whose quoted value contains `at`, inside the tag starting at `tag_start`. */
+function attribute_containing(xml: Uint8Array, tag_start: number, at: number): string | undefined {
+    const tag_end = find_tag_end(xml, tag_start);
+    if (tag_end === -1 || tag_end < at) return undefined;
+    const tag = utf8_text(xml, tag_start, tag_end + 1);
+    const offset = Buffer.byteLength(utf8_text(xml, tag_start, at));
+    const pattern = /([^\s=/<>]+)\s*=\s*("[^"]*"|'[^']*')/g;
+    for (let match = pattern.exec(tag); match !== null; match = pattern.exec(tag)) {
+        const value_start = Buffer.byteLength(tag.slice(0, match.index + match[0].length - match[2].length));
+        const value_end = value_start + Buffer.byteLength(match[2]);
+        if (offset > value_start && offset < value_end) return match[1];
+    }
+    return undefined;
+}
+
+type BackstopPartKind = 'worksheet' | 'workbook' | 'relationships' | 'other';
+
+/** Whether a sheet qualifier at `bang` sits where a specific check already handles it. */
+function backstop_skips(xml: Uint8Array, bang: number, kind: BackstopPartKind): boolean {
+    if (kind === 'other') return false;
+    const bytes = Buffer.from(xml.buffer, xml.byteOffset, xml.byteLength);
+    const last_open = bang === 0 ? -1 : bytes.lastIndexOf(0x3c, bang - 1);
+    if (last_open === -1) return false;
+    const last_close = bytes.lastIndexOf(0x3e, bang - 1);
+    const quoted_markup = xml[last_open + 1] === 0x21 || xml[last_open + 1] === 0x3f; // `<!` `<?`
+    if (last_open > last_close && !quoted_markup) {
+        // Inside a tag: an attribute value.
+        const attribute = attribute_containing(xml, last_open, bang);
+        if (attribute === undefined) return false;
+        const element = local_name(qname_at(xml, last_open + 1));
+        if (kind === 'worksheet') return element === 'hyperlink' && attribute === 'location';
+        if (kind === 'relationships') return attribute === 'Id' || attribute === 'Type';
+        return false;
+    }
+    // Text: its parent is the nearest preceding start tag, past comments and CDATA.
+    let parent = last_open;
+    while (parent > 0 && (xml[parent + 1] === 0x21 || xml[parent + 1] === 0x3f)) {
+        parent = bytes.lastIndexOf(0x3c, parent - 1);
+    }
+    if (parent < 0 || xml[parent + 1] === 0x2f) return false; // mixed content: keep it
+    const name = qname_at(xml, parent + 1);
+    if (kind === 'worksheet') return BACKSTOP_WORKSHEET_TEXT.has(name);
+    if (kind === 'workbook') return name === 'definedName';
+    return false;
+}
+
+/**
+ * For each worksheet index, the first package part that names it in a sheet
+ * qualifier (`Data!`, `'My Sheet'!`, `#Data!` in a relationship target) at
+ * a place no specific check classifies. Deliberately coarse: it may refuse a
+ * sheet that is merely named in text, but it never lets one through.
+ */
+function unclassified_references(
+    zip: ZipPackage,
+    worksheets: readonly ScannedWorksheet[],
+): Map<number, string> {
+    const found = new Map<number, string>();
+    const index_by_name = new Map(worksheets.map((sheet, index) => [sheet.name.toLowerCase(), index]));
+    const skipped = new Set<string>();
+    for (const relationship of relationships_of(zip, 'xl/workbook.xml')) {
+        if (BACKSTOP_SKIPPED_RELATIONSHIPS.has(relationship_key(relationship.type))) skipped.add(relationship.part);
+    }
+    const worksheet_paths = new Set(worksheets.map((sheet) => sheet.path));
+    for (const part of zip.part_names()) {
+        if (found.size === worksheets.length) break;
+        if (skipped.has(part) || part.startsWith('docProps/') || part.startsWith('xl/theme/')) continue;
+        if (BACKSTOP_BINARY_EXTENSION.test(part)) continue;
+        const raw = read_bytes(zip, part);
+        if (raw === null) continue;
+        let first = raw[0] === 0xef && raw[1] === 0xbb && raw[2] === 0xbf ? 3 : 0;
+        while (first < raw.length && (raw[first] === 0x20 || raw[first] === 0x09 || raw[first] === 0x0a || raw[first] === 0x0d)) first += 1;
+        if (raw[first] !== 0x3c) continue; // not XML
+        const kind: BackstopPartKind = worksheet_paths.has(part)
+            ? 'worksheet'
+            : part === 'xl/workbook.xml' ? 'workbook' : part.endsWith('.rels') ? 'relationships' : 'other';
+        for (let bang = index_of_bytes(raw, '!'); bang !== -1; bang = index_of_bytes(raw, '!', bang + 1)) {
+            const names = qualifier_names_before(raw, bang);
+            if (names === undefined) continue;
+            const indexes = names
+                .map((name) => index_by_name.get(name.toLowerCase()))
+                .filter((index): index is number => index !== undefined);
+            if (indexes.length === 0 || indexes.every((index) => found.has(index))) continue;
+            if (backstop_skips(raw, bang, kind)) continue;
+            // A 3D span between two known sheets covers the sheets between them.
+            const named = names.length === 2 && indexes.length === 2
+                ? Array.from({ length: Math.abs(indexes[1] - indexes[0]) + 1 }, (_, k) => Math.min(...indexes) + k)
+                : indexes;
+            for (const index of named) if (!found.has(index)) found.set(index, part);
+        }
+    }
+    return found;
+}
+
 /**
  * Scan a verified workbook package and report, per worksheet in reader order
  * (`worksheet_part_entries_from_package`), whether each axis can be
@@ -1689,6 +1877,7 @@ export function scan_xlsx_structural_support(
     };
 
     const unreadable = worksheets.find((sheet) => !sheet.readable);
+    const backstop = unclassified_references(zip, worksheets);
     const targets_cache = new Map<string, FormulaTargets>();
     const targets_of = (text: string): FormulaTargets => {
         let targets = targets_cache.get(text);
@@ -1699,10 +1888,10 @@ export function scan_xlsx_structural_support(
         return targets;
     };
 
-    return worksheets.map((sheet) => {
+    return worksheets.map((sheet, sheet_index) => {
         const sheet_key = sheet.name.toLowerCase();
         const referencing_names = names_referencing(names, users, sheet_key);
-        const reason = ((): StructuralRefusalReason | undefined => {
+        const specific = ((): StructuralRefusalReason | undefined => {
             if (sheet.ownRefusal !== undefined) return sheet.ownRefusal;
             if (unreadable !== undefined) {
                 return { code: 'unreadable-worksheet', worksheet: unreadable.name };
@@ -1772,6 +1961,9 @@ export function scan_xlsx_structural_support(
             }
             return undefined;
         })();
+        const backstop_part = backstop.get(sheet_index);
+        const reason: StructuralRefusalReason | undefined = specific
+            ?? (backstop_part === undefined ? undefined : { code: 'unclassified-reference', part: backstop_part });
 
         const axis = (name: StructuralAxis): StructuralAxisSupport => reason === undefined
             ? { supported: true }
