@@ -18115,9 +18115,35 @@ describe('structural conflict notice counts and Review Changes notes', () => {
             impacts: null,
         });
         const notice = document.querySelector('[aria-label="Row and column changes that need review"]')!;
-        expect(notice.textContent).toContain('Formula impact unavailable.');
+        expect(notice.textContent).toContain('Formula impact unavailable. Retry, or choose an action without the count.');
         expect(notice.textContent).not.toContain('Checking formulas…');
+        // A host that keeps failing can't strand the user: every action stays open.
         for (const button of notice.querySelectorAll('button')) expect((button as HTMLButtonElement).disabled).toBe(false);
+        // Retry asks again for the current state.
+        const requests = () => post_message.mock.calls.map(([message]) => message as WebviewMessage)
+            .filter((message): message is Extract<WebviewMessage, { type: 'requestFormulaImpact' }> =>
+                message.type === 'requestFormulaImpact');
+        const asked = requests().length;
+        await act(async () => {
+            ([...notice.querySelectorAll('button')].find((button) => button.textContent === 'Retry') as HTMLButtonElement)
+                .click();
+        });
+        expect(requests()).toHaveLength(asked + 1);
+        const retry = requests().at(-1)!;
+        expect(retry.requestId).not.toBe(request.requestId);
+        expect({ before: retry.before, keep: retry.keep, discard: retry.discard })
+            .toEqual({ before: request.before, keep: request.keep, discard: request.discard });
+        expect(notice.textContent).toContain('Checking formulas…');
+        expect(notice.textContent).not.toContain('Formula impact unavailable.');
+        await dispatch_host_message({
+            type: 'formulaImpact',
+            requestId: retry.requestId,
+            sourceGeneration: retry.sourceGeneration,
+            impacts: { keep: { ref: 0, moved: 2 }, discard: { ref: 1, moved: 0 } },
+        });
+        expect(notice.textContent).toContain('Discard row and column changes on Sales: 1 formula will show #REF!.');
+        expect(notice.textContent).not.toContain('Checking formulas…');
+        expect([...notice.querySelectorAll('button')].some((button) => button.textContent === 'Retry')).toBe(false);
     });
 
     it('notes that a column change pads short rows', async () => {

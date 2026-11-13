@@ -8665,6 +8665,9 @@ export function App(): React.JSX.Element {
         readonly requestId: string;
         readonly states: NonNullable<typeof formula_impact_states>;
     }>();
+    // Bumped by Retry after the host could not count: the effect below asks
+    // again for the same states.
+    const [formula_impact_attempt, set_formula_impact_attempt] = useState(0);
     useEffect(() => {
         if (formula_impact_states === undefined) {
             formula_impact_request_ref.current = undefined;
@@ -8678,7 +8681,7 @@ export function App(): React.JSX.Element {
             sourceGeneration: source_generation_ref.current,
             ...formula_impact_states,
         });
-    }, [formula_impact_states, load_epoch]);
+    }, [formula_impact_attempt, formula_impact_states, load_epoch]);
     useEffect(() => {
         const on_message = (event: MessageEvent) => {
             const msg = event.data as HostMessage;
@@ -9781,7 +9784,20 @@ export function App(): React.JSX.Element {
                         </p>
                     )}
                     {formula_impact_pending && <p role="status">Checking formulas…</p>}
-                    {formula_impact_unavailable && <p>Formula impact unavailable.</p>}
+                    {formula_impact_unavailable && (
+                        <p>
+                            Formula impact unavailable. Retry, or choose an action without the count.
+                            {' '}
+                            <button
+                                onClick={() => {
+                                    set_formula_impacts(undefined);
+                                    set_formula_impact_attempt((attempt) => attempt + 1);
+                                }}
+                            >
+                                Retry
+                            </button>
+                        </p>
+                    )}
                     {basis_changed && keep_impact_text !== undefined && (
                         <p>{`Keep new rows at the end: ${keep_impact_text}`}</p>
                     )}
