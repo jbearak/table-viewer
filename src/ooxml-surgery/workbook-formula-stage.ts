@@ -872,7 +872,7 @@ class Stage {
             // Names that may read an affected worksheet, closed over names that use them.
             const reading = new Set<string>();
             for (const { key, targets } of name_targets) {
-                if (targets.everySheet || targets.unqualified
+                if (targets.everySheet || targets.unqualified || targets.identifiers.has('indirect')
                     || [...targets.sheets].some((sheet) => affected_names.has(sheet))) reading.add(key);
             }
             for (let grew = true; grew;) {

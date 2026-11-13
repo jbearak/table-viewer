@@ -288,8 +288,10 @@ describe('workbook formula stage: cell formulas', () => {
                 { name: 'ByName', xml: grid(0, 0, { A1: '<f>Total*2</f><v>1</v>' }), rows: 1, columns: 1 },
                 { name: 'Chain', xml: grid(0, 0, { A1: '<f>ByName!A1</f><v>1</v>' }), rows: 1, columns: 1 },
                 { name: 'Alone', xml: grid(0, 0, { A1: '<f>1+1</f><v>2</v>' }), rows: 1, columns: 1 },
+                { name: 'Dynamic', xml: grid(0, 0, { A1: '<f>Chosen</f><v>1</v>' }), rows: 1, columns: 1 },
             ],
-            definedNames: '<definedName name="Total">Data!$A$3</definedName>',
+            definedNames: '<definedName name="Total">Data!$A$3</definedName>'
+                + '<definedName name="Chosen">INDIRECT("Data!A1")</definedName>',
         });
         expect(outcome.refusals).toEqual([]);
         expect(outcome.invalidations).toEqual([
@@ -297,6 +299,7 @@ describe('workbook formula stage: cell formulas', () => {
             { sheetIndex: 1, row: 0, column: 0 },
             { sheetIndex: 2, row: 0, column: 0 },
             { sheetIndex: 3, row: 0, column: 0 },
+            { sheetIndex: 5, row: 0, column: 0 },
         ]);
     });
 });
