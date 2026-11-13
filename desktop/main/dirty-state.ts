@@ -10,8 +10,9 @@
 //   • webview → host `pendingEditsChanged` — the live signal while editing, and
 //     the one that clears (`edits: null`) after a save.
 //   • host → webview `editSessionResult` / `workbookSnapshot` — a draft restored
-//     from a previous session arrives this way; the webview only echoes
-//     `pendingEditsChanged` once it is in edit mode with a session.
+//     from a previous session arrives this way; the webview only posts
+//     `pendingEditsChanged` once it holds an editing session and has
+//     something to report.
 //
 // Pure module (no electron import) so it is unit-testable.
 import type { HostMessage, PerFileState, WebviewMessage } from '../../src/types';

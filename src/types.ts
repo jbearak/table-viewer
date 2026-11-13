@@ -664,7 +664,7 @@ export interface PerFileState {
      * **Worksheet scoping.** The map above describes one sheet's edits. Since
      * .xlsx worksheets became editable the leaf is a *positional array* of those
      * maps, indexed by sheet, because the unit of editing is the worksheet: each
-     * sheet has its own Edit button, its own dirty state and its own save.
+     * sheet has its own dirty state and its own save.
      *
      * Each slot also carries the `sheetName` it was written against.  A bare
      * positional array is not sufficient on its own: nothing stops the workbook
@@ -3518,7 +3518,6 @@ export type HostMessage =
      */
     | { type: 'discardEditSessionResult'; editSessionId: string; cleared: boolean }
     | { type: 'editSessionRevoked'; reason: 'saved'; sheetIndex: number; lifecycle: Extract<TerminalCsvSaveLifecycle, { state: 'succeeded' }> }
-    | { type: 'saveDialogResult'; requestId: string; editSessionId: string; choice: 'save' | 'discard' | 'cancel' }
     /** The current state backend accepted a pending-edit full map through this sequence. */
     | { type: 'pendingEditsAcknowledged'; editSessionId: string; sequence: number }
     /** New full-snapshot acknowledgement; shares sequencing with the legacy path. */
@@ -3713,11 +3712,12 @@ export type WebviewMessage =
         sheetIndex?: number;
         sheetName?: string;
         worksheetId?: string;
+        /** The user did not ask to edit, so a refusal is not announced. */
+        quiet?: boolean;
     }
     | { type: 'releaseEditSession'; editSessionId: string }
     | { type: 'discardEditSession'; editSessionId: string }
     | { type: 'saveCsv'; operation: CsvSaveOperationRequest }
-    | { type: 'showSaveDialog'; editSessionId: string; requestId: string }
     // `sheetIndex`/`sheetName` say which worksheet's slot this complete map is
     // for. A workbook-scoped session (#154) can hold edits on several sheets, so
     // the host can no longer infer the slot from the session — the post has to

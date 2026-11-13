@@ -82,13 +82,13 @@ describe('extension runtime manifest', () => {
         });
     });
 
-    it('defaults Diff off when entering Edit mode', () => {
+    it('defaults Diff off when editing starts', () => {
         expect(manifest.contributes?.configuration?.properties?.[
             'tableViewer.diffOnByDefault'
         ]).toMatchObject({
             type: 'boolean',
             default: false,
-            description: expect.stringMatching(/Diff.*Edit mode/u),
+            description: expect.stringMatching(/Diff.*start editing/u),
         });
     });
 

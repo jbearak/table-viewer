@@ -51,12 +51,13 @@ function render_toolbar(props?: Partial<React.ComponentProps<typeof Toolbar>>) {
         },
         auto_fit_active: false,
         on_toggle_auto_fit: vi.fn(),
-        edit_mode: false,
+        editable: false,
+        editing: false,
         diff_mode: false,
         on_toggle_diff_mode: vi.fn(),
         is_dirty: false,
-        on_toggle_edit_mode: vi.fn(),
-        show_edit_button: false,
+        on_save: vi.fn(),
+        on_discard: vi.fn(),
         ...props,
     };
 
@@ -231,25 +232,26 @@ describe('Toolbar', () => {
         const on_action_complete = vi.fn();
         render_toolbar({
             on_action_complete,
-            show_edit_button: true,
+            editable: true,
+            is_dirty: true,
             show_excel_header_button: true,
         });
 
-        for (const label of ['Edit', 'Formatting', 'Header Row', 'Auto-fit Columns']) {
+        for (const label of ['Save', 'Formatting', 'Header Row', 'Auto-fit Columns']) {
             act(() => get_button(label).click());
         }
 
         expect(on_action_complete).toHaveBeenCalledTimes(4);
     });
 
-    it('separates Edit from the worksheet display actions', () => {
+    it('separates Save from the worksheet display actions', () => {
         const { container } = render_toolbar({
-            show_edit_button: true,
+            editable: true,
             show_excel_header_button: true,
         });
 
         expect(get_action_labels(container)).toEqual([
-            'Edit',
+            'Save',
             '|',
             'Formatting',
             'Header Row',
@@ -258,14 +260,53 @@ describe('Toolbar', () => {
         ]);
     });
 
-    it('shows Diff to the left of Edit only while edit mode is on', () => {
+    it('offers no Save, Discard, or Diff for a file that cannot be edited', () => {
+        const { container } = render_toolbar({ editing: true, is_dirty: true });
+        const labels = get_action_labels(container);
+        for (const label of ['Save', 'Discard', 'Diff']) {
+            expect(labels).not.toContain(label);
+        }
+    });
+
+    it('keeps Save in reach but inert until there is something to save', () => {
+        const on_save = vi.fn();
+        render_toolbar({ editable: true, on_save });
+        const save = get_button('Save');
+        // Focusable so its tooltip can say how to start editing, which is the
+        // only place the toolbar says that cells can be changed at all.
+        expect(save.disabled).toBe(false);
+        expect(save.getAttribute('aria-disabled')).toBe('true');
+        expect(save.classList.contains('has-unsaved')).toBe(false);
+        act(() => save.click());
+        expect(on_save).not.toHaveBeenCalled();
+
+        dispatch_mouse_event(save, 'mouseover');
+        expect(get_tooltip()?.textContent)
+            .toBe('No unsaved changes. Double-click a cell or start typing to edit it.');
+    });
+
+    it('saves through its handler once there are unsaved changes', () => {
+        const on_save = vi.fn();
+        render_toolbar({ editable: true, editing: true, is_dirty: true, on_save });
+        const save = get_button('Save');
+        expect(save.getAttribute('aria-disabled')).toBeNull();
+        expect(save.classList.contains('has-unsaved')).toBe(true);
+        // A command, not a toggle: it has no pressed state to announce.
+        expect(save.hasAttribute('aria-pressed')).toBe(false);
+        act(() => save.click());
+        expect(on_save).toHaveBeenCalledTimes(1);
+    });
+
+    it('shows Diff and Discard to the left of Save only beside unsaved changes', () => {
         const { container } = render_toolbar({
-            show_edit_button: true,
-            edit_mode: true,
+            editable: true,
+            editing: true,
+            is_dirty: true,
         });
         expect(get_action_labels(container)).toEqual([
             'Diff',
-            'Edit',
+            'Discard',
+            'Save',
             '|',
             'Formatting',
             'Columns',
@@ -273,16 +314,44 @@ describe('Toolbar', () => {
         ]);
     });
 
-    it('hides Diff while edit mode is off', () => {
-        const { container } = render_toolbar({ show_edit_button: true });
-        expect(get_action_labels(container)).not.toContain('Diff');
+    it('hides Diff and Discard while nothing is unsaved', () => {
+        const { container } = render_toolbar({ editable: true });
+        const labels = get_action_labels(container);
+        expect(labels).not.toContain('Diff');
+        expect(labels).not.toContain('Discard');
+    });
+
+    it('discards through its handler', () => {
+        const on_discard = vi.fn();
+        render_toolbar({ editable: true, editing: true, is_dirty: true, on_discard });
+        act(() => get_button('Discard').click());
+        expect(on_discard).toHaveBeenCalledTimes(1);
+    });
+
+    it('disables Save and Discard while a save is being written', () => {
+        const on_save = vi.fn();
+        const on_discard = vi.fn();
+        render_toolbar({
+            editable: true,
+            editing: true,
+            is_dirty: true,
+            save_busy: true,
+            on_save,
+            on_discard,
+        });
+        expect(get_button('Save').getAttribute('aria-disabled')).toBe('true');
+        act(() => get_button('Save').click());
+        expect(on_save).not.toHaveBeenCalled();
+        expect(on_discard).not.toHaveBeenCalled();
+        dispatch_mouse_event(get_button('Save'), 'mouseover');
+        expect(get_tooltip()?.textContent).toBe('Saving changes.');
     });
 
     it('reflects diff_mode as pressed state and toggles through its handler', () => {
         const on_toggle_diff_mode = vi.fn();
         render_toolbar({
-            show_edit_button: true,
-            edit_mode: true,
+            editable: true,
+            editing: true,
             diff_mode: true,
             on_toggle_diff_mode,
         });
@@ -293,16 +362,16 @@ describe('Toolbar', () => {
     });
 
     it('marks the divider as a vertical separator', () => {
-        const { container } = render_toolbar({ show_edit_button: true });
+        const { container } = render_toolbar({ editable: true });
 
         const divider = container.querySelector('.toolbar-actions-divider');
         expect(divider?.getAttribute('role')).toBe('separator');
         expect(divider?.getAttribute('aria-orientation')).toBe('vertical');
     });
 
-    it('omits the divider when Edit is not shown', () => {
+    it('omits the divider when Save is not shown', () => {
         // Formatting is a worksheet display control, so it does not create a group
-        // on the left or leave a stray leading rule when Edit is unavailable.
+        // on the left or leave a stray leading rule when the file cannot be edited.
         const { container } = render_toolbar({
             show_formatting_button: true,
         });
@@ -312,29 +381,29 @@ describe('Toolbar', () => {
             .toBe('Formatting');
     });
 
-    it('keeps the divider when Edit is the only action before it', () => {
+    it('keeps the divider when Save is the only action before it', () => {
         // The expected state now that tab orientation moved to the sheet tabs (#154):
-        // Edit is usually alone on the workbook side, and the rule still belongs there.
+        // Save is usually alone on the workbook side, and the rule still belongs there.
         const { container } = render_toolbar({
             show_formatting_button: false,
-            show_edit_button: true,
+            editable: true,
         });
 
         expect(get_action_labels(container))
-            .toEqual(['Edit', '|', 'Columns', 'Auto-fit Columns']);
+            .toEqual(['Save', '|', 'Columns', 'Auto-fit Columns']);
     });
 
-    it('separates only Edit for every combination of optional actions', () => {
-        for (const show_edit_button of [false, true]) {
+    it('separates only Save for every combination of optional actions', () => {
+        for (const editable of [false, true]) {
             for (const show_formatting_button of [false, true]) {
                 const { container } = render_toolbar({
-                    show_edit_button,
+                    editable,
                     show_formatting_button,
                     show_excel_header_button: true,
                 });
                 const labels = get_action_labels(container);
 
-                if (!show_edit_button) {
+                if (!editable) {
                     expect(labels).not.toContain('|');
                     expect(labels).toEqual([
                         ...(show_formatting_button ? ['Formatting'] : []),
@@ -345,7 +414,7 @@ describe('Toolbar', () => {
                 } else {
                     expect(labels.filter((label) => label === '|')).toHaveLength(1);
                     expect(labels).toEqual([
-                        'Edit',
+                        'Save',
                         '|',
                         ...(show_formatting_button ? ['Formatting'] : []),
                         'Header Row',
@@ -921,11 +990,12 @@ describe('Toolbar scope menus', () => {
         // the Formatting tooltip sitting underneath it.
         render_toolbar({
             auto_fit_scope_menu: scope_menu(),
-            show_edit_button: true,
+            editable: true,
+            is_dirty: true,
         });
 
-        dispatch_mouse_event(get_button('Edit'), 'mouseover');
-        expect(get_tooltip()?.textContent).toBe('Enter edit mode to modify cell values.');
+        dispatch_mouse_event(get_button('Save'), 'mouseover');
+        expect(get_tooltip()?.textContent).toBe('Save changes to the file.');
 
         open_caret();
         expect(get_tooltip()).toBeNull();
@@ -1002,11 +1072,11 @@ describe('Toolbar scope menus', () => {
     }
 
     it('closes an open menu when any toolbar button is pressed', async () => {
-        render_toolbar({ auto_fit_scope_menu: scope_menu(), show_edit_button: true });
+        render_toolbar({ auto_fit_scope_menu: scope_menu(), editable: true });
         open_caret();
         await arm_dismissal();
 
-        await act(async () => get_button('Edit').dispatchEvent(
+        await act(async () => get_button('Save').dispatchEvent(
             new MouseEvent('pointerdown', { bubbles: true, cancelable: true }),
         ));
         expect(document.querySelector('[role="menu"]')).toBeNull();

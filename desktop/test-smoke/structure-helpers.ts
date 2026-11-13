@@ -152,30 +152,29 @@ export async function undo_menu_label(app: ElectronApplication): Promise<string>
     return history_menu_item('undo', state).label;
 }
 
-export function edit_toggle(page: Page): Locator {
-    return page.getByRole('button', { name: 'Edit' });
+/**
+ * The toolbar's Save button. It is there for any file that can be edited, and
+ * carries `has-unsaved` exactly while there are changes to save.
+ */
+export function save_button(page: Page): Locator {
+    return page.getByRole('button', { name: 'Save' });
 }
 
-export async function enter_edit_mode(page: Page): Promise<void> {
-    const toggle = edit_toggle(page);
-    await toggle.click();
-    await expect(toggle).toHaveAttribute('aria-pressed', 'true');
-    // The accessibility rows mount after the toggle flips.
+/**
+ * Wait until the grid can take a gesture. There is no edit mode to enter: the
+ * first editing gesture acquires the session behind it.
+ */
+export async function wait_for_grid(page: Page): Promise<void> {
+    await expect(save_button(page)).toBeVisible();
     await expect.poll(() => page.locator('tbody tr').count(), { timeout: 30_000 })
         .toBeGreaterThan(0);
 }
 
-/**
- * Leave Edit mode with Save Edits. The dialog capture answers the first
- * button, which is Save Edits.
- */
-export async function leave_edit_mode_saving(app: ElectronApplication, page: Page): Promise<void> {
-    await edit_toggle(page).click();
-    await expect(edit_toggle(page)).toHaveAttribute('aria-pressed', 'false', { timeout: 30_000 });
-    expect(await take_dialogs(app)).toEqual([{
-        message: 'Leave edit mode?',
-        buttons: ['Save Edits', 'Discard Edits', 'Stay in Edit Mode'],
-    }]);
+/** Save through the toolbar and wait until nothing is left unsaved. */
+export async function save_changes(page: Page): Promise<void> {
+    await expect(save_button(page)).toHaveClass(/has-unsaved/);
+    await save_button(page).click();
+    await expect(save_button(page)).not.toHaveClass(/has-unsaved/, { timeout: 30_000 });
 }
 
 async function canvas_box(page: Page): Promise<{ x: number; y: number }> {

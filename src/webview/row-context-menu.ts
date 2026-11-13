@@ -31,7 +31,7 @@ export interface RowContextMenuModelProps {
     show_disabled_remove_pending_rows?: boolean;
     on_cancel_row_removals?: () => void;
     /**
-     * Delete row(s), offered in Edit mode when structural editing is on. It
+     * Delete row(s), offered in an editable file when structural editing is on. It
      * replaces "Remove pending row(s)", whose props are then ignored.
      */
     delete_rows?: StructureMenuAction;

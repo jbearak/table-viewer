@@ -350,12 +350,9 @@ async function stage_pending_change(
     const rows = page.locator('tbody tr');
     await expect.poll(() => rows.count()).toBeGreaterThan(0);
     const initial_row_count = await rows.count();
-    const edit_toggle = page.getByRole('button', { name: 'Edit' });
-    await edit_toggle.click();
-    await expect(edit_toggle).toHaveAttribute('aria-pressed', 'true');
     await scenario.stage(page);
     await expect(rows).toHaveCount(initial_row_count + scenario.appendedRows);
-    await expect(edit_toggle).toHaveClass(/has-unsaved/);
+    await expect(page.getByRole('button', { name: 'Save' })).toHaveClass(/has-unsaved/);
 }
 
 async function force_exit(app: ElectronApplication | undefined): Promise<void> {
@@ -453,14 +450,14 @@ async function switch_worksheets(launched: LifecycleApp): Promise<void> {
     await expect(original).toHaveClass(/active/);
 }
 
-async function leave_edit_mode(
+async function save_pending_change(
     launched: LifecycleApp,
     scenario: PendingChangeScenario,
 ): Promise<void> {
-    const edit_toggle = launched.page.getByRole('button', { name: 'Edit' });
-    await edit_toggle.click();
+    const save = launched.page.getByRole('button', { name: 'Save' });
+    await save.click();
     try {
-        await expect(edit_toggle).toHaveAttribute('aria-pressed', 'false');
+        await expect(save).not.toHaveClass(/has-unsaved/);
     } catch (error) {
         const state = await shutdown_state(launched.app);
         const detail = error instanceof Error ? error.message : String(error);
@@ -473,24 +470,24 @@ async function leave_edit_mode(
     ).rowCount).toBe(launched.initialRowCount + scenario.appendedRows);
     const saved = await read_lifecycle_file(launched.filePath, launched.fileVariant);
     for (const marker of scenario.savedMarkers) expect(saved.values).toContain(marker);
-    await expect(edit_toggle).not.toHaveClass(/has-unsaved/);
+    await expect(launched.page.getByRole('button', { name: 'Discard' })).toHaveCount(0);
     const state = await shutdown_state(launched.app);
     expect(state.viewerCount).toBe(1);
-    expect(state.dialogs.some((dialog) => dialog.buttons?.join('|')
-        === 'Save Edits|Discard Edits|Stay in Edit Mode')).toBe(true);
+    // Saving is a button, not an answer to a question.
+    expect(state.dialogs).toEqual([]);
     await switch_worksheets(launched);
 }
 
 for (const variant of lifecycle_file_variants) {
     test.describe(variant.name, () => {
         for (const scenario of pending_change_scenarios) {
-            test(`leaves Edit mode after ${scenario.name}`, async () => {
+            test(`saves from the toolbar after ${scenario.name}`, async () => {
                 await with_lifecycle_app(
                     `tv-edit-exit-${variant.id}-${scenario.id}-`,
                     variant,
                     async (launched) => {
                         await stage_pending_change(launched.page, scenario);
-                        await leave_edit_mode(launched, scenario);
+                        await save_pending_change(launched, scenario);
                     },
                 );
             });
@@ -507,19 +504,23 @@ for (const variant of lifecycle_file_variants) {
             });
         }
 
-        test('leaves a clean Edit mode', async () => {
+        test('an editor opened and cancelled leaves nothing unsaved', async () => {
             await with_lifecycle_app(
                 `tv-clean-edit-exit-${variant.id}-`,
                 variant,
                 async (launched) => {
-                    const edit_toggle = launched.page.getByRole('button', {
-                        name: 'Edit',
-                    });
-                    await edit_toggle.click();
-                    await expect(edit_toggle).toHaveAttribute('aria-pressed', 'true');
-                    await edit_toggle.click();
-                    await expect(edit_toggle).toHaveAttribute('aria-pressed', 'false');
-                    await expect(edit_toggle).not.toHaveClass(/has-unsaved/);
+                    const { page } = launched;
+                    const cell = page.locator('#glide-cell-1-0');
+                    await cell.focus();
+                    await expect(cell).toHaveAttribute('aria-selected', 'true');
+                    await page.keyboard.press('Enter');
+                    const editor = page.locator('.cell-editor-input');
+                    await expect(editor).toBeVisible();
+                    await page.keyboard.press('Escape');
+                    await expect(editor).toBeHidden();
+                    const save = page.getByRole('button', { name: 'Save' });
+                    await expect(save).not.toHaveClass(/has-unsaved/);
+                    await expect(save).toHaveAttribute('aria-disabled', 'true');
                     const state = await shutdown_state(launched.app);
                     expect(state.dialogs).toEqual([]);
                     await switch_worksheets(launched);

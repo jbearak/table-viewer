@@ -11,7 +11,7 @@ import type {
     PerFileState,
 } from '../types';
 import { decode_stored_per_file_state } from '../types';
-import type { EditingHandle } from '../webview/grid-shell';
+import type { EditingHandle, GridFocusHandle } from '../webview/grid-shell';
 import {
     create_edit_session_store,
     type EditSessionStore,
@@ -47,7 +47,15 @@ const grid_mock = vi.hoisted(() => ({
         }) => void;
         scrollOffsetX?: number;
         scrollOffsetY?: number;
+        onOverlayOpenRequest?: (cell: [number, number], initial: string | undefined) => boolean;
+        onPasteAdmission?: () => Promise<unknown> | undefined;
+        rowHeight?: number | ((row: number) => number);
+        gridSelection?: { current?: { cell: [number, number] } };
     },
+    // The imperative half of the DataEditor stub: what the shell asks the grid
+    // to do, as opposed to what it hands it.
+    open_overlay: vi.fn((_cell: [number, number], _initial?: string): boolean => true),
+    focus: vi.fn(),
     // Display row → canonical source row, and source row → that row's raw text.
     //
     // Both default to the identity/one-row fixture below, which is what a CSV
@@ -87,6 +95,8 @@ vi.mock('../webview/glide-data-grid', () => {
                 updateCells: vi.fn(),
                 scrollTo: vi.fn(),
                 dismissOverlay: vi.fn(),
+                openOverlay: grid_mock.open_overlay,
+                focus: grid_mock.focus,
             }));
             return React.createElement(
                 'div',
@@ -243,6 +253,13 @@ async function render_grid(
             sheet_index: number,
             after_order?: number,
         ) => string;
+        // Editing without a session held yet.
+        edit_mode?: boolean;
+        edit_session_id?: string;
+        on_request_edit_session?: (quiet?: boolean) => Promise<boolean>;
+        on_edit_session_idle?: () => void;
+        row_heights?: Record<number, number>;
+        grid_focus_ref?: React.MutableRefObject<GridFocusHandle | null>;
     } = {},
 ) {
     vi.resetModules();
@@ -356,9 +373,21 @@ async function render_grid(
         root!.render(React.createElement(GridShell, props));
     });
 
+    // Render again with some props replaced, as App does when its state moves.
+    const rerender = async (overrides: Record<string, unknown>) => {
+        await act(async () => {
+            root!.render(React.createElement(GridShell, {
+                ...props,
+                ...overrides,
+            } as React.ComponentProps<typeof GridShell>));
+        });
+    };
+
     return {
         post_message,
         editing_ref,
+        rerender,
+        edit_session: test_edit_session,
         rerender_save_lifecycle,
         rerender_highlight_in_flight,
         remount_at_generation,
@@ -442,6 +471,9 @@ afterEach(() => {
     save_lifecycle_revision = 0;
     document.body.innerHTML = '';
     grid_mock.props = null;
+    grid_mock.open_overlay.mockReset();
+    grid_mock.open_overlay.mockImplementation(() => true);
+    grid_mock.focus.mockReset();
     // Back to the identity mapping: a leaked permutation would silently change
     // which source row every later test's edits land on.
     grid_mock.source_row_for_display = null;
@@ -1759,5 +1791,210 @@ describe('GridShell host-rejected save keys', () => {
 
         await act(async () => { editing_ref.current!.discard_keys(['0:0']); });
         expect(statuses.at(-1)!.conflicted).toEqual([]);
+    });
+});
+
+describe('GridShell editing with no session held yet', () => {
+    /** A grant App can settle from the test, like the host answering. */
+    function session_request() {
+        let settle!: (granted: boolean) => void;
+        const request = vi.fn(() => new Promise<boolean>((resolve) => { settle = resolve; }));
+        return { request, grant: () => settle(true), refuse: () => settle(false) };
+    }
+    const no_session = { edit_mode: false, edit_session_id: undefined } as const;
+    const flush = async () => { await act(async () => { await Promise.resolve(); }); };
+
+    it('lets a cell answer an editing gesture, and asks the grid to check first', async () => {
+        const { request } = session_request();
+        await render_grid(undefined, { ...no_session, on_request_edit_session: request });
+
+        const cell = grid_mock.props!.getCellContent!([0, 0]);
+        expect(cell.allowOverlay).toBe(true);
+        expect(cell.readonly).not.toBe(true);
+        expect(grid_mock.props!.onOverlayOpenRequest).toBeTypeOf('function');
+        expect(grid_mock.props!.onPasteAdmission).toBeTypeOf('function');
+        // Nothing was asked of the host for merely being shown.
+        expect(request).not.toHaveBeenCalled();
+    });
+
+    it('offers no editing gesture when no session can be requested', async () => {
+        await render_grid(undefined, no_session);
+
+        expect(grid_mock.props!.getCellContent!([0, 0]).allowOverlay).toBe(false);
+        expect(grid_mock.props!.onOverlayOpenRequest).toBeUndefined();
+        expect(grid_mock.props!.onPasteAdmission).toBeUndefined();
+        expect(grid_mock.props!.onPaste).toBe(false);
+    });
+
+    it('holds an editor request for the session and opens it on the grant, with what was typed', async () => {
+        const { request, grant } = session_request();
+        const { rerender, editing_ref } = await render_grid(undefined, {
+            ...no_session,
+            on_request_edit_session: request,
+        });
+
+        // The first key starts the edit; the grid opens nothing itself.
+        expect(grid_mock.props!.onOverlayOpenRequest!([0, 0], 'h')).toBe(true);
+        expect(request).toHaveBeenCalledTimes(1);
+        expect(grid_mock.open_overlay).not.toHaveBeenCalled();
+        expect(editing_ref.current!.session_busy()).toBe(true);
+        // Keys typed while the host answers belong to the same edit.
+        expect(grid_mock.props!.onOverlayOpenRequest!([0, 0], 'i')).toBe(true);
+        expect(request).toHaveBeenCalledTimes(1);
+
+        grant();
+        await flush();
+        // Granted, but the grid that holds the session has not rendered yet.
+        expect(grid_mock.open_overlay).not.toHaveBeenCalled();
+        await rerender({ edit_mode: true, edit_session_id: 'session-1', on_request_edit_session: undefined });
+        await flush();
+
+        expect(grid_mock.open_overlay).toHaveBeenCalledTimes(1);
+        expect(grid_mock.open_overlay).toHaveBeenCalledWith([0, 0], 'hi');
+        // Under the session the grid opens editors itself again.
+        expect(grid_mock.props!.onOverlayOpenRequest).toBeUndefined();
+        // Still in use until the editor it asked for has mounted or been refused.
+        expect(editing_ref.current!.session_busy()).toBe(true);
+    });
+
+    it('drops the editor request when the host refuses, and says the session is not in use', async () => {
+        const { request, refuse } = session_request();
+        const on_edit_session_idle = vi.fn();
+        const { editing_ref } = await render_grid(undefined, {
+            ...no_session,
+            on_request_edit_session: request,
+            on_edit_session_idle,
+        });
+
+        grid_mock.props!.onOverlayOpenRequest!([0, 0], undefined);
+        refuse();
+        await flush();
+
+        expect(grid_mock.open_overlay).not.toHaveBeenCalled();
+        expect(editing_ref.current!.session_busy()).toBe(false);
+        expect(on_edit_session_idle).toHaveBeenCalled();
+        // The next gesture asks again rather than joining a request that ended.
+        grid_mock.props!.onOverlayOpenRequest!([0, 0], undefined);
+        expect(request).toHaveBeenCalledTimes(2);
+    });
+
+    it('applies a delete made before the session existed once it is granted', async () => {
+        const { request, grant } = session_request();
+        const { rerender, edit_session } = await render_grid(undefined, {
+            ...no_session,
+            on_request_edit_session: request,
+        });
+
+        let result: unknown;
+        await act(async () => {
+            result = grid_mock.props!.onCellsEdited!(
+                [{ location: [0, 0], value: { kind: 'text', data: '' } }],
+                'delete',
+            );
+        });
+        // Not applied yet, and not lost: the session is on its way.
+        expect(result).toBe('refused');
+        expect(request).toHaveBeenCalledTimes(1);
+        expect(edit_session!.snapshot().size).toBe(0);
+
+        grant();
+        await flush();
+        await rerender({ edit_mode: true, edit_session_id: 'session-1', on_request_edit_session: undefined });
+        await flush();
+
+        expect([...edit_session!.snapshot()]).toEqual([
+            ['0:0', expect.objectContaining({ value: '', base: 'base' })],
+        ]);
+    });
+
+    it('does not replay a delete when the host refuses', async () => {
+        const { request, refuse } = session_request();
+        const { edit_session } = await render_grid(undefined, {
+            ...no_session,
+            on_request_edit_session: request,
+        });
+
+        await act(async () => {
+            grid_mock.props!.onCellsEdited!(
+                [{ location: [0, 0], value: { kind: 'text', data: '' } }],
+                'delete',
+            );
+        });
+        refuse();
+        await flush();
+
+        expect(edit_session!.snapshot().size).toBe(0);
+    });
+
+    it('makes a paste wait for the session', async () => {
+        const { request, grant } = session_request();
+        const { rerender } = await render_grid(undefined, {
+            ...no_session,
+            on_request_edit_session: request,
+        });
+
+        let admitted = false;
+        void Promise.resolve(grid_mock.props!.onPasteAdmission!()).then(() => { admitted = true; });
+        await flush();
+        expect(request).toHaveBeenCalledTimes(1);
+        expect(admitted).toBe(false);
+
+        grant();
+        await flush();
+        await rerender({ edit_mode: true, edit_session_id: 'session-1', on_request_edit_session: undefined });
+        await flush();
+
+        expect(admitted).toBe(true);
+        // And the grid it resumes against accepts the paste.
+        expect(grid_mock.props!.onPaste).not.toBe(false);
+    });
+});
+
+describe('GridShell row heights handed to the grid', () => {
+    it('hands the grid one number while every row has the default height', async () => {
+        await render_grid();
+        // A number is arithmetic for the grid; a function is a walk over every
+        // row on every render, which is what made large files slow to scroll.
+        expect(grid_mock.props!.rowHeight).toBeTypeOf('number');
+    });
+
+    it('keeps the number while cells are edited', async () => {
+        await render_grid();
+        await edit_cell('changed');
+        expect(grid_mock.props!.rowHeight).toBeTypeOf('number');
+    });
+
+    it('hands the grid a function once a row has a height of its own', async () => {
+        await render_grid(undefined, { row_heights: { 0: 60 } });
+        const row_height = grid_mock.props!.rowHeight;
+        expect(row_height).toBeTypeOf('function');
+        expect((row_height as (row: number) => number)(0)).toBe(60);
+    });
+});
+
+describe('GridShell focus with a selection already made', () => {
+    it('ignores the first-cell default the grid applies when it is focused', async () => {
+        const grid_focus_ref: React.MutableRefObject<GridFocusHandle | null> = { current: null };
+        await render_grid(
+            { visible_to_source: [0, 1, 2], source_to_visible: [0, 1, 2], hidden_count: 0 },
+            { grid_focus_ref },
+        );
+        const selection = (cell: [number, number]) => ({
+            columns: { length: 0 },
+            rows: { length: 0 },
+            current: { cell, range: { x: cell[0], y: cell[1], width: 1, height: 1 }, rangeStack: [] },
+        });
+        await act(async () => { grid_mock.props!.onGridSelectionChange!(selection([2, 0])); });
+        expect(grid_mock.props!.gridSelection?.current?.cell).toEqual([2, 0]);
+
+        // The real grid decides "nothing is selected" from its last render and
+        // selects its first cell from inside the focus call.
+        grid_mock.focus.mockImplementation(() => {
+            grid_mock.props!.onGridSelectionChange!(selection([0, 0]));
+        });
+        await act(async () => { grid_focus_ref.current!.focus(); });
+
+        expect(grid_mock.focus).toHaveBeenCalled();
+        expect(grid_mock.props!.gridSelection?.current?.cell).toEqual([2, 0]);
     });
 });

@@ -23,7 +23,7 @@ export interface CellContextMenuModelProps {
     on_open_link?: () => void;
     /** Set alongside `on_open_link`: copy the link's URL to the clipboard. */
     on_copy_link?: () => void;
-    /** Set when this cell's hyperlink is editable (Edit mode, resolved source
+    /** Set when this cell's hyperlink is editable (editing session held, resolved source
      *  identity, a sheet whose format carries links). Opens the dialog. */
     on_edit_hyperlink?: () => void;
     /** True when the cell already has a link, which only changes the wording:

@@ -82,7 +82,7 @@ export interface DesktopSettings {
     csvMaxRows: number;
     maxFileSizeMiB: number;
     maxStoredFiles: number;
-    /** Whether Diff starts on when Edit mode is entered, so edits show the original value too. */
+    /** Whether Diff starts on when editing starts, so edits show the original value too. */
     diffOnByDefault: boolean;
     /** Check the release feed once after the desktop app finishes opening. */
     automaticallyCheckForUpdates: boolean;

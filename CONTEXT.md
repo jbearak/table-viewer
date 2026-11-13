@@ -31,6 +31,10 @@ _Avoid_: Added row
 An Appended Row held in an editing session that is not yet part of the workbook on disk.
 _Avoid_: Unsaved physical row, temporary row
 
+**Editing session**:
+The host's grant that lets one panel hold Pending Changes for a workbook. The first editing gesture acquires it and it is released once it holds nothing; a person never enters or leaves it.
+_Avoid_: Edit mode
+
 **Pending Change**:
 An unsaved change owned by an editing session: a cell change, a Pending Row, a Pending Column, a Pending Row Removal, a Pending Column Removal, a Moved Row or Column, or a Pending Tail Removal.
 _Avoid_: Pending edit, dirty edit

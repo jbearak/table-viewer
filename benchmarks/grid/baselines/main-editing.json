@@ -1,0 +1,47 @@
+{
+  "meta": {
+    "date": "2026-11-13T21:35:04.433Z",
+    "node": "v26.12.1",
+    "platform": "darwin",
+    "arch": "arm64",
+    "label": "baseline-editing"
+  },
+  "scenarios": {
+    "csv-200k": {
+      "open_canvas_ms": 461,
+      "open_first_cell_ms": 756,
+      "scroll_p50_ms": 16.7,
+      "scroll_p95_ms": 18.1,
+      "scroll_long_frames": 0,
+      "scroll_total_ms": 11942.2,
+      "scroll_script_ms": 1238.29,
+      "scroll_task_ms": 1653.39
+    },
+    "csv-200k-editing": {
+      "scroll_p50_ms": 16.7,
+      "scroll_p95_ms": 18.1,
+      "scroll_long_frames": 0,
+      "scroll_total_ms": 11953.8,
+      "scroll_script_ms": 1231.74,
+      "scroll_task_ms": 1791.29
+    },
+    "xlsx-merged-5k": {
+      "open_canvas_ms": 622,
+      "open_first_cell_ms": 904,
+      "scroll_p50_ms": 16.7,
+      "scroll_p95_ms": 18,
+      "scroll_long_frames": 0,
+      "scroll_total_ms": 11964.7,
+      "scroll_script_ms": 1295.67,
+      "scroll_task_ms": 1702.95
+    },
+    "xlsx-merged-5k-editing": {
+      "scroll_p50_ms": 16.7,
+      "scroll_p95_ms": 18.1,
+      "scroll_long_frames": 0,
+      "scroll_total_ms": 11959.5,
+      "scroll_script_ms": 1326.83,
+      "scroll_task_ms": 1833.17
+    }
+  }
+}

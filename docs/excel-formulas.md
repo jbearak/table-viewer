@@ -4,7 +4,7 @@ Table Viewer reads and edits formulas in modern Excel (`.xlsx`) workbooks. Legac
 
 ## Viewing and editing formulas
 
-Formula cells display their cached result from the workbook. In edit mode, opening a formula cell shows its formula text, including the leading `=`. Saving text that begins with `=` writes an Excel formula unless the cell contains styled text runs, in which case it is saved as text.
+Formula cells display their cached result from the workbook. Opening a formula cell for editing shows its formula text, including the leading `=`. Saving text that begins with `=` writes an Excel formula unless the cell contains styled text runs, in which case it is saved as text.
 
 After an edit, Table Viewer recalculates affected formulas when it can. Its built-in calculator supports:
 
@@ -25,7 +25,7 @@ Column names match without regard to case. Blank names and duplicate names canno
 
 Column references include hidden and filtered rows and do not follow display sorting. They exclude the promoted header and any rows above it. A full column is a range, so use it with a supported function such as `=SUM([Revenue])`; a cell cannot display `=[Revenue]`. If Table Viewer cannot calculate a formula, it shows the reason, such as `?? (unknown column)`, `?? (ambiguous column)`, or `?? (row outside worksheet body)`.
 
-This is smaller than Excel's structured-reference language. Table Viewer does not support table names, `#Data`, `#Headers`, `#Totals`, column spans, or unions. The useful difference is that you do not have to format a range as an Excel table. Turning on **Header Row** is enough. Right-click a column while in Edit mode and choose **Rename column…** to change the workbook's header cell and update references to that column. Rename is disabled when the name is inherited from the anchor of a vertical merge because the promoted row has no editable header cell in that column.
+This is smaller than Excel's structured-reference language. Table Viewer does not support table names, `#Data`, `#Headers`, `#Totals`, column spans, or unions. The useful difference is that you do not have to format a range as an Excel table. Turning on **Header Row** is enough. Right-click a column and choose **Rename column…** to change the workbook's header cell and update references to that column. Rename is disabled when the name is inherited from the anchor of a vertical merge because the promoted row has no editable header cell in that column.
 
 Table Viewer preserves this formula syntax in the `.xlsx`. Excel may not calculate it unless the worksheet cells belong to a real Excel table; Table Viewer does not create an OOXML table region behind your back.
 

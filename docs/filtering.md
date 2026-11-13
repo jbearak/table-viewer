@@ -73,6 +73,6 @@ Examining a large column can take a moment. While that happens the editor may sh
 
 ## Limits and special cases
 
-- CSV and TSV tables can be filtered like any other, with two exceptions. Filtering pauses while you are editing the table (after clicking the **Edit** button) and resumes when you leave edit mode. And it is not available in the read-only preview that **Open Preview to the Side** shows next to the text editor, because that preview scrolls in step with the source text; use **Open as Table** to filter the file.
+- CSV and TSV tables can be filtered like any other, with two exceptions. While the table has unsaved edits, rows stay where they are: you can still add or change a filter, and the view catches up with your new values once you save. And filtering is not available in the read-only preview that **Open Preview to the Side** shows next to the text editor, because that preview scrolls in step with the source text; use **Open as Table** to filter the file.
 - When a worksheet with merged cells is filtered, sorted, or has hidden columns, the merged cells are temporarily shown separately, with the value in the original top-left cell and the other cells blank. The merged layout returns once no filters or sorts are active and all columns are visible again.
 - Saved filters are tied to the worksheet's column layout. If a reloaded file has a different worksheet name, column count, or column names, Table Viewer removes the saved filters rather than risk applying them to the wrong columns.

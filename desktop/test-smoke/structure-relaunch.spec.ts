@@ -12,14 +12,14 @@ import { expect, test } from '@playwright/test';
 import { isolated_user_data, state_database_path } from './smoke-helpers';
 import {
     choose,
-    edit_toggle,
-    enter_edit_mode,
+    save_button,
+    wait_for_grid,
     exit_app,
     grid_headers,
     grid_rows,
     install_dialog_capture,
     launch_structural_viewer,
-    leave_edit_mode_saving,
+    save_changes,
     open_column_menu,
     open_row_menu,
     save_screenshot,
@@ -55,7 +55,7 @@ test('unsaved row and column changes survive closing the window and relaunching,
         try {
             const page = first.page;
             await install_dialog_capture(first.app, close_dialogs);
-            await enter_edit_mode(page);
+            await wait_for_grid(page);
             await choose(await open_row_menu(page, 1), 'Insert row above');
             await expect.poll(async () => (await grid_rows(page))[1]).toBe('Row 2, inserted||');
             await type_into_cell(page, 1, 1, 'kiwi');
@@ -89,10 +89,8 @@ test('unsaved row and column changes survive closing the window and relaunching,
         try {
             const page = second.page;
             await install_dialog_capture(second.app);
-            await expect(edit_toggle(page)).toHaveClass(/has-unsaved/, { timeout: 30_000 });
-            if (await edit_toggle(page).getAttribute('aria-pressed') !== 'true') {
-                await enter_edit_mode(page);
-            }
+            await expect(save_button(page)).toHaveClass(/has-unsaved/, { timeout: 30_000 });
+            await wait_for_grid(page);
             await expect.poll(() => grid_rows(page), { timeout: 30_000 }).toEqual([
                 '|apple|1|crisp',
                 'Row 2, inserted|kiwi||',
@@ -104,10 +102,10 @@ test('unsaved row and column changes survive closing the window and relaunching,
                 .toEqual(['|name', '|qty', 'Column C, inserted|New column']);
             await save_screenshot(page, '08-relaunch-restored-drafts');
 
-            await leave_edit_mode_saving(second.app, page);
+            await save_changes(page);
             await expect.poll(() => fs.readFileSync(file, 'utf8'))
                 .toBe('name,qty,New column\napple,1,crisp\nkiwi,,\nbanana,2,\ndate,4,\n');
-            await expect(edit_toggle(page)).not.toHaveClass(/has-unsaved/);
+            await expect(save_button(page)).not.toHaveClass(/has-unsaved/);
         } finally {
             await exit_app(second.app);
         }

@@ -623,7 +623,7 @@ interface ViewerProfileBase {
 /**
  * A viewer profile, discriminated on whether it can edit.
  *
- * `editing` gates csvEditingSupported and the saveCsv/pendingEdits/showSaveDialog
+ * `editing` gates csvEditingSupported and the saveCsv/pendingEdits
  * handling; `plan_save` is what a save actually calls. They live on the same arm
  * of the union so a profile cannot claim the first without supplying the second —
  * the alternative is a runtime "this file type cannot be saved" error thrown from
@@ -3133,9 +3133,6 @@ export function attach_viewer(
     let active_edit_session_request: ReceiverRequest | undefined;
     let edit_admission_closed = false;
     let active_edit_claim: symbol | undefined;
-    let active_save_dialog_request: (ReceiverRequest & {
-        readonly editSessionId: string;
-    }) | undefined;
     let pending_edit_writes: Promise<void> = Promise.resolve();
     let pending_edit_sequence_session_id: string | undefined;
     let highest_pending_edit_sequence = 0;
@@ -4592,7 +4589,6 @@ export function attach_viewer(
             || !renderer_ready
             || !session.acknowledged_current()
             || !source
-            || active_save_dialog_request
         ) return;
         for (const request of [...pending_sheet_selections]) {
             const sheets = source.meta().sheets;
@@ -12779,7 +12775,6 @@ export function attach_viewer(
                 // longer remembers asking would only hold memory.
                 replay_leases.clear();
                 replay_preparation_in_flight = false;
-                active_save_dialog_request = undefined;
                 pending_edit_sequence_session_id = undefined;
                 highest_pending_edit_sequence = 0;
                 highest_acknowledged_edit_sequence = 0;
@@ -13400,6 +13395,25 @@ export function attach_viewer(
                     });
                     return;
                 }
+                // A session is released as soon as it holds nothing unsaved and
+                // acquired again by the next editing gesture, so a request can
+                // arrive while this panel's own release is still settling its
+                // writes. That is a wait of one state write, not a refusal: the
+                // gesture behind the request would otherwise be dropped for a
+                // reason about timing rather than about the document.
+                const own_release = active_edit_release;
+                if (own_release !== undefined) {
+                    await own_release.completion.catch(() => undefined);
+                    if (edit_admission_closed) {
+                        void post_to_receiver({
+                            type: 'editSessionResult',
+                            requestId: msg.requestId,
+                            granted: false,
+                            sheetIndex: requested_sheet_index,
+                        });
+                        return;
+                    }
+                }
                 cancel_edit_claim(active_edit_claim);
                 const request: ReceiverRequest = {
                     requestId: msg.requestId,
@@ -13664,6 +13678,10 @@ export function attach_viewer(
                         || pending_changes_carry_layout(pendingChanges)
                     ) ? { pendingChanges } : {}),
                 }, request.receiverEpoch);
+                // A quiet request is one the user did not make as an edit — a menu
+                // opening that would offer editing items — so its refusal leaves
+                // those items unavailable and says nothing.
+                if (msg.quiet === true) return;
                 if (denied_by_layout_peer) {
                     show_owner_warning('Reload this window to keep editing this file.');
                 } else if (denied_by_unresolved_save) {
@@ -13678,7 +13696,7 @@ export function attach_viewer(
                         'This file is already being edited in another Table Viewer tab.');
                 } else if (denied_by_transform) {
                     show_owner_warning(
-                        'Wait for sorting and filtering to finish before entering edit mode.');
+                        'Wait for sorting and filtering to finish before editing.');
                 }
                 return;
             }
@@ -14359,7 +14377,6 @@ export function attach_viewer(
             }
             case 'releaseEditSession':
                 if (editing_supported && edit_message_is_current(msg.editSessionId)) {
-                    active_save_dialog_request = undefined;
                     await release_edit_session(msg.editSessionId);
                     if (!disposed) await refresh_session_state_material(false);
                 }
@@ -14369,7 +14386,6 @@ export function attach_viewer(
                     const writing = active_save_operation?.phase === 'writing'
                         && active_save_operation.identity.editSessionId === msg.editSessionId;
                     if (writing) return;
-                    active_save_dialog_request = undefined;
                     // As release and save do: fence new writes, let every write
                     // that crossed first settle, which hands the ledgers' IDs
                     // history still names to the retained stores (so Undo after
@@ -15635,30 +15651,6 @@ export function attach_viewer(
                 waiter.reject(new Error(
                     'Viewer renderer could not complete the pending-edit flush.',
                 ));
-                return;
-            }
-            case 'showSaveDialog': {
-                if (!editing_supported || !edit_message_is_current(msg.editSessionId)) return;
-                const request = {
-                    requestId: msg.requestId,
-                    receiverEpoch: session.current_receiver_epoch,
-                    editSessionId: msg.editSessionId,
-                } as const;
-                active_save_dialog_request = request;
-                const choice = await host.ui.show_save_discard_dialog();
-                if (
-                    active_save_dialog_request !== request
-                    || !receiver_request_is_current(request)
-                    || !edit_message_is_current(request.editSessionId)
-                ) return;
-                active_save_dialog_request = undefined;
-                await post_to_receiver({
-                    type: 'saveDialogResult',
-                    requestId: request.requestId,
-                    editSessionId: request.editSessionId,
-                    choice,
-                }, request.receiverEpoch);
-                flush_sheet_selections();
                 return;
             }
             case 'requestSourceDisplayRows': {
@@ -17209,7 +17201,6 @@ export function attach_viewer(
             cancel_ready_state_retry_waits();
             cancel_edit_cleanup_waiters();
             active_edit_session_request = undefined;
-            active_save_dialog_request = undefined;
             header_receipt_queue.length = 0;
             let first_error: unknown;
             const cleanup = (action: () => void) => {

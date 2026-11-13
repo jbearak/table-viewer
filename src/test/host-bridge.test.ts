@@ -294,6 +294,56 @@ describe('host-bridge', () => {
         expect(injected.postMessage).toHaveBeenCalledTimes(1);
     });
 
+    it('posts nothing for an empty map when the session has published nothing yet', async () => {
+        const injected = { postMessage: vi.fn() };
+        (globalThis as { __tableViewerHostBridge?: unknown })
+            .__tableViewerHostBridge = injected;
+        const { pending_changes_durability } = await import('../webview/host-bridge');
+        const empty = {
+            sheetIndex: 0,
+            sheetName: 'Sheet1',
+            cells: {},
+            formatTemplates: [],
+            appendedRows: [],
+            tailRemovals: [],
+            conflicts: [],
+        };
+
+        // A session begins holding what its grant handed over. An empty map
+        // then says only what the host knows, and saying it costs a durable
+        // write and a snapshot refresh on every session acquired.
+        expect(pending_changes_durability.publish('session:fresh', empty, 1)).toBe(0);
+        expect(injected.postMessage).not.toHaveBeenCalled();
+        expect(pending_changes_durability.has_publication('session:fresh', 0, 'Sheet1'))
+            .toBe(false);
+
+        // The first real edit is published, and so is the map going empty
+        // again after it: the host has to hear that the edit was taken back.
+        const edited = { ...empty, cells: { '0:0': { value: 'v', base: 'a' } } };
+        expect(pending_changes_durability.publish('session:fresh', edited, 1)).toBe(1);
+        expect(pending_changes_durability.publish('session:fresh', empty, 1)).toBe(2);
+        expect(injected.postMessage.mock.calls.map(([message]) => message.edits))
+            .toEqual([edited.cells, {}]);
+    });
+
+    it('still posts a forced empty map for a session that has published nothing', async () => {
+        const injected = { postMessage: vi.fn() };
+        (globalThis as { __tableViewerHostBridge?: unknown })
+            .__tableViewerHostBridge = injected;
+        const { pending_changes_durability } = await import('../webview/host-bridge');
+
+        expect(pending_changes_durability.publish('session:forced', {
+            sheetIndex: 0,
+            sheetName: 'Sheet1',
+            cells: {},
+            formatTemplates: [],
+            appendedRows: [],
+            tailRemovals: [],
+            conflicts: [],
+        }, 1, true)).toBe(1);
+        expect(injected.postMessage).toHaveBeenCalledTimes(1);
+    });
+
     it('records a complete snapshot when a cells-only publication clears a layout', async () => {
         const injected = { postMessage: vi.fn() };
         (globalThis as { __tableViewerHostBridge?: unknown })

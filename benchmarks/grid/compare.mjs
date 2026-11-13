@@ -19,6 +19,10 @@ const PCT_ALLOWANCE = {
     scroll_p50_ms: 5,
     scroll_p95_ms: 5,
     scroll_total_ms: 5,
+    // Main-thread work per scroll. Frame cadence saturates at the refresh
+    // rate, so this is what moves first when a cell gets more expensive.
+    scroll_script_ms: 10,
+    scroll_task_ms: 10,
 };
 const ABS_ALLOWANCE = {
     scroll_long_frames: 5,

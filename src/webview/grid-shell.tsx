@@ -307,6 +307,12 @@ const ROW_RESIZE_TOLERANCE_PX = 5;
  * launcher's occupied band (32px button + 8px insets on both sides).
  */
 const APPEND_DOCK_OVERSCROLL_PX = 96;
+/**
+ * The whole editing state of a clean cell on an editable sheet with no session:
+ * it opens an editor when asked. Shared, so marking every painted cell this way
+ * allocates nothing.
+ */
+const ARMED_CELL_OVERLAY: CellEditOverlay = Object.freeze({ editable: true });
 
 /** Module-level so the DataEditor prop is referentially stable. */
 const custom_renderers = [rich_text_cell_renderer];
@@ -531,6 +537,7 @@ import {
     host_bridge,
     pending_changes_durability,
 } from './host-bridge';
+import { pending_signal, type PendingSignal } from './pending-signal';
 import {
     create_pending_row_store,
     type PendingRowStoreChange,
@@ -1257,6 +1264,12 @@ export interface EditingHandle {
     flush_live_edit(): boolean;
     /** True when there are committed edits or an open editor with changes. */
     has_uncommitted_changes(): boolean;
+    /**
+     * True while the grid is doing something that needs the editing session
+     * although nothing is unsaved yet: a gesture waiting on the grant, an open
+     * editor, menu, dialog, or append surface.
+     */
+    session_busy(): boolean;
 }
 
 /** Imperative focus bridge used by App after generation-keyed remounts. */
@@ -1444,9 +1457,24 @@ export interface GridShellProps {
     ) => void;
     merges: MergeRange[];
     preview_mode?: boolean;
-    // Editing (Phase E). edit_mode is App-controlled (toolbar toggle); editing is
-    // only possible when csv_editable.
+    // Whether this panel holds the workbook's editing session. There is no mode
+    // for the user to enter: App acquires the session behind the first editing
+    // gesture (see `on_request_edit_session`) and releases it once nothing is
+    // unsaved. Editing is only possible when csv_editable.
     edit_mode?: boolean;
+    /**
+     * Ask App for the editing session, resolving once the host has granted or
+     * refused it. Supplied only while the file can be edited and no session is
+     * held, which is what makes cells accept an editing gesture before one
+     * exists: the grid holds the gesture, asks, and runs it on the grant.
+     * `quiet` marks a request the user did not make as an edit.
+     */
+    on_request_edit_session?: (quiet?: boolean) => Promise<boolean>;
+    /**
+     * Something only the grid can see has ended with nothing changed — an
+     * editor closed, a menu dismissed — so App may release an empty session.
+     */
+    on_edit_session_idle?: () => void;
     /** Diff toolbar toggle: dirty cells paint before/after instead of just the
      *  new value. App-owned so it survives Edit off/on within the session. */
     diff_mode?: boolean;
@@ -1458,7 +1486,8 @@ export interface GridShellProps {
      *  outside the row space, so a header-only edit never reaches the per-cell
      *  diff. Changed headers are annotated in the column title instead. */
     compare_changed_column_names?: readonly { col: number; base: string }[];
-    /** Parent-owned identity of the committed edit-mode activation. */
+    /** Parent-owned identity of the committed editing activation. It advances
+     *  whenever a session is acquired or released. */
     edit_activation_id: number;
     csv_editable?: boolean;
     /**
@@ -1660,6 +1689,8 @@ export function GridShell({
     merges,
     preview_mode = false,
     edit_mode = false,
+    on_request_edit_session,
+    on_edit_session_idle,
     diff_mode = false,
     git_compare = false,
     compare_changed_column_names,
@@ -1812,20 +1843,28 @@ export function GridShell({
     const preview_restore_timer_ref = useRef<number | null>(null);
     const preview_restore_token_ref = useRef(0);
 
+    // True for the duration of this shell's own focus call, whose focus event
+    // Glide handles synchronously. See `on_grid_selection_change`.
+    const focusing_grid_ref = useRef(false);
     const focus_grid = useCallback((): boolean => {
-        // Glide's ref can exist before its internal focus target is wired after a
-        // remount. Prefer the mounted tabbable element itself.
-        const target = grid_root_ref.current?.querySelector<HTMLElement>(
-            '[tabindex="0"]',
-        );
-        if (target) {
-            target.focus();
-            if (document.activeElement === target) return true;
+        focusing_grid_ref.current = true;
+        try {
+            // Glide's ref can exist before its internal focus target is wired after a
+            // remount. Prefer the mounted tabbable element itself.
+            const target = grid_root_ref.current?.querySelector<HTMLElement>(
+                '[tabindex="0"]',
+            );
+            if (target) {
+                target.focus();
+                if (document.activeElement === target) return true;
+            }
+            const grid = grid_ref.current;
+            if (!grid) return false;
+            grid.focus();
+            return grid_owns_focus(grid_root_ref.current, document.activeElement);
+        } finally {
+            focusing_grid_ref.current = false;
         }
-        const grid = grid_ref.current;
-        if (!grid) return false;
-        grid.focus();
-        return grid_owns_focus(grid_root_ref.current, document.activeElement);
     }, []);
 
     // Controlled selection. We intercept every change to snap it onto whole
@@ -3134,6 +3173,18 @@ export function GridShell({
         && !highlight_in_flight
         && !close_barrier_active;
     const editable_cells = append_admission_active && !append_in_flight;
+    // Editable, with no session behind it yet. Cells accept the same gestures
+    // they do under a session; each one asks App for the session first and runs
+    // on the grant. Nothing else about the grid changes, so a file that is only
+    // being read costs exactly what a read-only one does.
+    const edit_armed = !edit_mode
+        && on_request_edit_session !== undefined
+        && !preview_mode
+        && !save_in_flight
+        && !highlight_in_flight
+        && !close_barrier_active;
+    // Whether a cell answers an editing gesture at all, session or not.
+    const cells_accept_edits = editable_cells || edit_armed;
     // Stable row identities let cuts survive harmless sort/filter/projection
     // changes. Numeric fallback coordinates retain a separate generation guard.
     const clipboard_source = sheet_meta.worksheetId
@@ -3142,21 +3193,115 @@ export function GridShell({
     // through refs updated only by the committed tree: mutating them during render
     // would let an abandoned concurrent render change the mounted callbacks' view.
     const editable_cells_ref = useRef(editable_cells);
+    const edit_armed_ref = useRef(edit_armed);
     const append_admission_active_ref = useRef(append_admission_active);
     const edit_session_id_ref = useRef(edit_session_id);
+    const on_request_edit_session_ref = useRef(on_request_edit_session);
+    const on_edit_session_idle_ref = useRef(on_edit_session_idle);
+    /**
+     * Settled by the commit that makes this grid editable. The grant itself is
+     * App state, so the promise App returns resolves before React has rendered
+     * it; a gesture replayed then would meet the very gates it waited to pass.
+     */
+    const editable_commit_ref = useRef<PendingSignal<boolean> | null>(null);
     useLayoutEffect(() => {
         editable_cells_ref.current = editable_cells;
+        edit_armed_ref.current = edit_armed;
         append_admission_active_ref.current = append_admission_active;
         edit_session_id_ref.current = edit_session_id;
+        on_request_edit_session_ref.current = on_request_edit_session;
+        on_edit_session_idle_ref.current = on_edit_session_idle;
+        if (editable_cells) {
+            const committed = editable_commit_ref.current;
+            editable_commit_ref.current = null;
+            committed?.settle(true);
+        }
         return () => {
             // Async append admissions retain the callback that requested them.
             // Once this committed grid is replaced, that callback must not be
             // able to mutate its detached pending-row store.
             editable_cells_ref.current = false;
+            edit_armed_ref.current = false;
             append_admission_active_ref.current = false;
             edit_session_id_ref.current = undefined;
         };
-    }, [append_admission_active, editable_cells, edit_session_id]);
+    }, [
+        append_admission_active,
+        edit_armed,
+        editable_cells,
+        edit_session_id,
+        on_edit_session_idle,
+        on_request_edit_session,
+    ]);
+    useEffect(() => () => {
+        // A gesture still waiting when this grid goes away is told no.
+        const committed = editable_commit_ref.current;
+        editable_commit_ref.current = null;
+        committed?.settle(false);
+    }, []);
+    // Gestures waiting on the session. Counted so the session they are about
+    // to use is not released as empty in the moment before they run.
+    const session_requests_ref = useRef(0);
+    // What display coordinates currently mean. A gesture held for the session
+    // is replayed only if this has not changed underneath it.
+    const view_identity_ref = useRef('');
+    view_identity_ref.current = `${generation}:${source_generation}:${mapping_generation}`;
+    // An editor the grid was asked to open before a session existed, and the
+    // interval between asking Glide to open it and the editor mounting.
+    const overlay_intent_ref = useRef<{ cell: Item; initial: string | undefined } | null>(null);
+    const overlay_opening_ref = useRef(false);
+    const overlay_mounted_ref = useRef(false);
+    const session_surface_open_ref = useRef(false);
+    const on_cells_edited_ref = useRef<(
+        items: readonly EditListItem[],
+        source: CellEditSource,
+    ) => boolean | 'refused'>(() => 'refused');
+    /**
+     * Make this grid editable for a gesture, acquiring the session if there is
+     * none. Resolves true once the grid that holds the session has committed,
+     * so the caller may run the gesture through the ordinary gates; false when
+     * the file is not editable or the host refused.
+     */
+    const ensure_edit_session = useCallback(async (quiet = false): Promise<boolean> => {
+        if (editable_cells_ref.current) return true;
+        const request = on_request_edit_session_ref.current;
+        if (request === undefined || !edit_armed_ref.current) return false;
+        session_requests_ref.current += 1;
+        try {
+            if (!await request(quiet)) return false;
+            if (editable_cells_ref.current) return true;
+            const committed = editable_commit_ref.current ?? pending_signal<boolean>();
+            editable_commit_ref.current = committed;
+            return await committed.settled;
+        } finally {
+            session_requests_ref.current -= 1;
+        }
+    }, []);
+    // A row or column press that acquired the session for the drag it may
+    // become. Held until the button comes up, so the drop meets the session.
+    const drag_holds_session_ref = useRef(false);
+    /** Tell App the grid has let go of the session, after the current work settles. */
+    const notify_session_idle = useCallback(() => {
+        queueMicrotask(() => on_edit_session_idle_ref.current?.());
+    }, []);
+    const acquire_session_for_drag = useCallback(() => {
+        if (drag_holds_session_ref.current) return;
+        drag_holds_session_ref.current = true;
+        void ensure_edit_session(true);
+        // The button coming up ends the drag, and so does the window losing
+        // focus: a release outside it may never deliver a mouseup.
+        const release = () => {
+            window.removeEventListener('mouseup', release, true);
+            window.removeEventListener('blur', release);
+            // After every listener for this event, the grid's drop among them.
+            setTimeout(() => {
+                drag_holds_session_ref.current = false;
+                on_edit_session_idle_ref.current?.();
+            }, 0);
+        };
+        window.addEventListener('mouseup', release, true);
+        window.addEventListener('blur', release);
+    }, [ensure_edit_session]);
 
     useEffect(() => {
         if (
@@ -3393,12 +3538,13 @@ export function GridShell({
     // Populated once the truncated-cell tooltip helpers mount below; row menus
     // open from an earlier hook, so they clear via this ref rather than a TDZ.
     const hide_cell_tooltip_ref = useRef<() => void>(() => {});
-    // Row Delete and Restore appear in Edit mode only, and only when the host
-    // reports structural editing for this worksheet.
+    // Row Delete and Restore appear only where the file can be edited and the
+    // host reports structural editing for this worksheet.
     const structure_items_offered = structural_support !== undefined
-        && edit_mode
-        && csv_editable
-        && edit_session_id !== undefined;
+        && ((edit_mode && csv_editable && edit_session_id !== undefined)
+            // Before a session exists the items are offered all the same; the
+            // menu, shortcut, or drag that reaches for one acquires it.
+            || edit_armed);
     const promoted_header_row = sheet_meta.excelFirstRowHeader?.active === true
         ? sheet_meta.excelFirstRowHeader.sourceRow ?? 0
         : undefined;
@@ -4295,12 +4441,15 @@ export function GridShell({
         }
         return commit_staged_transaction(staged);
     }, [edit_session_id, history_capture, pending_store, show_pending_size_warning, store]);
-    const structure_gesture_admitted = useCallback((): boolean => (
-        editable_cells_ref.current
-        && !edit_admission_is_fenced()
+    /** The gates on a structural gesture other than the grid being editable. */
+    const structure_admission_open = useCallback((): boolean => (
+        !edit_admission_is_fenced()
         && !save_in_flight_ref.current
         && (gestures_admitted === undefined || gestures_admitted())
     ), [edit_admission_is_fenced, gestures_admitted, save_in_flight_ref]);
+    const structure_gesture_admitted = useCallback((): boolean => (
+        editable_cells_ref.current && structure_admission_open()
+    ), [structure_admission_open]);
     const delete_rows_gesture = useCallback((
         runs: readonly RowSelectionRun[],
         from_row: number,
@@ -5362,7 +5511,14 @@ export function GridShell({
         return selection;
     }, []);
     const can_drag_rows = useCallback((rows: { start: number; end: number }): boolean => {
-        if (structural_support === undefined || !structure_gesture_admitted()) return false;
+        if (structural_support === undefined) return false;
+        if (!editable_cells_ref.current && edit_armed_ref.current) {
+            // The press that may become a drag acquires the session; the drop
+            // target and the drop itself are judged against it once it is held.
+            acquire_session_for_drag();
+            return true;
+        }
+        if (!structure_gesture_admitted()) return false;
         return row_move_block_refusal({
             support: structural_support.rows,
             ready: true,
@@ -5370,7 +5526,14 @@ export function GridShell({
             changes: pending_store.snapshot(),
             context: structure_context_ref.current,
         }) === undefined;
-    }, [pending_store, row_drag_selection, structural_support, structure_gesture_admitted]);
+    }, [
+        ensure_edit_session,
+        notify_session_idle,
+        pending_store,
+        row_drag_selection,
+        structural_support,
+        structure_gesture_admitted,
+    ]);
     /** Where a drag dropping before display row `before` lands, or undefined when it may not drop there. */
     const row_drop_target = useCallback((
         rows: { start: number; end: number },
@@ -5402,11 +5565,20 @@ export function GridShell({
         if (target !== undefined) move_rows_gesture(target.identities, target.before);
     }, [move_rows_gesture, row_drop_target]);
     /** `Alt+Shift+↑`/`↓`: move the selected whole rows one step, or announce why not. */
+    const move_rows_by_keyboard_ref = useRef<(direction: 'backward' | 'forward') => boolean>(() => false);
     const move_rows_by_keyboard = useCallback((direction: 'backward' | 'forward'): boolean => {
         if (!row_moves_offered || structural_support === undefined) return false;
         const display_rows = selected_display_row_intervals(grid_selection_ref.current, row_count);
         if (display_rows === null || display_rows.length === 0
             || grid_selection_ref.current.rows.length === 0) return false;
+        if (!editable_cells_ref.current && edit_armed_ref.current) {
+            // No session yet: acquire one, then make the same move against it.
+            void ensure_edit_session().then((granted) => {
+                if (granted) move_rows_by_keyboard_ref.current(direction);
+                notify_session_idle();
+            });
+            return true;
+        }
         const selection = resolve_row_structure_selection(
             pending_projection_ref.current,
             display_rows,
@@ -5427,14 +5599,15 @@ export function GridShell({
         return true;
     }, [
         announce_structure,
+        ensure_edit_session,
         move_rows_gesture,
+        notify_session_idle,
         pending_store,
         row_count,
         row_moves_offered,
         structural_support,
         structure_gesture_admitted,
     ]);
-    const move_rows_by_keyboard_ref = useRef(move_rows_by_keyboard);
     move_rows_by_keyboard_ref.current = move_rows_by_keyboard;
 
     // --- Columns ----------------------------------------------------------
@@ -5683,7 +5856,10 @@ export function GridShell({
         if (!column_structure_offered || structural_support === undefined) return undefined;
         const model = column_structure_menu_model({
             support: structural_support.columns,
-            ready: editable_cells && structure_gesture_admitted(),
+            // Built while rendering, so from this render's own answer: the ref
+            // still holds the last commit's, and a menu opened as the session
+            // arrived would stay disabled.
+            ready: editable_cells && structure_admission_open(),
             selection,
             changes: pending_rows_ref.current,
             context: structure_context,
@@ -5723,13 +5899,21 @@ export function GridShell({
         restore_columns_gesture,
         structural_support,
         structure_context,
-        structure_gesture_admitted,
+        structure_admission_open,
     ]);
     /** `Alt+Shift+←`/`→`: move the selected whole columns one step, or announce why not. */
+    const move_columns_by_keyboard_ref = useRef<(direction: 'backward' | 'forward') => boolean>(() => false);
     const move_columns_by_keyboard = useCallback((direction: 'backward' | 'forward'): boolean => {
         if (!column_structure_offered || structural_support === undefined) return false;
         const selected = grid_selection_ref.current.columns;
         if (selected.length === 0) return false;
+        if (!editable_cells_ref.current && edit_armed_ref.current) {
+            void ensure_edit_session().then((granted) => {
+                if (granted) move_columns_by_keyboard_ref.current(direction);
+                notify_session_idle();
+            });
+            return true;
+        }
         const selection = resolve_column_structure_selection(projected_columns_ref.current, selected);
         const model = column_move_item_model({
             support: structural_support.columns,
@@ -5748,12 +5932,13 @@ export function GridShell({
     }, [
         announce_structure,
         column_structure_offered,
+        ensure_edit_session,
         move_columns_gesture,
+        notify_session_idle,
         pending_store,
         structural_support,
         structure_gesture_admitted,
     ]);
-    const move_columns_by_keyboard_ref = useRef(move_columns_by_keyboard);
     move_columns_by_keyboard_ref.current = move_columns_by_keyboard;
     /** A drag's block, resolved once per block rather than once per drop target. */
     const column_drag_selection_ref = useRef<{
@@ -5775,9 +5960,12 @@ export function GridShell({
         return selection;
     }, []);
     const can_drag_columns = useCallback((block: { start: number; end: number }): boolean => {
-        if (!column_structure_offered || structural_support === undefined || !structure_gesture_admitted()) {
-            return false;
+        if (!column_structure_offered || structural_support === undefined) return false;
+        if (!editable_cells_ref.current && edit_armed_ref.current) {
+            acquire_session_for_drag();
+            return true;
         }
+        if (!structure_gesture_admitted()) return false;
         return column_move_block_refusal({
             support: structural_support.columns,
             ready: true,
@@ -5785,7 +5973,15 @@ export function GridShell({
             changes: pending_store.snapshot(),
             context: structure_context_ref.current,
         }) === undefined;
-    }, [column_drag_selection, column_structure_offered, pending_store, structural_support, structure_gesture_admitted]);
+    }, [
+        column_drag_selection,
+        column_structure_offered,
+        ensure_edit_session,
+        notify_session_idle,
+        pending_store,
+        structural_support,
+        structure_gesture_admitted,
+    ]);
     /** Where a column drag dropping before display column `before` lands, or undefined when it may not. */
     const column_drop_target = useCallback((
         block: { start: number; end: number },
@@ -6205,9 +6401,13 @@ export function GridShell({
     const [append_dock_open, set_append_dock_open] = useState(false);
     const [composer_open, set_composer_open] = useState(false);
     const previous_append_session_ref = useRef(edit_session_id);
+    // The session the dock was opened for, when opening it is what acquired one.
+    const dock_opened_for_session_ref = useRef<string>();
     useEffect(() => {
         if (previous_append_session_ref.current === edit_session_id) return;
         previous_append_session_ref.current = edit_session_id;
+        // A dock opened as the gesture that acquired this session belongs to it.
+        if (edit_session_id !== undefined && dock_opened_for_session_ref.current === edit_session_id) return;
         set_append_dock_open(false);
         set_composer_open(false);
         if (on_append_composer_draft_change === undefined) {
@@ -6220,6 +6420,27 @@ export function GridShell({
         set_append_dock_open(false);
         set_composer_open(false);
     }, [may_offer_append_dock]);
+    /**
+     * The launcher is offered before a session exists, so adding a row needs no
+     * other edit first. Opening it is the gesture that acquires the session.
+     */
+    const may_offer_armed_dock = edit_armed
+        && on_append_rows !== undefined
+        && sheet_meta.columnCount > 0
+        && has_visible_columns
+        && remaining_append_capacity > 0;
+    const open_armed_dock = useCallback((open: boolean) => {
+        if (!open) return;
+        void ensure_edit_session().then((granted) => {
+            if (!granted) return;
+            dock_opened_for_session_ref.current = edit_session_id_ref.current;
+            // Marked open here, not only by the render that shows it: until
+            // that render commits, nothing else says the session just acquired
+            // is in use, and an empty session is released on sight.
+            session_surface_open_ref.current = true;
+            set_append_dock_open(true);
+        });
+    }, [ensure_edit_session]);
     /**
      * Labels for the composer's fields — the same titles the grid header
      * paints, so a field is identifiable by the column the user can see.
@@ -6481,6 +6702,7 @@ export function GridShell({
         }
         pending_editor_navigation_ref.current = null;
         overlay_admission_revoked_ref.current = true;
+        overlay_opening_ref.current = false;
         // `provideEditor` controls whether a *new* overlay may open; Glide does
         // not consistently apply that change to one it already owns. The caller
         // initiating an ordinary transition folds the live text first. This
@@ -7137,6 +7359,12 @@ export function GridShell({
             commit_live_edit_at_close_barrier,
             flush_live_edit,
             has_uncommitted_changes,
+            session_busy: () => session_requests_ref.current > 0
+                || drag_holds_session_ref.current
+                || overlay_intent_ref.current !== null
+                || overlay_opening_ref.current
+                || overlay_mounted_ref.current
+                || session_surface_open_ref.current,
         };
         return () => {
             editing_ref.current = null;
@@ -7170,6 +7398,27 @@ export function GridShell({
     const sample_loaded_rows_ref = useRef(sample_loaded_rows);
     sample_loaded_rows_ref.current = sample_loaded_rows;
 
+    /**
+     * The height every row has, when they all have the same one: no row has
+     * been resized, nothing is being dragged to a new height, and no row or
+     * column change is pending that could carry a height of its own.
+     *
+     * Handed to Glide as a number instead of a function, which is the
+     * difference between arithmetic and a walk. Given a function, Glide sums
+     * it over every row on every render and walks it from the first row to the
+     * viewport on every scroll event; on a 200,000-row file that walk was most
+     * of each frame. Nearly every file a person opens is in this state, with or
+     * without unsaved cell edits.
+     */
+    const uniform_row_height = useMemo((): number | undefined => {
+        if (row_resize_preview) return undefined;
+        if (row_height_overlay !== undefined && row_height_overlay.length > 0) return undefined;
+        if (has_pending_structural_changes(pending_rows)) return undefined;
+        for (const row in row_heights) {
+            if (Object.hasOwn(row_heights, row)) return undefined;
+        }
+        return default_row_height;
+    }, [default_row_height, pending_rows, row_height_overlay, row_heights, row_resize_preview]);
     const get_row_height = useMemo(() => {
         // Glide walks the visible rows once per column and getCellContent runs for
         // every cell. Keep row-height layer searches at roughly once per row, as
@@ -8084,7 +8333,7 @@ export function GridShell({
             // edited; it shows `??` with the reason instead.
             const formula_unrenderable = source_row !== undefined
                 && unrenderable_formula_for_cell(loaded_cell, dirty) !== undefined;
-            const editable = editable_cells && source_row !== undefined
+            const editable = cells_accept_edits && source_row !== undefined
                 && !pending_removal && !layout_removal && !formula_unrenderable;
             const value_overlay = source_row === undefined || key === undefined
                 ? undefined
@@ -8102,8 +8351,10 @@ export function GridShell({
             // runs, a clean cell its effective rich content. Only computed when
             // the cell can actually open an editor — this is Glide's per-cell
             // paint callback.
+            // Not while merely armed: the text is read when the editor opens,
+            // and by then the session is held and this runs again.
             let edit_value: string | undefined;
-            if (edit_syntax === 'markdown' && editable) {
+            if (edit_syntax === 'markdown' && editable && editable_cells) {
                 if (dirty) {
                     edit_value = cached_markdown_edit_text(
                         dirty,
@@ -8154,7 +8405,12 @@ export function GridShell({
                 ? compare_row_bgs[compare_status]
                 : undefined;
             let overlay: CellEditOverlay | undefined;
-            if (editable_cells || dirty || dependent_formula_affected || highlight_bg || flash_bg
+            if (edit_armed && editable && !dirty && !highlight_bg && !flash_bg && !compare_bg
+                && compare_base === undefined && !dependent_formula_affected && !layout_moved) {
+                // Nothing to tint and nothing unsaved: the cell only has to
+                // answer an editing gesture, which one shared object says.
+                overlay = ARMED_CELL_OVERLAY;
+            } else if (cells_accept_edits || dirty || dependent_formula_affected || highlight_bg || flash_bg
                 || compare_bg || compare_base !== undefined || layout_removal || layout_moved) {
                 overlay = {
                     editable,
@@ -8165,7 +8421,7 @@ export function GridShell({
                     // read-only sheet is not refusing anything — it never offered —
                     // and it does reach this branch, via highlight_bg, which is
                     // plain view state independent of edit mode.
-                    refused: editable_cells
+                    refused: cells_accept_edits
                         && (source_row === undefined || pending_removal || layout_removal
                             || formula_unrenderable),
                     ...value_overlay,
@@ -8260,6 +8516,8 @@ export function GridShell({
             removal_rendered_rows,
             is_removed_source_row,
             editable_cells,
+            edit_armed,
+            cells_accept_edits,
             edit_syntax,
             font_size_px,
             source_column_for_display,
@@ -8301,6 +8559,23 @@ export function GridShell({
      */
     const on_cells_edited = useCallback(
         (items: readonly EditListItem[], source: CellEditSource): boolean | 'refused' => {
+            // No session yet: acquire one and run the batch on the grant. A
+            // delete is the batch that arrives this way; a paste waits for the
+            // session before it is assembled (see `onPasteAdmission`), and an
+            // overlay commit cannot precede the session its overlay opened on.
+            if (!editable_cells_ref.current && edit_armed_ref.current && source !== 'edit') {
+                if (items.length === 0) return 'refused';
+                const armed_view = view_identity_ref.current;
+                void ensure_edit_session().then((granted) => {
+                    // The coordinates are display coordinates, so they mean
+                    // what they did only while the view has not moved.
+                    if (granted && view_identity_ref.current === armed_view) {
+                        on_cells_edited_ref.current(items, source);
+                    }
+                    notify_session_idle();
+                });
+                return 'refused';
+            }
             // The admission gates are the batch's, applied once: past the close
             // barrier `post_pending_edits` refuses to publish, so an edit
             // committed after it would sit in the store and never reach the host.
@@ -9011,6 +9286,11 @@ export function GridShell({
         ],
     );
 
+    // The batch a gesture held for the session is replayed through, so it meets
+    // the gates of the render that holds the session rather than the one that
+    // was waiting for it.
+    on_cells_edited_ref.current = on_cells_edited;
+
     // Tracking wrapper around the custom CSV editor: it makes the open overlay's
     // dirtiness observable (live_uncommitted) so App doesn't have to poll the DOM.
     // Refreshes on open and on every keystroke, clears on close. Memoized so its
@@ -9027,6 +9307,8 @@ export function GridShell({
     const tracking_editor = useMemo(() => {
         function TrackingCsvCellEditor(props: CsvCellEditorProps): React.JSX.Element {
             useEffect(() => {
+                overlay_opening_ref.current = false;
+                overlay_mounted_ref.current = true;
                 capture_open_overlay_row();
                 const opened_value = read_live_edit_ref.current()?.original;
                 if (
@@ -9045,6 +9327,10 @@ export function GridShell({
                     pending_editor_navigation_ref.current = null;
                     release_open_overlay_row();
                     set_live_uncommitted(false);
+                    // An editor closed without a change leaves the session
+                    // holding nothing.
+                    overlay_mounted_ref.current = false;
+                    notify_session_idle();
                     if (target) {
                         select_active_display_cell_ref.current(target);
                         focus_grid_ref.current();
@@ -9123,6 +9409,7 @@ export function GridShell({
     }, [
         capture_open_overlay_row,
         edit_admission_is_fenced,
+        notify_session_idle,
         post_pending_edits,
         refresh_live_uncommitted,
         release_open_overlay_row,
@@ -9184,13 +9471,55 @@ export function GridShell({
                 || !editable_cells
                 || (cell.kind !== GridCellKind.Text
                     && !(cell.kind === GridCellKind.Custom && is_rich_text_cell(cell)))
-            ) return undefined;
+            ) {
+                // No editor will mount, so nothing is opening any more.
+                overlay_opening_ref.current = false;
+                return undefined;
+            }
             // disablePadding/disableStyling: the editor carries its own
             // .cell-editor-input border + background, so suppress Glide's overlay box.
             return { editor: tracking_editor, disablePadding: true, disableStyling: true };
         },
         [editable_cells, save_in_flight_ref, tracking_editor],
     );
+
+    /**
+     * Glide asks before it opens an editor. Under a session it simply opens.
+     * Before one exists the request is held here while App acquires the session,
+     * and the editor is opened on the grant, with whatever the user typed.
+     */
+    const on_overlay_open_request = useCallback((
+        cell: Item,
+        initial: string | undefined,
+    ): boolean => {
+        if (editable_cells_ref.current || !edit_armed_ref.current) return false;
+        const waiting = overlay_intent_ref.current;
+        if (waiting !== null) {
+            // Keys typed while the session is on its way belong to the edit
+            // the first one started.
+            if (
+                waiting.initial !== undefined
+                && initial !== undefined
+                && waiting.cell[0] === cell[0]
+                && waiting.cell[1] === cell[1]
+            ) waiting.initial += initial;
+            return true;
+        }
+        const intent = { cell, initial };
+        overlay_intent_ref.current = intent;
+        void ensure_edit_session().then((granted) => {
+            if (overlay_intent_ref.current !== intent) return;
+            overlay_intent_ref.current = null;
+            if (granted) {
+                overlay_opening_ref.current = grid_ref.current?.openOverlay(
+                    intent.cell,
+                    intent.initial,
+                ) === true;
+            }
+            if (!overlay_opening_ref.current) notify_session_idle();
+        });
+        return true;
+    }, [ensure_edit_session, notify_session_idle]);
 
     // Arm/clear the row-resize strip as the pointer nears a row border. Glide's
     // hover args give the cell's client `bounds` + in-cell `localEventY`.
@@ -9460,6 +9789,18 @@ export function GridShell({
 
     const on_grid_selection_change = useCallback(
         (sel: GridSelection) => {
+            // A grid that takes focus with nothing selected selects its first
+            // cell, and Glide decides "nothing selected" from the props of its
+            // last render. A selection this shell wrote in the same turn as the
+            // focus — select the new row, then focus the grid — has not been
+            // rendered yet, so that default would replace it with the first
+            // cell. The ref below is written synchronously, so it knows better.
+            if (
+                focusing_grid_ref.current
+                && (grid_selection_ref.current.current !== undefined
+                    || grid_selection_ref.current.rows.length > 0
+                    || grid_selection_ref.current.columns.length > 0)
+            ) return;
             if (row_markers.intercept_selection_change(
                 sel,
                 display_column_count,
@@ -10276,6 +10617,31 @@ export function GridShell({
 
     const dismiss_context_menu = useCallback(() => set_context_menu(null), []);
 
+    // A menu on a sheet whose menus carry editing items — rows and columns to
+    // insert, delete, or move; a link or a header to change — acquires the
+    // session as it opens, so those items act on the first click. Quietly: the
+    // user asked for a menu, and a refusal only leaves the items unavailable.
+    const menu_open = context_menu !== null;
+    const menu_offers_edits = structural_support !== undefined || edit_syntax === 'markdown';
+    useEffect(() => {
+        if (menu_open && edit_armed && menu_offers_edits) void ensure_edit_session(true);
+    }, [edit_armed, ensure_edit_session, menu_offers_edits, menu_open]);
+
+    // Surfaces that hold the session open with nothing unsaved behind them.
+    // When the last one closes, App is told the session may be empty.
+    const session_surface_open = menu_open
+        || hyperlink_dialog !== null
+        || rename_column !== null
+        || rename_pending_column !== null
+        || append_dock_open
+        || composer_open;
+    useLayoutEffect(() => {
+        session_surface_open_ref.current = session_surface_open;
+    }, [session_surface_open]);
+    useEffect(() => {
+        if (!session_surface_open) notify_session_idle();
+    }, [notify_session_idle, session_surface_open]);
+
     /** The cell's external-link URL, pre-validated for immediate feedback
      *  (the host re-validates before anything reaches the OS opener).
      *  Internal links are render-only in v1, so they yield null here too. */
@@ -10439,7 +10805,8 @@ export function GridShell({
                 ctrl: args.ctrlKey,
                 meta: args.metaKey,
                 alt: args.altKey,
-                editable: editable_cells,
+                // Typing edits wherever a cell would accept it, session or not.
+                editable: cells_accept_edits,
             });
             if (!decision) return;
             const cur = grid_selection_ref.current.current?.cell;
@@ -10493,7 +10860,7 @@ export function GridShell({
             copy_source_selection,
             display_column_count,
             display_column_for_source,
-            editable_cells,
+            cells_accept_edits,
             inserted_rows_lock,
             merge_index,
             merges,
@@ -10606,8 +10973,8 @@ export function GridShell({
 
     // Full-region repaint on the discrete events that change content or
     // editability of *every* already-painted cell: a page landing (version
-    // bump), the formatting toggle (raw ↔ formatted), the edit-mode toggle
-    // (flips each cell's allowOverlay), and a font-size or edit-tint change
+    // bump), the formatting toggle (raw ↔ formatted), a session arriving or
+    // leaving (which changes what each cell answers to), and a font-size or edit-tint change
     // (each cell carries both in its theme override). A parent re-render alone
     // does not reliably invalidate Glide's per-cell cache, so damage explicitly.
     // (Sheet/merge changes remount via the grid key.)
@@ -11070,10 +11437,10 @@ export function GridShell({
                 maxColumnWidth={MAX_COLUMN_WIDTH_PX}
                 maxColumnAutoWidth={MAX_AUTO_FIT_COLUMN_WIDTH_PX}
                 overscrollX={LAST_COLUMN_RESIZE_GUTTER_PX}
-                overscrollY={may_offer_append_dock ? APPEND_DOCK_OVERSCROLL_PX : 0}
+                overscrollY={may_offer_append_dock || may_offer_armed_dock ? APPEND_DOCK_OVERSCROLL_PX : 0}
                 mergedRanges={merged_ranges}
                 getCellContent={get_cell_content}
-                rowHeight={get_row_height}
+                rowHeight={uniform_row_height ?? get_row_height}
                 rowMarkers={row_marker_options}
                 // A drag from a marker inside the selected block moves the
                 // block; any other marker press keeps drag-to-select.
@@ -11114,6 +11481,10 @@ export function GridShell({
                 onPaste={editable_cells
                     ? on_append_rows === undefined ? true : allow_rectangular_paste
                     : false}
+                // A paste before a session exists waits here for one, and is
+                // then assembled against the grid that holds it.
+                onPasteAdmission={edit_armed ? ensure_edit_session : undefined}
+                onOverlayOpenRequest={edit_armed ? on_overlay_open_request : undefined}
                 onPasteRowsNeeded={can_request_append_rows
                     ? append_rows_for_paste
                     : undefined}
@@ -11135,7 +11506,7 @@ export function GridShell({
                 onCellActivated={on_cell_activated}
                 provideEditor={provide_editor}
             />
-            {may_offer_append_dock && (
+            {(may_offer_append_dock || may_offer_armed_dock) && (
                 <AppendDock
                     style={{
                         '--append-slot-width': `${typeof row_marker_options === 'string'
@@ -11143,8 +11514,8 @@ export function GridShell({
                             : row_marker_options.width}px`,
                         '--append-slot-height': `${default_row_height}px`,
                     } as React.CSSProperties}
-                    open={append_dock_open}
-                    on_open_change={set_append_dock_open}
+                    open={may_offer_append_dock && append_dock_open}
+                    on_open_change={may_offer_append_dock ? set_append_dock_open : open_armed_dock}
                     remaining_capacity={remaining_append_capacity}
                     busy={append_in_flight}
                     on_add_rows={add_rows_from_dock}

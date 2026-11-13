@@ -1,5 +1,5 @@
 /**
- * Row Insert, Delete, Restore, and Move in Edit mode, as pure planning the
+ * Row Insert, Delete, Restore, and Move, as pure planning the
  * grid commits.
  *
  * Three steps, each testable apart from the grid: resolve a row-gutter
