@@ -85,6 +85,8 @@ function disk(initial: Uint8Array) {
         mtime: 1,
         /** Return a promise that never settles from the next matching call. */
         hang_stat_at: undefined as number | undefined,
+        /** Make the matching stat call throw, or report a different file. */
+        fail_stat_at: undefined as { readonly at: number; readonly kind: 'throw' | 'changed' } | undefined,
         stat_calls: 0,
         hung: false,
         write: undefined as ((content: Uint8Array) => Promise<void>) | undefined,
@@ -96,6 +98,10 @@ function disk(initial: Uint8Array) {
             if (file.hang_stat_at !== undefined && file.stat_calls >= file.hang_stat_at) {
                 file.hung = true;
                 return new Promise<never>(() => {});
+            }
+            if (file.fail_stat_at?.at === file.stat_calls) {
+                if (file.fail_stat_at.kind === 'throw') throw new Error('EBUSY');
+                return { size: file.bytes.length, mtime: file.mtime + 100 };
             }
             return { size: file.bytes.length, mtime: file.mtime };
         });
@@ -413,6 +419,25 @@ describe('the rekey intent, stopped after each step', () => {
         expect(dec.decode(drive.file.bytes)).toBe('h\na\nc\n');
         await second.dispose();
     });
+});
+
+describe('known aborts before the write', () => {
+    it.each(['throw', 'changed'] as const)(
+        'clear the intent and keep the payload when the final stat %s',
+        async (kind) => {
+            const drive = disk(BYTES);
+            const state = store_with({ pendingEdits: slot(REMOVAL) });
+            const viewer = await open_viewer({ state, disk: drive });
+            drive.file.stat_calls = 0;
+            // current, verified, final: the third stat is the one before the write.
+            drive.file.fail_stat_at = { at: 3, kind };
+            expect(await viewer.save(REMOVAL)).toMatchObject({ success: false });
+            expect(drive.file.writes).toHaveLength(0);
+            expect(viewer.durable().structuralRekeyIntent).toBeUndefined();
+            expect(viewer.durable().pendingEdits?.[0]).toMatchObject(REMOVAL);
+            await viewer.dispose();
+        },
+    );
 });
 
 describe('a structural write that fails', () => {

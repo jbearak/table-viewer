@@ -10075,6 +10075,7 @@ export function attach_viewer(
         // every abort before the write clears the intent and keeps the payload.
         let rekey_intent: StructuralRekeyIntent | undefined;
         let write_attempted = false;
+        let write_completed = false;
         let accepted_sequences: readonly number[] = [];
         try {
             await pending_edit_writes.catch(() => {});
@@ -10297,6 +10298,7 @@ export function attach_viewer(
                 if (rekey_intent !== undefined) await settle_failed_structural_write(rekey_intent);
                 throw error;
             }
+            write_completed = true;
 
             // The watcher is reserved across this write and CAS so the state
             // rebase commits against the same save authority.
@@ -10465,6 +10467,14 @@ export function attach_viewer(
                     await clear_structural_rekey_intent(rekey_intent.saveId).catch(() => {});
                 }
                 IN_FLIGHT_STRUCTURAL_SAVES.delete(rekey_intent.saveId);
+                // The write finished but the post-write transition did not:
+                // the intent is stored, and the file has the bytes it names, so
+                // recovery can apply it now rather than on the next load.
+                if (write_completed) {
+                    await resolve_stored_rekey_intent(rekey_intent.afterDigest).catch((resolve_error) => {
+                        log_sanitized_failure('Could not apply a structural save after its write', resolve_error);
+                    });
+                }
             }
             // A disposed failure releases the edit session from this catch. Do
             // not let that release wait on the Save's own authority fence; the
