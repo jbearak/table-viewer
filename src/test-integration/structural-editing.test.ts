@@ -3,9 +3,6 @@
 // loaded and acknowledges every snapshot; the test speaks the webview protocol
 // itself to admit inserts, publish a layout, and save, then reads the file.
 // The desktop smoke specs drive the same webview by mouse and keyboard.
-//
-// Structural editing ships behind `STRUCTURAL_EDITING_ENABLED`; the test turns
-// it on for the viewers it opens through the extension's test API.
 import * as assert from 'assert';
 import * as fs from 'fs/promises';
 import * as os from 'os';
@@ -20,7 +17,6 @@ import {
     close_all_editors,
     fixture_uri,
     has_custom_tab,
-    integration_api,
     open_session,
     wait_for,
     wait_for_latest_snapshot_ack,
@@ -213,14 +209,6 @@ async function structural_changes(
 
 describe('row and column structure in the VS Code extension host', () => {
     let root: string;
-
-    before(async () => {
-        (await integration_api()).setStructuralEditingEnabled(true);
-    });
-
-    after(async () => {
-        (await integration_api()).setStructuralEditingEnabled(undefined);
-    });
 
     beforeEach(async () => {
         root = await fs.mkdtemp(path.join(os.tmpdir(), 'table-viewer-structure-integration-'));

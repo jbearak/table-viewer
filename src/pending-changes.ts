@@ -481,11 +481,11 @@ export const PENDING_STRUCTURAL_CONFLICT_REASONS: ReadonlySet<PendingStructuralC
 /**
  * Release gate for inserting, deleting, and moving rows and columns. While it
  * is false the host refuses any publication or save that carries layout
- * fields (`pending_changes_carry_layout`), so an intermediate release never
- * accepts layout data it cannot write. Tests turn it on per controller through
+ * fields (`pending_changes_carry_layout`), so a release never accepts layout
+ * data it cannot write. Tests can set it per controller through
  * `ViewerControllerOptions.structuralEditingEnabled`.
  */
-export const STRUCTURAL_EDITING_ENABLED = false;
+export const STRUCTURAL_EDITING_ENABLED = true;
 
 /** `.xlsx` column formatting a Pending Column copies, fixed when it is inserted. */
 export type PendingColumnFormat =

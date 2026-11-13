@@ -39,9 +39,6 @@ interface OpenWorkbookAtSheetArguments {
 
 export interface TableViewerExtensionTestApi {
     integrationSession(uri: vscode.Uri): TableViewerIntegrationSession | undefined;
-    /** Override `STRUCTURAL_EDITING_ENABLED` for viewers opened afterwards;
-     *  `undefined` restores the shipped default. */
-    setStructuralEditingEnabled(enabled: boolean | undefined): void;
 }
 
 function open_workbook_at_sheet_arguments(value: unknown): OpenWorkbookAtSheetArguments {
@@ -340,8 +337,6 @@ export async function activate(
             && context.extensionMode === extension_test_mode
             ? {
                 integrationSession: (uri) => viewers!.integrationSession(uri),
-                setStructuralEditingEnabled: (enabled) =>
-                    viewers!.setStructuralEditingEnabled(enabled),
             }
             : undefined;
     } catch (error) {
