@@ -168,7 +168,8 @@ export interface XlsxWriteOptions {
     readonly formula_group_caches_invalidated?: boolean;
 }
 
-function encode_xml(s: string): string {
+/** Encode text for XML element content, such as a formula's `<f>`. */
+export function encode_xml(s: string): string {
     return strip_illegal_xml_chars(
         s
             .replace(/&/g, '&amp;')

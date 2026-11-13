@@ -617,7 +617,7 @@ export function unanchorable_formula_refusal(formula: string, construct?: string
 // Formula targets: which worksheets a formula may reference
 // ---------------------------------------------------------------------------
 
-interface FormulaTargets {
+export interface FormulaTargets {
     /** Lower-cased worksheet names named in sheet qualifiers. */
     readonly sheets: ReadonlySet<string>;
     /** A 3D qualifier such as `Sheet1:Sheet3!`, which may span any worksheet. */
@@ -710,7 +710,7 @@ function skip_brackets(formula: string, offset: number): number {
  * external-workbook references (`[1]Sheet1!A1`) are not this workbook's.
  * Everything else that could be a sheet qualifier or a defined name is kept.
  */
-function formula_targets(formula: string): FormulaTargets {
+export function formula_targets(formula: string): FormulaTargets {
     const sheets = new Set<string>();
     const identifiers = new Set<string>();
     let every_sheet = false;
