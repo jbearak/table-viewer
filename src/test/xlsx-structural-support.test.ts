@@ -756,6 +756,15 @@ describe('scan_xlsx_structural_support', () => {
             expect(refused(theme_path)).toMatchObject({ code: 'unclassified-reference', part: 'xl/theme/notatheme.xml' });
         });
 
+        it('reads attribute values with literal tabs and line breaks normalized to spaces', () => {
+            const [spaced, other] = scan({
+                sheets: [sheet('My Sheet'), sheet('Other')],
+                parts: { 'xl/vendor/thing.xml': '<r target="\'My\tSheet\'!A1"/>' },
+            });
+            expect(refused(spaced)).toMatchObject({ code: 'unclassified-reference', part: 'xl/vendor/thing.xml' });
+            expect_supported(other);
+        });
+
         it('refuses every sheet when a part declares a DTD', () => {
             const supports = scan({
                 sheets: [sheet('Data'), sheet('Other')],

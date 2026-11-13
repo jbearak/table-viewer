@@ -1789,7 +1789,10 @@ function decoded_attributes(tag: string): { readonly name: string; readonly valu
     const out: { name: string; value: string }[] = [];
     const pattern = /([^\s=/<>]+)\s*=\s*(?:"([^"]*)"|'([^']*)')/g;
     for (let match = pattern.exec(tag); match !== null; match = pattern.exec(tag)) {
-        out.push({ name: match[1], value: decode_xml(match[2] ?? match[3] ?? '') });
+        // Attribute-value normalization (XML 1.0 §3.3.3): literal line breaks
+        // and tabs read as spaces; ones written as character references stay.
+        const raw = (match[2] ?? match[3] ?? '').replace(/\r\n|[\t\n\r]/g, ' ');
+        out.push({ name: match[1], value: decode_xml(raw) });
     }
     return out;
 }
