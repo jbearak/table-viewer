@@ -5729,6 +5729,69 @@ describe('edit mode save exit', () => {
         expect(requests.some((request) => request.layouts !== undefined)).toBe(false);
     });
 
+    it('sends a header edit at its source column to a source calculation when a column layout moves it', async () => {
+        const meta = make_meta(['Sheet1'], false);
+        Object.assign(meta.sheets[0], {
+            columnCount: 3,
+            sourceRowCount: 3,
+            rowCount: 3,
+            columnNames: ['Name', 'Qty', 'Total'],
+            excelFirstRowHeader: { mode: 'on', detected: false, active: true, available: true, sourceRow: 0 },
+            // A formula with no cached result, so a source request is posted.
+            pendingFormulaCells: [1, 2],
+        });
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: { csvEditable: true, csvEditingSupported: true, editSyntax: 'markdown' },
+        }));
+        await click_button('Edit');
+        await dispatch_host_message({
+            type: 'editSessionResult',
+            granted: true,
+            editSessionId: 'moved-header-session',
+            sheetIndex: 0,
+            pendingChanges: {
+                sheetIndex: 0,
+                sheetName: 'Sheet1',
+                // Rename the header of source column 0, which the layout moves last.
+                cells: { '0:0': { value: 'Item', base: 'Name' } },
+                formatTemplates: [],
+                appendedRows: [],
+                tailRemovals: [],
+                conflicts: [],
+                columnLayout: {
+                    columns: [
+                        { kind: 'source', sourceColumn: 1 },
+                        { kind: 'source', sourceColumn: 2 },
+                        { kind: 'source', sourceColumn: 0 },
+                    ],
+                    removedSourceColumns: [],
+                    discardedPendingColumns: [],
+                },
+                structuralBasis: {
+                    kind: 'xlsx',
+                    worksheetPartDigest: 'sheet',
+                    sharedStringsDigest: null,
+                    stylesDigest: 'styles',
+                    workbookDigest: 'workbook',
+                    sourceRowCount: 3,
+                    sourceColumnCount: 3,
+                },
+            },
+        });
+        const requests = post_message.mock.calls
+            .map(([message]) => message as WebviewMessage)
+            .filter((message): message is Extract<WebviewMessage, { type: 'requestFormulaCalculation' }> =>
+                message.type === 'requestFormulaCalculation');
+        const source = requests.filter((request) => request.layouts === undefined).at(-1);
+        // The source request runs at source addresses: the header edit names
+        // source column 0, not the column 2 the layout gives it.
+        expect(source?.edits).toEqual([
+            expect.objectContaining({ sheetIndex: 0, row: 0, column: 0, value: 'Item' }),
+        ]);
+        expect(source?.targets).toEqual([{ sheetIndex: 0, row: 1, column: 2 }]);
+    });
+
     it('does not mutate a posted formula request when a later edit lands', async () => {
         const meta = make_meta(['Sheet1'], false);
         meta.sheets[0].formulaCells = [0, 1];

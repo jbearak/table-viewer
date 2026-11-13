@@ -872,6 +872,7 @@ export function App(): React.JSX.Element {
             });
             return {
                 edits: request.edits,
+                sourceEdits: edits,
                 prospectiveRowCounts: request.prospectiveRowCounts,
                 removedRows: [],
                 prospective: {
@@ -911,6 +912,7 @@ export function App(): React.JSX.Element {
             || (left.column - right.column));
         return {
             edits,
+            sourceEdits: edits,
             prospectiveRowCounts,
             removedRows,
             prospective: undefined,
@@ -932,12 +934,16 @@ export function App(): React.JSX.Element {
     const formula_calculation_edits = structural_formula_state.edits;
     const prospective_formula_row_counts = structural_formula_state.prospectiveRowCounts;
     const removed_formula_rows = structural_formula_state.removedRows;
-    const header_calculation_edits = useMemo(() => formula_calculation_edits.filter((edit) => {
+    // Cell edits at their source coordinates: what a source request, and every
+    // consumer that reads source column names, needs even when the calculation
+    // request itself is prospective.
+    const source_formula_edits = structural_formula_state.sourceEdits;
+    const header_calculation_edits = useMemo(() => source_formula_edits.filter((edit) => {
         const sheet = meta?.sheets[edit.sheetIndex];
         return sheet?.excelFirstRowHeader?.active === true
             && edit.row === (sheet.excelFirstRowHeader.sourceRow ?? 0);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    }), [formula_calculation_edits, formula_header_coordinate_signature]);
+    }), [source_formula_edits, formula_header_coordinate_signature]);
     const formula_roots = formula_calculation_edits;
     const formula_root_signature = structural_formula_state.tooManyEdits
         ? 'too-many-edits'
@@ -958,7 +964,7 @@ export function App(): React.JSX.Element {
         move.destinationRow,
         move.destinationColumn,
     ].join(':')).join(';');
-    const structured_column_renames = formula_calculation_edits.flatMap((edit) => {
+    const structured_column_renames = source_formula_edits.flatMap((edit) => {
         const sheet = meta?.sheets[edit.sheetIndex];
         const header_row = sheet?.excelFirstRowHeader?.sourceRow ?? 0;
         const old_name = sheet?.columnNames?.[edit.column];
@@ -1750,7 +1756,7 @@ export function App(): React.JSX.Element {
         sheet.excelFirstRowHeader?.sourceRow ?? null,
         sheet.columnNames ?? null,
     ]);
-    const pending_header_formula_signature = formula_calculation_edits.flatMap((edit) => {
+    const pending_header_formula_signature = source_formula_edits.flatMap((edit) => {
         const sheet = meta?.sheets[edit.sheetIndex];
         const header_row = sheet?.excelFirstRowHeader?.sourceRow ?? 0;
         return sheet?.excelFirstRowHeader?.active === true && edit.row === header_row

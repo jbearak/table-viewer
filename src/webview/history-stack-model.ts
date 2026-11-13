@@ -22,6 +22,7 @@ import {
     type StructuralBasis,
     pending_rows,
 } from '../pending-changes';
+import type { FormulaAnchors } from '../formula-anchors';
 import { append_source_rows_to_layout, type ColumnLayout, type RowLayout } from '../worksheet-layout';
 import {
     worksheet_target_key,
@@ -962,15 +963,50 @@ function rekey_move_provenance(
     };
 }
 
+/**
+ * Formula Anchors after a save: a corner on a Pending Row the save wrote
+ * names that row's source identity. The target worksheet is the reference's
+ * own, or the formula's (`worksheet`) when the reference omits it.
+ */
+export function rekey_saved_formula_anchors(
+    anchors: FormulaAnchors,
+    worksheet: WorksheetTarget,
+    assignments: ReadonlyMap<string, SavedHistoryRowAssignment>,
+): FormulaAnchors {
+    let changed = false;
+    const references = anchors.references.map((reference) => {
+        const target = reference.worksheet ?? worksheet;
+        const corners = reference.corners.map((corner) => {
+            if (corner.row?.kind !== 'identity') return corner;
+            const assignment = saved_assignment_for_identity(corner.row.row, target, assignments);
+            if (assignment === undefined) return corner;
+            changed = true;
+            return {
+                ...corner,
+                row: { kind: 'identity' as const, row: { kind: 'source' as const, sourceRow: assignment.sourceRow } },
+            };
+        });
+        return { ...reference, corners };
+    });
+    return changed ? { references } : anchors;
+}
+
 function rekey_pending_cell_provenance(
     cell: PendingRowCell | undefined,
     worksheet: WorksheetTarget,
     assignments: ReadonlyMap<string, SavedHistoryRowAssignment>,
 ): PendingRowCell | undefined {
-    if (cell?.movedFrom === undefined) return cell;
+    if (cell === undefined || (cell.movedFrom === undefined && cell.formulaAnchors === undefined)) {
+        return cell;
+    }
     return {
         ...cell,
-        movedFrom: rekey_move_provenance(cell.movedFrom, worksheet, assignments),
+        ...(cell.movedFrom === undefined ? {} : {
+            movedFrom: rekey_move_provenance(cell.movedFrom, worksheet, assignments),
+        }),
+        ...(cell.formulaAnchors === undefined ? {} : {
+            formulaAnchors: rekey_saved_formula_anchors(cell.formulaAnchors, worksheet, assignments),
+        }),
     };
 }
 
@@ -982,17 +1018,26 @@ function rekey_overlay_provenance(
     if (
         overlay.kind === 'absent'
         || overlay.value.kind === 'untouched'
-        || overlay.value.movedFrom === undefined
+        || (overlay.value.movedFrom === undefined && overlay.value.formulaAnchors === undefined)
     ) return overlay;
     return {
         ...overlay,
         value: {
             ...overlay.value,
-            movedFrom: rekey_move_provenance(
-                overlay.value.movedFrom,
-                worksheet,
-                assignments,
-            ),
+            ...(overlay.value.movedFrom === undefined ? {} : {
+                movedFrom: rekey_move_provenance(
+                    overlay.value.movedFrom,
+                    worksheet,
+                    assignments,
+                ),
+            }),
+            ...(overlay.value.formulaAnchors === undefined ? {} : {
+                formulaAnchors: rekey_saved_formula_anchors(
+                    overlay.value.formulaAnchors,
+                    worksheet,
+                    assignments,
+                ),
+            }),
         },
     };
 }
