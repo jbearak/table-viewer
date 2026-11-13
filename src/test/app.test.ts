@@ -17078,3 +17078,24 @@ describe('find', () => {
         expect(find_input()!.value).toBe('ron');
     });
 });
+
+describe('structural editing capability wiring', () => {
+    it('hands each worksheet its structure support, and nothing while the host has it off', async () => {
+        await render_app();
+        const meta = make_meta(['Sheet1'], false);
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        expect(grid_shell_mock.latest_props!.structural_support).toBeUndefined();
+        const unsupported = { supported: false as const, reason: 'Not available yet' };
+        await dispatch_host_message(workbook_snapshot_message(meta, {
+            capabilities: {
+                csvEditable: true,
+                csvEditingSupported: true,
+                structuralEditing: { sheets: [{ rows: unsupported, columns: unsupported }] },
+            },
+        }));
+        expect(grid_shell_mock.latest_props!.structural_support)
+            .toEqual({ rows: unsupported, columns: unsupported });
+    });
+});

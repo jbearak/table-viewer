@@ -19,6 +19,7 @@ import {
     type DirtyEntry,
 } from '../webview/edit-session-store';
 import { create_history_store, type HistoryStore } from '../webview/history-store';
+import { peek_history } from '../webview/history-stack-model';
 import { create_pending_row_store } from '../webview/pending-row-store';
 import {
     LAST_COLUMN_RESIZE_GUTTER_PX,
@@ -8408,5 +8409,132 @@ describe('GridShell find', () => {
             expect(await first).toEqual({ kind: 'stopped' });
         });
         expect(selected_cell()).toBeUndefined();
+    });
+});
+
+describe('row Delete and Restore in the row-gutter menu', () => {
+    const basis = {
+        kind: 'delimited' as const,
+        byteLength: 10,
+        digest: 'digest',
+        sourceRowCount: 4,
+        sourceColumnCount: 3,
+    };
+    const supported = {
+        rows: { supported: true as const },
+        columns: { supported: true as const },
+        basis,
+    };
+    const structure_props = (overrides: Partial<GridShellProps> = {}) => props({
+        sheet_meta: { ...props().sheet_meta, rowCount: 4, sourceRowCount: 4 },
+        row_count: 4,
+        edit_mode: true,
+        csv_editable: true,
+        edit_session_id: 'session',
+        transform_sections: true,
+        ...overrides,
+    });
+    const open_row_menu = async (row: number) => {
+        const on_cell_context_menu = grid_mock.props!.onCellContextMenu as
+            (cell: [number, number], event: Record<string, unknown>) => void;
+        await act(async () => on_cell_context_menu([-1, row], {
+            preventDefault: vi.fn(),
+            bounds: { x: 0, y: 24 * (row + 1), width: 40, height: 24 },
+            localEventX: 10,
+            localEventY: 10,
+        }));
+    };
+    const menu_item = (label: string) => Array.from(document.querySelectorAll('button'))
+        .find((candidate) => candidate.textContent === label);
+
+    it('offers no structure items while structural editing is off', async () => {
+        await render_grid(structure_props());
+        await open_row_menu(1);
+        expect(menu_button_labels()).not.toContain('Delete row');
+        expect(menu_button_labels()).toContain('Copy row');
+    });
+
+    it('shows Delete disabled with the host reason on a worksheet it cannot restructure', async () => {
+        const unsupported = { supported: false as const, reason: 'Not available yet' };
+        await render_grid(structure_props({
+            structural_support: { rows: unsupported, columns: unsupported },
+        }));
+        await open_row_menu(1);
+        const item = menu_item('Delete row')!;
+        expect(item.getAttribute('aria-disabled')).toBe('true');
+        expect(item.getAttribute('aria-description')).toBe('Not available yet');
+        expect(item.title).toBe('Not available yet');
+    });
+
+    it('deletes a row with its cell edits as one action, shows it removed, and restores it', async () => {
+        const cells = create_edit_session_store({ session_id: 'session' }, {
+            '1:0': { value: 'edited', base: 'source-a' },
+            '2:0': { value: 'kept', base: 'source-a' },
+        });
+        const pending = create_pending_row_store({ session_id: 'session' });
+        const history = create_history_store();
+        await render_grid(structure_props({
+            structural_support: supported,
+            edit_session: cells,
+            pending_row_store: pending,
+            history_store: history,
+        }));
+        await open_row_menu(1);
+        await act(async () => menu_item('Delete row')!.click());
+
+        expect(pending.snapshot().rowLayout?.removedSourceRows).toEqual([{ start: 1, count: 1 }]);
+        expect(pending.snapshot().structuralBasis).toEqual(basis);
+        expect([...cells.snapshot().keys()]).toEqual(['2:0']);
+        const undo = peek_history(history.snapshot(), 'undo');
+        if (undo.kind !== 'available') throw new Error('nothing recorded');
+        expect(undo.entry.action.label).toBe('Delete row');
+        expect(undo.entry.action.changes.map((change) => change.kind)).toEqual(['rowLayout', 'cell']);
+
+        // The removed row stays in place, read-only, unnumbered, and labeled.
+        const get_row_number = (grid_mock.props!.rowMarkers as {
+            getRowNumber(row: number): number | undefined;
+        }).getRowNumber;
+        expect([0, 1, 2, 3].map(get_row_number)).toEqual([1, undefined, 2, 3]);
+        const label = grid_mock.props!.getRowAccessibilityLabel as (row: number) => string | undefined;
+        expect(label(1)).toBe('Row removed, was row 2');
+        expect(label(2)).toBeUndefined();
+        const get_cell_content = grid_mock.props!.getCellContent as (cell: [number, number]) => {
+            allowOverlay?: boolean;
+            readonly?: boolean;
+        };
+        expect(get_cell_content([0, 1])).toMatchObject({ allowOverlay: false, readonly: true });
+        expect(get_cell_content([0, 2]).allowOverlay).toBe(true);
+        // Focus moves to the nearest live row once the grid shows the delete.
+        await vi.waitFor(() => expect((grid_mock.props!.gridSelection as {
+            current?: { cell: [number, number] };
+        }).current?.cell).toEqual([0, 2]));
+
+        await open_row_menu(1);
+        expect(menu_item('Delete row')?.getAttribute('aria-disabled')).toBe('true');
+        await act(async () => menu_item('Restore row')!.click());
+        expect(pending.snapshot().rowLayout).toBeUndefined();
+        const restore = peek_history(history.snapshot(), 'undo');
+        if (restore.kind !== 'available') throw new Error('nothing recorded');
+        expect(restore.entry.action.label).toBe('Restore row');
+    });
+
+    it('refuses a paste into a removed row', async () => {
+        const cells = create_edit_session_store({ session_id: 'session' });
+        const pending = create_pending_row_store({ session_id: 'session' });
+        await render_grid(structure_props({
+            structural_support: supported,
+            edit_session: cells,
+            pending_row_store: pending,
+        }));
+        await open_row_menu(1);
+        await act(async () => menu_item('Delete row')!.click());
+        const on_cells_edited = grid_mock.props!.onCellsEdited as (
+            items: readonly unknown[], source: string,
+        ) => unknown;
+        await act(async () => on_cells_edited([
+            { location: [0, 1], value: { kind: 'text', data: 'pasted' } },
+            { location: [0, 2], value: { kind: 'text', data: 'pasted' } },
+        ], 'paste'));
+        expect([...cells.snapshot().keys()]).toEqual(['2:0']);
     });
 });

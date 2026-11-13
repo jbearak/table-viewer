@@ -625,3 +625,53 @@ describe('history replay commit', () => {
         await viewer.dispose();
     });
 });
+
+describe('the structural editing capability', () => {
+    const current_basis: StructuralBasis = {
+        kind: 'delimited',
+        byteLength: BYTES.length,
+        digest: createHash('sha256').update(BYTES).digest('hex'),
+        sourceRowCount: 3,
+        sourceColumnCount: 1,
+    };
+    const capabilities = (viewer: Awaited<ReturnType<typeof open_viewer>>) =>
+        ([...(viewer.panel.__messages as Message[])].reverse().find((message) =>
+            message.type === 'workbookSnapshot') as {
+            snapshot: { capabilities: Record<string, unknown> };
+        }).snapshot.capabilities;
+
+    it('is absent while structural editing is off', async () => {
+        const viewer = await open_viewer();
+        expect(capabilities(viewer)).not.toHaveProperty('structuralEditing');
+        await viewer.dispose();
+    });
+
+    it('reports CSV rows and columns supported, with the current file as the basis', async () => {
+        const viewer = await open_viewer({ structuralEditingEnabled: true });
+        expect(capabilities(viewer).structuralEditing).toEqual({
+            sheets: [{
+                rows: { supported: true },
+                columns: { supported: true },
+                basis: current_basis,
+            }],
+        });
+        await viewer.dispose();
+    });
+
+    it('accepts a first delete authored against the current file, and no other basis', async () => {
+        const viewer = await open_viewer({ structuralEditingEnabled: true });
+        expect(await viewer.publish({
+            rowLayout: REMOVAL_LAYOUT,
+            structuralBasis: { ...current_basis, digest: 'sha256:other' },
+        })).toBe(false);
+        expect(await viewer.publish({
+            rowLayout: REMOVAL_LAYOUT,
+            structuralBasis: current_basis,
+        })).toBe(true);
+        expect(viewer.durable()).toMatchObject({
+            rowLayout: REMOVAL_LAYOUT,
+            structuralBasis: current_basis,
+        });
+        await viewer.dispose();
+    });
+});

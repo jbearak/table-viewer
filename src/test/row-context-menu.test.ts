@@ -117,3 +117,59 @@ describe('row context menu model', () => {
         expect(on_copy_rows).toHaveBeenCalledOnce();
     });
 });
+
+describe('row structure items', () => {
+    const base = {
+        selected_row_count: 2,
+        can_hide_rows: true,
+        can_promote_row_to_header: false,
+        on_hide_rows: vi.fn(),
+        on_promote_row_to_header: vi.fn(),
+        on_copy_rows: vi.fn(),
+    };
+    const shown = (items: ReturnType<typeof row_context_menu_items>) =>
+        items.flatMap((item) => item.kind === 'separator' || item.kind === 'submenu' ? [] : [{
+            label: item.label,
+            disabled: item.disabled === true,
+            reason: item.disabled_reason,
+        }]);
+
+    it('replaces Remove pending rows with Delete, and adds Restore', () => {
+        const on_delete = vi.fn();
+        const items = row_context_menu_items({
+            ...base,
+            on_remove_pending_rows: vi.fn(),
+            delete_rows: { count: 2, on_click: on_delete },
+            restore_rows: { count: 2, on_click: vi.fn() },
+        });
+        expect(shown(items)).toEqual([
+            { label: 'Delete 2 rows', disabled: false, reason: undefined },
+            { label: 'Restore 2 rows', disabled: false, reason: undefined },
+            { label: 'Hide 2 rows', disabled: false, reason: undefined },
+            { label: 'Copy 2 rows', disabled: false, reason: undefined },
+        ]);
+        const remove = items[0];
+        if (remove.kind === 'separator' || remove.kind === 'submenu') throw new Error('not an item');
+        remove.on_click({} as never);
+        expect(on_delete).toHaveBeenCalledOnce();
+    });
+
+    it('keeps a disabled structure item with its reason', () => {
+        expect(shown(row_context_menu_items({
+            ...base,
+            selected_row_count: 1,
+            delete_rows: { count: 1, disabled_reason: 'Not available yet' },
+        }))[0]).toEqual({ label: 'Delete row', disabled: true, reason: 'Not available yet' });
+    });
+
+    it('keeps Cancel row removal for tail removals beside Delete', () => {
+        expect(shown(row_context_menu_items({
+            ...base,
+            selected_row_count: 1,
+            delete_rows: { count: 1, disabled_reason: 'Save or redo the row removal first.' },
+            on_cancel_row_removals: vi.fn(),
+        })).map((item) => item.label)).toEqual([
+            'Delete row', 'Cancel row removal', 'Hide row', 'Copy row',
+        ]);
+    });
+});
