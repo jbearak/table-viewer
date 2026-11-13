@@ -44,6 +44,8 @@ export class CsvDataSource implements DataSource {
     private readonly _dataStart: number;
     /** Buffer with any leading UTF-8 BOM removed (see constructor). */
     private readonly buf: Uint8Array;
+    /** The file's bytes exactly as given, BOM included; `buf` is a view of it. */
+    private readonly fileBytes: Uint8Array;
     /** Reused across read_rows: decode() is stateless for non-streaming calls,
      *  so one decoder serves every page request (this is a per-scroll hot path). */
     private readonly decoder = new TextDecoder('utf-8', { ignoreBOM: true });
@@ -78,6 +80,7 @@ export class CsvDataSource implements DataSource {
         // (so a following `"` would NOT be treated as a field start), while the
         // string parser — fed BOM-free text — would open a quoted field. Removing
         // it once here keeps both views aligned and drops the BOM from saves.
+        this.fileBytes = buf;
         this.buf = (buf.length >= 3 && buf[0] === 0xef && buf[1] === 0xbb && buf[2] === 0xbf)
             ? buf.subarray(3)
             : buf;
@@ -149,6 +152,14 @@ export class CsvDataSource implements DataSource {
 
     meta(): WorkbookMeta {
         return this._meta;
+    }
+
+    /**
+     * The file's bytes exactly as parsed, BOM included: what a Structural
+     * Basis digests and what the prefix-growth test compares. No copy.
+     */
+    file_bytes(): Uint8Array {
+        return this.fileBytes;
     }
 
     read_rows(_sheet: number, start_row: number, count: number): RowWindow {

@@ -2762,11 +2762,40 @@ export interface AppendedRowAssignment extends WorksheetTarget {
     readonly savedRow?: SavedAppendedRowSnapshot;
 }
 
+/**
+ * How one structurally saved worksheet renumbered its rows and columns: one
+ * entry per worksheet that had a live layout change. Rows at or above the
+ * Header Row map to themselves and are not listed. Rows are canonical source
+ * rows before and after the save; columns are 0-based source columns.
+ */
+export interface WorksheetStructureReceipt extends WorksheetTarget {
+    /**
+     * Complete map of old source body rows: every live source run, in old
+     * order, with its new first row. Unmoved but shifted runs are included.
+     */
+    readonly rowRuns: readonly { readonly from: number; readonly count: number; readonly to: number }[];
+    readonly removedRows: readonly { readonly start: number; readonly count: number }[];
+    /** Index = old source column; value = new column or null when removed. */
+    readonly columnMap: readonly (number | null)[];
+    readonly insertedRows: readonly { readonly pendingRowId: string; readonly sourceRow: number }[];
+    readonly insertedColumns: readonly { readonly pendingColumnId: string; readonly column: number }[];
+}
+
 export interface PendingChangesSaveReceipt {
     readonly appendedRows: readonly AppendedRowAssignment[];
     readonly removedSourceRows: readonly (WorksheetTarget & {
         readonly sourceRows: readonly number[];
     })[];
+    /**
+     * One entry per worksheet the save restructured. Absent on a save without
+     * a live layout change, so append-only receipts keep their old shape.
+     */
+    readonly structure?: readonly WorksheetStructureReceipt[];
+}
+
+/** Whether a receipt describes a save that inserted, deleted, or moved rows or columns. */
+export function receipt_has_structure(receipt: PendingChangesSaveReceipt | undefined): boolean {
+    return (receipt?.structure?.length ?? 0) > 0;
 }
 
 /** The layout capability a current renderer declares in its `ready` message. */
@@ -2831,7 +2860,8 @@ export function own_structural_rekey_intent(value: unknown): StructuralRekeyInte
         || value.worksheets.length === 0
         || value.worksheets.length > MAX_REKEY_INTENT_WORKSHEETS
         || !is_plain_record(value.receipt)
-        || Object.keys(value.receipt).some((key) => key !== 'appendedRows' && key !== 'removedSourceRows')
+        || Object.keys(value.receipt).some((key) =>
+            key !== 'appendedRows' && key !== 'removedSourceRows' && key !== 'structure')
         || !Array.isArray(value.receipt.appendedRows)
         || !Array.isArray(value.receipt.removedSourceRows)
         || value.receipt.appendedRows.length > MAX_REKEY_INTENT_RECEIPT_ROWS
@@ -2898,6 +2928,9 @@ export function own_structural_rekey_intent(value: unknown): StructuralRekeyInte
             sourceRows: Object.freeze([...(target.sourceRows as number[])]),
         });
     });
+    const structure = value.receipt.structure === undefined
+        ? undefined
+        : own_worksheet_structure_receipts(value.receipt.structure, rekey_intent_error);
     return Object.freeze({
         saveId: value.saveId,
         beforeDigest: value.beforeDigest,
@@ -2906,8 +2939,94 @@ export function own_structural_rekey_intent(value: unknown): StructuralRekeyInte
         receipt: Object.freeze({
             appendedRows: Object.freeze(appendedRows),
             removedSourceRows: Object.freeze(removedSourceRows),
+            ...(structure === undefined ? {} : { structure }),
         }),
     });
+}
+
+const MAX_STRUCTURE_RECEIPT_ROW_RUNS = 1_000_000;
+
+function is_receipt_index(value: unknown): value is number {
+    return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+}
+
+/**
+ * Strictly own the worksheet structure entries of a stored receipt: exact
+ * keys, whole non-negative coordinates, positive counts, unique worksheets,
+ * and unique pending IDs. `fail` throws the caller's own error.
+ */
+export function own_worksheet_structure_receipts(
+    value: unknown,
+    fail: () => never,
+): readonly WorksheetStructureReceipt[] {
+    if (!Array.isArray(value) || value.length === 0 || value.length > MAX_REKEY_INTENT_WORKSHEETS) fail();
+    const keys = new Set<string>();
+    return Object.freeze((value as unknown[]).map((entry): WorksheetStructureReceipt => {
+        const allowed = new Set([
+            'sheetIndex', 'sheetName', 'worksheetId',
+            'rowRuns', 'removedRows', 'columnMap', 'insertedRows', 'insertedColumns',
+        ]);
+        if (!is_plain_record(entry) || Object.keys(entry).some((key) => !allowed.has(key))) fail();
+        const record = entry as Record<string, unknown>;
+        const target = sanitized_wire_worksheet_target(record);
+        if (target === undefined || record.sheetIndex === undefined) fail();
+        const key = worksheet_target_key(target);
+        if (keys.has(key)) fail();
+        keys.add(key);
+        const list = (field: unknown, limit: number): unknown[] => {
+            if (!Array.isArray(field) || field.length > limit) fail();
+            return field as unknown[];
+        };
+        const exact = (item: unknown, names: readonly string[]): Record<string, unknown> => {
+            if (!is_plain_record(item)) fail();
+            const object = item as Record<string, unknown>;
+            const item_keys = Object.keys(object);
+            if (item_keys.length !== names.length || item_keys.some((name) => !names.includes(name))) fail();
+            return object;
+        };
+        const rowRuns = list(record.rowRuns, MAX_STRUCTURE_RECEIPT_ROW_RUNS).map((item) => {
+            const run = exact(item, ['from', 'count', 'to']);
+            if (!is_receipt_index(run.from) || !is_receipt_index(run.to)
+                || !is_receipt_index(run.count) || run.count === 0) fail();
+            return Object.freeze({ from: run.from as number, count: run.count as number, to: run.to as number });
+        });
+        const removedRows = list(record.removedRows, MAX_STRUCTURE_RECEIPT_ROW_RUNS).map((item) => {
+            const run = exact(item, ['start', 'count']);
+            if (!is_receipt_index(run.start) || !is_receipt_index(run.count) || run.count === 0) fail();
+            return Object.freeze({ start: run.start as number, count: run.count as number });
+        });
+        const columnMap = list(record.columnMap, 2 * MAX_SHEET_COLUMNS).map((item) => {
+            if (item !== null && !is_receipt_index(item)) fail();
+            return item as number | null;
+        });
+        const pending_ids = new Set<string>();
+        const pending_id = (id: unknown): string => {
+            if (typeof id !== 'string' || id.length === 0 || id.length > 128 || pending_ids.has(id)) fail();
+            pending_ids.add(id);
+            return id;
+        };
+        const insertedRows = list(record.insertedRows, MAX_STRUCTURE_RECEIPT_ROW_RUNS).map((item) => {
+            const row = exact(item, ['pendingRowId', 'sourceRow']);
+            if (!is_receipt_index(row.sourceRow)) fail();
+            return Object.freeze({ pendingRowId: pending_id(row.pendingRowId), sourceRow: row.sourceRow as number });
+        });
+        const insertedColumns = list(record.insertedColumns, MAX_SHEET_COLUMNS).map((item) => {
+            const column = exact(item, ['pendingColumnId', 'column']);
+            if (!is_receipt_index(column.column)) fail();
+            return Object.freeze({
+                pendingColumnId: pending_id(column.pendingColumnId),
+                column: column.column as number,
+            });
+        });
+        return Object.freeze({
+            ...target,
+            rowRuns: Object.freeze(rowRuns),
+            removedRows: Object.freeze(removedRows),
+            columnMap: Object.freeze(columnMap),
+            insertedRows: Object.freeze(insertedRows),
+            insertedColumns: Object.freeze(insertedColumns),
+        });
+    }));
 }
 
 /** Decode one worksheet target, optionally defaulting a legacy missing index. */
