@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 import { describe, expect, it } from 'vitest';
 import CFB from 'cfb';
 import { parse_xlsx } from '../parse-xlsx';
@@ -157,6 +158,11 @@ function stage(run: Run): Outcome {
             ...(restructured === undefined ? {} : { restructured }),
         };
     });
+    for (const entry of worksheets) {
+        if (entry.restructured !== undefined) {
+            expect_well_formed(`restructured ${entry.part}`, Buffer.from(entry.restructured.worksheet_xml).toString('utf8'));
+        }
+    }
     const workbook_xml = workbook(run.sheets.map((sheet) => sheet.name), run.definedNames);
     const result = run_workbook_formula_stage({
         workbook_part: 'xl/workbook.xml',
@@ -165,6 +171,7 @@ function stage(run: Run): Outcome {
         ...(run.pending === undefined ? {} : { pending_formulas: run.pending }),
         ...(run.unshareLimits === undefined ? {} : { unshare_limits: run.unshareLimits }),
     });
+    for (const part of result.parts) expect_well_formed(part.part, part.newText);
     return {
         ...result,
         worksheets,
@@ -177,6 +184,15 @@ function stage(run: Run): Outcome {
             return Buffer.from(worksheets[index].source_xml).toString('utf8');
         },
     };
+}
+
+const XML_PARSER = new DOMParser();
+
+/** Fails unless `text` is well-formed XML. */
+function expect_well_formed(part: string, text: string): void {
+    const document = XML_PARSER.parseFromString(text, 'application/xml');
+    const errors = document.getElementsByTagName('parsererror');
+    expect([part, errors.length === 0 ? '' : errors[0].textContent]).toEqual([part, '']);
 }
 
 const SHEET1 = 'xl/worksheets/sheet1.xml';
@@ -364,6 +380,28 @@ describe('workbook formula stage: defined names and hyperlinks', () => {
         });
         expect(global.parts).toEqual([]);
         expect(global.refusals).toMatchObject([{ code: 'ambiguous-defined-name', location: { kind: 'defined-name', name: 'Where' } }]);
+    });
+
+    it('keeps a single-quoted location well-formed when its new text holds apostrophes', () => {
+        const outcome = stage({
+            sheets: [
+                {
+                    name: 'Data Set',
+                    xml: grid(5, 1),
+                    rows: 5,
+                    columns: 1,
+                    rowLayout: (layout) => ok(delete_rows(layout, [source(0)], () => 0)),
+                },
+                {
+                    name: 'Index',
+                    xml: grid(1, 1) + `<hyperlinks><hyperlink ref='A1' location='&apos;Data Set&apos;!A3'/></hyperlinks>`,
+                    rows: 1,
+                    columns: 1,
+                },
+            ],
+        });
+        expect(outcome.refusals).toEqual([]);
+        expect(outcome.text(SHEET2)).toContain(`<hyperlink ref='A1' location='&apos;Data Set&apos;!A2'/>`);
     });
 
     it('renders internal hyperlink locations on every worksheet and leaves external ones alone', () => {
@@ -655,6 +693,33 @@ describe('workbook formula stage: conditional formatting and data validation', (
         });
         expect(outcome.refusals).toEqual([]);
         expect(outcome.text(SHEET1)).toContain(cf('A1:A1048576', 'A2&lt;&gt;A1', 1));
+    });
+
+    it('keeps a rule with a construct it cannot adjust only while none of its cells move', () => {
+        const run = (xml: string, rowLayout: (layout: RowLayout) => RowLayout) => stage({
+            sheets: [
+                { name: 'View', xml: grid(6, 1) + xml, rows: 6, columns: 1, rowLayout },
+                { name: 'Other', xml: grid(4, 2), rows: 4, columns: 2 },
+            ],
+        });
+        const spill = (sqref: string) => cf(sqref, 'COUNT(Other!B1#)', 1);
+        // Rows below the rule change: every covered cell keeps its place.
+        const below = run(spill('A1:A3'), (layout) => ok(delete_rows(layout, [source(4)], () => 0)));
+        expect(below.refusals).toEqual([]);
+        expect(below.text(SHEET1)).toContain(spill('A1:A3'));
+        // A deletion above shifts the rule's top-left; a swap inside it keeps its range but moves its cells.
+        for (const moved of [
+            run(spill('A2:A3'), (layout) => ok(delete_rows(layout, [source(0)], () => 0))),
+            run(spill('A1:A3'), (layout) => ok(move_rows(layout, [source(0)], source(2)))),
+        ]) {
+            expect(moved.parts).toEqual([]);
+            expect(moved.refusals).toMatchObject([{
+                code: 'unrenderable-formula',
+                sheetIndex: 0,
+                location: { kind: 'conditional-formatting', worksheet: 'View' },
+                issue: { kind: 'spill' },
+            }]);
+        }
     });
 
     it('refuses a rule that would split into more than 64 rules', () => {

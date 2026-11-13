@@ -108,12 +108,22 @@ export function get_attr(tag: string, attr: string): string | null {
     return end === -1 ? null : decode_xml(tag.slice(start, end));
 }
 
-/** Replace one exact attribute's raw value while preserving its quote and spacing. */
-export function replace_attr_value(tag: string, attr: string, value: string): string {
+/**
+ * Replace one exact attribute's value with `text`, preserving its quote and
+ * spacing. `text` is plain, not markup: it is encoded for the attribute's own
+ * delimiter, so a value holding either quote character stays well-formed
+ * whichever quote the source used.
+ */
+export function replace_attr_value(tag: string, attr: string, text: string): string {
     const start = attr_value_start(tag, attr);
     if (start === -1) return tag;
-    const end = tag.indexOf(tag[start - 1], start);
-    return end === -1 ? tag : tag.slice(0, start) + value + tag.slice(end);
+    const delimiter = tag[start - 1];
+    const end = tag.indexOf(delimiter, start);
+    if (end === -1) return tag;
+    const encoded = encode_xml_attr(text);
+    return tag.slice(0, start)
+        + (delimiter === "'" ? encoded.replace(/'/g, '&apos;') : encoded)
+        + tag.slice(end);
 }
 
 /** Remove one exact attribute and the XML whitespace that introduces it. */

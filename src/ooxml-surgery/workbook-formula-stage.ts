@@ -36,6 +36,7 @@ import { render_formula } from '../formula-anchors';
 import {
     MAX_RULE_SPLIT,
     parse_rule_sqref,
+    relative_rule_cells_unchanged,
     relative_rule_issues,
     rule_split_workbook,
     rule_sqref_text,
@@ -57,7 +58,7 @@ import {
     type QualifiedElementSpan,
     type Span,
 } from '../ooxml-worksheet-scan';
-import { decode_xml, encode_xml_attr, get_attr, remove_attr, replace_attr_value } from '../ooxml-xml';
+import { decode_xml, get_attr, remove_attr, replace_attr_value } from '../ooxml-xml';
 import { parse_workbook_xml } from '../parse-xlsx';
 import { appended_rows } from '../pending-changes';
 import { source_column_layout, source_row_layout } from '../worksheet-layout';
@@ -533,7 +534,7 @@ class Stage {
                 splices.push({
                     start: link.element.start,
                     end: link.element.inner_start,
-                    text: replace_attr_value(open, 'location', encode_xml_attr(rendered.slice(1))),
+                    text: replace_attr_value(open, 'location', rendered.slice(1)),
                 });
             }
         }
@@ -598,12 +599,16 @@ class Stage {
             const groups = result.groups;
             const untouched = groups.length === 1 && groups[0].formulas.every((formula, at) =>
                 formula === wrap_translate_formula(`=${rule.formulas[at]}`, 0, 0).slice(1));
-            if (untouched) return;
+            // A construct the tokenizer cannot adjust is relative to the rule's
+            // top-left like any reference, so the rule may keep its text only
+            // while every covered cell, and so its top-left, stays put.
             const issues = relative_rule_issues(rule);
             if (issues.length > 0) {
+                if (untouched && relative_rule_cells_unchanged(this.split, rule, now)) return;
                 this.refuse('unrenderable-formula', index, location, issues[0]);
                 return;
             }
+            if (untouched) return;
             planned.push({ kind, element, sqref, formulas, cf_rules, groups });
         };
 

@@ -933,3 +933,34 @@ export function split_relative_rule(
 export function relative_rule_issues(rule: RelativeRule): readonly FormulaReferenceIssue[] {
     return rule.formulas.flatMap((formula) => formula_reference_tokens(`=${formula}`).issues);
 }
+
+/**
+ * Whether every covered cell of `rule` keeps its coordinates and no cell
+ * joins it: `new_cells` is the rule's old `sqref`, and both axes map each
+ * covered row and column to itself. Then the rule's top-left is unchanged
+ * too, so text the tokenizer cannot adjust still means what it meant.
+ */
+export function relative_rule_cells_unchanged(
+    workbook: RuleSplitWorkbook,
+    rule: RelativeRule,
+    new_cells: readonly RuleCellRange[],
+): boolean {
+    if (rule_sqref_text(rule.cells) !== rule_sqref_text(new_cells)) return false;
+    return (['rows', 'columns'] as const).every((axis) => {
+        const own = workbook.axes[rule.worksheet][axis];
+        if (!own.changed) return true;
+        return covered_spans(rule.cells, axis).every((span) => {
+            // Each axis maps with slope one between its cuts, so checking
+            // each piece's two ends checks every coordinate in it.
+            const found: number[] = [span.start, span.end];
+            shifted_cuts(own.cuts, 0, span.start, span.end, own.size, found);
+            const points = sorted_unique(found.filter((cut) => cut >= span.start && cut <= span.end));
+            for (let at = 0; at + 1 < points.length; at++) {
+                const first = points[at];
+                const last = points[at + 1] - 1;
+                if (own.old_to_new(first) !== first || own.old_to_new(last) !== last) return false;
+            }
+            return true;
+        });
+    });
+}
