@@ -5373,7 +5373,12 @@ export function App(): React.JSX.Element {
             && !pending_row_replay_busy_ref.current
             && pending_highlight_request_ref.current === null
             && pending_row_resize_requests_ref.current.size === 0
-            && pending_append_requests_ref.current.size === 0,
+            && pending_append_requests_ref.current.size === 0
+            // Backpressure against a host that has stopped acknowledging:
+            // each unacknowledged structural publication is kept until it is
+            // acknowledged, so a refresh echoing it is recognized.
+            && !(csv_edit_session_id_ref.current !== undefined
+                && pending_changes_durability.structural_backlog_full(csv_edit_session_id_ref.current)),
         [],
     );
 

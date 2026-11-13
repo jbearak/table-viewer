@@ -18179,6 +18179,89 @@ describe('rapid structural gestures against refresh echoes', () => {
             .not.toContainEqual(first);
     });
 
+    it('recognizes an echo of its first publication after many unacknowledged gestures', async () => {
+        const { post_message } = await render_app();
+        const meta = make_meta(['Sheet1'], false);
+        Object.assign(meta.sheets[0], { rowCount: 8, sourceRowCount: 8 });
+        const wide_basis = { ...basis, sourceRowCount: 8 };
+        const capabilities = {
+            csvEditable: true,
+            csvEditingSupported: true,
+            structuralEditing: { sheets: [{ rows: { supported: true as const }, columns: { supported: true as const } }] },
+        };
+        await dispatch_host_message(initial_snapshot_message(meta, { capabilities }));
+        await enter_edit_mode(post_message, 'slow-session');
+        const store = (grid_shell_mock.latest_props as unknown as GridShellProps).pending_row_store!;
+        const { pending_changes_durability } = await import('../webview/host-bridge');
+        // Distinct row orders, in lexicographic order after the identity.
+        const orders: number[][] = [];
+        const order = [0, 1, 2, 3, 4, 5, 6, 7];
+        while (orders.length < 70) {
+            let pivot = order.length - 2;
+            while (order[pivot]! >= order[pivot + 1]!) pivot -= 1;
+            let swap = order.length - 1;
+            while (order[swap]! <= order[pivot]!) swap -= 1;
+            [order[pivot], order[swap]] = [order[swap]!, order[pivot]!];
+            order.splice(pivot + 1, order.length, ...order.slice(pivot + 1).reverse());
+            orders.push([...order]);
+        }
+        // The host is slow: none of these is acknowledged.
+        for (const rows of orders) {
+            await act(async () => {
+                const before = store.snapshot();
+                const staged = store.stage_replace('slow-session', before, {
+                    ...before, rowLayout: layout(...rows), structuralBasis: wide_basis,
+                });
+                staged!.commit();
+                staged!.notify();
+                pending_changes_durability.publish('slow-session', {
+                    sheetIndex: 0, sheetName: 'Sheet1', cells: {}, ...store.snapshot(),
+                }, 1);
+            });
+        }
+        const sent = () => post_message.mock.calls
+            .map(([message]) => message as WebviewMessage)
+            .filter((message): message is Extract<WebviewMessage, { type: 'pendingChangesChanged' }> =>
+                message.type === 'pendingChangesChanged');
+        const sent_before_echo = sent().length;
+        // The host finally writes publication 1 and refreshes.
+        const { sheetIndex: _sheet_index, ...first_slot } = sent()[0]!.changes;
+        await dispatch_host_message(refresh_snapshot_message(meta, {
+            generation: 1,
+            sourceGeneration: 1,
+            reason: 'other',
+            capabilities: { ...capabilities, csvEditSessionId: 'slow-session' },
+            state: { pendingEdits: [first_slot] },
+        }));
+        expect(store.snapshot().rowLayout).toEqual(layout(...orders.at(-1)!));
+        expect(sent().slice(sent_before_echo).map((message) => message.changes.rowLayout))
+            .not.toContainEqual(layout(...orders[0]!));
+    });
+
+    it('admits no edit gesture once too many structural publications await the host', async () => {
+        const { post_message } = await render_app();
+        const meta = make_meta(['Sheet1'], false);
+        Object.assign(meta.sheets[0], { rowCount: 4, sourceRowCount: 4 });
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        await enter_edit_mode(post_message, 'stalled-session');
+        const { pending_changes_durability, MAX_UNACKNOWLEDGED_STRUCTURAL_PUBLICATIONS } =
+            await import('../webview/host-bridge');
+        const admitted = () => (grid_shell_mock.latest_props as unknown as GridShellProps).gestures_admitted!();
+        expect(admitted()).toBe(true);
+        let last = 0;
+        for (let gesture = 0; gesture < MAX_UNACKNOWLEDGED_STRUCTURAL_PUBLICATIONS; gesture += 1) {
+            last = pending_changes_durability.publish('stalled-session', {
+                ...slot(layout(...(gesture % 2 === 0 ? [1, 0, 2, 3] : [0, 2, 1, 3]))),
+                sheetIndex: 0,
+            }, 1);
+        }
+        expect(admitted()).toBe(false);
+        await dispatch_host_message({ type: 'pendingChangesAcknowledged', editSessionId: 'stalled-session', sequence: last });
+        expect(admitted()).toBe(true);
+    });
+
     const scenarios: readonly {
         readonly name: string;
         readonly steps: readonly { readonly rows: readonly number[]; readonly cell?: string }[];

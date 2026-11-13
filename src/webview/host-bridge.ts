@@ -84,8 +84,13 @@ interface PendingEditSessionChannel {
     supersededStructuralBySheet: Map<string, { readonly sequence: number; readonly payload: string }[]>;
 }
 
-/** Superseded structural publications retained per sheet for echo detection. */
-const MAX_SUPERSEDED_STRUCTURAL_PUBLICATIONS = 64;
+/**
+ * Unacknowledged structural publications past which App admits no new edit
+ * gesture until the host catches up. Superseded ones are never dropped
+ * before acknowledgement (a refresh may still echo any of them), so this
+ * backpressure is what bounds their memory against a stalled host.
+ */
+export const MAX_UNACKNOWLEDGED_STRUCTURAL_PUBLICATIONS = 256;
 
 const pending_edit_channels = new Map<string, PendingEditSessionChannel>();
 
@@ -366,7 +371,6 @@ export const pending_changes_durability = {
         if (latest?.structural && channel.unacknowledgedSequences.has(latest.sequence)) {
             const superseded = channel.supersededStructuralBySheet.get(dedupe_key) ?? [];
             superseded.push({ sequence: latest.sequence, payload: latest.payload });
-            if (superseded.length > MAX_SUPERSEDED_STRUCTURAL_PUBLICATIONS) superseded.shift();
             channel.supersededStructuralBySheet.set(dedupe_key, superseded);
         }
         if (latest) channel.unacknowledgedSequences.delete(latest.sequence);
@@ -454,6 +458,20 @@ export const pending_changes_durability = {
             worksheet_target_key({ sheetIndex, sheetName, worksheetId }),
         );
         return (superseded ?? []).map((entry) => JSON.parse(entry.payload) as WorksheetPendingChanges);
+    },
+    /**
+     * Whether the session has as many unacknowledged structural publications
+     * as App lets accumulate: the superseded ones and each sheet's latest.
+     */
+    structural_backlog_full(editSessionId: string): boolean {
+        const channel = pending_edit_channels.get(editSessionId);
+        if (channel === undefined) return false;
+        let backlog = 0;
+        for (const superseded of channel.supersededStructuralBySheet.values()) backlog += superseded.length;
+        for (const publication of channel.latestPublicationBySheet.values()) {
+            if (publication.structural && channel.unacknowledgedSequences.has(publication.sequence)) backlog += 1;
+        }
+        return backlog >= MAX_UNACKNOWLEDGED_STRUCTURAL_PUBLICATIONS;
     },
     unacknowledged_structural_payload_matches(
         editSessionId: string,

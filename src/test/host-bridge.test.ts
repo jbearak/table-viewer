@@ -334,7 +334,8 @@ describe('host-bridge', () => {
         const injected = { postMessage: vi.fn() };
         (globalThis as { __tableViewerHostBridge?: unknown })
             .__tableViewerHostBridge = injected;
-        const { pending_changes_durability } = await import('../webview/host-bridge');
+        const { pending_changes_durability, MAX_UNACKNOWLEDGED_STRUCTURAL_PUBLICATIONS } =
+            await import('../webview/host-bridge');
         const changes = (start: number) => ({
             sheetIndex: 0,
             sheetName: 'Sheet1',
@@ -366,11 +367,18 @@ describe('host-bridge', () => {
         pending_changes_durability.acknowledge('session:echo', third);
         expect(superseded()).toEqual([]);
         expect(second).toBe(first + 1);
-        // Bounded under a long run of unacknowledged gestures.
-        for (let gesture = 0; gesture < 200; gesture += 1) {
+        // Never dropped before acknowledgement, however many pile up: a
+        // refresh may still echo any of them. The backlog flag is App's
+        // backpressure instead.
+        expect(pending_changes_durability.structural_backlog_full('session:echo')).toBe(false);
+        for (let gesture = 0; gesture < MAX_UNACKNOWLEDGED_STRUCTURAL_PUBLICATIONS; gesture += 1) {
             pending_changes_durability.publish('session:echo', changes(gesture % 2), 1);
         }
-        expect(superseded().length).toBeLessThanOrEqual(64);
+        expect(superseded()).toHaveLength(MAX_UNACKNOWLEDGED_STRUCTURAL_PUBLICATIONS - 1);
+        expect(pending_changes_durability.structural_backlog_full('session:echo')).toBe(true);
+        pending_changes_durability.acknowledge('session:echo', third + MAX_UNACKNOWLEDGED_STRUCTURAL_PUBLICATIONS);
+        expect(superseded()).toEqual([]);
+        expect(pending_changes_durability.structural_backlog_full('session:echo')).toBe(false);
     });
 
     it('prefers an injected global bridge over acquireVsCodeApi', async () => {
