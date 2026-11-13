@@ -83,7 +83,10 @@ export function ends_with_unquoted_record_terminator(bytes: Uint8Array, delimite
     const separator = delimiter.charCodeAt(0);
     let in_quotes = false;
     let field_start = true;
-    for (let index = 0; index < bytes.length; index++) {
+    // A leading UTF-8 BOM is not content: `CsvDataSource` strips it before its
+    // own scan, so a `"` right after it opens a quoted field.
+    const start = bytes.length >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf ? 3 : 0;
+    for (let index = start; index < bytes.length; index++) {
         const byte = bytes[index];
         if (in_quotes) {
             if (byte === QUOTE) {

@@ -5980,35 +5980,45 @@ export function attach_viewer(
         sheets: readonly WorksheetIdentityInput[],
     ): FileStateSnapshot {
         const state = projected.state as PerFileState;
+        const stripped = state_without_unresolved_view(state, sheets);
+        return stripped === state ? projected : { revision: projected.revision, state: stripped };
+    }
+
+    /**
+     * `without_unresolved_view_state` on a state: what the panel may show,
+     * and what the core may install, while a structural save is unresolved.
+     * Sorts, filters, and schemas are column-keyed and stay.
+     */
+    function state_without_unresolved_view(
+        state: PerFileState,
+        sheets: readonly WorksheetIdentityInput[],
+    ): PerFileState {
         const intent = unresolved_rekey_intent(state);
-        if (intent === undefined) return projected;
+        if (intent === undefined) return state;
         const affected = structurally_affected_sheets(intent, sheets);
-        if (affected.length === 0) return projected;
+        if (affected.length === 0) return state;
         const highlights = state.cellHighlights === undefined ? undefined : {
             ...state.cellHighlights,
             sheets: state.cellHighlights.sheets.map((entry, index) => affected.includes(index) ? undefined : entry),
         };
         return {
-            revision: projected.revision,
-            state: {
-                ...state,
-                ...(highlights === undefined ? {} : { cellHighlights: highlights }),
-                ...(state.columnWidths === undefined ? {} : {
-                    columnWidths: state.columnWidths.map((entry, index) =>
-                        affected.includes(index) ? undefined : entry),
+            ...state,
+            ...(highlights === undefined ? {} : { cellHighlights: highlights }),
+            ...(state.columnWidths === undefined ? {} : {
+                columnWidths: state.columnWidths.map((entry, index) =>
+                    affected.includes(index) ? undefined : entry),
+            }),
+            ...(state.rowHeights === undefined ? {} : {
+                rowHeights: state.rowHeights.map((entry, index) =>
+                    affected.includes(index) ? undefined : entry),
+            }),
+            ...(state.transforms === undefined ? {} : {
+                transforms: state.transforms.map((entry, index) => {
+                    if (entry === undefined || !affected.includes(index)) return entry;
+                    const { hiddenRows: _hidden, ...rest } = entry;
+                    return rest;
                 }),
-                ...(state.rowHeights === undefined ? {} : {
-                    rowHeights: state.rowHeights.map((entry, index) =>
-                        affected.includes(index) ? undefined : entry),
-                }),
-                ...(state.transforms === undefined ? {} : {
-                    transforms: state.transforms.map((entry, index) => {
-                        if (entry === undefined || !affected.includes(index)) return entry;
-                        const { hiddenRows: _hidden, ...rest } = entry;
-                        return rest;
-                    }),
-                }),
-            },
+            }),
         };
     }
 
@@ -6437,8 +6447,8 @@ export function attach_viewer(
             const snapshot = await read_file_state(false);
             if (!transform_authority_is_current(message, authority)) return;
             const sheets = reconciliation_core.snapshot_material().core.meta.sheets;
-            const durable = normalize_host_state(
-                snapshot.state,
+            const durable = state_without_unresolved_view(
+                normalize_host_state(snapshot.state, sheets),
                 sheets,
             );
             const transforms = sheets.map((sheet, index) => {
@@ -10791,8 +10801,11 @@ export function attach_viewer(
                         let reconciled = false;
                         try {
                             const sheets = ready_core.snapshot_material().core.meta.sheets;
-                            const durable = normalize_host_state(
-                                state_snapshot.state,
+                            // The view the snapshot projects: an unresolved
+                            // structural save's affected sheets install no
+                            // hidden rows.
+                            const durable = state_without_unresolved_view(
+                                normalize_host_state(state_snapshot.state, sheets),
                                 sheets,
                             );
                             const transforms = sheets.map((sheet, index) => (

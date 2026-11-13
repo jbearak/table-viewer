@@ -347,6 +347,15 @@ describe('Structural Basis', () => {
         expect(is_delimited_prefix_growth(old, encoder.encode('h,v\na,"1\n2"\nb,3\n'), ',', parse)).toBe(false);
     });
 
+    it('reads quotes after a UTF-8 BOM the way the parser does', () => {
+        const bom = [0xef, 0xbb, 0xbf];
+        const old_with_bom = new Uint8Array([...bom, ...encoder.encode('"h,"\na\n')]);
+        expect(ends_with_unquoted_record_terminator(old_with_bom, ',')).toBe(true);
+        const old = basis_of(old_with_bom, 1, 1) as Extract<StructuralBasis, { kind: 'delimited' }>;
+        const grown = new Uint8Array([...old_with_bom, ...encoder.encode('b\n')]);
+        expect(is_delimited_prefix_growth(old, grown, ',', parse)).toBe(true);
+    });
+
     it('joins new rows after the run holding the highest old row, wherever it moved', () => {
         expect(rebase_row_layout_on_growth({
             runs: [{ kind: 'source', start: 3, count: 2 }, { kind: 'source', start: 0, count: 3 }],

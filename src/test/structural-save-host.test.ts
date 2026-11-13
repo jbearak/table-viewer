@@ -568,6 +568,28 @@ describe('an unresolved rekey intent', () => {
         await viewer.dispose();
     });
 
+    it('installs no durable hidden rows on an affected sheet as view state', async () => {
+        // Three body rows, so the durable hiddenRows [2] would be in range.
+        const { viewer } = await open_unresolved(BYTES);
+        // A reloaded renderer: the ready path reconciles installed transforms
+        // with durable state.
+        await viewer.panel.__receive({ type: 'ready', structuralLayout: 1 });
+        await viewer.controller.drain();
+        const snapshot = viewer.last<{ snapshot: { generation: number } }>('workbookSnapshot').snapshot;
+        await viewer.panel.__receive({
+            type: 'requestRows',
+            sheetIndex: 0,
+            startRow: 0,
+            count: 3,
+            requestId: 'rows',
+            generation: snapshot.generation,
+        });
+        await viewer.controller.drain();
+        expect(viewer.last<{ sourceRows: number[] }>('rowData').sourceRows).toEqual([0, 1, 2]);
+        expect(viewer.durable().transforms?.[0]?.hiddenRows).toEqual([2]);
+        await viewer.dispose();
+    });
+
     it('suggests "It didn\'t finish" when the shape does not match', async () => {
         const { viewer } = await open_unresolved(BYTES);
         // BYTES matches the payload's basis but neither intent digest.
