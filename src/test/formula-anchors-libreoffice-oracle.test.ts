@@ -230,8 +230,8 @@ class Replay {
  * Formula text with spelling that cannot change meaning folded away. Outside
  * string literals and quoted sheet names:
  *
- * - case, and whitespace beside an operator or bracket; other whitespace runs,
- *   such as the intersection operator, become one space;
+ * - case, and whitespace beside an operator or just inside a bracket; other
+ *   whitespace runs, such as the intersection operator, become one space;
  * - quotes around a sheet name that needs none;
  * - a sheet qualifier on `#REF!`: `'My Data'!#REF!` and `#REF!` are the same
  *   error, and LibreOffice drops the qualifier where Excel keeps it;
@@ -267,7 +267,10 @@ function normalize_formula(text: string): string {
     return skeleton
         .toUpperCase()
         .replace(/\s+/g, ' ')
-        .replace(/ ?([(),:+\-*/&=<>^%;{}]) ?/g, '$1')
+        .replace(/ ?([,:+\-*/&=<>^%;{}]) ?/g, '$1')
+        // A space between `)` and an operand is the intersection operator; only inner padding goes.
+        .replace(/\( /g, '(')
+        .replace(/ \)/g, ')')
         .trim()
         .replace(/(?:\u0000\d+\u0000|[A-Z0-9_.]+)!#REF!/g, '#REF!')
         .replace(/(?<![A-Z0-9_.$])(\$?[A-Z]{1,3}\$?[0-9]+):\1(?![A-Z0-9_.$(])/g, '$1')
@@ -290,6 +293,7 @@ describe('normalize_formula', () => {
     it('folds case, whitespace, and needless sheet quotes, and keeps literals exact', () => {
         expect(normalize_formula("=sum( 'Sheet1'!b3 : B4 )")).toBe('=SUM(SHEET1!B3:B4)');
         expect(normalize_formula('=SUM(B3:D6   C4:E8)')).toBe('=SUM(B3:D6 C4:E8)');
+        expect(normalize_formula('=SUM((B3:D6) (C4:E8))')).toBe('=SUM((B3:D6) (C4:E8))');
         expect(normalize_formula(`="a  b"&'My Data'!A1`)).toBe(`="a  b"&'My Data'!A1`);
         // A name that reads as a cell reference must stay quoted.
         expect(normalize_formula("='AB12'!A1")).toBe("='AB12'!A1");
