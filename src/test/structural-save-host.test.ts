@@ -650,6 +650,9 @@ describe('an unresolved rekey intent', () => {
             requestId: 'highlight',
             error: 'Choose whether your last save finished before editing this file.',
         });
+        // The refusal hands back what the panel may show, not the withheld highlights.
+        expect(viewer.last<{ state?: PerFileState['cellHighlights'] }>('cellHighlightsChanged').state?.sheets[0])
+            .toBeUndefined();
 
         await viewer.panel.__receive({
             type: 'setRowHeights', sheetIndex: 0, rows: [{ start: 0, end: 0 }], height: 50, requestId: 'resize', ...stamp,

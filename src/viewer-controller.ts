@@ -11231,8 +11231,13 @@ export function attach_viewer(
                         try {
                             const current = await read_file_state(false);
                             state_revision = current.revision;
+                            // What the panel may show: an unresolved structural
+                            // save's affected sheets carry no highlights.
                             state = normalize_workbook_snapshot_state(
-                                current.state,
+                                state_without_unresolved_view(
+                                    current.state as PerFileState,
+                                    current_source.meta().sheets,
+                                ),
                                 current_source.meta(),
                                 current_authority.physicalDigest,
                             ).cellHighlights;
