@@ -813,10 +813,14 @@ export function use_editing(
     }, [formula_reference_bases]);
     /** The persisted side as the editor shows it: a formula rendered for the current layouts. */
     const rendered_persisted_formula = options?.rendered_persisted_formula;
-    const persisted_formula_view = useCallback((base: ParsedCellEdit): ParsedCellEdit => {
+    const persisted_formula_view = useCallback((
+        base: ParsedCellEdit,
+        /** The persisted cell holds a formula: text starting with `=` may be a string. */
+        is_formula: boolean,
+    ): ParsedCellEdit => {
         if (rendered_persisted_formula === undefined
             || syntax !== 'markdown'
-            || !xlsx_edit_writes_formula(base.text, base.rich?.runs)) return base;
+            || !is_formula) return base;
         const text = rendered_persisted_formula(base.text);
         return text === base.text ? base : { text };
     }, [rendered_persisted_formula, syntax]);
@@ -867,7 +871,13 @@ export function use_editing(
                 (edit, before_entry, _before_overlay, persisted) => {
                     const parsed = parse_cell_edit(edit.value, syntax);
                     const formula_anchors = anchors_by_edit.get(edit);
-                    const persisted_view = persisted_formula_view(persisted.base);
+                    const persisted_cell = 'persistedCell' in edit
+                        ? edit.persistedCell
+                        : get_cell?.(edit.source_row, edit.source_col);
+                    const persisted_view = persisted_formula_view(
+                        persisted.base,
+                        persisted_cell?.formula !== undefined,
+                    );
                     const explicitly_opened = edit.openedValue === undefined
                         ? undefined
                         : parse_cell_edit(edit.openedValue, syntax);

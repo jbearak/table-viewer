@@ -288,7 +288,8 @@ const ROWS: (CellData | null)[][] = [
     [cell('10'), cell('1'), formula('=SUM(A2:A6)')],
     [cell('20'), cell('2'), formula('=A4*2')],
     [cell('30'), cell('3'), formula('=INDEX(A:A,1):A3')],
-    [cell('40'), cell('4'), null],
+    // C5 is a string that happens to start with `=`.
+    [cell('40'), cell('4'), cell('=A4')],
     [cell('50'), cell('5'), null],
 ];
 
@@ -387,6 +388,14 @@ describe('editing formulas against a layout', () => {
         expect(entry?.base).toBe('=SUM(A2:A6)');
         expect(entry?.writeValue).toBe(true);
         expect(entry?.formulaAnchors).toBeDefined();
+    });
+
+    it('compares a string that starts with = as text, not as a rendered formula', async () => {
+        const { store } = await render_hook(workbook(delete_data_rows([2])));
+        // As a formula `=A4` would render `=A3`; as a string it stays `=A4`, so
+        // typing the formula `=A3` is an edit, not a revert.
+        await act(async () => { hook_result!.commit_edit(4, 2, '=A3'); });
+        expect(store.get('4:2')).toMatchObject({ value: '=A3', base: '=A4' });
     });
 
     it('refuses a formula it cannot anchor, with the reason, and changes nothing', async () => {
