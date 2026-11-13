@@ -10257,6 +10257,11 @@ describe('columns: Insert, Delete, Restore, Move, rename, Pending Column cells, 
         const highlight_ref: { current: HighlightSelectionHandle | null } = { current: null };
         const { pending } = await render_columns({ highlight_ref });
         await insert_right_of_first();
+        // The insert focuses its first new cell by polling; let it land, or it
+        // would overwrite the selection below.
+        await vi.waitFor(() => expect(
+            (grid_mock.props!.gridSelection as { current?: { cell: [number, number] } }).current?.cell,
+        ).toEqual([1, 0]));
         // Source row 1's page is not resident: its identity is unknown.
         grid_mock.source_row_for_display = (display_row: number) => (display_row === 1 ? undefined : display_row);
         const on_selection_change = grid_mock.props!.onGridSelectionChange as (selection: unknown) => void;
@@ -10278,6 +10283,11 @@ describe('columns: Insert, Delete, Restore, Move, rename, Pending Column cells, 
         const on_highlight_selection = vi.fn();
         const { pending, history } = await render_columns({ highlight_ref, on_highlight_selection });
         await insert_right_of_first();
+        // The insert focuses its first new cell by polling; let it land, or it
+        // would overwrite the selection below.
+        await vi.waitFor(() => expect(
+            (grid_mock.props!.gridSelection as { current?: { cell: [number, number] } }).current?.cell,
+        ).toEqual([1, 0]));
         const on_selection_change = grid_mock.props!.onGridSelectionChange as (selection: unknown) => void;
         // The Pending Column alone: nothing goes to the host.
         await act(async () => on_selection_change({
