@@ -8,7 +8,19 @@ import { profile_for, simulate_process_restart_for_tests } from '../viewer-contr
 import { current_structural_basis } from '../structural-editing-capability';
 import { observe_xlsx_structure } from '../xlsx-structural-observation';
 import type { PerFileState, WorksheetPendingEdits } from '../types';
-import type { PendingAppendedRow } from '../pending-changes';
+import { EMPTY_PENDING_STRUCTURAL_CHANGES, type PendingAppendedRow } from '../pending-changes';
+import {
+    merge_destination_message,
+    MERGE_SPLIT_MESSAGE,
+    type WorksheetStructureContext,
+} from '../webview/pending-row-store';
+import {
+    merge_ranges_of,
+    plan_row_move,
+    row_move_block_refusal,
+    row_move_item_model,
+    type RowStructureSelection,
+} from '../webview/row-structure-model';
 import { content_digest } from '../content-digest';
 import { parse_xlsx } from '../parse-xlsx';
 import { ZipPackage } from '../zip-package';
@@ -573,5 +585,74 @@ describe('Pending Columns at the writer', () => {
         expect(data).toContain('<col min="3" max="4" width="10" style="2" customWidth="1"/>');
         expect(data).toContain('<autoFilter ref="A1:E7"/>');
         expect(part_text(saved, 'xl/worksheets/sheet2.xml')).toContain('<f>SUM(Data!E2:E7)</f>');
+    });
+});
+
+describe('row moves through the step 7 model on .xlsx', () => {
+    it('refuses moves across a shipped merge, and saves a move that round-trips through parse_xlsx', async () => {
+        const viewer = await open_xlsx(representative_workbook(), { state: HEADER_ON });
+        const support = viewer.capability().sheets[0]!;
+        const context: WorksheetStructureContext = {
+            worksheet: { sheetIndex: 0, sheetName: 'Data', worksheetId: '1' },
+            bodyStart: 1,
+            sourceRowCount: 7,
+            sourceColumnCount: 6,
+            bodyViewTransformed: false,
+            // As GridShell builds it: the merges the host's support scan shipped.
+            merges: merge_ranges_of(support.merges!),
+            structuralBasis: support.basis!,
+        };
+        const selection = (rows: readonly number[]): RowStructureSelection => ({
+            count: rows.length,
+            identities: rows.map((sourceRow) => ({ kind: 'source', sourceRow })),
+            removedSourceRows: [],
+            fixedRows: false,
+            tailRemovals: false,
+            contiguous: true,
+            bandRows: 0,
+            endsAtBandEnd: false,
+        });
+        const input = (rows: readonly number[]) => ({
+            support: support.rows,
+            ready: true,
+            selection: selection(rows),
+            changes: EMPTY_PENDING_STRUCTURAL_CHANGES,
+            context,
+        });
+        // An axis the scan refuses gives Move its own wording.
+        expect(row_move_block_refusal({
+            ...input([3]),
+            support: { supported: false, reason: "Can't insert or delete rows on this sheet: x.", moveReason: "Can't move rows on this sheet: x." },
+        })).toBe("Can't move rows on this sheet: x.");
+        // Banana (source row 2) is half of the merge E2:F3: no Move item, and
+        // no drag, whatever the destination.
+        expect(row_move_block_refusal(input([2]))).toBe(MERGE_SPLIT_MESSAGE);
+        expect(row_move_item_model(input([2]), 'forward')).toMatchObject({ enabled: false, reason: MERGE_SPLIT_MESSAGE });
+        // Cherry one step up would land between Apple and Banana, inside the merge.
+        expect(row_move_item_model(input([3]), 'backward'))
+            .toMatchObject({ enabled: false, reason: merge_destination_message('rows') });
+        expect(plan_row_move(EMPTY_PENDING_STRUCTURAL_CHANGES, context, [{ kind: 'source', sourceRow: 3 }], { kind: 'source', sourceRow: 2 }))
+            .toMatchObject({ ok: false, message: merge_destination_message('rows') });
+        // The whole merge moves together: Apple and Banana below Elder.
+        const plan = plan_row_move(
+            EMPTY_PENDING_STRUCTURAL_CHANGES,
+            context,
+            [{ kind: 'source', sourceRow: 1 }, { kind: 'source', sourceRow: 2 }],
+            { kind: 'source', sourceRow: 6 },
+        );
+        if (!plan.ok) throw new Error(plan.message);
+        const result = await viewer.save([{
+            sheetIndex: 0,
+            structural: { rowLayout: plan.outcome.next.rowLayout!, structuralBasis: support.basis! },
+        }]);
+        expect(result.rejection).toBeUndefined();
+        expect(result).toMatchObject({ success: true });
+        const saved = viewer.file.bytes;
+        expect(part_text(saved, 'xl/worksheets/sheet1.xml')).toContain('<mergeCell ref="E5:F6"/>');
+        const parsed = await parse_xlsx(saved);
+        expect(cell_values(parsed.data.sheets[0]!.rows as unknown[][]).map((cells) => cells.slice(0, 2))).toEqual([
+            ['Item', 'Qty'], ['Cherry', 7], ['Date', 9], ['Elder', 11], ['Apple', 3], ['Banana', 5], ['Fig', 13],
+        ]);
+        expect(part_text(saved, 'xl/worksheets/sheet2.xml')).toContain('<f>Data!B3</f>');
     });
 });

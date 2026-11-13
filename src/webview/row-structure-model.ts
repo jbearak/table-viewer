@@ -52,6 +52,7 @@ import {
     APPENDED_BAND_MESSAGE,
     delete_rows,
     insert_rows,
+    MERGE_SPLIT_MESSAGE,
     move_rows,
     restore_rows,
     source_cells_removed_by,
@@ -348,7 +349,9 @@ export function row_move_block_refusal(
     input: Pick<RowStructureMenuInput, 'support' | 'ready' | 'selection' | 'changes' | 'context'>,
 ): string | undefined {
     const { selection, changes, context } = input;
-    const reason = shared_structure_reason(input)
+    // An `.xlsx` sheet the host can't restructure says so in Move's words.
+    const reason = (input.support.supported ? undefined : input.support.moveReason)
+        ?? shared_structure_reason(input)
         ?? (selection.fixedRows ? MOVE_FIXED_ROWS_MESSAGE : undefined)
         ?? (selection.tailRemovals ? STRUCTURE_TAIL_REMOVAL_MESSAGE : undefined)
         ?? (selection.identities === undefined ? ROWS_NOT_LOADED_MESSAGE : undefined)
@@ -357,12 +360,44 @@ export function row_move_block_refusal(
         // into the band moves nothing.
         ?? (selection.bandRows > 0 ? APPENDED_BAND_MESSAGE : undefined)
         ?? (context.bodyViewTransformed ? STRUCTURE_TRANSFORMED_MESSAGE : undefined)
-        ?? structure_exclusivity_message(changes, context);
+        ?? structure_exclusivity_message(changes, context)
+        ?? merge_split_refusal(changes, context, selection.identities!);
     if (reason !== undefined) return reason;
     const index = index_row_layout(row_layout_for(changes, context));
     return insert_anchor_for_selection(index, selection.identities!, 'before') === undefined
         ? MOVE_ONLY_REMOVED_ROWS_MESSAGE
         : undefined;
+}
+
+/**
+ * Moving part of a merge is refused whatever the destination, so the Move
+ * items and the drag refuse it before a target is chosen, with the store's
+ * own message (`move_rows` refuses the same block). A merge's part is the
+ * block's live source rows inside its row span, against all its live rows.
+ */
+function merge_split_refusal(
+    changes: PendingStructuralChanges,
+    context: WorksheetStructureContext,
+    identities: readonly RowIdentity[],
+): string | undefined {
+    const merges = context.merges ?? [];
+    if (merges.length === 0) return undefined;
+    const is_removed = removed_source_row_test(changes);
+    const moved = identities.flatMap((identity) =>
+        identity.kind === 'source' && !is_removed(identity.sourceRow) ? [identity.sourceRow] : []);
+    if (moved.length === 0) return undefined;
+    for (const merge of merges) {
+        if (merge.endRow <= merge.startRow) continue;
+        let inside = 0;
+        for (const row of moved) if (row >= merge.startRow && row <= merge.endRow) inside += 1;
+        if (inside === 0) continue;
+        let live = 0;
+        for (let row = merge.startRow; row <= merge.endRow && live <= inside; row += 1) {
+            if (!is_removed(row)) live += 1;
+        }
+        if (inside < live) return MERGE_SPLIT_MESSAGE;
+    }
+    return undefined;
 }
 
 /**
