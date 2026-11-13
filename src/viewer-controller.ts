@@ -99,6 +99,8 @@ import {
 } from './excel-header-plan';
 import { parse_http_external_url } from './external-url';
 import { is_plain_record } from './plain-record';
+import { formula_anchor_context, formula_anchor_workbook } from './formula-anchor-layout';
+import { render_formula, type FormulaAnchors } from './formula-anchors';
 import { parser_format_for, type TableFormat } from './table-format';
 import {
     current_structural_basis,
@@ -1007,6 +1009,58 @@ function materialize_replay_cells(
  */
 function plan_xlsx_save(input: SavePlanInput): SavePlan {
     const { source: src } = input;
+    // A pending formula with stored anchors is written as it renders for the
+    // layout the save produces, never as its stored text: discarding an
+    // earlier appended row compacts the band, so the stored text of a
+    // reference to a later appended row names the wrong row.
+    const saved_structure = new Map(input.worksheets.map(({ sheet_index, structural_changes }) =>
+        [sheet_index, structural_changes] as const));
+    const anchor_workbook = formula_anchor_workbook('xlsx', src.meta().sheets.map((sheet, sheetIndex) => {
+        const changes = saved_structure.get(sheetIndex);
+        return {
+            target: {
+                sheetIndex,
+                sheetName: sheet.name,
+                ...(sheet.worksheetId === undefined ? {} : { worksheetId: sheet.worksheetId }),
+            },
+            name: sheet.name,
+            bodyStart: sheet.excelFirstRowHeader?.active === true
+                && sheet.excelFirstRowHeader.sourceRow !== undefined
+                ? sheet.excelFirstRowHeader.sourceRow + 1
+                : 0,
+            sourceRowCount: sheet.sourceRowCount,
+            sourceColumnCount: sheet.columnCount,
+            ...(changes === undefined ? {} : { changes }),
+        };
+    }));
+    const saved_formula_text = (
+        value: string,
+        anchors: FormulaAnchors | undefined,
+        sheet_index: number,
+        worksheet_operation_index: number,
+        structural: PendingStructuralChanges,
+        cell: NonNullable<PendingStructuralConflict['formulaCells']>[number],
+    ): string => {
+        if (anchors === undefined) return value;
+        let rendered: ReturnType<typeof render_formula> | undefined;
+        try {
+            rendered = render_formula(value, anchors, formula_anchor_context(anchor_workbook, sheet_index));
+        } catch {
+            rendered = undefined;
+        }
+        if (rendered?.kind === 'rendered') return rendered.text;
+        return structural_save_error(
+            worksheet_operation_index,
+            structural,
+            'ambiguousPendingFormula',
+            'A pending formula cannot be adjusted to the rows and columns it names.',
+            {
+                pendingRowIds: cell.rowIdentity.kind === 'pending' ? [cell.rowIdentity.pendingRowId] : [],
+                tailRemovalIds: [],
+                formulaCells: [cell],
+            },
+        );
+    };
     // Every worksheet is fully planned before bytes are produced. The package
     // writer likewise computes every replacement before mutating the container,
     // so one invalid worksheet rejects the workbook save atomically.
@@ -1174,7 +1228,16 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
             cell_edits.push({
                 row,
                 col,
-                value: header_edit ? committed_column_name(value) : value,
+                value: header_edit
+                    ? committed_column_name(value)
+                    : saved_formula_text(
+                        value,
+                        dirty_edits?.[key]?.value === value ? dirty_edits[key].formulaAnchors : undefined,
+                        sheet_index,
+                        worksheet_operation_index,
+                        structural,
+                        { rowIdentity: { kind: 'source', sourceRow: row }, sourceColumn: col },
+                    ),
                 ...(header_edit ? { force_text: true } : {}),
                 ...(!header_edit && runs && runs.length > 0 ? { runs } : {}),
                 ...(moved_from === undefined ? {} : { movedFrom: moved_from }),
@@ -1266,7 +1329,14 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
                 cell_edits.push({
                     row: destination,
                     col: column,
-                    value: pending_cell.value,
+                    value: saved_formula_text(
+                        pending_cell.value,
+                        pending_cell.formulaAnchors,
+                        sheet_index,
+                        worksheet_operation_index,
+                        structural,
+                        { rowIdentity: { kind: 'pending', pendingRowId: row.id }, sourceColumn: column },
+                    ),
                     ...(pending_cell.valueRuns?.runs.length
                         ? { runs: pending_cell.valueRuns.runs }
                         : {}),
