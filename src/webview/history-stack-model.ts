@@ -1226,6 +1226,66 @@ function saved_tail_removal(
     };
 }
 
+/**
+ * A Pending Column after a save: its cells' provenance and anchors name the
+ * saved rows by source row, and so do the keys of the cells and highlights it
+ * held in them (`p:<id>` becomes `s:<sourceRow>`).
+ */
+function rekey_pending_column_provenance(
+    column: PendingColumn,
+    worksheet: WorksheetTarget,
+    assignments: ReadonlyMap<string, SavedHistoryRowAssignment>,
+): PendingColumn {
+    const rekey_key = (key: string): string => {
+        if (!key.startsWith('p:')) return key;
+        const assignment = saved_assignment_for_identity(
+            { kind: 'pending', pendingRowId: key.slice(2) },
+            worksheet,
+            assignments,
+        );
+        return assignment === undefined ? key : `s:${assignment.sourceRow}`;
+    };
+    return {
+        ...column,
+        cells: Object.fromEntries(Object.entries(column.cells).map(([key, cell]) => [
+            rekey_key(key),
+            rekey_pending_cell_provenance(cell, worksheet, assignments)!,
+        ])),
+        ...(column.highlights === undefined ? {} : {
+            highlights: Object.fromEntries(Object.entries(column.highlights).map(
+                ([key, color]) => [rekey_key(key), color],
+            )),
+        }),
+    };
+}
+
+/** A layout gesture's Pending Row and Pending Column transitions after a save. */
+function rekey_layout_entries<L>(
+    delta: StructuralSnapshotDelta<L>,
+    assignments: ReadonlyMap<string, SavedHistoryRowAssignment>,
+): StructuralSnapshotDelta<L> {
+    const worksheet = delta.worksheet;
+    const row = (entry: PendingAppendedRow | null) => entry === null
+        ? null
+        : rekey_appended_row_provenance(entry, worksheet, assignments);
+    const column = (entry: PendingColumn | null) => entry === null
+        ? null
+        : rekey_pending_column_provenance(entry, worksheet, assignments);
+    return {
+        ...delta,
+        pendingRows: delta.pendingRows.map((entry) => ({
+            ...entry,
+            before: row(entry.before),
+            after: row(entry.after),
+        })),
+        pendingColumns: delta.pendingColumns.map((entry) => ({
+            ...entry,
+            before: column(entry.before),
+            after: column(entry.after),
+        })),
+    };
+}
+
 function rekey_structural_provenance(
     snapshot: PendingStructuralChanges,
     worksheet: WorksheetTarget,
@@ -1241,6 +1301,10 @@ function rekey_structural_provenance(
         ...snapshot,
         appendedRows: pending_rows(snapshot).map((row) =>
             rekey_appended_row_provenance(row, worksheet, assignments)),
+        ...(snapshot.pendingColumns === undefined ? {} : {
+            pendingColumns: snapshot.pendingColumns.map((column) =>
+                rekey_pending_column_provenance(column, worksheet, assignments)),
+        }),
         tailRemovals: snapshot.tailRemovals.map((removal) => ({
             ...removal,
             savedRow: rekey_saved_row_provenance(
@@ -1354,13 +1418,16 @@ function rekey_change_provenance(
         // recorded Structural Basis: replaying one that reinstates a live
         // layout change meets the host's basis check against the saved file
         // and is refused as a conflict rather than applied to bytes it was
-        // not authored against. Column layouts are untouched: appending never
-        // adds a column.
+        // not authored against. Column layouts keep their order: appending
+        // never adds a column. On both axes, the Pending Rows and Pending
+        // Columns a gesture recorded name the saved rows by source row, in
+        // their cells, keys, and Formula Anchors.
         case 'rowLayout': {
+            const delta = rekey_layout_entries(change.delta, assignments);
             const saved_rows = [...assignments.values()]
                 .filter((assignment) => worksheet_target_key(assignment.worksheet) === worksheet_target_key(worksheet))
                 .map((assignment) => assignment.sourceRow);
-            if (saved_rows.length === 0) return change;
+            if (saved_rows.length === 0) return { ...change, delta };
             const first = Math.min(...saved_rows);
             const end = Math.max(...saved_rows) + 1;
             const rebase = (layout: RowLayout | null) => layout === null
@@ -1368,11 +1435,11 @@ function rekey_change_provenance(
                 : append_source_rows_to_layout(layout, 0, first, end);
             return {
                 ...change,
-                delta: { ...change.delta, before: rebase(change.delta.before), after: rebase(change.delta.after) },
+                delta: { ...delta, before: rebase(delta.before), after: rebase(delta.after) },
             };
         }
         case 'columnLayout':
-            return change;
+            return { ...change, delta: rekey_layout_entries(change.delta, assignments) };
     }
 }
 

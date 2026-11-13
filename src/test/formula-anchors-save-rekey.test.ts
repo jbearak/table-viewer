@@ -8,6 +8,7 @@ import type { FormulaAnchors } from '../formula-anchors';
 import {
     own_pending_structural_changes,
     type PendingAppendedRow,
+    type PendingColumn,
     type PendingRowFormatTemplate,
     type PendingStructuralChanges,
 } from '../pending-changes';
@@ -191,5 +192,89 @@ describe('Formula Anchors across an append-only save', () => {
         // A pending ID on another worksheet is not the saved row.
         expect(rekey_saved_formula_anchors(anchored('=A7'), OTHER, assignments))
             .toEqual(anchored('=A7'));
+    });
+
+    it('rekeys the Pending Rows and Pending Columns a layout gesture recorded', () => {
+        // Undone before the save: an inserted column whose cell in row a1 holds
+        // `=A7`, and an inserted row on Other holding `=Data!A7`. Redo after the
+        // save must restore both naming a1 by its source row.
+        const formula = { value: '=A7', formulaAnchors: anchored('=A7') };
+        const column: PendingColumn = {
+            id: 'c1',
+            header: 'New',
+            cells: { 'p:a1': formula, 's:1': { value: 'x' } },
+            highlights: { 'p:a1': 'yellow' },
+            format: { kind: 'none' },
+            createdOrder: 3,
+        };
+        // On Other, so its layout arm saved no rows of its own.
+        const cross_sheet = { value: '=Data!A7', formulaAnchors: anchored('=Data!A7', 1) };
+        const inserted: PendingAppendedRow = {
+            ...appended('i1', 4, { 1: cross_sheet }),
+            origin: 'insert',
+        };
+        const history = record([
+            { label: 'Append row', changes: [row_change('a1', null, appended('a1', 1), 0)] },
+            {
+                label: 'Insert column',
+                changes: [{
+                    kind: 'columnLayout',
+                    delta: {
+                        worksheet: DATA,
+                        before: null,
+                        after: {
+                            columns: [0, 1, 2].map((sourceColumn) => ({ kind: 'source' as const, sourceColumn }))
+                                .concat([{ kind: 'pending' as const, pendingColumnId: 'c1' } as never]),
+                            removedSourceColumns: [],
+                            discardedPendingColumns: [],
+                        },
+                        pendingRows: [],
+                        pendingColumns: [{ id: 'c1', before: null, after: column }],
+                        formatTemplates: [],
+                    },
+                }],
+            },
+            {
+                label: 'Insert row',
+                changes: [{
+                    kind: 'rowLayout',
+                    delta: {
+                        worksheet: OTHER,
+                        before: null,
+                        after: {
+                            runs: [
+                                { kind: 'source', start: 0, count: 1 },
+                                { kind: 'pending', ids: ['i1'] },
+                                { kind: 'source', start: 1, count: 2 },
+                            ],
+                            removedSourceRows: [],
+                            discardedPendingRows: [],
+                        },
+                        pendingRows: [{ id: 'i1', before: null, after: inserted }],
+                        pendingColumns: [],
+                        formatTemplates: [TEMPLATE],
+                    },
+                }],
+            },
+        ]);
+        const rekeyed = rekey_saved_appended_row_history(history, SAVED.slice(0, 1));
+        const changes = rekeyed.undoStack.flatMap((entry) => entry.action.changes);
+        const column_change = changes.find((change) => change.kind === 'columnLayout');
+        const row_change_after = changes.find((change) => change.kind === 'rowLayout');
+        if (column_change?.kind !== 'columnLayout' || row_change_after?.kind !== 'rowLayout') {
+            throw new Error('Expected both layout changes');
+        }
+        const saved_column = column_change.delta.pendingColumns[0].after!;
+        expect(Object.keys(saved_column.cells)).toEqual(['s:6', 's:1']);
+        expect(saved_column.highlights).toEqual({ 's:6': 'yellow' });
+        expect(saved_column.cells['s:6'].formulaAnchors?.references[0].corners[0].row)
+            .toEqual(source_identity(6));
+        // The inserted row's anchor names Data's saved row by its reference's worksheet.
+        const saved_row = row_change_after.delta.pendingRows[0].after!;
+        expect(saved_row.cells[1].formulaAnchors?.references[0].corners[0].row)
+            .toEqual(source_identity(6));
+        expect(formula_display('=Data!A7', saved_row.cells[1].formulaAnchors, after_save, 1))
+            .toEqual({ kind: 'text', text: '=Data!A7' });
+        expect(JSON.stringify([column_change, row_change_after])).not.toContain('"a1"');
     });
 });
