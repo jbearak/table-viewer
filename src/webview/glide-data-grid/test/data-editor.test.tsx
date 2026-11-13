@@ -5347,6 +5347,27 @@ a new line char ""more quotes"" plus a tab  ."	https://google.com`)
             }
         });
 
+        test("lands at the end when the last row ends exactly at the visible bottom edge", () => {
+            // Header 40 + 31 rows of 30 end at y 970, the sticky append row's top.
+            const moved = vi.fn();
+            vi.useFakeTimers();
+            render(
+                <EventedDataEditor
+                    {...basicProps}
+                    rows={31}
+                    headerHeight={40}
+                    rowHeight={30}
+                    rowMarkers="clickable-number"
+                    gridSelection={blockSelection(5, 9)}
+                    onRowMoved={moved}
+                />,
+                { wrapper: Context }
+            );
+            prep();
+            markerGesture(screen.getByTestId("data-grid-canvas"), 300, 1100);
+            expect(moved).toHaveBeenCalledWith({ start: 5, end: 9 }, 31);
+        });
+
         test("Escape abandons an active move", () => {
             const moved = vi.fn();
             vi.useFakeTimers();

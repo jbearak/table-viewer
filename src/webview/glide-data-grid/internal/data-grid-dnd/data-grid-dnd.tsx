@@ -803,7 +803,8 @@ const DataGridDnd: React.FunctionComponent<DataGridDndProps> = p => {
         (bottom: number, from: number): number => {
             const hit = rowAtPointer(bottom - 1, from);
             if (hit === undefined) return rows;
-            return hit.row === rows - 1 && hit.top + hit.height <= bottom ? rows : hit.row;
+            // Grid bounds include a 1 px border below the row: compare its real bottom.
+            return hit.row === rows - 1 && hit.top + hit.height - 1 <= bottom ? rows : hit.row;
         },
         [rowAtPointer, rows]
     );
