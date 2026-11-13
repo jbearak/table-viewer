@@ -41,6 +41,7 @@ describe('current_structural_basis', () => {
             workbookDigest: parts.workbookDigest,
             sourceRowCount: 5,
             sourceColumnCount: 3,
+            bodyStart: 0,
         });
         expect(parts.worksheetPartDigests[0]).not.toBe(parts.worksheetPartDigests[1]);
         expect(current_structural_basis('xlsx', xlsx, sheet, 2)).toBeUndefined();

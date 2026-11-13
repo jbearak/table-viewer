@@ -131,6 +131,7 @@ describe('the .xlsx structural editing capability', () => {
             workbookDigest: digest('xl/workbook.xml'),
             sourceRowCount: 7,
             sourceColumnCount: 6,
+            bodyStart: 1,
         });
         expect(summary!.basis).toMatchObject({ worksheetPartDigest: digest('xl/worksheets/sheet2.xml') });
     });
