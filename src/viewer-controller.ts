@@ -58,6 +58,7 @@ import {
     capture_xlsx_append_row_format,
     xlsx_append_style_dependency_fingerprint,
     write_xlsx_workbook_cell_edits,
+    XlsxStructuralRefusalError,
     type XlsxFormulaWritePlan,
 } from './xlsx-package';
 import {
@@ -99,13 +100,19 @@ import {
 } from './excel-header-plan';
 import { parse_http_external_url } from './external-url';
 import { is_plain_record } from './plain-record';
-import { formula_anchor_context, formula_anchor_workbook } from './formula-anchor-layout';
+import {
+    formula_anchor_context,
+    formula_anchor_workbook,
+    type AnchorWorksheetInput,
+} from './formula-anchor-layout';
 import { render_formula, type FormulaAnchors } from './formula-anchors';
 import { parser_format_for, type TableFormat } from './table-format';
 import {
     current_structural_basis,
     STRUCTURE_NOT_AVAILABLE_YET,
     structural_editing_capability,
+    XLSX_STRUCTURE_UNREADABLE_MESSAGE,
+    type StructuralBasisObservation,
 } from './structural-editing-capability';
 import {
     persisted_saved_row_snapshot,
@@ -206,6 +213,7 @@ import {
     pending_changes_carry_layout,
     pending_cells_carry_formula_anchors,
     pending_layout_fields,
+    MAX_STRUCTURAL_CONFLICT_MESSAGE_LENGTH,
     pending_structure_error,
     STRUCTURAL_EDITING_ENABLED,
     type PendingAppendedRow,
@@ -218,17 +226,35 @@ import {
     type PendingStructuralConflictReason,
     type RowIdentity,
     type SavedAppendedRowSnapshot,
+    type XlsxPendingRowFormat,
 } from './pending-changes';
+import {
+    worksheet_coordinate_map,
+    type WorksheetCoordinateMap,
+    type WorksheetStructureLayout,
+    type XlsxColumnFormat,
+    type XlsxRowFormat,
+} from './ooxml-surgery/worksheet-structure';
 import {
     appended_row_source_row,
     has_live_column_layout_change,
+    has_live_row_layout_change,
     index_row_layout,
+    insert_rows as insert_rows_in_layout,
+    insert_template_source_row,
     MAX_ROW_LAYOUT_RUNS,
+    source_column_layout,
     source_row_layout,
     TOO_MANY_ROW_RUNS_MESSAGE,
     type RowLayout,
 } from './worksheet-layout';
 import { content_digest } from './content-digest';
+import {
+    observe_xlsx_structure,
+    xlsx_part_digests,
+    xlsx_structural_support,
+} from './xlsx-structural-observation';
+import type { StructuralAxis } from './xlsx-structural-support';
 import {
     delimited_records_of,
     is_delimited_prefix_growth,
@@ -343,7 +369,8 @@ function conflicts_after_publication(
 ): PendingStructuralChanges['conflicts'] {
     return has_live_layout_change(changes)
         ? durable
-        : durable.filter((conflict) => conflict.reason !== 'structuralBasisChanged');
+        : durable.filter((conflict) =>
+            conflict.reason !== 'structuralBasisChanged' && conflict.reason !== 'unsupportedStructure');
 }
 
 const UNRESOLVED_STRUCTURAL_SAVE_EDIT_MESSAGE =
@@ -448,6 +475,13 @@ function structural_save_error(
             ...(affected?.formulaCells === undefined ? {} : {
                 formulaCells: Object.freeze([...affected.formulaCells]),
             }),
+            // Review Changes names why: an `unsupportedStructure` refusal
+            // carries no row to point at, only its reason.
+            ...(reason === 'unsupportedStructure' ? {
+                message: message.length <= MAX_STRUCTURAL_CONFLICT_MESSAGE_LENGTH
+                    ? message
+                    : `${message.slice(0, MAX_STRUCTURAL_CONFLICT_MESSAGE_LENGTH - 1)}…`,
+            } : {}),
         }),
         message,
     );
@@ -464,6 +498,7 @@ function structural_save_rejection(error: unknown): CsvSaveRejection | undefined
         ...(error.conflict.formulaCells === undefined ? {} : {
             formulaCells: error.conflict.formulaCells,
         }),
+        ...(error.conflict.message === undefined ? {} : { message: error.conflict.message }),
     });
 }
 
@@ -1064,7 +1099,7 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
     // reference to a later appended row names the wrong row.
     const saved_structure = new Map(input.worksheets.map(({ sheet_index, structural_changes }) =>
         [sheet_index, structural_changes] as const));
-    const anchor_workbook = formula_anchor_workbook('xlsx', src.meta().sheets.map((sheet, sheetIndex) => {
+    const anchor_inputs = src.meta().sheets.map((sheet, sheetIndex): AnchorWorksheetInput => {
         const changes = saved_structure.get(sheetIndex);
         return {
             target: {
@@ -1081,16 +1116,23 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
             sourceColumnCount: sheet.columnCount,
             ...(changes === undefined ? {} : { changes }),
         };
-    }));
+    });
+    const anchor_workbook = formula_anchor_workbook('xlsx', anchor_inputs);
+    // A save that inserts, deletes, or moves rows or columns on any
+    // worksheet renders every pending formula through the layouts, from
+    // stored anchors or from the implicit anchors of its source-coordinate
+    // text, so each is rendered exactly once from one coordinate basis.
+    const structural_save = input.worksheets.some(({ structural_changes }) =>
+        structural_changes !== undefined && has_live_layout_change(structural_changes));
     const saved_formula_text = (
         value: string,
         anchors: FormulaAnchors | undefined,
         sheet_index: number,
         worksheet_operation_index: number,
         structural: PendingStructuralChanges,
-        cell: NonNullable<PendingStructuralConflict['formulaCells']>[number],
+        cell: NonNullable<PendingStructuralConflict['formulaCells']>[number] | undefined,
     ): string => {
-        if (anchors === undefined) return value;
+        if (anchors === undefined && !(structural_save && value.startsWith('='))) return value;
         let rendered: ReturnType<typeof render_formula> | undefined;
         try {
             rendered = render_formula(value, anchors, formula_anchor_context(anchor_workbook, sheet_index));
@@ -1098,6 +1140,17 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
             rendered = undefined;
         }
         if (rendered?.kind === 'rendered') return rendered.text;
+        if (cell === undefined) {
+            // A Pending Column cell has no source column to point Review
+            // Changes at, so the refusal is the worksheet's.
+            return structural_save_error(
+                worksheet_operation_index,
+                structural,
+                'unsupportedStructure',
+                "Can't save these row and column changes: a formula in a new column can't be adjusted to the rows and columns it names.",
+                { pendingRowIds: [], tailRemovalIds: [] },
+            );
+        }
         return structural_save_error(
             worksheet_operation_index,
             structural,
@@ -1129,10 +1182,16 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
         const sheet_meta = src.meta().sheets[sheet_index];
         if (!sheet_meta) throw new Error('Could not locate a worksheet to save.');
         const structural = structural_changes ?? own_pending_structural_changes({});
-        if (structural.conflicts.length > 0) {
+        // An `unsupportedStructure` conflict records the last save's refusal
+        // for Review Changes; the save re-derives it, so after the user
+        // changes the layout a save can succeed without a discard.
+        const blocking_conflicts = structural.conflicts.filter(
+            (conflict) => conflict.reason !== 'unsupportedStructure',
+        );
+        if (blocking_conflicts.length > 0) {
             throw new PendingStructuralSaveError(
                 worksheet_operation_index,
-                structural.conflicts[0],
+                blocking_conflicts[0],
                 'Pending rows have unresolved structural conflicts.',
             );
         }
@@ -1252,6 +1311,37 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
             (template) => [template.id, template.format],
         ));
         const header_row = sheet_meta?.excelFirstRowHeader?.sourceRow ?? 0;
+        const header_active = sheet_meta?.excelFirstRowHeader?.active === true;
+        const body_start = header_active && sheet_meta.excelFirstRowHeader?.sourceRow !== undefined
+            ? sheet_meta.excelFirstRowHeader.sourceRow + 1
+            : 0;
+        // A live layout change: every coordinate below is prospective,
+        // addressed through the coordinate map (design "Physical write").
+        const structure = has_live_layout_change(structural)
+            ? xlsx_save_structure(
+                worksheet_operation_index,
+                structural,
+                sheet_meta,
+                body_start,
+                { ...edits, ...(dirty_edits ?? {}) },
+            )
+            : undefined;
+        if (structure !== undefined && (
+            Object.values(dirty_edits ?? {}).some((entry) => entry.movedFrom !== undefined)
+            || pending_rows(structural).some((row) => Object.values(row.cells)
+                .some((cell) => cell.movedFrom !== undefined))
+        )) throw new Error('The row and column changes are inconsistent: cells were also moved.');
+        const prospective_cell = (row: number, col: number): { row: number; col: number } => {
+            if (structure === undefined) return { row, col };
+            const target_row = structure.coordinates.row(row);
+            const target_col = structure.coordinates.column(col);
+            if (target_row === null || target_col === null) {
+                throw new Error('A cell edit addresses a removed row or column.');
+            }
+            return { row: target_row, col: target_col };
+        };
+        /** Header cells the save writes, by source column, for the rename checks. */
+        const header_edits: { readonly col: number; readonly value: string }[] = [];
         for (const [key, value] of Object.entries(edits)) {
             const [row, col] = key.split(':').map(Number);
             if (!Number.isInteger(row) || !Number.isInteger(col)) continue;
@@ -1274,9 +1364,9 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
             const value_edit_order = dirty_edits?.[key]?.valueEditOrder;
             const header_edit = sheet_meta?.excelFirstRowHeader?.active === true
                 && row === header_row;
+            if (header_edit) header_edits.push({ col, value: committed_column_name(value) });
             cell_edits.push({
-                row,
-                col,
+                ...prospective_cell(row, col),
                 value: header_edit
                     ? committed_column_name(value)
                     : saved_formula_text(
@@ -1312,13 +1402,12 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
                     throw new Error('A hyperlink edit has an invalid or non-HTTP target.');
                 }
                 link_edits.push({
-                    row,
-                    col,
+                    ...prospective_cell(row, col),
                     link: { ...entry.link, target: normalized },
                 });
                 continue;
             }
-            link_edits.push({ row, col, link: entry.link ?? null });
+            link_edits.push({ ...prospective_cell(row, col), link: entry.link ?? null });
         }
         // A worksheet hyperlink is owned outside its row element. Clear links
         // captured in removed-row snapshots or they can recreate deleted cells.
@@ -1332,7 +1421,65 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
         const append_shells: Array<NonNullable<
             import('./xlsx-package').XlsxWorksheetCellEdits['row_changes']
         >['appendRows'][number]> = [];
-        for (const [index, row] of appended_rows(structural).entries()) {
+        // Where each Pending Row lands. Without a layout change the band
+        // follows the retained rows and the cell writer appends its shells;
+        // with one, the restructure stage writes every new row, inserted rows
+        // at their layout positions and the band after the live layout.
+        const placements = structure === undefined
+            ? appended_rows(structural).map((row, index) => ({
+                row,
+                destination: retained_row_count + index,
+                shell: true,
+            }))
+            : [
+                ...inserted_rows(structural).map((row) => ({
+                    row,
+                    destination: structure.coordinates.inserted_row(row.id),
+                    shell: false,
+                })),
+                ...structure.band.map((row, index) => ({
+                    row,
+                    destination: structure.coordinates.appended_row(index),
+                    shell: false,
+                })),
+            ];
+        for (const { row, destination: placed, shell } of placements) {
+            if (placed === undefined) throw new Error('A pending row has no place in the saved worksheet.');
+            const destination = placed;
+            if (!shell) {
+                for (const [column_text, pending_cell] of Object.entries(row.cells)) {
+                    const column = Number(column_text);
+                    if (column >= sheet_meta.columnCount) {
+                        throw new Error('A pending row contains a column outside the worksheet.');
+                    }
+                    const target_column = structure!.coordinates.column(column);
+                    if (target_column === null) throw new Error('A pending row cell addresses a removed column.');
+                    cell_edits.push({
+                        row: destination,
+                        col: target_column,
+                        value: saved_formula_text(
+                            pending_cell.value,
+                            pending_cell.formulaAnchors,
+                            sheet_index,
+                            worksheet_operation_index,
+                            structural,
+                            { rowIdentity: { kind: 'pending', pendingRowId: row.id }, sourceColumn: column },
+                        ),
+                        ...(pending_cell.valueRuns?.runs.length ? { runs: pending_cell.valueRuns.runs } : {}),
+                        ...(pending_cell.valueEditOrder === undefined
+                            ? {}
+                            : { valueEditOrder: pending_cell.valueEditOrder }),
+                    });
+                    if (pending_cell.link !== undefined) {
+                        link_edits.push({
+                            row: destination,
+                            col: target_column,
+                            link: pending_link(pending_cell.link, 'A pending-row hyperlink has an invalid target.'),
+                        });
+                    }
+                }
+                continue;
+            }
             const format = templates.get(row.formatTemplateId);
             if (!format || format.kind !== 'xlsx') {
                 structural_save_error(
@@ -1352,7 +1499,6 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
                     { pendingRowIds: [row.id], tailRemovalIds: [] },
                 );
             }
-            const destination = retained_row_count + index;
             append_shells.push(Object.freeze({
                 row: destination,
                 cellStyleIndexes: format.cellStyleIndexes,
@@ -1415,8 +1561,64 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
                 }
             }
         }
-        const row_changes = structural.tailRemovals.length > 0
-            || append_shells.length > 0
+        if (structure !== undefined) {
+            // Pending Columns: the header cell when the worksheet has an
+            // active Header Row, then each cell by its row identity. The
+            // restructure stage already wrote their formats.
+            const band_index = new Map(structure.band.map((row, index) => [row.id, index]));
+            for (const column of structural.pendingColumns ?? []) {
+                const target_column = structure.coordinates.inserted_column(column.id);
+                if (target_column === undefined) continue;
+                if (header_active && column.header !== '') {
+                    cell_edits.push({
+                        row: header_row,
+                        col: target_column,
+                        value: committed_column_name(column.header),
+                        force_text: true,
+                    });
+                }
+                for (const [identity_key, pending_cell] of Object.entries(column.cells)) {
+                    const id = identity_key.slice(2);
+                    const kind = identity_key.slice(0, 2);
+                    const target_row = kind === 's:'
+                        ? structure.coordinates.row(Number(id))
+                        : kind === 'f:'
+                            ? (Number.isSafeInteger(Number(id)) && Number(id) < body_start ? Number(id) : null)
+                            : kind === 'p:'
+                                ? structure.coordinates.inserted_row(id)
+                                    ?? (band_index.has(id) ? structure.coordinates.appended_row(band_index.get(id)!) : undefined)
+                                : undefined;
+                    if (target_row === null || target_row === undefined) {
+                        throw new Error('A pending column cell addresses a row the saved worksheet lacks.');
+                    }
+                    cell_edits.push({
+                        row: target_row,
+                        col: target_column,
+                        value: saved_formula_text(
+                            pending_cell.value,
+                            pending_cell.formulaAnchors,
+                            sheet_index,
+                            worksheet_operation_index,
+                            structural,
+                            undefined,
+                        ),
+                        ...(pending_cell.valueRuns?.runs.length ? { runs: pending_cell.valueRuns.runs } : {}),
+                        ...(pending_cell.valueEditOrder === undefined
+                            ? {}
+                            : { valueEditOrder: pending_cell.valueEditOrder }),
+                    });
+                    if (pending_cell.link !== undefined) {
+                        link_edits.push({
+                            row: target_row,
+                            col: target_column,
+                            link: pending_link(pending_cell.link, 'A pending-column hyperlink has an invalid target.'),
+                        });
+                    }
+                }
+            }
+        }
+        const row_changes = structure === undefined && (structural.tailRemovals.length > 0
+            || append_shells.length > 0)
             ? Object.freeze({
                 sourceRowCount: sheet_meta.sourceRowCount,
                 removeRows: Object.freeze(structural.tailRemovals.map(
@@ -1437,6 +1639,9 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
             structural,
             retainedRowCount: retained_row_count,
             formulaSourceCells: dirty_edits ?? {},
+            structure,
+            headerEdits: header_edits,
+            bodyStart: body_start,
         };
     });
     for (const formula_worksheet of planned) {
@@ -1481,8 +1686,10 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
         const header_row = sheet.excelFirstRowHeader.sourceRow ?? 0;
         const final_names = [...sheet.columnNames];
         const changed_columns = new Set<number>();
-        for (const edit of worksheet.edits) {
-            if (edit.row !== header_row || final_names[edit.col] === undefined) continue;
+        // Header edits by source column: a layout change moves the cell the
+        // save writes, never the column a name belongs to.
+        for (const edit of worksheet.headerEdits) {
+            if (final_names[edit.col] === undefined) continue;
             const old_name = final_names[edit.col];
             const new_name = committed_column_name(edit.value);
             if (new_name === '' && old_name !== '') {
@@ -1504,10 +1711,9 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
         const sheet = src.meta().sheets[worksheet.sheetIndex];
         if (sheet?.excelFirstRowHeader?.active !== true || !sheet.columnNames) return [];
         const column_names = sheet.columnNames;
-        const header_row = sheet.excelFirstRowHeader.sourceRow ?? 0;
-        return worksheet.edits.flatMap((edit) => {
+        return worksheet.headerEdits.flatMap((edit) => {
             const old_name = column_names[edit.col];
-            if (edit.row !== header_row || old_name === undefined) return [];
+            if (old_name === undefined) return [];
             const new_name = committed_column_name(edit.value);
             if (new_name === '') {
                 if (old_name !== '') throw new Error('A column name cannot be blank.');
@@ -1548,7 +1754,33 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
         || (left.row - right.row)
         || (left.column - right.column));
     let formula_write_plan: XlsxFormulaWritePlan | undefined;
-    if (
+    if (structural_save) {
+        // A structural save writes no calculated caches: the formula stage
+        // invalidates every formula on a restructured worksheet and on any
+        // worksheet that may read one, and the writer adds what the edits
+        // invalidate, all in prospective coordinates. The edits still meet
+        // the workbook's formula safety limits.
+        if (too_many_calculation_edits) {
+            throw new Error('Workbook would contain too many formulas to save safely.');
+        }
+        assert_safe_workbook_formula_edits(
+            src.meta().sheets,
+            planned.map((worksheet) => {
+                const values: Record<string, string> = {};
+                const formula_keys = new Set<string>();
+                for (const edit of worksheet.edits) {
+                    const key = `${edit.row}:${edit.col}`;
+                    values[key] = edit.value;
+                    if (is_xlsx_formula_edit(edit)) formula_keys.add(key);
+                }
+                return {
+                    sheetIndex: worksheet.sheetIndex,
+                    values,
+                    isFormulaValue: (key: string) => formula_keys.has(key),
+                };
+            }),
+        );
+    } else if (
         too_many_calculation_edits
         || calculation_edits.length > 0
         || planned.some((worksheet) =>
@@ -1651,6 +1883,7 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
         observed_rich: planned.map(({ observed_rich }) => observed_rich),
         observed_links: planned.map(({ observed_links }) => observed_links),
         produce: (raw) => {
+            if (structural_save) verify_xlsx_structural_save(raw, planned);
             for (const worksheet of planned) {
                 for (const removal of worksheet.structural.tailRemovals) {
                     if (!saved_row_unchanged(src, worksheet.sheetIndex, removal, raw)) {
@@ -1666,7 +1899,7 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
                         );
                     }
                 }
-                if (appended_rows(worksheet.structural).length === 0) continue;
+                if (pending_rows(worksheet.structural).length === 0) continue;
                 for (const template of worksheet.structural.formatTemplates) {
                     if (
                         template.format.kind !== 'xlsx'
@@ -1682,7 +1915,7 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
                         'templateChanged',
                         'The workbook style table changed after rows were appended.',
                         {
-                            pendingRowIds: appended_rows(worksheet.structural)
+                            pendingRowIds: pending_rows(worksheet.structural)
                                 .filter((row) => row.formatTemplateId === template.id)
                                 .map((row) => row.id),
                             tailRemovalIds: [],
@@ -1690,16 +1923,50 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
                     );
                 }
             }
-            return write_xlsx_workbook_cell_edits(
-                raw,
-                planned,
-                formula_write_plan || structured_column_renames.length > 0 ? {
-                    ...(formula_write_plan ? { formulaWritePlan: formula_write_plan } : {}),
+            if (!structural_save) {
+                return write_xlsx_workbook_cell_edits(
+                    raw,
+                    planned,
+                    formula_write_plan || structured_column_renames.length > 0 ? {
+                        ...(formula_write_plan ? { formulaWritePlan: formula_write_plan } : {}),
+                        ...(structured_column_renames.length > 0
+                            ? { structuredColumnRenames: structured_column_renames }
+                            : {}),
+                    } : undefined,
+                );
+            }
+            try {
+                return write_xlsx_workbook_cell_edits(raw, planned, {
+                    structure: {
+                        anchors: anchor_inputs,
+                        worksheets: planned.flatMap(({ sheetIndex, structure }) => structure === undefined ? [] : [{
+                            sheetIndex,
+                            layout: structure.layout,
+                            insertedRowFormats: structure.insertedRowFormats,
+                            appendedRowFormats: structure.appendedRowFormats,
+                            insertedColumnFormats: structure.insertedColumnFormats,
+                        }]),
+                    },
                     ...(structured_column_renames.length > 0
                         ? { structuredColumnRenames: structured_column_renames }
                         : {}),
-                } : undefined,
-            );
+                });
+            } catch (error) {
+                if (!(error instanceof XlsxStructuralRefusalError)) throw error;
+                // The refusal names the worksheet it is about; one outside the
+                // save (a formula on another sheet that reads a restructured
+                // one) is reported on the first restructured worksheet.
+                const worksheet = planned.find((candidate) =>
+                    candidate.structure !== undefined && candidate.sheetIndex === error.sheetIndex)
+                    ?? planned.find((candidate) => candidate.structure !== undefined)!;
+                return structural_save_error(
+                    worksheet.worksheetOperationIndex,
+                    worksheet.structural,
+                    'unsupportedStructure',
+                    error.message,
+                    { pendingRowIds: [], tailRemovalIds: [] },
+                );
+            }
         },
         receipt: Object.freeze({
             appendedRows: Object.freeze(planned.flatMap((worksheet) => {
@@ -1707,9 +1974,16 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
                 const templates = new Map(worksheet.structural.formatTemplates.map(
                     (template) => [template.id, template.format],
                 ));
-                return appended_rows(worksheet.structural).map((row, index) => {
+                // `H + N + i`: with a layout change the band follows the live
+                // layout, in `createdOrder`.
+                const band = worksheet.structure?.band ?? appended_rows(worksheet.structural);
+                return band.map((row, index) => {
                     const format = templates.get(row.formatTemplateId);
                     if (!format) throw new Error('A pending row lost its format template.');
+                    const sourceRow = worksheet.structure === undefined
+                        ? worksheet.retainedRowCount + index
+                        : worksheet.structure.coordinates.appended_row(index);
+                    if (sourceRow === undefined) throw new Error('A pending row has no place in the saved worksheet.');
                     return Object.freeze({
                         sheetIndex: worksheet.sheetIndex,
                         sheetName: sheet.name,
@@ -1717,7 +1991,7 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
                             ? {}
                             : { worksheetId: sheet.worksheetId }),
                         pendingRowId: row.id,
-                        sourceRow: worksheet.retainedRowCount + index,
+                        sourceRow,
                         savedFingerprint: saved_pending_row_fingerprint(row, format),
                         savedRow: persisted_saved_row_snapshot(row, format, row.cells),
                     });
@@ -1737,7 +2011,196 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
                     )),
                 })];
             })),
+            ...(structural_save ? {
+                structure: Object.freeze(planned.flatMap((worksheet) => {
+                    if (worksheet.structure === undefined) return [];
+                    const sheet = src.meta().sheets[worksheet.sheetIndex];
+                    return [worksheet_structure_receipt(
+                        {
+                            sheetIndex: worksheet.sheetIndex,
+                            sheetName: sheet.name,
+                            ...(sheet.worksheetId === undefined ? {} : { worksheetId: sheet.worksheetId }),
+                        },
+                        worksheet.structural,
+                        {
+                            bodyStart: worksheet.bodyStart,
+                            sourceRowCount: sheet.sourceRowCount,
+                            sourceColumnCount: sheet.columnCount,
+                        },
+                    )];
+                })),
+            } : {}),
         }),
+    };
+}
+
+/**
+ * The authoritative checks of an `.xlsx` structural save, on the exact bytes
+ * it rewrites (design "XLSX" → "Structural support", "External changes"):
+ * each restructured worksheet's Structural Basis, part by part, and the
+ * structural support scan for every axis its layout changes. A support
+ * answer that changed since edit grant refuses with `unsupportedStructure`.
+ */
+function verify_xlsx_structural_save(
+    raw: Uint8Array,
+    planned: readonly {
+        readonly worksheetOperationIndex: number;
+        readonly sheetIndex: number;
+        readonly structural: PendingStructuralChanges;
+        readonly structure?: XlsxSaveStructure;
+    }[],
+): void {
+    const digests = xlsx_part_digests(raw);
+    const support = xlsx_structural_support(raw);
+    for (const worksheet of planned) {
+        if (worksheet.structure === undefined) continue;
+        const basis = worksheet.structural.structuralBasis;
+        if (
+            digests === undefined
+            || basis?.kind !== 'xlsx'
+            || basis.worksheetPartDigest !== digests.worksheetPartDigests[worksheet.sheetIndex]
+            || basis.sharedStringsDigest !== digests.sharedStringsDigest
+            || basis.stylesDigest !== digests.stylesDigest
+            || basis.workbookDigest !== digests.workbookDigest
+        ) structural_save_error(
+            worksheet.worksheetOperationIndex,
+            worksheet.structural,
+            'structuralBasisChanged',
+            'The file changed after rows or columns were inserted, deleted, or moved.',
+            { pendingRowIds: [], tailRemovalIds: [] },
+        );
+        const { rowLayout, columnLayout } = worksheet.structure.layout;
+        const axes: StructuralAxis[] = [
+            ...(has_live_row_layout_change(rowLayout) ? ['rows' as const] : []),
+            ...(has_live_column_layout_change(columnLayout) ? ['columns' as const] : []),
+        ];
+        const scanned = support?.[worksheet.sheetIndex];
+        for (const axis of axes) {
+            const answer = scanned?.[axis];
+            if (answer?.supported === true) continue;
+            structural_save_error(
+                worksheet.worksheetOperationIndex,
+                worksheet.structural,
+                'unsupportedStructure',
+                answer === undefined ? XLSX_STRUCTURE_UNREADABLE_MESSAGE : answer.reason.message,
+                { pendingRowIds: [], tailRemovalIds: [] },
+            );
+        }
+    }
+}
+
+/** A Pending Row or Pending Column cell's link as written: external targets must be http(s). */
+function pending_link(link: CellHyperlink | null, message: string): CellHyperlink | null {
+    if (link?.kind !== 'external') return link;
+    const normalized = parse_http_external_url(link.target);
+    if (normalized === null) throw new Error(message);
+    return { ...link, target: normalized };
+}
+
+/** One `.xlsx` worksheet's validated structural save input: its layouts, coordinate map, and formats. */
+interface XlsxSaveStructure {
+    readonly layout: WorksheetStructureLayout;
+    readonly coordinates: WorksheetCoordinateMap;
+    /** The live append band, in `createdOrder`: index `i` is `coordinates.appended_row(i)`. */
+    readonly band: readonly PendingAppendedRow[];
+    readonly insertedRowFormats: ReadonlyMap<string, XlsxRowFormat>;
+    readonly appendedRowFormats: readonly XlsxRowFormat[];
+    readonly insertedColumnFormats: ReadonlyMap<string, XlsxColumnFormat>;
+}
+
+/** A Pending Row's format as the restructure writer takes it: the append shell without its row. */
+function xlsx_row_format(format: XlsxPendingRowFormat): XlsxRowFormat {
+    return Object.freeze({
+        cellStyleIndexes: format.cellStyleIndexes,
+        ...(format.rowStyleIndex === undefined ? {} : { rowStyleIndex: format.rowStyleIndex }),
+        ...(format.thickTop === undefined ? {} : { thickTop: true as const }),
+        ...(format.thickBottom === undefined ? {} : { thickBottom: true as const }),
+        ...(format.phonetic === undefined ? {} : { phonetic: true as const }),
+        ...(format.nativeRowHeight === undefined ? {} : { height: format.nativeRowHeight }),
+    });
+}
+
+/**
+ * The checks an `.xlsx` worksheet with a live layout change meets before its
+ * save is planned (design "Host" → "Save"), and what the writer needs from
+ * it. The recorded Structural Basis must describe this source's dimensions;
+ * the layout validator runs against this exact worksheet, with no cell edit
+ * on a removed row or column; every Pending Row has an `.xlsx` template of
+ * the worksheet's width and every Pending Column an `.xlsx` format; and the
+ * prospective sheet fits in `MAX_SHEET_ROWS`.
+ */
+function xlsx_save_structure(
+    worksheet_operation_index: number,
+    structural: PendingStructuralChanges,
+    sheet: SheetMeta,
+    body_start: number,
+    cells: Readonly<Record<string, unknown>>,
+): XlsxSaveStructure {
+    const basis = structural.structuralBasis;
+    if (
+        basis === undefined
+        || basis.kind !== 'xlsx'
+        || basis.sourceRowCount !== sheet.sourceRowCount
+        || basis.sourceColumnCount !== sheet.columnCount
+    ) structural_save_error(
+        worksheet_operation_index,
+        structural,
+        'structuralBasisChanged',
+        'The file changed after rows or columns were inserted, deleted, or moved.',
+        { pendingRowIds: [], tailRemovalIds: [] },
+    );
+    const error = pending_structure_error(structural, cells, {
+        bodyStart: body_start,
+        sourceRowCount: sheet.sourceRowCount,
+        sourceColumnCount: sheet.columnCount,
+        mintedAsInsert: () => true,
+    });
+    if (error !== undefined) throw new Error(`The row and column changes are inconsistent: ${error}`);
+    if (structural.tailRemovals.length > 0) {
+        throw new Error('The row and column changes are inconsistent: a row removal is pending.');
+    }
+    const layout: WorksheetStructureLayout = Object.freeze({
+        bodyStart: body_start,
+        rowLayout: structural.rowLayout
+            ?? source_row_layout(body_start, Math.max(0, sheet.sourceRowCount - body_start)),
+        columnLayout: structural.columnLayout ?? source_column_layout(sheet.columnCount),
+    });
+    const band = [...appended_rows(structural)].sort((left, right) => left.createdOrder - right.createdOrder);
+    const coordinates = worksheet_coordinate_map(layout, band.length);
+    if (coordinates.rowCount > MAX_SHEET_ROWS) structural_save_error(
+        worksheet_operation_index,
+        structural,
+        'rowLimitExceeded',
+        'Pending row changes exceed the worksheet row limit.',
+    );
+    const templates = new Map(structural.formatTemplates.map((template) => [template.id, template.format]));
+    const row_format = (row: PendingAppendedRow): XlsxRowFormat => {
+        const format = templates.get(row.formatTemplateId);
+        if (format?.kind !== 'xlsx' || format.cellStyleIndexes.length !== sheet.columnCount) {
+            structural_save_error(
+                worksheet_operation_index,
+                structural,
+                'templateChanged',
+                'An XLSX pending row has no XLSX format template of the worksheet\'s width.',
+                { pendingRowIds: [row.id], tailRemovalIds: [] },
+            );
+        }
+        return xlsx_row_format(format);
+    };
+    const insertedColumnFormats = new Map<string, XlsxColumnFormat>();
+    for (const column of structural.pendingColumns ?? []) {
+        if (column.format.kind === 'none') {
+            throw new Error('The row and column changes are inconsistent: a pending column has no XLSX format.');
+        }
+        insertedColumnFormats.set(column.id, column.format);
+    }
+    return {
+        layout,
+        coordinates,
+        band,
+        insertedRowFormats: new Map(inserted_rows(structural).map((row) => [row.id, row_format(row)])),
+        appendedRowFormats: band.map(row_format),
+        insertedColumnFormats,
     };
 }
 
@@ -3104,6 +3567,7 @@ export function attach_viewer(
             file_format.id,
             source_observation,
             source?.meta().sheets[target.sheetIndex],
+            target.sheetIndex,
         );
         return current !== undefined && posted === JSON.stringify(current);
     };
@@ -5007,7 +5471,7 @@ export function attach_viewer(
                 return reconcile_structural_bases(
                     without_structural_rekey_intent(current, save_id),
                     src,
-                    digest,
+                    source_observation?.digest === digest ? source_observation : { digest },
                 );
             }
             return structural_rekey_transition(current, intent, sheets, {
@@ -5072,14 +5536,16 @@ export function attach_viewer(
      * discards the row and column changes. A layout that holds only discarded
      * tombstones records no basis, so it is dropped on any external change
      * (the physical digest moved); with no formulas in a delimited file, no
-     * anchor renders differently. `.xlsx` bases are reconciled with the
-     * structural writer (delivery step 9), which no save can reach before.
+     * anchor renders differently. An `.xlsx` basis is the digests of the
+     * parts its save reads, with no growth rebase: it matches, or the
+     * worksheet conflicts.
      */
     function reconcile_structural_bases(
         current: PerFileState,
         candidate: DataSource,
-        digest: string,
+        observation: StructuralBasisObservation,
     ): PerFileState {
+        const { digest } = observation;
         const slots = current.pendingEdits;
         if (!slots?.some((slot) => slot !== undefined && pending_changes_carry_layout(slot))) return current;
         const sheets = candidate.meta().sheets;
@@ -5087,24 +5553,57 @@ export function attach_viewer(
         const file_changed = previous_digest !== undefined && previous_digest !== digest;
         const bytes = candidate instanceof CsvDataSource ? candidate.file_bytes() : undefined;
         let next: typeof slots | undefined;
+        const basis_changed = (
+            slot: WorksheetPendingEdits,
+            changes: PendingStructuralChanges,
+        ): WorksheetPendingEdits | undefined => {
+            if (changes.conflicts.some((conflict) => conflict.reason === 'structuralBasisChanged')) return undefined;
+            return {
+                ...slot,
+                conflicts: [...changes.conflicts, Object.freeze({
+                    reason: 'structuralBasisChanged' as const,
+                    pendingRowIds: Object.freeze([]),
+                    tailRemovalIds: Object.freeze([]),
+                })],
+            };
+        };
         for (const [index, slot] of slots.entries()) {
             if (slot === undefined || !pending_changes_carry_layout(slot)) continue;
             const changes = own_pending_structural_changes(slot);
-            const sheet = sheets[worksheet_target_index(sheets, {
+            const sheet_index = worksheet_target_index(sheets, {
                 sheetIndex: index,
                 sheetName: slot.sheetName,
                 worksheetId: slot.worksheetId,
-            }) ?? -1];
+            });
+            const sheet = sheets[sheet_index ?? -1];
             let replacement: WorksheetPendingEdits | undefined;
             if (!has_live_layout_change(changes)) {
                 if (!file_changed || (changes.rowLayout === undefined && changes.columnLayout === undefined)) continue;
                 const { rowLayout: _rows, columnLayout: _columns, ...rest } = slot;
                 replacement = rest;
+            } else if (changes.structuralBasis?.kind === 'xlsx') {
+                // `.xlsx` has no growth rebase: the basis matches, or the
+                // worksheet conflicts. An observation without part digests
+                // (structural editing off, an unreadable package) cannot
+                // vouch for the basis, so it conflicts only when the file
+                // itself changed.
+                if (sheet === undefined || sheet_index === undefined) continue;
+                const current_basis = current_structural_basis(file_format.id, observation, sheet, sheet_index);
+                const others = changes.conflicts.filter((conflict) => conflict.reason !== 'structuralBasisChanged');
+                if (current_basis !== undefined && structural_bases_equal(changes.structuralBasis, current_basis)) {
+                    if (others.length === changes.conflicts.length) continue;
+                    replacement = { ...slot, conflicts: others };
+                } else {
+                    if (current_basis === undefined && !file_changed) continue;
+                    replacement = basis_changed(slot, changes);
+                    if (replacement === undefined) continue;
+                }
             } else {
                 const basis = changes.structuralBasis;
                 if (
                     bytes === undefined
                     || sheet === undefined
+                    || sheet_index === undefined
                     || candidate.truncationMessage
                     || basis?.kind !== 'delimited'
                 ) continue;
@@ -5113,6 +5612,7 @@ export function attach_viewer(
                     file_format.id,
                     { digest, byteLength: bytes.byteLength },
                     sheet,
+                    sheet_index,
                 );
                 if (current_basis === undefined) continue;
                 const others = changes.conflicts.filter((conflict) => conflict.reason !== 'structuralBasisChanged');
@@ -5140,15 +5640,8 @@ export function attach_viewer(
                         conflicts: others,
                     };
                 } else {
-                    if (others.length !== changes.conflicts.length) continue;
-                    replacement = {
-                        ...slot,
-                        conflicts: [...changes.conflicts, Object.freeze({
-                            reason: 'structuralBasisChanged' as const,
-                            pendingRowIds: Object.freeze([]),
-                            tailRemovalIds: Object.freeze([]),
-                        })],
-                    };
+                    replacement = basis_changed(slot, changes);
+                    if (replacement === undefined) continue;
                 }
             }
             next ??= [...slots];
@@ -7172,6 +7665,8 @@ export function attach_viewer(
             && (profile.prefer_file_source || stat.size > MAX_WHOLE_FILE_READ_BYTES);
         let observation: PhysicalSourceObservation;
         let raw: Uint8Array | undefined;
+        // The bytes `observation.digest` covers, when they were read whole.
+        let observed_raw: Uint8Array | undefined;
         let file_backed_source: DataSource | undefined;
         if (use_file_backed_source) {
             let owned_source: DataSource | undefined;
@@ -7221,6 +7716,7 @@ export function attach_viewer(
             // the bytes were never fetched, so a pointer never reaches a profile.
             const pointer = parse_git_lfs_pointer(read_raw_main);
             raw = read_raw_main;
+            observed_raw = read_raw_main;
             if (pointer && resolved_lfs_main?.oid === pointer.oid) {
                 // Already fetched for this panel, so the pointer is not news. Kept
                 // in memory because this side may be a `git:` revision, whose read
@@ -7342,8 +7838,20 @@ export function attach_viewer(
                 warn_compare_unavailable(error);
             }
         }
+        // The structure of the bytes `observation.digest` covers, once per
+        // source generation: the snapshot capability, insert admission, and
+        // the save precheck read this one answer. Only bytes that were read
+        // as they are (not an LFS substitute) describe the file a save checks.
+        const xlsx_structure = structural_editing_enabled
+            && editing_supported
+            && file_format.id === 'xlsx'
+            && raw !== undefined
+            && raw === observed_raw
+            ? observe_xlsx_structure(raw)
+            : undefined;
         return new SourceCandidate(adopted, {
             ...observation,
+            ...(xlsx_structure === undefined ? {} : { xlsxStructure: xlsx_structure }),
             ...(comparison_observation
                 ? {
                     comparisonFingerprint: comparison_observation.fingerprint,
@@ -7710,7 +8218,7 @@ export function attach_viewer(
                 const planned_state = reconcile_structural_bases(
                     resolve_rekey_intent_in_state(excel_planned_state, digest, candidate_meta.sheets),
                     ds,
-                    digest,
+                    candidate.observation,
                 );
                 const structural_state_changed = planned_state !== excel_planned_state;
                 const next_highlights = reconcile_physical_cell_highlights(
@@ -9218,7 +9726,7 @@ export function attach_viewer(
         // as insert admission does: the band follows a layout authored
         // against one file, so it may not grow once that file changed.
         if (durable !== undefined && has_live_layout_change(durable)) {
-            const current_basis = current_structural_basis(file_format.id, source_observation, sheet);
+            const current_basis = current_structural_basis(file_format.id, source_observation, sheet, sheet_index);
             if (
                 durable.conflicts?.some((conflict) => conflict.reason === 'structuralBasisChanged') === true
                 || durable.structuralBasis === undefined
@@ -9593,7 +10101,7 @@ export function attach_viewer(
         }
         // The Structural Basis: the first live change records the current
         // file's; a later one must be authored against the same file.
-        const structuralBasis = current_structural_basis(file_format.id, source_observation, sheet);
+        const structuralBasis = current_structural_basis(file_format.id, source_observation, sheet, sheet_index);
         if (structuralBasis === undefined) {
             await refuse(STRUCTURE_NOT_AVAILABLE_YET);
             return;
@@ -9640,14 +10148,71 @@ export function attach_viewer(
             await refuse('Pending rows need review because the worksheet columns changed.');
             return;
         }
-        // `.xlsx` row templates arrive with delivery step 9; its capability
-        // reports "Not available yet" until then, so only delimited files reach here.
-        const format: PendingRowFormatTemplate['format'] = { kind: 'none' };
         // Recorded when absent and checked when present, exactly as append
         // admission does: both save planners refuse Pending Rows without one.
         // Inserted rows live in the layout, not the band, so they leave the
         // band's provisional high-water mark where it is.
         const provisional_ledger_basis = accepted_append_basis_for_ledger(ledger, ledger_key);
+        // "Formatting inheritance": an `.xlsx` Pending Inserted Row copies the
+        // live source row above it, or the one below it when it lands directly
+        // below the Header Row; with no live source row, the default. The
+        // capture reads the verified package, as append admission does.
+        let format: PendingRowFormatTemplate['format'] = { kind: 'none' };
+        let append_style_fingerprint = durable?.appendBasis?.styleFingerprint
+            ?? provisional_ledger_basis?.styleFingerprint;
+        if (file_format.id === 'xlsx') {
+            const observation = source_observation;
+            const probe = insert_rows_in_layout(
+                row_layout,
+                anchor,
+                message.side,
+                Array.from({ length: message.count }, (_, index) => `insert-probe:${index}`),
+            );
+            if (!observation || !probe.ok) {
+                await refuse(probe.ok ? 'The workbook source is not ready for an insert.' : probe.refusal.message);
+                return;
+            }
+            const anchor_row = insert_template_source_row(probe.layout, 'insert-probe:0', message.count);
+            const raw = await host.fs.read_file(uri);
+            if (
+                content_digest(raw) !== observation.digest
+                || !session_is_current()
+                || source_observation !== observation
+            ) {
+                await refuse('The workbook changed while the row format was being captured.');
+                return;
+            }
+            const header_source_row = sheet.excelFirstRowHeader?.active === true
+                ? sheet.excelFirstRowHeader.sourceRow
+                : undefined;
+            try {
+                const captured = capture_xlsx_append_row_format(
+                    raw,
+                    sheet_index,
+                    sheet.sourceRowCount,
+                    sheet.columnCount,
+                    header_source_row,
+                    anchor_row === null ? undefined : state.rowHeights?.[sheet_index]?.[anchor_row],
+                    anchor_row,
+                );
+                format = captured;
+                // The band's basis carries the append template's style
+                // fingerprint; an insert records the one an append would, so
+                // a later append on this worksheet extends the same basis.
+                append_style_fingerprint ??= capture_xlsx_append_row_format(
+                    raw,
+                    sheet_index,
+                    sheet.sourceRowCount,
+                    sheet.columnCount,
+                    header_source_row,
+                ).styleFingerprint;
+            } catch (error) {
+                await refuse(error instanceof Error
+                    ? error.message
+                    : 'The row above cannot be used as a format template.');
+                return;
+            }
+        }
         const appendBasis: PendingAppendBasis = Object.freeze({
             sourceRowCount: durable?.appendBasis?.sourceRowCount
                 ?? provisional_ledger_basis?.sourceRowCount
@@ -9662,6 +10227,7 @@ export function attach_viewer(
             ),
             columnCount: sheet.columnCount,
             schemaFingerprint,
+            ...(append_style_fingerprint === undefined ? {} : { styleFingerprint: append_style_fingerprint }),
         });
         if (provisional_ledger_basis !== undefined
             && advance_pending_append_basis(provisional_ledger_basis, appendBasis) === undefined) {
@@ -10575,7 +11141,7 @@ export function attach_viewer(
             // The same basis the snapshot reported and publication accepted,
             // computed from the observation of the file this save verifies.
             const current = verified_observation?.digest === verified_digest
-                ? current_structural_basis(file_format.id, verified_observation, sheet)
+                ? current_structural_basis(file_format.id, verified_observation, sheet, worksheet.sheetIndex)
                 : undefined;
             const basis_matches = structural_bases_equal(changes.structuralBasis, current);
             if (!basis_matches) {
@@ -10597,6 +11163,53 @@ export function attach_viewer(
             }
         }
         return undefined;
+    }
+
+    /**
+     * Record a refused structural save's `unsupportedStructure` conflict on
+     * its worksheet's durable slot, replacing any earlier one, before the
+     * webview hears of it. Conflicts are the host's to record: the webview
+     * keeps the rejection's conflict for Review Changes and echoes it in its
+     * next publication and save, which the host accepts only when its own
+     * slot holds the same conflicts. The planner re-derives the refusal on
+     * every save, so the conflict never blocks one.
+     */
+    async function record_unsupported_structure_conflict(
+        identity: CsvSaveOperation,
+        rejection: CsvSaveRejection,
+    ): Promise<void> {
+        if (rejection.reason !== 'structuralConflict' || rejection.structuralReason !== 'unsupportedStructure') return;
+        const worksheet = identity.worksheets[rejection.worksheetOperationIndex];
+        if (worksheet === undefined) return;
+        const conflict: PendingStructuralConflict = Object.freeze({
+            reason: 'unsupportedStructure',
+            pendingRowIds: Object.freeze([]),
+            tailRemovalIds: Object.freeze([]),
+            ...(rejection.message === undefined ? {} : { message: rejection.message }),
+        });
+        try {
+            await update_file_state((current, sheets) => {
+                const sheet_index = worksheet_target_index(sheets, worksheet);
+                if (sheet_index === undefined) return current;
+                const slot = pending_changes_for_sheet(
+                    current.pendingEdits,
+                    sheet_index,
+                    worksheet.sheetName,
+                    worksheet.worksheetId,
+                );
+                if (slot === undefined || !pending_changes_carry_layout(slot)) return current;
+                const conflicts = [
+                    ...(slot.conflicts ?? []).filter((candidate) => candidate.reason !== 'unsupportedStructure'),
+                    conflict,
+                ];
+                if (JSON.stringify(conflicts) === JSON.stringify(slot.conflicts ?? [])) return current;
+                const pendingEdits = [...(current.pendingEdits ?? [])];
+                pendingEdits[sheet_index] = { ...slot, conflicts };
+                return { ...current, pendingEdits };
+            });
+        } catch (error) {
+            log_sanitized_failure('Could not record a refused structural save', error);
+        }
     }
 
     async function handle_save(input: unknown): Promise<void> {
@@ -10707,15 +11320,14 @@ export function attach_viewer(
         }
 
         // Peer compatibility rule 3: while the flag is off no layout field may
-        // reach a planner. With it on, CSV and TSV write layouts; `.xlsx`
-        // refuses them until its structural writer lands (delivery step 9).
+        // reach a planner. With it on, CSV, TSV, and `.xlsx` write layouts.
         const carries_layout = identity.worksheets.some((worksheet) =>
             pending_changes_carry_layout(worksheet.structuralChanges));
         const layout_refusal = !carries_layout
             ? undefined
             : !structural_editing_enabled
                 ? 'Saving inserted, deleted, or moved rows and columns is not available in this version.'
-                : file_format.id !== 'csv' && file_format.id !== 'tsv'
+                : file_format.id !== 'csv' && file_format.id !== 'tsv' && file_format.id !== 'xlsx'
                     ? 'Saving inserted, deleted, or moved rows and columns is not available yet.'
                     : undefined;
         // An unresolved structural save: a new save would build on one reading
@@ -10784,6 +11396,7 @@ export function attach_viewer(
             const lifecycle = finish_save_lifecycle(active.operation, 'failed');
             const rejection = structural_save_rejection(error);
             if (rejection !== undefined) {
+                await record_unsupported_structure_conflict(identity, rejection);
                 void post_to_receiver({
                     type: 'saveResult',
                     success: false,
@@ -11048,6 +11661,11 @@ export function attach_viewer(
                     save_receipt = Object.freeze({
                         appendedRows: Object.freeze(appendedRows),
                         removedSourceRows: save_receipt.removedSourceRows,
+                        // A structural save's row and column maps, which its
+                        // rekey intent and post-write rekey are built from.
+                        ...(save_receipt.structure === undefined
+                            ? {}
+                            : { structure: save_receipt.structure }),
                     });
                 } finally {
                     persisted_source.close();
@@ -11393,6 +12011,7 @@ export function attach_viewer(
                 }
                 const rejection = structural_save_rejection(error);
                 if (rejection !== undefined) {
+                    await record_unsupported_structure_conflict(identity, rejection);
                     void post_to_receiver({
                         type: 'saveResult',
                         success: false,

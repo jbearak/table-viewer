@@ -38,6 +38,7 @@ import {
     own_saved_appended_row_snapshot,
     pending_changes_carry_layout,
     pending_rows,
+    MAX_STRUCTURAL_CONFLICT_MESSAGE_LENGTH,
     PENDING_STRUCTURAL_CONFLICT_REASONS,
     type PendingAppendedRow,
     type PendingAppendBasis,
@@ -2709,6 +2710,8 @@ export interface CsvStructuralSaveRejection {
     readonly pendingRowIds: readonly string[];
     readonly tailRemovalIds: readonly string[];
     readonly formulaCells?: PendingStructuralConflict['formulaCells'];
+    /** An `unsupportedStructure` refusal's reason, for Review Changes. */
+    readonly message?: string;
 }
 
 export type CsvSaveRejection = CsvCellSaveRejection | CsvStructuralSaveRejection;
@@ -2732,6 +2735,7 @@ export function is_wire_csv_save_rejection(
                     ...(value.formulaCells === undefined
                         ? {}
                         : { formulaCells: value.formulaCells }),
+                    ...(value.message === undefined ? {} : { message: value.message }),
                 }],
             });
             payload_within_bound = true;
@@ -2740,6 +2744,10 @@ export function is_wire_csv_save_rejection(
         }
         return payload_within_bound
             && reasons.has(value.structuralReason as PendingStructuralConflictReason)
+            && (value.message === undefined || (value.structuralReason === 'unsupportedStructure'
+                && typeof value.message === 'string'
+                && value.message.length > 0
+                && value.message.length <= MAX_STRUCTURAL_CONFLICT_MESSAGE_LENGTH))
             && Array.isArray(value.pendingRowIds)
             && Array.isArray(value.tailRemovalIds)
             && (value.formulaCells === undefined || (Array.isArray(value.formulaCells)

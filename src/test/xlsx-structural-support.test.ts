@@ -181,10 +181,11 @@ describe('scan_xlsx_structural_support', () => {
         expect_supported(support);
         expect(support.merges).toEqual(['A3:B3', 'C1:D2']);
         expect(support.autoFilter).toEqual({ ref: 'A1:B2', filteredColumns: [] });
+        // One entry per element: the writer splits an element's rules
+        // together and caps the split per element.
         expect(support.relativeRules).toEqual([
-            { sqref: 'B2:B5 D1', formulas: ['B2>A2'] },
-            { sqref: 'B2:B5 D1', formulas: [] },
-            { sqref: 'A2:A9', formulas: ['0', '$C$1'] },
+            { kind: 'conditionalFormatting', sqref: 'B2:B5 D1', formulas: ['B2>A2'] },
+            { kind: 'dataValidation', sqref: 'A2:A9', formulas: ['0', '$C$1'] },
         ]);
     });
 

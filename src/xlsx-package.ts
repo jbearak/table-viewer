@@ -53,7 +53,21 @@ import {
 } from './parse-xlsx';
 import type { DateMode } from './spreadsheet-format';
 import { rels_path_for_part, scan_relationships_document } from './ooxml-relationships';
-import type { XlsxHyperlinkEdit } from './xlsx-hyperlink-write';
+import { remove_hyperlink_relationships, type XlsxHyperlinkEdit } from './xlsx-hyperlink-write';
+import type { AnchorWorksheetInput } from './formula-anchor-layout';
+import type { PendingRowId } from './pending-changes';
+import type { PendingColumnId } from './worksheet-layout';
+import {
+    restructure_worksheet,
+    WorksheetStructureRefusalError,
+    type WorksheetCoordinateMap,
+    type WorksheetRestructureResult,
+    type WorksheetStructureLayout,
+    type XlsxColumnFormat,
+    type XlsxRowFormat,
+} from './ooxml-surgery/worksheet-structure';
+import { run_workbook_formula_stage } from './ooxml-surgery/workbook-formula-stage';
+import { OoxmlRefusalError } from './ooxml-refusal';
 import {
     apply_worksheet_edits,
     type XlsxWorksheetRowChanges,
@@ -395,6 +409,12 @@ function parse_append_style_index(raw: string, message: string): number {
  * Capture the exact presentation dependency for rows admitted at the physical
  * worksheet tail. This reads the verified package, never the paged DataSource,
  * so a sparse or unloaded final row cannot silently lose its formatting.
+ *
+ * `anchor_row` names the source row to copy instead, for a Pending Inserted
+ * Row ("Formatting inheritance"): the live source row above the insertion, or
+ * the one below it when it is inserted directly below the Header Row. `null`
+ * captures the default format (a header-only body). Absent, the template is
+ * the last row that is not the Header Row, as appending has always used.
  */
 export function capture_xlsx_append_row_format(
     raw: Uint8Array,
@@ -403,6 +423,7 @@ export function capture_xlsx_append_row_format(
     column_count: number,
     header_source_row?: number,
     viewer_row_height?: number,
+    anchor_row?: number | null,
 ): XlsxPendingRowFormat {
     if (
         !Number.isSafeInteger(sheet_index)
@@ -414,6 +435,14 @@ export function capture_xlsx_append_row_format(
         || column_count <= 0
         || column_count > 256
     ) throw new Error('Invalid worksheet append format request');
+    if (
+        anchor_row !== undefined
+        && anchor_row !== null
+        && (!Number.isSafeInteger(anchor_row)
+            || anchor_row < 0
+            || anchor_row >= source_row_count
+            || anchor_row === header_source_row)
+    ) throw new Error('Invalid worksheet insert format row');
 
     let zip: ZipPackage;
     try {
@@ -435,6 +464,7 @@ export function capture_xlsx_append_row_format(
     if (templateSourceRow === header_source_row) {
         templateSourceRow = templateSourceRow === 0 ? null : templateSourceRow - 1;
     }
+    if (anchor_row !== undefined) templateSourceRow = anchor_row;
     const cellStyleIndexes: Array<number | null> = Array(column_count).fill(null);
     let nativeRowHeight: number | undefined;
     let rowStyleIndex: number | undefined;
@@ -819,7 +849,48 @@ export function create_xlsx_formula_write_plan(
     });
 }
 
+/** One worksheet a structural save restructures: its validated layouts and new rows' and columns' formats. */
+export interface XlsxStructuralWorksheet {
+    readonly sheetIndex: number;
+    readonly layout: WorksheetStructureLayout;
+    /** Every live Pending Inserted Row's format. */
+    readonly insertedRowFormats: ReadonlyMap<PendingRowId, XlsxRowFormat>;
+    /** The live append band, in `createdOrder`. */
+    readonly appendedRowFormats: readonly XlsxRowFormat[];
+    /** Every live Pending Column's format. */
+    readonly insertedColumnFormats: ReadonlyMap<PendingColumnId, XlsxColumnFormat>;
+}
+
+/**
+ * The structural stage of a save (design "Physical write"): restructure each
+ * listed worksheet, then render every formula in the workbook for the
+ * layouts. Runs before cell edits, which are then addressed in prospective
+ * coordinates.
+ */
+export interface XlsxStructuralWrite {
+    /** Every worksheet of the workbook, in reader order, as formula rendering sees it. */
+    readonly anchors: readonly AnchorWorksheetInput[];
+    /** Exactly the worksheets with a live layout change. */
+    readonly worksheets: readonly XlsxStructuralWorksheet[];
+    /** Called with each restructured worksheet's coordinate map, for the caller's checks. */
+    readonly onRestructured?: (sheetIndex: number, coordinates: WorksheetCoordinateMap) => void;
+}
+
+/**
+ * A structural save the writer refuses: a worksheet the restructure stage
+ * cannot shift, or a formula, rule, or name the formula stage cannot render.
+ * `sheetIndex` names the worksheet the refusal is about, when it has one.
+ */
+export class XlsxStructuralRefusalError extends Error {
+    constructor(message: string, readonly sheetIndex: number | undefined) {
+        super(message);
+        this.name = 'XlsxStructuralRefusalError';
+    }
+}
+
 export interface XlsxWorkbookWriteOptions {
+    /** Present only for a save that inserts, deletes, or moves rows or columns. */
+    readonly structure?: XlsxStructuralWrite;
     /** Topology parsed from the verified source, in current worksheet order. */
     readonly formulaDependencies?: readonly {
         readonly formulaDependencies?: PackedFormulaDependencies;
@@ -847,7 +918,11 @@ export function write_xlsx_workbook_cell_edits(
             || (row_changes?.removeRows.length ?? 0) > 0
             || (row_changes?.appendRows.length ?? 0) > 0,
     );
-    if (active.length === 0) return raw;
+    const structure = options?.structure;
+    if (active.length === 0 && structure === undefined) return raw;
+    if (structure !== undefined && (options?.formulaWritePlan || options?.formulaDependencies)) {
+        throw new Error('A structural save writes its own formula caches');
+    }
     if (options?.formulaWritePlan && options.formulaDependencies) {
         throw new Error('Formula write plan and dependency fallback are mutually exclusive');
     }
@@ -878,6 +953,81 @@ export function write_xlsx_workbook_cell_edits(
         return content;
     };
     const sheet_names = parts.map((part) => part.name);
+    // The structural stage: every later step reads the restructured and
+    // rendered parts through `read_worksheet_bytes`, in prospective
+    // coordinates, exactly as it reads an unchanged part.
+    const structural_parts = new Set<number>();
+    const structural_invalidations: XlsxFormulaCacheAddress[] = [];
+    const rels_overrides = new Map<string, string>();
+    let workbook_override: string | undefined;
+    if (structure !== undefined) {
+        if (structure.anchors.length !== parts.length) {
+            throw new Error('The structural save does not match the workbook');
+        }
+        const restructured = new Map<number, WorksheetRestructureResult>();
+        for (const worksheet of structure.worksheets) {
+            const part = parts[worksheet.sheetIndex];
+            if (!part || restructured.has(worksheet.sheetIndex)) {
+                throw new Error('Invalid or duplicate worksheet to restructure');
+            }
+            try {
+                restructured.set(worksheet.sheetIndex, restructure_worksheet({
+                    worksheet_xml: read_worksheet_bytes(worksheet.sheetIndex, 'Could not read a worksheet to restructure'),
+                    layout: worksheet.layout,
+                    inserted_row_formats: worksheet.insertedRowFormats,
+                    appended_row_formats: worksheet.appendedRowFormats,
+                    inserted_column_formats: worksheet.insertedColumnFormats,
+                }));
+            } catch (error) {
+                if (error instanceof WorksheetStructureRefusalError || error instanceof OoxmlRefusalError) {
+                    throw new XlsxStructuralRefusalError(error.message, worksheet.sheetIndex);
+                }
+                throw error;
+            }
+        }
+        const workbook_xml = read_part_bytes(zip, '/xl/workbook.xml');
+        if (workbook_xml === null) throw new Error('Could not read the workbook to restructure');
+        const stage = run_workbook_formula_stage({
+            workbook_part: 'xl/workbook.xml',
+            workbook_xml,
+            worksheets: structure.anchors.map((anchor, index) => ({
+                ...anchor,
+                part: parts[index].path,
+                source_xml: read_worksheet_bytes(index, 'Could not read a worksheet to restructure'),
+                ...(restructured.has(index) ? { restructured: restructured.get(index)! } : {}),
+            })),
+        });
+        const refusal = stage.refusals[0];
+        if (refusal !== undefined) throw new XlsxStructuralRefusalError(refusal.message, refusal.sheetIndex);
+        const index_by_part = new Map(parts.map((part, index) => [part.path, index]));
+        for (const part of stage.parts) {
+            const index = index_by_part.get(part.part);
+            if (index !== undefined) {
+                worksheet_bytes.set(index, Buffer.from(part.newText, 'utf8'));
+                structural_parts.add(index);
+            } else if (part.part === 'xl/workbook.xml') {
+                workbook_override = part.newText;
+            } else {
+                throw new Error('The formula stage rewrote an unexpected part');
+            }
+        }
+        for (const [index, result] of restructured) {
+            structure.onRestructured?.(index, result.coordinates);
+            if (!structural_parts.has(index)) {
+                worksheet_bytes.set(index, result.worksheet_xml);
+                structural_parts.add(index);
+            }
+            if (result.removed_relationship_ids.length === 0) continue;
+            const rels_path = `/${rels_path_for_part(parts[index].path)}`;
+            const rels = read_part_text(zip, rels_path);
+            if (rels === null) continue;
+            const next = remove_hyperlink_relationships(rels, new Set(result.removed_relationship_ids));
+            if (next !== rels) rels_overrides.set(rels_path, next);
+        }
+        structural_invalidations.push(...stage.invalidations);
+    }
+    const read_rels_text = (path: string): string | null =>
+        rels_overrides.get(path) ?? read_part_text(zip, path);
     const moves: XlsxFormulaCellMove[] = [];
     const moved_sources = new Map<string, string>();
     const moved_destinations = new Set<string>();
@@ -1161,9 +1311,21 @@ export function write_xlsx_workbook_cell_edits(
             if (cells.length > 0) formula_invalidations_by_sheet.set(sheet_index, cells);
         }
     }
+    for (const invalidation of structural_invalidations) {
+        if (
+            !Number.isSafeInteger(invalidation.sheetIndex)
+            || invalidation.sheetIndex < 0
+            || invalidation.sheetIndex >= parts.length
+        ) throw new Error('Invalid formula cache invalidation');
+        const sheet = formula_invalidations_by_sheet.get(invalidation.sheetIndex) ?? [];
+        sheet.push({ row: invalidation.row, column: invalidation.column });
+        formula_invalidations_by_sheet.set(invalidation.sheetIndex, sheet);
+    }
     const { is_date_style, cell_font_style, run_font_base } = read_style_write_context(zip);
     const datemode = read_datemode(zip);
-    let calculation_chain_stale = false;
+    // Restructuring moves formula cells, so the calculation chain no longer
+    // describes them (Coverage: `calcChain.xml`, remove).
+    let calculation_chain_stale = structure !== undefined;
     const replacements: Array<
         | { path: string; bytes: Uint8Array }
         | { path: string; text: string; created?: boolean }
@@ -1188,6 +1350,7 @@ export function write_xlsx_workbook_cell_edits(
     for (const sheet_index of formula_invalidations_by_sheet.keys()) {
         touched_sheets.add(sheet_index);
     }
+    for (const sheet_index of structural_parts) touched_sheets.add(sheet_index);
 
     for (const sheetIndex of [...touched_sheets].sort((left, right) => left - right)) {
         const active_entry = active_by_sheet.get(sheetIndex);
@@ -1204,7 +1367,7 @@ export function write_xlsx_workbook_cell_edits(
 
         const rels_path = `/${rels_path_for_part(part.path)}`;
         const rels_xml = link_edits && link_edits.length > 0
-            ? read_part_text(zip, rels_path)
+            ? read_rels_text(rels_path)
             : null;
         const invalidations = formula_invalidations_by_sheet.get(sheetIndex) ?? [];
         const formula_result_updates = formula_results_by_sheet.get(sheetIndex) ?? [];
@@ -1241,12 +1404,21 @@ export function write_xlsx_workbook_cell_edits(
                 // A sheet that had no `.rels` part gets one created.
                 created: rels_xml === null,
             });
+            rels_overrides.delete(rels_path);
         }
         calculation_chain_stale ||= result.calculation_chain_stale;
-        if (active_entry !== undefined || result.worksheet_xml !== sheet_xml) {
+        if (
+            active_entry !== undefined
+            || result.worksheet_xml !== sheet_xml
+            || structural_parts.has(sheetIndex)
+        ) {
             replacements.push({ path, bytes: result.worksheet_xml });
         }
     }
+    // Relationships of hyperlinks the restructure dropped, where no link
+    // edit on the same worksheet already rewrote the part from them.
+    for (const [path, text] of rels_overrides) replacements.push({ path, text });
+    if (workbook_override !== undefined) replacements.push({ path: '/xl/workbook.xml', text: workbook_override });
 
     for (const replacement of replacements) {
         if ('text' in replacement && replacement.created) {

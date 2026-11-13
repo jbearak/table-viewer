@@ -19,6 +19,7 @@
 import {
     appended_rows,
     has_inserted_or_moved_rows,
+    has_live_layout_change,
     is_inserted_row,
     MAX_PENDING_APPENDED_ROWS,
     pending_rows,
@@ -27,8 +28,17 @@ import {
     type PendingStructuralChanges,
     type RowIdentity,
 } from '../pending-changes';
-import type { StructuralAxisSupport } from '../viewer-snapshot';
+import type { StructuralAxisSupport, WorksheetRelativeRule } from '../viewer-snapshot';
+import type { AnchorWorksheetInput } from '../formula-anchor-layout';
 import {
+    MAX_RULE_SPLIT,
+    parse_rule_sqref,
+    relative_rule_split_count,
+    rule_split_workbook,
+} from '../formula-rule-split';
+import type { MergeRange } from '../types';
+import {
+    has_live_column_layout_change,
     index_row_layout,
     insert_anchor_for_selection,
     source_row_layout,
@@ -692,4 +702,99 @@ export function nearest_live_row(
         if (is_live(row)) return row;
     }
     return undefined;
+}
+
+/**
+ * The shipped `.xlsx` merges (A1 ranges) as the store's merge rules read them,
+ * in canonical source coordinates. A range the parser cannot read is left
+ * out: the host's support scan already refused the worksheet over it.
+ */
+export function merge_ranges_of(refs: readonly string[]): MergeRange[] {
+    return refs.flatMap((ref) => {
+        const cells = parse_rule_sqref(ref);
+        if (cells === undefined || cells.length !== 1) return [];
+        const [range] = cells;
+        return [{
+            startRow: range!.firstRow,
+            startCol: range!.firstColumn,
+            endRow: range!.lastRow,
+            endCol: range!.lastColumn,
+        }];
+    });
+}
+
+/** One `.xlsx` rule that Save would refuse to split. */
+export interface RuleSplitWarning {
+    readonly kind: WorksheetRelativeRule['kind'];
+    readonly sqref: string;
+}
+
+/**
+ * The conditional-formatting elements and data-validation rules on
+ * `sheet_index` that the current layouts would split into more than
+ * `MAX_RULE_SPLIT` rules, which Save refuses. Counted with the writer's own
+ * partition (`relative_rule_split_count`), per element, so the warning names
+ * exactly what Save would refuse. A rule the layouts cannot render at all is
+ * refused at Save with its own reason, so it is not repeated here.
+ */
+export function rule_split_warnings(
+    inputs: readonly AnchorWorksheetInput[],
+    sheet_index: number,
+    rules: readonly WorksheetRelativeRule[],
+): RuleSplitWarning[] {
+    if (rules.length === 0 || !inputs.some((input) =>
+        input.changes !== undefined && has_live_layout_change(input.changes))) return [];
+    const workbook = rule_split_workbook(inputs);
+    return rules.flatMap((rule) => {
+        if (rule.formulas.length === 0) return [];
+        const cells = parse_rule_sqref(rule.sqref);
+        if (cells === undefined) return [];
+        const split = relative_rule_split_count(workbook, {
+            worksheet: sheet_index,
+            cells,
+            formulas: rule.formulas,
+        });
+        return split.kind === 'count' && split.count > MAX_RULE_SPLIT
+            ? [Object.freeze({ kind: rule.kind, sqref: rule.sqref })]
+            : [];
+    });
+}
+
+/**
+ * "Moving these rows would split the conditional formatting on B2:B500 into
+ * more than 64 rules. Save will refuse it." The lead names the worksheet's
+ * gestures when they are of one kind. The split count stops at the cap, so
+ * the message says "more than" rather than a number.
+ */
+export function rule_split_warning_message(
+    warning: RuleSplitWarning,
+    changes: Pick<PendingStructuralChanges, 'rowLayout' | 'columnLayout' | 'appendedRows'>,
+): string {
+    const rows = changes.rowLayout === undefined ? undefined : index_row_layout(changes.rowLayout);
+    const columns_changed = changes.columnLayout !== undefined
+        && has_live_column_layout_change(changes.columnLayout);
+    const moved = rows?.hasOutOfOrderRun === true;
+    const inserted = rows?.hasLiveInserted === true;
+    const deleted = (changes.rowLayout?.removedSourceRows.length ?? 0) > 0;
+    const lead = columns_changed || [moved, inserted, deleted].filter(Boolean).length !== 1
+        ? 'These row and column changes'
+        : moved ? 'Moving these rows' : inserted ? 'Inserting these rows' : 'Deleting these rows';
+    const what = warning.kind === 'conditionalFormatting' ? 'conditional formatting' : 'data validation';
+    return `${lead} would split the ${what} on ${warning.sqref} into more than ${MAX_RULE_SPLIT} rules. Save will refuse it.`;
+}
+
+/** The shipped AutoFilter as the store's filtered-column move rule reads it, or nothing. */
+export function structure_auto_filter(
+    auto_filter: { readonly ref: string; readonly filteredColumns: readonly number[] } | undefined,
+): { readonly autoFilter?: NonNullable<WorksheetStructureContext['autoFilter']> } {
+    if (auto_filter === undefined || auto_filter.filteredColumns.length === 0) return {};
+    const cells = parse_rule_sqref(auto_filter.ref);
+    if (cells === undefined || cells.length !== 1) return {};
+    return {
+        autoFilter: Object.freeze({
+            firstColumn: cells[0]!.firstColumn,
+            lastColumn: cells[0]!.lastColumn,
+            filteredColumns: Object.freeze([...auto_filter.filteredColumns]),
+        }),
+    };
 }

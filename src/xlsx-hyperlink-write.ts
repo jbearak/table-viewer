@@ -435,6 +435,27 @@ function remove_relationships(rels_xml: string, ids: ReadonlySet<string>): strin
     ));
 }
 
+/**
+ * Remove the hyperlink relationships among `ids`: the relationships of
+ * hyperlinks a structural save dropped with their cells (design "Coverage",
+ * `<hyperlinks>` `ref`). A relationship of any other type is kept, since
+ * something other than the dropped hyperlink owns it.
+ */
+export function remove_hyperlink_relationships(rels_xml: string, ids: ReadonlySet<string>): string {
+    if (ids.size === 0) return rels_xml;
+    const document = scan_relationships_document(rels_xml);
+    if (document === undefined) return rels_xml;
+    const hyperlinks = new Set(document.relationships.flatMap((relationship) => {
+        const id = get_attr(relationship.openTag, 'Id');
+        const type = get_attr(relationship.openTag, 'Type');
+        return id !== null && ids.has(id)
+            && (type === TRANSITIONAL_HYPERLINK_REL_TYPE || type === STRICT_HYPERLINK_REL_TYPE)
+            ? [id]
+            : [];
+    }));
+    return remove_relationships(rels_xml, hyperlinks);
+}
+
 /** The `display` text a clear edit is about to delete along with its element. */
 export interface ClearedDisplay {
     readonly row: number;

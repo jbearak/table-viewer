@@ -1162,6 +1162,33 @@ export function insert_rows(
 }
 
 /**
+ * The source row whose format a run of `count` Pending Inserted Rows, the
+ * first of which is `first_id`, copies at admission (design "Formatting
+ * inheritance"): the nearest live source row above the run, or, when none is
+ * above it (the run sits directly below the Header Row), the nearest one
+ * below it. Null when the layout has no live source row, as on a header-only
+ * worksheet, which takes the default format.
+ */
+export function insert_template_source_row(
+    layout: RowLayout,
+    first_id: PendingRowId,
+    count: number,
+): number | null {
+    const index = index_row_layout(layout);
+    const first = index.body_index_of({ kind: 'pending', pendingRowId: first_id });
+    if (first === undefined) throw new Error('The inserted rows are not live in the layout.');
+    for (let body_index = first - 1; body_index >= 1; body_index -= 1) {
+        const identity = index.identity_at_body_index(body_index);
+        if (identity?.kind === 'source') return identity.sourceRow;
+    }
+    for (let body_index = first + count; body_index <= index.liveCount; body_index += 1) {
+        const identity = index.identity_at_body_index(body_index);
+        if (identity?.kind === 'source') return identity.sourceRow;
+    }
+    return null;
+}
+
+/**
  * Delete rows in place: live source rows become Pending Row Removals and live
  * Pending Inserted Rows become discarded tombstones carrying
  * `created_order(id)`. Entries that are already tombstones are left alone.
