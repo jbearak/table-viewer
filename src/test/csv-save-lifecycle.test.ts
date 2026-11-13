@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { own_pending_structural_changes } from '../pending-changes';
 import type {
     CsvSaveOperation,
     SheetPendingEditCells,
@@ -9,6 +10,7 @@ import {
     is_valid_csv_save_lifecycle,
     propose_csv_save,
     reduce_csv_save_projection,
+    remove_operation_owned_pending_structural_changes,
     resolve_csv_save_hydration,
     save_lifecycle_correlation,
     save_operation_worksheet,
@@ -749,5 +751,51 @@ describe('CSV save lifecycle projection', () => {
             'current-session',
             undefined,
         )).toEqual(dirty_edits(local));
+    });
+});
+
+describe('removing a saved operation’s structural changes at hydration', () => {
+    const template = { id: 'plain', format: { kind: 'none' as const } };
+    const layout = {
+        runs: [
+            { kind: 'source' as const, start: 0, count: 1 },
+            { kind: 'pending' as const, ids: ['ins'] },
+            { kind: 'source' as const, start: 1, count: 2 },
+        ],
+        removedSourceRows: [{ start: 2, count: 1 }],
+        discardedPendingRows: [],
+    };
+    const changes = {
+        formatTemplates: [template],
+        appendedRows: [
+            { id: 'ins', origin: 'insert' as const, cells: {}, formatTemplateId: 'plain', createdOrder: 1 },
+            { id: 'app', cells: {}, formatTemplateId: 'plain', createdOrder: 2 },
+        ],
+        tailRemovals: [],
+        conflicts: [],
+        appendBasis: { sourceRowCount: 3, columnCount: 1, schemaFingerprint: 'x' },
+        rowLayout: layout,
+        structuralBasis: {
+            kind: 'delimited' as const, byteLength: 4, digest: 'd', sourceRowCount: 3, sourceColumnCount: 1,
+        },
+    };
+
+    it('retires the layout the save wrote along with its inserted and appended rows', () => {
+        const retained = remove_operation_owned_pending_structural_changes(changes, {
+            sheetIndex: 0,
+            edits: {},
+            dirtyEdits: {},
+            structuralChanges: changes,
+        });
+        expect(retained).toEqual(own_pending_structural_changes({}));
+    });
+
+    it('keeps a layout when the save carried none', () => {
+        const retained = remove_operation_owned_pending_structural_changes(changes, {
+            sheetIndex: 0,
+            edits: {},
+            dirtyEdits: {},
+        });
+        expect(retained?.rowLayout).toEqual(layout);
     });
 });

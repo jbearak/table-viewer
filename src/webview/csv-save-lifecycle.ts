@@ -24,6 +24,7 @@ import {
 } from '../types';
 import {
     EMPTY_PENDING_STRUCTURAL_CHANGES,
+    pending_changes_carry_layout,
     own_pending_structural_changes,
     type PendingStructuralChanges,
     pending_rows,
@@ -453,15 +454,26 @@ export function remove_operation_owned_pending_structural_changes(
     const tail_removals = pending.tailRemovals.filter(
         (removal) => !removed_source_rows.has(removal.sourceRow),
     );
+    // A save that carried a layout wrote it: its inserted rows are among the
+    // rows removed above, so the layout that placed them goes with them.
+    const saved_layout = pending_changes_carry_layout(owned) && pending_changes_carry_layout(pending);
     if (
         appended_rows.length === pending_rows(pending).length
         && tail_removals.length === pending.tailRemovals.length
+        && !saved_layout
     ) return pending;
     const retained_template_ids = new Set(
         appended_rows.map((row) => row.formatTemplateId),
     );
+    const {
+        rowLayout: _row_layout,
+        columnLayout: _column_layout,
+        pendingColumns: _pending_columns,
+        structuralBasis: _structural_basis,
+        ...unlaid
+    } = pending;
     return own_pending_structural_changes({
-        ...pending,
+        ...(saved_layout ? unlaid : pending),
         formatTemplates: pending.formatTemplates.filter(
             (template) => retained_template_ids.has(template.id),
         ),

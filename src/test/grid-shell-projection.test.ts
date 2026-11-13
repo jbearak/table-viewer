@@ -24,6 +24,7 @@ import { create_history_store, type HistoryStore } from '../webview/history-stor
 import { peek_history } from '../webview/history-stack-model';
 import { webview_formula_workbook } from '../webview/formula-anchor-model';
 import { EMPTY_PENDING_STRUCTURAL_CHANGES } from '../pending-changes';
+import { plan_pending_row_history_replay } from '../webview/pending-row-history';
 import { create_pending_row_store } from '../webview/pending-row-store';
 import {
     LAST_COLUMN_RESIZE_GUTTER_PX,
@@ -8733,6 +8734,41 @@ describe('row Insert in the row-gutter menu', () => {
         expect([0, 1, 2, 3, 4].map(get_row_number)).toEqual([1, 2, 3, 4, 5]);
         // Focus lands on the new row in the focused column, by polling.
         await vi.waitFor(() => expect(caret()).toEqual([0, 2]));
+    });
+
+    it('records and undoes a cell edit in an inserted row', async () => {
+        const pending = create_pending_row_store({ session_id: 'session' });
+        const history = create_history_store();
+        const host = admission(['ins-a']);
+        await render_grid(structure_props({
+            edit_session: create_edit_session_store({ session_id: 'session' }),
+            pending_row_store: pending,
+            history_store: history,
+            on_insert_rows: host.on_insert_rows,
+        }));
+        await open_row_menu(0);
+        await act(async () => menu_item('Insert row below')!.click());
+        await act(async () => host.grant());
+        await vi.waitFor(() => expect(host.settled).toEqual([true]));
+        const inserted = pending.snapshot();
+        const on_cells_edited = grid_mock.props!.onCellsEdited as (
+            items: readonly unknown[], source?: string,
+        ) => unknown;
+        await act(async () => on_cells_edited([
+            { location: [0, 1], value: { kind: 'text', data: 'typed' } },
+        ]));
+        expect(pending.snapshot().appendedRows).toEqual([expect.objectContaining({
+            id: 'ins-a',
+            origin: 'insert',
+            cells: { 0: expect.objectContaining({ value: 'typed' }) },
+        })]);
+        expect(pending.snapshot().rowLayout).toEqual(inserted.rowLayout);
+        const peek = peek_history(history.snapshot(), 'undo');
+        if (peek.kind !== 'available') throw new Error('nothing recorded');
+        expect(peek.entry.action.changes.map((change) => change.kind)).toEqual(['rowAppend']);
+        const undo = plan_pending_row_history_replay(peek.entry.action, 'undo', () => pending.snapshot());
+        if (undo.kind !== 'plan') throw new Error(undo.kind);
+        expect(undo.plans[0]!.next).toEqual(inserted);
     });
 
     it('cancels an insert whose anchor was removed while the request was out', async () => {

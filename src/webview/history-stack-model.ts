@@ -2964,10 +2964,20 @@ function own_history_change(
             if (template === undefined) {
                 throw new TypeError('Row history lost its format template');
             }
-            return pending_rows(own_pending_structural_changes({
+            // A cell edit in a Pending Inserted Row records this arm too. The
+            // row is owned without the layout that places it, so its origin
+            // is checked here and restored, as `own_layout_delta` does.
+            const { origin, ...rest } = snapshot_structural_input(row);
+            if (origin !== undefined && origin !== 'append' && origin !== 'insert') {
+                throw new TypeError('Row history holds a row with an unknown origin');
+            }
+            const owned = pending_rows(own_pending_structural_changes({
                 formatTemplates: [template],
-                appendedRows: [snapshot_structural_input(row)],
+                appendedRows: [rest],
             }))[0];
+            if (origin !== 'insert') return owned;
+            const { id, ...owned_rest } = owned;
+            return Object.freeze({ id, origin, ...owned_rest });
         };
         const before = own_row(change.delta.before);
         const after = own_row(change.delta.after);
@@ -2980,10 +2990,6 @@ function own_history_change(
             if (template === undefined) {
                 throw new TypeError('Row history lost its format template');
             }
-            own_pending_structural_changes({
-                formatTemplates: [template],
-                appendedRows: [row],
-            });
             formats_by_id.set(row.formatTemplateId, template);
         }
         const formats = [...formats_by_id.values()];
