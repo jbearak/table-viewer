@@ -649,6 +649,27 @@ export function plan_pending_column_cells(
     };
 }
 
+/**
+ * Set Pending Column widths, view state stored without a history entry (as a
+ * resize stores them): a number sets `viewerWidth`, `undefined` clears it.
+ * Columns no longer pending are skipped. Undefined when nothing changes.
+ */
+export function with_pending_column_widths(
+    changes: PendingStructuralChanges,
+    widths: Readonly<Record<string, number | undefined>>,
+): PendingStructuralChanges | undefined {
+    let changed = false;
+    const columns = (changes.pendingColumns ?? []).map((column) => {
+        if (!Object.prototype.hasOwnProperty.call(widths, column.id)) return column;
+        const width = widths[column.id];
+        if (column.viewerWidth === width) return column;
+        changed = true;
+        const { viewerWidth: _previous, ...rest } = column;
+        return width === undefined ? rest : { ...rest, viewerWidth: width };
+    });
+    return changed ? { ...changes, pendingColumns: columns } : undefined;
+}
+
 /** A Pending Column cell's highlight a gesture sets; `color` undefined clears it. */
 export interface PendingColumnHighlightEdit {
     readonly pendingColumnId: string;

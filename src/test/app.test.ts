@@ -71,6 +71,7 @@ const grid_shell_mock = vi.hoisted(() => ({
     }) as import('../webview/find-model').FindScanResult),
     cancel_find: vi.fn(),
     auto_fit_result: { 0: 120 } as Record<number, number> | null,
+    pending_auto_fit_result: {} as Record<string, number>,
     latest_props: null as Record<string, unknown> | null,
     mount_edits: null as Record<string, CsvDirtyEntry> | null,
     mount_conflicted: null as string[] | null,
@@ -253,6 +254,9 @@ vi.mock('../webview/grid-shell', () => ({
         // App's auto-fit toggle has fitted widths to apply.
         if (props.auto_fit_ref) {
             props.auto_fit_ref.current = () => grid_shell_mock.auto_fit_result;
+        }
+        if (props.pending_auto_fit_ref) {
+            props.pending_auto_fit_ref.current = () => grid_shell_mock.pending_auto_fit_result;
         }
         return React.createElement(
             'div',
@@ -1018,6 +1022,7 @@ function cleanup() {
     grid_shell_mock.find.mockResolvedValue({ kind: 'none' });
     grid_shell_mock.cancel_find.mockReset();
     grid_shell_mock.auto_fit_result = { 0: 120 };
+    grid_shell_mock.pending_auto_fit_result = {};
     grid_shell_mock.mount_edits = null;
     grid_shell_mock.mount_conflicted = null;
     grid_shell_mock.emit_pending_edits_on_mount = false;
@@ -17735,5 +17740,44 @@ describe('Review Changes for row and column structure', () => {
             row: { kind: 'source', sourceRow: 0 },
             column: { kind: 'source', sourceColumn: 0 },
         });
+    });
+});
+
+describe('auto-fit with Pending Columns', () => {
+    it('fits a Pending Column into its Pending Changes and Restore puts its width back', async () => {
+        const { post_message } = await render_app();
+        const meta = make_meta(['Sheet1'], false);
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        await enter_edit_mode(post_message, 'fit-session');
+        const store = (grid_shell_mock.latest_props as unknown as GridShellProps).pending_row_store!;
+        const before = store.snapshot();
+        await act(async () => {
+            const staged = store.stage_replace('fit-session', before, {
+                ...before,
+                columnLayout: {
+                    columns: [{ kind: 'source', sourceColumn: 0 }, { kind: 'pending', pendingColumnId: 'column-a' }],
+                    removedSourceColumns: [],
+                    discardedPendingColumns: [],
+                },
+                pendingColumns: [{
+                    id: 'column-a',
+                    header: 'New column',
+                    cells: { 's:0': { value: 'a much longer value' } },
+                    viewerWidth: 90,
+                    format: { kind: 'none' },
+                    createdOrder: 1,
+                }],
+            });
+            staged!.commit();
+            staged!.notify();
+        });
+        grid_shell_mock.pending_auto_fit_result = { 'column-a': 180 };
+        await click_button('Auto-fit Columns');
+        expect(store.snapshot().pendingColumns?.[0]?.viewerWidth).toBe(180);
+        expect(grid_shell_mock.latest_props!.auto_fit_active).toBe(true);
+        await click_button('Auto-fit Columns');
+        expect(store.snapshot().pendingColumns?.[0]?.viewerWidth).toBe(90);
     });
 });

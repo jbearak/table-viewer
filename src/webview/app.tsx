@@ -249,6 +249,7 @@ import { run_discard_transaction } from './discard-transaction-model';
 import { highlight_history_source } from './highlight-capture-model';
 import { commit_staged_transaction, type StagedMutation } from './staged-mutation';
 import { discard_layout_changes, keep_inserted_rows_at_end } from './pending-row-store';
+import { with_pending_column_widths } from './column-structure-model';
 import {
     has_inserted_or_moved_rows,
     INSERTED_ROWS_TRANSFORM_MESSAGE,
@@ -1704,6 +1705,28 @@ export function App(): React.JSX.Element {
     // GridShell populates this with a measure function returning fitted column
     // widths (null when nothing is loaded); App calls it from the auto-fit toggle.
     const auto_fit_ref = useRef<(() => Record<number, number> | null) | null>(null);
+    // Its twin for Pending Columns, whose widths live in the Pending Changes.
+    const pending_auto_fit_ref = useRef<(() => Record<string, number>) | null>(null);
+    /**
+     * Per sheet, the Pending Column widths a fit replaced (`undefined` for a
+     * column that had none), so Restore puts them back as the source widths'
+     * snapshot does.
+     */
+    const pending_auto_fit_snapshot_ref = useRef<(Record<string, number | undefined> | undefined)[]>([]);
+    /** Write Pending Column widths into a sheet's Pending Changes, as a resize stores them. */
+    const write_pending_column_widths = useCallback((
+        sheet_index: number,
+        widths: Readonly<Record<string, number | undefined>>,
+    ) => {
+        const store = edit_session_registry_ref.current!.pending_rows_for_sheet(sheet_index);
+        const before = store.snapshot();
+        const next = with_pending_column_widths(before, widths);
+        if (next === undefined) return;
+        const staged = store.stage_replace(csv_edit_session_id_ref.current, before, next);
+        if (staged === undefined || !staged.valid()) return;
+        staged.commit();
+        staged.notify();
+    }, []);
     // GridShell populates this with sheet-tab actions (select all / copy sheet)
     // for the mounted sheet; App calls them from the sheet-tab context menu.
     const grid_actions_ref = useRef<GridActionsHandle | null>(null);
@@ -7776,6 +7799,8 @@ export function App(): React.JSX.Element {
     }, [persist_immediate]);
 
     const deactivate_auto_fit_for_sheet = useCallback((sheet_index: number) => {
+        // A direct resize keeps every current width, Pending Columns' too.
+        pending_auto_fit_snapshot_ref.current[sheet_index] = undefined;
         const is_active = auto_fit_active_ref.current[sheet_index];
         const has_snapshot =
             auto_fit_snapshot_ref.current[sheet_index] !== undefined;
@@ -8030,8 +8055,21 @@ export function App(): React.JSX.Element {
      */
     const apply_auto_fit_to_active_sheet = useCallback(() => {
         const fitted = auto_fit_ref.current?.();
-        if (!fitted) return false;
+        const pending_fitted = pending_auto_fit_ref.current?.() ?? {};
+        const pending_ids = Object.keys(pending_fitted);
+        if (!fitted && pending_ids.length === 0) return false;
         const sheet_index = active_sheet_index;
+        if (pending_ids.length > 0) {
+            const before = new Map((edit_session_registry_ref.current!
+                .pending_rows_for_sheet(sheet_index).snapshot().pendingColumns ?? [])
+                .map((column) => [column.id, column.viewerWidth]));
+            const snapshot = pending_auto_fit_snapshot_ref.current[sheet_index] ?? {};
+            for (const id of pending_ids) {
+                if (!Object.prototype.hasOwnProperty.call(snapshot, id)) snapshot[id] = before.get(id);
+            }
+            pending_auto_fit_snapshot_ref.current[sheet_index] = snapshot;
+            write_pending_column_widths(sheet_index, pending_fitted);
+        }
         const current_widths = column_widths[sheet_index];
         set_auto_fit_snapshot((prev) => {
             const next = [...prev];
@@ -8046,7 +8084,7 @@ export function App(): React.JSX.Element {
         });
         set_column_widths((prev) => {
             const next = [...prev];
-            next[sheet_index] = { ...(next[sheet_index] ?? {}), ...fitted };
+            next[sheet_index] = { ...(next[sheet_index] ?? {}), ...(fitted ?? {}) };
             state_ref.current = { ...state_ref.current, columnWidths: [...next] };
             persist_immediate();
             return next;
@@ -8058,7 +8096,7 @@ export function App(): React.JSX.Element {
             return next;
         });
         return true;
-    }, [active_sheet_index, column_widths, persist_immediate]);
+    }, [active_sheet_index, column_widths, persist_immediate, write_pending_column_widths]);
 
     /**
      * Put the named sheets back on the widths their fit replaced.
@@ -8070,6 +8108,11 @@ export function App(): React.JSX.Element {
     const restore_widths_for_sheets = useCallback((indices: readonly number[]) => {
         const fitted = indices.filter((index) => auto_fit_active_ref.current[index]);
         if (fitted.length === 0) return;
+        for (const index of fitted) {
+            const pending = pending_auto_fit_snapshot_ref.current[index];
+            pending_auto_fit_snapshot_ref.current[index] = undefined;
+            if (pending !== undefined) write_pending_column_widths(index, pending);
+        }
         set_column_widths((prev) => {
             const next = [...prev];
             for (const index of fitted) next[index] = auto_fit_snapshot_ref.current[index];
@@ -8089,7 +8132,7 @@ export function App(): React.JSX.Element {
             auto_fit_snapshot_ref.current = next;
             return next;
         });
-    }, [persist_immediate]);
+    }, [persist_immediate, write_pending_column_widths]);
 
     const handle_toggle_auto_fit = useCallback(() => {
         if (auto_fit_active[active_sheet_index]) {
@@ -9037,6 +9080,7 @@ export function App(): React.JSX.Element {
             on_editing_change={handle_editing_change}
             editing_ref={editing_ref}
             auto_fit_ref={auto_fit_ref}
+            pending_auto_fit_ref={pending_auto_fit_ref}
             on_auto_fit_sample_change={
                 pending_auto_fit_sheets.has(active_sheet_index)
                     ? try_apply_pending_auto_fit

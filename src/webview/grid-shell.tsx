@@ -216,6 +216,7 @@ import {
 } from './csv-save-lifecycle';
 import {
     canvas_font,
+    fit_column_width,
     fit_column_widths,
     measurable_from_rendered,
     type MeasurableCell,
@@ -1525,6 +1526,8 @@ export interface GridShellProps {
     // App provides this ref; GridShell populates it with a function that measures
     // loaded rows and returns fitted column widths (null when nothing is loaded).
     auto_fit_ref?: MutableRefObject<(() => Record<number, number> | null) | null>;
+    /** Auto-fit widths for the visible Pending Columns, by Pending Column ID. */
+    pending_auto_fit_ref?: MutableRefObject<(() => Record<string, number>) | null>;
     /** Notifies App when a deferred auto-fit may have become measurable. */
     on_auto_fit_sample_change?: () => void;
     /** App-owned bridge for restoring focus after generation-keyed remounts. */
@@ -1659,6 +1662,7 @@ export function GridShell({
     on_editing_change,
     editing_ref,
     auto_fit_ref,
+    pending_auto_fit_ref,
     on_auto_fit_sample_change,
     grid_focus_ref,
     grid_actions_ref,
@@ -7541,6 +7545,53 @@ export function GridShell({
         font_size_px,
         visible_source_columns,
     ]);
+
+    /**
+     * Fitted widths for the visible Pending Columns. A Pending Column's cells
+     * are all in the Pending Changes, not on loaded pages, so every stored
+     * cell is measured, as the grid shows it.
+     */
+    const compute_pending_auto_fit = useCallback((): Record<string, number> => {
+        const widths: Record<string, number> = {};
+        if (!measure_ctx_ref.current) {
+            measure_ctx_ref.current = document.createElement('canvas').getContext('2d');
+        }
+        const ctx = measure_ctx_ref.current;
+        if (!ctx) return widths;
+        const measure = (cell: MeasurableCell): number => {
+            ctx.font = canvas_font(cell.bold, cell.italic, font_family, font_size_px);
+            return ctx.measureText(cell.text).width;
+        };
+        for (const projected of projected_columns) {
+            if (projected.identity.kind !== 'pending') continue;
+            const column = pending_columns_by_id.get(projected.identity.pendingColumnId);
+            if (column === undefined) continue;
+            const cells: MeasurableCell[] = Object.values(column.cells).map((cell) => ({
+                text: pending_column_cell_text(cell),
+                bold: false,
+                italic: false,
+                ...(show_formatting && cell.valueRuns?.runs !== undefined && cell.valueRuns.runs.length > 0
+                    ? { runs: cell.valueRuns.runs }
+                    : {}),
+            }));
+            widths[column.id] = fit_column_width(cells, measure);
+        }
+        return widths;
+    }, [
+        font_family,
+        font_size_px,
+        pending_column_cell_text,
+        pending_columns_by_id,
+        projected_columns,
+        show_formatting,
+    ]);
+    useEffect(() => {
+        if (!pending_auto_fit_ref) return;
+        pending_auto_fit_ref.current = compute_pending_auto_fit;
+        return () => {
+            pending_auto_fit_ref.current = null;
+        };
+    }, [pending_auto_fit_ref, compute_pending_auto_fit]);
 
     useEffect(() => {
         if (!auto_fit_ref) return;
