@@ -17803,6 +17803,102 @@ describe('auto-fit with Pending Columns', () => {
         await click_button('Auto-fit Columns');
         expect(store.snapshot().pendingColumns?.[0]?.viewerWidth).toBe(90);
     });
+
+    it('defers a Pending Column fit while a highlight request holds the gesture slot', async () => {
+        const { post_message } = await render_app();
+        const meta = make_meta(['Sheet1'], false);
+        const snapshot = initial_snapshot_message(meta, {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        });
+        await dispatch_host_message(snapshot);
+        await enter_edit_mode(post_message, 'held-session');
+        const store = (grid_shell_mock.latest_props as unknown as GridShellProps).pending_row_store!;
+        const before = store.snapshot();
+        await act(async () => {
+            const staged = store.stage_replace('held-session', before, {
+                ...before,
+                columnLayout: {
+                    columns: [{ kind: 'source', sourceColumn: 0 }, { kind: 'pending', pendingColumnId: 'column-a' }],
+                    removedSourceColumns: [],
+                    discardedPendingColumns: [],
+                },
+                pendingColumns: [{
+                    id: 'column-a', header: 'New column', cells: {}, viewerWidth: 90,
+                    format: { kind: 'none' }, createdOrder: 1,
+                }],
+            });
+            staged!.commit();
+            staged!.notify();
+        });
+        await click_button('Highlight');
+        await click_button('Clear all highlights');
+        const request = post_message.mock.calls.map((call) => call[0])
+            .find((message) => message?.type === 'clearAllCellHighlights');
+        grid_shell_mock.pending_auto_fit_result = { 'column-a': 180 };
+        await click_button('Auto-fit Columns');
+        // No write into the Pending Changes while the request is out.
+        expect(store.snapshot().pendingColumns?.[0]?.viewerWidth).toBe(90);
+        await dispatch_host_message({
+            type: 'cellHighlightsChanged',
+            requestId: request.requestId,
+            stateRevision: snapshot.snapshot.identity.stateRevision + 1,
+            physicalRevision: snapshot.snapshot.identity.sourceBasis.physicalRevision,
+            state: undefined,
+            sourceGeneration: snapshot.snapshot.sourceGeneration,
+        });
+        // The deferred fit lands once the slot is free.
+        await vi.waitUntil(() => store.snapshot().pendingColumns?.[0]?.viewerWidth === 180);
+    });
+
+    it('takes a new baseline for a Pending Column after another width invalidates the fit', async () => {
+        const { post_message } = await render_app();
+        const meta = make_meta(['Sheet1'], false);
+        const capabilities = { csvEditable: true, csvEditingSupported: true };
+        await dispatch_host_message(initial_snapshot_message(meta, { capabilities }));
+        await enter_edit_mode(post_message, 'refit-session');
+        const store = (grid_shell_mock.latest_props as unknown as GridShellProps).pending_row_store!;
+        const before = store.snapshot();
+        await act(async () => {
+            const staged = store.stage_replace('refit-session', before, {
+                ...before,
+                columnLayout: {
+                    columns: [{ kind: 'source', sourceColumn: 0 }, { kind: 'pending', pendingColumnId: 'column-a' }],
+                    removedSourceColumns: [],
+                    discardedPendingColumns: [],
+                },
+                pendingColumns: [{
+                    id: 'column-a',
+                    header: 'New column',
+                    cells: {},
+                    viewerWidth: 90,
+                    format: { kind: 'none' },
+                    createdOrder: 1,
+                }],
+            });
+            staged!.commit();
+            staged!.notify();
+        });
+        grid_shell_mock.pending_auto_fit_result = { 'column-a': 180 };
+        await click_button('Auto-fit Columns');
+        expect(store.snapshot().pendingColumns?.[0]?.viewerWidth).toBe(180);
+        // The host's widths differ from the fit (another panel resized), which
+        // ends the fit: 180 is now simply the column's width.
+        const { sheetIndex: _sheet_index, ...slot } = { sheetIndex: 0, sheetName: 'Sheet1', cells: {}, ...store.snapshot() };
+        await dispatch_host_message(refresh_snapshot_message(meta, {
+            generation: 1,
+            sourceGeneration: 1,
+            reason: 'other',
+            capabilities: { ...capabilities, csvEditSessionId: 'refit-session' },
+            state: { columnWidths: [{ 0: 333 }], pendingEdits: [slot] },
+        }));
+        expect(grid_shell_mock.latest_props!.auto_fit_active).toBe(false);
+        expect(store.snapshot().pendingColumns?.[0]?.viewerWidth).toBe(180);
+        grid_shell_mock.pending_auto_fit_result = { 'column-a': 240 };
+        await click_button('Auto-fit Columns');
+        expect(store.snapshot().pendingColumns?.[0]?.viewerWidth).toBe(240);
+        await click_button('Auto-fit Columns');
+        expect(store.snapshot().pendingColumns?.[0]?.viewerWidth).toBe(180);
+    });
 });
 
 describe('cursor after a structural save', () => {
@@ -17941,10 +18037,24 @@ describe('structural conflict notice counts and Review Changes notes', () => {
         });
         const notice = document.querySelector('[aria-label="Row and column changes that need review"]');
         if (reason === 'structuralBasisChanged') {
-            expect(notice?.textContent).toContain('Keep new rows at the end: 12 formulas will point at different rows.');
+            expect(notice?.textContent).toContain('Keep new rows at the end: 12 formulas will point at different rows or columns.');
         }
         expect(notice?.textContent).toContain(
-            'Discard row and column changes on Sales: 4 formulas will show #REF! and 12 will point at different rows.');
+            'Discard row and column changes on Sales: 4 formulas will show #REF! and 12 will point at different rows or columns.');
+        // A change to what the actions would act on hides the old counts at
+        // once, before the host answers for the new state.
+        const store = (grid_shell_mock.latest_props as unknown as GridShellProps).pending_row_store!;
+        await act(async () => {
+            const current = store.snapshot();
+            const staged = store.stage_replace('impact-session', current, {
+                ...current,
+                rowLayout: { ...current.rowLayout!, removedSourceRows: [{ start: 1, count: 2 }] },
+            });
+            staged!.commit();
+            staged!.notify();
+        });
+        expect(document.querySelector('[aria-label="Row and column changes that need review"]')?.textContent)
+            .not.toContain('4 formulas will show #REF!');
     });
 
     it('notes that a column change pads short rows', async () => {

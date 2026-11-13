@@ -811,6 +811,14 @@ export function create_pending_row_store(
             const appendedRows = pending_rows(state).filter((row) => !pending_row_ids.has(row.id));
             const next = own({
                 ...state,
+                // The rows' Pending Column cells and highlights leave with them,
+                // in the same write: a cell for an unknown row is invalid.
+                ...(state.pendingColumns === undefined ? {} : {
+                    pendingColumns: columns_without_row_keys(
+                        state.pendingColumns,
+                        (key) => key.startsWith('p:') && pending_row_ids.has(key.slice(2)),
+                    ),
+                }),
                 formatTemplates: retained_templates(state.formatTemplates, appendedRows),
                 appendedRows,
                 // The basis authorizes a provisional append band, so it has no
@@ -1656,6 +1664,20 @@ function columns_without_cells(
         const cells: Record<string, PendingRowCell> = { ...column.cells };
         for (const key of keys) delete cells[key];
         return { ...column, cells };
+    });
+}
+
+/** `columns` without the cells and highlights whose row keys `drop` selects. */
+function columns_without_row_keys(
+    columns: readonly PendingColumn[],
+    drop: (key: string) => boolean,
+): PendingColumn[] {
+    return columns_without_cells(columns, drop).map((column) => {
+        const highlights = column.highlights;
+        if (highlights === undefined || !Object.keys(highlights).some(drop)) return column;
+        const kept = Object.fromEntries(Object.entries(highlights).filter(([key]) => !drop(key)));
+        const { highlights: _dropped, ...rest } = column;
+        return Object.keys(kept).length === 0 ? rest : { ...rest, highlights: kept };
     });
 }
 

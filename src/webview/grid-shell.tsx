@@ -550,6 +550,7 @@ import {
     plan_row_insert,
     only_appended_rows,
     only_appended_runs,
+    ROWS_NOT_LOADED_MESSAGE,
     plan_row_delete,
     plan_row_delete_runs,
     plan_row_restore,
@@ -1052,7 +1053,21 @@ export function pending_row_history_changes(
         const before_rows = pending_snapshot_rows_by_id(stored_pending_rows(before));
         const after_rows = pending_snapshot_rows_by_id(stored_pending_rows(after));
         const row_ids = new Set([...before_rows.keys(), ...after_rows.keys()]);
+        // Rows on both sides in the same relative order only shift by the
+        // removals and insertions around them, which the removal and
+        // insertion arms replay in index-stable order. An arm re-indexing
+        // such a row would expect its old index after those arms had already
+        // moved it, and refuse the replay.
+        const surviving_before = stored_pending_rows(before).filter((row) => after_rows.has(row.id));
+        const surviving_after = stored_pending_rows(after).filter((row) => before_rows.has(row.id));
+        const order_kept = surviving_before.every((row, index) => surviving_after[index]?.id === row.id);
         for (const pending_row_id of row_ids) {
+            const prior = before_rows.get(pending_row_id);
+            const next = after_rows.get(pending_row_id);
+            if (
+                order_kept && prior !== undefined && next !== undefined
+                && pending_values_equal(prior.row, next.row)
+            ) continue;
             const change = build_row_change(
                 pending_row_id,
                 before_rows.get(pending_row_id),
@@ -2376,11 +2391,15 @@ export function GridShell({
         after: PendingStructuralChanges,
     ): void => {
         if (history_capture === undefined) return;
-        const changes = pending_row_history_changes(
-            history_capture.worksheet,
-            before,
-            after,
-        );
+        // Pending Column cells the gesture changed with its rows (a removed
+        // row's cells and highlights), as the record's first arm: Redo clears
+        // them while the row is still there, and Undo, replaying in reverse,
+        // restores them once the row is back.
+        const column_change = pending_column_cells_change(history_capture.worksheet, before, after);
+        const changes = [
+            ...(column_change === undefined ? [] : [column_change]),
+            ...pending_row_history_changes(history_capture.worksheet, before, after),
+        ];
         if (changes.length === 0) return;
         const record = history_capture.history.stage_record({ label, changes });
         commit_staged_transaction([record]);
@@ -3574,6 +3593,13 @@ export function GridShell({
             for (const interval of selection.displayRows) {
                 for (let row = interval.start; row <= interval.end; row += 1) {
                     const row_target = pending_column_row_target(row);
+                    if (row_target === undefined && pending_projection.row_at(row)?.kind === 'source') {
+                        // A source row whose page is not resident has no
+                        // identity to key its cell by. Skipping it would apply
+                        // the highlight to part of the selection, uncounted.
+                        host_bridge.postMessage({ type: 'showWarning', message: ROWS_NOT_LOADED_MESSAGE });
+                        return false;
+                    }
                     if (row_target === undefined || !row_target.live) continue;
                     for (const pendingColumnId of pending_column_ids) {
                         column_highlights.push({
@@ -4508,16 +4534,25 @@ export function GridShell({
         transform_pending,
     ]);
     const applied_cell_focus_ref = useRef<number | null>(null);
+    const cell_focus_mounted_ref = useRef(true);
+    useEffect(() => {
+        cell_focus_mounted_ref.current = true;
+        return () => { cell_focus_mounted_ref.current = false; };
+    }, []);
     useLayoutEffect(() => {
         if (cell_focus === null || cell_focus.sheetIndex !== sheet_index) return;
         if (applied_cell_focus_ref.current === cell_focus.sequence) return;
         applied_cell_focus_ref.current = cell_focus.sequence;
         const sequence = cell_focus.sequence;
         const { row, column } = cell_focus;
-        // A source cell may be on a page not loaded yet: the source path loads it.
+        // A source cell may be on a page not loaded yet: the source path loads
+        // it. A newer request, or the shell unmounting, retires this one, so a
+        // late load cannot move the caret off the newer cell.
         if (row.kind === 'source' && column.kind === 'source') {
-            void reveal_source_cell(row.sourceRow, column.sourceColumn).then((visible) => {
-                on_cell_focus_applied(sequence, visible);
+            const is_current = () => cell_focus_mounted_ref.current
+                && applied_cell_focus_ref.current === sequence;
+            void reveal_source_cell(row.sourceRow, column.sourceColumn, is_current).then((visible) => {
+                if (is_current()) on_cell_focus_applied(sequence, visible);
             });
             return;
         }

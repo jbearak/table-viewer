@@ -4207,6 +4207,7 @@ export function App(): React.JSX.Element {
                     if (source_changed) {
                         auto_fit_active_ref.current = [];
                         auto_fit_snapshot_ref.current = [];
+                        pending_auto_fit_snapshot_ref.current = [];
                         set_auto_fit_active([]);
                         set_auto_fit_snapshot([]);
                         update_pending_auto_fit_sheets(EMPTY_PENDING_AUTO_FIT);
@@ -4221,6 +4222,9 @@ export function App(): React.JSX.Element {
                             ));
                         auto_fit_active_ref.current = next_active;
                         auto_fit_snapshot_ref.current = next_snapshot;
+                        invalid_auto_fit_sheets.forEach((index) => {
+                            pending_auto_fit_snapshot_ref.current[index] = undefined;
+                        });
                         set_auto_fit_active(next_active);
                         set_auto_fit_snapshot(next_snapshot);
                         update_pending_auto_fit_sheets((prev) => {
@@ -4254,6 +4258,9 @@ export function App(): React.JSX.Element {
                                 ));
                             auto_fit_active_ref.current = next_active;
                             auto_fit_snapshot_ref.current = next_snapshot;
+                            stale.forEach((was_stale, index) => {
+                                if (was_stale) pending_auto_fit_snapshot_ref.current[index] = undefined;
+                            });
                             set_auto_fit_active(next_active);
                             set_auto_fit_snapshot(next_snapshot);
                         }
@@ -5077,6 +5084,7 @@ export function App(): React.JSX.Element {
                     next_snapshot[msg.sheetIndex] = undefined;
                     auto_fit_active_ref.current = next_active;
                     auto_fit_snapshot_ref.current = next_snapshot;
+                    pending_auto_fit_snapshot_ref.current[msg.sheetIndex] = undefined;
                     set_auto_fit_active(next_active);
                     set_auto_fit_snapshot(next_snapshot);
                 }
@@ -8152,6 +8160,11 @@ export function App(): React.JSX.Element {
         const pending_ids = Object.keys(pending_fitted);
         if (!fitted && pending_ids.length === 0) return false;
         const sheet_index = active_sheet_index;
+        // Pending Column widths live in the Pending Changes, which a held
+        // gesture (a highlight awaiting the host) has staged against: a write
+        // now would make that gesture's commit fail half-applied. The caller
+        // keeps the fit owed until the slot is free.
+        if (pending_ids.length > 0 && !edit_gestures_admitted()) return false;
         if (pending_ids.length > 0) {
             const before = new Map((edit_session_registry_ref.current!
                 .pending_rows_for_sheet(sheet_index).snapshot().pendingColumns ?? [])
@@ -8189,7 +8202,13 @@ export function App(): React.JSX.Element {
             return next;
         });
         return true;
-    }, [active_sheet_index, column_widths, persist_immediate, write_pending_column_widths]);
+    }, [
+        active_sheet_index,
+        column_widths,
+        edit_gestures_admitted,
+        persist_immediate,
+        write_pending_column_widths,
+    ]);
 
     /**
      * Put the named sheets back on the widths their fit replaced.
@@ -8201,6 +8220,12 @@ export function App(): React.JSX.Element {
     const restore_widths_for_sheets = useCallback((indices: readonly number[]) => {
         const fitted = indices.filter((index) => auto_fit_active_ref.current[index]);
         if (fitted.length === 0) return;
+        // As a fit, a restore that writes Pending Column widths waits for a
+        // held gesture rather than break it.
+        if (
+            fitted.some((index) => pending_auto_fit_snapshot_ref.current[index] !== undefined)
+            && !edit_gestures_admitted()
+        ) return;
         for (const index of fitted) {
             const pending = pending_auto_fit_snapshot_ref.current[index];
             pending_auto_fit_snapshot_ref.current[index] = undefined;
@@ -8225,19 +8250,25 @@ export function App(): React.JSX.Element {
             auto_fit_snapshot_ref.current = next;
             return next;
         });
-    }, [persist_immediate, write_pending_column_widths]);
+    }, [edit_gestures_admitted, persist_immediate, write_pending_column_widths]);
 
     const handle_toggle_auto_fit = useCallback(() => {
         if (auto_fit_active[active_sheet_index]) {
             restore_widths_for_sheets([active_sheet_index]);
-        } else {
-            apply_auto_fit_to_active_sheet();
+        } else if (!apply_auto_fit_to_active_sheet() && !edit_gestures_admitted()) {
+            // Held off for a gesture in flight: owe the fit, as the all-sheets
+            // action owes one to a sheet it cannot measure yet.
+            update_pending_auto_fit_sheets((prev) => (
+                prev.has(active_sheet_index) ? prev : new Set([...prev, active_sheet_index])
+            ));
         }
     }, [
         active_sheet_index,
         apply_auto_fit_to_active_sheet,
         auto_fit_active,
+        edit_gestures_admitted,
         restore_widths_for_sheets,
+        update_pending_auto_fit_sheets,
     ]);
 
     const auto_fit_waits_for_transform = useCallback((sheet_index: number) => {
@@ -8281,6 +8312,8 @@ export function App(): React.JSX.Element {
         // retry directly through GridShell's notification prop.
         generation,
         load_epoch,
+        // A fit owed while a highlight held the gesture slot.
+        highlight_request_pending,
         try_apply_pending_auto_fit,
     ]);
 
@@ -8617,18 +8650,23 @@ export function App(): React.JSX.Element {
         [impact_conflict, formula_calculation_edit_signature, active_sheet_index, meta,
             edit_syntax, formula_anchor_workbook],
     );
+    // Each answer carries the input states it was asked for, so counts for
+    // an older state never show beside actions that act on a newer one.
     const [formula_impacts, set_formula_impacts] = useState<{
-        readonly requestId: string;
+        readonly states: NonNullable<typeof formula_impact_states>;
         readonly impacts: { readonly keep?: FormulaImpact; readonly discard?: FormulaImpact } | null;
     }>();
-    const formula_impact_request_ref = useRef<string>();
+    const formula_impact_request_ref = useRef<{
+        readonly requestId: string;
+        readonly states: NonNullable<typeof formula_impact_states>;
+    }>();
     useEffect(() => {
         if (formula_impact_states === undefined) {
             formula_impact_request_ref.current = undefined;
             return;
         }
         const requestId = `formula-impact:${load_epoch}:${++formula_divergence_sequence_ref.current}`;
-        formula_impact_request_ref.current = requestId;
+        formula_impact_request_ref.current = { requestId, states: formula_impact_states };
         host_bridge.postMessage({
             type: 'requestFormulaImpact',
             requestId,
@@ -8639,8 +8677,9 @@ export function App(): React.JSX.Element {
     useEffect(() => {
         const on_message = (event: MessageEvent) => {
             const msg = event.data as HostMessage;
-            if (msg.type !== 'formulaImpact' || msg.requestId !== formula_impact_request_ref.current) return;
-            set_formula_impacts({ requestId: msg.requestId, impacts: msg.impacts });
+            const request = formula_impact_request_ref.current;
+            if (msg.type !== 'formulaImpact' || msg.requestId !== request?.requestId) return;
+            set_formula_impacts({ states: request.states, impacts: msg.impacts });
         };
         window.addEventListener('message', on_message);
         return () => window.removeEventListener('message', on_message);
@@ -9033,8 +9072,7 @@ export function App(): React.JSX.Element {
     const show_append_conflicts = show_structural_conflicts && append_conflicts.length > 0;
     const basis_changed = layout_conflicts.some((conflict) => conflict.reason === 'structuralBasisChanged');
     const current_formula_impacts = formula_impact_states !== undefined
-        && formula_impacts !== undefined
-        && formula_impacts.requestId === formula_impact_request_ref.current
+        && formula_impacts?.states === formula_impact_states
         ? formula_impacts.impacts
         : undefined;
     const keep_impact_text = current_formula_impacts?.keep === undefined

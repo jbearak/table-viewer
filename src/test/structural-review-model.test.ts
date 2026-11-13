@@ -46,11 +46,11 @@ describe('divergence text', () => {
 });
 
 describe('formula_impact_text', () => {
-    it('counts #REF! formulas and formulas pointing at different rows', () => {
+    it('counts #REF! formulas and formulas pointing at different rows or columns', () => {
         expect(formula_impact_text({ ref: 4, moved: 12 }))
-            .toBe('4 formulas will show #REF! and 12 will point at different rows.');
+            .toBe('4 formulas will show #REF! and 12 will point at different rows or columns.');
         expect(formula_impact_text({ ref: 1, moved: 0 })).toBe('1 formula will show #REF!.');
-        expect(formula_impact_text({ ref: 0, moved: 1 })).toBe('1 formula will point at different rows.');
+        expect(formula_impact_text({ ref: 0, moved: 1 })).toBe('1 formula will point at different rows or columns.');
         expect(formula_impact_text({ ref: 0, moved: 0 })).toBeUndefined();
     });
 });

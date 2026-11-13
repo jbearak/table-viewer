@@ -184,16 +184,16 @@ export function divergence_cell_label(sheet_name: string, row: number, column: n
 
 /**
  * The structural conflict notice's count for one action, before the user
- * chooses: "4 formulas will show #REF! and 12 will point at different rows."
+ * chooses: "4 formulas will show #REF! and 12 will point at different rows or columns."
  * Undefined when the action changes no formula.
  */
 export function formula_impact_text(impact: FormulaImpact): string | undefined {
     const formulas = (count: number) => `${count.toLocaleString('en-US')} ${count === 1 ? 'formula' : 'formulas'}`;
     if (impact.ref > 0 && impact.moved > 0) {
-        return `${formulas(impact.ref)} will show #REF! and ${impact.moved.toLocaleString('en-US')} will point at different rows.`;
+        return `${formulas(impact.ref)} will show #REF! and ${impact.moved.toLocaleString('en-US')} will point at different rows or columns.`;
     }
     if (impact.ref > 0) return `${formulas(impact.ref)} will show #REF!.`;
-    if (impact.moved > 0) return `${formulas(impact.moved)} will point at different rows.`;
+    if (impact.moved > 0) return `${formulas(impact.moved)} will point at different rows or columns.`;
     return undefined;
 }
 

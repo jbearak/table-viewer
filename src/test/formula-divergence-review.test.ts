@@ -206,12 +206,49 @@ describe('review_formula_impact', () => {
         // Summary!A3 shows #REF!; Data!C2, Data!C7, Summary!A1, and Summary!A2
         // lose the inserted row and render one row up.
         expect(impact).toEqual({ ref: 1, moved: 4 });
+        // A `#REF!` inside a string literal is text, not a broken reference.
+        const quoted = anchor_formula(
+            '="#REF!"&Data!A3',
+            formula_anchor_context(formula_calculation_workbook(source.meta().sheets, before_layouts), 1),
+        );
+        if (quoted.kind !== 'anchored') throw new Error('not anchored');
+        const quoted_edit = {
+            ...edit,
+            value: '="#REF!"&Data!A3',
+            ...(quoted.anchors === undefined ? {} : { formulaAnchors: quoted.anchors }),
+        };
+        expect(review_formula_impact(
+            source,
+            { edits: [quoted_edit], layouts: before_layouts },
+            { edits: [quoted_edit], layouts: [layout_of(undefined, 1), layout_of(undefined, 0)] },
+        )).toEqual({ ref: 1, moved: 4 });
         // Nothing changes when the layouts do not.
         expect(review_formula_impact(
             source,
             { edits: [edit], layouts: before_layouts },
             { edits: [edit], layouts: before_layouts },
         )).toEqual({ ref: 0, moved: 0 });
+    });
+
+    it('yields while rendering formula edits, not only source formulas', async () => {
+        const with_formulas = workbook();
+        const meta = with_formulas.meta();
+        // No source formulas: every formula the impact renders is an edit.
+        const source: DataSource = {
+            ...with_formulas,
+            meta: () => ({ ...meta, sheets: meta.sheets.map((sheet) => ({ ...sheet, formulaCells: [] })) }),
+        };
+        const edits = Array.from({ length: 5_000 }, (_, index) => ({
+            sheetIndex: 0, row: 1 + (index % 6), column: 1, value: '=A2', writesFormula: true,
+        }));
+        const state = { edits, layouts: [layout_of(moved(), 1), layout_of(undefined, 0)] };
+        let yields = 0;
+        await review_formula_impact_cooperatively(source, state, state, {
+            isCancelled: () => false,
+            workSliceMs: 0,
+            yieldControl: async () => { yields += 1; },
+        });
+        expect(yields).toBeGreaterThan(2);
     });
 
     it('yields between slices and stops once cancelled', async () => {

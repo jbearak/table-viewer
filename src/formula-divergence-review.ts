@@ -9,6 +9,7 @@
  * calculator. It runs only when Review Changes asks, never per gesture.
  */
 import { read_source_columns, type DataSource } from './data-source/interface';
+import { formula_ref_error_count } from './xlsx-formula';
 import {
     formula_calculation_workbook,
     type FormulaCalculationEdit,
@@ -247,7 +248,7 @@ export interface FormulaImpactState {
 
 /** What an action would do to the workbook's formulas. */
 export interface FormulaImpact {
-    /** Formulas that render `#REF!` after the action and did not before. */
+    /** Formulas whose rendered text gains a `#REF!` error token (not one inside a string). */
     readonly ref: number;
     /** Other formulas whose rendered text changes: they point at different rows or columns. */
     readonly moved: number;
@@ -258,7 +259,7 @@ export interface FormulaImpact {
  * `after`, matched by the row and column identities of its cell, so a cell a
  * layout renumbers is still the same cell. Formulas only one state holds
  * (on a row or column the action drops) are not counted. "4 formulas will
- * show #REF! and 12 will point at different rows."
+ * show #REF! and 12 will point at different rows or columns."
  */
 function* impact_steps(
     source: DataSource,
@@ -289,13 +290,18 @@ function* impact_steps(
             }
         };
         const edited = new Set<string>();
+        let since_yield = 0;
         for (const edit of state.edits) {
             const key = key_at(edit.sheetIndex, edit.row, edit.column);
             if (key === undefined) continue;
             edited.add(key);
-            if (edit.writesFormula) out.set(key, render(edit.sheetIndex, edit.value, edit.formulaAnchors));
+            if (!edit.writesFormula) continue;
+            out.set(key, render(edit.sheetIndex, edit.value, edit.formulaAnchors));
+            if (++since_yield >= FORMULAS_PER_STEP) {
+                since_yield = 0;
+                yield;
+            }
         }
-        let since_yield = 0;
         for (let sheet_index = 0; sheet_index < sheets.length; sheet_index += 1) {
             const cells = sheets[sheet_index]!.formulaCells ?? [];
             const worksheet = workbook.worksheets[sheet_index]!;
@@ -337,7 +343,7 @@ function* impact_steps(
     for (const [key, text] of will) {
         const previous = was.get(key);
         if (previous === undefined || previous === text) continue;
-        if (text.includes('#REF!') && !previous.includes('#REF!')) ref += 1;
+        if (formula_ref_error_count(text) > formula_ref_error_count(previous)) ref += 1;
         else moved += 1;
     }
     return Object.freeze({ ref, moved });
