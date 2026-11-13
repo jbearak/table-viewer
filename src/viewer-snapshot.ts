@@ -5,6 +5,7 @@ import type {
     FileAuthoritySnapshot,
 } from './file-coordinator';
 import type { GitLfsFailureReason } from './host-ports';
+import type { StructuralBasis } from './pending-changes';
 import type { FileStateSnapshot } from './state';
 import { deep_clone_and_freeze } from './immutable';
 import { project_renderable_cell_highlight_state } from './cell-highlights';
@@ -183,6 +184,33 @@ export interface WorkbookSnapshotCapabilities {
      * not required to preserve a non-finite number.
      */
     readonly appendRowCeiling?: number | null;
+    /**
+     * Row and column structure editing (insert, delete, restore, move), per
+     * worksheet. Absent when structural editing is off for this panel, which
+     * hides every structure item; see `structural_editing_capability`.
+     */
+    readonly structuralEditing?: StructuralEditingCapability;
+}
+
+/** Whether the host can restructure one axis of a worksheet, and why not. */
+export type StructuralAxisSupport =
+    | { readonly supported: true }
+    | { readonly supported: false; readonly reason: string };
+
+export interface WorksheetStructuralSupport {
+    readonly rows: StructuralAxisSupport;
+    readonly columns: StructuralAxisSupport;
+    /**
+     * The current file's Structural Basis for this worksheet, which the
+     * webview records with the worksheet's first layout change. Present
+     * whenever either axis is supported.
+     */
+    readonly basis?: StructuralBasis;
+}
+
+export interface StructuralEditingCapability {
+    /** Positionally matching `meta.sheets`. */
+    readonly sheets: readonly WorksheetStructuralSupport[];
 }
 
 /**

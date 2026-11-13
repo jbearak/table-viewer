@@ -36,7 +36,11 @@ import {
 import { create_resource_identity, type ResourceUriLike } from './resource-identity';
 import { CompareDataSource, align_workbook } from './diff-compare/compare-session';
 import { AlignmentCancelledError } from './diff-compare/row-alignment';
-import type { UnresolvedLfsObject, WorkbookSnapshotCompare } from './viewer-snapshot';
+import type {
+    StructuralEditingCapability,
+    UnresolvedLfsObject,
+    WorkbookSnapshotCompare,
+} from './viewer-snapshot';
 import type { GitLfsResolveOutcome } from './host-ports';
 import { MAX_POINTER_BYTES, parse_git_lfs_pointer } from './git-lfs-pointer';
 import { UnresolvedLfsDataSource } from './data-source/unresolved-lfs-source';
@@ -96,6 +100,10 @@ import {
 import { parse_http_external_url } from './external-url';
 import { is_plain_record } from './plain-record';
 import { parser_format_for, type TableFormat } from './table-format';
+import {
+    current_structural_basis,
+    structural_editing_capability,
+} from './structural-editing-capability';
 import {
     persisted_saved_row_snapshot,
     physical_row_format,
@@ -2000,6 +2008,24 @@ export function attach_viewer(
     );
     const structural_editing_enabled = options.structuralEditingEnabled
         ?? STRUCTURAL_EDITING_ENABLED;
+    /**
+     * The snapshot's `structuralEditing` capability: present only while
+     * structural editing is enabled for a panel that can edit at all.
+     */
+    const projected_structural_editing = (
+        observation: Readonly<PhysicalSourceObservation> | undefined,
+        projected_source: DataSource,
+    ): { readonly structuralEditing?: StructuralEditingCapability } => (
+        structural_editing_enabled && editing_supported
+            ? {
+                structuralEditing: structural_editing_capability(
+                    file_format.id,
+                    observation,
+                    projected_source.meta().sheets,
+                ),
+            }
+            : {}
+    );
     // VS Code may make panel.webview throw as soon as the panel is disposed.
     // Capture the live transport once; every later post is liveness-gated below.
     const webview = panel.webview;
@@ -2674,6 +2700,25 @@ export function attach_viewer(
     };
 
     /**
+     * A layout's Structural Basis is the one the session recorded for the
+     * worksheet. Before one is recorded (Delete, Restore, and Move need no
+     * admission round trip), it must be the current file's, as the snapshot
+     * capability reported it.
+     */
+    const structural_basis_authorized = (
+        target: WorksheetTarget,
+        basis: StructuralBasis,
+        ledger: AppendAdmissionLedger | undefined,
+    ): boolean => {
+        const expected = ledger?.structuralBasis ?? current_structural_basis(
+            file_format.id,
+            source_observation,
+            source?.meta().sheets[target.sheetIndex],
+        );
+        return expected !== undefined && JSON.stringify(basis) === JSON.stringify(expected);
+    };
+
+    /**
      * The layout rules a new-protocol publication must meet beyond the append
      * rules: the release gate, the ledger origin rule (origin `insert` only for
      * an ID an insert minted; origin `append` for any admitted ID), host-issued
@@ -2698,7 +2743,7 @@ export function attach_viewer(
         }
         if (
             changes.structuralBasis !== undefined
-            && JSON.stringify(changes.structuralBasis) !== JSON.stringify(ledger?.structuralBasis)
+            && !structural_basis_authorized(target, changes.structuralBasis, ledger)
         ) return 'structural-basis-mismatch';
         if (has_live_layout_change(changes) && changes.structuralBasis === undefined) {
             return 'structural-basis-missing';
@@ -6184,6 +6229,7 @@ export function attach_viewer(
                 observation = {
                     fingerprint,
                     digest: built.digest,
+                    byteLength: built.size,
                     verification: 'bracketedDigest',
                 };
             } finally {
@@ -6200,6 +6246,7 @@ export function attach_viewer(
                 // smudged bytes must not make the panel look like it has already
                 // seen a file it has not, or the next real change is missed.
                 digest: content_digest(read_raw_main),
+                byteLength: read_raw_main.byteLength,
             };
             // Before the parser, which is the whole point: a `.csv` pointer parses
             // into a convincing three-row grid of LFS metadata and an `.xlsx`
@@ -6998,6 +7045,10 @@ export function attach_viewer(
                                 appendRowCeiling: projected_append_row_ceiling(
                                     profile,
                                 ),
+                                ...projected_structural_editing(
+                                    candidate.observation,
+                                    next,
+                                ),
                                 ...(owns_edit_session() && active_edit_session_id
                                     ? { csvEditSessionId: active_edit_session_id }
                                     : {}),
@@ -7263,6 +7314,10 @@ export function attach_viewer(
                                         csvSaveLifecycle: projected_save_lifecycle(),
                                         appendRowCeiling: projected_append_row_ceiling(
                                             profile,
+                                        ),
+                                        ...projected_structural_editing(
+                                            source_observation,
+                                            source!,
                                         ),
                                         ...(owns_edit_session() && active_edit_session_id
                                             ? { csvEditSessionId: active_edit_session_id }

@@ -489,7 +489,21 @@ import {
     create_pending_row_store,
     type PendingRowStoreChange,
     type PendingRowStore,
+    type WorksheetStructureContext,
 } from './pending-row-store';
+import {
+    nearest_live_row,
+    only_appended_rows,
+    plan_row_delete,
+    plan_row_restore,
+    removed_source_row_test,
+    resolve_row_structure_selection,
+    row_structure_label,
+    row_structure_menu_model,
+    type RowStructurePlan,
+    type RowStructureSelection,
+} from './row-structure-model';
+import type { WorksheetStructuralSupport } from '../viewer-snapshot';
 import {
     pending_changes_after_move_discard,
     plan_pending_move_discard,
@@ -507,6 +521,7 @@ import {
     type PendingTailRemoval,
     type RowIdentity,
     appended_rows,
+    has_live_layout_change,
     // `pending_rows` names this shell's structural snapshot below.
     pending_rows as stored_pending_rows,
 } from '../pending-changes';
@@ -1243,6 +1258,12 @@ export interface GridShellProps {
      * became a property of the profile; delimited sources pass Infinity.
      */
     append_row_ceiling?: number;
+    /**
+     * This worksheet's entry of the snapshot's `structuralEditing`
+     * capability. Absent when structural editing is off, which hides the row
+     * Delete and Restore items and keeps "Remove pending rows".
+     */
+    structural_support?: WorksheetStructuralSupport;
     /** How this sheet's cells are edited ('markdown' for xlsx). Default 'plain'. */
     edit_syntax?: EditSyntax;
     edit_session_id?: string;
@@ -1404,6 +1425,7 @@ export function GridShell({
     highlight_in_flight = false,
     append_in_flight = false,
     append_row_ceiling = MAX_SHEET_ROWS,
+    structural_support,
     edit_syntax = 'plain',
     edit_session_id,
     value_edit_order_floor = 0,
@@ -1582,6 +1604,8 @@ export function GridShell({
         /** Stable structural identities captured when the menu opened. */
         pending_row_ids: string[];
         tail_removal_source_rows: number[];
+        /** Row identities for Delete and Restore, when structural editing is on. */
+        structure?: RowStructureSelection;
     }) | null>(null);
 
     const sort_metadata = useMemo(
@@ -1932,6 +1956,16 @@ export function GridShell({
     const pending_tail_removal_source_rows = useMemo(() => new Set(
         pending_rows.tailRemovals.map((removal) => removal.sourceRow),
     ), [pending_rows.tailRemovals]);
+    // First body source row, as the host computes it for layout validation:
+    // the Header Row's 1-based number, or 0 without one.
+    const header_meta = sheet_meta.excelFirstRowHeader;
+    const body_start = header_meta?.active === true && header_meta.sourceRow !== undefined
+        ? header_meta.sourceRow + 1
+        : 0;
+    // The layout mode needs the host's display to be the source order. Any
+    // installed transform, or one still computing, keeps the band mode, where
+    // Pending Row Removals stay in place too.
+    const body_view_transformed = projected_source_rows || transform_pending;
     const pending_projection = useMemo(() => create_pending_row_projection({
         sourceDisplayRowCount: source_row_count,
         sourceRowAt: get_source_row,
@@ -1941,8 +1975,12 @@ export function GridShell({
         appendedRowAt: (index) => appended_rows(pending_rows_ref.current)[index],
         removedSourceDisplayRows: removed_source_display_rows,
         projectedTailRemovalIds: projected_tail_removal_ids,
+        bodyStart: body_start,
+        bodyViewTransformed: body_view_transformed,
     }), [
         authoritative_display_row_for_source,
+        body_start,
+        body_view_transformed,
         get_source_row,
         pending_store,
         pending_topology_revision_ref.current,
@@ -2132,6 +2170,55 @@ export function GridShell({
         pending_store,
         show_pending_size_warning,
     ]);
+    const has_row_layout = pending_rows.rowLayout !== undefined;
+    /** Whether a source row is a Pending Row Removal: read-only, tinted, unnumbered. */
+    const is_removed_source_row = useMemo(
+        () => removed_source_row_test(pending_rows),
+        [pending_rows.rowLayout],
+    );
+    const is_removed_source_row_ref = useRef(is_removed_source_row);
+    is_removed_source_row_ref.current = is_removed_source_row;
+    /** What the structure operations know about this worksheet besides its snapshot. */
+    const structure_context = useMemo((): WorksheetStructureContext => ({
+        worksheet: {
+            sheetIndex: sheet_index,
+            ...(sheet_meta.name === undefined ? {} : { sheetName: sheet_meta.name }),
+            ...(sheet_meta.worksheetId === undefined
+                ? {}
+                : { worksheetId: sheet_meta.worksheetId }),
+        },
+        bodyStart: body_start,
+        sourceRowCount: sheet_meta.sourceRowCount,
+        sourceColumnCount: sheet_meta.columnCount,
+        bodyViewTransformed: body_view_transformed,
+        hasPendingCellMove: () => {
+            for (const entry of store.snapshot().values()) {
+                if (entry.movedFrom !== undefined) return true;
+            }
+            return false;
+        },
+        // Canonical merges for the action-time merge rules; the grid's own
+        // `merges` prop is withheld under transforms and layout changes.
+        merges: sheet_meta.merges,
+        ...(structural_support?.basis === undefined
+            ? {}
+            : { structuralBasis: structural_support.basis }),
+        ...(Number.isFinite(append_row_ceiling)
+            ? { maxProspectiveRows: append_row_ceiling }
+            : {}),
+    }), [
+        append_row_ceiling,
+        body_start,
+        body_view_transformed,
+        sheet_index,
+        sheet_meta.columnCount,
+        sheet_meta.merges,
+        sheet_meta.name,
+        sheet_meta.sourceRowCount,
+        sheet_meta.worksheetId,
+        store,
+        structural_support?.basis,
+    ]);
     const row_marker_options = useMemo(() => {
         const physical_row_count = Math.max(
             sheet_meta.sourceRowCount,
@@ -2155,6 +2242,13 @@ export function GridShell({
             kind: 'clickable-number' as const,
             width,
             getRowNumber: (display_row: number) => {
+                // Row numbers are prospective once a worksheet has a row
+                // layout: what the file will show after save. A Pending Row
+                // Removal has none, so no two rows share a number.
+                if (has_row_layout) {
+                    const prospective = pending_projection.prospective_row(display_row);
+                    return prospective === undefined ? undefined : prospective + 1;
+                }
                 const projected = pending_projection.row_at(display_row);
                 if (projected?.kind === 'pending'
                     || projected?.kind === 'replacement'
@@ -2174,6 +2268,7 @@ export function GridShell({
             },
         };
     }, [
+        has_row_layout,
         pending_projection,
         stored_pending_rows(pending_rows).length,
         pending_rows.tailRemovals.length,
@@ -2763,6 +2858,15 @@ export function GridShell({
     // Populated once the truncated-cell tooltip helpers mount below; row menus
     // open from an earlier hook, so they clear via this ref rather than a TDZ.
     const hide_cell_tooltip_ref = useRef<() => void>(() => {});
+    // Row Delete and Restore appear in Edit mode only, and only when the host
+    // reports structural editing for this worksheet.
+    const structure_items_offered = structural_support !== undefined
+        && edit_mode
+        && csv_editable
+        && edit_session_id !== undefined;
+    const promoted_header_row = sheet_meta.excelFirstRowHeader?.active === true
+        ? sheet_meta.excelFirstRowHeader.sourceRow ?? 0
+        : undefined;
     const open_row_marker_menu = useCallback((request: {
         x: number;
         y: number;
@@ -2806,8 +2910,43 @@ export function GridShell({
             source_display_rows: source_intervals,
             pending_row_ids: [...pending_ids],
             tail_removal_source_rows: [...removal_rows],
+            ...(structure_items_offered
+                ? {
+                    structure: resolve_row_structure_selection(
+                        pending_projection,
+                        request.display_rows,
+                        {
+                            bodyStart: body_start,
+                            isRemoved: is_removed_source_row,
+                            // Untransformed, a source-display row maps to its
+                            // source row arithmetically (skipping a promoted
+                            // header row), so an unloaded row still resolves.
+                            ...(body_view_transformed ? {} : {
+                                sourceRowFor: (source_display_row: number) => {
+                                    const source_row = promoted_header_row !== undefined
+                                        && source_display_row >= promoted_header_row
+                                        ? source_display_row + 1
+                                        : source_display_row;
+                                    return source_row < sheet_meta.sourceRowCount
+                                        ? source_row
+                                        : undefined;
+                                },
+                            }),
+                        },
+                    ),
+                }
+                : {}),
         });
-    }, [pending_projection, row_marker_options]);
+    }, [
+        body_start,
+        body_view_transformed,
+        is_removed_source_row,
+        pending_projection,
+        promoted_header_row,
+        row_marker_options,
+        sheet_meta.sourceRowCount,
+        structure_items_offered,
+    ]);
     const row_markers = use_row_marker_selection({
         row_count,
         selection_ref: grid_selection_ref,
@@ -3328,7 +3467,12 @@ export function GridShell({
         focus_grid();
         return true;
     }, [display_column_count, focus_grid, pending_projection, select_active_display_cell]);
-    const remove_pending_rows = useCallback((pending_row_ids: readonly string[]): boolean => {
+    const remove_pending_rows = useCallback((
+        pending_row_ids: readonly string[],
+        /** Undo label for the removed count; the Delete item names its own. */
+        label_for: (count: number) => string = (count) =>
+            count === 1 ? 'Remove pending row' : 'Remove pending rows',
+    ): boolean => {
         if (edit_admission_is_fenced() || save_in_flight_ref.current
             || (gestures_admitted !== undefined && !gestures_admitted())) return false;
         const ids = new Set(pending_row_ids);
@@ -3337,7 +3481,7 @@ export function GridShell({
         const removed = pending_store.remove_rows(edit_session_id, ids);
         if (removed === undefined || removed.length === 0) return false;
         record_pending_row_gesture(
-            removed.length === 1 ? 'Remove pending row' : 'Remove pending rows',
+            label_for(removed.length),
             before,
             pending_store.snapshot(),
         );
@@ -3399,6 +3543,142 @@ export function GridShell({
         record_pending_row_gesture,
         save_in_flight_ref,
         write_grid_selection,
+    ]);
+    /**
+     * After a Delete, move the caret to the nearest live row. Polls the
+     * projection the grid renders until it shows the delete (a deleted source
+     * row reports `removed`, a deleted Pending Row is gone), never a fixed
+     * delay, then selects from where the first deleted row was.
+     */
+    const focus_after_row_delete = useCallback((
+        deleted: readonly RowIdentity[],
+        from_row: number,
+        display_column: number,
+    ): void => {
+        const probe = deleted[0];
+        if (probe === undefined) return;
+        let attempts = 0;
+        const poll = () => {
+            const projection = pending_projection_ref.current;
+            const display_row = projection.display_row_for_identity(probe);
+            const landed = probe.kind === 'pending'
+                ? display_row === undefined
+                : display_row !== undefined && is_removed_source_row_ref.current(probe.sourceRow);
+            if (!landed) {
+                attempts += 1;
+                if (attempts < 120) window.requestAnimationFrame(poll);
+                return;
+            }
+            const target = nearest_live_row(
+                Math.min(display_row ?? from_row, projection.rowCount - 1),
+                projection.rowCount,
+                (row) => {
+                    const state = projection.row_state(row);
+                    return state !== 'removed' && state !== 'tail-removal';
+                },
+                deleted.length + 1,
+            );
+            if (target !== undefined && display_column_count > 0) {
+                select_active_display_cell([
+                    Math.min(Math.max(0, display_column), display_column_count - 1),
+                    target,
+                ]);
+            }
+            focus_grid();
+        };
+        poll();
+    }, [display_column_count, focus_grid, select_active_display_cell]);
+    /**
+     * Commit one planned row structure gesture as one history action: the
+     * structural store's layout, the discard of the source cell edits it
+     * names, and the recording, staged and committed together.
+     */
+    const commit_row_structure_plan = useCallback((plan: RowStructurePlan): boolean => {
+        const staged: StagedMutation[] = [];
+        if (plan.discardedCellKeys.length > 0) {
+            const source_staging = store.stage_writes(
+                edit_session_id,
+                plan.discardedCellKeys.map((key) => ({ key, entry: undefined })),
+            );
+            if (source_staging === undefined) return false;
+            staged.push(source_staging);
+        }
+        const refusal_before = envelope_refusal_sequence_ref.current;
+        const pending_staging = pending_store.stage_replace(
+            edit_session_id,
+            plan.outcome.before,
+            plan.outcome.next,
+        );
+        if (pending_staging === undefined) {
+            if (envelope_refusal_sequence_ref.current !== refusal_before) {
+                show_pending_size_warning();
+            }
+            return false;
+        }
+        staged.push(pending_staging);
+        if (history_capture !== undefined) {
+            staged.push(history_capture.history.stage_record({
+                label: plan.label,
+                changes: plan.changes,
+            }));
+        }
+        return commit_staged_transaction(staged);
+    }, [edit_session_id, history_capture, pending_store, show_pending_size_warning, store]);
+    const structure_gesture_admitted = useCallback((): boolean => (
+        editable_cells_ref.current
+        && !edit_admission_is_fenced()
+        && !save_in_flight_ref.current
+        && (gestures_admitted === undefined || gestures_admitted())
+    ), [edit_admission_is_fenced, gestures_admitted, save_in_flight_ref]);
+    const delete_rows_gesture = useCallback((
+        identities: readonly RowIdentity[],
+        from_row: number,
+    ): boolean => {
+        if (!structure_gesture_admitted()) return false;
+        const display_column = grid_selection_ref.current.current?.cell[0] ?? 0;
+        const before = pending_store.snapshot();
+        // Pending Appended Rows alone leave the layout as it is: the existing
+        // removal, under the Delete item's name.
+        if (only_appended_rows(before, identities)) {
+            return remove_pending_rows(
+                identities.flatMap((identity) =>
+                    identity.kind === 'pending' ? [identity.pendingRowId] : []),
+                (count) => row_structure_label('Delete', count),
+            );
+        }
+        const plan = plan_row_delete(before, structure_context, identities, store.snapshot());
+        if (!plan.ok) {
+            host_bridge.postMessage({ type: 'showWarning', message: plan.message });
+            return false;
+        }
+        if (!commit_row_structure_plan(plan)) return false;
+        focus_after_row_delete(identities, from_row, display_column);
+        return true;
+    }, [
+        commit_row_structure_plan,
+        focus_after_row_delete,
+        pending_store,
+        remove_pending_rows,
+        store,
+        structure_context,
+        structure_gesture_admitted,
+    ]);
+    const restore_rows_gesture = useCallback((source_rows: readonly number[]): boolean => {
+        if (!structure_gesture_admitted()) return false;
+        const plan = plan_row_restore(pending_store.snapshot(), structure_context, source_rows);
+        if (!plan.ok) {
+            host_bridge.postMessage({ type: 'showWarning', message: plan.message });
+            return false;
+        }
+        if (!commit_row_structure_plan(plan)) return false;
+        focus_grid();
+        return true;
+    }, [
+        commit_row_structure_plan,
+        focus_grid,
+        pending_store,
+        structure_context,
+        structure_gesture_admitted,
     ]);
     const rows_are_projected = transform_state.sort.length > 0
         || transform_state.filters.length > 0
@@ -3877,8 +4157,15 @@ export function GridShell({
         if (projected?.kind === 'removal') {
             return `Pending tail removal row ${projected.intendedPhysicalRow + 1}`;
         }
+        if (
+            projected?.kind === 'source'
+            && projected.identity !== undefined
+            && is_removed_source_row(projected.identity.sourceRow)
+        ) {
+            return `Row removed, was row ${projected.identity.sourceRow + 1}`;
+        }
         return undefined;
-    }, [pending_projection]);
+    }, [is_removed_source_row, pending_projection]);
     const draw_pending_divider = useCallback<
         NonNullable<React.ComponentProps<typeof DataEditor>['drawCell']>
     >((args, draw_content) => {
@@ -5795,7 +6082,13 @@ export function GridShell({
             // effect damages the cells whose tint actually changed.
             const pending_removal = source_row !== undefined
                 && pending_tail_removal_source_rows.has(source_row);
-            const editable = editable_cells && source_row !== undefined && !pending_removal;
+            // A Pending Row Removal stays in place, read-only, with the deleted
+            // tint; unlike a tail removal it shows its current values plainly,
+            // and a cell highlight still wins over the tint.
+            const layout_removal = source_row !== undefined
+                && is_removed_source_row(source_row);
+            const editable = editable_cells && source_row !== undefined
+                && !pending_removal && !layout_removal;
             const loaded_row = get_row(source_display_row);
             const loaded_cell = loaded_row?.[source_column];
             const value_overlay = source_row === undefined || key === undefined
@@ -5870,7 +6163,7 @@ export function GridShell({
                 : undefined;
             let overlay: CellEditOverlay | undefined;
             if (editable_cells || dirty || dependent_formula_affected || highlight_bg || flash_bg
-                || compare_bg || compare_base !== undefined) {
+                || compare_bg || compare_base !== undefined || layout_removal) {
                 overlay = {
                     editable,
                     ...(edit_value !== undefined ? { edit_value } : {}),
@@ -5880,7 +6173,8 @@ export function GridShell({
                     // read-only sheet is not refusing anything — it never offered —
                     // and it does reach this branch, via highlight_bg, which is
                     // plain view state independent of edit mode.
-                    refused: editable_cells && (source_row === undefined || pending_removal),
+                    refused: editable_cells
+                        && (source_row === undefined || pending_removal || layout_removal),
                     ...value_overlay,
                     // Compare's before-text rides the Diff toggle's channel; no
                     // dirty_value, so the "after" side is the cell's own text.
@@ -5897,6 +6191,8 @@ export function GridShell({
                     // come back when it expires; nothing about them is lost.
                     bg: flash_bg ?? (pending_removal
                         ? compare_row_bgs.deleted
+                        : layout_removal
+                        ? highlight_bg ?? compare_row_bgs.deleted
                         : dirty
                         ? key !== undefined && conflicted_keys_ref.current.has(key)
                             ? conflict_bg
@@ -5969,6 +6265,7 @@ export function GridShell({
             pending_projection,
             pending_rendered_rows,
             removal_rendered_rows,
+            is_removed_source_row,
             editable_cells,
             edit_syntax,
             font_size_px,
@@ -6049,6 +6346,23 @@ export function GridShell({
                 host_bridge.postMessage({
                     type: 'showWarning',
                     message: 'The cut source row no longer exists, so nothing was pasted.',
+                });
+                return 'refused';
+            }
+            // A cut moves cells by their physical place, which a layout change
+            // is about to shift: the two are exclusive on one worksheet.
+            if (
+                items.some((item) => item.movedFrom !== undefined
+                    || item.movedFromRowIdentity !== undefined)
+                && has_live_layout_change(pending_store.snapshot())
+            ) {
+                host_bridge.postMessage({
+                    type: 'showWarning',
+                    message: `Save or undo the row and column changes on ${
+                        sheet_meta.unnamedSingleSheet === true || !sheet_meta.name
+                            ? 'this sheet'
+                            : sheet_meta.name
+                    } before moving cells there.`,
                 });
                 return 'refused';
             }
@@ -6267,6 +6581,9 @@ export function GridShell({
                         ? targetRowIdentity.sourceRow
                         : resolve_source_row(target_display_row);
                 if (source_row === null) continue;
+                // A Pending Row Removal is read-only. Glide's paste path does
+                // not consult the cell's editability, so refuse it here too.
+                if (is_removed_source_row_ref.current(source_row)) continue;
                 const text = value.kind === GridCellKind.Text
                     ? value.data ?? ''
                     : value.kind === GridCellKind.Custom && is_rich_text_cell(value)
@@ -6588,6 +6905,7 @@ export function GridShell({
             record_pending_row_gesture,
             sheet_index,
             sheet_meta.name,
+            sheet_meta.unnamedSingleSheet,
             sheet_meta.worksheetId,
             source_column_for_display,
             commit_source_row,
@@ -8589,6 +8907,17 @@ export function GridShell({
                 const only_removals = selected_removal_rows.size === selected_row_count;
                 const has_structural_rows = selected_pending_ids.size > 0
                     || selected_removal_rows.size > 0;
+                const structure_menu = row_menu.structure === undefined
+                    || structural_support === undefined
+                    ? undefined
+                    : row_structure_menu_model({
+                        support: structural_support.rows,
+                        ready: editable_cells,
+                        selection: row_menu.structure,
+                        changes: pending_rows,
+                        context: structure_context,
+                    });
+                const structure_selection = row_menu.structure;
                 return (
                     <ContextMenu
                         x={row_menu.x}
@@ -8630,6 +8959,35 @@ export function GridShell({
                                 pending_row_count: selected_pending_ids.size,
                                 show_disabled_remove_pending_rows: true,
                             } : {}),
+                            ...(structure_menu === undefined || structure_selection === undefined ? {} : {
+                                delete_rows: {
+                                    count: structure_menu.delete.count,
+                                    ...(structure_menu.delete.enabled
+                                        ? {
+                                            on_click: () => {
+                                                delete_rows_gesture(
+                                                    structure_selection.identities ?? [],
+                                                    row_menu.row,
+                                                );
+                                            },
+                                        }
+                                        : { disabled_reason: structure_menu.delete.reason }),
+                                },
+                                ...(structure_menu.restore === undefined ? {} : {
+                                    restore_rows: {
+                                        count: structure_menu.restore.count,
+                                        ...(structure_menu.restore.enabled
+                                            ? {
+                                                on_click: () => {
+                                                    restore_rows_gesture(
+                                                        structure_selection.removedSourceRows,
+                                                    );
+                                                },
+                                            }
+                                            : { disabled_reason: structure_menu.restore.reason }),
+                                    },
+                                }),
+                            }),
                             ...(only_removals ? {
                                 on_cancel_row_removals: () => {
                                     const before = pending_store.snapshot();
