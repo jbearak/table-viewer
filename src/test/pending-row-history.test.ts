@@ -790,13 +790,15 @@ describe('layout history arms', () => {
         expect(replay(insert_action, 'undo', inserted.next)).toEqual(own_pending_structural_changes(state([])));
     });
 
-    it('keeps a refused save while a live layout change remains, the host replay rule', () => {
-        const refusal = {
+    it.each([
+        {
             reason: 'unsupportedStructure' as const,
             pendingRowIds: [],
             tailRemovalIds: [],
             message: "Can't insert, delete, or move rows on this sheet: it contains an Excel table.",
-        };
+        },
+        { reason: 'structuralBasisChanged' as const, pendingRowIds: [], tailRemovalIds: [] },
+    ])('keeps a worksheet-level $reason while a live layout change remains, the host replay rule', (refusal) => {
         const refused = (changes: PendingStructuralChanges) => ({ ...changes, conflicts: [refusal] });
         const first = planned(delete_rows(state([]), structure_context(), [{ kind: 'source', sourceRow: 2 }]));
         const second = planned(delete_rows(first.next, structure_context(), [{ kind: 'source', sourceRow: 3 }]));

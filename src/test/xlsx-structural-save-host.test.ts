@@ -445,6 +445,30 @@ describe('structural save refusals', () => {
         expect((committed as { committed: { structures?: unknown[] } }).committed.structures ?? []).toEqual([]);
     });
 
+    it('keeps a basis change when an unrelated cell edit is undone', async () => {
+        const raw = representative_workbook();
+        const viewer = await open_xlsx(raw, {
+            state: { ...HEADER_ON, pendingEdits: [{ sheetName: 'Data', cells: { '3:1': { value: '70', base: '7' } } }] },
+        });
+        expect(await viewer.publish(0, { ...removal(viewer), cells: { '3:1': { value: '70', base: '7' } } })).toBe(true);
+        // Another tool rewrites Data's part, with a cell the layout does not touch.
+        const sheet = part_text(raw, 'xl/worksheets/sheet1.xml')!;
+        await viewer.change(with_parts(raw, { 'xl/worksheets/sheet1.xml': sheet.replace('?>', '?>\n') }));
+        const conflict = { reason: 'structuralBasisChanged' as const, pendingRowIds: [], tailRemovalIds: [] };
+        await vi.waitFor(() => expect(viewer.durable().pendingEdits?.[0]?.conflicts).toEqual([conflict]));
+        const committed = await viewer.replay('undo-cell', [{
+            ordinal: 0,
+            worksheet: { sheetIndex: 0, sheetName: 'Data' },
+            sourceRow: 3,
+            sourceColumn: 1,
+            overlay: wire_overlay_from_cell_overlay_state(value_only_overlay(history_value('70'), history_value('7'))),
+        }]);
+        expect(committed).toBeDefined();
+        expect(viewer.durable().pendingEdits?.[0]?.cells ?? {}).toEqual({});
+        expect(viewer.durable().pendingEdits?.[0]?.conflicts).toEqual([conflict]);
+        expect((committed as { committed: { structures?: unknown[] } }).committed.structures ?? []).toEqual([]);
+    });
+
     it('refuses a formula on another worksheet that cannot be adjusted, naming it', async () => {
         const raw = build_fixture_xlsx({
             sheets: [

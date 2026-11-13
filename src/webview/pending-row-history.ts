@@ -145,10 +145,13 @@ function with_layout_change(
         : current.columnLayout;
     const live_layout = has_live_layout_change({ rowLayout, columnLayout });
     // Conflicts name live rows only; the host derives them afresh after replay.
-    // A worksheet-level `unsupportedStructure` refusal names none; it stays
-    // while a live layout change remains, the host's replay rule.
+    // A worksheet-level conflict (`structuralBasisChanged`,
+    // `unsupportedStructure`) names none; it stays while a live layout change
+    // remains, the host's replay rule.
     const conflicts = current.conflicts.flatMap((conflict) => {
-        if (conflict.reason === 'unsupportedStructure') return live_layout ? [conflict] : [];
+        if (conflict.reason === 'structuralBasisChanged' || conflict.reason === 'unsupportedStructure') {
+            return live_layout ? [conflict] : [];
+        }
         const pendingRowIds = conflict.pendingRowIds.filter((id) => row_ids.has(id));
         const formulaCells = conflict.formulaCells?.filter((cell) =>
             cell.rowIdentity.kind !== 'pending' || row_ids.has(cell.rowIdentity.pendingRowId));

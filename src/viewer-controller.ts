@@ -16011,16 +16011,18 @@ export function attach_viewer(
                     // renderer's desired array. Formula diagnostics are derived
                     // afresh below. Other diagnostics survive only for structural
                     // identities the prospective state still contains. A
-                    // worksheet-level `unsupportedStructure` refusal names none;
-                    // it stays while the sheet has a live layout change, the
-                    // rule `conflicts_after_publication` applies.
+                    // worksheet-level conflict (`structuralBasisChanged`,
+                    // `unsupportedStructure`) names none; it stays while the
+                    // sheet has a live layout change, the rule
+                    // `conflicts_after_publication` applies.
                     const live_layout = has_live_layout_change(structural);
                     const retained_conflicts = durable_structural.conflicts.flatMap(
                         (conflict): PendingStructuralConflict[] => {
                             if (conflict.reason === 'ambiguousPendingFormula') return [];
-                            if (conflict.reason === 'unsupportedStructure') {
-                                return live_layout ? [conflict] : [];
-                            }
+                            if (
+                                conflict.reason === 'structuralBasisChanged'
+                                || conflict.reason === 'unsupportedStructure'
+                            ) return live_layout ? [conflict] : [];
                             const pendingRowIds = conflict.pendingRowIds.filter(
                                 (id) => pending_ids.has(id),
                             );
