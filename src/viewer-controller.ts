@@ -226,6 +226,9 @@ import {
     prospective_transform_schema,
     structural_payload_for,
     structural_rekey_transition,
+    structural_receipt_shape_matches,
+    structurally_affected_sheets,
+    without_parked_structural_payloads,
     without_structural_rekey_intent,
     worksheet_structure_receipt,
 } from './structural-save';
@@ -4090,6 +4093,7 @@ export function attach_viewer(
                 durable_row_heights_state,
                 (snapshot.state as StoredPerFileState).rowHeights,
             );
+            observe_unresolved_structural_save(state);
         }
         if (
             !file_edit_state
@@ -4564,6 +4568,89 @@ export function attach_viewer(
         if (messages.length > 0) show_owner_warning(messages.join(' '));
     }
 
+    let unresolved_structural_sheet_names: ReadonlySet<string> = new Set();
+    let posted_unresolved_save_id: string | undefined;
+
+    /**
+     * Track whether the durable state holds an unresolved structural save, and
+     * tell the renderer when that changes: it shows the notice bar with the
+     * two choices, defaulting to the shape hint.
+     */
+    function observe_unresolved_structural_save(state: PerFileState): void {
+        const intent = unresolved_rekey_intent(state);
+        const sheets = source?.meta().sheets ?? [];
+        unresolved_structural_sheet_names = intent === undefined
+            ? new Set()
+            : new Set(structurally_affected_sheets(intent, sheets).map((index) => sheets[index]!.name));
+        if (intent?.saveId === posted_unresolved_save_id) return;
+        posted_unresolved_save_id = intent?.saveId;
+        post_unresolved_structural_save_notice(state);
+    }
+
+    function post_unresolved_structural_save_notice(state: PerFileState): void {
+        const intent = unresolved_rekey_intent(state);
+        const sheets = source?.meta().sheets ?? [];
+        void post_to_receiver({
+            type: 'structuralSaveUnresolved',
+            notice: intent === undefined ? null : {
+                saveId: intent.saveId,
+                message: `Table Viewer can't tell whether your last save of ${display_file_name()} finished, `
+                    + 'because the file has changed since.',
+                suggestion: structural_receipt_shape_matches(
+                    intent.receipt,
+                    sheets,
+                    (target) => structural_payload_for(state, sheets, target),
+                ) ? 'finished' : 'notFinished',
+            },
+        });
+    }
+
+    function display_file_name(): string {
+        const slash = Math.max(file_path.lastIndexOf('/'), file_path.lastIndexOf('\\'));
+        return file_path.slice(slash + 1);
+    }
+
+    /**
+     * The user's answer to an unresolved structural save. "It finished"
+     * applies the intent and parks the payload until the next successful save,
+     * so a wrong answer can still be recovered; "It didn't finish" clears the
+     * intent and keeps the payload, which then meets the Structural Basis
+     * check against the file as it is.
+     */
+    async function handle_resolve_structural_save(message: unknown): Promise<void> {
+        if (
+            !is_plain_record(message)
+            || typeof message.saveId !== 'string'
+            || (message.choice !== 'finished' && message.choice !== 'notFinished')
+        ) return;
+        const save_id = message.saveId;
+        const finished = message.choice === 'finished';
+        const src = source;
+        const digest = session.acknowledged_physical_digest();
+        if (src === undefined || digest === undefined) return;
+        const sheets = src.meta().sheets;
+        await update_file_state((current) => {
+            const intent = unresolved_rekey_intent(current);
+            if (intent?.saveId !== save_id) return current;
+            if (!finished) {
+                return reconcile_structural_bases(
+                    without_structural_rekey_intent(current, save_id),
+                    src,
+                    digest,
+                );
+            }
+            return structural_rekey_transition(current, intent, sheets, {
+                retire: () => true,
+                park: true,
+                schemaAfter: (sheet_index) => {
+                    const sheet = sheets[sheet_index];
+                    return sheet === undefined ? undefined : transform_schema_for_sheet(sheet);
+                },
+            }).state;
+        }, undefined, undefined, null);
+        await refresh_panel_source(true, 'recovery');
+    }
+
     /** A stored rekey intent no running save owns: the file's state is unresolved. */
     function unresolved_rekey_intent(state: StoredPerFileState): StructuralRekeyIntent | undefined {
         const intent = (state as PerFileState).structuralRekeyIntent;
@@ -4850,12 +4937,18 @@ export function attach_viewer(
         readonly revision: number;
         readonly heights: readonly (Record<number, number> | undefined)[];
     } {
+        const heights = normalize_sheet_state_array<Record<number, number>>(
+            durable_row_heights_state,
+            [...sheet_names],
+        );
         return {
             revision: durable_row_heights_revision,
-            heights: normalize_sheet_state_array<Record<number, number>>(
-                durable_row_heights_state,
-                [...sheet_names],
-            ),
+            // An unresolved structural save: heights are keyed to rows that
+            // may have moved, so affected worksheets render without them.
+            heights: unresolved_structural_sheet_names.size === 0
+                ? heights
+                : heights.map((entry, index) =>
+                    unresolved_structural_sheet_names.has(sheet_names[index]!) ? undefined : entry),
         };
     }
 
@@ -5879,6 +5972,60 @@ export function attach_viewer(
      * the session those edits belong to is not this panel's to represent.
      */
     function project_state_for_panel(
+        snapshot: Readonly<FileStateSnapshot>,
+        allow_claim = false,
+        sheets?: readonly WorksheetIdentityInput[],
+    ): FileStateSnapshot {
+        return without_unresolved_view_state(
+            project_state_for_panel_unstripped(snapshot, allow_claim, sheets),
+            sheets ?? source?.meta().sheets ?? [],
+        );
+    }
+
+    /**
+     * While a structural save is unresolved, the worksheets it restructured
+     * render without source-keyed highlights, hidden rows, and widths: they
+     * are keyed to rows and columns that may or may not have moved. Durable
+     * state keeps them; only the panel's projection omits them.
+     */
+    function without_unresolved_view_state(
+        projected: FileStateSnapshot,
+        sheets: readonly WorksheetIdentityInput[],
+    ): FileStateSnapshot {
+        const state = projected.state as PerFileState;
+        const intent = unresolved_rekey_intent(state);
+        if (intent === undefined) return projected;
+        const affected = structurally_affected_sheets(intent, sheets);
+        if (affected.length === 0) return projected;
+        const highlights = state.cellHighlights === undefined ? undefined : {
+            ...state.cellHighlights,
+            sheets: state.cellHighlights.sheets.map((entry, index) => affected.includes(index) ? undefined : entry),
+        };
+        return {
+            revision: projected.revision,
+            state: {
+                ...state,
+                ...(highlights === undefined ? {} : { cellHighlights: highlights }),
+                ...(state.columnWidths === undefined ? {} : {
+                    columnWidths: state.columnWidths.map((entry, index) =>
+                        affected.includes(index) ? undefined : entry),
+                }),
+                ...(state.rowHeights === undefined ? {} : {
+                    rowHeights: state.rowHeights.map((entry, index) =>
+                        affected.includes(index) ? undefined : entry),
+                }),
+                ...(state.transforms === undefined ? {} : {
+                    transforms: state.transforms.map((entry, index) => {
+                        if (entry === undefined || !affected.includes(index)) return entry;
+                        const { hiddenRows: _hidden, ...rest } = entry;
+                        return rest;
+                    }),
+                }),
+            },
+        };
+    }
+
+    function project_state_for_panel_unstripped(
         snapshot: Readonly<FileStateSnapshot>,
         allow_claim = false,
         // The workbook being adopted, when that is not yet the installed `source`:
@@ -7845,8 +7992,14 @@ export function attach_viewer(
     // physical/projection/layout writes use the coordinator serialization above.
     async function clear_pending_edits(
         scope: EditCleanupScope,
+        // A successful save ends the recovery window of payloads parked by an
+        // unresolved structural save's "It finished".
+        drop_parked_structural_payloads = false,
     ): Promise<FileStateSnapshot> {
-        const committed = await update_file_state((current, sheets) => {
+        const committed = await update_file_state((stored, sheets) => {
+            const current = drop_parked_structural_payloads
+                ? without_parked_structural_payloads(stored)
+                : stored;
             if (!current.pendingEdits) return current;
             if (scope.type === 'workbook') {
                 // The one workbook dialog discards the entire session, including
@@ -10394,7 +10547,7 @@ export function attach_viewer(
         void clear_pending_edits({
             type: 'worksheets',
             targets: operation.durableTargets,
-        }).then((snapshot) => {
+        }, true).then((snapshot) => {
             finish_edit_cleanup(cleanup_operation, true, snapshot);
             if (!disposed) update_session_state_material(snapshot, false);
         }).catch((error) => {
@@ -10538,6 +10691,9 @@ export function attach_viewer(
                 }
                 renderer_ready = true;
                 renderer_understands_layout = msg.structuralLayout === WEBVIEW_STRUCTURAL_LAYOUT_VERSION;
+                // A new renderer has no notice bar yet: the next durable read
+                // re-posts an unresolved structural save.
+                posted_unresolved_save_id = undefined;
                 renderer_protocol_epoch += 1;
                 const begun = session.begin_ready();
                 // This must happen before the first await: an older receiver's
@@ -12331,6 +12487,9 @@ export function attach_viewer(
                     // A failed refresh must leave the action retryable.
                     load_all_csv_rows = false;
                 }
+                return;
+            case 'resolveStructuralSave':
+                if (editing_supported) await handle_resolve_structural_save(msg);
                 return;
             case 'saveCsv':
                 if (editing_supported) {

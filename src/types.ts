@@ -2798,6 +2798,13 @@ export function receipt_has_structure(receipt: PendingChangesSaveReceipt | undef
     return (receipt?.structure?.length ?? 0) > 0;
 }
 
+export interface StructuralSaveUnresolvedNotice {
+    readonly saveId: string;
+    readonly message: string;
+    /** The default action, from whether the file's shape matches the saved changes. */
+    readonly suggestion: 'finished' | 'notFinished';
+}
+
 /** The layout capability a current renderer declares in its `ready` message. */
 export const WEBVIEW_STRUCTURAL_LAYOUT_VERSION = 1;
 
@@ -3313,6 +3320,12 @@ export type HostMessage =
      *  carries original raw (`base`) and formatted text for differing cells. */
     | { type: 'compareDiff'; sheetIndex: number; startRow: number; rowStatus: CompareRowStatus[]; changedCells: { row: number; col: number; base: string; formattedBase?: string }[]; requestId: string; generation: number }
     | { type: 'scrollToRow'; row: number }
+    /**
+     * A structural save's rekey intent is stored and unresolved: the file
+     * matches neither the bytes the save read nor the bytes it wrote. The
+     * notice bar asks which way it went; `null` clears the bar.
+     */
+    | { type: 'structuralSaveUnresolved'; notice: StructuralSaveUnresolvedNotice | null }
     | { type: 'saveOperationStarted'; lifecycle: ActiveCsvSaveLifecycle }
     | {
         type: 'saveResult';
@@ -3597,6 +3610,8 @@ export type WebviewMessage =
     // User-facing warning raised inside the webview (e.g. a clipped copy) that
     // the host surfaces via vscode.window.showWarningMessage.
     | { type: 'showWarning'; message: string }
+    /** The user's answer to an unresolved structural save's notice bar. */
+    | { type: 'resolveStructuralSave'; saveId: string; choice: 'finished' | 'notFinished' }
     // Ctrl/Cmd+click (or the context menu's "Open link") on a hyperlinked
     // cell. The webview pre-validates for immediate feedback, but the host
     // re-validates with parse_http_external_url before anything reaches the
