@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
     a1_formula_references,
+    formula_reference_tokens,
     is_xlsx_formula_text,
     local_a1_formula_references,
     retarget_moved_a1_formula,
@@ -260,5 +261,268 @@ describe('workbook_a1_formula_references', () => {
                 lastColumn: 2,
             },
         ]);
+    });
+});
+
+describe('formula reference tokenizer', () => {
+    const shapes = (formula: string) => formula_reference_tokens(formula).references.map(
+        (token) => ({
+            kind: token.kind,
+            text: formula.slice(token.start, token.end),
+            sheet: token.sheetName,
+            corners: token.corners.map((corner) => ({
+                text: formula.slice(corner.start, corner.end),
+                sheet: corner.sheet && formula.slice(corner.sheet.start, corner.sheet.end),
+                row: corner.row && `${corner.row.absolute ? '$' : ''}${corner.row.value}`
+                    + `@${formula.slice(corner.row.start, corner.row.end)}`,
+                column: corner.column && `${corner.column.absolute ? '$' : ''}${corner.column.value}`
+                    + `@${formula.slice(corner.column.start, corner.column.end)}`,
+            })),
+        }),
+    );
+    const issues = (formula: string) => formula_reference_tokens(formula).issues.map(
+        (issue) => ({
+            kind: issue.kind,
+            text: formula.slice(issue.start, issue.end),
+            worksheets: issue.worksheets,
+        }),
+    );
+
+    it('keeps each corner, its spans, and its $ flags in authored order', () => {
+        expect(shapes('=SUM($b5:A$2)+c3')).toEqual([
+            {
+                kind: 'range',
+                text: '$b5:A$2',
+                sheet: undefined,
+                corners: [
+                    { text: '$b5', sheet: undefined, row: '5@5', column: '$2@b' },
+                    { text: 'A$2', sheet: undefined, row: '$2@2', column: '1@A' },
+                ],
+            },
+            {
+                kind: 'cell',
+                text: 'c3',
+                sheet: undefined,
+                corners: [{ text: 'c3', sheet: undefined, row: '3@3', column: '3@c' }],
+            },
+        ]);
+    });
+
+    it('reads whole-row and whole-column references', () => {
+        expect(shapes('=SUM(3:$5)+SUM($A:C)')).toEqual([
+            {
+                kind: 'rows',
+                text: '3:$5',
+                sheet: undefined,
+                corners: [
+                    { text: '3', sheet: undefined, row: '3@3', column: undefined },
+                    { text: '$5', sheet: undefined, row: '$5@5', column: undefined },
+                ],
+            },
+            {
+                kind: 'columns',
+                text: '$A:C',
+                sheet: undefined,
+                corners: [
+                    { text: '$A', sheet: undefined, row: undefined, column: '$1@A' },
+                    { text: 'C', sheet: undefined, row: undefined, column: '3@C' },
+                ],
+            },
+        ]);
+    });
+
+    it('reads unquoted, quoted, and per-corner sheet qualifiers', () => {
+        const formula = "=Sheet1!A1:Sheet1!B2+'Sales Q1'!C3+'It''s'!D4:E5+sheet1!1:SHEET1!2";
+        expect(shapes(formula).map(({ kind, text, sheet, corners }) => ({
+            kind,
+            text,
+            sheet,
+            sheets: corners.map((corner) => corner.sheet),
+        }))).toEqual([
+            { kind: 'range', text: 'Sheet1!A1:Sheet1!B2', sheet: 'Sheet1', sheets: ['Sheet1!', 'Sheet1!'] },
+            { kind: 'cell', text: "'Sales Q1'!C3", sheet: 'Sales Q1', sheets: ["'Sales Q1'!"] },
+            { kind: 'range', text: "'It''s'!D4:E5", sheet: "It's", sheets: ["'It''s'!", undefined] },
+            { kind: 'rows', text: 'sheet1!1:SHEET1!2', sheet: 'sheet1', sheets: ['sheet1!', 'SHEET1!'] },
+        ]);
+        const quoted = formula_reference_tokens("='Sales Q1'!C3").references[0].corners[0].sheet;
+        expect(quoted).toEqual({ name: 'Sales Q1', quoted: true, start: 1, end: 12 });
+    });
+
+    it('skips strings, functions, names, external workbooks, and structured references', () => {
+        expect(shapes(
+            '="A1"&LOG10(2)&[1]Sheet1!A1:B2&\'[Book.xlsx]Data\'!C3&[Revenue]&[@Cost]'
+            + '&Data![Revenue]&Table1[[#Data],[A1]]&Name1&TRUE&D4',
+        ).map((token) => token.text)).toEqual(['D4']);
+        expect(issues('=[Book.xlsx]Sheet1!A1:B2+[Book.xlsx]Sheet1![Revenue]')).toEqual([]);
+    });
+
+    it('skips structured references with escaped brackets and quotes', () => {
+        for (const formula of ["=Table1[A']+B2]+C3", "=Table1[A'[B]+C3", '=Table1[A"B]+C3']) {
+            expect(shapes(formula).map((token) => token.text)).toEqual(['C3']);
+            expect(issues(formula)).toEqual([]);
+        }
+        expect(shapes("=Table1[[#Data],[x'] y]]+Data![a'[b]+'Q(1'![c]+D4").map((token) => token.text))
+            .toEqual(['D4']);
+    });
+
+    it('reports a range operator with a non-reference operand', () => {
+        expect(issues('=SUM(INDEX(A:A,1):B5)')).toEqual([
+            { kind: 'rangeOperand', text: 'INDEX(A:A,1):B5', worksheets: [undefined] },
+        ]);
+        expect(shapes('=SUM(INDEX(A:A,1):B5)').map((token) => token.text)).toEqual(['A:A']);
+        expect(issues('=SUM(B5:INDEX(Data!A:A,2))')).toEqual([
+            { kind: 'rangeOperand', text: 'B5:INDEX(Data!A:A,2)', worksheets: [undefined, 'Data'] },
+        ]);
+        expect(issues('=INDEX(Data!A:A,MATCH(")",A:A,0)):B5')).toEqual([{
+            kind: 'rangeOperand',
+            text: 'INDEX(Data!A:A,MATCH(")",A:A,0)):B5',
+            worksheets: ['Data', undefined],
+        }]);
+        expect(issues("=INDEX(Data!A:A,MATCH(1,'Da(ta'!A:A,0)):B5")).toEqual([{
+            kind: 'rangeOperand',
+            text: "INDEX(Data!A:A,MATCH(1,'Da(ta'!A:A,0)):B5",
+            worksheets: ['Data', 'Da(ta', undefined],
+        }]);
+        // Parentheses inside quoted sheet names and structured references
+        // do not nest, scanning forward or backward.
+        expect(issues("=B5:INDEX('Da)ta'!A:A,1)+C3")).toEqual([{
+            kind: 'rangeOperand',
+            text: "B5:INDEX('Da)ta'!A:A,1)",
+            worksheets: [undefined, 'Da)ta'],
+        }]);
+        expect(shapes("=B5:INDEX('Da(ta'!A:A,1)+C3").map((token) => token.text)).toEqual(['C3']);
+        expect(issues('=INDEX(Data!A:A,MATCH(1,Table1[foo(bar],0)):B5')).toEqual([{
+            kind: 'rangeOperand',
+            text: 'INDEX(Data!A:A,MATCH(1,Table1[foo(bar],0)):B5',
+            // A table may lie on any sheet.
+            worksheets: [],
+        }]);
+        expect(issues('=SUM(A1:B2:Data!C3)')).toEqual([
+            { kind: 'rangeOperand', text: 'A1:B2:Data!C3', worksheets: [undefined, 'Data'] },
+        ]);
+        // A sheet-scoped defined name may point at any sheet.
+        expect(issues('=INDEX(Data!Total,1):B5')).toEqual([
+            { kind: 'rangeOperand', text: 'INDEX(Data!Total,1):B5', worksheets: [] },
+        ]);
+        expect(issues("=INDEX(Data![Col],1):B5+INDEX('Da ta'!Total,1):B5")).toEqual([
+            { kind: 'rangeOperand', text: 'INDEX(Data![Col],1):B5', worksheets: ['Data', undefined] },
+            { kind: 'rangeOperand', text: "INDEX('Da ta'!Total,1):B5", worksheets: [] },
+        ]);
+        expect(issues('=SUM(Total:B5)')).toEqual([
+            // A defined name may lie on any sheet.
+            { kind: 'rangeOperand', text: 'Total:B5', worksheets: [] },
+        ]);
+        expect(shapes('=SUM(A1:B2:C3)')).toEqual([]);
+    });
+
+    it('reports a range operator between two function results', () => {
+        expect(issues('=INDEX(Data!A:A,1):INDEX(Data!B:B,2)')).toEqual([{
+            kind: 'rangeOperand',
+            text: 'INDEX(Data!A:A,1):INDEX(Data!B:B,2)',
+            worksheets: ['Data'],
+        }]);
+        expect(shapes('=INDEX(Data!A:A,1):INDEX(Data!B:B,2)').map((token) => token.text))
+            .toEqual(['Data!A:A']);
+        expect(issues('=SUM(INDEX(A:A,1) : B5)+SUM(B5 : INDEX(A:A,2))')).toEqual([
+            { kind: 'rangeOperand', text: 'INDEX(A:A,1) : B5', worksheets: [undefined] },
+            { kind: 'rangeOperand', text: 'B5 : INDEX(A:A,2)', worksheets: [undefined] },
+        ]);
+    });
+
+    it('reads whitespace around a range colon as one reference', () => {
+        expect(shapes("=SUM(A2 : $A5)+SUM(2 :3)+SUM(A: C)+Sheet1!B1 :'Sheet1'!B2")).toEqual([
+            {
+                kind: 'range',
+                text: 'A2 : $A5',
+                sheet: undefined,
+                corners: [
+                    { text: 'A2', sheet: undefined, row: '2@2', column: '1@A' },
+                    { text: '$A5', sheet: undefined, row: '5@5', column: '$1@A' },
+                ],
+            },
+            {
+                kind: 'rows',
+                text: '2 :3',
+                sheet: undefined,
+                corners: [
+                    { text: '2', sheet: undefined, row: '2@2', column: undefined },
+                    { text: '3', sheet: undefined, row: '3@3', column: undefined },
+                ],
+            },
+            {
+                kind: 'columns',
+                text: 'A: C',
+                sheet: undefined,
+                corners: [
+                    { text: 'A', sheet: undefined, row: undefined, column: '1@A' },
+                    { text: 'C', sheet: undefined, row: undefined, column: '3@C' },
+                ],
+            },
+            {
+                kind: 'range',
+                text: "Sheet1!B1 :'Sheet1'!B2",
+                sheet: 'Sheet1',
+                corners: [
+                    { text: 'Sheet1!B1', sheet: 'Sheet1!', row: '1@1', column: '2@B' },
+                    { text: "'Sheet1'!B2", sheet: "'Sheet1'!", row: '2@2', column: '2@B' },
+                ],
+            },
+        ]);
+        // A space without a colon is the intersection operator.
+        expect(shapes('=A1:B2 B2:C3').map((token) => token.text)).toEqual(['A1:B2', 'B2:C3']);
+    });
+
+    it('reports ranges whose corners name different worksheets', () => {
+        expect(issues('=SUM(Sheet1!A1:Sheet2!B2)+SUM(A1:Sheet2!B2)')).toEqual([
+            { kind: 'mixedSheets', text: 'Sheet1!A1:Sheet2!B2', worksheets: ['Sheet1', 'Sheet2'] },
+            // `A1:Sheet2!B2` may also be a 3D reference from a sheet named A1.
+            { kind: 'mixedSheets', text: 'A1:Sheet2!B2', worksheets: [undefined, 'A1', 'Sheet2'] },
+        ]);
+    });
+
+    it('reports 3D, spill, and R1C1 references', () => {
+        expect(issues("=SUM(Sheet1:Sheet3!A1)+SUM('Jan:Mar'!B2:B4)")).toEqual([
+            { kind: 'threeDimensional', text: 'Sheet1:Sheet3!A1', worksheets: ['Sheet1', 'Sheet3'] },
+            { kind: 'threeDimensional', text: "'Jan:Mar'!B2:B4", worksheets: ['Jan', 'Mar'] },
+        ]);
+        // A cell- or column-shaped 3D prefix names its bounds by its text.
+        expect(issues('=SUM(S1:S3!A1)+SUM(A:C!B2:B3)')).toEqual([
+            { kind: 'threeDimensional', text: 'S1:S3!A1', worksheets: ['S1', 'S3'] },
+            { kind: 'threeDimensional', text: 'A:C!B2:B3', worksheets: ['A', 'C'] },
+        ]);
+        expect(issues('=SUM(A1#)+Data!B2#')).toEqual([
+            { kind: 'spill', text: 'A1#', worksheets: [undefined] },
+            { kind: 'spill', text: 'Data!B2#', worksheets: ['Data'] },
+        ]);
+        expect(issues('=R1C1+R[1]C[-2]+RC+Data!R2C+C[1]')).toEqual([
+            { kind: 'r1c1', text: 'R1C1', worksheets: [undefined] },
+            { kind: 'r1c1', text: 'R[1]C[-2]', worksheets: [undefined] },
+            { kind: 'r1c1', text: 'RC', worksheets: [undefined] },
+            { kind: 'r1c1', text: 'Data!R2C', worksheets: ['Data'] },
+            { kind: 'r1c1', text: 'C[1]', worksheets: [undefined] },
+        ]);
+        // `RC4` is an A1 cell, and `ROUND` is a function.
+        expect(shapes('=RC4+ROUND(R2,0)').map((token) => token.text)).toEqual(['RC4', 'R2']);
+        expect(issues('=RC4+ROUND(R2,0)')).toEqual([]);
+    });
+
+    it('finds the same references as the existing lexer wherever both read them', () => {
+        for (const formula of [
+            '=SUM(A1:B2)+$C$3+Sheet2!D4:E5',
+            "='My Sheet'!A:A+1:3+XFD1048576",
+            '=IF(A1>0,"B2",C3)&[Revenue]',
+        ]) {
+            expect(formula_reference_tokens(formula).references.map((token) => {
+                const rows = token.corners.map((corner) => corner.row?.value);
+                const columns = token.corners.map((corner) => corner.column?.value);
+                return {
+                    ...(token.sheetName === undefined ? {} : { sheetName: token.sheetName }),
+                    firstRow: Math.min(...rows.map((row) => row ?? 1)) - 1,
+                    firstColumn: Math.min(...columns.map((column) => column ?? 1)) - 1,
+                    lastRow: Math.max(...rows.map((row) => row ?? 1_048_576)) - 1,
+                    lastColumn: Math.max(...columns.map((column) => column ?? 16_384)) - 1,
+                };
+            })).toEqual(a1_formula_references(formula));
+        }
     });
 });
