@@ -7415,11 +7415,15 @@ describe('GridShell append composer', () => {
         expect(field_labels()).toEqual(['A name', 'New column', 'C name']);
         await act(async () => set_input_value(field('append-composer-0-0') as HTMLInputElement, 'left'));
         await act(async () => set_input_value(field('append-composer-0-1') as HTMLInputElement, 'typed'));
+        // One store write, so the host gets one payload with the row and its Pending Column cell.
+        const notifications: string[] = [];
+        pending.subscribe((change) => notifications.push(change.kind));
         await act(async () => { button('Stage row').click(); });
         await vi.waitUntil(() => pending.snapshot().appendedRows.length === 1);
         const [row] = pending.snapshot().appendedRows;
         expect(row.cells[0]?.value).toBe('left');
         expect(pending.snapshot().pendingColumns?.[0]?.cells[`p:${row.id}`]?.value).toBe('typed');
+        expect(notifications).toHaveLength(1);
         const entries = history.snapshot().undoStack;
         expect(entries.map((entry) => entry.action.label)).toEqual(['Compose row']);
         expect(entries[0]!.action.changes.map((change) => change.kind)).toContain('columnLayout');

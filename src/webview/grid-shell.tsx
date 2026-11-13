@@ -71,6 +71,7 @@ import {
     plan_column_move,
     plan_column_restore,
     plan_pending_column_cells,
+    pending_column_cells_change,
     plan_pending_column_highlights,
     plan_pending_column_update,
     resolve_column_move_drop,
@@ -4918,6 +4919,8 @@ export function GridShell({
          */
         seed_cells?: readonly Readonly<Record<number, PendingRowCell>>[]
             | ((row_ids: readonly string[]) => readonly Readonly<Record<number, PendingRowCell>>[]),
+        /** Pending Column cells the rows carry from birth, by row: Pending Column ID to cell. */
+        seed_column_cells?: (row_ids: readonly string[]) => readonly Readonly<Record<string, PendingRowCell>>[],
     ) => {
         // Capture the activation before joining the serialization tail. The
         // first request's busy affordance may render while a second gesture is
@@ -4979,6 +4982,7 @@ export function GridShell({
                 insert_created_order(before, issue_value_edit_order()),
                 admitted.appendBasis,
                 typeof seed_cells === 'function' ? seed_cells(admitted.rowIds) : seed_cells,
+                seed_column_cells?.(admitted.rowIds),
             );
             if (!added) {
                 admitted.settle(false);
@@ -5934,11 +5938,6 @@ export function GridShell({
         (count: number): Promise<boolean> => append_and_focus_rows(count, 0),
         [append_and_focus_rows],
     );
-    /** `plan_pending_column_text`, defined below with the cell commit paths. */
-    const plan_pending_column_text_ref = useRef<(
-        edits: readonly { readonly pendingColumnId: string; readonly rowKey: string; readonly text: string }[],
-        before: PendingStructuralChanges,
-    ) => ReturnType<typeof plan_pending_column_cells> | 'refused'>(() => undefined);
     /**
      * The composer's staging path — quick add's sibling, with cell values.
      *
@@ -5964,26 +5963,34 @@ export function GridShell({
         // second payload outstanding.
         let gesture_order: number | undefined;
         let formula_refusal: string | undefined;
-        // Values for Pending Columns, by composed row: they are written into
-        // the Pending Column once the row has an identity.
-        const column_values = rows.map((values) => projected_columns.flatMap((column) => {
-            if (column.identity.kind !== 'pending') return [];
-            const pendingColumnId = column.identity.pendingColumnId;
-            const raw = values[`p:${pendingColumnId}`];
-            if (raw === undefined) return [];
-            const parsed = parse_cell_edit(raw, edit_syntax);
-            if (parsed.text === '' && parsed.rich === undefined) return [];
-            const formula_fields = commit_formula_fields(
-                parsed.text,
-                edit_syntax === 'markdown' && xlsx_edit_writes_formula(parsed.text, parsed.rich?.runs),
-                rows.length,
-            );
-            if (formula_fields.kind === 'refused') {
-                formula_refusal ??= formula_fields.reason;
-                return [];
+        // Values for Pending Columns, by composed row, keyed by Pending
+        // Column ID: seeded into the same store write as the rows.
+        const column_seed = rows.map((values) => {
+            const cells: Record<string, PendingRowCell> = {};
+            for (const column of projected_columns) {
+                if (column.identity.kind !== 'pending') continue;
+                const raw = values[`p:${column.identity.pendingColumnId}`];
+                if (raw === undefined) continue;
+                const parsed = parse_cell_edit(raw, edit_syntax);
+                if (parsed.text === '' && parsed.rich === undefined) continue;
+                const formula_fields = commit_formula_fields(
+                    parsed.text,
+                    edit_syntax === 'markdown' && xlsx_edit_writes_formula(parsed.text, parsed.rich?.runs),
+                    rows.length,
+                );
+                if (formula_fields.kind === 'refused') {
+                    formula_refusal ??= formula_fields.reason;
+                    continue;
+                }
+                cells[column.identity.pendingColumnId] = {
+                    value: parsed.text,
+                    ...(parsed.rich === undefined ? {} : { valueRuns: parsed.rich }),
+                    valueEditOrder: gesture_order ??= issue_value_edit_order(),
+                    ...committed_formula_cell_fields(formula_fields),
+                };
             }
-            return [{ pendingColumnId, text: raw }];
-        }));
+            return cells;
+        });
         const seed_cells = rows.map((values) => {
             const cells: Record<number, PendingRowCell> = {};
             // Only the columns on screen: a draft keeps values for columns that
@@ -6025,6 +6032,18 @@ export function GridShell({
         // identity once admitted: anchor again against the band that holds it.
         const anchored_seed_cells = (row_ids: readonly string[]) => {
             if (formula_workbook === undefined) return seed_cells;
+            return reanchored(row_ids, seed_cells) as Record<number, PendingRowCell>[];
+        };
+        const anchored_column_cells = (row_ids: readonly string[]) => {
+            if (formula_workbook === undefined) return column_seed;
+            return reanchored(row_ids, column_seed);
+        };
+        /** Anchor each seeded formula again against the band that now holds the batch. */
+        function reanchored(
+            row_ids: readonly string[],
+            seeds: readonly Readonly<Record<string, PendingRowCell>>[],
+        ): Record<string, PendingRowCell>[] {
+            if (formula_workbook === undefined) return seeds.map((cells) => ({ ...cells }));
             const extended = formula_workbook_with_appended_rows(
                 formula_workbook,
                 sheet_index,
@@ -6032,8 +6051,8 @@ export function GridShell({
                 pending_store.snapshot(),
                 row_ids,
             );
-            return seed_cells.map((cells) => {
-                const next: Record<number, PendingRowCell> = {};
+            return seeds.map((cells) => {
+                const next: Record<string, PendingRowCell> = {};
                 for (const [column, cell] of Object.entries(cells)) {
                     const fields = xlsx_edit_writes_formula(cell.value, cell.valueRuns?.runs)
                         ? committed_formula_fields(
@@ -6047,7 +6066,7 @@ export function GridShell({
                         )
                         : undefined;
                     if (fields?.kind !== 'fields') {
-                        next[Number(column)] = cell;
+                        next[column] = cell;
                         continue;
                     }
                     const {
@@ -6055,7 +6074,7 @@ export function GridShell({
                         formulaReferenceBases: _bases,
                         ...rest
                     } = cell;
-                    next[Number(column)] = { ...rest, ...committed_formula_cell_fields(fields) };
+                    next[column] = { ...rest, ...committed_formula_cell_fields(fields) };
                 }
                 return next;
             });
@@ -6065,43 +6084,17 @@ export function GridShell({
             false,
             () => true,
             anchored_seed_cells,
+            anchored_column_cells,
         );
         // An envelope too large to hold the composed values now refuses the
         // whole gesture rather than staging blank rows beside a warning.
         if (appended === undefined) return false;
-        // Pending Column values join the same gesture, after the rows exist.
-        const column_edits = column_values.flatMap((values, index) => {
-            const row_id = appended.rowIds[index];
-            return row_id === undefined
-                ? []
-                : values.map((value) => ({ ...value, rowKey: `p:${row_id}` }));
-        });
-        let column_change: HistoryChange | undefined;
-        if (column_edits.length > 0) {
-            const roll_back = () => {
-                const rollback = pending_store.stage_replace(edit_session_id, pending_store.snapshot(), appended.before);
-                if (rollback?.valid()) {
-                    rollback.commit();
-                    rollback.notify();
-                }
-            };
-            const plan = plan_pending_column_text_ref.current(column_edits, pending_store.snapshot());
-            if (plan === 'refused') {
-                roll_back();
-                return false;
-            }
-            if (plan !== undefined) {
-                const staged = pending_store.stage_replace(edit_session_id, pending_store.snapshot(), plan.next);
-                if (staged === undefined || !staged.valid()) {
-                    roll_back();
-                    show_pending_size_warning();
-                    return false;
-                }
-                staged.commit();
-                staged.notify();
-                column_change = plan.change;
-            }
-        }
+        // The Pending Column cells the admission seeded, as the gesture's column arm.
+        const column_change = pending_column_cells_change(
+            structure_context.worksheet,
+            appended.before,
+            pending_store.snapshot(),
+        );
         if (history_capture !== undefined) {
             const changes = pending_row_history_changes(
                 history_capture.worksheet,
@@ -6137,7 +6130,7 @@ export function GridShell({
         pending_display_row,
         pending_store,
         projected_columns,
-        show_pending_size_warning,
+        structure_context.worksheet,
     ]);
     const [local_composer_draft, set_local_composer_draft] = useState<AppendComposerDraft>(
         EMPTY_APPEND_COMPOSER_DRAFT,
@@ -6612,7 +6605,6 @@ export function GridShell({
         refuse_formula,
         structure_context.worksheet,
     ]);
-    plan_pending_column_text_ref.current = plan_pending_column_text;
     const commit_pending_column_cells = useCallback((
         edits: readonly { readonly pendingColumnId: string; readonly rowKey: string; readonly text: string }[],
         label: string,

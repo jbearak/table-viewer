@@ -670,6 +670,38 @@ export function with_pending_column_widths(
     return changed ? { ...changes, pendingColumns: columns } : undefined;
 }
 
+/**
+ * The `columnLayout` arm for Pending Columns whose content changed between two
+ * snapshots with the same column layout, such as cells an admission seeded.
+ * Undefined when no Pending Column changed.
+ */
+export function pending_column_cells_change(
+    worksheet: WorksheetStructureContext['worksheet'],
+    before: PendingStructuralChanges,
+    after: PendingStructuralChanges,
+): LayoutHistoryChange | undefined {
+    const prior = new Map((before.pendingColumns ?? []).map((column) => [column.id, column]));
+    const transitions = (after.pendingColumns ?? []).flatMap((column) => {
+        const was = prior.get(column.id);
+        return was === undefined || JSON.stringify(was) === JSON.stringify(column)
+            ? []
+            : [{ id: column.id, before: was, after: column }];
+    });
+    if (transitions.length === 0) return undefined;
+    const layout = after.columnLayout ?? null;
+    return {
+        kind: 'columnLayout',
+        delta: {
+            worksheet,
+            before: layout,
+            after: layout,
+            pendingRows: [],
+            pendingColumns: transitions,
+            formatTemplates: [],
+        },
+    };
+}
+
 /** A Pending Column cell's highlight a gesture sets; `color` undefined clears it. */
 export interface PendingColumnHighlightEdit {
     readonly pendingColumnId: string;

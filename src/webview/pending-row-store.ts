@@ -113,6 +113,12 @@ export interface PendingRowStore {
          * the row blank before they see it filled.
          */
         initial_cells?: readonly Readonly<Record<number, PendingRowCell>>[],
+        /**
+         * Pending Column cells the new rows carry from birth, by row index:
+         * Pending Column ID to cell. Written in the same mutation, for the
+         * same reason as `initial_cells`.
+         */
+        initial_column_cells?: readonly Readonly<Record<string, PendingRowCell>>[],
     ): boolean;
     set_cell(
         session_id: string | undefined,
@@ -533,6 +539,7 @@ export function create_pending_row_store(
             first_created_order,
             append_basis,
             initial_cells,
+            initial_column_cells,
         ) => {
             if (
                 row_ids.length === 0
@@ -568,6 +575,16 @@ export function create_pending_row_store(
                 formatTemplateId: format_template.id,
                 createdOrder: first_created_order + index,
             }));
+            const column_cells = new Map<string, Record<string, PendingRowCell>>();
+            row_ids.forEach((id, index) => {
+                for (const [column_id, cell] of Object.entries(initial_column_cells?.[index] ?? {})) {
+                    const cells = column_cells.get(column_id) ?? {};
+                    cells[`p:${id}`] = cell;
+                    column_cells.set(column_id, cells);
+                }
+            });
+            if ([...column_cells.keys()].some((id) =>
+                !(state.pendingColumns ?? []).some((column) => column.id === id))) return false;
             return mutate(session_id, () => ({
                 ...state,
                 formatTemplates: templates,
@@ -575,6 +592,12 @@ export function create_pending_row_store(
                 ...(next_basis === undefined
                     ? {}
                     : { appendBasis: next_basis }),
+                ...(column_cells.size === 0 ? {} : {
+                    pendingColumns: (state.pendingColumns ?? []).map((column) => {
+                        const cells = column_cells.get(column.id);
+                        return cells === undefined ? column : { ...column, cells: { ...column.cells, ...cells } };
+                    }),
+                }),
             }), RESET_CHANGE);
         },
         set_cell: (session_id, pending_row_id, source_column, cell) => {
