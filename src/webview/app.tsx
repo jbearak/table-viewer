@@ -149,6 +149,8 @@ import {
     type EditingStatus,
     type EditingHandle,
     type AppendRowsAdmission,
+    type StructuralInsertAdmission,
+    type StructuralInsertRequest,
     type GridActionsHandle,
     type GridFocusHandle,
     type HighlightSelectionHandle,
@@ -231,7 +233,8 @@ import { pending_signal, type PendingSignal } from './pending-signal';
 import { run_discard_transaction } from './discard-transaction-model';
 import { highlight_history_source } from './highlight-capture-model';
 import { commit_staged_transaction, type StagedMutation } from './staged-mutation';
-import { discard_layout_changes } from './pending-row-store';
+import { discard_layout_changes, keep_inserted_rows_at_end } from './pending-row-store';
+import { has_inserted_rows, INSERTED_ROWS_TRANSFORM_MESSAGE } from './row-structure-model';
 
 /**
  * Structural conflicts about a whole worksheet rather than a row or cell:
@@ -1119,6 +1122,46 @@ export function App(): React.JSX.Element {
     }, [active_sheet_index]);
 
     /**
+     * Review Changes' "Keep new rows at the end": every live Pending Inserted
+     * Row on the active worksheet becomes a Pending Appended Row, in layout
+     * order, and the rest of the layout is dropped, as one history action
+     * whose Undo puts the rows back where they were.
+     */
+    const keep_active_inserted_rows_at_end = useCallback(() => {
+        const sheet_index = active_sheet_index;
+        const sheet = meta_ref.current?.sheets[sheet_index];
+        const session_id = csv_edit_session_id_ref.current;
+        if (sheet === undefined || session_id === undefined) return;
+        if (save_in_flight_ref.current || !edit_gestures_admitted()) return;
+        const store = edit_session_registry_ref.current!.pending_rows_for_sheet(sheet_index);
+        const before = store.snapshot();
+        const header = sheet.excelFirstRowHeader;
+        const result = keep_inserted_rows_at_end(before, {
+            worksheet: {
+                sheetIndex: sheet_index,
+                sheetName: sheet.name,
+                ...(sheet.worksheetId === undefined ? {} : { worksheetId: sheet.worksheetId }),
+            },
+            bodyStart: header?.active === true && header.sourceRow !== undefined ? header.sourceRow + 1 : 0,
+            sourceRowCount: sheet.sourceRowCount,
+            sourceColumnCount: sheet.columnCount,
+            bodyViewTransformed: false,
+        // On the clock append orders use, so later appends still sort after these rows.
+        }, Date.now() * 1_000);
+        if (!result.ok) {
+            host_bridge.postMessage({ type: 'showWarning', message: result.refusal.message });
+            return;
+        }
+        const staged_store = store.stage_replace(session_id, before, result.outcome.next);
+        if (staged_store === undefined) return;
+        const record = history_store_ref.current!.stage_record({
+            label: 'Keep new rows at the end',
+            changes: [result.outcome.change],
+        });
+        commit_staged_transaction([record, staged_store]);
+    }, [active_sheet_index]);
+
+    /**
      * Record a highlight gesture this window made, once the host has applied it.
      *
      * A plain record with nothing staged alongside it: unlike a cell edit, the
@@ -1647,12 +1690,20 @@ export function App(): React.JSX.Element {
         Array.from(crypto.getRandomValues(new Uint32Array(2)), (value) =>
             value.toString(36)).join('-'),
     );
+    // Appends and inserts share one in-flight map, so every fence that waits
+    // for an append (Save, Undo, Redo, other edits, leaving Edit mode) also
+    // waits for an insert, as the host's one reservation slot does.
     const pending_append_requests_ref = useRef(new Map<string, {
         readonly sourceGeneration: number;
         readonly editSessionId: string;
         readonly sheetIndex: number;
+    } & ({
+        readonly kind: 'append';
         readonly resolve: (result: AppendRowsAdmission | undefined) => void;
-    }>());
+    } | {
+        readonly kind: 'insert';
+        readonly resolve: (result: StructuralInsertAdmission | undefined) => void;
+    })>());
     const [append_request_pending, set_append_request_pending] = useState(false);
     const restore_saved_rows_seq_ref = useRef(0);
     const pending_saved_row_restorations_ref = useRef(new Map<string, {
@@ -6335,6 +6386,21 @@ export function App(): React.JSX.Element {
         || !edit_gestures_admitted()
     ), [edit_gestures_admitted, edit_session_pending, preview_mode]);
 
+    /**
+     * While a worksheet holds Pending Inserted Rows its display order must
+     * stay the layout's, so a request that would sort, filter, or hide rows
+     * on it is refused with the reason. One clearing a transform is not
+     * refused: none can exist while inserted rows do, and clearing is harmless.
+     */
+    const inserted_rows_refuse_transform = useCallback((sheet_index: number): boolean => {
+        for (const [index, store] of edit_session_registry_ref.current?.pending_entries() ?? []) {
+            if (index !== sheet_index || !has_inserted_rows(store.snapshot())) continue;
+            host_bridge.postMessage({ type: 'showWarning', message: INSERTED_ROWS_TRANSFORM_MESSAGE });
+            return true;
+        }
+        return false;
+    }, []);
+
     const handle_transform_change = useCallback(
         (next_state: SheetTransformState, origin: TransformOrigin): boolean => {
             if (transform_request_blocked()) return false;
@@ -6362,11 +6428,18 @@ export function App(): React.JSX.Element {
                 source_row_count,
             );
             if (transforms_semantically_equal(current, sanitized)) return false;
+            if (
+                (sanitized.sort.length > 0
+                    || sanitized.filters.some((filter) => filter.enabled)
+                    || (sanitized.hiddenRows?.length ?? 0) > 0)
+                && inserted_rows_refuse_transform(active_sheet_index)
+            ) return false;
             request_transform(active_sheet_index, sanitized, 'user', origin);
             return true;
         },
         [
             active_sheet_index,
+            inserted_rows_refuse_transform,
             meta,
             request_transform,
             transform_request_blocked,
@@ -6377,6 +6450,7 @@ export function App(): React.JSX.Element {
         if (
             transform_request_blocked()
             || pending_transforms[active_sheet_index]
+            || inserted_rows_refuse_transform(active_sheet_index)
         ) return;
         const request_id = [
             'transform',
@@ -6407,6 +6481,7 @@ export function App(): React.JSX.Element {
         });
     }, [
         active_sheet_index,
+        inserted_rows_refuse_transform,
         pending_transforms,
         transform_request_blocked,
     ]);
@@ -6430,6 +6505,7 @@ export function App(): React.JSX.Element {
         ].join(':');
         return new Promise((resolve) => {
             pending_append_requests_ref.current.set(request_id, {
+                kind: 'append',
                 sourceGeneration: source_generation,
                 editSessionId: edit_session_id,
                 sheetIndex: active_sheet_index,
@@ -6449,6 +6525,62 @@ export function App(): React.JSX.Element {
                 },
                 sourceGeneration: source_generation,
                 count,
+            });
+        });
+    }, [active_sheet_index]);
+
+    const request_structural_insert = useCallback((request: StructuralInsertRequest): Promise<
+        StructuralInsertAdmission | undefined
+    > => {
+        const edit_session_id = csv_edit_session_id_ref.current;
+        const sheet = meta_ref.current?.sheets[active_sheet_index];
+        if (
+            edit_session_id === undefined
+            || sheet === undefined
+            || !Number.isSafeInteger(request.count)
+            || request.count <= 0
+        ) return Promise.resolve(undefined);
+        // A sort, filter, or hide still computing would commit after the
+        // insert, under the inserted-rows lock: the host refuses the overlap
+        // too, and this keeps the request from being sent at all.
+        if (pending_transform_request_ids_ref.current[active_sheet_index] !== undefined) {
+            host_bridge.postMessage({
+                type: 'showWarning',
+                message: 'Wait for sorting and filtering to finish, then insert again.',
+            });
+            return Promise.resolve(undefined);
+        }
+        const source_generation = source_generation_ref.current;
+        const request_id = [
+            'insert',
+            append_request_prefix_ref.current,
+            ++append_request_seq_ref.current,
+        ].join(':');
+        return new Promise((resolve) => {
+            pending_append_requests_ref.current.set(request_id, {
+                kind: 'insert',
+                sourceGeneration: source_generation,
+                editSessionId: edit_session_id,
+                sheetIndex: active_sheet_index,
+                resolve,
+            });
+            set_append_request_pending(true);
+            host_bridge.postMessage({
+                type: 'requestStructuralInsert',
+                requestId: request_id,
+                editSessionId: edit_session_id,
+                worksheet: {
+                    sheetIndex: active_sheet_index,
+                    sheetName: sheet.name,
+                    ...(sheet.worksheetId === undefined
+                        ? {}
+                        : { worksheetId: sheet.worksheetId }),
+                },
+                sourceGeneration: source_generation,
+                axis: 'rows',
+                anchor: { row: request.anchor },
+                side: request.side,
+                count: request.count,
             });
         });
     }, [active_sheet_index]);
@@ -6522,10 +6654,12 @@ export function App(): React.JSX.Element {
         if (
             transform_request_blocked()
             || pending_transforms[active_sheet_index]
+            || inserted_rows_refuse_transform(active_sheet_index)
         ) return;
         set_filter_editor({ column_index, anchor, restore_focus, origin });
     }, [
         active_sheet_index,
+        inserted_rows_refuse_transform,
         pending_transforms,
         transform_request_blocked,
     ]);
@@ -6767,9 +6901,70 @@ export function App(): React.JSX.Element {
                 // resuming here reads the stores the grant just replaced rather
                 // than the ones it is about to.
                 settle_session_grant_waiters(msg.granted && !!msg.editSessionId);
+            } else if (msg.type === 'structuralInsertResult') {
+                const pending = pending_append_requests_ref.current.get(msg.requestId);
+                if (pending === undefined || pending.kind !== 'insert') {
+                    // A reply to a request this window no longer tracks (it
+                    // remounted, or the document left) is settled as released.
+                    if (msg.granted && csv_edit_session_id_ref.current !== undefined) {
+                        host_bridge.postMessage({
+                            type: 'settleRowAdmission',
+                            requestId: msg.requestId,
+                            editSessionId: csv_edit_session_id_ref.current,
+                            accepted: false,
+                        });
+                    }
+                    return;
+                }
+                pending_append_requests_ref.current.delete(msg.requestId);
+                if (pending_append_requests_ref.current.size === 0) {
+                    set_append_request_pending(false);
+                }
+                if (
+                    msg.sourceGeneration !== pending.sourceGeneration
+                    || msg.sourceGeneration !== source_generation_ref.current
+                    || csv_edit_session_id_ref.current !== pending.editSessionId
+                    || rendered_sheet_index_ref.current !== pending.sheetIndex
+                    || !msg.granted
+                    || msg.rowIds === undefined
+                    || msg.formatTemplate === undefined
+                    || msg.structuralBasis === undefined
+                    || msg.appendBasis === undefined
+                ) {
+                    if (msg.granted) {
+                        host_bridge.postMessage({
+                            type: 'settleRowAdmission',
+                            requestId: msg.requestId,
+                            editSessionId: pending.editSessionId,
+                            accepted: false,
+                        });
+                    }
+                    pending.resolve(undefined);
+                    if (msg.reason) {
+                        host_bridge.postMessage({ type: 'showWarning', message: msg.reason });
+                    }
+                    return;
+                }
+                let settled = false;
+                pending.resolve({
+                    rowIds: msg.rowIds,
+                    formatTemplate: msg.formatTemplate,
+                    structuralBasis: msg.structuralBasis,
+                    appendBasis: msg.appendBasis,
+                    settle: (accepted) => {
+                        if (settled) return;
+                        settled = true;
+                        host_bridge.postMessage({
+                            type: 'settleRowAdmission',
+                            requestId: msg.requestId,
+                            editSessionId: pending.editSessionId,
+                            accepted,
+                        });
+                    },
+                });
             } else if (msg.type === 'appendRowsResult') {
                 const pending = pending_append_requests_ref.current.get(msg.requestId);
-                if (pending === undefined) return;
+                if (pending === undefined || pending.kind !== 'append') return;
                 pending_append_requests_ref.current.delete(msg.requestId);
                 if (pending_append_requests_ref.current.size === 0) {
                     set_append_request_pending(false);
@@ -7784,6 +7979,19 @@ export function App(): React.JSX.Element {
         active_layout_change_snapshot,
         active_layout_change_snapshot,
     );
+    // What "Keep new rows at the end" loses, counted for its notice: Pending
+    // Columns that hold typed values. (CSV and TSV have no formulas, so no
+    // formula can show #REF! or move.)
+    const active_column_values_lost_snapshot = useCallback(
+        () => (active_pending_row_store.snapshot().pendingColumns ?? []).filter((column) =>
+            Object.values(column.cells).some((cell) => cell.value !== '')).length,
+        [active_pending_row_store],
+    );
+    const active_column_values_lost = useSyncExternalStore(
+        subscribe_active_pending_conflicts,
+        active_column_values_lost_snapshot,
+        active_column_values_lost_snapshot,
+    );
     const current_column_projection = useMemo(
         () => create_column_projection(
             current_sheet?.columnCount ?? 0,
@@ -8545,6 +8753,7 @@ export function App(): React.JSX.Element {
             append_composer_draft={active_composer_draft}
             on_append_composer_draft_change={handle_append_composer_draft_change}
             on_append_rows={request_append_rows}
+            on_insert_rows={request_structural_insert}
             history_store={history_store_ref.current!}
             gestures_admitted={edit_gestures_admitted}
             host_rejected_keys={live_rejected_keys}
@@ -8894,6 +9103,12 @@ export function App(): React.JSX.Element {
                             </li>
                         ))}
                     </ul>
+                    {active_column_values_lost > 0 && structural_conflicts.some((conflict) =>
+                        conflict.reason === 'structuralBasisChanged') && (
+                        <p>
+                            {`Values typed in ${active_column_values_lost} new ${active_column_values_lost === 1 ? 'column' : 'columns'} will be discarded.`}
+                        </p>
+                    )}
                     <div className="external-change-item-actions">
                         <button
                             disabled={structurally_conflicted_pending_row_ids.length === 0
@@ -8939,15 +9154,16 @@ export function App(): React.JSX.Element {
                                 Cancel affected row removals
                             </button>
                         )}
-                        {/* "Keep new rows at the end" converts Pending Inserted
-                            Rows to appends, so it is offered once inserting
-                            lands (delivery step 6); until then a worksheet has
-                            no inserted rows for it to keep. */}
                         {structural_conflicts.some((conflict) =>
                             conflict.reason === 'structuralBasisChanged') && (
-                            <button onClick={discard_active_layout_changes}>
-                                {`Discard row and column changes on ${current_sheet.name}`}
-                            </button>
+                            <>
+                                <button onClick={keep_active_inserted_rows_at_end}>
+                                    Keep new rows at the end
+                                </button>
+                                <button onClick={discard_active_layout_changes}>
+                                    {`Discard row and column changes on ${current_sheet.name}`}
+                                </button>
+                            </>
                         )}
                         <button
                             onClick={() => {

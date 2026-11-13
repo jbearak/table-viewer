@@ -54,6 +54,7 @@ import {
     type RowIdentity,
 } from './pending-changes';
 import type { FormulaAnchors } from './formula-anchors';
+import type { ColumnIdentity } from './worksheet-layout';
 import { is_plain_record } from './plain-record';
 import { is_canonical_cell_key } from './cell-key';
 import { MAX_SHEET_COLUMNS } from './spreadsheet-safety';
@@ -3420,6 +3421,23 @@ export type HostMessage =
     // asked about, so the webview can route a grant to the right worksheet store.
     | { type: 'editSessionResult'; requestId: string; granted: boolean; editSessionId?: string; sheetIndex?: number; pendingEdits?: SheetPendingEditCells; pendingChanges?: WorksheetPendingChanges; diffOnByDefault?: boolean }
     | { type: 'appendRowsResult'; requestId: string; sourceGeneration: number; granted: boolean; rowIds?: readonly string[]; formatTemplate?: PendingRowFormatTemplate; appendBasis?: PendingAppendBasis; reason?: string }
+    /**
+     * The answer to `requestStructuralInsert`: the minted insert-origin IDs,
+     * the row format template (`{ kind: 'none' }` for CSV and TSV), the
+     * Structural Basis the insert is authored against, and the worksheet's
+     * `appendBasis`. A granted reply is settled with `settleRowAdmission`.
+     */
+    | {
+        type: 'structuralInsertResult';
+        requestId: string;
+        sourceGeneration: number;
+        granted: boolean;
+        rowIds?: readonly string[];
+        formatTemplate?: PendingRowFormatTemplate;
+        structuralBasis?: StructuralBasis;
+        appendBasis?: PendingAppendBasis;
+        reason?: string;
+    }
     | { type: 'restoreSavedRowsResult'; requestId: string; sourceGeneration: number; granted: boolean; appendHistoryIds?: readonly string[]; appendBasis?: PendingAppendBasis; reason?: string }
     | { type: 'tailRemovalReplayValidated'; requestId: string; sourceGeneration: number; valid: boolean }
     /**
@@ -3640,7 +3658,23 @@ export type WebviewMessage =
         count: number;
     }
     | {
-        /** Release or retain a host-issued append/restoration reservation. */
+        /**
+         * Insert `count` blank Pending Inserted Rows (or, from step 8,
+         * Pending Columns) beside `anchor`. Admitted through the append
+         * ledger and its single reservation slot per worksheet.
+         */
+        type: 'requestStructuralInsert';
+        requestId: string;
+        editSessionId: string;
+        worksheet: WorksheetTarget;
+        sourceGeneration: number;
+        axis: 'rows' | 'columns';
+        anchor: { readonly row?: RowIdentity; readonly column?: ColumnIdentity };
+        side: 'before' | 'after';
+        count: number;
+    }
+    | {
+        /** Release or retain a host-issued append/insert/restoration reservation. */
         type: 'settleRowAdmission';
         requestId: string;
         editSessionId: string;

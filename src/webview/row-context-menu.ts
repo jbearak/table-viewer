@@ -20,6 +20,8 @@ export interface RowContextMenuModelProps {
     selected_row_count: number;
     can_hide_rows: boolean;
     show_disabled_hide_rows?: boolean;
+    /** Why "Hide row(s)" is disabled, when it is shown disabled. */
+    hide_rows_disabled_reason?: string;
     can_promote_row_to_header: boolean;
     on_hide_rows: () => void;
     on_promote_row_to_header: () => void;
@@ -35,12 +37,21 @@ export interface RowContextMenuModelProps {
     delete_rows?: StructureMenuAction;
     /** Restore row(s), offered when the selection includes Pending Row Removals. */
     restore_rows?: StructureMenuAction;
+    /** "Insert row above" / "Insert N rows above", offered beside Delete. */
+    insert_rows_above?: StructureMenuAction;
+    /** "Insert row below" / "Insert N rows below"; below the band's last row it appends. */
+    insert_rows_below?: StructureMenuAction;
 }
 
-function structure_item(verb: 'Delete' | 'Restore', action: StructureMenuAction): MenuItem {
+function structure_item(
+    verb: 'Delete' | 'Restore' | 'Insert above' | 'Insert below',
+    action: StructureMenuAction,
+): MenuItem {
     const count = Math.max(1, action.count);
+    const [word, side] = verb.split(' ');
+    const rows = count === 1 ? `${word} row` : `${word} ${count} rows`;
     return {
-        label: count === 1 ? `${verb} row` : `${verb} ${count} rows`,
+        label: side === undefined ? rows : `${rows} ${side}`,
         on_click: () => action.on_click?.(),
         ...(action.on_click === undefined
             ? {
@@ -58,12 +69,15 @@ export function hide_rows_menu_item(
     selected_row_count: number,
     on_hide_rows: () => void,
     disabled = false,
+    disabled_reason?: string,
 ): MenuItem {
     const count = Math.max(1, selected_row_count);
     return {
         label: count === 1 ? 'Hide row' : `Hide ${count} rows`,
         on_click: () => on_hide_rows(),
-        ...(disabled ? { disabled: true } : {}),
+        ...(disabled
+            ? { disabled: true, ...(disabled_reason === undefined ? {} : { disabled_reason }) }
+            : {}),
     };
 }
 
@@ -75,6 +89,12 @@ export function row_context_menu_items(props: RowContextMenuModelProps): MenuIte
             label: 'Use row as header',
             on_click: () => props.on_promote_row_to_header(),
         });
+    }
+    if (props.insert_rows_above !== undefined) {
+        items.push(structure_item('Insert above', props.insert_rows_above));
+    }
+    if (props.insert_rows_below !== undefined) {
+        items.push(structure_item('Insert below', props.insert_rows_below));
     }
     if (props.delete_rows !== undefined) {
         items.push(structure_item('Delete', props.delete_rows));
@@ -107,6 +127,7 @@ export function row_context_menu_items(props: RowContextMenuModelProps): MenuIte
             selected_row_count,
             props.on_hide_rows,
             !props.can_hide_rows,
+            props.hide_rows_disabled_reason,
         ));
     }
     items.push({

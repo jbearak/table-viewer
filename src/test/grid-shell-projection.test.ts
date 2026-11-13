@@ -10,6 +10,8 @@ import type {
     GridFocusHandle,
     HighlightSelectionHandle,
     GridShellProps,
+    StructuralInsertAdmission,
+    StructuralInsertRequest,
 } from '../webview/grid-shell';
 import { matches_filter } from '../table-transform';
 import type { CsvSaveOperation, FilterEntry, SheetTransformState } from '../types';
@@ -21,8 +23,9 @@ import {
 import { create_history_store, type HistoryStore } from '../webview/history-store';
 import { peek_history } from '../webview/history-stack-model';
 import { webview_formula_workbook } from '../webview/formula-anchor-model';
-import { EMPTY_PENDING_STRUCTURAL_CHANGES } from '../pending-changes';
-import { create_pending_row_store } from '../webview/pending-row-store';
+import { EMPTY_PENDING_STRUCTURAL_CHANGES, inserted_rows } from '../pending-changes';
+import { plan_pending_row_history_replay } from '../webview/pending-row-history';
+import { create_pending_row_store, keep_inserted_rows_at_end } from '../webview/pending-row-store';
 import {
     LAST_COLUMN_RESIZE_GUTTER_PX,
     MAX_AUTO_FIT_COLUMN_WIDTH_PX,
@@ -193,6 +196,23 @@ const resident_display_row = vi.hoisted(() => (source_row: number): number | und
     return undefined;
 });
 
+// Stable across renders, as the real loader's `useCallback`s are: a fresh
+// closure per render would rebuild every memo keyed on them and hide a memo
+// that misses a dependency.
+// Identity unless a test installs a permutation. See the knob's declaration:
+// with display === source, a display-keyed and a source-keyed implementation
+// cannot be told apart.
+const mock_get_source_row = vi.hoisted(() => (display_row: number) => (
+    grid_mock.source_row_for_display
+        ? grid_mock.source_row_for_display(display_row)
+        : display_row
+));
+const mock_get_display_row_for_source = vi.hoisted(() => (source_row: number) => (
+    additionally_loaded_source_rows.has(source_row)
+        ? additionally_loaded_source_rows.get(source_row)
+        : resident_display_row(source_row)
+));
+
 vi.mock('../webview/use-row-loader', () => ({
     use_row_loader: (
         _sheet: number,
@@ -208,14 +228,7 @@ vi.mock('../webview/use-row-loader', () => ({
             pin_rows: grid_mock.pin_rows,
             unpin_rows: grid_mock.unpin_rows,
             get_row: grid_mock.get_row,
-            // Identity unless a test installs a permutation. See the knob's
-            // declaration: with display === source, a display-keyed and a
-            // source-keyed implementation cannot be told apart.
-            get_source_row: (display_row: number) => (
-                grid_mock.source_row_for_display
-                    ? grid_mock.source_row_for_display(display_row)
-                    : display_row
-            ),
+            get_source_row: mock_get_source_row,
             // Residency as the real loader's source→page index defines it: a source
             // row is readable exactly when some display row in the window claims it.
             get_cell_raw_for_source: (source_row: number, col: number) => {
@@ -233,11 +246,7 @@ vi.mock('../webview/use-row-loader', () => ({
                 additionally_loaded_source_rows.has(source_row)
                 || resident_display_row(source_row) !== undefined
             ),
-            get_display_row_for_source: (source_row: number) => (
-                additionally_loaded_source_rows.has(source_row)
-                    ? additionally_loaded_source_rows.get(source_row)
-                    : resident_display_row(source_row)
-            ),
+            get_display_row_for_source: mock_get_display_row_for_source,
             get_compare_status: (row: number) => grid_mock.compare_status[row],
             get_compare_base: (row: number, col: number) =>
                 grid_mock.compare_base[`${row}:${col}`],
@@ -8632,5 +8641,518 @@ describe('row Delete and Restore in the row-gutter menu', () => {
             { location: [0, 2], value: { kind: 'text', data: 'pasted' } },
         ], 'paste'));
         expect([...cells.snapshot().keys()]).toEqual(['2:0']);
+    });
+});
+
+describe('row Insert in the row-gutter menu', () => {
+    const basis = {
+        kind: 'delimited' as const,
+        byteLength: 10,
+        digest: 'digest',
+        sourceRowCount: 4,
+        sourceColumnCount: 3,
+    };
+    const supported = {
+        rows: { supported: true as const },
+        columns: { supported: true as const },
+        basis,
+    };
+    const template = { id: 'plain', format: { kind: 'none' as const } };
+    const append_basis = { sourceRowCount: 4, columnCount: 3, schemaFingerprint: 'sha256:x' };
+    const structure_props = (overrides: Partial<GridShellProps> = {}) => props({
+        sheet_meta: { ...props().sheet_meta, rowCount: 4, sourceRowCount: 4 },
+        row_count: 4,
+        edit_mode: true,
+        csv_editable: true,
+        edit_session_id: 'session',
+        transform_sections: true,
+        structural_support: supported,
+        ...overrides,
+    });
+    const open_row_menu = async (row: number) => {
+        const on_cell_context_menu = grid_mock.props!.onCellContextMenu as
+            (cell: [number, number], event: Record<string, unknown>) => void;
+        await act(async () => on_cell_context_menu([-1, row], {
+            preventDefault: vi.fn(),
+            bounds: { x: 0, y: 24 * (row + 1), width: 40, height: 24 },
+            localEventX: 10,
+            localEventY: 10,
+        }));
+    };
+    const menu_item = (label: string) => Array.from(document.querySelectorAll('button'))
+        .find((candidate) => candidate.textContent === label);
+    const caret = () => (grid_mock.props!.gridSelection as {
+        current?: { cell: [number, number] };
+    }).current?.cell;
+    /** An admission the test resolves when it chooses, recording how it settles. */
+    const admission = (row_ids: readonly string[]) => {
+        const settled: boolean[] = [];
+        let resolve!: (value: StructuralInsertAdmission | undefined) => void;
+        const promise = new Promise<StructuralInsertAdmission | undefined>((done) => { resolve = done; });
+        return {
+            settled,
+            on_insert_rows: vi.fn((_request: StructuralInsertRequest) => promise),
+            grant: () => resolve({
+                rowIds: row_ids,
+                formatTemplate: template,
+                structuralBasis: basis,
+                appendBasis: append_basis,
+                settle: (accepted) => { settled.push(accepted); },
+            }),
+        };
+    };
+
+    it('inserts a row below as one action, labelled, numbered, and focused', async () => {
+        const pending = create_pending_row_store({ session_id: 'session' });
+        const history = create_history_store();
+        const host = admission(['ins-a']);
+        await render_grid(structure_props({
+            edit_session: create_edit_session_store({ session_id: 'session' }),
+            pending_row_store: pending,
+            history_store: history,
+            on_insert_rows: host.on_insert_rows,
+        }));
+        await open_row_menu(1);
+        expect(menu_button_labels()).toEqual(expect.arrayContaining(['Insert row above', 'Insert row below']));
+        await act(async () => menu_item('Insert row below')!.click());
+        expect(host.on_insert_rows).toHaveBeenCalledWith({
+            anchor: { kind: 'source', sourceRow: 1 },
+            side: 'after',
+            count: 1,
+        });
+        await act(async () => host.grant());
+        await vi.waitFor(() => expect(host.settled).toEqual([true]));
+        expect(pending.snapshot().rowLayout?.runs).toEqual([
+            { kind: 'source', start: 0, count: 2 },
+            { kind: 'pending', ids: ['ins-a'] },
+            { kind: 'source', start: 2, count: 2 },
+        ]);
+        expect(pending.snapshot().structuralBasis).toEqual(basis);
+        const undo = peek_history(history.snapshot(), 'undo');
+        if (undo.kind !== 'available') throw new Error('nothing recorded');
+        expect(undo.entry.action.label).toBe('Insert row');
+        expect(undo.entry.action.changes.map((change) => change.kind)).toEqual(['rowLayout']);
+        const label = grid_mock.props!.getRowAccessibilityLabel as (row: number) => string | undefined;
+        expect(label(2)).toBe('Row 3, inserted');
+        const get_row_number = (grid_mock.props!.rowMarkers as {
+            getRowNumber(row: number): number | undefined;
+        }).getRowNumber;
+        expect([0, 1, 2, 3, 4].map(get_row_number)).toEqual([1, 2, 3, 4, 5]);
+        // Focus lands on the new row in the focused column, by polling.
+        await vi.waitFor(() => expect(caret()).toEqual([0, 2]));
+    });
+
+    it('records and undoes a cell edit in an inserted row', async () => {
+        const pending = create_pending_row_store({ session_id: 'session' });
+        const history = create_history_store();
+        const host = admission(['ins-a']);
+        await render_grid(structure_props({
+            edit_session: create_edit_session_store({ session_id: 'session' }),
+            pending_row_store: pending,
+            history_store: history,
+            on_insert_rows: host.on_insert_rows,
+        }));
+        await open_row_menu(0);
+        await act(async () => menu_item('Insert row below')!.click());
+        await act(async () => host.grant());
+        await vi.waitFor(() => expect(host.settled).toEqual([true]));
+        const inserted = pending.snapshot();
+        const on_cells_edited = grid_mock.props!.onCellsEdited as (
+            items: readonly unknown[], source?: string,
+        ) => unknown;
+        await act(async () => on_cells_edited([
+            { location: [0, 1], value: { kind: 'text', data: 'typed' } },
+        ]));
+        expect(pending.snapshot().appendedRows).toEqual([expect.objectContaining({
+            id: 'ins-a',
+            origin: 'insert',
+            cells: { 0: expect.objectContaining({ value: 'typed' }) },
+        })]);
+        expect(pending.snapshot().rowLayout).toEqual(inserted.rowLayout);
+        const peek = peek_history(history.snapshot(), 'undo');
+        if (peek.kind !== 'available') throw new Error('nothing recorded');
+        expect(peek.entry.action.changes.map((change) => change.kind)).toEqual(['rowAppend']);
+        const undo = plan_pending_row_history_replay(peek.entry.action, 'undo', () => pending.snapshot());
+        if (undo.kind !== 'plan') throw new Error(undo.kind);
+        expect(undo.plans[0]!.next).toEqual(inserted);
+    });
+
+    it('does not request an insert once a sort has started since the menu opened', async () => {
+        const host = admission(['ins-a']);
+        const base = structure_props({
+            edit_session: create_edit_session_store({ session_id: 'session' }),
+            pending_row_store: create_pending_row_store({ session_id: 'session' }),
+            on_insert_rows: host.on_insert_rows,
+        });
+        const GridShell = await render_grid(base);
+        await open_row_menu(1);
+        const item = menu_item('Insert row above')!;
+        expect(item.getAttribute('aria-disabled')).toBeNull();
+        // A sort request goes out while the menu is still open.
+        await act(async () => {
+            root!.render(React.createElement(GridShell, { ...base, transform_pending: true }));
+        });
+        // The open menu follows: Insert is disabled with the reason.
+        const current = menu_item('Insert row above')!;
+        expect(current.getAttribute('aria-disabled')).toBe('true');
+        expect(current.getAttribute('aria-description'))
+            .toBe('Clear sorts, filters, and hidden rows to insert or move rows.');
+        await act(async () => current.click());
+        await act(async () => item.click());
+        expect(host.on_insert_rows).not.toHaveBeenCalled();
+    });
+
+    /** Install one inserted row after source row 0 through the grid's own gesture. */
+    const insert_after_first = async (
+        overrides: Partial<GridShellProps> = {},
+        row_ids: readonly string[] = ['ins-a'],
+    ) => {
+        const pending = create_pending_row_store({ session_id: 'session' });
+        const history = create_history_store();
+        const host = admission(row_ids);
+        const GridShell = await render_grid(structure_props({
+            edit_session: create_edit_session_store({ session_id: 'session' }),
+            pending_row_store: pending,
+            history_store: history,
+            on_insert_rows: host.on_insert_rows,
+            ...overrides,
+        }));
+        await open_row_menu(0);
+        await act(async () => menu_item('Insert row below')!.click());
+        await act(async () => host.grant());
+        await vi.waitFor(() => expect(host.settled).toEqual([true]));
+        return { pending, history, GridShell };
+    };
+    const topology_key = () => grid_mock.props!.pasteTopologyKey as string;
+
+    it('changes the paste topology key when layout placement changes without changing the row set', async () => {
+        const { pending } = await insert_after_first();
+        const inserted = topology_key();
+        // Delete in layout mode: the source row stays in place, as a removal.
+        await open_row_menu(2);
+        await act(async () => menu_item('Delete row')!.click());
+        const deleted = topology_key();
+        expect(deleted).not.toBe(inserted);
+        // Restore puts it back: the key follows.
+        await open_row_menu(2);
+        await act(async () => menu_item('Restore row')!.click());
+        const restored = topology_key();
+        expect(restored).not.toBe(deleted);
+        // "Keep new rows at the end" moves the inserted row into the band.
+        const kept = keep_inserted_rows_at_end(pending.snapshot(), {
+            worksheet: { sheetIndex: 0 },
+            bodyStart: 0,
+            sourceRowCount: 4,
+            sourceColumnCount: 3,
+            bodyViewTransformed: false,
+        });
+        if (!kept.ok) throw new Error(kept.refusal.message);
+        await act(async () => { pending.apply_structure('session', kept.outcome); });
+        expect(pending.snapshot().appendedRows.map((row) => row.id)).toEqual(['ins-a']);
+        expect(topology_key()).not.toBe(restored);
+    });
+
+    it('appends after rows "Keep new rows at the end" placed above the edit clock', async () => {
+        const append_basis_for_band = { sourceRowCount: 4, columnCount: 3, schemaFingerprint: 'sha256:x' };
+        const on_append_rows = vi.fn(async () => ({
+            rowIds: ['app-new'],
+            formatTemplate: template,
+            appendBasis: append_basis_for_band,
+            settle: () => {},
+        }));
+        const { pending } = await insert_after_first({ on_append_rows });
+        const far = Date.now() * 1_000 + 1_000_000_000;
+        const kept = keep_inserted_rows_at_end(pending.snapshot(), {
+            worksheet: { sheetIndex: 0 },
+            bodyStart: 0,
+            sourceRowCount: 4,
+            sourceColumnCount: 3,
+            bodyViewTransformed: false,
+        }, far);
+        if (!kept.ok) throw new Error(kept.refusal.message);
+        await act(async () => { pending.apply_structure('session', kept.outcome); });
+        // "Insert row below" on the band's last row appends.
+        await open_row_menu(4);
+        await act(async () => menu_item('Insert row below')!.click());
+        await vi.waitFor(() => expect(pending.snapshot().appendedRows.map((row) => row.id))
+            .toEqual(['ins-a', 'app-new']));
+        const [converted, added] = pending.snapshot().appendedRows;
+        expect(added!.createdOrder).toBeGreaterThan(converted!.createdOrder);
+    });
+
+    it('resizes an inserted row together with the source rows selected around it', async () => {
+        const on_row_resize = vi.fn((
+            _intervals: unknown,
+            _height: number,
+            finish?: (applied: boolean) => void,
+        ) => finish?.(true));
+        const { pending } = await insert_after_first({ on_row_resize });
+        const on_selection_change = grid_mock.props!.onGridSelectionChange as (selection: unknown) => void;
+        // Display rows 0 (source 0), 1 (inserted), 2 (source 1).
+        await act(async () => on_selection_change({ columns: compact([]), rows: compact([0, 1, 2]) }));
+        const on_resize_start = grid_mock.row_resize_props!.on_resize_start as
+            (row: number, height: number) => void;
+        const on_resize = grid_mock.row_resize_props!.on_resize as (row: number, height: number) => void;
+        const on_resize_end = grid_mock.row_resize_props!.on_resize_end as (row: number, height: number) => void;
+        act(() => on_resize_start(1, 24));
+        act(() => on_resize(1, 48));
+        act(() => on_resize_end(1, 48));
+        expect(on_row_resize).toHaveBeenCalledOnce();
+        expect(on_row_resize.mock.calls[0]![0]).toEqual([{ start: 0, end: 1 }]);
+        expect(pending.snapshot().appendedRows).toEqual([
+            expect.objectContaining({ id: 'ins-a', viewerRowHeight: 48 }),
+        ]);
+    });
+
+    const keep_at_end = async (pending: ReturnType<typeof create_pending_row_store>) => {
+        const kept = keep_inserted_rows_at_end(pending.snapshot(), {
+            worksheet: { sheetIndex: 0 },
+            bodyStart: 0,
+            sourceRowCount: 4,
+            sourceColumnCount: 3,
+            bodyViewTransformed: false,
+        });
+        if (!kept.ok) throw new Error(kept.refusal.message);
+        await act(async () => { pending.apply_structure('session', kept.outcome); });
+    };
+    const selected_rows = () => {
+        const rows = (grid_mock.props!.gridSelection as { rows: { toArray(): number[] } }).rows;
+        return rows.toArray();
+    };
+
+    it('keeps an inline inserted row selected through "Keep new rows at the end"', async () => {
+        const { pending } = await insert_after_first();
+        const on_selection_change = grid_mock.props!.onGridSelectionChange as (selection: unknown) => void;
+        // Display rows 0 (source 0), 1 (inserted), 2 (source 1).
+        // Let the insert's focus move land first, so it does not replace this selection.
+        await vi.waitFor(() => expect((grid_mock.props!.gridSelection as {
+            current?: { cell: [number, number] };
+        }).current?.cell).toEqual([0, 1]));
+        await act(async () => on_selection_change({ columns: compact([]), rows: compact([0, 1, 2]) }));
+        expect(selected_rows()).toEqual([0, 1, 2]);
+        await keep_at_end(pending);
+        // Source rows 0 and 1 are now display rows 0 and 1; the row moved to
+        // the band's end, display row 4, and stays selected. As for a row that
+        // moves into a band today, the remapped selection spans its rows.
+        await vi.waitFor(() => expect(selected_rows()).toEqual([0, 1, 2, 3, 4]));
+    });
+
+    it('highlights an inserted row selected with the source row above it', async () => {
+        const highlight_ref: { current: HighlightSelectionHandle | null } = { current: null };
+        const on_highlight_selection = vi.fn();
+        const { pending } = await insert_after_first({ highlight_ref, on_highlight_selection });
+        const on_selection_change = grid_mock.props!.onGridSelectionChange as (selection: unknown) => void;
+        await act(async () => on_selection_change({
+            columns: compact([]),
+            rows: compact([]),
+            current: { cell: [0, 0], range: { x: 0, y: 0, width: 1, height: 2 }, rangeStack: [] },
+        }));
+        expect(highlight_ref.current?.apply('yellow')).toBe(true);
+        const call = on_highlight_selection.mock.calls[0]!;
+        expect(call[0]).toEqual({ displayRows: [{ start: 0, end: 0 }], sourceColumns: [0] });
+        const pending_gesture = call[2];
+        expect(pending_gesture).toBeDefined();
+        expect(pending_gesture.commit([], 'Highlight cells')).toBe(true);
+        expect(pending.snapshot().appendedRows[0]?.highlights).toEqual({ 0: 'yellow' });
+    });
+
+    it('offers Clear highlight for a highlighted inserted row', async () => {
+        const { pending } = await insert_after_first();
+        const inserted = pending.snapshot();
+        await act(async () => {
+            pending.stage_replace('session', inserted, {
+                ...inserted,
+                appendedRows: inserted.appendedRows.map((row) => ({ ...row, highlights: { 0: 'pink' } })),
+            })?.commit();
+        });
+        const on_selection_change = grid_mock.props!.onGridSelectionChange as (selection: unknown) => void;
+        await act(async () => on_selection_change({
+            columns: compact([]),
+            rows: compact([]),
+            current: { cell: [0, 1], range: { x: 0, y: 1, width: 1, height: 1 }, rangeStack: [] },
+        }));
+        const on_cell_context_menu = grid_mock.props!.onCellContextMenu as
+            (cell: [number, number], event: Record<string, unknown>) => void;
+        await act(async () => on_cell_context_menu([0, 1], {
+            preventDefault: vi.fn(),
+            bounds: { x: 40, y: 60, width: 100, height: 24 },
+            localEventX: 10,
+            localEventY: 10,
+        }));
+        expect(menu_button_labels()).toContain('Clear highlight');
+    });
+
+    it('repaints an inline inserted row whose physical row a changed key names', async () => {
+        await insert_after_first({ edit_session: create_edit_session_store({ session_id: 'session' }) });
+        grid_mock.update_cells.mockClear();
+        const on_cells_edited = grid_mock.props!.onCellsEdited as (items: readonly unknown[]) => unknown;
+        // Source row 1 (display row 2) is edited; the inserted row now sits at
+        // physical row 1 (display row 1), whose formula results key the same way.
+        await act(async () => on_cells_edited([{ location: [0, 2], value: { kind: 'text', data: 'x' } }]));
+        const damaged = grid_mock.update_cells.mock.calls.flatMap(([cells]) =>
+            (cells as { cell: [number, number] }[]).map(({ cell }) => cell.join(',')));
+        expect(damaged).toContain('0,1');
+    });
+
+    it('shows an inline inserted row’s new height and highlight after a rows-only change', async () => {
+        const { pending } = await insert_after_first();
+        const row_height = () => (grid_mock.props!.rowHeight as (row: number) => number)(1);
+        const default_height = row_height();
+        const inserted_id = pending.snapshot().appendedRows[0].id;
+        // A height and a highlight publish rows-kind changes: the row's payload
+        // moves, the topology does not, so the projection is not rebuilt.
+        await act(async () => {
+            pending.set_row_heights('session', new Set([inserted_id]), default_height + 40);
+            pending.set_highlights('session', new Set([inserted_id]), [0], 'pink');
+        });
+        expect(row_height()).toBe(default_height + 40);
+        const get_cell_content = grid_mock.props!.getCellContent as (cell: [number, number]) => {
+            themeOverride?: { bgCell?: string };
+        };
+        expect(get_cell_content([0, 1]).themeOverride?.bgCell).toBe(highlight_rgba('pink', false));
+    });
+
+    it('keeps a deleted inserted row’s tombstone through a later insert while a Formula Anchor names it', async () => {
+        const pending = create_pending_row_store({ session_id: 'session' });
+        const queued = [['ins-a'], ['ins-b']];
+        const settled: boolean[] = [];
+        await render_grid(structure_props({
+            edit_session: create_edit_session_store({ session_id: 'session' }),
+            pending_row_store: pending,
+            history_store: create_history_store(),
+            on_insert_rows: async () => ({
+                rowIds: queued.shift()!,
+                formatTemplate: template,
+                structuralBasis: basis,
+                appendBasis: append_basis,
+                settle: (accepted: boolean) => { settled.push(accepted); },
+            }),
+            // A stored anchor elsewhere in the workbook names ins-a.
+            formula_anchor_references: () => ({ rows: new Set(['ins-a']), columns: new Set() }),
+        }));
+        await open_row_menu(0);
+        await act(async () => menu_item('Insert row below')!.click());
+        await vi.waitFor(() => expect(settled).toEqual([true]));
+        await open_row_menu(1);
+        await act(async () => menu_item('Delete row')!.click());
+        expect(pending.snapshot().rowLayout?.discardedPendingRows.map((row) => row.id)).toEqual(['ins-a']);
+        // The insert is a structural action on the rows axis too: it must ask
+        // the same references, or it drops the tombstone the anchor names.
+        await open_row_menu(0);
+        await act(async () => menu_item('Insert row below')!.click());
+        await vi.waitFor(() => expect(settled).toEqual([true, true]));
+        expect(inserted_rows(pending.snapshot()).map((row) => row.id)).toEqual(['ins-b']);
+        expect(pending.snapshot().rowLayout?.discardedPendingRows.map((row) => row.id)).toEqual(['ins-a']);
+    });
+
+    it('cancels an insert whose anchor was removed while the request was out', async () => {
+        const pending = create_pending_row_store({ session_id: 'session' });
+        const host = admission(['ins-a']);
+        await render_grid(structure_props({
+            edit_session: create_edit_session_store({ session_id: 'session' }),
+            pending_row_store: pending,
+            on_insert_rows: host.on_insert_rows,
+        }));
+        await open_row_menu(1);
+        await act(async () => menu_item('Insert row above')!.click());
+        // Row 1 is deleted before the reply arrives.
+        await open_row_menu(1);
+        await act(async () => menu_item('Delete row')!.click());
+        expect(pending.snapshot().rowLayout?.removedSourceRows).toEqual([{ start: 1, count: 1 }]);
+        await act(async () => host.grant());
+        await vi.waitFor(() => expect(host.settled).toEqual([false]));
+        expect(pending.snapshot().appendedRows).toEqual([]);
+        expect(document.querySelector('[data-testid="structure-announcement"]')?.textContent)
+            .toContain('Insert canceled because its row was removed.');
+    });
+
+    it('releases a reply that arrives after the session changed', async () => {
+        const pending = create_pending_row_store({ session_id: 'session' });
+        const host = admission(['ins-a']);
+        await render_grid(structure_props({
+            edit_session: create_edit_session_store({ session_id: 'session' }),
+            pending_row_store: pending,
+            on_insert_rows: host.on_insert_rows,
+        }));
+        await open_row_menu(0);
+        await act(async () => menu_item('Insert row below')!.click());
+        // A discard or a new grant re-stamps the App-owned store.
+        await act(async () => pending.adopt_session('other'));
+        await act(async () => host.grant());
+        await vi.waitFor(() => expect(host.settled).toEqual([false]));
+        expect(pending.snapshot().appendedRows).toEqual([]);
+    });
+
+    it('disables Insert in a transformed view and for a split selection, with the reasons', async () => {
+        await render_grid(structure_props({
+            edit_session: create_edit_session_store({ session_id: 'session' }),
+            pending_row_store: create_pending_row_store({ session_id: 'session' }),
+            on_insert_rows: vi.fn(),
+            transform_state: { sort: [{ colIndex: 0, direction: 'asc' }], filters: [] },
+        }));
+        await open_row_menu(1);
+        expect(menu_item('Insert row above')?.getAttribute('aria-description'))
+            .toBe('Clear sorts, filters, and hidden rows to insert or move rows.');
+
+        await render_grid(structure_props({
+            edit_session: create_edit_session_store({ session_id: 'session' }),
+            pending_row_store: create_pending_row_store({ session_id: 'session' }),
+            on_insert_rows: vi.fn(),
+        }));
+        const on_selection_change = grid_mock.props!.onGridSelectionChange as (selection: unknown) => void;
+        await act(async () => on_selection_change({ columns: compact([]), rows: compact([0, 2]) }));
+        await open_row_menu(2);
+        expect(menu_item('Insert 2 rows below')?.getAttribute('aria-description'))
+            .toBe('Select adjacent rows to insert or move them.');
+    });
+
+    it('appends for "Insert row below" on the band’s last row', async () => {
+        const pending = create_pending_row_store({ session_id: 'session' });
+        pending.append_rows('session', ['band-a'], template, 1, append_basis);
+        const on_append_rows = vi.fn(async () => undefined);
+        await render_grid(structure_props({
+            edit_session: create_edit_session_store({ session_id: 'session' }),
+            pending_row_store: pending,
+            on_insert_rows: vi.fn(),
+            on_append_rows,
+        }));
+        await open_row_menu(4);
+        expect(menu_item('Insert row above')?.getAttribute('aria-description'))
+            .toBe('Appended rows stay at the end until you save.');
+        await act(async () => menu_item('Insert row below')!.click());
+        await vi.waitFor(() => expect(on_append_rows).toHaveBeenCalledWith(1));
+    });
+
+    it('disables sorting, filtering, and hiding rows while inserted rows exist', async () => {
+        const pending = create_pending_row_store({ session_id: 'session' });
+        const host = admission(['ins-a']);
+        const on_transform_change = vi.fn();
+        await render_grid(structure_props({
+            edit_session: create_edit_session_store({ session_id: 'session' }),
+            pending_row_store: pending,
+            on_insert_rows: host.on_insert_rows,
+            on_transform_change,
+        }));
+        await open_row_menu(0);
+        await act(async () => menu_item('Insert row below')!.click());
+        await act(async () => host.grant());
+        await vi.waitFor(() => expect(host.settled).toEqual([true]));
+        const reason = 'Save or discard inserted and moved rows to sort, filter, or hide rows.';
+        await open_row_menu(3);
+        expect(menu_item('Hide row')?.getAttribute('aria-description')).toBe(reason);
+        const on_header_context_menu = grid_mock.props!.onHeaderContextMenu as
+            (column: number, event: Record<string, unknown>) => void;
+        await act(async () => on_header_context_menu(0, {
+            preventDefault: vi.fn(),
+            bounds: { x: 100, y: 0, width: 100, height: 36 },
+            localEventX: 20,
+            localEventY: 10,
+        }));
+        const sort = Array.from(document.querySelectorAll('button'))
+            .find((button) => button.textContent?.includes('Sort ascending'))!;
+        expect(sort.getAttribute('aria-disabled')).toBe('true');
+        expect(sort.getAttribute('aria-description')).toBe(reason);
+        await act(async () => sort.click());
+        expect(on_transform_change).not.toHaveBeenCalled();
     });
 });

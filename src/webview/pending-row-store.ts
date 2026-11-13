@@ -1428,6 +1428,60 @@ export function discard_layout_changes(
     return { ok: true, outcome: Object.freeze({ ...result.outcome, next }) };
 }
 
+/**
+ * Review Changes' "Keep new rows at the end", offered beside the discard when
+ * the file changed under a live layout change: every live Pending Inserted
+ * Row becomes a Pending Appended Row, in layout order, with `origin` set to
+ * `append` and fresh `createdOrder`s after every Pending Row's (so after the
+ * band's highest), which puts it at the end of `appendedRows` and of the
+ * band. Removals, moves, Pending Columns, and tombstones are dropped, leaving
+ * the source layout and no Structural Basis; `appendBasis` is kept, so the
+ * band then reconciles by today's append rules. Typed content in the inserted
+ * rows survives. One history action: its `pendingRows` transitions hold each
+ * converted row's old origin and order, so Undo puts it back in the layout.
+ *
+ * `first_created_order` is a floor for the fresh orders, so a caller can keep
+ * them on the same clock as the orders it issues for appends.
+ */
+export function keep_inserted_rows_at_end(
+    changes: PendingStructuralChanges,
+    context: WorksheetStructureContext,
+    first_created_order = 0,
+): StructureResult {
+    if (changes.columnLayout !== undefined || (changes.pendingColumns?.length ?? 0) > 0) {
+        return refuse_structure('invalid', 'Keeping new rows with column changes is not available yet.');
+    }
+    const layout = row_layout_of(changes, context);
+    const inserted = new Map(inserted_rows(changes).map((row) => [row.id, row]));
+    const in_layout_order = index_row_layout(layout).segments.flatMap((segment) =>
+        segment.kind === 'pending' && segment.status === 'live' && inserted.has(segment.id)
+            ? [inserted.get(segment.id)!]
+            : []);
+    let highest = -1;
+    for (const row of pending_rows(changes)) highest = Math.max(highest, row.createdOrder);
+    let next_order = Math.max(highest + 1, first_created_order);
+    if (!Number.isSafeInteger(next_order + in_layout_order.length)) {
+        return refuse_structure('invalid-created-order', 'New rows need a creation order.');
+    }
+    const converted = in_layout_order.map((row): PendingAppendedRow => ({
+        ...row,
+        origin: 'append',
+        createdOrder: next_order++,
+    }));
+    const result = finish_structure(changes, { ...context, structuralBasis: undefined }, 'rows', {
+        rowLayout: source_row_layout(context.bodyStart, body_row_count(context)),
+        columnLayout: column_layout_of(changes, context),
+        rows: [...appended_rows(changes), ...converted],
+        columns: [],
+    });
+    if (!result.ok) return result;
+    const next = own_pending_structural_changes({
+        ...result.outcome.next,
+        conflicts: result.outcome.next.conflicts.filter((conflict) => conflict.reason !== 'structuralBasisChanged'),
+    });
+    return { ok: true, outcome: Object.freeze({ ...result.outcome, next }) };
+}
+
 /** Drop Pending Column cells keyed by any of `keys`, keeping untouched columns as they are. */
 function columns_without_cells(
     columns: readonly PendingColumn[],

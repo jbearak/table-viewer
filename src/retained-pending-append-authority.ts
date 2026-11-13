@@ -5,6 +5,11 @@ export interface RetainedPendingAppendAuthorityInput {
     readonly formatTemplateId: string;
     readonly appendBasis?: PendingAppendBasis;
     readonly sourceGeneration: number;
+    /**
+     * An insert minted this row, so its replay may carry origin `insert`
+     * (a Pending Inserted Row or its discarded tombstone).
+     */
+    readonly insertMinted?: true;
 }
 
 export interface RetainedPendingAppendAuthority
