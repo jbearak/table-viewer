@@ -30,7 +30,11 @@ import {
     MAX_PENDING_APPENDED_ROWS,
     own_pending_structural_changes,
     own_pending_formula_reference_bases,
+    own_formula_anchors,
     own_pending_row_cells,
+    pending_cells_carry_formula_anchors,
+    pending_structure_carries_formula_anchors,
+    type PendingChangesFormat,
     own_saved_appended_row_snapshot,
     pending_changes_carry_layout,
     pending_rows,
@@ -49,6 +53,7 @@ import {
     type PendingFormulaReferenceBasis,
     type RowIdentity,
 } from './pending-changes';
+import type { FormulaAnchors } from './formula-anchors';
 import { is_plain_record } from './plain-record';
 import { is_canonical_cell_key } from './cell-key';
 import { MAX_SHEET_COLUMNS } from './spreadsheet-safety';
@@ -1079,6 +1084,8 @@ function decode_pending_edit_slots(
     if (is_plain_record(value)) {
         if (Object.hasOwn(value, 'sheets')) invalid_leaf('pendingEdits');
         const cells = validate_edit_cells(value);
+        // The pre-worksheet flat map was necessarily one CSV's edits.
+        if (pending_cells_carry_formula_anchors(cells)) invalid_leaf('pendingEdits');
         return Object.keys(cells).length === 0
             ? undefined
             : rebase_pending_edit_orders([{ cells }]);
@@ -1095,7 +1102,8 @@ function decode_pending_edit_slots(
             invalid_leaf('pendingEdits');
         }
         const cells = validate_edit_cells(slot.cells);
-        const structural = own_pending_structural_changes(slot);
+        // A slot without a sheet name was migrated from the CSV flat map.
+        const structural = own_pending_structural_changes(slot, { delimited: slot.sheetName === undefined });
         if (Object.keys(cells).length === 0 && !has_pending_structural_changes(structural)) {
             return undefined;
         }
@@ -1155,13 +1163,18 @@ function decode_pending_edit_slots(
 /**
  * Whether persisting `pendingEdits` needs the version-2 envelope: some slot
  * carries a row or column layout, a Pending Column, a Structural Basis, or a
- * Pending Row of origin `insert`. Formula Anchors join this list when they are
- * stored.
+ * Pending Row of origin `insert`, or some cell entry, Pending Row cell, or
+ * Pending Column cell carries Formula Anchors. The cell-entry decoder of an
+ * older build drops unknown fields, so anchors are a trigger of their own.
  */
 export function pending_edits_require_version_2(
     pending: PerFileState['pendingEdits'],
 ): boolean {
-    return !!pending?.some((slot) => slot !== undefined && pending_changes_carry_layout(slot));
+    return !!pending?.some((slot) => slot !== undefined && (
+        pending_changes_carry_layout(slot)
+        || pending_cells_carry_formula_anchors(slot.cells)
+        || pending_structure_carries_formula_anchors({ appendedRows: slot.appendedRows ?? [], pendingColumns: slot.pendingColumns })
+    ));
 }
 
 /** The `pendingEdits` envelope version `stringify_stored_per_file_state` writes for `state`. */
@@ -1873,6 +1886,13 @@ export interface CsvDirtyEntry {
     readonly valueEditOrder?: number;
     /** Pending append bands referenced by the formula when this value was authored. */
     readonly formulaReferenceBases?: readonly PendingFormulaReferenceBasis[];
+    /**
+     * Row and column identities the formula's references name, stored when the
+     * value was committed against a live layout change or named a Pending Row
+     * or Pending Column (see `formula-anchors.ts`). `.xlsx` only, and never
+     * alongside `formulaReferenceBases`: the anchors already name the rows.
+     */
+    readonly formulaAnchors?: FormulaAnchors;
 }
 
 /** The latest persisted side of a cell carrying a pending edit. */
@@ -2146,6 +2166,8 @@ export interface DirtyEntryOptions {
     readonly movedFrom?: CsvDirtyEntry['movedFrom'];
     readonly valueEditOrder?: number;
     readonly formulaReferenceBases?: readonly PendingFormulaReferenceBasis[];
+    /** Wins over `formulaReferenceBases`, which are then dropped. */
+    readonly formulaAnchors?: FormulaAnchors;
 }
 
 /**
@@ -2179,9 +2201,10 @@ export function make_dirty_entry(
         ...(options.valueEditOrder !== undefined
             ? { valueEditOrder: options.valueEditOrder }
             : {}),
-        ...(options.formulaReferenceBases !== undefined
+        ...(options.formulaReferenceBases !== undefined && options.formulaAnchors === undefined
             ? { formulaReferenceBases: options.formulaReferenceBases }
             : {}),
+        ...(options.formulaAnchors !== undefined ? { formulaAnchors: options.formulaAnchors } : {}),
     };
 }
 
@@ -2215,6 +2238,7 @@ export function copy_dirty_entry(
             movedFrom: merged.movedFrom,
             valueEditOrder: merged.valueEditOrder,
             formulaReferenceBases: merged.formulaReferenceBases,
+            formulaAnchors: merged.formulaAnchors,
         },
     );
 }
@@ -2295,6 +2319,7 @@ export function sanitized_dirty_entry(entry: {
     readonly movedFrom?: unknown;
     readonly valueEditOrder?: unknown;
     readonly formulaReferenceBases?: unknown;
+    readonly formulaAnchors?: unknown;
 }): CsvDirtyEntry {
     const keep = (runs: unknown, text: string): RichText | undefined => (
         is_matching_rich_text(runs, text) ? runs : undefined
@@ -2358,6 +2383,9 @@ export function sanitized_dirty_entry(entry: {
     const formula_reference_bases = entry.formulaReferenceBases === undefined
         ? undefined
         : own_pending_formula_reference_bases(entry.formulaReferenceBases);
+    const formula_anchors = entry.formulaAnchors === undefined
+        ? undefined
+        : own_formula_anchors(entry.formulaAnchors, entry.value);
     return make_dirty_entry(
         entry.value,
         entry.base,
@@ -2373,6 +2401,7 @@ export function sanitized_dirty_entry(entry: {
             movedFrom: moved_from,
             valueEditOrder: value_edit_order,
             formulaReferenceBases: formula_reference_bases,
+            formulaAnchors: formula_anchors,
         },
     );
 }
@@ -2399,6 +2428,7 @@ export function sanitized_wire_dirty_entry(entry: unknown): CsvDirtyEntry | unde
         && own_pending_formula_reference_bases(entry.formulaReferenceBases) === undefined) {
         return undefined;
     }
+    if (!formula_anchor_fields_valid(entry)) return undefined;
     return sanitized_dirty_entry(entry as {
         readonly value: string;
         readonly base: string;
@@ -2413,7 +2443,19 @@ export function sanitized_wire_dirty_entry(entry: unknown): CsvDirtyEntry | unde
         readonly movedFrom?: unknown;
         readonly valueEditOrder?: unknown;
         readonly formulaReferenceBases?: unknown;
+        readonly formulaAnchors?: unknown;
     });
+}
+
+/**
+ * Formula Anchors, when present, are valid for the entry's value, and the
+ * entry carries no `formulaReferenceBases` beside them.
+ */
+function formula_anchor_fields_valid(entry: Record<string, unknown>): boolean {
+    if (entry.formulaAnchors === undefined) return true;
+    return typeof entry.value === 'string'
+        && entry.formulaReferenceBases === undefined
+        && own_formula_anchors(entry.formulaAnchors, entry.value) !== undefined;
 }
 
 /** Runtime shape guard for an exact lifecycle identity, and for each durable
@@ -2448,6 +2490,7 @@ export function is_strict_wire_dirty_entry(value: unknown): value is CsvDirtyEnt
         && own_pending_formula_reference_bases(value.formulaReferenceBases) === undefined) {
         return false;
     }
+    if (!formula_anchor_fields_valid(value)) return false;
 
     const has_link = value.link !== undefined || value.baseLink !== undefined;
     if (has_link && !(
@@ -2534,7 +2577,9 @@ export function dirty_entries_equal(
         && move_provenance_equal(left.movedFrom, right.movedFrom)
         && left.valueEditOrder === right.valueEditOrder
         && JSON.stringify(left.formulaReferenceBases ?? [])
-            === JSON.stringify(right.formulaReferenceBases ?? []);
+            === JSON.stringify(right.formulaReferenceBases ?? [])
+        && JSON.stringify(left.formulaAnchors ?? null)
+            === JSON.stringify(right.formulaAnchors ?? null);
 }
 
 export function observed_file_bases_equal(
@@ -3099,10 +3144,18 @@ const STRICT_DIRTY_ENTRY_KEYS = new Set([
     'movedFrom',
     'valueEditOrder',
     'formulaReferenceBases',
+    'formulaAnchors',
 ]);
 
-/** Strict all-or-nothing owner for the new full-snapshot wire protocol. */
-export function own_wire_pending_changes(value: unknown): WorksheetPendingChanges | undefined {
+/**
+ * Strict all-or-nothing owner for the new full-snapshot wire protocol.
+ * `format` says what the receiver knows of the worksheet's table format: a
+ * CSV or TSV worksheet's values never carry Formula Anchors.
+ */
+export function own_wire_pending_changes(
+    value: unknown,
+    format: PendingChangesFormat = {},
+): WorksheetPendingChanges | undefined {
     if (!is_plain_record(value)) return undefined;
     try {
         // Conflicts are host-owned and may use the reserved tail of the durable
@@ -3146,7 +3199,7 @@ export function own_wire_pending_changes(value: unknown): WorksheetPendingChange
     const cells = sanitized_wire_dirty_map(value.cells);
     if (cells === undefined) return undefined;
     try {
-        const structural = own_pending_structural_changes(value);
+        const structural = own_pending_structural_changes(value, format);
         const owned = Object.freeze({ ...target, cells, ...structural });
         assert_pending_changes_encoded_bound(owned);
         assert_pending_user_changes_encoded_bound({

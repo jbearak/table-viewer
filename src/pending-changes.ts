@@ -24,6 +24,13 @@ import { is_plain_record } from './plain-record';
 import { is_cell_highlight_color, type CellHighlightColor } from './cell-highlight-colors';
 import { MAX_SHEET_COLUMNS, MAX_PENDING_ROW_INDEX } from './spreadsheet-safety';
 import type { XlsxNumberFormat } from './spreadsheet-format';
+import type {
+    ColumnAnchor,
+    FormulaAnchors,
+    FormulaReferenceAnchor,
+    FormulaReferenceAnchorCorner,
+    RowAnchor,
+} from './formula-anchors';
 import {
     canonical_column_layout,
     canonical_row_layout,
@@ -122,6 +129,13 @@ export interface PendingRowCell {
     readonly valueEditOrder?: number;
     /** Pending append bands this formula meant at the time it was authored. */
     readonly formulaReferenceBases?: readonly PendingFormulaReferenceBasis[];
+    /**
+     * Row and column identities the formula's references name, stored when it
+     * was committed against a live layout change or named a Pending Row or
+     * Pending Column. `.xlsx` only; a cell with anchors has no
+     * `formulaReferenceBases`.
+     */
+    readonly formulaAnchors?: FormulaAnchors;
     /** Stable cut origin; numeric rows are the last resolved physical fallback. */
     readonly movedFrom?: PendingCellMoveProvenance;
 }
@@ -175,6 +189,150 @@ export function own_pending_formula_reference_bases(
     });
     if (owned.some((entry) => entry === undefined)) return undefined;
     return Object.freeze(owned as PendingFormulaReferenceBasis[]);
+}
+
+/** Last 1-based row and column a formula reference can name (`.xlsx`). */
+const MAX_ANCHOR_ROW = 1_048_576;
+const MAX_ANCHOR_COLUMN = 16_384;
+/** Each reference spans at least two characters, so a formula holds at most half its length. */
+const MAX_FORMULA_ANCHOR_REFERENCES = 4_096;
+
+function is_anchor_number(value: unknown, minimum: number, maximum: number): value is number {
+    return Number.isSafeInteger(value) && (value as number) >= minimum && (value as number) <= maximum;
+}
+
+function own_anchor_worksheet(value: unknown): FormulaReferenceAnchor['worksheet'] | undefined {
+    if (
+        !is_plain_record(value)
+        || !has_only_keys(value, ['sheetIndex', 'sheetName', 'worksheetId'])
+        || !is_anchor_number(value.sheetIndex, 0, Number.MAX_SAFE_INTEGER)
+        || (value.sheetName !== undefined
+            && (typeof value.sheetName !== 'string' || value.sheetName.length > 32_767))
+        || (value.worksheetId !== undefined
+            && (typeof value.worksheetId !== 'string' || value.worksheetId.length > 32_767))
+    ) return undefined;
+    return Object.freeze({
+        sheetIndex: value.sheetIndex,
+        ...(value.sheetName === undefined ? {} : { sheetName: value.sheetName as string }),
+        ...(value.worksheetId === undefined ? {} : { worksheetId: value.worksheetId as string }),
+    });
+}
+
+function own_strict_row_identity(value: unknown): RowIdentity | undefined {
+    if (!is_plain_record(value)) return undefined;
+    if (value.kind === 'source' && has_only_keys(value, ['kind', 'sourceRow'])) {
+        return own_row_identity(value);
+    }
+    if (value.kind === 'pending' && has_only_keys(value, ['kind', 'pendingRowId'])) {
+        return own_row_identity(value);
+    }
+    return undefined;
+}
+
+function own_strict_column_identity(value: unknown): ColumnIdentity | undefined {
+    if (is_plain_record(value) && value.kind === 'source'
+        && has_only_keys(value, ['kind', 'sourceColumn'])
+        && is_anchor_number(value.sourceColumn, 0, MAX_ANCHOR_COLUMN - 1)) {
+        return Object.freeze({ kind: 'source', sourceColumn: value.sourceColumn });
+    }
+    if (is_plain_record(value) && value.kind === 'pending'
+        && has_only_keys(value, ['kind', 'pendingColumnId']) && is_pending_id(value.pendingColumnId)) {
+        return Object.freeze({ kind: 'pending', pendingColumnId: value.pendingColumnId });
+    }
+    return undefined;
+}
+
+function own_row_anchor(value: unknown): RowAnchor | undefined {
+    if (!is_plain_record(value)) return undefined;
+    if (value.kind === 'identity' && has_only_keys(value, ['kind', 'row'])) {
+        const row = own_strict_row_identity(value.row);
+        return row === undefined ? undefined : Object.freeze({ kind: 'identity', row });
+    }
+    if (value.kind === 'fixed' && has_only_keys(value, ['kind', 'row'])
+        && is_anchor_number(value.row, 1, MAX_ANCHOR_ROW)) {
+        return Object.freeze({ kind: 'fixed', row: value.row });
+    }
+    if (value.kind === 'trailing' && has_only_keys(value, ['kind', 'offset'])
+        && is_anchor_number(value.offset, 1, MAX_ANCHOR_ROW)) {
+        return Object.freeze({ kind: 'trailing', offset: value.offset });
+    }
+    if (value.kind === 'edge' && has_only_keys(value, ['kind'])) return Object.freeze({ kind: 'edge' });
+    return undefined;
+}
+
+function own_column_anchor(value: unknown): ColumnAnchor | undefined {
+    if (!is_plain_record(value)) return undefined;
+    if (value.kind === 'identity' && has_only_keys(value, ['kind', 'column'])) {
+        const column = own_strict_column_identity(value.column);
+        return column === undefined ? undefined : Object.freeze({ kind: 'identity', column });
+    }
+    if (value.kind === 'trailing' && has_only_keys(value, ['kind', 'offset'])
+        && is_anchor_number(value.offset, 1, MAX_ANCHOR_COLUMN)) {
+        return Object.freeze({ kind: 'trailing', offset: value.offset });
+    }
+    if (value.kind === 'edge' && has_only_keys(value, ['kind'])) return Object.freeze({ kind: 'edge' });
+    return undefined;
+}
+
+function own_anchor_corner(value: unknown): FormulaReferenceAnchorCorner | undefined {
+    if (!is_plain_record(value) || !has_only_keys(value, ['row', 'column'])) return undefined;
+    if (value.row === undefined && value.column === undefined) return undefined;
+    const row = value.row === undefined ? undefined : own_row_anchor(value.row);
+    const column = value.column === undefined ? undefined : own_column_anchor(value.column);
+    if ((value.row !== undefined && row === undefined) || (value.column !== undefined && column === undefined)) {
+        return undefined;
+    }
+    return Object.freeze({
+        ...(row === undefined ? {} : { row }),
+        ...(column === undefined ? {} : { column }),
+    });
+}
+
+/**
+ * Own stored Formula Anchors for `text`, strictly, or `undefined` when any
+ * part is malformed: spans that lie inside the formula and do not overlap,
+ * one corner for a cell or two for a range, every corner naming the same
+ * axes, known anchor kinds, valid row and column identities, and a strict
+ * worksheet target. Whether each span is a reference the tokenizer reads is
+ * checked when the formula renders, which needs the workbook.
+ */
+export function own_formula_anchors(value: unknown, text: string): FormulaAnchors | undefined {
+    if (
+        !is_plain_record(value)
+        || !has_only_keys(value, ['references'])
+        || !Array.isArray(value.references)
+        || value.references.length === 0
+        || value.references.length > MAX_FORMULA_ANCHOR_REFERENCES
+        || !text.startsWith('=')
+    ) return undefined;
+    const references: FormulaReferenceAnchor[] = [];
+    let previous_end = 1;
+    for (const entry of value.references as unknown[]) {
+        if (
+            !is_plain_record(entry)
+            || !has_only_keys(entry, ['start', 'end', 'worksheet', 'corners'])
+            || !is_anchor_number(entry.start, previous_end, text.length)
+            || !is_anchor_number(entry.end, (entry.start as number) + 1, text.length)
+            || !Array.isArray(entry.corners)
+            || entry.corners.length < 1
+            || entry.corners.length > 2
+        ) return undefined;
+        const worksheet = entry.worksheet === undefined ? undefined : own_anchor_worksheet(entry.worksheet);
+        if (entry.worksheet !== undefined && worksheet === undefined) return undefined;
+        const corners = (entry.corners as unknown[]).map(own_anchor_corner);
+        if (corners.some((corner) => corner === undefined)) return undefined;
+        const shape = (corner: FormulaReferenceAnchorCorner | undefined) =>
+            `${corner!.row !== undefined}:${corner!.column !== undefined}`;
+        if (corners.some((corner) => shape(corner) !== shape(corners[0]))) return undefined;
+        references.push(Object.freeze({
+            start: entry.start as number,
+            end: entry.end as number,
+            ...(worksheet === undefined ? {} : { worksheet }),
+            corners: Object.freeze(corners as FormulaReferenceAnchorCorner[]),
+        }));
+        previous_end = entry.end as number;
+    }
+    return Object.freeze({ references: Object.freeze(references) });
 }
 
 /** CSV/TSV rows have no presentation state to copy. */
@@ -664,6 +822,7 @@ function own_pending_row_cell(value: unknown): PendingRowCell {
             'link',
             'valueEditOrder',
             'formulaReferenceBases',
+            'formulaAnchors',
             'movedFrom',
         ])
         || typeof value.value !== 'string'
@@ -685,6 +844,15 @@ function own_pending_row_cell(value: unknown): PendingRowCell {
     if (value.formulaReferenceBases !== undefined && formulaReferenceBases === undefined) {
         pending_row_error('contain invalid formula reference bases');
     }
+    const formulaAnchors = value.formulaAnchors === undefined
+        ? undefined
+        : own_formula_anchors(value.formulaAnchors, value.value);
+    if (value.formulaAnchors !== undefined && formulaAnchors === undefined) {
+        pending_row_error('contain invalid formula anchors');
+    }
+    if (formulaAnchors !== undefined && formulaReferenceBases !== undefined) {
+        pending_row_error('contain a formula with both anchors and reference bases');
+    }
     const movedFrom = value.movedFrom === undefined
         ? undefined
         : own_pending_move(value.movedFrom);
@@ -699,6 +867,7 @@ function own_pending_row_cell(value: unknown): PendingRowCell {
             ? { valueEditOrder: value.valueEditOrder as number }
             : {}),
         ...(formulaReferenceBases === undefined ? {} : { formulaReferenceBases }),
+        ...(formulaAnchors === undefined ? {} : { formulaAnchors }),
         ...(movedFrom === undefined ? {} : { movedFrom }),
     });
 }
@@ -1413,6 +1582,50 @@ export function assert_pending_user_changes_encoded_bound(value: unknown): void 
  * the structure check; see `pending_structure_error` for what is checked
  * without the source.
  */
+function cell_has_formula_anchors(cell: unknown): boolean {
+    return is_plain_record(cell) && cell.formulaAnchors !== undefined;
+}
+
+/** Whether any Pending Row cell or Pending Column cell carries Formula Anchors. */
+export function pending_structure_carries_formula_anchors(
+    changes: Pick<PendingStructuralChanges, 'appendedRows'> & Partial<Pick<PendingStructuralChanges, 'pendingColumns'>>,
+): boolean {
+    return pending_rows(changes).some((row) => Object.values(row.cells).some(cell_has_formula_anchors))
+        || (changes.pendingColumns ?? []).some((column) =>
+            Object.values(column.cells).some(cell_has_formula_anchors));
+}
+
+/** Whether any cell entry of a worksheet's `cells` map carries Formula Anchors. */
+export function pending_cells_carry_formula_anchors(
+    cells: Readonly<Record<string, unknown>> | undefined,
+): boolean {
+    return Object.values(cells ?? {}).some(cell_has_formula_anchors);
+}
+
+/**
+ * Whether Pending Changes show their worksheet is CSV or TSV: a delimited
+ * Structural Basis, or a Pending Row or Pending Column format that only
+ * delimited worksheets use. Changes holding only cell edits show nothing, so
+ * a codec that knows the format says so through `PendingChangesFormat`.
+ */
+export function pending_changes_show_delimited(
+    changes: Pick<PendingStructuralChanges, 'formatTemplates'>
+        & Partial<Pick<PendingStructuralChanges, 'pendingColumns' | 'structuralBasis'>>,
+): boolean {
+    return changes.structuralBasis?.kind === 'delimited'
+        || changes.formatTemplates.some((template) => template.format.kind === 'none')
+        || (changes.pendingColumns ?? []).some((column) => column.format.kind === 'none');
+}
+
+/** What a codec knows about the worksheet's table format. */
+export interface PendingChangesFormat {
+    /** The worksheet is CSV or TSV, so no value may carry Formula Anchors. */
+    readonly delimited?: boolean;
+}
+
+export const DELIMITED_FORMULA_ANCHORS_MESSAGE =
+    'CSV and TSV values are text, so they cannot carry formula anchors.';
+
 export function own_pending_structural_changes(value: {
     readonly formatTemplates?: unknown;
     readonly appendedRows?: unknown;
@@ -1424,7 +1637,7 @@ export function own_pending_structural_changes(value: {
     readonly pendingColumns?: unknown;
     readonly structuralBasis?: unknown;
     readonly cells?: unknown;
-}): PendingStructuralChanges {
+}, format: PendingChangesFormat = {}): PendingStructuralChanges {
     // Bound hostile wire/storage input before any of its collections are cloned.
     // The measurer stops as soon as the cap is crossed, so this is also a bound on
     // the amount of input we inspect before taking ownership.
@@ -1714,6 +1927,11 @@ export function own_pending_structural_changes(value: {
         is_plain_record(value.cells) ? value.cells : undefined,
     );
     if (structure_error !== undefined) pending_row_error(`are inconsistent: ${structure_error}`);
+    if (
+        (format.delimited === true || pending_changes_show_delimited(owned))
+        && (pending_structure_carries_formula_anchors(owned)
+            || pending_cells_carry_formula_anchors(is_plain_record(value.cells) ? value.cells : undefined))
+    ) pending_row_error(`are invalid: ${DELIMITED_FORMULA_ANCHORS_MESSAGE}`);
     assert_pending_changes_encoded_bound(owned);
     return owned;
 }

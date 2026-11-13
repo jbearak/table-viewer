@@ -199,6 +199,7 @@ import {
     pending_rows,
     has_live_layout_change,
     pending_changes_carry_layout,
+    pending_cells_carry_formula_anchors,
     pending_layout_fields,
     pending_structure_error,
     STRUCTURAL_EDITING_ENABLED,
@@ -2127,6 +2128,10 @@ export function attach_viewer(
     const uri = create_resource_identity(resource).uri;
     const file_path = uri.fsPath;
     const file_format = parser_format_for(file_path);
+    /** What the Pending Changes codecs know of this file: CSV and TSV values never carry formula anchors. */
+    const wire_pending_changes_format = Object.freeze({
+        delimited: file_format.id === 'csv' || file_format.id === 'tsv',
+    });
     const compare_original_uri = options.compare
         ? create_resource_identity(options.compare.originalUri).uri
         : undefined;
@@ -9090,7 +9095,7 @@ export function attach_viewer(
             tailRemovals: durable?.tailRemovals ?? [],
             appendBasis,
             conflicts: durable?.conflicts ?? [],
-        })) {
+        }, wire_pending_changes_format)) {
             await refuse('Appending these rows would exceed the pending-changes size limit.');
             return;
         }
@@ -9523,7 +9528,7 @@ export function attach_viewer(
             tailRemovals: durable?.tailRemovals ?? [],
             appendBasis,
             conflicts: durable?.conflicts ?? [],
-        })) {
+        }, wire_pending_changes_format)) {
             await refuse('Restoring these rows would exceed the pending-changes size limit.');
             return;
         }
@@ -9718,6 +9723,9 @@ export function attach_viewer(
             );
             if (!target || !canonical_target || canonical_target.sheetIndex !== target.sheetIndex
                 || !maps) return malformed();
+            // CSV and TSV values are text: a value carrying formula anchors is malformed.
+            if (wire_pending_changes_format.delimited === true
+                && pending_cells_carry_formula_anchors(maps.dirtyEdits)) return malformed();
             let structuralChanges: CsvSaveWorksheetOperation['structuralChanges'];
             if (Object.prototype.hasOwnProperty.call(requested, 'structuralChanges')) {
                 if (!is_plain_record(requested.structuralChanges)) return malformed();
@@ -9725,7 +9733,7 @@ export function attach_viewer(
                     ...target,
                     cells: maps.dirtyEdits,
                     ...requested.structuralChanges,
-                });
+                }, wire_pending_changes_format);
                 if (!owned) return malformed();
                 structuralChanges = Object.freeze({
                     formatTemplates: owned.formatTemplates,
@@ -12878,7 +12886,7 @@ export function attach_viewer(
                     });
                     return;
                 }
-                const changes = own_wire_pending_changes(msg.changes);
+                const changes = own_wire_pending_changes(msg.changes, wire_pending_changes_format);
                 // Captured now: a reload before the queued write must not
                 // change how this renderer's publication is read.
                 const publisher_understands_layout = renderer_understands_layout;
