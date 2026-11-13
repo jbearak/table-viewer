@@ -17615,3 +17615,125 @@ describe('structural editing capability wiring', () => {
             .toEqual({ rows: unsupported, columns: unsupported });
     });
 });
+
+describe('Review Changes for row and column structure', () => {
+    const supported = { supported: true as const };
+    const xlsx_basis = {
+        kind: 'xlsx' as const,
+        worksheetPartDigest: 'w',
+        sharedStringsDigest: null,
+        stylesDigest: null,
+        workbookDigest: 'b',
+        sourceRowCount: 5,
+        sourceColumnCount: 3,
+    };
+
+    async function open_restructured_workbook() {
+        const meta = make_meta(['Data', 'Summary'], false);
+        Object.assign(meta.sheets[0], {
+            columnCount: 3,
+            sourceRowCount: 5,
+            rowCount: 5,
+            columnNames: ['Name', 'Qty', 'Total'],
+            excelFirstRowHeader: { mode: 'on', detected: false, active: true, available: true, sourceRow: 0 },
+            formulaCells: [1, 2],
+        });
+        meta.sheets[1].formulaCells = [0, 0];
+        const rendered = await render_app();
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: {
+                csvEditable: true,
+                csvEditingSupported: true,
+                editSyntax: 'markdown',
+                structuralEditing: {
+                    sheets: [{ rows: supported, columns: supported }, { rows: supported, columns: supported }],
+                },
+            },
+        }));
+        await click_button('Edit');
+        await dispatch_host_message({
+            type: 'editSessionResult',
+            granted: true,
+            editSessionId: 'review-session',
+            sheetIndex: 0,
+            pendingChanges: {
+                sheetIndex: 0,
+                sheetName: 'Data',
+                // Qty renamed in the Header Row.
+                cells: { '0:1': { value: 'Units', base: 'Qty' } },
+                formatTemplates: [],
+                appendedRows: [],
+                tailRemovals: [],
+                conflicts: [],
+                // Source row 1 moved below row 3, row 4 deleted; column C deleted.
+                rowLayout: {
+                    runs: [
+                        { kind: 'source', start: 2, count: 2 },
+                        { kind: 'source', start: 1, count: 1 },
+                        { kind: 'source', start: 4, count: 1 },
+                    ],
+                    removedSourceRows: [{ start: 4, count: 1 }],
+                    discardedPendingRows: [],
+                },
+                columnLayout: {
+                    columns: [0, 1, 2].map((sourceColumn) => ({ kind: 'source' as const, sourceColumn })),
+                    removedSourceColumns: [2],
+                    discardedPendingColumns: [],
+                },
+                structuralBasis: xlsx_basis,
+            },
+        });
+        return rendered;
+    }
+
+    const review = () => document.querySelector('[aria-label="Row and column changes"]');
+
+    it('stays collapsed and asks the host nothing until Review changes is pressed', async () => {
+        const { post_message } = await open_restructured_workbook();
+        expect(review()?.textContent).toContain('Save will insert, delete, or move rows or columns on Data.');
+        expect(post_message.mock.calls.some(([message]) => message?.type === 'requestFormulaDivergence')).toBe(false);
+    });
+
+    it('lists the counts and the flagged formulas by class, and goes to a formula on another sheet', async () => {
+        const { post_message } = await open_restructured_workbook();
+        await click_button('Review changes');
+        expect(review()?.textContent).toContain('1 row deleted, 1 row moved; 1 column deleted, 1 column renamed.');
+        const request = post_message.mock.calls.map(([message]) => message as WebviewMessage)
+            .find((message): message is Extract<WebviewMessage, { type: 'requestFormulaDivergence' }> =>
+                message.type === 'requestFormulaDivergence');
+        expect(request).toBeDefined();
+        expect(request!.layouts[0]!.rowLayout).toBeDefined();
+        expect(review()?.textContent).toContain('Checking formulas…');
+        await dispatch_host_message({
+            type: 'formulaDivergence',
+            requestId: request!.requestId,
+            sourceGeneration: request!.sourceGeneration,
+            review: {
+                items: [{
+                    targetSheetIndex: 0,
+                    sheetIndex: 1,
+                    row: 0,
+                    column: 0,
+                    formula: '=SUM(Data!A2:A4)',
+                    classes: ['moved'],
+                    axes: ['row'],
+                }],
+                counts: [{ targetSheetIndex: 0, formulas: 1 }],
+            },
+        });
+        const text = review()?.textContent ?? '';
+        expect(text).toContain('1 formula has a range whose first or last row was moved or deleted; check it before saving.');
+        expect(text).toContain('A move carried a corner of the range');
+        expect(text).toContain('Summary!A1');
+        expect(text).toContain('=SUM(Data!A2:A4)');
+        await click_button('Go to cell');
+        // Summary is not on screen, so the tab switches and the grid is asked for the cell.
+        const props = grid_shell_mock.latest_props as unknown as GridShellProps;
+        expect(props.sheet_index).toBe(1);
+        expect(props.cell_focus).toMatchObject({
+            sheetIndex: 1,
+            row: { kind: 'source', sourceRow: 0 },
+            column: { kind: 'source', sourceColumn: 0 },
+        });
+    });
+});
