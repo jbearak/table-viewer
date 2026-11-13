@@ -436,6 +436,18 @@ describe('Pending Column content', () => {
         expect(undo.plans[0]!.next.pendingColumns?.[0]?.viewerWidth).toBe(240);
     });
 
+    it('brings a Pending Column back at the width it had, when Undo restores it', () => {
+        const before = own_pending_structural_changes({
+            ...inserted(),
+            pendingColumns: [{ ...inserted().pendingColumns![0]!, viewerWidth: 240 }],
+        });
+        const after = own_pending_structural_changes({ ...EMPTY });
+        const change: HistoryChange = { kind: 'pendingRows', delta: { worksheet, before, after } };
+        const undo = plan_pending_row_history_replay({ label: 'Discard', changes: [change] } as never, 'undo', () => after);
+        if (undo.kind !== 'plan') throw new Error(undo.kind);
+        expect(undo.plans[0]!.next.pendingColumns?.[0]?.viewerWidth).toBe(240);
+    });
+
     it('renames a Pending Column as one action', () => {
         const before = inserted();
         const plan = plan_pending_column_update(before, worksheet, 'p1', (column) => ({ ...column, header: 'origin' }))!;

@@ -70,7 +70,9 @@ function without_column_width(column: PendingColumn): PendingColumn {
 }
 
 function with_current_width(column: PendingColumn, current: PendingColumn | undefined): PendingColumn {
-    const width = current?.viewerWidth;
+    // A column the replay brings back has no current width: it keeps its own.
+    if (current === undefined) return column;
+    const width = current.viewerWidth;
     if (width === column.viewerWidth) return column;
     const rest = without_column_width(column);
     return width === undefined ? rest : { ...rest, viewerWidth: width };
