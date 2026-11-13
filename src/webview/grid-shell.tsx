@@ -4610,6 +4610,10 @@ export function GridShell({
     }, []);
     const structure_context_ref = useRef(structure_context);
     structure_context_ref.current = structure_context;
+    // Read at plan time, after the host's admission round trip: the Formula
+    // Anchor references then are the ones the insert must keep tombstones for.
+    const action_structure_context_ref = useRef(action_structure_context);
+    action_structure_context_ref.current = action_structure_context;
     /**
      * After an Insert (or the append "Insert below" makes on the band's last
      * row), put the caret on the first new row, in the column that was
@@ -4664,7 +4668,9 @@ export function GridShell({
             return false;
         }
         const before = pending_store.snapshot();
-        const context = structure_context_ref.current;
+        // With the Formula Anchor references, so the insert keeps the
+        // discarded tombstones a stored anchor names, as delete and restore do.
+        const context = action_structure_context_ref.current();
         if (!insert_anchor_is_live(before, context, anchor)) {
             admitted.settle(false);
             announce_structure(INSERT_CANCELED_MESSAGE);

@@ -23,7 +23,7 @@ import {
 import { create_history_store, type HistoryStore } from '../webview/history-store';
 import { peek_history } from '../webview/history-stack-model';
 import { webview_formula_workbook } from '../webview/formula-anchor-model';
-import { EMPTY_PENDING_STRUCTURAL_CHANGES } from '../pending-changes';
+import { EMPTY_PENDING_STRUCTURAL_CHANGES, inserted_rows } from '../pending-changes';
 import { plan_pending_row_history_replay } from '../webview/pending-row-history';
 import { create_pending_row_store, keep_inserted_rows_at_end } from '../webview/pending-row-store';
 import {
@@ -9010,6 +9010,39 @@ describe('row Insert in the row-gutter menu', () => {
             themeOverride?: { bgCell?: string };
         };
         expect(get_cell_content([0, 1]).themeOverride?.bgCell).toBe(highlight_rgba('pink', false));
+    });
+
+    it('keeps a deleted inserted row’s tombstone through a later insert while a Formula Anchor names it', async () => {
+        const pending = create_pending_row_store({ session_id: 'session' });
+        const queued = [['ins-a'], ['ins-b']];
+        const settled: boolean[] = [];
+        await render_grid(structure_props({
+            edit_session: create_edit_session_store({ session_id: 'session' }),
+            pending_row_store: pending,
+            history_store: create_history_store(),
+            on_insert_rows: async () => ({
+                rowIds: queued.shift()!,
+                formatTemplate: template,
+                structuralBasis: basis,
+                appendBasis: append_basis,
+                settle: (accepted: boolean) => { settled.push(accepted); },
+            }),
+            // A stored anchor elsewhere in the workbook names ins-a.
+            formula_anchor_references: () => ({ rows: new Set(['ins-a']), columns: new Set() }),
+        }));
+        await open_row_menu(0);
+        await act(async () => menu_item('Insert row below')!.click());
+        await vi.waitFor(() => expect(settled).toEqual([true]));
+        await open_row_menu(1);
+        await act(async () => menu_item('Delete row')!.click());
+        expect(pending.snapshot().rowLayout?.discardedPendingRows.map((row) => row.id)).toEqual(['ins-a']);
+        // The insert is a structural action on the rows axis too: it must ask
+        // the same references, or it drops the tombstone the anchor names.
+        await open_row_menu(0);
+        await act(async () => menu_item('Insert row below')!.click());
+        await vi.waitFor(() => expect(settled).toEqual([true, true]));
+        expect(inserted_rows(pending.snapshot()).map((row) => row.id)).toEqual(['ins-b']);
+        expect(pending.snapshot().rowLayout?.discardedPendingRows.map((row) => row.id)).toEqual(['ins-a']);
     });
 
     it('cancels an insert whose anchor was removed while the request was out', async () => {
