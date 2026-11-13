@@ -3577,7 +3577,6 @@ export function GridShell({
                     const state = projection.row_state(row);
                     return state !== 'removed' && state !== 'tail-removal';
                 },
-                deleted.length + 1,
             );
             if (target !== undefined && display_column_count > 0) {
                 select_active_display_cell([
@@ -3652,8 +3651,12 @@ export function GridShell({
             host_bridge.postMessage({ type: 'showWarning', message: plan.message });
             return false;
         }
+        // Poll on a row this delete changed: one already removed would show
+        // `removed` before the grid renders this delete.
+        const affected = identities.filter((identity) => identity.kind === 'pending'
+            || !is_removed_source_row_ref.current(identity.sourceRow));
         if (!commit_row_structure_plan(plan)) return false;
-        focus_after_row_delete(identities, from_row, display_column);
+        focus_after_row_delete(affected, from_row, display_column);
         return true;
     }, [
         commit_row_structure_plan,

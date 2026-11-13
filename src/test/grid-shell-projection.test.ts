@@ -8518,6 +8518,31 @@ describe('row Delete and Restore in the row-gutter menu', () => {
         expect(restore.entry.action.label).toBe('Restore row');
     });
 
+    it('focuses the next live row when the deleted selection starts with a removed row', async () => {
+        const pending = create_pending_row_store({ session_id: 'session' });
+        await render_grid(structure_props({
+            sheet_meta: { ...props().sheet_meta, rowCount: 5, sourceRowCount: 5 },
+            row_count: 5,
+            structural_support: { ...supported, basis: { ...basis, sourceRowCount: 5 } },
+            edit_session: create_edit_session_store({ session_id: 'session' }),
+            pending_row_store: pending,
+        }));
+        await open_row_menu(1);
+        await act(async () => menu_item('Delete row')!.click());
+        const on_selection_change = grid_mock.props!.onGridSelectionChange as
+            (selection: unknown) => void;
+        await act(async () => on_selection_change({
+            columns: compact([]),
+            rows: compact([1, 2]),
+        }));
+        await open_row_menu(2);
+        await act(async () => menu_item('Delete 2 rows')!.click());
+        expect(pending.snapshot().rowLayout?.removedSourceRows).toEqual([{ start: 1, count: 2 }]);
+        await vi.waitFor(() => expect((grid_mock.props!.gridSelection as {
+            current?: { cell: [number, number] };
+        }).current?.cell).toEqual([0, 3]));
+    });
+
     it('refuses a paste into a removed row', async () => {
         const cells = create_edit_session_store({ session_id: 'session' });
         const pending = create_pending_row_store({ session_id: 'session' });
