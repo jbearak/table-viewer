@@ -1546,8 +1546,10 @@ export function discard_layout_changes(
     changes: PendingStructuralChanges,
     context: WorksheetStructureContext,
 ): StructureResult {
-    // The row arm drops the inserted rows' Pending Column cells with them, so
-    // its own transition restores them on Undo before the column arm runs.
+    // The row arm drops the inserted rows' Pending Column cells with them.
+    // Undo replays in reverse: the column arm restores the Pending Columns
+    // first, then the row arm restores the rows and those cells in one
+    // transition.
     const discarded = new Set(inserted_rows(changes).map((row) => `p:${row.id}`));
     const result = rows_then_columns(changes, context, {
         rowLayout: source_row_layout(context.bodyStart, body_row_count(context)),

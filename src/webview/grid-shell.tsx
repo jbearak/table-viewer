@@ -2833,7 +2833,10 @@ export function GridShell({
             const projected = pending_projection.row_at(display_row);
             if (projected === undefined || projected.kind === 'removal') return undefined;
             if (projected.kind !== 'source') {
-                return projected.kind === 'pending'
+                // A replacement row is a Pending Row too, keyed by its own
+                // identity. (A live Pending Column cannot coexist with the tail
+                // removal a replacement needs; this keeps the key uniform.)
+                return projected.kind === 'pending' || projected.kind === 'replacement'
                     ? { key: row_identity_key(projected.identity), live: true }
                     : undefined;
             }
@@ -9188,7 +9191,13 @@ export function GridShell({
             const displayed = [...cells];
             for (const { column, pending } of virtual_columns) {
                 const cell = pending.cells[row_key];
-                const value = cell === undefined ? undefined : pending_column_cell_text(cell);
+                // An open editor's uncommitted text, as the source and Pending
+                // Row paths copy it.
+                const value = live?.kind === 'pendingColumn'
+                    && live.pendingColumnId === pending.id
+                    && live.rowKey === row_key
+                    ? live.value
+                    : cell === undefined ? undefined : pending_column_cell_text(cell);
                 displayed[column] = value === undefined ? null : {
                     raw: value,
                     formatted: value,

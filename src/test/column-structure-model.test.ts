@@ -8,6 +8,7 @@
 import { describe, expect, it } from 'vitest';
 import {
     own_pending_structural_changes,
+    pending_structure_error,
     type PendingColumn,
     type PendingStructuralChanges,
 } from '../pending-changes';
@@ -356,6 +357,21 @@ describe('planning column gestures', () => {
     });
 });
 
+describe('Pending Columns beside a tail removal', () => {
+    it('cannot coexist with one, so no Pending Column cell sits on a replacement row', () => {
+        expect(pending_structure_error({
+            ...inserted(),
+            tailRemovals: [{
+                appendHistoryId: 'saved',
+                sourceRow: 3,
+                savedFingerprint: 'f',
+                savedRow: { cells: {}, format: { kind: 'none' } },
+            }],
+        }, undefined, { bodyStart: 0, sourceRowCount: 4, sourceColumnCount: 4 }))
+            .toBe('A worksheet with row or column changes cannot also undo a saved append.');
+    });
+});
+
 describe('Pending Column content', () => {
     it('writes cells by row identity as a column arm Undo reverses', () => {
         const before = inserted();
@@ -376,6 +392,48 @@ describe('Pending Column content', () => {
         expect(plan_pending_column_cells(before, worksheet, [
             { pendingColumnId: 'p1', rowKey: 's:0', cell: undefined },
         ])).toBeUndefined();
+    });
+
+    it('treats a Pending Column\'s width as view state: content Undo and Redo keep the current width', () => {
+        const before = inserted();
+        const plan = plan_pending_column_cells(before, worksheet, [
+            { pendingColumnId: 'p1', rowKey: 's:0', cell: { value: 'Spain' } },
+        ])!;
+        const history = create_history_store();
+        const record = history.stage_record({ label: 'Edit cell', changes: [plan.change] });
+        record.commit();
+        record.notify();
+        const peek = peek_history(history.snapshot(), 'undo');
+        if (peek.kind !== 'available') throw new Error(peek.kind);
+        // The column was resized after the edit, without a history entry.
+        const resized = own_pending_structural_changes({
+            ...plan.next,
+            pendingColumns: [{ ...plan.next.pendingColumns![0]!, viewerWidth: 240 }],
+        });
+        const undo = plan_pending_row_history_replay(peek.entry.action, 'undo', () => resized);
+        if (undo.kind !== 'plan') throw new Error(undo.kind);
+        expect(undo.plans[0]!.next.pendingColumns?.[0]).toMatchObject({ cells: {}, viewerWidth: 240 });
+        const redo = plan_pending_row_history_replay(peek.entry.action, 'redo', () => undo.plans[0]!.next);
+        if (redo.kind !== 'plan') throw new Error(redo.kind);
+        expect(redo.plans[0]!.next.pendingColumns?.[0]).toMatchObject({ cells: { 's:0': { value: 'Spain' } }, viewerWidth: 240 });
+    });
+
+    it('ignores a Pending Column\'s width in a metadata arm\'s snapshots', () => {
+        const before = own_pending_structural_changes({
+            ...inserted(),
+            conflicts: [{ reason: 'savedSuffixChanged', pendingRowIds: [], tailRemovalIds: [] }],
+        });
+        const after = own_pending_structural_changes({ ...before, conflicts: [] });
+        const change: HistoryChange = { kind: 'pendingRows', delta: { worksheet, before, after } };
+        const resized = (changes: PendingStructuralChanges) => own_pending_structural_changes({
+            ...changes,
+            pendingColumns: [{ ...changes.pendingColumns![0]!, viewerWidth: 240 }],
+        });
+        const action = { label: 'Edit cell', changes: [change] } as const;
+        const undo = plan_pending_row_history_replay(action as never, 'undo', () => resized(after));
+        if (undo.kind !== 'plan') throw new Error(undo.kind);
+        expect(undo.plans[0]!.next.conflicts).toHaveLength(1);
+        expect(undo.plans[0]!.next.pendingColumns?.[0]?.viewerWidth).toBe(240);
     });
 
     it('renames a Pending Column as one action', () => {

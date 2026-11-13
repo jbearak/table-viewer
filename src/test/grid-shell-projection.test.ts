@@ -9849,6 +9849,25 @@ describe('columns: Insert, Delete, Restore, Move, rename, Pending Column cells, 
         expect(JSON.stringify(get_cell_content([1, 1]))).toContain('"2"');
     });
 
+    it('copies the sheet with an open Pending Column editor\'s uncommitted text', async () => {
+        const write_text = vi.fn(async (_text: string) => {});
+        Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: write_text } });
+        const pending = with_pending_column({ 's:1': { value: 'stored' } });
+        type GridActionsHandle = import('../webview/grid-shell').GridActionsHandle;
+        const grid_actions_ref = React.createRef<GridActionsHandle | null>() as
+            React.MutableRefObject<GridActionsHandle | null>;
+        await render_columns({ pending_row_store: pending, grid_actions_ref });
+        const close_overlay = await open_tracking_overlay([1, 1], 'typed, not committed');
+        try {
+            await act(async () => { await grid_actions_ref.current!.copy_sheet(); });
+        } finally {
+            await close_overlay();
+        }
+        const copied = String(write_text.mock.calls.at(-1)?.[0]);
+        expect(copied).toContain('typed, not committed');
+        expect(copied).not.toContain('stored');
+    });
+
     it('finds text in a Pending Column cell', async () => {
         const pending = with_pending_column({ 's:1': { value: 'Spain' } });
         type GridActionsHandle = import('../webview/grid-shell').GridActionsHandle;

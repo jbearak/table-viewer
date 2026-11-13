@@ -312,6 +312,20 @@ describe('column insert admission', () => {
         await viewer.dispose();
     });
 
+    it('refuses a Save carrying a Pending Column the session never admitted, or one it released', async () => {
+        const viewer = await open_viewer();
+        expect(await viewer.save(inserted_changes(['insert-column:forged']))).toMatchObject({ success: false });
+        const released = await viewer.insert({ requestId: 'released' });
+        await viewer.settle('released', false);
+        expect(await viewer.save(inserted_changes(released.columnIds!))).toMatchObject({ success: false });
+        expect(dec.decode(viewer.drive.file.bytes)).toBe(TEXT);
+        // An admitted column still saves.
+        const admitted = await viewer.insert({ requestId: 'admitted' });
+        await viewer.settle('admitted', true);
+        expect(await viewer.save(inserted_changes(admitted.columnIds!))).toMatchObject({ success: true });
+        await viewer.dispose();
+    });
+
     it('refuses too many columns, an anchor outside the sheet or removed, and a stale basis', async () => {
         const viewer = await open_viewer();
         expect(await viewer.insert({ requestId: 'many', count: MAX_PENDING_COLUMNS + 1 }))
@@ -435,6 +449,29 @@ describe('Pending Columns reachable only from history', () => {
         // Undo the Discard: one more owned ID would be the 257th.
         expect(await prepare_replay(viewer, 'undo-discard', changes)).toBe(false);
         expect(await viewer.publish(changes)).toBe(false);
+        await viewer.dispose();
+    });
+
+    it('replays a Pending Column after the Discard button, which clears the session\'s changes', async () => {
+        const viewer = await open_viewer();
+        const reply = await viewer.insert({ requestId: 'cols' });
+        await viewer.settle('cols', true);
+        const changes = inserted_changes(reply.columnIds!);
+        expect(await viewer.publish(changes)).toBe(true);
+        await retain(viewer, reply.columnIds!);
+        // The Discard button: the host clears every pending change and ends the session.
+        const session = viewer.last<{ editSessionId: string }>('editSessionResult').editSessionId;
+        await viewer.panel.__receive({ type: 'discardEditSession', editSessionId: session });
+        await viewer.controller.drain();
+        expect(viewer.last<{ cleared: boolean }>('discardEditSessionResult')).toMatchObject({ cleared: true });
+        expect(viewer.durable().pendingEdits?.[0]?.pendingColumns).toBeUndefined();
+        await viewer.panel.__receive({ type: 'requestEditSession', requestId: 'again' });
+        await viewer.controller.drain();
+        expect(viewer.last<{ granted: boolean }>('editSessionResult').granted).toBe(true);
+        // Undo the Discard: the column comes back against the new ledger.
+        expect(await prepare_replay(viewer, 'undo-discard', changes)).toBe(true);
+        expect(await viewer.publish(changes)).toBe(true);
+        expect(viewer.durable().pendingEdits?.[0]?.pendingColumns?.map((column) => column.id)).toEqual(reply.columnIds);
         await viewer.dispose();
     });
 

@@ -3761,6 +3761,33 @@ export function attach_viewer(
     };
 
     /**
+     * Host-issued Pending Column IDs, for publication, replay, and Save alike:
+     * every live or tombstoned Pending Column is one this session's ledger
+     * owns, or one a Discard handed to history for this worksheet. A retained
+     * column re-enters the session's ledger when it is published, so it counts
+     * against the same 256 admissions a fresh insert does.
+     */
+    const pending_column_ownership_refusal = (
+        target: WorksheetTarget,
+        changes: Pick<PendingStructuralChanges, 'pendingColumns' | 'columnLayout'>,
+        ledger: AppendAdmissionLedger | undefined,
+    ): string | undefined => {
+        const column_ids = [
+            ...(changes.pendingColumns ?? []).map((column) => column.id),
+            ...(changes.columnLayout?.discardedPendingColumns ?? []).map((column) => column.id),
+        ];
+        if (column_ids.some((id) => ledger?.ownedColumnIds.has(id) !== true
+            && !retained_pending_column_owned(target, id))) {
+            return 'pending-column-not-owned-by-ledger';
+        }
+        const restored = new Set(column_ids.filter((id) => ledger?.ownedColumnIds.has(id) !== true));
+        if ((ledger?.ownedColumnIds.size ?? 0) + restored.size > MAX_PENDING_COLUMNS) {
+            return 'too-many-pending-columns';
+        }
+        return undefined;
+    };
+
+    /**
      * The layout rules a new-protocol publication must meet beyond the append
      * rules: the release gate, the ledger origin rule (origin `insert` only for
      * an ID an insert minted; origin `append` for any admitted ID), host-issued
@@ -3776,20 +3803,8 @@ export function attach_viewer(
         if (inserted_rows(changes).some((row) => !minted_as_insert(target, row.id, ledger))) {
             return 'insert-origin-not-minted-by-insert';
         }
-        const column_ids = [
-            ...(changes.pendingColumns ?? []).map((column) => column.id),
-            ...(changes.columnLayout?.discardedPendingColumns ?? []).map((column) => column.id),
-        ];
-        if (column_ids.some((id) => ledger?.ownedColumnIds.has(id) !== true
-            && !retained_pending_column_owned(target, id))) {
-            return 'pending-column-not-owned-by-ledger';
-        }
-        // A retained column re-enters the session's ledger on this publication,
-        // so it counts against the same 256 admissions a fresh insert does.
-        const restored = new Set(column_ids.filter((id) => ledger?.ownedColumnIds.has(id) !== true));
-        if ((ledger?.ownedColumnIds.size ?? 0) + restored.size > MAX_PENDING_COLUMNS) {
-            return 'too-many-pending-columns';
-        }
+        const column_refusal = pending_column_ownership_refusal(target, changes, ledger);
+        if (column_refusal !== undefined) return column_refusal;
         if (
             changes.structuralBasis !== undefined
             && !structural_basis_authorized(target, changes.structuralBasis, ledger)
@@ -11256,6 +11271,8 @@ export function attach_viewer(
             structural.formatTemplates,
             structural.appendBasis,
         )) return false;
+        // Pending Columns meet the publication's ownership rules at Save too.
+        if (pending_column_ownership_refusal(target, structural, live_ledger) !== undefined) return false;
         return accepted_row_admission_gestures_are_complete(
             ledger_key,
             pending_rows(structural),
@@ -14305,8 +14322,35 @@ export function attach_viewer(
                         && active_save_operation.identity.editSessionId === msg.editSessionId;
                     if (writing) return;
                     active_save_dialog_request = undefined;
-                    const operation = begin_edit_cleanup(msg.editSessionId);
-                    if (!operation) return;
+                    // As release and save do: fence new writes, let every write
+                    // that crossed first settle, which hands the ledgers' IDs
+                    // history still names to the retained stores (so Undo after
+                    // the Discard can replay them), then clean up under the fence.
+                    // Cleanup refuses beside any save operation; refuse before
+                    // fencing, so a refused discard leaves the session as it was.
+                    if (active_save_operation) return;
+                    const fence = fence_edit_session_writes(msg.editSessionId);
+                    if (!fence) return;
+                    try {
+                        await fence.admittedWrites;
+                    } catch (error) {
+                        log_sanitized_failure('Failed to settle admitted edits before discard', error);
+                    }
+                    const operation = begin_edit_cleanup(msg.editSessionId, undefined, fence.release);
+                    if (!operation) {
+                        // Something else took the session while its writes
+                        // settled: end the fenced session as release would.
+                        if (
+                            file_edit_state?.phase.type === 'releasing'
+                            && file_edit_state.phase.release === fence.release
+                            && active_edit_session_id === msg.editSessionId
+                        ) {
+                            active_edit_session_id = undefined;
+                            file_edit_state.phase = { type: 'free' };
+                            notify_edit_state();
+                        }
+                        return;
+                    }
                     notify_edit_state();
                     // Acknowledged either way, because a discard is undoable and
                     // undoing one has to acquire a NEW session: until cleanup
