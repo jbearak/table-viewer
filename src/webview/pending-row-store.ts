@@ -40,7 +40,9 @@ import {
 import { MAX_SHEET_COLUMNS } from '../spreadsheet-safety';
 import {
     delete_columns as delete_layout_columns,
-    delete_rows as delete_layout_rows,
+    canonical_source_intervals,
+    delete_row_intervals,
+    subtract_intervals,
     drop_unreferenced_column_tombstones,
     drop_unreferenced_row_tombstones,
     has_live_column_layout_change,
@@ -52,6 +54,7 @@ import {
     move_columns as move_layout_columns,
     move_rows as move_layout_rows,
     restore_columns as restore_layout_columns,
+    restore_row_intervals as restore_layout_row_intervals,
     restore_rows as restore_layout_rows,
     source_column_layout,
     source_row_layout,
@@ -110,6 +113,12 @@ export interface PendingRowStore {
          * the row blank before they see it filled.
          */
         initial_cells?: readonly Readonly<Record<number, PendingRowCell>>[],
+        /**
+         * Pending Column cells the new rows carry from birth, by row index:
+         * Pending Column ID to cell. Written in the same mutation, for the
+         * same reason as `initial_cells`.
+         */
+        initial_column_cells?: readonly Readonly<Record<string, PendingRowCell>>[],
     ): boolean;
     set_cell(
         session_id: string | undefined,
@@ -530,6 +539,7 @@ export function create_pending_row_store(
             first_created_order,
             append_basis,
             initial_cells,
+            initial_column_cells,
         ) => {
             if (
                 row_ids.length === 0
@@ -565,6 +575,16 @@ export function create_pending_row_store(
                 formatTemplateId: format_template.id,
                 createdOrder: first_created_order + index,
             }));
+            const column_cells = new Map<string, Record<string, PendingRowCell>>();
+            row_ids.forEach((id, index) => {
+                for (const [column_id, cell] of Object.entries(initial_column_cells?.[index] ?? {})) {
+                    const cells = column_cells.get(column_id) ?? {};
+                    cells[`p:${id}`] = cell;
+                    column_cells.set(column_id, cells);
+                }
+            });
+            if ([...column_cells.keys()].some((id) =>
+                !(state.pendingColumns ?? []).some((column) => column.id === id))) return false;
             return mutate(session_id, () => ({
                 ...state,
                 formatTemplates: templates,
@@ -572,6 +592,12 @@ export function create_pending_row_store(
                 ...(next_basis === undefined
                     ? {}
                     : { appendBasis: next_basis }),
+                ...(column_cells.size === 0 ? {} : {
+                    pendingColumns: (state.pendingColumns ?? []).map((column) => {
+                        const cells = column_cells.get(column.id);
+                        return cells === undefined ? column : { ...column, cells: { ...column.cells, ...cells } };
+                    }),
+                }),
             }), RESET_CHANGE);
         },
         set_cell: (session_id, pending_row_id, source_column, cell) => {
@@ -785,6 +811,14 @@ export function create_pending_row_store(
             const appendedRows = pending_rows(state).filter((row) => !pending_row_ids.has(row.id));
             const next = own({
                 ...state,
+                // The rows' Pending Column cells and highlights leave with them,
+                // in the same write: a cell for an unknown row is invalid.
+                ...(state.pendingColumns === undefined ? {} : {
+                    pendingColumns: columns_without_row_keys(
+                        state.pendingColumns,
+                        (key) => key.startsWith('p:') && pending_row_ids.has(key.slice(2)),
+                    ),
+                }),
                 formatTemplates: retained_templates(state.formatTemplates, appendedRows),
                 appendedRows,
                 // The basis authorizes a provisional append band, so it has no
@@ -1633,6 +1667,20 @@ function columns_without_cells(
     });
 }
 
+/** `columns` without the cells and highlights whose row keys `drop` selects. */
+function columns_without_row_keys(
+    columns: readonly PendingColumn[],
+    drop: (key: string) => boolean,
+): PendingColumn[] {
+    return columns_without_cells(columns, drop).map((column) => {
+        const highlights = column.highlights;
+        if (highlights === undefined || !Object.keys(highlights).some(drop)) return column;
+        const kept = Object.fromEntries(Object.entries(highlights).filter(([key]) => !drop(key)));
+        const { highlights: _dropped, ...rest } = column;
+        return Object.keys(kept).length === 0 ? rest : { ...rest, highlights: kept };
+    });
+}
+
 function in_intervals(intervals: readonly SourceInterval[], value: number): boolean {
     return intervals.some((interval) => value >= interval.start && value < interval.start + interval.count);
 }
@@ -1698,6 +1746,30 @@ export function insert_rows(
 }
 
 /**
+ * Selected body rows as runs: consecutive source rows as one interval, or one
+ * Pending Row. A gesture over a large selection stays proportional to its
+ * runs, not its rows.
+ */
+export type RowSelectionRun =
+    | { readonly kind: 'source'; readonly start: number; readonly count: number }
+    | { readonly kind: 'pending'; readonly identity: Extract<RowIdentity, { kind: 'pending' }> };
+
+/** Runs of a list of row identities, source rows merged into intervals. */
+export function row_runs_of_identities(identities: readonly RowIdentity[]): RowSelectionRun[] {
+    const sources: number[] = [];
+    const runs: RowSelectionRun[] = [];
+    for (const identity of identities) {
+        if (identity.kind === 'source') sources.push(identity.sourceRow);
+        else runs.push({ kind: 'pending', identity });
+    }
+    return [
+        ...intervals_of_columns([...new Set(sources)].sort((left, right) => left - right))
+            .map((entry) => ({ kind: 'source' as const, start: entry.start, count: entry.count })),
+        ...runs,
+    ];
+}
+
+/**
  * Delete body rows: live source rows become Pending Row Removals in place,
  * Pending Inserted Rows become discarded tombstones (dropped unless a Formula
  * Anchor names them), and Pending Appended Rows leave the band, as Remove
@@ -1711,34 +1783,53 @@ export function delete_rows(
     context: WorksheetStructureContext,
     identities: readonly RowIdentity[],
 ): StructureResult {
+    return delete_row_runs(changes, context, row_runs_of_identities(identities));
+}
+
+/** `delete_rows` over runs: proportional to the selection's runs. */
+export function delete_row_runs(
+    changes: PendingStructuralChanges,
+    context: WorksheetStructureContext,
+    runs: readonly RowSelectionRun[],
+): StructureResult {
     const exclusive = exclusivity_refusal(changes, context);
     if (exclusive !== undefined) return exclusive;
     const layout = row_layout_of(changes, context);
     const index = index_row_layout(layout);
     const rows_by_id = new Map(pending_rows(changes).map((row) => [row.id, row]));
-    const layout_identities: RowIdentity[] = [];
+    const inserted_ids: string[] = [];
     const removed_ids = new Set<string>();
-    const newly_removed: number[] = [];
-    for (const identity of identities) {
-        if (identity.kind === 'pending') {
-            const row = rows_by_id.get(identity.pendingRowId);
-            if (row !== undefined && !is_inserted_row(row)) {
-                removed_ids.add(row.id);
-                continue;
-            }
+    const sources: SourceInterval[] = [];
+    for (const run of runs) {
+        if (run.kind === 'source') {
+            sources.push({ start: run.start, count: run.count });
+            continue;
         }
-        const status = index.status_of(identity);
+        const row = rows_by_id.get(run.identity.pendingRowId);
+        if (row !== undefined && !is_inserted_row(row)) {
+            removed_ids.add(row.id);
+            continue;
+        }
+        const status = index.status_of(run.identity);
         if (status === undefined) return layout_refusal({ reason: 'unknown-identity', message: "That row is not part of this sheet's layout." });
         if (status !== 'live') continue;
-        layout_identities.push(identity);
-        if (identity.kind === 'source') newly_removed.push(identity.sourceRow);
-        else removed_ids.add(identity.pendingRowId);
+        inserted_ids.push(run.identity.pendingRowId);
+        removed_ids.add(run.identity.pendingRowId);
     }
-    if (layout_identities.length === 0 && removed_ids.size === 0) {
+    const selected = canonical_source_intervals(sources);
+    const removed_intervals = subtract_intervals(selected, layout.removedSourceRows);
+    if (removed_intervals.length === 0 && removed_ids.size === 0) {
+        // An unknown source row still answers as one.
+        const probe = delete_row_intervals(layout, selected, [], () => NaN);
+        if (!probe.ok) return layout_refusal(probe.refusal);
         return refuse_structure('no-live-entry', "Select at least one row that isn't deleted.");
     }
-    const removed_intervals = intervals_of_columns(newly_removed);
-    const result = delete_layout_rows(layout, layout_identities, (id) => rows_by_id.get(id)?.createdOrder ?? NaN);
+    const result = delete_row_intervals(
+        layout,
+        selected,
+        inserted_ids,
+        (id) => rows_by_id.get(id)?.createdOrder ?? NaN,
+    );
     if (!result.ok) return layout_refusal(result.refusal);
     const column_layout = column_layout_of(changes, context);
     const merge = merge_anchor_refusal(
@@ -1765,6 +1856,24 @@ export function delete_rows(
         appendBasis: removed_ids.size > 0 && rows.length === 0 ? undefined : changes.appendBasis,
         discardedRows: pending_rows(changes).filter((row) => removed_ids.has(row.id)),
         removedSourceRows: removed_intervals,
+    });
+}
+
+/** `restore_rows` over intervals of source rows, proportional to the intervals. */
+export function restore_row_runs(
+    changes: PendingStructuralChanges,
+    context: WorksheetStructureContext,
+    source: readonly SourceInterval[],
+): StructureResult {
+    const exclusive = exclusivity_refusal(changes, context);
+    if (exclusive !== undefined) return exclusive;
+    const result = restore_layout_row_intervals(row_layout_of(changes, context), source);
+    if (!result.ok) return layout_refusal(result.refusal);
+    return finish_structure(changes, context, 'rows', {
+        rowLayout: result.layout,
+        columnLayout: column_layout_of(changes, context),
+        rows: pending_rows(changes),
+        columns: changes.pendingColumns ?? [],
     });
 }
 

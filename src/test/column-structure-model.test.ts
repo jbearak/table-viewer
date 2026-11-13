@@ -7,6 +7,7 @@
 // grid shows, and "Discard row and column changes" with column changes.
 import { describe, expect, it } from 'vitest';
 import {
+    EMPTY_PENDING_STRUCTURAL_CHANGES,
     own_pending_structural_changes,
     pending_structure_error,
     type PendingColumn,
@@ -56,6 +57,7 @@ import {
     SELECT_ADJACENT_COLUMNS_MESSAGE,
     type ColumnMovePlanResult,
     type ColumnStructurePlanResult,
+    with_pending_column_widths,
 } from '../webview/column-structure-model';
 import {
     create_column_projection,
@@ -637,5 +639,29 @@ describe('Discard row and column changes, and Keep new rows at the end, with col
         if (!result.ok) throw new Error(result.refusal.message);
         expect(result.outcome.next.pendingColumns).toBeUndefined();
         expect(result.outcome.discardedColumns.map((column) => column.id)).toEqual(['p1']);
+    });
+});
+
+describe('with_pending_column_widths', () => {
+    const column = (id: string, viewerWidth?: number) => ({
+        id,
+        header: id,
+        cells: {},
+        format: { kind: 'none' as const },
+        createdOrder: 1,
+        ...(viewerWidth === undefined ? {} : { viewerWidth }),
+    });
+    const changes = {
+        ...EMPTY_PENDING_STRUCTURAL_CHANGES,
+        pendingColumns: [column('a', 90), column('b')],
+    };
+
+    it('sets and clears widths by ID, skipping columns no longer pending', () => {
+        const next = with_pending_column_widths(changes, { a: undefined, b: 140, gone: 10 });
+        expect(next?.pendingColumns).toEqual([column('a'), column('b', 140)]);
+    });
+
+    it('is undefined when nothing changes', () => {
+        expect(with_pending_column_widths(changes, { a: 90, b: undefined })).toBeUndefined();
     });
 });

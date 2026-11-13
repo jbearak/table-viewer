@@ -706,6 +706,43 @@ describe('an unresolved rekey intent', () => {
         await viewer.dispose();
     });
 
+    it.each(['finished', 'notFinished'] as const)(
+        'keeps column widths through a resize during the notice, its answer (%s), and a stale write',
+        async (choice) => {
+            const { viewer, state } = await open_unresolved(enc.encode('h\na\nc\n'));
+            const snapshot = viewer.last<{
+                snapshot: { sourceGeneration: number; identity: unknown; state: PerFileState };
+            }>('workbookSnapshot').snapshot;
+            const resize = () => viewer.panel.__receive({
+                type: 'stateChanged',
+                state: { ...snapshot.state, columnWidths: [{ 0: 300 }] },
+                sourceGeneration: snapshot.sourceGeneration,
+                snapshotIdentity: snapshot.identity,
+            });
+            const widths = () => (state.get_state(FILE) as PerFileState).columnWidths;
+            // The panel shows the sheet without widths; a resize there names
+            // a column the receipt may renumber, so the host keeps its own.
+            await resize();
+            await viewer.controller.drain();
+            expect(widths()).toEqual([{ 0: 120 }]);
+            const snapshots = () => viewer.messages().filter((message) => message.type === 'workbookSnapshot');
+            const before = snapshots().length;
+            await viewer.panel.__receive({ type: 'resolveStructuralSave', saveId: 'interrupted', choice });
+            await viewer.controller.drain();
+            expect(widths()).toEqual([{ 0: 120 }]);
+            // The answer delivers a new snapshot with the widths, so the panel
+            // replaces the width it showed during the notice.
+            expect(snapshots().length).toBeGreaterThan(before);
+            expect((snapshots().at(-1) as unknown as { snapshot: { state: PerFileState } })
+                .snapshot.state.columnWidths?.[0]).toEqual({ 0: 120 });
+            // A write still stamped with the notice's snapshot is dropped.
+            await resize();
+            await viewer.controller.drain();
+            expect(widths()).toEqual([{ 0: 120 }]);
+            await viewer.dispose();
+        },
+    );
+
     it('suggests "It didn\'t finish" when the shape does not match', async () => {
         const { viewer } = await open_unresolved(BYTES);
         // BYTES matches the payload's basis but neither intent digest.

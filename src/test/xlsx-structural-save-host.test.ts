@@ -20,8 +20,10 @@ import {
     row_move_block_refusal,
     row_move_item_model,
     type RowStructureSelection,
+    row_structure_selection,
 } from '../webview/row-structure-model';
 import { content_digest } from '../content-digest';
+import { MAX_SHEET_ROWS } from '../spreadsheet-safety';
 import { parse_xlsx } from '../parse-xlsx';
 import { ZipPackage } from '../zip-package';
 import { build_fixture_xlsx, cell, representative_workbook, row } from './helpers/xlsx-structure-fixture';
@@ -363,6 +365,58 @@ describe('the worksheet row ceiling', () => {
         expect(viewer.durable().pendingEdits?.[0]?.appendedRows?.map((row) => row.id)).toEqual([insert_id]);
         // A second insert would exceed it.
         expect(await viewer.insert({ requestId: 'over', anchor: 4, side: 'after' })).toMatchObject({ granted: false });
+    });
+});
+
+describe('the worksheet row limit at save', () => {
+    it('saves a delete and an append on a sheet at the limit, counting the live layout', async () => {
+        // The Header Row, three body rows, and a last cell on the sheet's last row.
+        const last = MAX_SHEET_ROWS;
+        const raw = build_fixture_xlsx({
+            sheets: [{
+                name: 'Data',
+                body: `<sheetData>${[
+                    row(1, [cell('A1', 'Item')]),
+                    row(2, [cell('A2', 'apple')]),
+                    row(3, [cell('A3', 'pear')]),
+                    row(4, [cell('A4', 'plum')]),
+                    row(last, [cell(`A${last}`, 'last')]),
+                ].join('')}</sheetData>`,
+            }],
+        });
+        const viewer = await open_xlsx(raw, { state: HEADER_ON });
+        expect(viewer.basis(0)?.sourceRowCount).toBe(last);
+        const deleted = {
+            rowLayout: {
+                runs: [{ kind: 'source' as const, start: 1, count: last - 1 }],
+                removedSourceRows: [{ start: 2, count: 1 }],
+                discardedPendingRows: [],
+            },
+            structuralBasis: viewer.basis(0),
+        };
+        expect(await viewer.publish(0, deleted)).toBe(true);
+        // Admission counts the live layout, so the deleted row makes room.
+        const append = await viewer.append('append', 1);
+        expect(append).toMatchObject({ granted: true });
+        await viewer.settle('append', true);
+        const structural: Partial<WorksheetPendingEdits> = {
+            ...deleted,
+            formatTemplates: [append.formatTemplate!],
+            appendedRows: [{
+                id: append.rowIds![0]!,
+                cells: { 0: { value: 'fig' } },
+                formatTemplateId: append.formatTemplate!.id,
+                createdOrder: 1,
+            }],
+            appendBasis: append.appendBasis!,
+        };
+        expect(await viewer.publish(0, structural)).toBe(true);
+        // One row deleted and one appended: the sheet stays at the limit.
+        const result = await viewer.save([{ sheetIndex: 0, structural }]);
+        expect((result as { rejection?: unknown }).rejection).toBeUndefined();
+        expect(result).toMatchObject({ success: true });
+        const rows = rows_of(part_text(viewer.file.bytes, 'xl/worksheets/sheet1.xml')!);
+        expect(rows.get(last)?.inner).toContain('fig');
     });
 });
 
@@ -709,7 +763,7 @@ describe('row moves through the step 7 model on .xlsx', () => {
             merges: merge_ranges_of(support.merges!),
             structuralBasis: support.basis!,
         };
-        const selection = (rows: readonly number[]): RowStructureSelection => ({
+        const selection = (rows: readonly number[]): RowStructureSelection => row_structure_selection({
             count: rows.length,
             identities: rows.map((sourceRow) => ({ kind: 'source', sourceRow })),
             removedSourceRows: [],

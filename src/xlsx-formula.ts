@@ -691,6 +691,27 @@ function opaque_span_end_at(formula: string, offset: number): number | undefined
 }
 
 /**
+ * `#REF!` error tokens in a formula, outside string literals, quoted sheet
+ * names, and bracketed spans, where the same characters are text.
+ */
+export function formula_ref_error_count(formula: string): number {
+    let count = 0;
+    let index = 0;
+    while (index < formula.length) {
+        const span_end = opaque_span_end_at(formula, index);
+        if (span_end !== undefined) {
+            index = span_end;
+        } else if (formula.slice(index, index + 5).toUpperCase() === '#REF!') {
+            count += 1;
+            index += 5;
+        } else {
+            index += 1;
+        }
+    }
+    return count;
+}
+
+/**
  * Start of each opaque span, keyed by its end, from one forward pass of
  * {@link opaque_span_end_at}. Backward scans use it to step over a span
  * whole.

@@ -28,7 +28,8 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
  */
 
 /**
- * One composed row per entry, keyed by SOURCE column.
+ * One composed row per entry, keyed by SOURCE column, or by `p:<id>` for a
+ * Pending Column, which has no source column.
  *
  * Keyed by source rather than display position because a draft outlives the
  * projection it was authored against: hiding or revealing a column shifts every
@@ -37,15 +38,21 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
  * projection change — a value returns to the column it was typed for when that
  * column comes back, and is neither shown nor staged while it is hidden.
  */
-export type AppendComposerDraft = readonly Readonly<Record<number, string>>[];
+export type AppendComposerDraft = readonly Readonly<Record<string, string>>[];
+
+/**
+ * A field's draft key: a source column's number, or `p:<id>` for a Pending
+ * Column, which has no source column and stages into its own cells.
+ */
+export type ComposerColumnKey = number | `p:${string}`;
 
 export const EMPTY_APPEND_COMPOSER_DRAFT: AppendComposerDraft = [];
 
 export interface AppendComposerProps {
     /** Visible column titles, indexed by display column. */
     readonly column_labels: readonly string[];
-    /** Source column each label belongs to, same order — the draft's keys. */
-    readonly source_columns: readonly number[];
+    /** Column each label belongs to, same order — the draft's keys. */
+    readonly source_columns: readonly ComposerColumnKey[];
     /**
      * Worksheet row number the first composed row will take, 1-based. Legends
      * count up from it: a draft's second row is not "Row 2" of anything the
@@ -77,7 +84,7 @@ export interface AppendComposerProps {
     readonly on_stage_success: () => void;
 }
 
-const blank_row = (): Readonly<Record<number, string>> => ({});
+const blank_row = (): Readonly<Record<string, string>> => ({});
 
 /**
  * The draft as the panel renders it: at least one row, so an untouched composer
@@ -87,7 +94,7 @@ const blank_row = (): Readonly<Record<number, string>> => ({});
  */
 export function normalize_draft(
     draft: AppendComposerDraft,
-): readonly Readonly<Record<number, string>>[] {
+): readonly Readonly<Record<string, string>>[] {
     return draft.length === 0 ? [blank_row()] : draft;
 }
 
@@ -130,7 +137,7 @@ export function AppendComposer({
 
     const set_field = useCallback((
         row_index: number,
-        source_column: number,
+        source_column: ComposerColumnKey,
         value: string,
     ) => {
         on_draft_change(rows.map((row, index) => (index === row_index

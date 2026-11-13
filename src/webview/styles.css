@@ -1231,6 +1231,40 @@ body.vscode-high-contrast-light .toolbar-split-caret.open {
     margin-top: 8px;
 }
 
+.structure-review p {
+    margin: 4px 0;
+}
+
+.structure-review h4 {
+    margin: 8px 0 4px;
+    font-size: var(--tv-font-size-sm);
+    font-weight: 600;
+}
+
+.structure-review-formulas {
+    display: grid;
+    gap: 4px;
+    list-style: none;
+    padding: 0;
+    margin: 0;
+}
+
+.structure-review-formulas li {
+    display: grid;
+    grid-template-columns: max-content minmax(0, 1fr) max-content;
+    align-items: baseline;
+    column-gap: 8px;
+}
+
+.structure-review-formulas code {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    padding: 1px 4px;
+    color: var(--vscode-textPreformat-foreground, var(--vscode-foreground, #ccc));
+    background: var(--vscode-textCodeBlock-background, rgba(128, 128, 128, 0.15));
+    border-radius: 2px;
+}
+
 .external-change-review-status {
     min-height: 1.2em;
     margin-top: 6px;

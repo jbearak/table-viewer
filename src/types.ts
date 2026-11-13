@@ -83,6 +83,11 @@ import type {
     FormulaCalculationLayout,
     FormulaCalculationResult,
 } from './formula-calculation';
+import type {
+    FormulaDivergenceReview,
+    FormulaImpact,
+    FormulaImpactState,
+} from './formula-divergence-review';
 
 export interface WorkbookData {
     sheets: SheetData[];
@@ -2848,6 +2853,39 @@ export interface PendingChangesSaveReceipt {
 }
 
 /** Whether a receipt describes a save that inserted, deleted, or moved rows or columns. */
+/**
+ * Map an old canonical source row through a structure entry. Rows before the
+ * body map to themselves; removed rows and rows past the old body map to null.
+ */
+export function structure_row_mapper(entry: WorksheetStructureReceipt): (row: number) => number | null {
+    const runs = [...entry.rowRuns].sort((left, right) => left.from - right.from);
+    const removed = entry.removedRows;
+    let body_start = Infinity;
+    let body_end = -Infinity;
+    for (const run of runs) {
+        body_start = Math.min(body_start, run.from);
+        body_end = Math.max(body_end, run.from + run.count);
+    }
+    for (const run of removed) {
+        body_start = Math.min(body_start, run.start);
+        body_end = Math.max(body_end, run.start + run.count);
+    }
+    return (row) => {
+        if (!(row >= body_start)) return row;
+        if (row >= body_end) return null;
+        let low = 0;
+        let high = runs.length - 1;
+        while (low <= high) {
+            const middle = (low + high) >> 1;
+            const run = runs[middle]!;
+            if (row < run.from) high = middle - 1;
+            else if (row >= run.from + run.count) low = middle + 1;
+            else return run.to + (row - run.from);
+        }
+        return null;
+    };
+}
+
 export function receipt_has_structure(receipt: PendingChangesSaveReceipt | undefined): boolean {
     return (receipt?.structure?.length ?? 0) > 0;
 }
@@ -3408,6 +3446,15 @@ export type HostMessage =
         mappingGeneration: number;
     }
     | { type: 'formulaCalculation'; requestId: string; sourceGeneration: number; results: readonly FormulaCalculationResult[] }
+    /** Review Changes' divergence list; `null` when the request was refused. */
+    | { type: 'formulaDivergence'; requestId: string; sourceGeneration: number; review: FormulaDivergenceReview | null }
+    /** Per salvage action, how many formulas it would turn to `#REF!` or point elsewhere; `null` when refused. */
+    | {
+        type: 'formulaImpact';
+        requestId: string;
+        sourceGeneration: number;
+        impacts: { readonly keep?: FormulaImpact; readonly discard?: FormulaImpact } | null;
+    }
     /** Git compare mode: sparse positional diff for the same page a rowData
      *  answered. `rowStatus[i]` describes row `startRow + i`; `changedCells`
      *  carries original raw (`base`) and formatted text for differing cells. */
@@ -3633,6 +3680,29 @@ export type WebviewMessage =
         layouts?: readonly FormulaCalculationLayout[];
     }
     | { type: 'cancelFormulaCalculation'; requestId: string; sourceGeneration: number }
+    /**
+     * Review Changes asks which formulas might render differently from Excel
+     * for these layouts. `edits` are the calculator's prospective edits.
+     */
+    /**
+     * The structural conflict notice asks what each salvage action would do
+     * to the workbook's formulas: `before` is now, each action its result.
+     */
+    | {
+        type: 'requestFormulaImpact';
+        requestId: string;
+        sourceGeneration: number;
+        before: FormulaImpactState;
+        keep?: FormulaImpactState;
+        discard: FormulaImpactState;
+    }
+    | {
+        type: 'requestFormulaDivergence';
+        requestId: string;
+        sourceGeneration: number;
+        edits: readonly FormulaCalculationEdit[];
+        layouts: readonly FormulaCalculationLayout[];
+    }
     | { type: 'stateChanged'; state: PerFileState; sourceGeneration: number; snapshotIdentity: WorkbookSnapshotIdentity }
     | { type: 'visibleRowChanged'; row: number }
     // `sheetIndex` is optional so a single-sheet source can omit it; the host

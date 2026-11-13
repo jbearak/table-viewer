@@ -43,6 +43,7 @@ import {
     STRUCTURE_BUSY_MESSAGE,
     type RowStructurePlanResult,
     type RowStructureSelection,
+    row_structure_selection,
 } from '../webview/row-structure-model';
 import { row_context_menu_items } from '../webview/row-context-menu';
 import type { ActionMenuItem } from '../webview/context-menu';
@@ -95,7 +96,7 @@ function appended(id: string, createdOrder: number): PendingAppendedRow {
 }
 
 function selection(overrides: Partial<RowStructureSelection>): RowStructureSelection {
-    return {
+    return row_structure_selection({
         count: 1,
         identities: [source(2)],
         removedSourceRows: [],
@@ -105,7 +106,7 @@ function selection(overrides: Partial<RowStructureSelection>): RowStructureSelec
         bandRows: 0,
         endsAtBandEnd: false,
         ...overrides,
-    };
+    } as Parameters<typeof row_structure_selection>[0]);
 }
 
 function menu(

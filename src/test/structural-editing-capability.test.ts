@@ -89,4 +89,11 @@ describe('structural_editing_capability', () => {
         expect(wide.rows).toEqual({ supported: true });
         expect(wide.columns).toEqual({ supported: false, reason: TOO_WIDE_TO_RESTRUCTURE_MESSAGE });
     });
+
+    it("carries a delimited sheet's shortest record width for the padding note", () => {
+        const [csv] = structural_editing_capability('csv', observation, [sheet], [2]).sheets;
+        expect(csv.shortestRowWidth).toBe(2);
+        const [unknown] = structural_editing_capability('csv', observation, [sheet]).sheets;
+        expect(unknown).not.toHaveProperty('shortestRowWidth');
+    });
 });

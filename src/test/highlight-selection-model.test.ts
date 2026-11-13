@@ -116,8 +116,23 @@ describe('highlight_selection_from_grid', () => {
         expect(highlight_selection_from_grid(current(1, 2), 10, projection, []))
             .toEqual({
                 selection: { displayRows: [{ start: 2, end: 2 }], sourceColumns: [2] },
+                pendingDisplayColumns: [],
                 estimatedCellCount: 1,
             });
+    });
+
+    it('names selected Pending Columns, which have no source column, apart from the source cells', () => {
+        const with_pending = { ...projection, visible_to_source: [0, undefined as unknown as number, 2] };
+        expect(highlight_selection_from_grid(current(1, 2), 10, with_pending, [])).toEqual({
+            selection: { displayRows: [{ start: 2, end: 2 }], sourceColumns: [] },
+            pendingDisplayColumns: [1],
+            estimatedCellCount: 1,
+        });
+        expect(highlight_selection_from_grid(current(0, 2, 2, 1), 10, with_pending, [])).toEqual({
+            selection: { displayRows: [{ start: 2, end: 2 }], sourceColumns: [0] },
+            pendingDisplayColumns: [1],
+            estimatedCellCount: 2,
+        });
     });
 
     it('converts rectangular, row, and column selections deterministically', () => {

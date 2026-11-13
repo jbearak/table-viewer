@@ -95,11 +95,55 @@ export interface PendingRowProjection {
      * where a scan of the bands does not reach; the band mode has none.
      */
     inline_pending_display_rows(start: number, end: number): readonly number[];
+    /**
+     * The rows of `[start, end]` before the deleted band, as runs, so a
+     * selection resolves in proportion to its runs rather than its rows: a
+     * `source` run is consecutive source rows (layout mode), a
+     * `sourceDisplay` run is consecutive host source-display rows (band
+     * mode), and a `row` is one row to resolve with `row_at`.
+     */
+    source_row_runs(start: number, end: number): readonly SourceRowRun[];
+    /**
+     * The first display row at or after `from` (then the last before it) that
+     * is not a Pending Row Removal or tail removal, skipping removed runs
+     * whole in layout mode; undefined when none is found within `limit` rows
+     * of `from` in band mode.
+     */
+    nearest_live_display_row(from: number, limit?: number): number | undefined;
     /** Expand compressed source-band intervals back into host display space. */
     source_display_intervals(
         intervals: readonly { readonly start: number; readonly end: number }[],
     ): { start: number; end: number }[];
 }
+
+/** See `PendingRowProjection.source_row_runs`. */
+export type SourceRowRun =
+    | { readonly kind: 'source'; readonly displayStart: number; readonly count: number; readonly sourceRow: number }
+    | { readonly kind: 'sourceDisplay'; readonly displayStart: number; readonly count: number; readonly sourceDisplayStart: number }
+    | { readonly kind: 'row'; readonly displayRow: number };
+
+/** Band mode's live-row search: row by row, at most `limit` rows each way. */
+function nearest_live_by_state(
+    projection: Pick<PendingRowProjection, 'row_state' | 'rowCount'>,
+    from: number,
+    limit: number,
+): number | undefined {
+    const is_live = (row: number) => {
+        const state = projection.row_state(row);
+        return state !== 'removed' && state !== 'tail-removal';
+    };
+    const start = Math.max(0, Math.min(from, projection.rowCount - 1));
+    for (let row = start; row < projection.rowCount && row - start <= limit; row += 1) {
+        if (is_live(row)) return row;
+    }
+    for (let row = start - 1; row >= 0 && start - row <= limit; row -= 1) {
+        if (is_live(row)) return row;
+    }
+    return undefined;
+}
+
+/** Rows band mode examines each way for a live row after a delete. */
+export const NEAREST_LIVE_ROW_SCAN_LIMIT = 10_000;
 
 export interface PendingRowProjectionInput {
     /** Source-backed display rows after transforms, before tail-removal exclusion. */
@@ -372,6 +416,18 @@ function create_band_row_projection(
                 : undefined
         ),
         inline_pending_display_rows: () => [],
+        source_row_runs: (start, end) => {
+            const last = Math.min(end, filtered_source_count - 1);
+            if (last < Math.max(0, start)) return [];
+            return projection.source_display_intervals([{ start, end: last }]).map((raw) => ({
+                kind: 'sourceDisplay' as const,
+                displayStart: filtered_source_display_row(raw.start)!,
+                count: raw.end - raw.start + 1,
+                sourceDisplayStart: raw.start,
+            }));
+        },
+        nearest_live_display_row: (from, limit = NEAREST_LIVE_ROW_SCAN_LIMIT) =>
+            nearest_live_by_state(projection, from, limit),
         display_row_for_tail_removal_id: (append_history_id: string): number | undefined => {
             const deleted_index = deleted_index_by_removal_id.get(append_history_id);
             if (deleted_index !== undefined) return deletedBandStart + deleted_index;
@@ -422,6 +478,17 @@ function create_layout_row_projection(
     const inline_pending: number[] = displayed.flatMap((segment) =>
         segment.kind === 'pending' ? [fixed_count + segment.displayBefore] : []);
 
+    /** Index of the displayed segment holding layout display index `index` (the last one starting at or before it). */
+    const segment_at_display_index = (index: number): number => {
+        let low = 0;
+        let high = displayed.length;
+        while (low < high) {
+            const middle = (low + high) >>> 1;
+            if (displayed[middle]!.displayBefore <= index) low = middle + 1;
+            else high = middle;
+        }
+        return Math.max(0, low - 1);
+    };
     const is_moved = (source_row: number): boolean => {
         let low = 0;
         let high = moved.length;
@@ -536,6 +603,62 @@ function create_layout_row_projection(
             return display_index === undefined ? undefined : fixed_count + display_index;
         },
         display_row_for_tail_removal_id: () => undefined,
+        source_row_runs: (start, end) => {
+            const first = Math.max(0, start);
+            const last = Math.min(end, layout_end - 1);
+            const runs: SourceRowRun[] = [];
+            for (let row = first; row <= Math.min(last, fixed_count - 1); row += 1) {
+                runs.push({ kind: 'row', displayRow: row });
+            }
+            const low_index = Math.max(first, fixed_count) - fixed_count;
+            const high_index = last - fixed_count;
+            if (high_index < low_index) return runs;
+            for (let at = segment_at_display_index(low_index); at < displayed.length; at++) {
+                const segment = displayed[at]!;
+                if (segment.displayBefore > high_index) break;
+                if (segment.kind === 'pending') {
+                    if (segment.displayBefore >= low_index) {
+                        runs.push({ kind: 'row', displayRow: fixed_count + segment.displayBefore });
+                    }
+                    continue;
+                }
+                const low = Math.max(low_index, segment.displayBefore);
+                const high = Math.min(high_index, segment.displayBefore + segment.count - 1);
+                if (high < low) continue;
+                runs.push({
+                    kind: 'source',
+                    displayStart: fixed_count + low,
+                    count: high - low + 1,
+                    sourceRow: segment.start + low - segment.displayBefore,
+                });
+            }
+            return runs;
+        },
+        nearest_live_display_row: (from) => {
+            if (rowCount === 0) return undefined;
+            const start = Math.max(0, Math.min(from, rowCount - 1));
+            // Fixed rows and the band are live; in the layout, skip removed segments whole.
+            const live_at_or_after = (row: number): number | undefined => {
+                if (row < fixed_count || row >= layout_end) return row;
+                for (let at = segment_at_display_index(row - fixed_count); at < displayed.length; at++) {
+                    const segment = displayed[at]!;
+                    if (segment.status !== 'live') continue;
+                    return fixed_count + Math.max(segment.displayBefore, row - fixed_count);
+                }
+                return layout_end < rowCount ? layout_end : undefined;
+            };
+            const live_at_or_before = (row: number): number | undefined => {
+                if (row < fixed_count || row >= layout_end) return row;
+                for (let at = segment_at_display_index(row - fixed_count); at >= 0; at--) {
+                    const segment = displayed[at]!;
+                    if (segment.status !== 'live') continue;
+                    const segment_last = segment.displayBefore + segment.count - 1;
+                    return fixed_count + Math.min(segment_last, row - fixed_count);
+                }
+                return fixed_count > 0 ? fixed_count - 1 : undefined;
+            };
+            return live_at_or_after(start) ?? (start > 0 ? live_at_or_before(start - 1) : undefined);
+        },
         inline_pending_display_rows: (start, end) => {
             let low = 0;
             let high = inline_pending.length;

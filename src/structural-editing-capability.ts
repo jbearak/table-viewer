@@ -156,6 +156,8 @@ export function structural_editing_capability(
     format: TableFormatId,
     observation: StructuralBasisObservation | undefined,
     sheets: readonly Pick<SheetMeta, 'sourceRowCount' | 'columnCount'>[],
+    /** CSV and TSV: the shortest record's field count, per sheet. */
+    shortest_row_widths?: readonly (number | undefined)[],
 ): StructuralEditingCapability {
     const scanned = observation?.xlsxStructure?.support;
     return Object.freeze({
@@ -174,7 +176,13 @@ export function structural_editing_capability(
             const columns = sheet.columnCount > MAX_SHEET_COLUMNS
                 ? Object.freeze({ supported: false as const, reason: TOO_WIDE_TO_RESTRUCTURE_MESSAGE })
                 : SUPPORTED;
-            return Object.freeze({ rows: SUPPORTED, columns, basis });
+            const shortest = shortest_row_widths?.[sheet_index];
+            return Object.freeze({
+                rows: SUPPORTED,
+                columns,
+                basis,
+                ...(shortest === undefined ? {} : { shortestRowWidth: shortest }),
+            });
         })),
     });
 }

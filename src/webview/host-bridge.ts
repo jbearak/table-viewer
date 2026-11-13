@@ -74,7 +74,23 @@ interface PendingEditSessionChannel {
     // only the key of last resort for the untagged single-sheet CSV path.
     latestPublicationBySheet: Map<string, PendingEditPublication>;
     unacknowledgedSequences: Set<number>;
+    /**
+     * Structural publications a newer one superseded before the host
+     * acknowledged them, per sheet, oldest first. The host may still write
+     * them, and a refresh carrying one is an echo of the renderer's own past,
+     * not a change the host made; acknowledgement of a later sequence proves
+     * every earlier write landed, and prunes them.
+     */
+    supersededStructuralBySheet: Map<string, { readonly sequence: number; readonly payload: string }[]>;
 }
+
+/**
+ * Unacknowledged structural publications past which App admits no new edit
+ * gesture until the host catches up. Superseded ones are never dropped
+ * before acknowledgement (a refresh may still echo any of them), so this
+ * backpressure is what bounds their memory against a stalled host.
+ */
+export const MAX_UNACKNOWLEDGED_STRUCTURAL_PUBLICATIONS = 256;
 
 const pending_edit_channels = new Map<string, PendingEditSessionChannel>();
 
@@ -147,6 +163,7 @@ function pending_edit_channel(session_id: string): PendingEditSessionChannel {
             nextSequence: 1,
             latestPublicationBySheet: new Map(),
             unacknowledgedSequences: new Set(),
+            supersededStructuralBySheet: new Map(),
         };
         pending_edit_channels.set(session_id, channel);
     }
@@ -307,6 +324,14 @@ export const pending_edit_durability = {
         const channel = pending_edit_channels.get(editSessionId);
         if (!channel || sequence > channel.nextSequence - 1) return;
         channel.unacknowledgedSequences.delete(sequence);
+        // The host writes publications in sequence order, so every
+        // superseded one at or before this sequence has landed: no later
+        // refresh can carry it as the host's current truth.
+        for (const [key, superseded] of channel.supersededStructuralBySheet) {
+            const remaining = superseded.filter((entry) => entry.sequence > sequence);
+            if (remaining.length === 0) channel.supersededStructuralBySheet.delete(key);
+            else channel.supersededStructuralBySheet.set(key, remaining);
+        }
     },
     retire(editSessionId: string): void {
         pending_edit_channels.delete(editSessionId);
@@ -343,6 +368,11 @@ export const pending_changes_durability = {
             )
         ) return channel.nextSequence - 1;
         const sequence = channel.nextSequence++;
+        if (latest?.structural && channel.unacknowledgedSequences.has(latest.sequence)) {
+            const superseded = channel.supersededStructuralBySheet.get(dedupe_key) ?? [];
+            superseded.push({ sequence: latest.sequence, payload: latest.payload });
+            channel.supersededStructuralBySheet.set(dedupe_key, superseded);
+        }
         if (latest) channel.unacknowledgedSequences.delete(latest.sequence);
         channel.latestPublicationBySheet.set(dedupe_key, {
             payload,
@@ -412,6 +442,36 @@ export const pending_changes_durability = {
         // value. Parsing that private canonical snapshot gives refresh merging an
         // immutable publication base without retaining mutable caller objects.
         return JSON.parse(publication.payload) as WorksheetPendingChanges;
+    },
+    /**
+     * Structural publications for the sheet that a newer one superseded
+     * before the host acknowledged them, oldest first: what a refresh may
+     * still echo from the renderer's own past.
+     */
+    superseded_structural_payloads(
+        editSessionId: string,
+        sheetIndex: number,
+        sheetName: string | undefined,
+        worksheetId?: string,
+    ): readonly WorksheetPendingChanges[] {
+        const superseded = pending_edit_channels.get(editSessionId)?.supersededStructuralBySheet.get(
+            worksheet_target_key({ sheetIndex, sheetName, worksheetId }),
+        );
+        return (superseded ?? []).map((entry) => JSON.parse(entry.payload) as WorksheetPendingChanges);
+    },
+    /**
+     * Whether the session has as many unacknowledged structural publications
+     * as App lets accumulate: the superseded ones and each sheet's latest.
+     */
+    structural_backlog_full(editSessionId: string): boolean {
+        const channel = pending_edit_channels.get(editSessionId);
+        if (channel === undefined) return false;
+        let backlog = 0;
+        for (const superseded of channel.supersededStructuralBySheet.values()) backlog += superseded.length;
+        for (const publication of channel.latestPublicationBySheet.values()) {
+            if (publication.structural && channel.unacknowledgedSequences.has(publication.sequence)) backlog += 1;
+        }
+        return backlog >= MAX_UNACKNOWLEDGED_STRUCTURAL_PUBLICATIONS;
     },
     unacknowledged_structural_payload_matches(
         editSessionId: string,

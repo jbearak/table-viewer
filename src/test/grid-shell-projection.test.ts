@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 
 import React, { act } from 'react';
+import { ROWS_NOT_LOADED_MESSAGE } from '../webview/row-structure-model';
 import { createRoot, type Root } from 'react-dom/client';
 import { readFileSync } from 'node:fs';
 import { afterEach, describe, expect, it, onTestFinished, vi } from 'vitest';
@@ -4322,6 +4323,41 @@ describe('GridShell column projection', () => {
         expect(after_clear.rows.length).toBe(0);
     });
 
+    it('drops a cell focus request a newer one replaced while its row loaded', async () => {
+        // Source row 2's page is not resident, so request 1 waits on a load.
+        grid_mock.source_row_for_display = (display_row: number) => (display_row === 2 ? undefined : display_row);
+        let finish_load: (loaded: boolean) => void = () => {};
+        grid_mock.ensure_rows_loaded.mockImplementation(() => new Promise<boolean>((resolve) => {
+            finish_load = resolve;
+        }));
+        const on_cell_focus_applied = vi.fn();
+        const base = props({
+            row_count: 3,
+            sheet_meta: { ...props().sheet_meta, rowCount: 3, sourceRowCount: 3 },
+            on_cell_focus_applied,
+        });
+        const GridShell = await render_grid({
+            ...base,
+            cell_focus: { sequence: 1, sheetIndex: 0, row: { kind: 'source', sourceRow: 2 }, column: { kind: 'source', sourceColumn: 0 } },
+        });
+        expect(grid_mock.ensure_rows_loaded).toHaveBeenCalled();
+        // Request 2 lands on a loaded row at once.
+        await act(async () => {
+            root!.render(React.createElement(GridShell, {
+                ...base,
+                cell_focus: { sequence: 2, sheetIndex: 0, row: { kind: 'source', sourceRow: 0 }, column: { kind: 'source', sourceColumn: 0 } },
+            }));
+        });
+        const caret = () => (grid_mock.props!.gridSelection as { current?: { cell: [number, number] } }).current?.cell;
+        expect(caret()).toEqual([0, 0]);
+        grid_mock.source_row_for_display = null;
+        await act(async () => { finish_load(true); });
+        // Request 1's load finishing must not move the caret off request 2's cell.
+        expect(caret()).toEqual([0, 0]);
+        expect(on_cell_focus_applied).not.toHaveBeenCalledWith(1, true);
+        expect(on_cell_focus_applied).toHaveBeenCalledWith(2, true);
+    });
+
     it('publishes grid actions that select all and copy the whole sheet', async () => {
         const write_text = vi.fn(async () => {});
         Object.defineProperty(navigator, 'clipboard', {
@@ -7392,6 +7428,48 @@ describe('GridShell append composer', () => {
             .toBe('false');
     });
 
+    it('offers a Pending Column and stages its value into the column, in the same history entry', async () => {
+        const history = create_history_store();
+        const pending = create_pending_row_store({ session_id: 'session-1' });
+        const before = pending.snapshot();
+        pending.stage_replace('session-1', before, {
+            ...before,
+            columnLayout: {
+                columns: [
+                    { kind: 'source', sourceColumn: 0 },
+                    { kind: 'pending', pendingColumnId: 'c1' },
+                    { kind: 'source', sourceColumn: 1 },
+                    { kind: 'source', sourceColumn: 2 },
+                ],
+                removedSourceColumns: [],
+                discardedPendingColumns: [],
+            },
+            pendingColumns: [{ id: 'c1', header: 'New column', cells: {}, format: { kind: 'none' }, createdOrder: 1 }],
+        })!.commit();
+        await render_grid(composer_props({ pending_row_store: pending, history_store: history }));
+        await open_composer();
+        expect(field_labels()).toEqual(['A name', 'New column', 'C name']);
+        await act(async () => set_input_value(field('append-composer-0-0') as HTMLInputElement, 'left'));
+        await act(async () => set_input_value(field('append-composer-0-1') as HTMLInputElement, 'typed'));
+        // One store write, so the host gets one payload with the row and its Pending Column cell.
+        const notifications: string[] = [];
+        pending.subscribe((change) => notifications.push(change.kind));
+        await act(async () => { button('Stage row').click(); });
+        await vi.waitUntil(() => pending.snapshot().appendedRows.length === 1);
+        const [row] = pending.snapshot().appendedRows;
+        expect(row.cells[0]?.value).toBe('left');
+        expect(pending.snapshot().pendingColumns?.[0]?.cells[`p:${row.id}`]?.value).toBe('typed');
+        expect(notifications).toHaveLength(1);
+        const entries = history.snapshot().undoStack;
+        expect(entries.map((entry) => entry.action.label)).toEqual(['Compose row']);
+        expect(entries[0]!.action.changes.map((change) => change.kind)).toContain('columnLayout');
+        const undo = plan_pending_row_history_replay(entries[0]!.action, 'undo', () => pending.snapshot());
+        if (undo.kind !== 'plan') throw new Error(undo.kind);
+        const undone = undo.plans.at(-1)!.next;
+        expect(undone.appendedRows).toEqual([]);
+        expect(undone.pendingColumns?.[0]?.cells).toEqual({});
+    });
+
     it('stages a batch composed with Add another row as one gesture', async () => {
         const history = create_history_store();
         const pending = create_pending_row_store({ session_id: 'session-1' });
@@ -8632,6 +8710,90 @@ describe('row Delete and Restore in the row-gutter menu', () => {
         }).current?.cell).toEqual([0, 4]));
     });
 
+    it('undoes and redoes deleting an appended row above another', async () => {
+        const pending = create_pending_row_store({ session_id: 'session' });
+        const history = create_history_store();
+        pending.append_rows('session', ['pending-a', 'pending-b'], {
+            id: 'plain', format: { kind: 'none' },
+        }, 1);
+        const before = pending.snapshot();
+        await render_grid(structure_props({
+            structural_support: supported,
+            edit_session: create_edit_session_store({ session_id: 'session' }),
+            pending_row_store: pending,
+            history_store: history,
+        }));
+        await open_row_menu(4);
+        await act(async () => menu_item('Delete row')!.click());
+        const deleted = pending.snapshot();
+        expect(deleted.appendedRows.map((row) => row.id)).toEqual(['pending-b']);
+        const undo = peek_history(history.snapshot(), 'undo');
+        if (undo.kind !== 'available') throw new Error('nothing recorded');
+        // pending-b only shifts up; no arm re-indexes it.
+        expect(undo.entry.action.changes).toHaveLength(1);
+        const undone = plan_pending_row_history_replay(undo.entry.action, 'undo', () => deleted);
+        if (undone.kind !== 'plan') throw new Error(undone.kind);
+        expect(undone.plans.at(-1)!.next).toEqual(before);
+        const redone = plan_pending_row_history_replay(undo.entry.action, 'redo', () => before);
+        if (redone.kind !== 'plan') throw new Error(redone.kind);
+        expect(redone.plans.at(-1)!.next).toEqual(deleted);
+    });
+
+    it('deletes an appended row with its Pending Column cells, and Undo brings both back', async () => {
+        const pending = create_pending_row_store({ session_id: 'session' });
+        const history = create_history_store();
+        pending.append_rows('session', ['pending-a', 'pending-b'], {
+            id: 'plain', format: { kind: 'none' },
+        }, 1);
+        const before = pending.snapshot();
+        pending.stage_replace('session', before, {
+            ...before,
+            columnLayout: {
+                columns: [
+                    { kind: 'source', sourceColumn: 0 },
+                    { kind: 'pending', pendingColumnId: 'c1' },
+                    { kind: 'source', sourceColumn: 1 },
+                    { kind: 'source', sourceColumn: 2 },
+                ],
+                removedSourceColumns: [],
+                discardedPendingColumns: [],
+            },
+            pendingColumns: [{
+                id: 'c1',
+                header: 'New column',
+                cells: { 'p:pending-a': { value: 'composed' }, 'p:pending-b': { value: 'kept' } },
+                highlights: { 'p:pending-a': 'yellow' },
+                format: { kind: 'none' },
+                createdOrder: 1,
+            }],
+            structuralBasis: basis,
+        })!.commit();
+        const with_cells = pending.snapshot();
+        await render_grid(structure_props({
+            structural_support: supported,
+            edit_session: create_edit_session_store({ session_id: 'session' }),
+            pending_row_store: pending,
+            history_store: history,
+        }));
+        await open_row_menu(4);
+        await act(async () => menu_item('Delete row')!.click());
+        expect(pending.snapshot().appendedRows.map((row) => row.id)).toEqual(['pending-b']);
+        expect(pending.snapshot().pendingColumns?.[0]?.cells).toEqual({ 'p:pending-b': { value: 'kept' } });
+        expect(pending.snapshot().pendingColumns?.[0]?.highlights).toBeUndefined();
+        const undo = peek_history(history.snapshot(), 'undo');
+        if (undo.kind !== 'available') throw new Error('nothing recorded');
+        expect(undo.entry.action.label).toBe('Delete row');
+        const replay = plan_pending_row_history_replay(undo.entry.action, 'undo', () => pending.snapshot());
+        if (replay.kind !== 'plan') throw new Error(replay.kind);
+        const undone = replay.plans.at(-1)!.next;
+        expect(undone.appendedRows.map((row) => row.id)).toEqual(['pending-a', 'pending-b']);
+        expect(undone.pendingColumns).toEqual(with_cells.pendingColumns);
+        const deleted = pending.snapshot();
+        const redo = plan_pending_row_history_replay(undo.entry.action, 'redo', () => undone);
+        if (redo.kind !== 'plan') throw new Error(redo.kind);
+        expect(redo.plans.at(-1)!.next).toEqual(deleted);
+    });
+
     it('refuses a paste into a removed row', async () => {
         const cells = create_edit_session_store({ session_id: 'session' });
         const pending = create_pending_row_store({ session_id: 'session' });
@@ -9827,6 +9989,109 @@ describe('columns: Insert, Delete, Restore, Move, rename, Pending Column cells, 
         expect(cell.data?.edit_value ?? (cell as { copyData?: string }).copyData).toBe('=1+1');
     });
 
+    it('auto-fits a Pending Column formula by its calculated result', async () => {
+        const canvas_context = vi.spyOn(HTMLCanvasElement.prototype, 'getContext')
+            .mockReturnValue({
+                font: '',
+                measureText: (text: string) => ({ width: text.length * 7 }),
+            } as unknown as CanvasRenderingContext2D);
+        onTestFinished(() => canvas_context.mockRestore());
+        const pending = with_pending_column({ 's:1': { value: '=REPT("x",60)' } }, xlsx_basis);
+        const sheet_meta = { ...props().sheet_meta, rowCount: 2, sourceRowCount: 2 };
+        const formula_anchor_workbook = webview_formula_workbook(true, [sheet_meta], () => pending.snapshot());
+        const pending_auto_fit_ref: { current: (() => Record<string, number>) | null } = { current: null };
+        const { rerender } = await render_columns({
+            pending_row_store: pending,
+            edit_syntax: 'markdown',
+            structural_support: { ...supported, basis: xlsx_basis },
+            formula_anchor_workbook,
+            formula_results: new Map(),
+            pending_auto_fit_ref,
+        });
+        // No result yet: the formula text is what there is to measure.
+        const before_result = pending_auto_fit_ref.current!()['c1']!;
+        await rerender({ formula_results: new Map([['1:1', 'x'.repeat(60)]]) });
+        const with_result = pending_auto_fit_ref.current!()['c1']!;
+        expect(with_result).toBeGreaterThan(before_result);
+        expect(with_result).toBeGreaterThanOrEqual(60 * 7);
+    });
+
+    it('goes to a Pending Column cell on a source row that has not loaded, loading it first', async () => {
+        // Source row 1's page is not resident until the load.
+        grid_mock.source_row_for_display = (display_row: number) => (display_row === 1 ? undefined : display_row);
+        grid_mock.ensure_rows_loaded.mockImplementation(async () => {
+            grid_mock.source_row_for_display = null;
+            return true;
+        });
+        const on_cell_focus_applied = vi.fn();
+        await render_columns({
+            pending_row_store: with_pending_column({}),
+            on_cell_focus_applied,
+            cell_focus: {
+                sequence: 1,
+                sheetIndex: 0,
+                row: { kind: 'source', sourceRow: 1 },
+                column: { kind: 'pending', pendingColumnId: 'c1' },
+            },
+        });
+        await vi.waitFor(() => expect(on_cell_focus_applied).toHaveBeenCalledWith(1, true));
+        expect(grid_mock.ensure_rows_loaded).toHaveBeenCalled();
+        expect((grid_mock.props!.gridSelection as { current?: { cell: [number, number] } }).current?.cell)
+            .toEqual([1, 1]);
+    });
+
+    it('goes to a Pending Column by identity when it moves, or nowhere when it goes, while its row loads', async () => {
+        for (const outcome of ['moved', 'removed'] as const) {
+            grid_mock.source_row_for_display = (display_row: number) => (display_row === 1 ? undefined : display_row);
+            let finish_load: (loaded: boolean) => void = () => {};
+            grid_mock.ensure_rows_loaded.mockImplementation(() => new Promise<boolean>((resolve) => {
+                finish_load = resolve;
+            }));
+            const pending = with_pending_column({});
+            const on_cell_focus_applied = vi.fn();
+            await render_columns({
+                pending_row_store: pending,
+                on_cell_focus_applied,
+                cell_focus: {
+                    sequence: 1,
+                    sheetIndex: 0,
+                    row: { kind: 'source', sourceRow: 1 },
+                    column: { kind: 'pending', pendingColumnId: 'c1' },
+                },
+            });
+            expect(grid_mock.ensure_rows_loaded).toHaveBeenCalled();
+            const caret = () => (grid_mock.props!.gridSelection as { current?: { cell: [number, number] } }).current?.cell;
+            const caret_before = caret();
+            // While the row loads, the Pending Column moves to the end, or goes.
+            await act(async () => {
+                const before = pending.snapshot();
+                const columns = outcome === 'moved'
+                    ? [{ kind: 'source' as const, sourceColumn: 0 }, { kind: 'source' as const, sourceColumn: 1 },
+                        { kind: 'source' as const, sourceColumn: 2 }, { kind: 'pending' as const, pendingColumnId: 'c1' }]
+                    : [{ kind: 'source' as const, sourceColumn: 0 }, { kind: 'source' as const, sourceColumn: 1 },
+                        { kind: 'source' as const, sourceColumn: 2 }];
+                const staged = pending.stage_replace('session', before, {
+                    ...before,
+                    columnLayout: { ...before.columnLayout!, columns },
+                    ...(outcome === 'removed' ? { pendingColumns: [] } : {}),
+                });
+                staged!.commit();
+                staged!.notify();
+            });
+            grid_mock.source_row_for_display = null;
+            await act(async () => { finish_load(true); });
+            if (outcome === 'moved') {
+                await vi.waitFor(() => expect(on_cell_focus_applied).toHaveBeenCalledWith(1, true));
+                expect(caret()).toEqual([3, 1]);
+            } else {
+                await vi.waitFor(() => expect(on_cell_focus_applied).toHaveBeenCalledWith(1, false));
+                expect(caret()).toEqual(caret_before);
+            }
+            act(() => root?.unmount());
+            root = null;
+        }
+    });
+
     it('repaints a Pending Column formula when its result arrives', async () => {
         const pending = with_pending_column({ 's:1': { value: '=1+1' } }, xlsx_basis);
         const sheet_meta = { ...props().sheet_meta, rowCount: 2, sourceRowCount: 2 };
@@ -10089,6 +10354,76 @@ describe('columns: Insert, Delete, Restore, Move, rename, Pending Column cells, 
             { kind: 'source', sourceColumn: 2 },
             { kind: 'source', sourceColumn: 0 },
         ]);
+    });
+
+    it('refuses a Pending Column highlight over a source row that has not loaded', async () => {
+        const highlight_ref: { current: HighlightSelectionHandle | null } = { current: null };
+        const { pending } = await render_columns({ highlight_ref });
+        await insert_right_of_first();
+        // The insert focuses its first new cell by polling; let it land, or it
+        // would overwrite the selection below.
+        await vi.waitFor(() => expect(
+            (grid_mock.props!.gridSelection as { current?: { cell: [number, number] } }).current?.cell,
+        ).toEqual([1, 0]));
+        // Source row 1's page is not resident: its identity is unknown.
+        grid_mock.source_row_for_display = (display_row: number) => (display_row === 1 ? undefined : display_row);
+        const on_selection_change = grid_mock.props!.onGridSelectionChange as (selection: unknown) => void;
+        await act(async () => on_selection_change({
+            columns: compact([]),
+            rows: compact([]),
+            current: { cell: [1, 0], range: { x: 1, y: 0, width: 1, height: 2 }, rangeStack: [] },
+        }));
+        await act(async () => { expect(highlight_ref.current?.apply('yellow')).toBe(false); });
+        expect(pending.snapshot().pendingColumns?.[0]?.highlights).toBeUndefined();
+        expect(grid_mock.post_message).toHaveBeenCalledWith({
+            type: 'showWarning',
+            message: ROWS_NOT_LOADED_MESSAGE,
+        });
+    });
+
+    it('highlights Pending Column cells by row identity, beside source cells, as one action', async () => {
+        const highlight_ref: { current: HighlightSelectionHandle | null } = { current: null };
+        const on_highlight_selection = vi.fn();
+        const { pending, history } = await render_columns({ highlight_ref, on_highlight_selection });
+        await insert_right_of_first();
+        // The insert focuses its first new cell by polling; let it land, or it
+        // would overwrite the selection below.
+        await vi.waitFor(() => expect(
+            (grid_mock.props!.gridSelection as { current?: { cell: [number, number] } }).current?.cell,
+        ).toEqual([1, 0]));
+        const on_selection_change = grid_mock.props!.onGridSelectionChange as (selection: unknown) => void;
+        // The Pending Column alone: nothing goes to the host.
+        await act(async () => on_selection_change({
+            columns: compact([]),
+            rows: compact([]),
+            current: { cell: [1, 0], range: { x: 1, y: 0, width: 1, height: 2 }, rangeStack: [] },
+        }));
+        await act(async () => { expect(highlight_ref.current?.apply('yellow')).toBe(true); });
+        expect(on_highlight_selection).not.toHaveBeenCalled();
+        expect(pending.snapshot().pendingColumns?.[0]?.highlights).toEqual({ 's:0': 'yellow', 's:1': 'yellow' });
+        const action = last_action(history);
+        expect(action.label).toBe('Highlight cells');
+        expect(action.changes.map((change) => change.kind)).toEqual(['columnLayout']);
+        const get_cell_content = grid_mock.props!.getCellContent as (cell: [number, number]) => {
+            themeOverride?: { bgCell?: string };
+        };
+        expect(get_cell_content([1, 0]).themeOverride?.bgCell).not.toBe('#81b88b@0.12');
+        // A source column and the Pending Column together: the host gets the
+        // source cells, and its commit records the Pending Column in the same action.
+        await act(async () => on_selection_change({
+            columns: compact([]),
+            rows: compact([]),
+            current: { cell: [0, 0], range: { x: 0, y: 0, width: 2, height: 1 }, rangeStack: [] },
+        }));
+        await act(async () => { expect(highlight_ref.current?.clear()).toBe(true); });
+        const call = on_highlight_selection.mock.calls[0]!;
+        expect(call[0]).toEqual({ displayRows: [{ start: 0, end: 0 }], sourceColumns: [0] });
+        await act(async () => { expect(call[2].commit([], 'Clear highlights')).toBe(true); });
+        expect(pending.snapshot().pendingColumns?.[0]?.highlights).toEqual({ 's:1': 'yellow' });
+        expect(last_action(history).changes.map((change) => change.kind)).toEqual(['columnLayout']);
+        const undo = plan_pending_row_history_replay(last_action(history), 'undo', () => pending.snapshot());
+        if (undo.kind !== 'plan') throw new Error(undo.kind);
+        expect(undo.plans[0]!.next.pendingColumns?.[0]?.highlights).toEqual({ 's:0': 'yellow', 's:1': 'yellow' });
     });
 
     it('offers no column structure items or drag without structural support', async () => {

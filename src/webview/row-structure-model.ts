@@ -43,6 +43,7 @@ import {
     insert_anchor_for_selection,
     source_row_layout,
     step_move_target,
+    subtract_intervals,
     type SourceInterval,
 } from '../worksheet-layout';
 import type { HistoryDirtyEntry } from './history-cell-state-model';
@@ -50,7 +51,9 @@ import { discard_history_source } from './history-discard-model';
 import type { HistoryChange } from './history-stack-model';
 import {
     APPENDED_BAND_MESSAGE,
-    delete_rows,
+    delete_row_runs,
+    restore_row_runs,
+    row_runs_of_identities,
     insert_rows,
     MERGE_SPLIT_MESSAGE,
     move_rows,
@@ -60,6 +63,7 @@ import {
     STRUCTURE_TAIL_REMOVAL_MESSAGE,
     STRUCTURE_TRANSFORMED_MESSAGE,
     TOO_MANY_PENDING_ROWS_MESSAGE,
+    type RowSelectionRun,
     type StructureOutcome,
     type WorksheetStructureContext,
 } from './pending-row-store';
@@ -134,12 +138,23 @@ export interface RowStructureSelection {
     /** Selected display rows. */
     readonly count: number;
     /**
+     * The selected source body rows and Pending Rows as runs, in display
+     * order: proportional to the selection's runs, not its rows. Undefined
+     * when a selected row could not be resolved, which only happens for a
+     * transformed view's row whose page has not loaded.
+     */
+    readonly runs: readonly RowSelectionRun[] | undefined;
+    /**
      * Every selected source body row and Pending Row, by identity, in display
-     * order; undefined when a selected row could not be resolved, which only
-     * happens for a transformed view's row whose page has not loaded.
+     * order; `undefined` exactly when `runs` is. Expanded from the runs on
+     * first read, for gestures that need each row.
      */
     readonly identities: readonly RowIdentity[] | undefined;
-    /** Selected Pending Row Removals, by source row, in display order. */
+    /** Selected Pending Row Removals, as sorted source intervals. */
+    readonly removedSourceRuns: readonly SourceInterval[];
+    /** How many selected rows are Pending Row Removals. */
+    readonly removedCount: number;
+    /** Selected Pending Row Removals, by source row; expanded on first read. */
     readonly removedSourceRows: readonly number[];
     /** The Header Row or a row above it is selected. */
     readonly fixedRows: boolean;
@@ -158,20 +173,51 @@ export interface RowStructureSelectionOptions {
     readonly bodyStart: number;
     readonly isRemoved: (source_row: number) => boolean;
     /**
+     * Pending Row Removals as sorted intervals, so a run of rows is checked
+     * at once; without them each row asks `isRemoved`.
+     */
+    readonly removedSourceRows?: readonly SourceInterval[];
+    /**
      * A source row for a source-display row whose identity is not resident.
      * The grid answers only in an untransformed view, where the mapping is
      * arithmetic; a transformed view leaves the row unresolved.
      */
     readonly sourceRowFor?: (source_display_row: number) => number | undefined;
+    /**
+     * `sourceRowFor` for `count` consecutive source-display rows, as source
+     * intervals in display order; undefined where the mapping is not
+     * arithmetic (a transformed view).
+     */
+    readonly sourceRowsFor?: (source_display_start: number, count: number) => readonly SourceInterval[] | undefined;
+}
+
+function intersect_intervals(
+    left: readonly SourceInterval[],
+    right: readonly SourceInterval[],
+): SourceInterval[] {
+    const out: SourceInterval[] = [];
+    let at = 0;
+    for (const entry of left) {
+        const end = entry.start + entry.count;
+        while (at < right.length && right[at]!.start + right[at]!.count <= entry.start) at++;
+        for (let cursor = at; cursor < right.length && right[cursor]!.start < end; cursor++) {
+            const other = right[cursor]!;
+            const start = Math.max(entry.start, other.start);
+            const stop = Math.min(end, other.start + other.count);
+            if (stop > start) out.push({ start, count: stop - start });
+        }
+    }
+    return out;
 }
 
 export function resolve_row_structure_selection(
-    projection: Pick<PendingRowProjection, 'row_at' | 'rowCount'>,
+    projection: Pick<PendingRowProjection, 'row_at' | 'rowCount'>
+        & Partial<Pick<PendingRowProjection, 'source_row_runs' | 'deletedBandStart'>>,
     display_rows: readonly { readonly start: number; readonly end: number }[],
     options: RowStructureSelectionOptions,
 ): RowStructureSelection {
-    const identities: RowIdentity[] = [];
-    const removedSourceRows: number[] = [];
+    const runs: RowSelectionRun[] = [];
+    const removed: SourceInterval[] = [];
     let count = 0;
     let resolved = true;
     let fixedRows = false;
@@ -179,56 +225,219 @@ export function resolve_row_structure_selection(
     let bandRows = 0;
     let last_row: number | undefined;
     const covered: { start: number; end: number }[] = [];
+    const add_source = (start: number, length: number): void => {
+        let first = start;
+        let rows = length;
+        if (first < options.bodyStart) {
+            fixedRows = true;
+            const skip = Math.min(rows, options.bodyStart - first);
+            first += skip;
+            rows -= skip;
+        }
+        if (rows <= 0) return;
+        const previous = runs[runs.length - 1];
+        if (previous?.kind === 'source' && previous.start + previous.count === first) {
+            runs[runs.length - 1] = { kind: 'source', start: previous.start, count: previous.count + rows };
+        } else {
+            runs.push({ kind: 'source', start: first, count: rows });
+        }
+        if (options.removedSourceRows !== undefined) {
+            removed.push(...intersect_intervals([{ start: first, count: rows }], options.removedSourceRows));
+        } else {
+            for (let row = first; row < first + rows; row += 1) {
+                if (options.isRemoved(row)) removed.push({ start: row, count: 1 });
+            }
+        }
+    };
+    const add_row = (row: number): void => {
+        const projected = projection.row_at(row);
+        if (projected === undefined) {
+            resolved = false;
+            return;
+        }
+        if (projected.kind === 'removal') {
+            tailRemovals = true;
+            return;
+        }
+        if (projected.kind !== 'source') {
+            if (projected.kind === 'replacement' || !is_inserted_row(projected.row)) bandRows += 1;
+            runs.push({ kind: 'pending', identity: projected.identity as Extract<RowIdentity, { kind: 'pending' }> });
+            return;
+        }
+        const source_row = projected.identity?.sourceRow
+            ?? options.sourceRowFor?.(projected.sourceDisplayRow);
+        if (source_row === undefined) {
+            resolved = false;
+            return;
+        }
+        if (source_row < options.bodyStart) {
+            fixedRows = true;
+            return;
+        }
+        add_source(source_row, 1);
+    };
     for (const interval of display_rows) {
         const end = Math.min(interval.end, projection.rowCount - 1);
         const start = Math.max(0, interval.start);
-        if (end >= start) covered.push({ start, end });
-        for (let row = start; row <= end; row += 1) {
-            count += 1;
-            last_row = Math.max(last_row ?? row, row);
-            const projected = projection.row_at(row);
-            if (projected === undefined) {
-                resolved = false;
-                continue;
+        if (end < start) continue;
+        covered.push({ start, end });
+        count += end - start + 1;
+        last_row = Math.max(last_row ?? end, end);
+        const band_start = projection.source_row_runs === undefined
+            ? start
+            : Math.min(Math.max(start, projection.deletedBandStart ?? start), end + 1);
+        if (band_start > start) {
+            for (const run of projection.source_row_runs!(start, band_start - 1)) {
+                if (run.kind === 'row') {
+                    add_row(run.displayRow);
+                } else if (run.kind === 'source') {
+                    add_source(run.sourceRow, run.count);
+                } else {
+                    const mapped = options.sourceRowsFor?.(run.sourceDisplayStart, run.count);
+                    if (mapped !== undefined) {
+                        for (const entry of mapped) add_source(entry.start, entry.count);
+                        continue;
+                    }
+                    // Not arithmetic: each row resolves on its own, and one that
+                    // has not loaded leaves the selection unresolved.
+                    for (let row = run.displayStart; row < run.displayStart + run.count && resolved; row += 1) {
+                        add_row(row);
+                    }
+                }
             }
-            if (projected.kind === 'removal') {
-                tailRemovals = true;
-                continue;
-            }
-            if (projected.kind !== 'source') {
-                if (projected.kind === 'replacement' || !is_inserted_row(projected.row)) bandRows += 1;
-                identities.push(projected.identity);
-                continue;
-            }
-            const source_row = projected.identity?.sourceRow
-                ?? options.sourceRowFor?.(projected.sourceDisplayRow);
-            if (source_row === undefined) {
-                resolved = false;
-                continue;
-            }
-            if (source_row < options.bodyStart) {
-                fixedRows = true;
-                continue;
-            }
-            if (options.isRemoved(source_row)) removedSourceRows.push(source_row);
-            identities.push({ kind: 'source', sourceRow: source_row });
         }
+        // The deleted and append bands: at most the session's Pending Rows and tail removals.
+        for (let row = band_start; row <= end; row += 1) add_row(row);
     }
     covered.sort((left, right) => left.start - right.start);
     let contiguous = covered.length > 0;
     for (let index = 1; index < covered.length && contiguous; index += 1) {
         if (covered[index]!.start > covered[index - 1]!.end + 1) contiguous = false;
     }
+    const frozen_runs = resolved ? Object.freeze(runs) : undefined;
+    const removed_runs = Object.freeze(merge_intervals(removed));
+    let identities: readonly RowIdentity[] | undefined;
+    let removed_rows: readonly number[] | undefined;
     return Object.freeze({
         count,
-        identities: resolved ? Object.freeze(identities) : undefined,
-        removedSourceRows: Object.freeze(removedSourceRows),
+        runs: frozen_runs,
+        get identities(): readonly RowIdentity[] | undefined {
+            if (frozen_runs === undefined) return undefined;
+            identities ??= Object.freeze(identities_of_runs(frozen_runs));
+            return identities;
+        },
+        removedSourceRuns: removed_runs,
+        removedCount: removed_runs.reduce((total, entry) => total + entry.count, 0),
+        get removedSourceRows(): readonly number[] {
+            removed_rows ??= Object.freeze(removed_runs.flatMap((entry) =>
+                Array.from({ length: entry.count }, (_, offset) => entry.start + offset)));
+            return removed_rows;
+        },
         fixedRows,
         tailRemovals,
         contiguous,
         bandRows,
         endsAtBandEnd: bandRows > 0 && last_row === projection.rowCount - 1,
     });
+}
+
+/**
+ * A selection from per-row identities, for callers outside the grid: runs in
+ * the identities' order, consecutive source rows merged.
+ */
+export function row_structure_selection(
+    fields: Omit<RowStructureSelection, 'runs' | 'identities' | 'removedSourceRuns' | 'removedCount' | 'removedSourceRows'> & {
+        readonly identities: readonly RowIdentity[] | undefined;
+        readonly removedSourceRows: readonly number[];
+    },
+): RowStructureSelection {
+    const runs: RowSelectionRun[] | undefined = fields.identities === undefined ? undefined : [];
+    for (const identity of fields.identities ?? []) {
+        const previous = runs![runs!.length - 1];
+        if (identity.kind === 'pending') runs!.push({ kind: 'pending', identity });
+        else if (previous?.kind === 'source' && previous.start + previous.count === identity.sourceRow) {
+            runs![runs!.length - 1] = { kind: 'source', start: previous.start, count: previous.count + 1 };
+        } else runs!.push({ kind: 'source', start: identity.sourceRow, count: 1 });
+    }
+    const removed = merge_intervals(fields.removedSourceRows.map((row) => ({ start: row, count: 1 })));
+    return Object.freeze({
+        ...fields,
+        runs: runs === undefined ? undefined : Object.freeze(runs),
+        removedSourceRuns: Object.freeze(removed),
+        removedCount: removed.reduce((total, entry) => total + entry.count, 0),
+    });
+}
+
+/** Sort and merge overlapping or adjacent intervals. */
+function merge_intervals(intervals: readonly SourceInterval[]): SourceInterval[] {
+    const sorted = [...intervals].sort((left, right) => left.start - right.start);
+    const out: SourceInterval[] = [];
+    for (const entry of sorted) {
+        const last = out[out.length - 1];
+        if (last !== undefined && entry.start <= last.start + last.count) {
+            out[out.length - 1] = {
+                start: last.start,
+                count: Math.max(last.start + last.count, entry.start + entry.count) - last.start,
+            };
+        } else {
+            out.push({ start: entry.start, count: entry.count });
+        }
+    }
+    return out;
+}
+
+/** The runs' rows, one identity each, in order. */
+export function identities_of_runs(runs: readonly RowSelectionRun[]): RowIdentity[] {
+    const out: RowIdentity[] = [];
+    for (const run of runs) {
+        if (run.kind === 'pending') {
+            out.push(run.identity);
+            continue;
+        }
+        for (let row = run.start; row < run.start + run.count; row += 1) out.push({ kind: 'source', sourceRow: row });
+    }
+    return out;
+}
+
+/**
+ * At most two identities per run: the first and last live row of each, so a
+ * selection's live span, which Insert and Move anchor on, is found in
+ * proportion to its runs.
+ */
+export function live_span_identities(
+    changes: PendingStructuralChanges,
+    runs: readonly RowSelectionRun[],
+): RowIdentity[] {
+    const removed = changes.rowLayout?.removedSourceRows ?? [];
+    const out: RowIdentity[] = [];
+    for (const run of runs) {
+        if (run.kind === 'pending') {
+            out.push(run.identity);
+            continue;
+        }
+        const live = subtract_intervals([{ start: run.start, count: run.count }], removed);
+        const first = live[0];
+        const last = live[live.length - 1];
+        if (first === undefined || last === undefined) {
+            // A run of tombstones still names a known row for the index to place.
+            out.push({ kind: 'source', sourceRow: run.start });
+            continue;
+        }
+        out.push({ kind: 'source', sourceRow: first.start });
+        if (last.start + last.count - 1 !== first.start) {
+            out.push({ kind: 'source', sourceRow: last.start + last.count - 1 });
+        }
+    }
+    return out;
+}
+
+/** `only_appended_rows` over runs. */
+export function only_appended_runs(
+    changes: PendingStructuralChanges,
+    runs: readonly RowSelectionRun[],
+): boolean {
+    if (runs.length === 0 || runs.some((run) => run.kind !== 'pending')) return false;
+    return only_appended_rows(changes, runs.map((run) => (run as Extract<RowSelectionRun, { kind: 'pending' }>).identity));
 }
 
 /** Whether every identity is a Pending Appended Row: Delete then leaves the layout alone. */
@@ -308,25 +517,25 @@ export function row_structure_menu_model(input: RowStructureMenuInput): RowStruc
     const delete_reason = shared_reason
         ?? (selection.fixedRows ? FIXED_ROWS_MESSAGE : undefined)
         ?? (selection.tailRemovals ? STRUCTURE_TAIL_REMOVAL_MESSAGE : undefined)
-        ?? (selection.identities === undefined ? ROWS_NOT_LOADED_MESSAGE : undefined)
-        ?? (only_appended_rows(changes, selection.identities!)
+        ?? (selection.runs === undefined ? ROWS_NOT_LOADED_MESSAGE : undefined)
+        ?? (only_appended_runs(changes, selection.runs!)
             ? undefined
-            : refusal_message(plan_row_delete(changes, context, selection.identities!, new Map())));
+            : refusal_message(plan_row_delete_runs(changes, context, selection.runs!, new Map())));
     const insertAbove = insert_item(input, shared_reason, 'before');
     const insertBelow = insert_item(input, shared_reason, 'after');
     const moveUp = row_move_item_model(input, 'backward');
     const moveDown = row_move_item_model(input, 'forward');
-    if (selection.removedSourceRows.length === 0) {
+    if (selection.removedCount === 0) {
         return Object.freeze({ insertAbove, insertBelow, delete: item(count, delete_reason), moveUp, moveDown });
     }
     const restore_reason = shared_reason
-        ?? (selection.removedSourceRows.length !== count ? RESTORE_ONLY_REMOVALS_MESSAGE : undefined)
-        ?? refusal_message(plan_row_restore(changes, context, selection.removedSourceRows));
+        ?? (selection.removedCount !== count ? RESTORE_ONLY_REMOVALS_MESSAGE : undefined)
+        ?? refusal_message(plan_row_restore_runs(changes, context, selection.removedSourceRuns));
     return Object.freeze({
         insertAbove,
         insertBelow,
         delete: item(count, delete_reason),
-        restore: item(selection.removedSourceRows.length, restore_reason),
+        restore: item(selection.removedCount, restore_reason),
         moveUp,
         moveDown,
     });
@@ -354,17 +563,17 @@ export function row_move_block_refusal(
         ?? shared_structure_reason(input)
         ?? (selection.fixedRows ? MOVE_FIXED_ROWS_MESSAGE : undefined)
         ?? (selection.tailRemovals ? STRUCTURE_TAIL_REMOVAL_MESSAGE : undefined)
-        ?? (selection.identities === undefined ? ROWS_NOT_LOADED_MESSAGE : undefined)
+        ?? (selection.runs === undefined ? ROWS_NOT_LOADED_MESSAGE : undefined)
         ?? (!selection.contiguous ? SELECT_ADJACENT_ROWS_MESSAGE : undefined)
         // Appended rows stay where Append put them; a selection reaching
         // into the band moves nothing.
         ?? (selection.bandRows > 0 ? APPENDED_BAND_MESSAGE : undefined)
         ?? (context.bodyViewTransformed ? STRUCTURE_TRANSFORMED_MESSAGE : undefined)
         ?? structure_exclusivity_message(changes, context)
-        ?? merge_split_refusal(changes, context, selection.identities!);
+        ?? merge_split_refusal(changes, context, selection.runs!);
     if (reason !== undefined) return reason;
     const index = index_row_layout(row_layout_for(changes, context));
-    return insert_anchor_for_selection(index, selection.identities!, 'before') === undefined
+    return insert_anchor_for_selection(index, live_span_identities(changes, selection.runs!), 'before') === undefined
         ? MOVE_ONLY_REMOVED_ROWS_MESSAGE
         : undefined;
 }
@@ -378,23 +587,22 @@ export function row_move_block_refusal(
 function merge_split_refusal(
     changes: PendingStructuralChanges,
     context: WorksheetStructureContext,
-    identities: readonly RowIdentity[],
+    runs: readonly RowSelectionRun[],
 ): string | undefined {
     const merges = context.merges ?? [];
     if (merges.length === 0) return undefined;
-    const is_removed = removed_source_row_test(changes);
-    const moved = identities.flatMap((identity) =>
-        identity.kind === 'source' && !is_removed(identity.sourceRow) ? [identity.sourceRow] : []);
+    const removed = changes.rowLayout?.removedSourceRows ?? [];
+    const moved = subtract_intervals(merge_intervals(runs.flatMap((run) =>
+        run.kind === 'source' ? [{ start: run.start, count: run.count }] : [])), removed);
     if (moved.length === 0) return undefined;
+    const size = (intervals: readonly SourceInterval[]) =>
+        intervals.reduce((total, entry) => total + entry.count, 0);
     for (const merge of merges) {
         if (merge.endRow <= merge.startRow) continue;
-        let inside = 0;
-        for (const row of moved) if (row >= merge.startRow && row <= merge.endRow) inside += 1;
+        const span = [{ start: merge.startRow, count: merge.endRow - merge.startRow + 1 }];
+        const inside = size(intersect_intervals(moved, span));
         if (inside === 0) continue;
-        let live = 0;
-        for (let row = merge.startRow; row <= merge.endRow && live <= inside; row += 1) {
-            if (!is_removed(row)) live += 1;
-        }
+        const live = size(subtract_intervals(span, removed));
         if (inside < live) return MERGE_SPLIT_MESSAGE;
     }
     return undefined;
@@ -415,7 +623,7 @@ export function row_move_item_model(
     const reason = row_move_block_refusal(input);
     if (reason !== undefined) return disabled(reason);
     const index = index_row_layout(row_layout_for(changes, context));
-    const before = step_move_target(index, selection.identities!, direction);
+    const before = step_move_target(index, live_span_identities(changes, selection.runs!), direction);
     if (before === undefined) {
         if (direction === 'backward') {
             return disabled(context.bodyStart > 0 ? MOVE_ABOVE_HEADER_MESSAGE : MOVE_AT_TOP_MESSAGE);
@@ -440,7 +648,7 @@ function insert_item(
     const reason = shared_reason
         ?? (selection.fixedRows ? INSERT_ABOVE_HEADER_MESSAGE : undefined)
         ?? (selection.tailRemovals ? STRUCTURE_TAIL_REMOVAL_MESSAGE : undefined)
-        ?? (selection.identities === undefined ? ROWS_NOT_LOADED_MESSAGE : undefined)
+        ?? (selection.runs === undefined ? ROWS_NOT_LOADED_MESSAGE : undefined)
         ?? (!selection.contiguous ? SELECT_ADJACENT_ROWS_MESSAGE : undefined);
     if (reason !== undefined) return disabled(reason);
     if (selection.bandRows > 0) {
@@ -456,7 +664,7 @@ function insert_item(
     if (context.bodyViewTransformed) return disabled(STRUCTURE_TRANSFORMED_MESSAGE);
     const anchor = insert_anchor_for_selection(
         index_row_layout(row_layout_for(changes, context)),
-        selection.identities!,
+        live_span_identities(changes, selection.runs!),
         side,
     );
     if (anchor === undefined) return disabled(INSERT_ONLY_REMOVED_ROWS_MESSAGE);
@@ -575,7 +783,17 @@ export function plan_row_delete(
     identities: readonly RowIdentity[],
     cells: ReadonlyMap<string, HistoryDirtyEntry>,
 ): RowStructurePlanResult {
-    const result = delete_rows(changes, context, identities);
+    return plan_row_delete_runs(changes, context, row_runs_of_identities(identities), cells);
+}
+
+/** `plan_row_delete` over a selection's runs, proportional to the runs. */
+export function plan_row_delete_runs(
+    changes: PendingStructuralChanges,
+    context: WorksheetStructureContext,
+    runs: readonly RowSelectionRun[],
+    cells: ReadonlyMap<string, HistoryDirtyEntry>,
+): RowStructurePlanResult {
+    const result = delete_row_runs(changes, context, runs);
     if (!result.ok) return { ok: false, message: result.refusal.message };
     const { outcome } = result;
     const removed = source_cells_removed_by(outcome, cells.keys());
@@ -590,6 +808,23 @@ export function plan_row_delete(
         outcome,
         discardedCellKeys: Object.freeze(removed.map(({ key }) => key)),
         changes: Object.freeze([outcome.change, ...cell_changes]),
+    });
+}
+
+/** `plan_row_restore` over intervals of source rows, proportional to the intervals. */
+export function plan_row_restore_runs(
+    changes: PendingStructuralChanges,
+    context: WorksheetStructureContext,
+    source: readonly SourceInterval[],
+): RowStructurePlanResult {
+    const result = restore_row_runs(changes, context, source);
+    if (!result.ok) return { ok: false, message: result.refusal.message };
+    return Object.freeze({
+        ok: true,
+        label: row_structure_label('Restore', merge_intervals(source).reduce((total, entry) => total + entry.count, 0)),
+        outcome: result.outcome,
+        discardedCellKeys: Object.freeze([]),
+        changes: Object.freeze([result.outcome.change]),
     });
 }
 

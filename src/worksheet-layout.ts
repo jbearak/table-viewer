@@ -1242,6 +1242,92 @@ export function delete_rows(
     return { ok: true, layout: freeze_row_layout(layout.runs, removed, discarded) };
 }
 
+/** Canonical intervals of `left` not in `right`; both sorted and disjoint. */
+export function subtract_intervals(
+    left: readonly SourceInterval[],
+    right: readonly SourceInterval[],
+): SourceInterval[] {
+    const out: SourceInterval[] = [];
+    let cursor = 0;
+    for (const entry of left) {
+        let start = entry.start;
+        const end = entry.start + entry.count;
+        while (cursor < right.length && right[cursor]!.start + right[cursor]!.count <= start) cursor++;
+        let at = cursor;
+        while (at < right.length && right[at]!.start < end) {
+            const cut = right[at]!;
+            if (cut.start > start) out.push(interval(start, cut.start - start));
+            start = Math.max(start, cut.start + cut.count);
+            at++;
+        }
+        if (end > start) out.push(interval(start, end - start));
+    }
+    return out;
+}
+
+/** Sort and merge overlapping or adjacent intervals, dropping empty ones. */
+export function canonical_source_intervals(intervals: readonly SourceInterval[]): SourceInterval[] {
+    return canonical_intervals(intervals);
+}
+
+/**
+ * `delete_rows` for source rows given as intervals: proportional to the
+ * intervals, not the rows they hold. Every interval must lie in the body;
+ * rows already removed stay removed. `pending` lists Pending Inserted Rows,
+ * discarded with `created_order(id)`.
+ */
+export function delete_row_intervals(
+    layout: RowLayout,
+    source: readonly SourceInterval[],
+    pending: readonly PendingRowId[],
+    created_order: (id: PendingRowId) => number,
+): LayoutResult<RowLayout> {
+    let body_start = Infinity;
+    let body_end = -Infinity;
+    for (const run of layout.runs) {
+        if (run.kind !== 'source') continue;
+        body_start = Math.min(body_start, run.start);
+        body_end = Math.max(body_end, run.start + run.count);
+    }
+    for (const entry of source) {
+        if (!(entry.count > 0) || entry.start < body_start || entry.start + entry.count > body_end) {
+            return unknown_identity('row');
+        }
+    }
+    const index = index_row_layout(layout);
+    const discarded = [...layout.discardedPendingRows];
+    const seen = new Set<string>();
+    for (const id of pending) {
+        const status = index.status_of({ kind: 'pending', pendingRowId: id });
+        if (status === undefined) return unknown_identity('row');
+        if (status !== 'live' || seen.has(id)) continue;
+        seen.add(id);
+        const order = created_order(id);
+        if (!Number.isSafeInteger(order)) {
+            return refuse('invalid-created-order', 'A deleted pending row needs its creation order.');
+        }
+        discarded.push({ id, createdOrder: order });
+    }
+    const removed = canonical_intervals([...layout.removedSourceRows, ...source]);
+    if (removed.length > MAX_REMOVED_ROW_INTERVALS) {
+        return refuse('too-many-removals', TOO_MANY_ROW_REMOVALS_MESSAGE);
+    }
+    return { ok: true, layout: freeze_row_layout(layout.runs, removed, discarded) };
+}
+
+/** `restore_rows` for source rows given as intervals; every row must currently be removed. */
+export function restore_row_intervals(layout: RowLayout, source: readonly SourceInterval[]): LayoutResult<RowLayout> {
+    const rows = canonical_intervals(source);
+    if (subtract_intervals(rows, layout.removedSourceRows).length > 0) {
+        return refuse('not-removed', 'Only deleted rows can be restored.');
+    }
+    const removed = subtract_intervals(layout.removedSourceRows, rows);
+    if (removed.length > MAX_REMOVED_ROW_INTERVALS) {
+        return refuse('too-many-removals', TOO_MANY_RESTORED_ROW_GROUPS_MESSAGE);
+    }
+    return { ok: true, layout: freeze_row_layout(layout.runs, removed, layout.discardedPendingRows) };
+}
+
 /** Cancel Pending Row Removals; every row must currently be removed. */
 export function restore_rows(layout: RowLayout, source_rows: readonly number[]): LayoutResult<RowLayout> {
     const rows = sorted_unique(source_rows);

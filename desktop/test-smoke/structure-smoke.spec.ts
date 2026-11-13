@@ -262,12 +262,12 @@ test('an external change conflicts, and both salvage actions resolve it', async 
     // Another program rewrites a value in place: not an append, so the layout
     // can't be placed in the new file.
     fs.writeFileSync(file, 'name,qty\napple,10\nbanana,2\ncherry,3\ndate,4\n');
-    const review = page.getByRole('alert').filter({ hasText: 'Pending rows need review' });
+    const review = page.getByRole('alert', { name: 'Row and column changes that need review' });
     await expect(review).toContainText(
-        "Sheet1 changed on disk after you inserted, deleted, or moved rows or columns. "
-        + "Table Viewer can't tell where those changes belong in the new version.",
+        'Sheet1 changed on disk after you inserted, deleted, or moved rows or columns.',
         { timeout: 30_000 },
     );
+    await expect(review).toContainText("Table Viewer can't tell where those changes belong in the new version.");
     await expect(review).toContainText('Values typed in 1 new column will be discarded.');
     await save_screenshot(page, '04-conflict-review');
 
@@ -321,7 +321,7 @@ test('an external edit that turns on an .xlsx Header Row conflicts, and Keep new
     await expect.poll(() => grid_rows(page)).toContain('Row removed, was row 2|3|4');
 
     fs.writeFileSync(file, book(['x', 'y']));
-    const review = page.getByRole('alert').filter({ hasText: 'Pending rows need review' });
+    const review = page.getByRole('alert', { name: 'Row and column changes that need review' });
     await expect(review).toContainText('Data changed on disk after you inserted, deleted, or moved rows or columns.',
         { timeout: 30_000 });
     // Editing still works while the notice is up, and the edit is durable:

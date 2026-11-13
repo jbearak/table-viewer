@@ -46,6 +46,7 @@ import { split_csv_raw_fields } from './data-source/line-index';
 import { get_raw_cell_text } from './cell-display';
 import {
     pending_changes_for_sheet,
+    structure_row_mapper,
     transform_schema_for_sheet,
     with_pending_changes_for_sheet,
     worksheet_target_index,
@@ -60,6 +61,8 @@ import {
     type WorksheetStructureReceipt,
     type WorksheetTarget,
 } from './types';
+
+export { structure_row_mapper };
 
 // ---------------------------------------------------------------------------
 // Structural Basis
@@ -336,39 +339,6 @@ export function structure_live_row_end(entry: WorksheetStructureReceipt, body_st
     let live = entry.insertedRows.length;
     for (const run of entry.rowRuns) live += run.count;
     return body_start + live;
-}
-
-/**
- * Map an old canonical source row through a structure entry. Rows before the
- * body map to themselves; removed rows and rows past the old body map to null.
- */
-export function structure_row_mapper(entry: WorksheetStructureReceipt): (row: number) => number | null {
-    const runs = [...entry.rowRuns].sort((left, right) => left.from - right.from);
-    const removed = entry.removedRows;
-    let body_start = Infinity;
-    let body_end = -Infinity;
-    for (const run of runs) {
-        body_start = Math.min(body_start, run.from);
-        body_end = Math.max(body_end, run.from + run.count);
-    }
-    for (const run of removed) {
-        body_start = Math.min(body_start, run.start);
-        body_end = Math.max(body_end, run.start + run.count);
-    }
-    return (row) => {
-        if (!(row >= body_start)) return row;
-        if (row >= body_end) return null;
-        let low = 0;
-        let high = runs.length - 1;
-        while (low <= high) {
-            const middle = (low + high) >> 1;
-            const run = runs[middle]!;
-            if (row < run.from) high = middle - 1;
-            else if (row >= run.from + run.count) low = middle + 1;
-            else return run.to + (row - run.from);
-        }
-        return null;
-    };
 }
 
 /** The first body row of a structure entry, old and new alike (fixed rows never move). */

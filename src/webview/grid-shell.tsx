@@ -71,6 +71,8 @@ import {
     plan_column_move,
     plan_column_restore,
     plan_pending_column_cells,
+    pending_column_cells_change,
+    plan_pending_column_highlights,
     plan_pending_column_update,
     resolve_column_move_drop,
     resolve_column_structure_selection,
@@ -78,6 +80,7 @@ import {
     type ColumnMoveItemModel,
     type ColumnStructureSelection,
     type PendingColumnCellEdit,
+    type PendingColumnHighlightEdit,
 } from './column-structure-model';
 import {
     column_projections_equal,
@@ -214,6 +217,7 @@ import {
 } from './csv-save-lifecycle';
 import {
     canvas_font,
+    fit_column_width,
     fit_column_widths,
     measurable_from_rendered,
     type MeasurableCell,
@@ -228,6 +232,7 @@ import {
     AppendComposer,
     EMPTY_APPEND_COMPOSER_DRAFT,
     type AppendComposerDraft,
+    type ComposerColumnKey,
 } from './append-composer';
 import { row_boundary_hit } from './row-resize-model';
 import { read_overlay_editor_value } from './live-editor';
@@ -533,6 +538,7 @@ import {
     STRUCTURE_TRANSFORMED_MESSAGE,
     TOO_MANY_PENDING_ROWS_MESSAGE,
     type WorksheetStructureContext,
+    type RowSelectionRun,
 } from './pending-row-store';
 import {
     nearest_live_row,
@@ -543,8 +549,12 @@ import {
     INSERTED_ROWS_TRANSFORM_MESSAGE,
     plan_row_insert,
     only_appended_rows,
+    only_appended_runs,
+    ROWS_NOT_LOADED_MESSAGE,
     plan_row_delete,
+    plan_row_delete_runs,
     plan_row_restore,
+    plan_row_restore_runs,
     removed_source_row_test,
     moved_block_display_rows,
     plan_row_move,
@@ -593,13 +603,16 @@ import {
     type PendingRowProjection,
 } from './pending-row-projection';
 import {
+    column_identities_equal,
     column_identity_key,
     header_body_start,
     index_column_layout,
+    index_row_layout,
     row_identity_key,
     source_column_layout,
     type ColumnIdentity,
     type RowLayout,
+    type SourceInterval,
 } from '../worksheet-layout';
 import { scroll_preview_to_row } from './preview-scroll';
 import {
@@ -950,6 +963,14 @@ function pending_values_equal(left: unknown, right: unknown): boolean {
     return left === right || JSON.stringify(left) === JSON.stringify(right);
 }
 
+/**
+ * Pending Column cells one Highlight gesture may set: each is a key in the
+ * Pending Changes envelope, so a whole-sheet selection is refused up front.
+ */
+export const MAX_PENDING_COLUMN_HIGHLIGHTS = 100_000;
+export const TOO_MANY_PENDING_COLUMN_HIGHLIGHTS_MESSAGE =
+    'Highlight fewer cells in new columns at once.';
+
 /** Build the row-owned history transition represented by two store snapshots. */
 export function pending_row_history_changes(
     worksheet: WorksheetTarget,
@@ -1032,7 +1053,21 @@ export function pending_row_history_changes(
         const before_rows = pending_snapshot_rows_by_id(stored_pending_rows(before));
         const after_rows = pending_snapshot_rows_by_id(stored_pending_rows(after));
         const row_ids = new Set([...before_rows.keys(), ...after_rows.keys()]);
+        // Rows on both sides in the same relative order only shift by the
+        // removals and insertions around them, which the removal and
+        // insertion arms replay in index-stable order. An arm re-indexing
+        // such a row would expect its old index after those arms had already
+        // moved it, and refuse the replay.
+        const surviving_before = stored_pending_rows(before).filter((row) => after_rows.has(row.id));
+        const surviving_after = stored_pending_rows(after).filter((row) => before_rows.has(row.id));
+        const order_kept = surviving_before.every((row, index) => surviving_after[index]?.id === row.id);
         for (const pending_row_id of row_ids) {
+            const prior = before_rows.get(pending_row_id);
+            const next = after_rows.get(pending_row_id);
+            if (
+                order_kept && prior !== undefined && next !== undefined
+                && pending_values_equal(prior.row, next.row)
+            ) continue;
             const change = build_row_change(
                 pending_row_id,
                 before_rows.get(pending_row_id),
@@ -1242,6 +1277,11 @@ export interface GridFocusHandle {
         readonly pendingRowId: string;
         readonly sourceColumn: number;
     } | undefined;
+    /** Source cell under the active cell, captured before a structural save renumbers it. */
+    source_active_cell?(): {
+        readonly sourceRow: number;
+        readonly sourceColumn: number;
+    } | undefined;
 }
 
 export interface SavedRowFocus {
@@ -1250,6 +1290,17 @@ export interface SavedRowFocus {
     readonly sourceRow: number;
     readonly sourceColumn: number;
     readonly restoreFocus: boolean;
+}
+
+/**
+ * One-shot selection of a cell by row and column identity, such as Review
+ * Changes' Go to cell, applied once this sheet's grid can place it.
+ */
+export interface CellFocus {
+    readonly sequence: number;
+    readonly sheetIndex: number;
+    readonly row: RowIdentity;
+    readonly column: ColumnIdentity;
 }
 
 /** One-shot stable pending-row cursor restoration across a GridShell remount. */
@@ -1503,6 +1554,8 @@ export interface GridShellProps {
     // App provides this ref; GridShell populates it with a function that measures
     // loaded rows and returns fitted column widths (null when nothing is loaded).
     auto_fit_ref?: MutableRefObject<(() => Record<number, number> | null) | null>;
+    /** Auto-fit widths for the visible Pending Columns, by Pending Column ID. */
+    pending_auto_fit_ref?: MutableRefObject<(() => Record<string, number>) | null>;
     /** Notifies App when a deferred auto-fit may have become measurable. */
     on_auto_fit_sample_change?: () => void;
     /** App-owned bridge for restoring focus after generation-keyed remounts. */
@@ -1529,6 +1582,9 @@ export interface GridShellProps {
     /** Stable pending-row cursor captured before a source-refresh remount. */
     pending_row_focus?: PendingRowFocus | null;
     on_pending_row_focus_applied?: (sequence: number, visible: boolean) => void;
+    /** A cell to select by identity; `visible` is false when this view cannot show it. */
+    cell_focus?: CellFocus | null;
+    on_cell_focus_applied?: (sequence: number, visible: boolean) => void;
     /**
      * This sheet's mapping generation, for checking a host-resolved focus against
      * the view actually installed. A projection resolved against a mapping that
@@ -1634,6 +1690,7 @@ export function GridShell({
     on_editing_change,
     editing_ref,
     auto_fit_ref,
+    pending_auto_fit_ref,
     on_auto_fit_sample_change,
     grid_focus_ref,
     grid_actions_ref,
@@ -1643,6 +1700,8 @@ export function GridShell({
     on_saved_row_focus_applied = () => {},
     pending_row_focus = null,
     on_pending_row_focus_applied = () => {},
+    cell_focus = null,
+    on_cell_focus_applied = () => {},
     mapping_generation = 1,
     pending_preview_scroll = null,
     on_preview_scroll_applied = () => {},
@@ -2332,11 +2391,15 @@ export function GridShell({
         after: PendingStructuralChanges,
     ): void => {
         if (history_capture === undefined) return;
-        const changes = pending_row_history_changes(
-            history_capture.worksheet,
-            before,
-            after,
-        );
+        // Pending Column cells the gesture changed with its rows (a removed
+        // row's cells and highlights), as the record's first arm: Redo clears
+        // them while the row is still there, and Undo, replaying in reverse,
+        // restores them once the row is back.
+        const column_change = pending_column_cells_change(history_capture.worksheet, before, after);
+        const changes = [
+            ...(column_change === undefined ? [] : [column_change]),
+            ...pending_row_history_changes(history_capture.worksheet, before, after),
+        ];
         if (changes.length === 0) return;
         const record = history_capture.history.stage_record({ label, changes });
         commit_staged_transaction([record]);
@@ -3299,6 +3362,17 @@ export function GridShell({
             sourceColumn: source_column,
         };
     }, [pending_projection, source_column_for_display]);
+    const source_active_cell = useCallback(() => {
+        const cell = grid_selection_ref.current.current?.cell;
+        if (cell === undefined) return undefined;
+        const projected = pending_projection.row_at(cell[1]);
+        if (projected?.kind !== 'source') return undefined;
+        const source_row = projected.identity?.sourceRow ?? get_source_row(projected.sourceDisplayRow);
+        const source_column = source_column_for_display(cell[0]);
+        return source_row === undefined || source_column === undefined
+            ? undefined
+            : { sourceRow: source_row, sourceColumn: source_column };
+    }, [get_source_row, pending_projection, source_column_for_display]);
     useLayoutEffect(() => {
         if (!grid_focus_ref) return;
         const handle: GridFocusHandle = {
@@ -3309,12 +3383,13 @@ export function GridShell({
             ),
             focus: focus_grid,
             pending_active_cell,
+            source_active_cell,
         };
         grid_focus_ref.current = handle;
         return () => {
             if (grid_focus_ref.current === handle) grid_focus_ref.current = null;
         };
-    }, [focus_grid, generation, grid_focus_ref, pending_active_cell]);
+    }, [focus_grid, generation, grid_focus_ref, pending_active_cell, source_active_cell]);
     // Populated once the truncated-cell tooltip helpers mount below; row menus
     // open from an earlier hook, so they clear via this ref rather than a TDZ.
     const hide_cell_tooltip_ref = useRef<() => void>(() => {});
@@ -3334,6 +3409,7 @@ export function GridShell({
     const row_structure_selection_options = useMemo((): RowStructureSelectionOptions => ({
         bodyStart: body_start,
         isRemoved: is_removed_source_row,
+        removedSourceRows: pending_rows.rowLayout?.removedSourceRows ?? [],
         // Untransformed, a source-display row maps to its source row
         // arithmetically (skipping a promoted header row), so an unloaded row
         // still resolves.
@@ -3347,11 +3423,31 @@ export function GridShell({
                     ? source_row
                     : undefined;
             },
+            // The same mapping for a run: consecutive, except that it steps
+            // over a promoted header row.
+            sourceRowsFor: (source_display_start: number, count: number) => {
+                const out: { start: number; count: number }[] = [];
+                const push = (start: number, length: number) => {
+                    const capped = Math.min(length, sheet_meta.sourceRowCount - start);
+                    if (capped > 0) out.push({ start, count: capped });
+                };
+                const end = source_display_start + count;
+                if (promoted_header_row === undefined || end <= promoted_header_row) {
+                    push(source_display_start, count);
+                } else if (source_display_start >= promoted_header_row) {
+                    push(source_display_start + 1, count);
+                } else {
+                    push(source_display_start, promoted_header_row - source_display_start);
+                    push(promoted_header_row + 1, end - promoted_header_row);
+                }
+                return out;
+            },
         }),
     }), [
         body_start,
         body_view_transformed,
         is_removed_source_row,
+        pending_rows.rowLayout,
         promoted_header_row,
         sheet_meta.sourceRowCount,
     ]);
@@ -3431,24 +3527,36 @@ export function GridShell({
         },
         on_open_menu: open_row_marker_menu,
     });
+    /**
+     * The cells a Highlight gesture would change: source columns go to the
+     * host, and Pending Columns, which have no source column, are written
+     * into the Pending Column itself.
+     */
     const current_highlight_selection = useCallback(() => {
-        const selection = highlight_selection_from_grid(
+        const result = highlight_selection_from_grid(
             grid_selection_ref.current,
             row_count,
             column_projection,
             merges,
-        )?.selection;
-        if (selection === undefined) return null;
-        const has_highlightable_row = selection.displayRows.some((interval) => (
-            interval.start < pending_projection.deletedBandStart
-            || interval.end >= pending_projection.pendingBandStart
-        ));
-        return has_highlightable_row ? selection : null;
-    }, [column_projection, merges, pending_projection, row_count]);
+        );
+        if (result === null) return null;
+        const { selection } = result;
+        const pending_column_ids = result.pendingDisplayColumns.flatMap((display_column) => {
+            const identity = projected_columns[display_column]?.identity;
+            return identity?.kind === 'pending' ? [identity.pendingColumnId] : [];
+        });
+        const has_highlightable_row = pending_column_ids.length > 0
+            || (selection.sourceColumns.length > 0 && selection.displayRows.some((interval) => (
+                interval.start < pending_projection.deletedBandStart
+                || interval.end >= pending_projection.pendingBandStart
+            )));
+        return has_highlightable_row ? { selection, pendingColumnIds: pending_column_ids } : null;
+    }, [column_projection, merges, pending_projection, projected_columns, row_count]);
     const mutate_highlight_selection = useCallback((mutation: CellHighlightMutation): boolean => {
         if (gestures_admitted !== undefined && !gestures_admitted()) return false;
-        const selection = current_highlight_selection();
-        if (!selection) return false;
+        const target = current_highlight_selection();
+        if (!target) return false;
+        const { selection, pendingColumnIds: pending_column_ids } = target;
         const compressed_source_intervals: DisplayRowInterval[] = [];
         const pending_ids = new Set<string>();
         for (const interval of selection.displayRows) {
@@ -3476,10 +3584,41 @@ export function GridShell({
                 if (projected?.kind === 'pending') pending_ids.add(projected.row.id);
             }
         }
-        const source_intervals = pending_projection.source_display_intervals(
-            compressed_source_intervals,
-        );
-        if (pending_ids.size === 0) {
+        const source_intervals = selection.sourceColumns.length === 0
+            ? []
+            : pending_projection.source_display_intervals(compressed_source_intervals);
+        // Pending Column cells: every live row of the selection, keyed by row identity.
+        const column_highlights: PendingColumnHighlightEdit[] = [];
+        if (pending_column_ids.length > 0) {
+            for (const interval of selection.displayRows) {
+                for (let row = interval.start; row <= interval.end; row += 1) {
+                    const row_target = pending_column_row_target(row);
+                    if (row_target === undefined && pending_projection.row_at(row)?.kind === 'source') {
+                        // A source row whose page is not resident has no
+                        // identity to key its cell by. Skipping it would apply
+                        // the highlight to part of the selection, uncounted.
+                        host_bridge.postMessage({ type: 'showWarning', message: ROWS_NOT_LOADED_MESSAGE });
+                        return false;
+                    }
+                    if (row_target === undefined || !row_target.live) continue;
+                    for (const pendingColumnId of pending_column_ids) {
+                        column_highlights.push({
+                            pendingColumnId,
+                            rowKey: row_target.key,
+                            color: mutation.type === 'set' ? mutation.color : undefined,
+                        });
+                    }
+                    if (column_highlights.length > MAX_PENDING_COLUMN_HIGHLIGHTS) {
+                        host_bridge.postMessage({
+                            type: 'showWarning',
+                            message: TOO_MANY_PENDING_COLUMN_HIGHLIGHTS_MESSAGE,
+                        });
+                        return false;
+                    }
+                }
+            }
+        }
+        if (pending_ids.size === 0 && column_highlights.length === 0) {
             if (source_intervals.length > 0) {
                 on_highlight_selection({
                     ...selection,
@@ -3489,7 +3628,7 @@ export function GridShell({
             return source_intervals.length > 0;
         }
         const before = pending_store.snapshot();
-        const after: PendingStructuralChanges = {
+        const row_highlighted: PendingStructuralChanges = {
             ...before,
             appendedRows: stored_pending_rows(before).map((row) => {
                 if (!pending_ids.has(row.id)) return row;
@@ -3508,6 +3647,13 @@ export function GridShell({
                 };
             }),
         };
+        const column_plan = plan_pending_column_highlights(
+            row_highlighted,
+            structure_context.worksheet,
+            column_highlights,
+        );
+        const after = column_plan?.next ?? row_highlighted;
+        const column_changes = column_plan === undefined ? [] : [column_plan.change];
         const refusal_before = envelope_refusal_sequence_ref.current;
         const pending_stage = pending_store.stage_replace(edit_session_id, before, after);
         if (pending_stage === undefined) {
@@ -3528,6 +3674,8 @@ export function GridShell({
                 },
                 before,
                 after,
+                undefined,
+                column_changes,
             );
             const participants: StagedMutation[] = [pending_stage];
             if (history_capture !== undefined && changes.length > 0) {
@@ -3545,6 +3693,8 @@ export function GridShell({
             },
             before,
             after,
+            undefined,
+            column_changes,
         );
         const pending_gesture: PendingHostGesture = {
             commit: (source_changes, gesture_label) => {
@@ -3570,12 +3720,14 @@ export function GridShell({
         gestures_admitted,
         history_capture,
         on_highlight_selection,
+        pending_column_row_target,
         pending_projection,
         pending_store,
         sheet_index,
         sheet_meta.name,
         sheet_meta.worksheetId,
         show_pending_size_warning,
+        structure_context.worksheet,
     ]);
     useLayoutEffect(() => {
         if (!highlight_ref) return;
@@ -4095,14 +4247,8 @@ export function GridShell({
                 if (attempts < 120) window.requestAnimationFrame(poll);
                 return;
             }
-            const target = nearest_live_row(
-                display_row ?? from_row,
-                projection.rowCount,
-                (row) => {
-                    const state = projection.row_state(row);
-                    return state !== 'removed' && state !== 'tail-removal';
-                },
-            );
+            // Removed runs are skipped whole, so a large delete costs its runs.
+            const target = projection.nearest_live_display_row(display_row ?? from_row);
             if (target !== undefined && display_column_count > 0) {
                 select_active_display_cell([
                     Math.min(Math.max(0, display_column), display_column_count - 1),
@@ -4156,7 +4302,7 @@ export function GridShell({
         && (gestures_admitted === undefined || gestures_admitted())
     ), [edit_admission_is_fenced, gestures_admitted, save_in_flight_ref]);
     const delete_rows_gesture = useCallback((
-        identities: readonly RowIdentity[],
+        runs: readonly RowSelectionRun[],
         from_row: number,
     ): boolean => {
         if (!structure_gesture_admitted()) return false;
@@ -4164,24 +4310,26 @@ export function GridShell({
         const before = pending_store.snapshot();
         // Pending Appended Rows alone leave the layout as it is: the existing
         // removal, under the Delete item's name.
-        if (only_appended_rows(before, identities)) {
+        if (only_appended_runs(before, runs)) {
+            const identities = runs.flatMap((run) => run.kind === 'pending' ? [run.identity] : []);
             if (!remove_pending_rows(
-                identities.flatMap((identity) =>
-                    identity.kind === 'pending' ? [identity.pendingRowId] : []),
+                identities.map((identity) => identity.pendingRowId),
                 (count) => row_structure_label('Delete', count),
             )) return false;
             focus_after_row_delete(identities, from_row, display_column);
             return true;
         }
-        const plan = plan_row_delete(before, action_structure_context(), identities, store.snapshot());
+        const plan = plan_row_delete_runs(before, action_structure_context(), runs, store.snapshot());
         if (!plan.ok) {
             host_bridge.postMessage({ type: 'showWarning', message: plan.message });
             return false;
         }
         // Poll on a row this delete changed: one already removed would show
         // `removed` before the grid renders this delete.
-        const affected = identities.filter((identity) => identity.kind === 'pending'
-            || !is_removed_source_row_ref.current(identity.sourceRow));
+        const newly_removed = plan.outcome.removedSourceRows[0];
+        const affected: RowIdentity[] = newly_removed !== undefined
+            ? [{ kind: 'source', sourceRow: newly_removed.start }]
+            : runs.flatMap((run) => run.kind === 'pending' ? [run.identity] : []).slice(0, 1);
         if (!commit_row_structure_plan(plan)) return false;
         focus_after_row_delete(affected, from_row, display_column);
         return true;
@@ -4194,9 +4342,9 @@ export function GridShell({
         store,
         structure_gesture_admitted,
     ]);
-    const restore_rows_gesture = useCallback((source_rows: readonly number[]): boolean => {
+    const restore_rows_gesture = useCallback((source_rows: readonly SourceInterval[]): boolean => {
         if (!structure_gesture_admitted()) return false;
-        const plan = plan_row_restore(pending_store.snapshot(), action_structure_context(), source_rows);
+        const plan = plan_row_restore_runs(pending_store.snapshot(), action_structure_context(), source_rows);
         if (!plan.ok) {
             host_bridge.postMessage({ type: 'showWarning', message: plan.message });
             return false;
@@ -4241,15 +4389,18 @@ export function GridShell({
         pending_projection,
         unloaded_display_row_for_source,
     ]);
-    const reveal_source_cell = useCallback(async (
+    /**
+     * Select a cell on a source row, loading the row's page first if it is
+     * not resident. `display_column` is the column, or a resolver read after
+     * the load, for a column that can move while the page loads.
+     */
+    const reveal_source_row_cell = useCallback(async (
         source_row: number,
-        source_column: number,
+        display_column: number | (() => number | undefined),
         is_current?: () => boolean,
         restore_focus = true,
     ): Promise<boolean> => {
         if (is_current?.() === false) return false;
-        const display_column = display_column_for_source(source_column);
-        if (display_column === undefined) return false;
         let display_row = pending_projection.display_row_for_identity({
             kind: 'source',
             sourceRow: source_row,
@@ -4268,18 +4419,30 @@ export function GridShell({
         }
         if (display_row === undefined) return false;
         if (is_current?.() === false) return false;
-        select_active_display_cell([display_column, display_row]);
+        const column = typeof display_column === 'function' ? display_column() : display_column;
+        if (column === undefined) return false;
+        select_active_display_cell([column, display_row]);
         if (restore_focus) focus_grid();
         return true;
     }, [
         authoritative_display_row_for_source,
-        display_column_for_source,
         ensure_rows_loaded,
         focus_grid,
         pending_projection,
         select_active_display_cell,
         unloaded_display_row_for_source,
     ]);
+    const reveal_source_cell = useCallback(async (
+        source_row: number,
+        source_column: number,
+        is_current?: () => boolean,
+        restore_focus = true,
+    ): Promise<boolean> => {
+        if (is_current?.() === false) return false;
+        const display_column = display_column_for_source(source_column);
+        if (display_column === undefined) return false;
+        return reveal_source_row_cell(source_row, display_column, is_current, restore_focus);
+    }, [display_column_for_source, reveal_source_row_cell]);
     const applied_saved_row_focus_ref = useRef<number | null>(null);
     const saved_row_focus_attempt_ref = useRef<string | null>(null);
     const saved_row_focus_retries_ref = useRef({ sequence: -1, count: 0 });
@@ -4384,6 +4547,62 @@ export function GridShell({
         sheet_meta.sourceRowCount,
         source_generation,
         transform_pending,
+    ]);
+    const applied_cell_focus_ref = useRef<number | null>(null);
+    const cell_focus_mounted_ref = useRef(true);
+    useEffect(() => {
+        cell_focus_mounted_ref.current = true;
+        return () => { cell_focus_mounted_ref.current = false; };
+    }, []);
+    useLayoutEffect(() => {
+        if (cell_focus === null || cell_focus.sheetIndex !== sheet_index) return;
+        if (applied_cell_focus_ref.current === cell_focus.sequence) return;
+        applied_cell_focus_ref.current = cell_focus.sequence;
+        const sequence = cell_focus.sequence;
+        const { row, column } = cell_focus;
+        const display_column = projected_columns.findIndex((projected) =>
+            column_identities_equal(projected.identity, column));
+        // A source row may be on a page not loaded yet: the source path loads
+        // it, for a source or a Pending Column cell. A newer request, or the
+        // shell unmounting, retires this one, so a late load cannot move the
+        // caret off the newer cell.
+        if (row.kind === 'source' && (column.kind === 'source' || display_column >= 0)) {
+            const is_current = () => cell_focus_mounted_ref.current
+                && applied_cell_focus_ref.current === sequence;
+            // A Pending Column is found again by identity after the load: it
+            // may have moved, or gone, while the page loaded.
+            const pending_column_now = () => {
+                const index = projected_columns_ref.current.findIndex((projected) =>
+                    column_identities_equal(projected.identity, column));
+                return index < 0 ? undefined : index;
+            };
+            const revealed = column.kind === 'source'
+                ? reveal_source_cell(row.sourceRow, column.sourceColumn, is_current)
+                : reveal_source_row_cell(row.sourceRow, pending_column_now, is_current);
+            void revealed.then((visible) => {
+                if (is_current()) on_cell_focus_applied(sequence, visible);
+            });
+            return;
+        }
+        const display_row = pending_projection.display_row_for_identity(row);
+        if (display_row === undefined || display_column < 0) {
+            focus_grid();
+            on_cell_focus_applied(sequence, false);
+            return;
+        }
+        select_active_display_cell([display_column, display_row]);
+        focus_grid();
+        on_cell_focus_applied(sequence, true);
+    }, [
+        cell_focus,
+        focus_grid,
+        on_cell_focus_applied,
+        pending_projection,
+        projected_columns,
+        reveal_source_cell,
+        reveal_source_row_cell,
+        select_active_display_cell,
+        sheet_index,
     ]);
     const applied_pending_row_focus_ref = useRef<number | null>(null);
     useLayoutEffect(() => {
@@ -4762,6 +4981,8 @@ export function GridShell({
          */
         seed_cells?: readonly Readonly<Record<number, PendingRowCell>>[]
             | ((row_ids: readonly string[]) => readonly Readonly<Record<number, PendingRowCell>>[]),
+        /** Pending Column cells the rows carry from birth, by row: Pending Column ID to cell. */
+        seed_column_cells?: (row_ids: readonly string[]) => readonly Readonly<Record<string, PendingRowCell>>[],
     ) => {
         // Capture the activation before joining the serialization tail. The
         // first request's busy affordance may render while a second gesture is
@@ -4823,6 +5044,7 @@ export function GridShell({
                 insert_created_order(before, issue_value_edit_order()),
                 admitted.appendBasis,
                 typeof seed_cells === 'function' ? seed_cells(admitted.rowIds) : seed_cells,
+                seed_column_cells?.(admitted.rowIds),
             );
             if (!added) {
                 admitted.settle(false);
@@ -5803,6 +6025,34 @@ export function GridShell({
         // second payload outstanding.
         let gesture_order: number | undefined;
         let formula_refusal: string | undefined;
+        // Values for Pending Columns, by composed row, keyed by Pending
+        // Column ID: seeded into the same store write as the rows.
+        const column_seed = rows.map((values) => {
+            const cells: Record<string, PendingRowCell> = {};
+            for (const column of projected_columns) {
+                if (column.identity.kind !== 'pending') continue;
+                const raw = values[`p:${column.identity.pendingColumnId}`];
+                if (raw === undefined) continue;
+                const parsed = parse_cell_edit(raw, edit_syntax);
+                if (parsed.text === '' && parsed.rich === undefined) continue;
+                const formula_fields = commit_formula_fields(
+                    parsed.text,
+                    edit_syntax === 'markdown' && xlsx_edit_writes_formula(parsed.text, parsed.rich?.runs),
+                    rows.length,
+                );
+                if (formula_fields.kind === 'refused') {
+                    formula_refusal ??= formula_fields.reason;
+                    continue;
+                }
+                cells[column.identity.pendingColumnId] = {
+                    value: parsed.text,
+                    ...(parsed.rich === undefined ? {} : { valueRuns: parsed.rich }),
+                    valueEditOrder: gesture_order ??= issue_value_edit_order(),
+                    ...committed_formula_cell_fields(formula_fields),
+                };
+            }
+            return cells;
+        });
         const seed_cells = rows.map((values) => {
             const cells: Record<number, PendingRowCell> = {};
             // Only the columns on screen: a draft keeps values for columns that
@@ -5844,6 +6094,18 @@ export function GridShell({
         // identity once admitted: anchor again against the band that holds it.
         const anchored_seed_cells = (row_ids: readonly string[]) => {
             if (formula_workbook === undefined) return seed_cells;
+            return reanchored(row_ids, seed_cells) as Record<number, PendingRowCell>[];
+        };
+        const anchored_column_cells = (row_ids: readonly string[]) => {
+            if (formula_workbook === undefined) return column_seed;
+            return reanchored(row_ids, column_seed);
+        };
+        /** Anchor each seeded formula again against the band that now holds the batch. */
+        function reanchored(
+            row_ids: readonly string[],
+            seeds: readonly Readonly<Record<string, PendingRowCell>>[],
+        ): Record<string, PendingRowCell>[] {
+            if (formula_workbook === undefined) return seeds.map((cells) => ({ ...cells }));
             const extended = formula_workbook_with_appended_rows(
                 formula_workbook,
                 sheet_index,
@@ -5851,8 +6113,8 @@ export function GridShell({
                 pending_store.snapshot(),
                 row_ids,
             );
-            return seed_cells.map((cells) => {
-                const next: Record<number, PendingRowCell> = {};
+            return seeds.map((cells) => {
+                const next: Record<string, PendingRowCell> = {};
                 for (const [column, cell] of Object.entries(cells)) {
                     const fields = xlsx_edit_writes_formula(cell.value, cell.valueRuns?.runs)
                         ? committed_formula_fields(
@@ -5866,7 +6128,7 @@ export function GridShell({
                         )
                         : undefined;
                     if (fields?.kind !== 'fields') {
-                        next[Number(column)] = cell;
+                        next[column] = cell;
                         continue;
                     }
                     const {
@@ -5874,7 +6136,7 @@ export function GridShell({
                         formulaReferenceBases: _bases,
                         ...rest
                     } = cell;
-                    next[Number(column)] = { ...rest, ...committed_formula_cell_fields(fields) };
+                    next[column] = { ...rest, ...committed_formula_cell_fields(fields) };
                 }
                 return next;
             });
@@ -5884,15 +6146,32 @@ export function GridShell({
             false,
             () => true,
             anchored_seed_cells,
+            anchored_column_cells,
         );
         // An envelope too large to hold the composed values now refuses the
         // whole gesture rather than staging blank rows beside a warning.
         if (appended === undefined) return false;
-        record_pending_row_gesture(
-            rows.length === 1 ? 'Compose row' : `Compose ${rows.length} rows`,
+        // The Pending Column cells the admission seeded, as the gesture's column arm.
+        const column_change = pending_column_cells_change(
+            structure_context.worksheet,
             appended.before,
             pending_store.snapshot(),
         );
+        if (history_capture !== undefined) {
+            const changes = pending_row_history_changes(
+                history_capture.worksheet,
+                appended.before,
+                pending_store.snapshot(),
+                undefined,
+                column_change === undefined ? [] : [column_change],
+            );
+            if (changes.length > 0) {
+                commit_staged_transaction([history_capture.history.stage_record({
+                    label: rows.length === 1 ? 'Compose row' : `Compose ${rows.length} rows`,
+                    changes,
+                })]);
+            }
+        }
         const display_row = await pending_display_row(appended.rowIds[0]);
         if (display_row === undefined) return true;
         select_active_display_cell_ref.current([0, display_row]);
@@ -5909,10 +6188,11 @@ export function GridShell({
         refuse_formula,
         sheet_index,
         sheet_meta,
+        history_capture,
         pending_display_row,
         pending_store,
-        record_pending_row_gesture,
         projected_columns,
+        structure_context.worksheet,
     ]);
     const [local_composer_draft, set_local_composer_draft] = useState<AppendComposerDraft>(
         EMPTY_APPEND_COMPOSER_DRAFT,
@@ -5944,13 +6224,16 @@ export function GridShell({
      * Labels for the composer's fields — the same titles the grid header
      * paints, so a field is identifiable by the column the user can see.
      */
-    // The composer stages Pending Row cells, keyed by source column: it
-    // offers the live source columns only.
+    // The composer stages Pending Row cells, keyed by source column, and
+    // Pending Column cells, keyed by `p:<id>`: it offers every live column.
     const composer_columns = useMemo(
-        () => projected_columns.flatMap((column, display) =>
-            column.identity.kind === 'source' && column.state !== 'removed'
-                ? [{ source: column.identity.sourceColumn, title: columns[display]?.title ?? '' }]
-                : []),
+        () => projected_columns.flatMap((column, display): { source: ComposerColumnKey; title: string }[] => {
+            if (column.state === 'removed') return [];
+            const title = columns[display]?.title ?? '';
+            return column.identity.kind === 'source'
+                ? [{ source: column.identity.sourceColumn, title }]
+                : [{ source: `p:${column.identity.pendingColumnId}`, title }];
+        }),
         [columns, projected_columns],
     );
     const composer_column_labels = useMemo(
@@ -5968,10 +6251,13 @@ export function GridShell({
      * counting from one, so a legend names the row the values will actually
      * land on.
      */
-    const composer_first_row_number = sheet_meta.sourceRowCount
-        - pending_rows.tailRemovals.length
-        + stored_pending_rows(pending_rows).length
-        + 1;
+    // Under a row layout, removed rows leave and the band follows the layout's live rows.
+    const composer_first_row_number = pending_rows.rowLayout === undefined
+        ? sheet_meta.sourceRowCount
+            - pending_rows.tailRemovals.length
+            + stored_pending_rows(pending_rows).length
+            + 1
+        : body_start + index_row_layout(pending_rows.rowLayout).liveCount + appended_rows(pending_rows).length + 1;
     const may_append_rows_ref = useRef(may_append_rows);
     may_append_rows_ref.current = may_append_rows;
     const append_and_focus_ref = useRef(append_and_focus);
@@ -7430,6 +7716,73 @@ export function GridShell({
         font_size_px,
         visible_source_columns,
     ]);
+
+    /**
+     * Fitted widths for the visible Pending Columns. A Pending Column's cells
+     * are all in the Pending Changes, not on loaded pages, so every stored
+     * cell is measured, as the grid shows it.
+     */
+    const compute_pending_auto_fit = useCallback((): Record<string, number> => {
+        const widths: Record<string, number> = {};
+        if (!measure_ctx_ref.current) {
+            measure_ctx_ref.current = document.createElement('canvas').getContext('2d');
+        }
+        const ctx = measure_ctx_ref.current;
+        if (!ctx) return widths;
+        const measure = (cell: MeasurableCell): number => {
+            ctx.font = canvas_font(cell.bold, cell.italic, font_family, font_size_px);
+            return ctx.measureText(cell.text).width;
+        };
+        for (const projected of projected_columns) {
+            if (projected.identity.kind !== 'pending') continue;
+            const column = pending_columns_by_id.get(projected.identity.pendingColumnId);
+            if (column === undefined) continue;
+            const worksheet = formula_anchor_workbook?.worksheets[sheet_index];
+            const cells: MeasurableCell[] = Object.entries(column.cells).map(([row_key, cell]) => {
+                // A formula shows its calculated result (or, unrenderable, its
+                // error), as `pending_column_cell_content` draws it; its text
+                // until a result arrives.
+                const is_formula = edit_syntax === 'markdown'
+                    && xlsx_edit_writes_formula(cell.value, cell.valueRuns?.runs);
+                if (is_formula) {
+                    const formula = formula_display_for(cell.value, cell.formulaAnchors, cell.valueEditOrder ?? 0);
+                    const result_key = pending_column_result_key(worksheet, column.id, row_key);
+                    const result = formula?.kind === 'unrenderable'
+                        ? formula.result
+                        : result_key === undefined ? undefined : formula_results_ref.current?.get(result_key);
+                    return { text: result ?? pending_column_cell_text(cell), bold: false, italic: false };
+                }
+                return {
+                    text: pending_column_cell_text(cell),
+                    bold: false,
+                    italic: false,
+                    ...(show_formatting && cell.valueRuns?.runs !== undefined && cell.valueRuns.runs.length > 0
+                        ? { runs: cell.valueRuns.runs }
+                        : {}),
+                };
+            });
+            widths[column.id] = fit_column_width(cells, measure);
+        }
+        return widths;
+    }, [
+        edit_syntax,
+        font_family,
+        font_size_px,
+        formula_anchor_workbook,
+        formula_display_for,
+        sheet_index,
+        pending_column_cell_text,
+        pending_columns_by_id,
+        projected_columns,
+        show_formatting,
+    ]);
+    useEffect(() => {
+        if (!pending_auto_fit_ref) return;
+        pending_auto_fit_ref.current = compute_pending_auto_fit;
+        return () => {
+            pending_auto_fit_ref.current = null;
+        };
+    }, [pending_auto_fit_ref, compute_pending_auto_fit]);
 
     useEffect(() => {
         if (!auto_fit_ref) return;
@@ -10509,8 +10862,15 @@ export function GridShell({
                 }
                 return pending_projection.inline_pending_display_rows(interval.start, interval.end).length > 0;
             });
-        const highlight_selection = current_highlight_selection();
-        const pending_selection_has_highlight = highlight_selection?.displayRows.some(
+        const highlight_target = current_highlight_selection();
+        const highlight_selection = highlight_target?.selection ?? null;
+        const pending_column_selection_has_highlight = highlight_target !== null
+            && highlight_target.pendingColumnIds.some((id) => {
+                const highlights = pending_columns_by_id.get(id)?.highlights;
+                return highlights !== undefined && Object.keys(highlights).length > 0;
+            });
+        const pending_selection_has_highlight = pending_column_selection_has_highlight
+            || highlight_selection?.displayRows.some(
             (interval) => {
                 for (
                     let candidate = Math.max(interval.start, pending_projection.pendingBandStart);
@@ -10539,7 +10899,7 @@ export function GridShell({
             ? highlight_selection.displayRows.reduce(
                 (total, interval) => total + interval.end - interval.start + 1,
                 0,
-            ) * highlight_selection.sourceColumns.length
+            ) * (highlight_selection.sourceColumns.length + highlight_target!.pendingColumnIds.length)
             : 0;
         // Source-keyed dirty probe. An unresolved source row reports `false` rather
         // than guessing: it is also the case where discard_edit would have no key to
@@ -10998,7 +11358,7 @@ export function GridShell({
                                         ? {
                                             on_click: () => {
                                                 delete_rows_gesture(
-                                                    structure_selection.identities ?? [],
+                                                    structure_selection.runs ?? [],
                                                     row_menu.row,
                                                 );
                                             },
@@ -11020,7 +11380,7 @@ export function GridShell({
                                             ? {
                                                 on_click: () => {
                                                     restore_rows_gesture(
-                                                        structure_selection.removedSourceRows,
+                                                        structure_selection.removedSourceRuns,
                                                     );
                                                 },
                                             }

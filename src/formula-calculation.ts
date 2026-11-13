@@ -379,6 +379,53 @@ function result_text(value: number): string {
 }
 
 /**
+ * The workbook a calculation request's layouts describe, as Formula Anchors
+ * render against it: each worksheet's layout, append band, and Pending Tail
+ * Removals, with no cell content.
+ */
+export function formula_calculation_workbook(
+    sheets: readonly {
+        readonly name: string;
+        readonly worksheetId?: string;
+        readonly sourceRowCount: number;
+        readonly columnCount: number;
+    }[],
+    layouts: readonly FormulaCalculationLayout[],
+): FormulaAnchorWorkbook {
+    return formula_anchor_workbook('xlsx', sheets.map((sheet, sheetIndex) => ({
+        target: {
+            sheetIndex,
+            sheetName: sheet.name,
+            ...(sheet.worksheetId === undefined ? {} : { worksheetId: sheet.worksheetId }),
+        },
+        name: sheet.name,
+        bodyStart: layouts[sheetIndex].bodyStart,
+        sourceRowCount: sheet.sourceRowCount,
+        sourceColumnCount: sheet.columnCount,
+        changes: {
+            appendedRows: layouts[sheetIndex].band.map((id, createdOrder) => ({
+                id,
+                cells: {},
+                formatTemplateId: '',
+                createdOrder,
+            })),
+            tailRemovals: (layouts[sheetIndex].tailRemovedSourceRows ?? []).map((sourceRow) => ({
+                appendHistoryId: '',
+                sourceRow,
+                savedFingerprint: '',
+                savedRow: { cells: {}, format: { kind: 'none' } },
+            })),
+            ...(layouts[sheetIndex].rowLayout === undefined
+                ? {}
+                : { rowLayout: layouts[sheetIndex].rowLayout }),
+            ...(layouts[sheetIndex].columnLayout === undefined
+                ? {}
+                : { columnLayout: layouts[sheetIndex].columnLayout }),
+        },
+    })));
+}
+
+/**
  * Calculate selected formulas against canonical workbook coordinates.
  *
  * The interface names only edits and targets. Formula parsing, recursion,
@@ -399,37 +446,7 @@ function* calculate_workbook_formula_steps(
     // to an identity, and only a source identity reads the file.
     const workbook: FormulaAnchorWorkbook | undefined = layouts === undefined
         ? undefined
-        : formula_anchor_workbook('xlsx', sheets.map((sheet, sheetIndex) => ({
-            target: {
-                sheetIndex,
-                sheetName: sheet.name,
-                ...(sheet.worksheetId === undefined ? {} : { worksheetId: sheet.worksheetId }),
-            },
-            name: sheet.name,
-            bodyStart: layouts[sheetIndex].bodyStart,
-            sourceRowCount: sheet.sourceRowCount,
-            sourceColumnCount: sheet.columnCount,
-            changes: {
-                appendedRows: layouts[sheetIndex].band.map((id, createdOrder) => ({
-                    id,
-                    cells: {},
-                    formatTemplateId: '',
-                    createdOrder,
-                })),
-                tailRemovals: (layouts[sheetIndex].tailRemovedSourceRows ?? []).map((sourceRow) => ({
-                    appendHistoryId: '',
-                    sourceRow,
-                    savedFingerprint: '',
-                    savedRow: { cells: {}, format: { kind: 'none' } },
-                })),
-                ...(layouts[sheetIndex].rowLayout === undefined
-                    ? {}
-                    : { rowLayout: layouts[sheetIndex].rowLayout }),
-                ...(layouts[sheetIndex].columnLayout === undefined
-                    ? {}
-                    : { columnLayout: layouts[sheetIndex].columnLayout }),
-            },
-        })));
+        : formula_calculation_workbook(sheets, layouts);
     const row_counts = sheets.map((sheet, sheet_index) => workbook !== undefined
         ? prospective_row_count(workbook.worksheets[sheet_index])
         : request.prospectiveRowCounts?.[sheet_index] ?? sheet.sourceRowCount);

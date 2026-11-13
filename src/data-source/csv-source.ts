@@ -31,6 +31,12 @@ export class CsvDataSource implements DataSource {
     readonly truncationMessage?: string;
     /** Per-row field counts before padding, capped to kept rows (save path). */
     readonly originalColumnCounts: number[];
+    /**
+     * Fields in the shortest record, the header line included: a structural
+     * save writes every record at the prospective width, so Review Changes
+     * notes when that pads short rows.
+     */
+    readonly shortestRecordWidth: number;
     /** Detected line terminator so re-serialization round-trips (save path). */
     readonly lineEnding: '\r\n' | '\r' | '\n';
     /** Verbatim header line (terminator stripped) when row 0 was consumed as the
@@ -119,6 +125,9 @@ export class CsvDataSource implements DataSource {
         }
         this._colCount = colCount;
         this.originalColumnCounts = originalColumnCounts;
+        let shortest = header ? this.index.fieldCountOf(0) : colCount;
+        for (const count of originalColumnCounts) if (count < shortest) shortest = count;
+        this.shortestRecordWidth = shortest;
         this.lineEnding = detect_line_ending(this.buf, delimiter.charCodeAt(0));
 
         let columnNames: string[] | undefined;
