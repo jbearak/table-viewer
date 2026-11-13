@@ -484,6 +484,37 @@ describe('known aborts before the write', () => {
     );
 });
 
+describe('a post-write transition that fails', () => {
+    it('recovers the stored intent and reports the save as succeeded, with its receipt', async () => {
+        const drive = disk(BYTES);
+        const state = store_with({ pendingEdits: slot(REMOVAL) });
+        const viewer = await open_viewer({ state, disk: drive });
+        // The first state write after the file is written (the post-write
+        // transition) fails; the recovery's own write then succeeds.
+        const compare_and_set = state.store.compare_and_set.bind(state.store);
+        let failed = false;
+        vi.spyOn(state.store, 'compare_and_set').mockImplementation(async (...args) => {
+            if (!failed && drive.file.writes.length > 0) {
+                failed = true;
+                throw new Error('state write failed');
+            }
+            return compare_and_set(...args);
+        });
+        const result = await viewer.save(REMOVAL);
+        expect(failed).toBe(true);
+        expect(result).toMatchObject({
+            success: true,
+            lifecycle: { state: 'succeeded' },
+            receipt: { structure: [{ removedRows: [{ start: 1, count: 1 }] }] },
+        });
+        expect(dec.decode(drive.file.bytes)).toBe('h\na\nc\n');
+        await vi.waitFor(() => expect(viewer.durable().pendingEdits).toBeUndefined());
+        expect(viewer.durable().structuralRekeyIntent).toBeUndefined();
+        expect(viewer.durable().cellHighlights?.sheets[0]?.cells).toEqual({ '0:0': 'yellow', '1:0': 'blue' });
+        await viewer.dispose();
+    });
+});
+
 describe('a structural write that fails', () => {
     it('clears the intent and keeps the payload when nothing was written', async () => {
         const drive = disk(BYTES);
@@ -517,6 +548,12 @@ describe('a structural write that fails', () => {
             }));
         expect(viewer.durable().structuralRekeyIntent).toBeDefined();
         expect(viewer.durable().pendingEdits?.[0]).toMatchObject(REMOVAL);
+        // A second save would repeat the changes the first may have written.
+        drive.file.write = undefined;
+        expect(await viewer.save(REMOVAL)).toMatchObject({ success: false });
+        expect(viewer.warning).toHaveBeenCalledWith(
+            'Choose whether your last save finished before editing this file.');
+        expect(dec.decode(drive.file.bytes)).toBe('h\na\n');
         await viewer.dispose();
     });
 });

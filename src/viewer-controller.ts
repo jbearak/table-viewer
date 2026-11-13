@@ -4577,6 +4577,8 @@ export function attach_viewer(
     }
 
     let unresolved_structural_sheet_names: ReadonlySet<string> = new Set();
+    /** Durable state holds a structural save's intent that no running save owns. */
+    let unresolved_structural_save_present = false;
     let posted_unresolved_save_id: string | undefined;
 
     /**
@@ -4586,6 +4588,7 @@ export function attach_viewer(
      */
     function observe_unresolved_structural_save(state: PerFileState): void {
         const intent = unresolved_rekey_intent(state);
+        unresolved_structural_save_present = intent !== undefined;
         // The hint and the affected worksheets are answered by the installed
         // workbook; before the first adoption there is none to ask.
         if (source === undefined) return;
@@ -4786,15 +4789,21 @@ export function attach_viewer(
         return next === undefined ? current : { ...current, pendingEdits: next };
     }
 
-    /** Resolve the stored intent now, against `digest`, with the installed workbook. */
-    async function resolve_stored_rekey_intent(digest: string): Promise<void> {
+    /**
+     * Resolve the stored intent now, against `digest`, with the installed
+     * workbook. Answers whether intent `save_id` is settled: no longer stored.
+     */
+    async function resolve_stored_rekey_intent(digest: string, save_id?: string): Promise<boolean> {
         const sheets = source?.meta().sheets ?? [];
-        await update_file_state(
+        const committed = await update_file_state(
             (current) => resolve_rekey_intent_in_state(current, digest, sheets),
             undefined,
             undefined,
             null,
         );
+        const latest = committed ?? await read_file_state(false);
+        return (latest.state as PerFileState).structuralRekeyIntent?.saveId !== save_id
+            || save_id === undefined;
     }
 
     function retire_pending_edit_target(
@@ -9884,6 +9893,15 @@ export function attach_viewer(
                 : file_format.id !== 'csv' && file_format.id !== 'tsv'
                     ? 'Saving inserted, deleted, or moved rows and columns is not available yet.'
                     : undefined;
+        // An unresolved structural save: a new save would build on one reading
+        // of the file and could repeat the changes it already wrote.
+        if (unresolved_structural_save_present) {
+            const active = begin_save_lifecycle(identity);
+            const lifecycle = finish_save_lifecycle(active.operation, 'failed');
+            show_owner_warning(UNRESOLVED_STRUCTURAL_SAVE_EDIT_MESSAGE);
+            void post_to_receiver({ type: 'saveResult', success: false, lifecycle });
+            return;
+        }
         if (layout_refusal !== undefined) {
             const active = begin_save_lifecycle(identity);
             const lifecycle = finish_save_lifecycle(active.operation, 'failed');
@@ -10048,7 +10066,9 @@ export function attach_viewer(
         // acknowledged digest: an xlsx save splices into exactly those bytes, so
         // it cannot be built before we know which bytes they are.
         let saved_bytes: Uint8Array;
-        let saved_digest: string;
+        // Definitely assigned on every path that reaches the success tail: the
+        // normal one, and recovery after a completed write.
+        let saved_digest!: string;
         let save_receipt = plan.receipt;
         const persisted_append_snapshots = new Map<
             string,
@@ -10444,6 +10464,7 @@ export function attach_viewer(
                 announce_structural_rekey(rekey_announcements);
             }
         } catch (error) {
+            let recovered_after_write = false;
             if (rekey_intent !== undefined) {
                 // A known abort before the write clears the intent and keeps the
                 // payload. After an attempted write the intent stays until the
@@ -10454,47 +10475,55 @@ export function attach_viewer(
                 IN_FLIGHT_STRUCTURAL_SAVES.delete(rekey_intent.saveId);
                 // The write finished but the post-write transition did not:
                 // the intent is stored, and the file has the bytes it names, so
-                // recovery can apply it now rather than on the next load.
+                // recovery applies it now. Once it has, the save succeeded: the
+                // renderer must get the receipt and install the barrier, not
+                // restore the written layout as still pending.
                 if (write_completed) {
-                    await resolve_stored_rekey_intent(rekey_intent.afterDigest).catch((resolve_error) => {
+                    recovered_after_write = await resolve_stored_rekey_intent(
+                        rekey_intent.afterDigest,
+                        rekey_intent.saveId,
+                    ).catch((resolve_error) => {
                         log_sanitized_failure('Could not apply a structural save after its write', resolve_error);
+                        return false;
                     });
                 }
             }
-            // A disposed failure releases the edit session from this catch. Do
-            // not let that release wait on the Save's own authority fence; the
-            // finally below would otherwise be unreachable.
-            save_append_authority.release();
-            if (active_save_operation !== operation) return;
-            active_save_operation = undefined;
-            post_save_reservation?.cancel();
-            const lifecycle = finish_save_lifecycle(identity, 'failed');
-            if (disposed) {
-                await release_edit_session(identity.editSessionId);
-                delete_shared_edit_state_if_unused();
-                return;
-            }
-            const rejection = structural_save_rejection(error);
-            if (rejection !== undefined) {
+            if (!(recovered_after_write && active_save_operation === operation && !disposed)) {
+                // A disposed failure releases the edit session from this catch. Do
+                // not let that release wait on the Save's own authority fence; the
+                // finally below would otherwise be unreachable.
+                save_append_authority.release();
+                if (active_save_operation !== operation) return;
+                active_save_operation = undefined;
+                post_save_reservation?.cancel();
+                const lifecycle = finish_save_lifecycle(identity, 'failed');
+                if (disposed) {
+                    await release_edit_session(identity.editSessionId);
+                    delete_shared_edit_state_if_unused();
+                    return;
+                }
+                const rejection = structural_save_rejection(error);
+                if (rejection !== undefined) {
+                    void post_to_receiver({
+                        type: 'saveResult',
+                        success: false,
+                        lifecycle,
+                        rejection,
+                        basesValidated: true,
+                    });
+                    return;
+                }
+                show_owner_error(
+                    `Failed to save: ${error instanceof Error ? error.message : String(error)}`,
+                );
                 void post_to_receiver({
                     type: 'saveResult',
                     success: false,
                     lifecycle,
-                    rejection,
                     basesValidated: true,
                 });
                 return;
             }
-            show_owner_error(
-                `Failed to save: ${error instanceof Error ? error.message : String(error)}`,
-            );
-            void post_to_receiver({
-                type: 'saveResult',
-                success: false,
-                lifecycle,
-                basesValidated: true,
-            });
-            return;
         } finally {
             save_append_authority.release();
         }
