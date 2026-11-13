@@ -1076,6 +1076,19 @@ function cells_hold_move(cells: Readonly<Record<string, PendingRowCell>>): boole
     return false;
 }
 
+/**
+ * Why no structure item may act on the worksheet right now under the
+ * exclusivity rules (a Pending Tail Removal or a pending cell move), or
+ * undefined. Menus ask it before any target-specific reason.
+ */
+export function structure_exclusivity_message(
+    changes: PendingStructuralChanges,
+    context: WorksheetStructureContext,
+): string | undefined {
+    const refusal = exclusivity_refusal(changes, context);
+    return refusal === undefined || refusal.ok ? undefined : refusal.refusal.message;
+}
+
 /** The exclusivity rules every structure item shares (invariant 8). */
 function exclusivity_refusal(
     changes: PendingStructuralChanges,

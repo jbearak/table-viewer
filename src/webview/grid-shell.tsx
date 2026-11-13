@@ -495,7 +495,7 @@ import {
 } from './pending-row-store';
 import {
     nearest_live_row,
-    has_inserted_rows,
+    has_inserted_or_moved_rows,
     insert_anchor_is_live,
     insert_created_order,
     INSERT_CANCELED_MESSAGE,
@@ -505,12 +505,20 @@ import {
     plan_row_delete,
     plan_row_restore,
     removed_source_row_test,
+    moved_block_display_rows,
+    plan_row_move,
+    resolve_row_move_drop,
     resolve_row_structure_selection,
+    row_move_announcement,
+    row_move_block_refusal,
+    row_move_item_model,
     row_structure_label,
     row_structure_menu_model,
     type InsertItemModel,
+    type MoveItemModel,
     type RowStructurePlan,
     type RowStructureSelection,
+    type RowStructureSelectionOptions,
 } from './row-structure-model';
 import type { WorksheetStructuralSupport } from '../viewer-snapshot';
 import {
@@ -2308,10 +2316,13 @@ export function GridShell({
     ]);
     const has_row_layout = pending_rows.rowLayout !== undefined;
     /**
-     * Inserted rows pin the display order to the layout's: sorting,
+     * Inserted and moved rows pin the display order to the layout's: sorting,
      * filtering, and hiding rows on this worksheet wait for Save or Discard.
      */
-    const inserted_rows_lock = has_inserted_rows(pending_rows);
+    const inserted_rows_lock = useMemo(
+        () => has_inserted_or_moved_rows(pending_rows),
+        [pending_rows],
+    );
     /** Whether a source row is a Pending Row Removal: read-only, tinted, unnumbered. */
     const is_removed_source_row = useMemo(
         () => removed_source_row_test(pending_rows),
@@ -3116,6 +3127,36 @@ export function GridShell({
     const promoted_header_row = sheet_meta.excelFirstRowHeader?.active === true
         ? sheet_meta.excelFirstRowHeader.sourceRow ?? 0
         : undefined;
+    /**
+     * How a gutter selection resolves to row identities, for the row menu, the
+     * Move shortcuts, and a row drag alike.
+     */
+    const row_structure_selection_options = useMemo((): RowStructureSelectionOptions => ({
+        bodyStart: body_start,
+        isRemoved: is_removed_source_row,
+        // Untransformed, a source-display row maps to its source row
+        // arithmetically (skipping a promoted header row), so an unloaded row
+        // still resolves.
+        ...(body_view_transformed ? {} : {
+            sourceRowFor: (source_display_row: number) => {
+                const source_row = promoted_header_row !== undefined
+                    && source_display_row >= promoted_header_row
+                    ? source_display_row + 1
+                    : source_display_row;
+                return source_row < sheet_meta.sourceRowCount
+                    ? source_row
+                    : undefined;
+            },
+        }),
+    }), [
+        body_start,
+        body_view_transformed,
+        is_removed_source_row,
+        promoted_header_row,
+        sheet_meta.sourceRowCount,
+    ]);
+    const row_structure_selection_options_ref = useRef(row_structure_selection_options);
+    row_structure_selection_options_ref.current = row_structure_selection_options;
     const open_row_marker_menu = useCallback((request: {
         x: number;
         y: number;
@@ -3169,36 +3210,15 @@ export function GridShell({
                     structure: resolve_row_structure_selection(
                         pending_projection,
                         request.display_rows,
-                        {
-                            bodyStart: body_start,
-                            isRemoved: is_removed_source_row,
-                            // Untransformed, a source-display row maps to its
-                            // source row arithmetically (skipping a promoted
-                            // header row), so an unloaded row still resolves.
-                            ...(body_view_transformed ? {} : {
-                                sourceRowFor: (source_display_row: number) => {
-                                    const source_row = promoted_header_row !== undefined
-                                        && source_display_row >= promoted_header_row
-                                        ? source_display_row + 1
-                                        : source_display_row;
-                                    return source_row < sheet_meta.sourceRowCount
-                                        ? source_row
-                                        : undefined;
-                                },
-                            }),
-                        },
+                        row_structure_selection_options,
                     ),
                 }
                 : {}),
         });
     }, [
-        body_start,
-        body_view_transformed,
-        is_removed_source_row,
         pending_projection,
-        promoted_header_row,
         row_marker_options,
-        sheet_meta.sourceRowCount,
+        row_structure_selection_options,
         structure_items_offered,
     ]);
     const row_markers = use_row_marker_selection({
@@ -4445,6 +4465,18 @@ export function GridShell({
         ) {
             return `Row removed, was row ${projected.identity.sourceRow + 1}`;
         }
+        // Labels follow the moved tint, which marks the fewest rows that
+        // explain the new order, so they can name a row the user did not drag.
+        if (
+            projected?.kind === 'source'
+            && projected.identity !== undefined
+            && pending_projection.row_state(row) === 'moved'
+        ) {
+            const prospective = pending_projection.prospective_row(row);
+            return prospective === undefined
+                ? undefined
+                : `Row ${prospective + 1}, moved from row ${projected.identity.sourceRow + 1}`;
+        }
         return undefined;
     }, [is_removed_source_row, pending_projection]);
     const draw_pending_divider = useCallback<
@@ -4747,6 +4779,186 @@ export function GridShell({
             },
         };
     }, [append_rows_gesture, insert_rows_gesture]);
+    /**
+     * After a Move, select the moved block where it now is, scroll its
+     * leading row into view, and focus the grid. Polls the projection the grid
+     * renders until it is a newer one that shows every moved row, never a
+     * fixed delay.
+     */
+    const focus_after_row_move = useCallback((
+        moved: readonly RowIdentity[],
+        direction: 'up' | 'down',
+        before_projection: PendingRowProjection,
+    ): void => {
+        let attempts = 0;
+        const poll = () => {
+            const projection = pending_projection_ref.current;
+            const block = projection === before_projection
+                ? undefined
+                : moved_block_display_rows(projection, moved);
+            if (block === undefined) {
+                attempts += 1;
+                if (attempts < 120) window.requestAnimationFrame(poll);
+                return;
+            }
+            write_grid_selection({
+                columns: CompactSelection.empty(),
+                rows: CompactSelection.fromSingleSelection([block.start, block.end + 1]),
+            });
+            grid_ref.current?.scrollTo(0, direction === 'up' ? block.start : block.end, 'vertical');
+            focus_grid();
+        };
+        poll();
+    }, [focus_grid, write_grid_selection]);
+    /**
+     * Move the live rows of `identities` (each with its glued tombstones) to
+     * just before `before`: one history action, announced through the live
+     * region, with the selection following the moved rows. A move that
+     * changes nothing does nothing.
+     */
+    const move_rows_gesture = useCallback((
+        identities: readonly RowIdentity[],
+        before: RowIdentity | 'end',
+    ): boolean => {
+        if (!structure_gesture_admitted()) return false;
+        // The menu or drag was set up before this gesture: re-check that no
+        // sort, filter, or hide was installed or started since.
+        if (structure_context_ref.current.bodyViewTransformed) {
+            host_bridge.postMessage({ type: 'showWarning', message: STRUCTURE_TRANSFORMED_MESSAGE });
+            return false;
+        }
+        const plan = plan_row_move(
+            pending_store.snapshot(),
+            action_structure_context_ref.current(),
+            identities,
+            before,
+        );
+        if (!plan.ok) {
+            if (plan.unchanged !== true) host_bridge.postMessage({ type: 'showWarning', message: plan.message });
+            return false;
+        }
+        const before_projection = pending_projection_ref.current;
+        if (!commit_row_structure_plan(plan)) return false;
+        announce_structure(row_move_announcement(plan.movedRows, plan.direction));
+        focus_after_row_move(plan.movedIdentities, plan.direction, before_projection);
+        return true;
+    }, [
+        announce_structure,
+        commit_row_structure_plan,
+        focus_after_row_move,
+        pending_store,
+        structure_gesture_admitted,
+    ]);
+    const move_menu_action = useCallback((
+        model: MoveItemModel,
+        identities: readonly RowIdentity[],
+    ): StructureMenuAction => {
+        const before = model.before;
+        if (!model.enabled || before === undefined) {
+            return {
+                count: model.count,
+                ...(model.reason === undefined ? {} : { disabled_reason: model.reason }),
+            };
+        }
+        return { count: model.count, on_click: () => { move_rows_gesture(identities, before); } };
+    }, [move_rows_gesture]);
+    /** Row moves are offered (by menu, shortcut, and drag) only where Insert and Delete are. */
+    const row_moves_offered = structure_items_offered && structural_support !== undefined;
+    /** A drag's block, resolved once per block rather than once per drop target. */
+    const row_drag_selection_ref = useRef<{
+        readonly start: number;
+        readonly end: number;
+        readonly projection: PendingRowProjection;
+        readonly selection: RowStructureSelection;
+    } | null>(null);
+    const row_drag_selection = useCallback((rows: { start: number; end: number }): RowStructureSelection => {
+        const projection = pending_projection_ref.current;
+        const cached = row_drag_selection_ref.current;
+        if (cached !== null && cached.start === rows.start && cached.end === rows.end
+            && cached.projection === projection) return cached.selection;
+        const selection = resolve_row_structure_selection(
+            projection,
+            [{ start: rows.start, end: rows.end }],
+            row_structure_selection_options_ref.current,
+        );
+        row_drag_selection_ref.current = { ...rows, projection, selection };
+        return selection;
+    }, []);
+    const can_drag_rows = useCallback((rows: { start: number; end: number }): boolean => {
+        if (structural_support === undefined || !structure_gesture_admitted()) return false;
+        return row_move_block_refusal({
+            support: structural_support.rows,
+            ready: true,
+            selection: row_drag_selection(rows),
+            changes: pending_store.snapshot(),
+            context: structure_context_ref.current,
+        }) === undefined;
+    }, [pending_store, row_drag_selection, structural_support, structure_gesture_admitted]);
+    /** Where a drag dropping before display row `before` lands, or undefined when it may not drop there. */
+    const row_drop_target = useCallback((
+        rows: { start: number; end: number },
+        before: number,
+    ): { identities: readonly RowIdentity[]; before: RowIdentity | 'end' } | undefined => {
+        const selection = row_drag_selection(rows);
+        if (selection.identities === undefined) return undefined;
+        const target = resolve_row_move_drop(
+            pending_projection_ref.current,
+            before,
+            row_structure_selection_options_ref.current,
+        );
+        if (!target.ok) return undefined;
+        const plan = plan_row_move(
+            pending_store.snapshot(),
+            structure_context_ref.current,
+            selection.identities,
+            target.before,
+        );
+        return plan.ok || plan.unchanged === true
+            ? { identities: selection.identities, before: target.before }
+            : undefined;
+    }, [pending_store, row_drag_selection]);
+    const propose_row_move = useCallback((rows: { start: number; end: number }, before: number): boolean =>
+        row_drop_target(rows, before) !== undefined, [row_drop_target]);
+    const on_row_moved = useCallback((rows: { start: number; end: number }, before: number): void => {
+        const target = row_drop_target(rows, before);
+        row_drag_selection_ref.current = null;
+        if (target !== undefined) move_rows_gesture(target.identities, target.before);
+    }, [move_rows_gesture, row_drop_target]);
+    /** `Alt+Shift+↑`/`↓`: move the selected whole rows one step, or announce why not. */
+    const move_rows_by_keyboard = useCallback((direction: 'backward' | 'forward'): boolean => {
+        if (!row_moves_offered || structural_support === undefined) return false;
+        const display_rows = selected_display_row_intervals(grid_selection_ref.current, row_count);
+        if (display_rows === null || display_rows.length === 0
+            || grid_selection_ref.current.rows.length === 0) return false;
+        const selection = resolve_row_structure_selection(
+            pending_projection_ref.current,
+            display_rows,
+            row_structure_selection_options_ref.current,
+        );
+        const model = row_move_item_model({
+            support: structural_support.rows,
+            ready: editable_cells_ref.current && structure_gesture_admitted(),
+            selection,
+            changes: pending_store.snapshot(),
+            context: structure_context_ref.current,
+        }, direction);
+        if (!model.enabled || model.before === undefined) {
+            if (model.reason !== undefined) announce_structure(model.reason);
+            return true;
+        }
+        move_rows_gesture(selection.identities ?? [], model.before);
+        return true;
+    }, [
+        announce_structure,
+        move_rows_gesture,
+        pending_store,
+        row_count,
+        row_moves_offered,
+        structural_support,
+        structure_gesture_admitted,
+    ]);
+    const move_rows_by_keyboard_ref = useRef(move_rows_by_keyboard);
+    move_rows_by_keyboard_ref.current = move_rows_by_keyboard;
     const pending_paste_history_ref = useRef<{
         readonly before: PendingStructuralChanges;
         readonly rowIds: ReadonlySet<string>;
@@ -6583,6 +6795,11 @@ export function GridShell({
             // and a cell highlight still wins over the tint.
             const layout_removal = source_row !== undefined
                 && is_removed_source_row(source_row);
+            // A Moved Row keeps its values and stays editable, with the moved
+            // band tint under any cell highlight, edit, or compare tint.
+            const layout_moved = projected_row?.kind === 'source'
+                && !layout_removal
+                && pending_projection.row_state(row) === 'moved';
             const loaded_row = get_row(source_display_row);
             const loaded_cell = loaded_row?.[source_column];
             // A formula that cannot render for the current layouts cannot be
@@ -6660,7 +6877,7 @@ export function GridShell({
                 : undefined;
             let overlay: CellEditOverlay | undefined;
             if (editable_cells || dirty || dependent_formula_affected || highlight_bg || flash_bg
-                || compare_bg || compare_base !== undefined || layout_removal) {
+                || compare_bg || compare_base !== undefined || layout_removal || layout_moved) {
                 overlay = {
                     editable,
                     ...(edit_value !== undefined ? { edit_value } : {}),
@@ -6695,7 +6912,8 @@ export function GridShell({
                         ? key !== undefined && conflicted_keys_ref.current.has(key)
                             ? conflict_bg
                             : dirty_bg
-                        : highlight_bg ?? compare_bg),
+                        : highlight_bg ?? compare_bg
+                            ?? (layout_moved ? compare_row_bgs.moved : undefined)),
                 };
             }
             const grid_cell = build_grid_cell(
@@ -8651,6 +8869,18 @@ export function GridShell({
     // shortcuts) stay native to Glide, which steps past merges itself.
     const on_key_down = useCallback(
         (args: GridKeyEventArgs) => {
+            // Alt+Shift+Up/Down move whole selected rows. Neither the
+            // transform shortcuts (letters and digits) nor Find use arrows.
+            if (
+                args.altKey && args.shiftKey && !args.ctrlKey && !args.metaKey
+                && (args.key === 'ArrowUp' || args.key === 'ArrowDown')
+                && !is_editable_target(args.rawEvent?.target ?? null)
+                && move_rows_by_keyboard_ref.current(args.key === 'ArrowUp' ? 'backward' : 'forward')
+            ) {
+                args.cancel();
+                args.preventDefault();
+                return;
+            }
             const shortcut = transform_shortcut({
                 shiftKey: args.shiftKey,
                 altKey: args.altKey,
@@ -9325,6 +9555,15 @@ export function GridShell({
                 getCellContent={get_cell_content}
                 rowHeight={get_row_height}
                 rowMarkers={row_marker_options}
+                // A drag from a marker inside the selected block moves the
+                // block; any other marker press keeps drag-to-select.
+                {...(row_moves_offered
+                    ? {
+                        onRowMoved: on_row_moved,
+                        canMoveRows: can_drag_rows,
+                        onRowProposeMove: propose_row_move,
+                    }
+                    : {})}
                 theme={theme}
                 smoothScrollX
                 smoothScrollY
@@ -9582,6 +9821,14 @@ export function GridShell({
                                         }
                                         : { disabled_reason: structure_menu.delete.reason }),
                                 },
+                                move_rows_up: move_menu_action(
+                                    structure_menu.moveUp,
+                                    structure_selection.identities ?? [],
+                                ),
+                                move_rows_down: move_menu_action(
+                                    structure_menu.moveDown,
+                                    structure_selection.identities ?? [],
+                                ),
                                 ...(structure_menu.restore === undefined ? {} : {
                                     restore_rows: {
                                         count: structure_menu.restore.count,

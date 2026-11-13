@@ -1,12 +1,14 @@
 /**
- * Row Insert, Delete, and Restore in Edit mode, as pure planning the grid
- * commits.
+ * Row Insert, Delete, Restore, and Move in Edit mode, as pure planning the
+ * grid commits.
  *
  * Three steps, each testable apart from the grid: resolve a row-gutter
  * selection into row identities (`resolve_row_structure_selection`), decide
  * which structure items the menu offers and why one is disabled
  * (`row_structure_menu_model`), and plan the one history action a gesture
- * records (`plan_row_insert`, `plan_row_delete`, `plan_row_restore`). A
+ * records (`plan_row_insert`, `plan_row_delete`, `plan_row_restore`,
+ * `plan_row_move`). A drag's drop row resolves to a layout target through
+ * `resolve_row_move_drop`. A
  * delete's action holds the `rowLayout` arm the structural store planned and,
  * beside it, a `cell` delta for every source cell edit in a removed row, so
  * Undo restores both together. An insert's IDs come from host admission, so
@@ -15,6 +17,8 @@
  */
 
 import {
+    appended_rows,
+    has_inserted_or_moved_rows,
     is_inserted_row,
     MAX_PENDING_APPENDED_ROWS,
     pending_rows,
@@ -28,6 +32,7 @@ import {
     index_row_layout,
     insert_anchor_for_selection,
     source_row_layout,
+    step_move_target,
     type SourceInterval,
 } from '../worksheet-layout';
 import type { HistoryDirtyEntry } from './history-cell-state-model';
@@ -37,8 +42,10 @@ import {
     APPENDED_BAND_MESSAGE,
     delete_rows,
     insert_rows,
+    move_rows,
     restore_rows,
     source_cells_removed_by,
+    structure_exclusivity_message,
     STRUCTURE_TAIL_REMOVAL_MESSAGE,
     STRUCTURE_TRANSFORMED_MESSAGE,
     TOO_MANY_PENDING_ROWS_MESSAGE,
@@ -56,16 +63,26 @@ export const SELECT_ADJACENT_ROWS_MESSAGE = 'Select adjacent rows to insert or m
 export const INSERT_ABOVE_HEADER_MESSAGE = "Rows can't be inserted above the header row.";
 export const INSERT_ONLY_REMOVED_ROWS_MESSAGE = 'Select a row that isn\'t deleted to insert rows beside it.';
 export const INSERT_CANCELED_MESSAGE = 'Insert canceled because its row was removed.';
-/** Sort, filter, and hide rows are disabled while inserted (or, from step 7, moved) rows exist. */
+/** Sort, filter, and hide rows are disabled while inserted or moved rows exist. */
 export const INSERTED_ROWS_TRANSFORM_MESSAGE =
     'Save or discard inserted and moved rows to sort, filter, or hide rows.';
+export const MOVE_FIXED_ROWS_MESSAGE = "The header row and the rows above it can't be moved.";
+export const MOVE_ONLY_REMOVED_ROWS_MESSAGE = "Select a row that isn't deleted to move it.";
+export const MOVE_ABOVE_HEADER_MESSAGE = "Rows can't be moved above the header row.";
+export const MOVE_AT_TOP_MESSAGE = 'The selected rows are already at the top.';
+export const MOVE_AT_BOTTOM_MESSAGE = 'The selected rows are already at the bottom.';
 
 /**
- * "Delete row", "Delete 3 rows", "Restore row", "Insert 2 rows", ...: undo
- * labels, and menu items for Delete and Restore.
+ * "Delete row", "Delete 3 rows", "Restore row", "Insert 2 rows", "Move 3
+ * rows", ...: undo labels, and menu items for Delete and Restore.
  */
-export function row_structure_label(verb: 'Delete' | 'Restore' | 'Insert', count: number): string {
+export function row_structure_label(verb: 'Delete' | 'Restore' | 'Insert' | 'Move', count: number): string {
     return count === 1 ? `${verb} row` : `${verb} ${count} rows`;
+}
+
+/** The live region's report of a move: "Moved 3 rows down", "Moved 1 row up". */
+export function row_move_announcement(count: number, direction: 'up' | 'down'): string {
+    return `Moved ${count} ${count === 1 ? 'row' : 'rows'} ${direction}`;
 }
 
 /** "Insert row above", "Insert 3 rows below": the Insert menu items. */
@@ -74,14 +91,12 @@ export function row_insert_label(side: 'above' | 'below', count: number): string
 }
 
 /**
- * Whether the worksheet holds a live Pending Inserted Row. While it does, the
- * display order must stay the layout's, so sorting, filtering, and hiding rows
- * on the worksheet are disabled with `INSERTED_ROWS_TRANSFORM_MESSAGE`.
- * Moved rows join this rule with delivery step 7.
+ * Whether the worksheet holds a live Pending Inserted Row or a Moved Row.
+ * While it does, the display order must stay the layout's, so sorting,
+ * filtering, and hiding rows on the worksheet are disabled with
+ * `INSERTED_ROWS_TRANSFORM_MESSAGE`.
  */
-export function has_inserted_rows(changes: PendingStructuralChanges): boolean {
-    return pending_rows(changes).some(is_inserted_row);
-}
+export { has_inserted_or_moved_rows };
 
 /** Membership in a worksheet's Pending Row Removals, `O(log R)` per row. */
 export function removed_source_row_test(
@@ -230,12 +245,20 @@ export interface InsertItemModel extends StructureItemModel {
     readonly anchor?: RowIdentity;
 }
 
+/** A Move item: one step past the neighboring live row (with its glued tombstones). */
+export interface MoveItemModel extends StructureItemModel {
+    /** The `before` target of the step; absent when the item is disabled. */
+    readonly before?: RowIdentity | 'end';
+}
+
 export interface RowStructureMenuModel {
     readonly insertAbove: InsertItemModel;
     readonly insertBelow: InsertItemModel;
     readonly delete: StructureItemModel;
     /** Offered only when the selection includes a Pending Row Removal. */
     readonly restore?: StructureItemModel;
+    readonly moveUp: MoveItemModel;
+    readonly moveDown: MoveItemModel;
 }
 
 export interface RowStructureMenuInput {
@@ -280,8 +303,10 @@ export function row_structure_menu_model(input: RowStructureMenuInput): RowStruc
             : refusal_message(plan_row_delete(changes, context, selection.identities!, new Map())));
     const insertAbove = insert_item(input, shared_reason, 'before');
     const insertBelow = insert_item(input, shared_reason, 'after');
+    const moveUp = row_move_item_model(input, 'backward');
+    const moveDown = row_move_item_model(input, 'forward');
     if (selection.removedSourceRows.length === 0) {
-        return Object.freeze({ insertAbove, insertBelow, delete: item(count, delete_reason) });
+        return Object.freeze({ insertAbove, insertBelow, delete: item(count, delete_reason), moveUp, moveDown });
     }
     const restore_reason = shared_reason
         ?? (selection.removedSourceRows.length !== count ? RESTORE_ONLY_REMOVALS_MESSAGE : undefined)
@@ -291,7 +316,71 @@ export function row_structure_menu_model(input: RowStructureMenuInput): RowStruc
         insertBelow,
         delete: item(count, delete_reason),
         restore: item(selection.removedSourceRows.length, restore_reason),
+        moveUp,
+        moveDown,
     });
+}
+
+function shared_structure_reason(input: Pick<RowStructureMenuInput, 'support' | 'ready'>): string | undefined {
+    return !input.support.supported
+        ? input.support.reason
+        : !input.ready
+            ? STRUCTURE_BUSY_MESSAGE
+            : undefined;
+}
+
+/**
+ * Why the selected rows cannot move at all, in either direction or by drag,
+ * or undefined. Both Move items ask it before their step's own reasons, and a
+ * drag arms only when it is undefined.
+ */
+export function row_move_block_refusal(
+    input: Pick<RowStructureMenuInput, 'support' | 'ready' | 'selection' | 'changes' | 'context'>,
+): string | undefined {
+    const { selection, changes, context } = input;
+    const reason = shared_structure_reason(input)
+        ?? (selection.fixedRows ? MOVE_FIXED_ROWS_MESSAGE : undefined)
+        ?? (selection.tailRemovals ? STRUCTURE_TAIL_REMOVAL_MESSAGE : undefined)
+        ?? (selection.identities === undefined ? ROWS_NOT_LOADED_MESSAGE : undefined)
+        ?? (!selection.contiguous ? SELECT_ADJACENT_ROWS_MESSAGE : undefined)
+        // Appended rows stay where Append put them; a selection reaching
+        // into the band moves nothing.
+        ?? (selection.bandRows > 0 ? APPENDED_BAND_MESSAGE : undefined)
+        ?? (context.bodyViewTransformed ? STRUCTURE_TRANSFORMED_MESSAGE : undefined)
+        ?? structure_exclusivity_message(changes, context);
+    if (reason !== undefined) return reason;
+    const index = index_row_layout(row_layout_for(changes, context));
+    return insert_anchor_for_selection(index, selection.identities!, 'before') === undefined
+        ? MOVE_ONLY_REMOVED_ROWS_MESSAGE
+        : undefined;
+}
+
+/**
+ * One Move item ('backward' is up): enabled with the step's `before` target
+ * when the gesture would succeed now, else disabled with the reason it would
+ * give. The `Alt+Shift+↑`/`↓` shortcuts ask the same question.
+ */
+export function row_move_item_model(
+    input: Pick<RowStructureMenuInput, 'support' | 'ready' | 'selection' | 'changes' | 'context'>,
+    direction: 'backward' | 'forward',
+): MoveItemModel {
+    const { selection, changes, context } = input;
+    const count = selection.count;
+    const disabled = (reason: string): MoveItemModel => Object.freeze({ count, enabled: false, reason });
+    const reason = row_move_block_refusal(input);
+    if (reason !== undefined) return disabled(reason);
+    const index = index_row_layout(row_layout_for(changes, context));
+    const before = step_move_target(index, selection.identities!, direction);
+    if (before === undefined) {
+        if (direction === 'backward') {
+            return disabled(context.bodyStart > 0 ? MOVE_ABOVE_HEADER_MESSAGE : MOVE_AT_TOP_MESSAGE);
+        }
+        return disabled(appended_rows(changes).length > 0 ? APPENDED_BAND_MESSAGE : MOVE_AT_BOTTOM_MESSAGE);
+    }
+    // A dry run gives the refusal the gesture would get (merges, run limit).
+    const probe = plan_row_move(changes, context, selection.identities!, before);
+    if (!probe.ok) return disabled(probe.message);
+    return Object.freeze({ count, enabled: true, before });
 }
 
 function insert_item(
@@ -474,6 +563,111 @@ export function plan_row_restore(
         discardedCellKeys: Object.freeze([]),
         changes: Object.freeze([result.outcome.change]),
     });
+}
+
+/** A planned move, with what the live region announces. */
+export interface RowMovePlan extends RowStructurePlan {
+    /** Live rows the gesture moves (glued tombstones ride along uncounted). */
+    readonly movedRows: number;
+    readonly direction: 'up' | 'down';
+    /** The live identities the gesture moves, in display order: focus follows them. */
+    readonly movedIdentities: readonly RowIdentity[];
+}
+
+export type RowMovePlanResult =
+    | RowMovePlan
+    | { readonly ok: false; readonly message: string; readonly unchanged?: true };
+
+/**
+ * Move the live rows of `identities`, each with its glued tombstones, to just
+ * before `before` ('end' is the end of the layout, before the append band):
+ * one history action, the `rowLayout` arm, labelled "Move row" or "Move N
+ * rows". A move that would change nothing is refused with `unchanged`.
+ */
+export function plan_row_move(
+    changes: PendingStructuralChanges,
+    context: WorksheetStructureContext,
+    identities: readonly RowIdentity[],
+    before: RowIdentity | 'end',
+): RowMovePlanResult {
+    const result = move_rows(changes, context, identities, before);
+    if (!result.ok) {
+        return result.refusal.reason === 'unchanged'
+            ? { ok: false, message: result.refusal.message, unchanged: true }
+            : { ok: false, message: result.refusal.message };
+    }
+    const index = index_row_layout(row_layout_for(changes, context));
+    const live = identities.filter((identity) => index.is_live(identity));
+    const first = Math.min(...live.map((identity) => index.position_of(identity)!));
+    const direction = before === 'end' || (index.position_of(before) ?? Infinity) > first ? 'down' : 'up';
+    return Object.freeze({
+        ok: true,
+        label: row_structure_label('Move', live.length),
+        outcome: result.outcome,
+        discardedCellKeys: Object.freeze([]),
+        changes: Object.freeze([result.outcome.change]),
+        movedRows: live.length,
+        direction,
+        movedIdentities: Object.freeze(live),
+    });
+}
+
+/** Options for resolving a drop row; see `RowStructureSelectionOptions`. */
+export interface RowMoveDropOptions {
+    readonly bodyStart: number;
+    readonly sourceRowFor?: (source_display_row: number) => number | undefined;
+}
+
+/**
+ * The layout target for a drag that drops before display row `before`
+ * (`projection.rowCount` for the end, -1 over the column header). A drop at
+ * or above the Header Row is refused; a drop inside or after the append band
+ * resolves to just before it ('end'); a drop between a live row and its glued
+ * tombstones names the tombstone, which `move_rows` resolves to after them.
+ */
+export function resolve_row_move_drop(
+    projection: Pick<PendingRowProjection, 'row_at' | 'rowCount' | 'pendingBandStart'>,
+    before: number,
+    options: RowMoveDropOptions,
+): { readonly ok: true; readonly before: RowIdentity | 'end' } | { readonly ok: false; readonly message: string } {
+    const refused_above = {
+        ok: false as const,
+        message: options.bodyStart > 0 ? MOVE_ABOVE_HEADER_MESSAGE : MOVE_AT_TOP_MESSAGE,
+    };
+    if (before < 0) return refused_above;
+    if (before >= projection.pendingBandStart || before >= projection.rowCount) {
+        return { ok: true, before: 'end' };
+    }
+    const projected = projection.row_at(before);
+    if (projected === undefined) return { ok: false, message: ROWS_NOT_LOADED_MESSAGE };
+    if (projected.kind === 'pending') return { ok: true, before: projected.identity };
+    if (projected.kind !== 'source') return { ok: true, before: 'end' };
+    const source_row = projected.identity?.sourceRow ?? options.sourceRowFor?.(projected.sourceDisplayRow);
+    if (source_row === undefined) return { ok: false, message: ROWS_NOT_LOADED_MESSAGE };
+    if (source_row < options.bodyStart) return refused_above;
+    return { ok: true, before: { kind: 'source', sourceRow: source_row } };
+}
+
+/**
+ * The display rows a move's block occupies once the grid shows it: from its
+ * first moved live row through its last, plus the removed rows glued after
+ * that one, which moved with it. Undefined until every moved row is shown.
+ */
+export function moved_block_display_rows(
+    projection: Pick<PendingRowProjection, 'display_row_for_identity' | 'row_state' | 'rowCount'>,
+    moved: readonly RowIdentity[],
+): { readonly start: number; readonly end: number } | undefined {
+    let start = Infinity;
+    let end = -Infinity;
+    for (const identity of moved) {
+        const row = projection.display_row_for_identity(identity);
+        if (row === undefined) return undefined;
+        start = Math.min(start, row);
+        end = Math.max(end, row);
+    }
+    if (end < 0) return undefined;
+    while (end + 1 < projection.rowCount && projection.row_state(end + 1) === 'removed') end += 1;
+    return { start, end };
 }
 
 /**

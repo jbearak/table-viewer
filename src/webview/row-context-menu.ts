@@ -41,15 +41,19 @@ export interface RowContextMenuModelProps {
     insert_rows_above?: StructureMenuAction;
     /** "Insert row below" / "Insert N rows below"; below the band's last row it appends. */
     insert_rows_below?: StructureMenuAction;
+    /** "Move rows up": the block passes one neighboring displayed row. */
+    move_rows_up?: StructureMenuAction;
+    /** "Move rows down". */
+    move_rows_down?: StructureMenuAction;
 }
 
 function structure_item(
-    verb: 'Delete' | 'Restore' | 'Insert above' | 'Insert below',
+    verb: 'Delete' | 'Restore' | 'Insert above' | 'Insert below' | 'Move up' | 'Move down',
     action: StructureMenuAction,
 ): MenuItem {
     const count = Math.max(1, action.count);
     const [word, side] = verb.split(' ');
-    const rows = count === 1 ? `${word} row` : `${word} ${count} rows`;
+    const rows = word === 'Move' ? 'Move rows' : count === 1 ? `${word} row` : `${word} ${count} rows`;
     return {
         label: side === undefined ? rows : `${rows} ${side}`,
         on_click: () => action.on_click?.(),
@@ -101,6 +105,8 @@ export function row_context_menu_items(props: RowContextMenuModelProps): MenuIte
         if (props.restore_rows !== undefined) {
             items.push(structure_item('Restore', props.restore_rows));
         }
+        if (props.move_rows_up !== undefined) items.push(structure_item('Move up', props.move_rows_up));
+        if (props.move_rows_down !== undefined) items.push(structure_item('Move down', props.move_rows_down));
     } else if (props.on_remove_pending_rows || props.show_disabled_remove_pending_rows) {
         const pending_row_count = Math.max(
             1,
