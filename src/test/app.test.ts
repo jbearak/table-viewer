@@ -17872,7 +17872,14 @@ describe('cursor after a structural save', () => {
 });
 
 describe('structural conflict notice counts and Review Changes notes', () => {
-    it('asks the host what each salvage action does to formulas and shows the counts', async () => {
+    for (const reason of ['structuralBasisChanged', 'unsupportedStructure'] as const) it(
+        `asks the host what each salvage action does to formulas and shows the counts (${reason})`, async () => {
+        const conflict = {
+            reason,
+            pendingRowIds: [],
+            tailRemovalIds: [],
+            ...(reason === 'unsupportedStructure' ? { message: "Can't save these row and column changes." } : {}),
+        };
         const { post_message } = await render_app();
         const meta = make_meta(['Sales'], false);
         Object.assign(meta.sheets[0], { columnCount: 2, sourceRowCount: 4, rowCount: 4, formulaCells: [0, 1] });
@@ -17897,7 +17904,7 @@ describe('structural conflict notice counts and Review Changes notes', () => {
                 formatTemplates: [],
                 appendedRows: [],
                 tailRemovals: [],
-                conflicts: [{ reason: 'structuralBasisChanged', pendingRowIds: [], tailRemovalIds: [] }],
+                conflicts: [conflict],
                 rowLayout: {
                     runs: [{ kind: 'source', start: 0, count: 4 }],
                     removedSourceRows: [{ start: 2, count: 1 }],
@@ -17921,14 +17928,21 @@ describe('structural conflict notice counts and Review Changes notes', () => {
         // Discard drops the removal; the layout afterwards is the source layout.
         expect(request!.before.layouts[0]!.rowLayout?.removedSourceRows).toEqual([{ start: 2, count: 1 }]);
         expect(request!.discard.layouts[0]!.rowLayout).toBeUndefined();
+        // Keep is offered only for a Structural Basis change.
+        expect(request!.keep !== undefined).toBe(reason === 'structuralBasisChanged');
         await dispatch_host_message({
             type: 'formulaImpact',
             requestId: request!.requestId,
             sourceGeneration: request!.sourceGeneration,
-            impacts: { keep: { ref: 0, moved: 12 }, discard: { ref: 4, moved: 12 } },
+            impacts: {
+                ...(reason === 'structuralBasisChanged' ? { keep: { ref: 0, moved: 12 } } : {}),
+                discard: { ref: 4, moved: 12 },
+            },
         });
         const notice = document.querySelector('[aria-label="Row and column changes that need review"]');
-        expect(notice?.textContent).toContain('Keep new rows at the end: 12 formulas will point at different rows.');
+        if (reason === 'structuralBasisChanged') {
+            expect(notice?.textContent).toContain('Keep new rows at the end: 12 formulas will point at different rows.');
+        }
         expect(notice?.textContent).toContain(
             'Discard row and column changes on Sales: 4 formulas will show #REF! and 12 will point at different rows.');
     });

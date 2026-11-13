@@ -8534,10 +8534,16 @@ export function App(): React.JSX.Element {
         return entries.length === 0 ? undefined : Object.fromEntries(entries);
     }, [live_rejected_keys, save_rejection]);
 
-    // Whether the active worksheet has a Structural Basis conflict, whose
-    // notice counts what each salvage action does to formulas.
-    const impact_basis_changed = edit_mode_on_active_sheet
-        && active_pending_conflicts.some((conflict) => conflict.reason === 'structuralBasisChanged');
+    // The active worksheet's structural conflict, whose notice counts what
+    // each salvage action does to formulas: Discard for either reason, Keep
+    // only for a Structural Basis change.
+    const impact_conflict = !edit_mode_on_active_sheet
+        ? undefined
+        : active_pending_conflicts.some((conflict) => conflict.reason === 'structuralBasisChanged')
+            ? 'structuralBasisChanged'
+            : active_pending_conflicts.some((conflict) => conflict.reason === 'unsupportedStructure')
+                ? 'unsupportedStructure'
+                : undefined;
     // What each salvage action would do to the workbook's formulas, counted
     // by the host before the user chooses.
     const formula_impact_states = useMemo((): {
@@ -8545,7 +8551,7 @@ export function App(): React.JSX.Element {
         readonly keep?: FormulaImpactState;
         readonly discard: FormulaImpactState;
     } | undefined => {
-        if (!impact_basis_changed || !meta || edit_syntax !== 'markdown'
+        if (impact_conflict === undefined || !meta || edit_syntax !== 'markdown'
             || formula_anchor_workbook === undefined) return undefined;
         const sheet = meta.sheets[active_sheet_index];
         if (sheet === undefined) return undefined;
@@ -8572,18 +8578,20 @@ export function App(): React.JSX.Element {
         try {
             const discard = discard_layout_changes(current, context);
             if (!discard.ok) return undefined;
-            const keep = keep_inserted_rows_at_end(current, context, Date.now() * 1_000);
+            const keep = impact_conflict === 'structuralBasisChanged'
+                ? keep_inserted_rows_at_end(current, context, Date.now() * 1_000)
+                : undefined;
             return {
                 before: state_for(),
                 discard: state_for(discard.outcome.next),
-                ...(keep.ok ? { keep: state_for(keep.outcome.next) } : {}),
+                ...(keep?.ok ? { keep: state_for(keep.outcome.next) } : {}),
             };
         } catch {
             return undefined;
         }
     },
         // eslint-disable-next-line react-hooks/exhaustive-deps
-        [impact_basis_changed, formula_calculation_edit_signature, active_sheet_index, meta,
+        [impact_conflict, formula_calculation_edit_signature, active_sheet_index, meta,
             edit_syntax, formula_anchor_workbook],
     );
     const [formula_impacts, set_formula_impacts] = useState<{
