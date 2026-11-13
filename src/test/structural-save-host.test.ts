@@ -123,6 +123,8 @@ async function open_viewer(options: {
     readonly path?: string;
     readonly requestEdit?: boolean;
     readonly structuralSaveLeaseMs?: number;
+    /** Runs before every durable state read, so a test can pause one. */
+    readonly beforeRead?: () => Promise<void>;
 }) {
     options.disk.install();
     const path = options.path ?? FILE;
@@ -130,7 +132,15 @@ async function open_viewer(options: {
     const controller = attach_viewer(
         panel as unknown as Parameters<typeof attach_viewer>[0],
         vscode_mock.Uri.file(path) as unknown as vscode.Uri,
-        with_in_memory_authority_transactions(options.state.store),
+        with_in_memory_authority_transactions(options.beforeRead === undefined
+            ? options.state.store
+            : {
+                ...options.state.store,
+                read: async (file_path) => {
+                    await options.beforeRead!();
+                    return options.state.store.read(file_path);
+                },
+            }),
         csv_table_profile(),
         fake_viewer_host,
         {
@@ -814,6 +824,50 @@ describe('rekey intent ownership across processes', () => {
         expect((state.get_state(FILE) as PerFileState).pendingEdits?.[0]?.cells)
             .toEqual({ '0:0': { value: 'first', base: 'a' } });
         await viewer.dispose();
+    });
+
+    it('leaves no cleanup tombstone for a save closed while its refused payload write was pending', async () => {
+        // The foreign save's accepted payload holds an edit this window's save
+        // also carries, value for value: a tombstone for our never-persisted
+        // save would strip it during failed-save cleanup.
+        const drive = disk(BYTES);
+        const state = store_with({ pendingEdits: slot(REMOVAL) });
+        let pause_next_read = false;
+        let paused = false;
+        let release_read!: () => void;
+        const viewer = await open_viewer({
+            state,
+            disk: drive,
+            // Pause the payload compare-and-set's state read.
+            beforeRead: async () => {
+                if (!pause_next_read) return;
+                pause_next_read = false;
+                paused = true;
+                await new Promise<void>((resolve) => { release_read = resolve; });
+            },
+        });
+        const shared = { '0:0': { value: 'shared', base: 'a' } };
+        const foreign_payload = slot({ ...REMOVAL, cells: shared });
+        const current = state.get_state(FILE) as PerFileState;
+        await state.store.compare_and_set(FILE, state.revision(FILE), {
+            ...current,
+            pendingEdits: foreign_payload,
+            structuralRekeyIntent: owned(Date.now() + 60_000),
+        });
+        pause_next_read = true;
+        void viewer.send_save(REMOVAL, shared);
+        await vi.waitFor(() => expect(paused).toBe(true));
+        // Close the viewer while the read is pending: the release decides
+        // whether this save left a tombstone.
+        viewer.panel.dispose();
+        release_read();
+        await viewer.controller.drain();
+        await vi.waitFor(() => expect((state.get_state(FILE) as PerFileState).pendingEdits).toEqual(foreign_payload));
+        // A fresh window's cleanup finds nothing of ours to strip.
+        simulate_process_restart_for_tests();
+        const reopened = await open_viewer({ state, disk: drive, requestEdit: false });
+        expect((state.get_state(FILE) as PerFileState).pendingEdits?.[0]?.cells).toEqual(shared);
+        await reopened.dispose();
     });
 
     it('rechecks a lapsing lease without refreshing while the owner keeps it alive', async () => {

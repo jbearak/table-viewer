@@ -9887,11 +9887,20 @@ export function attach_viewer(
             });
             return { ...current, pendingEdits: pending };
         }, undefined, () => save_operation_is_current(operation));
-        if (blocked_by !== undefined) {
-            // Nothing was written; the recorded target was never persisted.
+        if (committed === undefined) {
+            // Nothing was written: refused before the updater ran, a no-op
+            // (another save's intent, a dropped layout, unauthenticated
+            // conflicts). The target was recorded before the compare-and-set
+            // so a release landing during it could tombstone this save; with
+            // nothing persisted there is nothing to undo, and a tombstone would
+            // strip matching cells from whatever payload is stored, such as
+            // another save's accepted edits. Retract both.
             persisted_save_targets.delete(operation.identity);
-            return blocked_by;
+            if (file_edit_state?.failedSaveTombstone === operation.identity) {
+                file_edit_state.failedSaveTombstone = undefined;
+            }
         }
+        if (blocked_by !== undefined) return blocked_by;
         if (drops_stored_layout) {
             throw new Error('Reload this window to keep editing this file.');
         }
