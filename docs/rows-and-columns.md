@@ -1,6 +1,6 @@
 # Inserting, deleting, and moving rows and columns
 
-In Edit mode you can insert, delete, restore, and move rows and columns in `.xlsx`, CSV, and TSV files. Nothing changes on disk until you save. Until then the grid shows the file as it will look after the save: new rows and columns are tinted green, deleted ones red, and moved ones purple.
+In Edit mode you can insert, delete, restore, and move rows and columns in `.xlsx`, CSV, and TSV files. Nothing changes on disk until you save. Until then the grid shows rows and columns in the order the save will write, unless a sort or filter is active, which changes only the view. New rows and columns are tinted green and moved ones purple. Rows and columns you delete stay where they were, tinted red, until the save removes them.
 
 These actions are not available for `.xls`, `.dta`, or Parquet files, in a comparison, in a synchronized preview, or in a CSV or TSV file that opened with only its first rows loaded.
 
