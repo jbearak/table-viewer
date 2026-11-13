@@ -10266,6 +10266,8 @@ export function attach_viewer(
         let rekey_intent: StructuralRekeyIntent | undefined;
         let write_attempted = false;
         let write_completed = false;
+        /** A failed write's own recovery already applied the intent. */
+        let structural_write_applied = false;
         let stop_lease_renewal: (() => void) | undefined;
         const settle_pre_write_intent = async (): Promise<void> => {
             if (rekey_intent === undefined) return;
@@ -10532,13 +10534,17 @@ export function attach_viewer(
                 await host.fs.write_file(uri, saved_bytes);
             } catch (error) {
                 // The write may have landed before it failed. If the file now
-                // has the saved bytes, recovery applied the intent: report the
-                // save as the success it was (the catch below sees the intent
-                // settled and falls through to the success tail).
+                // has the saved bytes, recovery applied the intent here: the
+                // rekey is committed and the intent cleared. Record that, so the
+                // catch below reports the save as the success it was without
+                // resolving it a second time.
                 if (
                     rekey_intent !== undefined
                     && await settle_failed_structural_write(rekey_intent, src.meta().sheets) === 'applied'
-                ) write_completed = true;
+                ) {
+                    write_completed = true;
+                    structural_write_applied = true;
+                }
                 throw error;
             }
             write_completed = true;
@@ -10719,7 +10725,9 @@ export function attach_viewer(
                 // recovery applies it now. Once it has, the save succeeded: the
                 // renderer must get the receipt and install the barrier, not
                 // restore the written layout as still pending.
-                if (write_completed) {
+                if (structural_write_applied) {
+                    recovered_after_write = true;
+                } else if (write_completed) {
                     recovered_after_write = await resolve_stored_rekey_intent(
                         rekey_intent,
                         disposed ? undefined : src.meta().sheets,

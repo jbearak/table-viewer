@@ -976,6 +976,30 @@ describe('recovery after the write', () => {
         await viewer.dispose();
     });
 
+    it('reports the success once even when a second resolution would fail', async () => {
+        const drive = disk(BYTES);
+        const state = store_with({ pendingEdits: slot(REMOVAL) });
+        const viewer = await open_viewer({ state, disk: drive });
+        drive.file.write = async (content) => {
+            drive.file.bytes = content;
+            drive.file.mtime += 1;
+            // The failed write's recovery reads the file once and applies the
+            // intent. Any later read fails, as a second resolution would.
+            let reads = 0;
+            vscode_mock.__setReadFileImplementation(async () => {
+                reads += 1;
+                if (reads > 1) throw new Error('EIO on reread');
+                return drive.file.bytes;
+            });
+            throw new Error('EIO after write');
+        };
+        const result = await viewer.save(REMOVAL);
+        expect(result).toMatchObject({ success: true, receipt: { structure: [{ removedRows: [{ start: 1, count: 1 }] }] } });
+        expect(viewer.durable().structuralRekeyIntent).toBeUndefined();
+        expect(viewer.durable().cellHighlights?.sheets[0]?.cells).toEqual({ '0:0': 'yellow', '1:0': 'blue' });
+        await viewer.dispose();
+    });
+
     it('re-reads the file and leaves the intent unresolved when it changed again', async () => {
         const drive = disk(BYTES);
         const state = store_with({ pendingEdits: slot(REMOVAL) });
