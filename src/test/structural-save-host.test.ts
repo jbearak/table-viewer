@@ -241,6 +241,20 @@ describe('saving a row removal', () => {
             'Saving inserted, deleted, or moved rows and columns is not available in this version.');
         expect(write).not.toHaveBeenCalled();
         await off.dispose();
+
+        // The `.xlsx` gate is the file format's, not the planner's: a CSV
+        // planner seam behind an `.xlsx` path still refuses until step 9.
+        const xlsx = await open_viewer({
+            state: versioned_state_store({ pendingEdits: slot(REMOVAL) }),
+            disk: disk(BYTES),
+            path: '/tmp/structural-save-host.xlsx',
+        });
+        expect(xlsx.session()).toMatchObject({ granted: true });
+        expect(await xlsx.save(REMOVAL)).toMatchObject({ success: false });
+        expect(xlsx.warning).toHaveBeenCalledWith(
+            'Saving inserted, deleted, or moved rows and columns is not available yet.');
+        expect(write).not.toHaveBeenCalled();
+        await xlsx.dispose();
     });
 
     it('refuses a save whose Structural Basis no longer matches the verified file', async () => {

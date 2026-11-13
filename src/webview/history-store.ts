@@ -27,6 +27,7 @@ import {
     record_history_action,
     rekey_saved_appended_row_history,
     rekey_committed_tail_removal_history,
+    install_structural_save_barrier,
     type CommitOutcome,
     type HistoryAction,
     type HistoryActionSource,
@@ -138,6 +139,11 @@ export interface HistoryStore {
      * through a worksheet identity that happens to match.
      */
     clear(): void;
+    /**
+     * Install the workbook-wide `structural-save` barrier after a save that
+     * inserted, deleted, or moved rows or columns. History before it is gone.
+     */
+    install_structural_save_barrier(): void;
 }
 
 export function create_history_store(initial?: HistoryStackState): HistoryStore {
@@ -220,6 +226,11 @@ export function create_history_store(initial?: HistoryStackState): HistoryStore 
                     hardMaxBytes: bounds.hardMaxBytes,
                 }
                 : { kind: 'rekeyed', changed: true };
+        },
+
+        install_structural_save_barrier: () => {
+            state = install_structural_save_barrier(state);
+            notify();
         },
 
         clear: () => {

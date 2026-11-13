@@ -24,6 +24,7 @@ import {
     type StructuralBasis,
 } from './pending-changes';
 import {
+    append_source_rows_to_layout,
     column_save_map,
     row_save_map,
     source_row_layout,
@@ -198,37 +199,8 @@ export function delimited_records_of(bytes: Uint8Array, delimiter: ',' | '\t'): 
     };
 }
 
-/**
- * Join `[old_count, new_count)` to a row layout as one source run placed right
- * after the run holding the highest-numbered old source row, wherever a move
- * left it. Rows appended on disk thus land after every old body row of that
- * run and before the append band, which is outside the layout.
- */
-export function rebase_row_layout_on_growth(
-    layout: RowLayout,
-    body_start: number,
-    old_count: number,
-    new_count: number,
-): RowLayout {
-    if (new_count <= old_count) return layout;
-    const added = { kind: 'source' as const, start: old_count, count: new_count - old_count };
-    const highest = old_count - 1;
-    const index = highest < body_start
-        ? -1
-        : layout.runs.findIndex((run) =>
-            run.kind === 'source' && highest >= run.start && highest < run.start + run.count);
-    const runs = [...layout.runs];
-    if (index < 0) {
-        // A header-only body: the new rows are the whole body.
-        runs.unshift(added);
-    } else {
-        // The run holding the highest old row ends at the old body's end, so
-        // the new rows extend it in place, keeping the runs canonical.
-        const run = runs[index] as Extract<RowLayout['runs'][number], { kind: 'source' }>;
-        runs[index] = { kind: 'source', start: run.start, count: run.count + added.count };
-    }
-    return Object.freeze({ ...layout, runs: Object.freeze(runs) });
-}
+/** Rows appended on disk join a layout the way saved appends do. */
+export const rebase_row_layout_on_growth = append_source_rows_to_layout;
 
 // ---------------------------------------------------------------------------
 // Receipt

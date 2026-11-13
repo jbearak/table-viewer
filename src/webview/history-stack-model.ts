@@ -22,7 +22,7 @@ import {
     type StructuralBasis,
     pending_rows,
 } from '../pending-changes';
-import type { ColumnLayout, RowLayout } from '../worksheet-layout';
+import { append_source_rows_to_layout, type ColumnLayout, type RowLayout } from '../worksheet-layout';
 import {
     worksheet_target_key,
     type CellHighlightColor,
@@ -239,7 +239,12 @@ export interface HistoryEntry extends MeasuredAction {
  * why rather than silently do nothing.
  */
 export interface HistoryBarrier {
-    readonly reason: 'action-too-large';
+    /**
+     * `action-too-large`: the gesture could not be recorded. `structural-save`:
+     * a save wrote a row or column layout change, after which every recorded
+     * source coordinate in the workbook may name different content.
+     */
+    readonly reason: 'action-too-large' | 'structural-save';
     /**
      * The gesture that forced it, for the message. Truncated to
      * `MAX_BARRIER_LABEL_LENGTH`: a label can be built from data, and retaining an
@@ -1288,9 +1293,33 @@ function rekey_change_provenance(
             };
         case 'highlight':
             return change;
-        // A save that writes a layout change installs a history barrier, so a
-        // layout arm only meets append-only saves, which move no source row.
-        case 'rowLayout':
+        // A save that writes a layout change installs the `structural-save`
+        // barrier, so a layout arm only meets append-only saves. Those move no
+        // source row, but they do turn the worksheet's saved appended rows
+        // into source rows the recorded layouts do not cover yet. They join
+        // each recorded row layout as one source run after the run holding
+        // the highest old row, exactly as rows appended on disk do, so a
+        // replayed arm still covers the whole body. The arm keeps its
+        // recorded Structural Basis: replaying one that reinstates a live
+        // layout change meets the host's basis check against the saved file
+        // and is refused as a conflict rather than applied to bytes it was
+        // not authored against. Column layouts are untouched: appending never
+        // adds a column.
+        case 'rowLayout': {
+            const saved_rows = [...assignments.values()]
+                .filter((assignment) => worksheet_target_key(assignment.worksheet) === worksheet_target_key(worksheet))
+                .map((assignment) => assignment.sourceRow);
+            if (saved_rows.length === 0) return change;
+            const first = Math.min(...saved_rows);
+            const end = Math.max(...saved_rows) + 1;
+            const rebase = (layout: RowLayout | null) => layout === null
+                ? null
+                : append_source_rows_to_layout(layout, 0, first, end);
+            return {
+                ...change,
+                delta: { ...change.delta, before: rebase(change.delta.before), after: rebase(change.delta.after) },
+            };
+        }
         case 'columnLayout':
             return change;
     }
@@ -2426,6 +2455,26 @@ function with_stacks(
     return direction === 'undo'
         ? { ...state, undoStack: from, redoStack: to }
         : { ...state, undoStack: to, redoStack: from };
+}
+
+/** What Undo says when it reaches the `structural-save` barrier. */
+export const STRUCTURAL_SAVE_BARRIER_MESSAGE =
+    "Can't undo past a save that inserted, deleted, or moved rows or columns.";
+
+/**
+ * Install the workbook-wide `structural-save` barrier: every recorded action
+ * is discarded, because a save that inserted, deleted, or moved rows or
+ * columns renumbered the source coordinates they name. Cross-save undo of
+ * structural changes is out of scope (design "History"). The epoch advances,
+ * so a replay in flight across the save cannot be readmitted.
+ */
+export function install_structural_save_barrier(state: HistoryStackState): HistoryStackState {
+    return {
+        undoStack: [],
+        redoStack: [],
+        barrier: { reason: 'structural-save', label: 'Save' },
+        epoch: state.epoch + 1,
+    };
 }
 
 /**

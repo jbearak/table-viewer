@@ -1048,6 +1048,40 @@ function freeze_row_layout(
     });
 }
 
+/**
+ * Join new source rows `[old_count, new_count)` to a row layout as one source
+ * run placed right after the run holding the highest-numbered old source row,
+ * wherever a move left it, and before the append band, which is outside the
+ * layout. Used when rows are appended on disk under a layout (design
+ * "External changes") and when an append-only save turns Pending Appended
+ * Rows into source rows under a layout that history still records.
+ */
+export function append_source_rows_to_layout(
+    layout: RowLayout,
+    body_start: number,
+    old_count: number,
+    new_count: number,
+): RowLayout {
+    if (new_count <= old_count) return layout;
+    const added = { kind: 'source' as const, start: old_count, count: new_count - old_count };
+    const highest = old_count - 1;
+    const index = highest < body_start
+        ? -1
+        : layout.runs.findIndex((run) =>
+            run.kind === 'source' && highest >= run.start && highest < run.start + run.count);
+    const runs = [...layout.runs];
+    if (index < 0) {
+        // A header-only body: the new rows are the whole body.
+        runs.unshift(added);
+    } else {
+        // The run holding the highest old row ends at the old body's end, so
+        // the new rows extend it in place, keeping the runs canonical.
+        const run = runs[index] as Extract<RowLayoutRun, { kind: 'source' }>;
+        runs[index] = { kind: 'source', start: run.start, count: run.count + added.count };
+    }
+    return Object.freeze({ ...layout, runs: Object.freeze(runs) });
+}
+
 /** The source layout of a body: one source run covering it, or none for a header-only sheet. */
 export function source_row_layout(body_start: number, body_row_count: number): RowLayout {
     return freeze_row_layout(
