@@ -82,7 +82,8 @@ import {
 import { cell_edit_base } from './cell-edit-model';
 import { get_raw_cell_text } from './cell-display';
 import { cell_key, parse_cell_key } from './cell-key';
-import type { CellHyperlink, RichText } from './cell-content';
+import type { CellHyperlink, RichText, RichTextRun } from './cell-content';
+import { xlsx_edit_writes_formula } from './xlsx-cell-value';
 import { committed_column_name, normalized_column_name } from './column-name';
 import type { XlsxHyperlinkEdit } from './xlsx-hyperlink-write';
 import type {
@@ -1133,8 +1134,12 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
         worksheet_operation_index: number,
         structural: PendingStructuralChanges,
         cell: NonNullable<PendingStructuralConflict['formulaCells']>[number] | undefined,
+        runs: readonly RichTextRun[] | undefined,
     ): string => {
-        if (anchors === undefined && !(structural_save && value.startsWith('='))) return value;
+        // The writer's own decision: a value with runs is literal text, even
+        // when it starts with `=`, so it is never rendered.
+        if (!xlsx_edit_writes_formula(value, runs !== undefined && runs.length > 0 ? runs : undefined)) return value;
+        if (anchors === undefined && !structural_save) return value;
         let rendered: ReturnType<typeof render_formula> | undefined;
         try {
             rendered = render_formula(value, anchors, formula_anchor_context(anchor_workbook, sheet_index));
@@ -1378,6 +1383,7 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
                         worksheet_operation_index,
                         structural,
                         { rowIdentity: { kind: 'source', sourceRow: row }, sourceColumn: col },
+                        runs,
                     ),
                 ...(header_edit ? { force_text: true } : {}),
                 ...(!header_edit && runs && runs.length > 0 ? { runs } : {}),
@@ -1466,6 +1472,7 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
                             worksheet_operation_index,
                             structural,
                             { rowIdentity: { kind: 'pending', pendingRowId: row.id }, sourceColumn: column },
+                            pending_cell.valueRuns?.runs,
                         ),
                         ...(pending_cell.valueRuns?.runs.length ? { runs: pending_cell.valueRuns.runs } : {}),
                         ...(pending_cell.valueEditOrder === undefined
@@ -1533,6 +1540,7 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
                         worksheet_operation_index,
                         structural,
                         { rowIdentity: { kind: 'pending', pendingRowId: row.id }, sourceColumn: column },
+                        pending_cell.valueRuns?.runs,
                     ),
                     ...(pending_cell.valueRuns?.runs.length
                         ? { runs: pending_cell.valueRuns.runs }
@@ -1603,6 +1611,7 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
                             worksheet_operation_index,
                             structural,
                             undefined,
+                            pending_cell.valueRuns?.runs,
                         ),
                         ...(pending_cell.valueRuns?.runs.length ? { runs: pending_cell.valueRuns.runs } : {}),
                         ...(pending_cell.valueEditOrder === undefined
@@ -1778,9 +1787,6 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
         // worksheet that may read one, and the writer adds what the edits
         // invalidate, all in prospective coordinates. The edits still meet
         // the workbook's formula safety limits.
-        if (too_many_calculation_edits) {
-            throw new Error('Workbook would contain too many formulas to save safely.');
-        }
         // The edits are addressed in prospective coordinates, so the source
         // formulas they may overwrite are too: each restructured worksheet's
         // formulas where the layout puts them, without those it removes.
@@ -2731,6 +2737,21 @@ export function csv_table_profile(config?: ConfigPort): ViewerProfile {
 
 /** The row ceiling an append must respect for this profile's format.
  *  Workbook formats keep `MAX_SHEET_ROWS`; delimited formats have none. */
+/**
+ * How many rows a worksheet with a row layout would have: the rows above its
+ * body, the layout's live rows (source rows less removals, plus live Pending
+ * Inserted Rows), and `band` appended rows. Insert admission and publication
+ * check the row ceiling against this one count, so a publication never refuses
+ * what admission granted.
+ */
+function layout_row_count(sheet: SheetMeta, row_layout: RowLayout, band: number): number {
+    const header = sheet.excelFirstRowHeader;
+    const body_start = header?.active === true && header.sourceRow !== undefined
+        ? header.sourceRow + 1
+        : 0;
+    return body_start + index_row_layout(row_layout).liveCount + band;
+}
+
 export function append_row_ceiling_for(profile: ViewerProfile): number {
     return profile.append_row_ceiling ?? MAX_SHEET_ROWS;
 }
@@ -10201,10 +10222,7 @@ export function attach_viewer(
         for (const [id] of ledger.reservedRowIds) {
             if (!ledger.insertMintedRowIds.has(id)) reserved_band.add(id);
         }
-        const prospective_rows = body_start
-            + index_row_layout(row_layout).liveCount
-            + reserved_band.size
-            + message.count;
+        const prospective_rows = layout_row_count(sheet, row_layout, reserved_band.size + message.count);
         const row_ceiling = append_row_ceiling_for(profile);
         if (prospective_rows > row_ceiling) {
             await refuse(`Can't insert rows here: the sheet would have more than ${row_ceiling.toLocaleString('en-US')} rows.`);
@@ -15992,10 +16010,17 @@ export function attach_viewer(
                     // Start from the authenticated durable diagnostics, never the
                     // renderer's desired array. Formula diagnostics are derived
                     // afresh below. Other diagnostics survive only for structural
-                    // identities the prospective state still contains.
+                    // identities the prospective state still contains. A
+                    // worksheet-level `unsupportedStructure` refusal names none;
+                    // it stays while the sheet has a live layout change, the
+                    // rule `conflicts_after_publication` applies.
+                    const live_layout = has_live_layout_change(structural);
                     const retained_conflicts = durable_structural.conflicts.flatMap(
                         (conflict): PendingStructuralConflict[] => {
                             if (conflict.reason === 'ambiguousPendingFormula') return [];
+                            if (conflict.reason === 'unsupportedStructure') {
+                                return live_layout ? [conflict] : [];
+                            }
                             const pendingRowIds = conflict.pendingRowIds.filter(
                                 (id) => pending_ids.has(id),
                             );
@@ -16366,11 +16391,14 @@ export function attach_viewer(
                             !== worksheet_append_schema_fingerprint(sheet)
                     )
                 ) return false;
+                // With a row layout, the rows it keeps live plus the append
+                // band, the count insert admission granted against.
+                const prospective_rows = desired.rowLayout === undefined
+                    ? sheet.sourceRowCount - desired.tailRemovals.length + pending_rows(desired).length
+                    : layout_row_count(sheet, desired.rowLayout, appended_rows(desired).length);
                 if (
                     sheet.sourceRowCount - desired.tailRemovals.length < 0
-                    || sheet.sourceRowCount - desired.tailRemovals.length
-                        + pending_rows(desired).length
-                        > append_row_ceiling_for(profile)
+                    || prospective_rows > append_row_ceiling_for(profile)
                 ) return false;
                 const retained_row_count = sheet.sourceRowCount
                     - desired.tailRemovals.length;

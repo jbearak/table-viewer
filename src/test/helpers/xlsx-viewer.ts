@@ -78,6 +78,11 @@ export interface OpenXlsx {
         structural?: Partial<WorksheetPendingEdits>;
         cells?: Record<string, { value: string; base: string }>;
     }[]): Promise<{ success: boolean; receipt?: Record<string, unknown>; rejection?: Record<string, unknown> }>;
+    /**
+     * Prepare and commit one history replay of cell overlays on sheet 0; the
+     * committed message, or undefined when the host refused it.
+     */
+    replay(id: string, cells: readonly unknown[]): Promise<Record<string, unknown> | undefined>;
 }
 
 export async function open_xlsx(
@@ -88,6 +93,8 @@ export async function open_xlsx(
         readonly disk?: ReturnType<typeof disk>;
         /** Defaults to on. */
         readonly structuralEditingEnabled?: boolean;
+        /** Defaults to the `.xlsx` profile. */
+        readonly profile?: ReturnType<typeof profile_for>;
     } = {},
 ): Promise<OpenXlsx & { readonly store: ReturnType<typeof versioned_state_store> }> {
     const file = options.disk ?? disk(bytes);
@@ -97,7 +104,7 @@ export async function open_xlsx(
         panel as unknown as Parameters<typeof attach_viewer>[0],
         vscode_mock.Uri.file(FILE) as unknown as vscode.Uri,
         with_in_memory_authority_transactions(state.store),
-        profile_for(FILE),
+        options.profile ?? profile_for(FILE),
         fake_viewer_host,
         { structuralEditingEnabled: options.structuralEditingEnabled ?? true },
     );
@@ -221,6 +228,43 @@ export async function open_xlsx(
                     ?.operation?.saveRequestId === save_request_id);
             if (result === undefined) throw new Error(`No saveResult arrived for ${save_request_id}.`);
             return result as never;
+        },
+        async replay(id, cells) {
+            const worksheet = { sheetIndex: 0, sheetName: sheet_name(0) };
+            const latest = last<{ snapshot: { identity: unknown } }>('workbookSnapshot');
+            await panel.__receive({ type: 'snapshotApplied', identity: latest.snapshot.identity, disposition: 'applied' });
+            await panel.__receive({
+                type: 'prepareHistoryReplay',
+                request: {
+                    requestId: `${id}-prepare`,
+                    replayId: id,
+                    cells,
+                    highlights: [],
+                    structures: [],
+                    focus: { worksheet, sourceRowStart: 0, sourceRowEnd: 0, sourceColumnStart: 0, sourceColumnEnd: 0 },
+                },
+            });
+            await controller.drain();
+            const prepared = (messages().find((message) => message.type === 'historyReplayPrepared'
+                && (message as { prepared?: { replayId?: string } }).prepared?.replayId === id) as {
+                prepared?: { requestId: string; replayId: string; leaseId: string };
+            } | undefined)?.prepared;
+            if (prepared === undefined) return undefined;
+            await panel.__receive({
+                type: 'commitHistoryReplay',
+                request: {
+                    requestId: prepared.requestId,
+                    replayId: prepared.replayId,
+                    leaseId: prepared.leaseId,
+                    mutationId: `${id}-mutation`,
+                    cells: cells.map((_cell, ordinal) => ({ ordinal, entry: null })),
+                    highlights: [],
+                    structures: [],
+                },
+            });
+            await controller.drain();
+            return messages().find((message) => message.type === 'historyReplayCommitted'
+                && (message as { committed?: { replayId?: string } }).committed?.replayId === id);
         },
     };
 }

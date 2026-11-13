@@ -790,6 +790,24 @@ describe('layout history arms', () => {
         expect(replay(insert_action, 'undo', inserted.next)).toEqual(own_pending_structural_changes(state([])));
     });
 
+    it('keeps a refused save while a live layout change remains, the host replay rule', () => {
+        const refusal = {
+            reason: 'unsupportedStructure' as const,
+            pendingRowIds: [],
+            tailRemovalIds: [],
+            message: "Can't insert, delete, or move rows on this sheet: it contains an Excel table.",
+        };
+        const refused = (changes: PendingStructuralChanges) => ({ ...changes, conflicts: [refusal] });
+        const first = planned(delete_rows(state([]), structure_context(), [{ kind: 'source', sourceRow: 2 }]));
+        const second = planned(delete_rows(first.next, structure_context(), [{ kind: 'source', sourceRow: 3 }]));
+        const first_action = recorded({ label: 'Delete row', changes: [first.change] });
+        const second_action = recorded({ label: 'Delete row', changes: [second.change] });
+        // Row 2's delete is still pending, so the refusal stands.
+        expect(replay(second_action, 'undo', refused(second.next))?.conflicts).toEqual([refusal]);
+        // Undoing the only layout change answers it.
+        expect(replay(first_action, 'undo', refused(first.next))?.conflicts).toEqual([]);
+    });
+
     it('undoes a column delete with the Pending Row cells it dropped and its cell deltas', () => {
         const start = state([row('x', 1, 'kept')]);
         const with_cells: PendingStructuralChanges = {

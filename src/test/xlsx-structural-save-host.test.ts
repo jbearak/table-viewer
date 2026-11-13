@@ -27,6 +27,8 @@ import { ZipPackage } from '../zip-package';
 import { build_fixture_xlsx, cell, representative_workbook, row } from './helpers/xlsx-structure-fixture';
 import { FILE, open_xlsx, part_text, with_parts, type OpenXlsx } from './helpers/xlsx-viewer';
 import * as vscode_mock from './mocks/vscode';
+import { history_value, value_only_overlay } from '../webview/history-cell-state-model';
+import { wire_overlay_from_cell_overlay_state } from '../webview/history-replay-wire-model';
 
 afterEach(() => {
     for (const panel of vscode_mock.__getPanels()) panel.dispose();
@@ -321,6 +323,48 @@ describe('the per-part Structural Basis', () => {
     });
 });
 
+describe('the worksheet row ceiling', () => {
+    it('publishes an insert that replaces a deleted row on a sheet at the ceiling', async () => {
+        // Seven rows (the Header Row and six body rows) on a seven-row sheet.
+        const viewer = await open_xlsx(representative_workbook(), {
+            state: HEADER_ON,
+            profile: { ...profile_for(FILE), append_row_ceiling: 7 },
+        });
+        const changes = removal(viewer);
+        expect(await viewer.publish(0, changes)).toBe(true);
+        // Admission counts the live layout rows, so the deleted row makes room.
+        const insert = await viewer.insert({ requestId: 'insert', anchor: 4, side: 'after' });
+        expect(insert).toMatchObject({ granted: true });
+        await viewer.settle('insert', true);
+        const insert_id = insert.rowIds![0]!;
+        // Publication counts them the same way.
+        expect(await viewer.publish(0, {
+            ...changes,
+            formatTemplates: [insert.formatTemplate!],
+            appendedRows: [{
+                id: insert_id,
+                origin: 'insert',
+                cells: { 0: { value: 'Grape' } },
+                formatTemplateId: insert.formatTemplate!.id,
+                createdOrder: 1,
+            }],
+            appendBasis: insert.appendBasis!,
+            rowLayout: {
+                runs: [
+                    { kind: 'source', start: 1, count: 4 },
+                    { kind: 'pending', ids: [insert_id] },
+                    { kind: 'source', start: 5, count: 2 },
+                ],
+                removedSourceRows: [{ start: 2, count: 1 }],
+                discardedPendingRows: [],
+            },
+        })).toBe(true);
+        expect(viewer.durable().pendingEdits?.[0]?.appendedRows?.map((row) => row.id)).toEqual([insert_id]);
+        // A second insert would exceed it.
+        expect(await viewer.insert({ requestId: 'over', anchor: 4, side: 'after' })).toMatchObject({ granted: false });
+    });
+});
+
 describe('structural save refusals', () => {
     async function refused_save(viewer: OpenXlsx, structural: Partial<WorksheetPendingEdits>) {
         const result = await viewer.save([{ sheetIndex: 0, structural }]);
@@ -361,6 +405,44 @@ describe('structural save refusals', () => {
         // Discarding the layout answers it.
         expect(await viewer.publish(0, { conflicts: [] })).toBe(true);
         expect(viewer.durable().pendingEdits?.[0]?.conflicts ?? []).toEqual([]);
+    });
+
+    it('keeps the refusal when an unrelated cell edit is undone', async () => {
+        const raw = representative_workbook();
+        const viewer = await open_xlsx(raw, {
+            state: { ...HEADER_ON, pendingEdits: [{ sheetName: 'Data', cells: { '3:1': { value: '70', base: '7' } } }] },
+        });
+        expect(viewer.durable().pendingEdits?.[0]?.cells).toEqual({ '3:1': { value: '70', base: '7' } });
+        const changes = removal(viewer);
+        expect(await viewer.publish(0, { ...changes, cells: { '3:1': { value: '70', base: '7' } } })).toBe(true);
+        expect(viewer.durable().pendingEdits?.[0]?.cells).toEqual({ '3:1': { value: '70', base: '7' } });
+        const rels = part_text(raw, 'xl/worksheets/_rels/sheet1.xml.rels')!.replace(
+            '</Relationships>',
+            '<Relationship Id="rId9" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/table" Target="../tables/table1.xml"/></Relationships>',
+        );
+        await viewer.change(with_parts(raw, {
+            'xl/worksheets/_rels/sheet1.xml.rels': rels,
+            'xl/tables/table1.xml': '<table xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" id="1" name="T" displayName="T" ref="A1:D7"/>',
+        }));
+        const result = await viewer.save([{ sheetIndex: 0, structural: changes, cells: { '3:1': { value: '70', base: '7' } } }]);
+        expect(result).toMatchObject({ success: false, rejection: { structuralReason: 'unsupportedStructure' } });
+        const message = (result.rejection as { message: string }).message;
+        expect(viewer.durable().pendingEdits?.[0]?.cells).toEqual({ '3:1': { value: '70', base: '7' } });
+        const conflict = { reason: 'unsupportedStructure' as const, pendingRowIds: [], tailRemovalIds: [], message };
+        expect(viewer.durable().pendingEdits?.[0]?.conflicts).toEqual([conflict]);
+        // Undo the cell edit; the removal is still pending, so its refusal stays.
+        const committed = await viewer.replay('undo-cell', [{
+            ordinal: 0,
+            worksheet: { sheetIndex: 0, sheetName: 'Data' },
+            sourceRow: 3,
+            sourceColumn: 1,
+            overlay: wire_overlay_from_cell_overlay_state(value_only_overlay(history_value('70'), history_value('7'))),
+        }]);
+        expect(committed).toBeDefined();
+        expect(viewer.durable().pendingEdits?.[0]?.cells ?? {}).toEqual({});
+        expect(viewer.durable().pendingEdits?.[0]?.conflicts).toEqual([conflict]);
+        // No host-derived conflict transition tells the renderer to drop it.
+        expect((committed as { committed: { structures?: unknown[] } }).committed.structures ?? []).toEqual([]);
     });
 
     it('refuses a formula on another worksheet that cannot be adjusted, naming it', async () => {
@@ -780,4 +862,38 @@ describe('publishing inserted .xlsx rows', () => {
             structuralBasis: viewer.basis(0),
         })).toBe(true);
     });
+});
+
+describe('styled text and plain values in a structural save', () => {
+    it('writes styled text that starts with = as text, never rendered as a formula', async () => {
+        const viewer = await open_xlsx(representative_workbook(), { state: HEADER_ON });
+        // Fig's name (A7, row 6 after Banana is removed) as bold text that
+        // reads like a spill reference no layout can adjust: the writer
+        // stores runs as literal text, so the save must neither render nor
+        // refuse it.
+        const runs = [{ text: '=SUM(A2#)', style: { bold: true } }];
+        const result = await viewer.save([{
+            sheetIndex: 0,
+            structural: removal(viewer),
+            cells: { '6:0': { value: '=SUM(A2#)', base: 'Fig', valueRuns: { runs } } as never },
+        }]);
+        expect(result.rejection).toBeUndefined();
+        expect(result).toMatchObject({ success: true });
+        const a6 = /<c r="A6"[^>]*>(.*?)<\/c>/.exec(part_text(viewer.file.bytes, 'xl/worksheets/sheet1.xml')!)![1]!;
+        expect(a6).not.toContain('<f>');
+        expect(a6).toContain('=SUM(A2#)');
+    });
+
+    it('accepts more than 100,000 plain-value edits, as a save without a layout change does', async () => {
+        const rows = Array.from({ length: 100_002 }, (_, index) => row(index + 1, [cell(`A${index + 1}`, index)]));
+        const raw = build_fixture_xlsx({ sheets: [{ name: 'Data', body: `<sheetData>${rows.join('')}</sheetData>` }] });
+        const edits = Object.fromEntries(Array.from({ length: 100_002 }, (_, index) => [`${index}:0`, 'x']));
+        await expect(plan_directly(raw, {}, {
+            rowLayout: {
+                runs: [{ kind: 'source', start: 100_001, count: 1 }, { kind: 'source', start: 0, count: 100_001 }],
+                removedSourceRows: [],
+                discardedPendingRows: [],
+            },
+        }, edits)).resolves.toBeDefined();
+    }, 60_000);
 });
