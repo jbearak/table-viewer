@@ -82,7 +82,13 @@ export interface OpenXlsx {
 
 export async function open_xlsx(
     bytes: Uint8Array,
-    options: { readonly state?: PerFileState; readonly store?: ReturnType<typeof versioned_state_store>; readonly disk?: ReturnType<typeof disk> } = {},
+    options: {
+        readonly state?: PerFileState;
+        readonly store?: ReturnType<typeof versioned_state_store>;
+        readonly disk?: ReturnType<typeof disk>;
+        /** Defaults to on. */
+        readonly structuralEditingEnabled?: boolean;
+    } = {},
 ): Promise<OpenXlsx & { readonly store: ReturnType<typeof versioned_state_store> }> {
     const file = options.disk ?? disk(bytes);
     const state = options.store ?? versioned_state_store(options.state ?? {});
@@ -93,7 +99,7 @@ export async function open_xlsx(
         with_in_memory_authority_transactions(state.store),
         profile_for(FILE),
         fake_viewer_host,
-        { structuralEditingEnabled: true },
+        { structuralEditingEnabled: options.structuralEditingEnabled ?? true },
     );
     panel.onDidDispose(() => controller.dispose());
     const warning = vi.spyOn(vscode_mock.window, 'showWarningMessage');
