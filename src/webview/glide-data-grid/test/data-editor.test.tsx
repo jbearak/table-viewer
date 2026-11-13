@@ -5368,6 +5368,45 @@ a new line char ""more quotes"" plus a tab  ."	https://google.com`)
             expect(moved).toHaveBeenCalledWith({ start: 5, end: 9 }, 31);
         });
 
+        test("finds the bottom edge from the visible rows, not from a far-away target", async () => {
+            const moved = vi.fn();
+            const propose = vi.fn(() => true);
+            vi.useFakeTimers();
+            render(
+                <EventedDataEditor
+                    {...basicProps}
+                    rowMarkers="clickable-number"
+                    gridSelection={blockSelection(940, 944)}
+                    onRowMoved={moved}
+                    onRowProposeMove={propose}
+                />,
+                { wrapper: Context }
+            );
+            const scroller = prep();
+            // Scroll so row 937 is the first visible row (30,000 px down).
+            if (scroller !== null) {
+                vi.spyOn(scroller, "scrollHeight", "get").mockImplementation(() => 1000 * 32 + 36);
+                vi.spyOn(scroller, "scrollTop", "get").mockImplementation(() => 30_000);
+                fireEvent.scroll(scroller);
+            }
+            await drainEventLoop();
+            const canvas = screen.getByTestId("data-grid-canvas");
+            const measured = vi.spyOn(Element.prototype, "getBoundingClientRect");
+            // Row 942, then over the header (a -1 target), then below the grid.
+            fireEvent.mouseDown(canvas, { clientX: 10, clientY: 36 + 5 * 32 });
+            fireEvent.mouseMove(canvas, { clientX: 10, clientY: 20, buttons: 1 });
+            expect(propose).toHaveBeenLastCalledWith({ start: 940, end: 944 }, -1);
+            measured.mockClear();
+            fireEvent.mouseMove(canvas, { clientX: 10, clientY: 1100, buttons: 1 });
+            // One walk across the visible rows at most, not across the 937 above them.
+            expect(measured.mock.calls.length).toBeLessThan(100);
+            fireEvent.mouseUp(canvas, { clientX: 10, clientY: 1100 });
+            const before = moved.mock.calls[0]?.[1] as number;
+            expect(before).toBeGreaterThan(960);
+            expect(before).toBeLessThan(970);
+            measured.mockRestore();
+        });
+
         test("Escape abandons an active move", () => {
             const moved = vi.fn();
             vi.useFakeTimers();
