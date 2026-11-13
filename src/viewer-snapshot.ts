@@ -526,6 +526,13 @@ export function normalize_complete_per_file_state(
     if ('rowHeightsVersion' in stored && stored.rowHeightsVersion === 1) {
         normalized.rowHeightsVersion = 1;
     }
+    // A structural save's rekey intent is host bookkeeping like the markers
+    // above, and the one leaf whose loss is unrecoverable: a state update that
+    // normalized it away would leave a restructured file with view state still
+    // keyed to the old rows. Carried through verbatim; the durable decoder
+    // already owned it.
+    const rekey_intent = (stored as PerFileState).structuralRekeyIntent;
+    if (rekey_intent !== undefined) normalized.structuralRekeyIntent = rekey_intent;
     return normalized;
 }
 

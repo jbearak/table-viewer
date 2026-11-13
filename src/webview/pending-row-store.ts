@@ -14,6 +14,7 @@
 import {
     advance_pending_append_basis,
     appended_rows,
+    inserted_rows,
     EMPTY_PENDING_STRUCTURAL_CHANGES,
     has_pending_structural_changes,
     is_inserted_row,
@@ -171,6 +172,11 @@ export interface PendingRowStore {
         session_id: string | undefined,
         pending_row_ids: ReadonlySet<string>,
         removed_source_rows: ReadonlySet<number>,
+        /**
+         * The save wrote this worksheet's live layout change: drop the row and
+         * column layouts, Pending Columns, and Structural Basis with the rows.
+         */
+        clear_layout?: boolean,
     ): void;
     clear(session_id: string | undefined): void;
     stage_clear(session_id: string | undefined): StagedMutation | undefined;
@@ -837,7 +843,7 @@ export function create_pending_row_store(
             RESET_CHANGE,
             false,
         ),
-        clear_saved: (session_id, pending_row_ids, removed_source_rows) => {
+        clear_saved: (session_id, pending_row_ids, removed_source_rows, clear_layout = false) => {
             if (!session_matches(session_id)) return;
             const appendedRows = pending_rows(state).filter(
                 (row) => !pending_row_ids.has(row.id),
@@ -845,8 +851,15 @@ export function create_pending_row_store(
             const tailRemovals = state.tailRemovals.filter(
                 (removal) => !removed_source_rows.has(removal.sourceRow),
             );
+            const {
+                rowLayout: _rows,
+                columnLayout: _columns,
+                pendingColumns: _pending_columns,
+                structuralBasis: _basis,
+                ...without_layout
+            } = state;
             const next = own({
-                ...state,
+                ...(clear_layout ? without_layout : state),
                 formatTemplates: retained_templates(state.formatTemplates, appendedRows),
                 appendedRows,
                 tailRemovals,
@@ -1341,6 +1354,39 @@ function finish_structure(
             removedSourceColumns: Object.freeze([...(draft.removedSourceColumns ?? [])]),
         }),
     };
+}
+
+/**
+ * Review Changes' "Discard row and column changes on <sheet>", offered when
+ * the file changed under a live layout change (`structuralBasisChanged`):
+ * drop Pending Inserted Rows, removals, moves, and tombstones, leaving the
+ * source layout of the file as it is now and no Structural Basis. Cell edits
+ * on source cells and Pending Appended Rows are kept, and reconcile by
+ * today's rules. One history action; the conflict it answers goes with it.
+ *
+ * Column layouts arrive with delivery step 8, whose column history arm this
+ * action will then carry; until then a worksheet cannot hold one.
+ */
+export function discard_layout_changes(
+    changes: PendingStructuralChanges,
+    context: WorksheetStructureContext,
+): StructureResult {
+    if (changes.columnLayout !== undefined || (changes.pendingColumns?.length ?? 0) > 0) {
+        return refuse_structure('invalid', 'Discarding column changes is not available yet.');
+    }
+    const result = finish_structure(changes, { ...context, structuralBasis: undefined }, 'rows', {
+        rowLayout: source_row_layout(context.bodyStart, body_row_count(context)),
+        columnLayout: column_layout_of(changes, context),
+        rows: appended_rows(changes),
+        columns: [],
+        discardedRows: inserted_rows(changes),
+    });
+    if (!result.ok) return result;
+    const next = own_pending_structural_changes({
+        ...result.outcome.next,
+        conflicts: result.outcome.next.conflicts.filter((conflict) => conflict.reason !== 'structuralBasisChanged'),
+    });
+    return { ok: true, outcome: Object.freeze({ ...result.outcome, next }) };
 }
 
 /** Drop Pending Column cells keyed by any of `keys`, keeping untouched columns as they are. */

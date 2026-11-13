@@ -5519,6 +5519,88 @@ describe('edit mode save exit', () => {
             .not.toBeNull();
     });
 
+    it('shows a worksheet-level Structural Basis conflict from a save rejection, with its discard', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1'], false), {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        await enter_edit_mode(post_message, 'basis-session');
+        const operation: CsvSaveOperation = {
+            editSessionId: 'basis-session',
+            saveRequestId: 'save-basis',
+            worksheets: [{ sheetIndex: 0, sheetName: 'Sheet1', edits: {}, dirtyEdits: {} }],
+        };
+        await dispatch_host_message({
+            type: 'saveOperationStarted',
+            lifecycle: { revision: 1, state: 'active', operation },
+        });
+        post_message.mockClear();
+        await dispatch_host_message({
+            type: 'saveResult',
+            success: false,
+            lifecycle: { revision: 2, state: 'failed', operation },
+            rejection: {
+                reason: 'structuralConflict',
+                worksheetOperationIndex: 0,
+                structuralReason: 'structuralBasisChanged',
+                pendingRowIds: [],
+                tailRemovalIds: [],
+            },
+            basesValidated: true,
+        });
+        expect(post_message.mock.calls.some(([message]) => message?.type === 'showWarning')).toBe(false);
+        expect(document.querySelector('[aria-label="Pending rows that need review"]')).not.toBeNull();
+        expect([...document.querySelectorAll('button')].some((button) =>
+            button.textContent === 'Discard row and column changes on Sheet1')).toBe(true);
+    });
+
+    it('does not discard row and column changes while another gesture is admitted', async () => {
+        const { post_message } = await render_app();
+        const meta = make_meta(['Sheet1'], false);
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        await click_button('Edit');
+        await dispatch_host_message({
+            type: 'editSessionResult',
+            granted: true,
+            editSessionId: 'discard-session',
+            sheetIndex: 0,
+            pendingChanges: {
+                sheetIndex: 0,
+                sheetName: 'Sheet1',
+                cells: {},
+                formatTemplates: [],
+                appendedRows: [],
+                tailRemovals: [],
+                conflicts: [{ reason: 'structuralBasisChanged', pendingRowIds: [], tailRemovalIds: [] }],
+                rowLayout: {
+                    runs: [{ kind: 'source', start: 0, count: meta.sheets[0].sourceRowCount }],
+                    removedSourceRows: [{ start: 0, count: 1 }],
+                    discardedPendingRows: [],
+                },
+                structuralBasis: {
+                    kind: 'delimited',
+                    byteLength: 10,
+                    digest: 'abc',
+                    sourceRowCount: meta.sheets[0].sourceRowCount,
+                    sourceColumnCount: meta.sheets[0].columnCount,
+                },
+            },
+        });
+        const store = (grid_shell_mock.latest_props as unknown as GridShellProps).pending_row_store!;
+        expect(store.snapshot().rowLayout).toBeDefined();
+        // An append admission owns the gesture slot.
+        const request_append = grid_shell_mock.latest_props!.on_append_rows as
+            (count: number) => Promise<unknown>;
+        await act(async () => { void request_append(1); });
+        await vi.waitUntil(() => post_message.mock.calls.some(
+            ([message]) => message?.type === 'requestAppendRows',
+        ));
+        await click_button('Discard row and column changes on Sheet1');
+        expect(store.snapshot().rowLayout).toBeDefined();
+    });
+
     it('projects recursive formula invalidations across worksheet switches', async () => {
         const meta = make_meta(['People', 'Inventory'], false);
         meta.sheets[0].formulaDependencies = [

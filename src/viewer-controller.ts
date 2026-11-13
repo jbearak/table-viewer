@@ -145,6 +145,9 @@ import {
     with_pending_edits_for_sheet,
     worksheet_identity,
     worksheet_target_index,
+    receipt_has_structure,
+    type StructuralSaveUnresolvedNotice,
+    type StructuralRekeyIntent,
     worksheet_target_key,
     worksheet_target_lookup,
     worksheet_target_matches,
@@ -209,6 +212,27 @@ import {
     type PendingStructuralConflictReason,
     type SavedAppendedRowSnapshot,
 } from './pending-changes';
+import {
+    appended_row_source_row,
+    has_live_column_layout_change,
+    source_row_layout,
+    type RowLayout,
+} from './worksheet-layout';
+import { content_digest } from './content-digest';
+import {
+    delimited_records_of,
+    is_delimited_prefix_growth,
+    rebase_row_layout_on_growth,
+    structural_bases_equal,
+    prospective_transform_schema,
+    structural_payload_for,
+    structural_rekey_transition,
+    structural_receipt_shape_matches,
+    structurally_affected_sheets,
+    without_parked_structural_payloads,
+    without_structural_rekey_intent,
+    worksheet_structure_receipt,
+} from './structural-save';
 import { MAX_HISTORY_ACTION_ENCODED_BYTES } from './history-limits';
 import { RetainedPendingAppendAuthorityStore } from './retained-pending-append-authority';
 import { AppendAdmissionTemplateAuthorityStore } from './append-admission-template-authority';
@@ -264,6 +288,58 @@ import {
 } from './viewer-snapshot';
 
 const SAVE_WINDOW = 10_000;
+
+/**
+ * Structural saves between storing their rekey intent and settling it, in
+ * this process. Recovery leaves these intents alone: an intent whose save is
+ * still running is not an interrupted one, and resolving it against the
+ * pre-write file would clear it out from under the write.
+ */
+const IN_FLIGHT_STRUCTURAL_SAVES = new Set<string>();
+
+/**
+ * This host process, as the owner a stored rekey intent names. Another
+ * process sharing the state (VS Code and the desktop app, or two windows) sees
+ * a different id and leaves the intent alone while its lease is live. The
+ * SQLite writer sessions cannot answer this: their activity time moves only
+ * on commits, and the repository treats another session's leases as
+ * unprovable; the VS Code memento backend has no sessions at all. So the
+ * lease lives in the intent, and the owner renews it while the save runs.
+ */
+const PROCESS_OWNER_ID = randomUUID();
+
+/** How long a structural save's intent lease lasts between renewals. */
+const STRUCTURAL_SAVE_LEASE_MS = 30_000;
+
+/** Whether a stored intent belongs to a save that is still running, here or elsewhere. */
+function rekey_intent_is_live(intent: StructuralRekeyIntent, now = Date.now()): boolean {
+    return IN_FLIGHT_STRUCTURAL_SAVES.has(intent.saveId)
+        || (intent.owner !== undefined
+            && intent.owner.id !== PROCESS_OWNER_ID
+            && intent.owner.leaseExpiresAtMs > now);
+}
+
+
+/**
+ * The host-owned conflicts a worksheet keeps once `changes` are published.
+ * Conflicts are the host's to record, so a publication must echo them, with
+ * one exception: a `structuralBasisChanged` conflict belongs to a live layout
+ * change, and a publication with none left ("Discard row and column changes")
+ * answers it, so it goes.
+ */
+function conflicts_after_publication(
+    durable: PendingStructuralChanges['conflicts'],
+    changes: Pick<PendingStructuralChanges, 'rowLayout' | 'columnLayout'>,
+): PendingStructuralChanges['conflicts'] {
+    return has_live_layout_change(changes)
+        ? durable
+        : durable.filter((conflict) => conflict.reason !== 'structuralBasisChanged');
+}
+
+const UNRESOLVED_STRUCTURAL_SAVE_EDIT_MESSAGE =
+    "Choose whether your last save finished before editing this file.";
+const FOREIGN_STRUCTURAL_SAVE_EDIT_MESSAGE =
+    'Another Table Viewer window is saving this file. Try again when it finishes.';
 
 /**
  * What a profile needs to turn one worksheet's edits into bytes.
@@ -412,6 +488,8 @@ export interface ViewerControllerOptions {
      * the layout publication and save gates before the flag ships on.
      */
     readonly structuralEditingEnabled?: boolean;
+    /** Test seam: the lease a structural save's intent holds between renewals. */
+    readonly structuralSaveLeaseMs?: number;
     /** Test-host protocol seam. It is supplied only by the VS Code integration
      * runner and observes the real controller transport without replacing it. */
     readonly integrationTestPort?: {
@@ -557,6 +635,16 @@ interface CsvEditFileState {
 // particular, releasing one panel after a successful write must not allow a
 // sibling panel to reclaim durable edits that have not yet been cleared.
 const csv_edit_file_states = new Map<string, CsvEditFileState>();
+
+/**
+ * Test seam: forget every in-process save and edit owner, as a process that
+ * died mid-save would. Tests that stop a structural save after each step use
+ * it before reopening the file in a new controller.
+ */
+export function simulate_process_restart_for_tests(): void {
+    IN_FLIGHT_STRUCTURAL_SAVES.clear();
+    csv_edit_file_states.clear();
+}
 let next_edit_session_host_epoch = 0;
 
 function allocate_edit_session_id(file_key: string): string {
@@ -599,10 +687,6 @@ const COMPARE_DIFF_INCOMPLETE_WARNING =
 const MAX_SAVED_APPEND_AUTHORITIES = 100_000;
 const MAX_SAVED_APPEND_AUTHORITY_BYTES = 256 * 1024 * 1024;
 const MAX_ACTIONABLE_STRUCTURAL_CONFLICT_ROW_IDS = 16;
-
-function content_digest(bytes: Uint8Array): string {
-    return createHash('sha256').update(bytes).digest('hex');
-}
 
 function worksheet_append_schema_fingerprint(sheet: SheetMeta): string {
     return `sha256:${createHash('sha256').update(JSON.stringify({
@@ -1738,29 +1822,14 @@ export function plan_csv_save(
     const chunks: Uint8Array[] = [];
     let pending_prefix = serializer.headerPrefix;
 
-    const row_count = retained_row_count;
-    let start = 0;
-    while (start < row_count) {
-        const window = src.read_rows(
-            0,
-            start,
-            structural.tailRemovals.length === 0
-                ? SAVE_WINDOW
-                : Math.min(SAVE_WINDOW, row_count - start),
-        );
-        if (
-            window.startRow !== start
-            || window.rows.length === 0
-            || window.rows.length > SAVE_WINDOW
-            || start + window.rows.length > row_count
-        ) {
-            throw new Error('CSV source returned an invalid row window.');
-        }
-
+    // Serialize one contiguous stretch of source rows, harvesting the bases
+    // edits asked for. Every record owns its terminator, so stretches written
+    // in any order concatenate without a separator.
+    const emit_rows = (rows_in: readonly (readonly (RenderedCell | null)[])[], first_row: number): void => {
         function* rows_with_observed_bases() {
-            for (let offset = 0; offset < window.rows.length; offset += 1) {
-                const absolute_row = start + offset;
-                const row = window.rows[offset];
+            for (let offset = 0; offset < rows_in.length; offset += 1) {
+                const absolute_row = first_row + offset;
+                const row = rows_in[offset];
                 const columns = wanted_columns.get(absolute_row);
                 if (columns) {
                     for (const column of columns) {
@@ -1777,11 +1846,67 @@ export function plan_csv_save(
                 yield row;
             }
         }
-        const rows = wants_bases ? rows_with_observed_bases() : window.rows;
-        const text = pending_prefix + serializer.serialize_rows(rows, start);
+        const rows = wants_bases ? rows_with_observed_bases() : rows_in;
+        const text = pending_prefix + serializer.serialize_rows(rows, first_row);
         pending_prefix = '';
         if (text.length > 0) chunks.push(encoder.encode(text));
-        start += window.rows.length;
+    };
+    // Read `[start, end)` in `SAVE_WINDOW` windows, handing each to `emit`.
+    const stream_source_rows = (
+        start_row: number,
+        end_row: number,
+        bounded: boolean,
+        emit: (rows: readonly (readonly (RenderedCell | null)[])[], first_row: number) => void,
+    ): void => {
+        let start = start_row;
+        while (start < end_row) {
+            const window = src.read_rows(
+                0,
+                start,
+                bounded ? Math.min(SAVE_WINDOW, end_row - start) : SAVE_WINDOW,
+            );
+            if (
+                window.startRow !== start
+                || window.rows.length === 0
+                || window.rows.length > SAVE_WINDOW
+                || start + window.rows.length > end_row
+            ) {
+                throw new Error('CSV source returned an invalid row window.');
+            }
+            emit(window.rows, start);
+            start += window.rows.length;
+        }
+    };
+
+    // A live layout change writes the prospective body (row and column
+    // structure design, "CSV and TSV"). Without one the body is written
+    // exactly as before, so a save that carries no layout, or a layout that
+    // differs from the source only by discarded tombstones, is byte-identical
+    // to an unstructured save.
+    const layout = has_live_layout_change(structural)
+        ? csv_save_layout(structural, sheet, edits, input.worksheets[0].dirty_edits)
+        : undefined;
+    let live_body_rows = retained_row_count;
+    if (layout === undefined) {
+        stream_source_rows(0, retained_row_count, structural.tailRemovals.length > 0, emit_rows);
+    } else {
+        live_body_rows = 0;
+        for (const run of layout.runs) {
+            // Pending runs hold only discarded tombstones here: the layout
+            // check refuses live inserted rows until inserting can be saved.
+            if (run.kind !== 'source') continue;
+            // Each run reads its own windows, so a run that a move placed out
+            // of source order streams exactly like one that stayed in place.
+            stream_source_rows(run.start, run.start + run.count, true, (rows, first_row) => {
+                for (const stretch of live_stretches(layout.removedSourceRows, first_row, first_row + rows.length)) {
+                    emit_rows(
+                        rows.slice(stretch.start - first_row, stretch.start - first_row + stretch.count),
+                        stretch.start,
+                    );
+                    live_body_rows += stretch.count;
+                }
+            });
+        }
     }
     if (pending_prefix.length > 0) chunks.push(encoder.encode(pending_prefix));
     const delimiter = get_delimiter(input.file_path);
@@ -1819,7 +1944,8 @@ export function plan_csv_save(
                 sheetName: sheet.name,
                 ...(sheet.worksheetId === undefined ? {} : { worksheetId: sheet.worksheetId }),
                 pendingRowId: row.id,
-                sourceRow: retained_row_count + index,
+                // `H + N + i`: the band follows the live layout.
+                sourceRow: appended_row_source_row(0, live_body_rows, index),
                 savedFingerprint: saved_pending_row_fingerprint(row, { kind: 'none' }),
                 savedRow: persisted_saved_row_snapshot(row, { kind: 'none' }, row.cells),
             }))),
@@ -1835,8 +1961,93 @@ export function plan_csv_save(
                         (removal) => removal.sourceRow,
                     )),
                 }]),
+            ...(layout === undefined ? {} : {
+                structure: Object.freeze([worksheet_structure_receipt(
+                    {
+                        sheetIndex: 0,
+                        sheetName: sheet.name,
+                        ...(sheet.worksheetId === undefined ? {} : { worksheetId: sheet.worksheetId }),
+                    },
+                    structural,
+                    { bodyStart: 0, sourceRowCount: sheet.sourceRowCount, sourceColumnCount: sheet.columnCount },
+                )]),
+            }),
         }),
     };
+}
+
+/**
+ * The row layout a CSV/TSV structural save writes, after the checks the
+ * planner owns: the layout validator against this exact source (a delimited
+ * body starts at row 0, after the header line), the recorded Structural
+ * Basis's dimensions, and no cell edit on a removed row or column. Inserted
+ * rows and column changes are refused until their writers land (delivery
+ * steps 6 and 8); the host never admits them before then.
+ */
+function csv_save_layout(
+    structural: PendingStructuralChanges,
+    sheet: SheetMeta,
+    edits: Readonly<Record<string, string>>,
+    dirty_edits: CsvDirtyMap | undefined,
+): RowLayout {
+    if (structural.columnLayout !== undefined && has_live_column_layout_change(structural.columnLayout)) {
+        throw new Error('Saving inserted, deleted, or moved columns is not available yet.');
+    }
+    if (inserted_rows(structural).length > 0) {
+        throw new Error('Saving inserted rows is not available yet.');
+    }
+    const basis = structural.structuralBasis;
+    if (
+        basis === undefined
+        || basis.kind !== 'delimited'
+        || basis.sourceRowCount !== sheet.sourceRowCount
+        || basis.sourceColumnCount !== sheet.columnCount
+    ) structural_save_error(
+        0,
+        structural,
+        'structuralBasisChanged',
+        'The file changed after rows or columns were inserted, deleted, or moved.',
+        { pendingRowIds: [], tailRemovalIds: [] },
+    );
+    const cells: Record<string, unknown> = { ...(dirty_edits ?? {}) };
+    for (const key of Object.keys(edits)) cells[key] ??= edits[key];
+    const error = pending_structure_error(structural, cells, {
+        bodyStart: 0,
+        sourceRowCount: sheet.sourceRowCount,
+        sourceColumnCount: sheet.columnCount,
+        mintedAsInsert: () => true,
+    });
+    if (error !== undefined) throw new Error(`The row and column changes are inconsistent: ${error}`);
+    return structural.rowLayout ?? source_row_layout(0, sheet.sourceRowCount);
+}
+
+/**
+ * The live stretches of `[start, end)`: the source rows not covered by
+ * `removed`, a sorted list of disjoint removal intervals, in order.
+ */
+function live_stretches(
+    removed: readonly { readonly start: number; readonly count: number }[],
+    start: number,
+    end: number,
+): { start: number; count: number }[] {
+    // First interval that ends after `start`.
+    let low = 0;
+    let high = removed.length;
+    while (low < high) {
+        const middle = (low + high) >> 1;
+        if (removed[middle]!.start + removed[middle]!.count <= start) low = middle + 1;
+        else high = middle;
+    }
+    const stretches: { start: number; count: number }[] = [];
+    let cursor = start;
+    for (let index = low; index < removed.length && cursor < end; index++) {
+        const interval = removed[index]!;
+        if (interval.start >= end) break;
+        if (interval.start > cursor) stretches.push({ start: cursor, count: interval.start - cursor });
+        cursor = Math.max(cursor, interval.start + interval.count);
+    }
+    if (cursor < end) stretches.push({ start: cursor, count: end - cursor });
+    return stretches;
 }
 
 export function csv_source_builder(config?: ConfigPort): ViewerProfile['build_source'] {
@@ -2136,6 +2347,7 @@ export function attach_viewer(
     let pending_edit_writes: Promise<void> = Promise.resolve();
     let pending_edit_sequence_session_id: string | undefined;
     let highest_pending_edit_sequence = 0;
+    const last_published_sequences = new Map<string, number>();
     let highest_acknowledged_edit_sequence = 0;
     const pending_edit_admissions = new Set<symbol>();
     let renderer_ready = false;
@@ -3931,6 +4143,7 @@ export function attach_viewer(
                 durable_row_heights_state,
                 (snapshot.state as StoredPerFileState).rowHeights,
             );
+            observe_unresolved_structural_save(state);
         }
         if (
             !file_edit_state
@@ -4353,6 +4566,392 @@ export function attach_viewer(
             pending_edit_session_targets.set(edit_session_id, targets);
         }
         targets.set(worksheet_target_key(target), { target, sequence });
+        last_published_sequences.set(append_ledger_key(edit_session_id, target), sequence);
+    }
+
+    /**
+     * The publication sequence that last carried a worksheet's Pending
+     * Changes in a session, or 0. A structural save records it as the
+     * accepted payload's sequence, and retires the payload after the write
+     * only while it is unchanged.
+     */
+    function last_published_sequence(edit_session_id: string, target: WorksheetTarget): number {
+        return last_published_sequences.get(append_ledger_key(edit_session_id, target)) ?? 0;
+    }
+
+    /** Clear a stored rekey intent, if it is still this save's: a known abort before the write. */
+    async function clear_structural_rekey_intent(save_id: string): Promise<void> {
+        await update_file_state(
+            (current) => without_structural_rekey_intent(current, save_id),
+            undefined,
+            undefined,
+            null,
+        );
+    }
+
+    /**
+     * A structural write threw. If the file still has the bytes the save read,
+     * nothing was written: clear the intent and keep the payload for a retry.
+     * Otherwise keep the intent and let recovery decide, now, which way the
+     * file went.
+     */
+    async function settle_failed_structural_write(
+        intent: StructuralRekeyIntent,
+        sheets: readonly SheetMeta[],
+    ): Promise<'applied' | 'cleared' | 'unresolved'> {
+        IN_FLIGHT_STRUCTURAL_SAVES.delete(intent.saveId);
+        return resolve_stored_rekey_intent(intent, sheets).catch((error) => {
+            log_sanitized_failure('Could not resolve a structural save after a failed write', error);
+            return 'unresolved' as const;
+        });
+    }
+
+    const structural_save_lease_ms = options.structuralSaveLeaseMs ?? STRUCTURAL_SAVE_LEASE_MS;
+
+    /**
+     * Keep renewing a running save's intent lease, so another process sharing
+     * this state never mistakes it for an interrupted one. Answers a stop.
+     * Independent of the panel: a write still pending after the panel closes
+     * keeps its lease until `handle_save` settles and stops it.
+     */
+    function renew_structural_save_lease(save_id: string): () => void {
+        let stopped = false;
+        let handle: unknown;
+        const schedule = (): void => {
+            handle = scheduler.setTimeout(() => {
+                if (stopped) return;
+                void update_file_state((current) => {
+                    const intent = current.structuralRekeyIntent;
+                    if (stopped || intent?.saveId !== save_id) return current;
+                    return {
+                        ...current,
+                        structuralRekeyIntent: {
+                            ...intent,
+                            owner: { id: PROCESS_OWNER_ID, leaseExpiresAtMs: Date.now() + structural_save_lease_ms },
+                        },
+                    };
+                }, undefined, undefined, null).catch((error) => {
+                    log_sanitized_failure('Could not renew a structural save lease', error);
+                }).finally(() => {
+                    if (!stopped) schedule();
+                });
+            }, Math.max(1, Math.floor(structural_save_lease_ms / 3)));
+        };
+        schedule();
+        return () => {
+            stopped = true;
+            scheduler.clearTimeout(handle);
+        };
+    }
+
+    function announce_structural_rekey(messages: readonly string[]): void {
+        if (messages.length > 0) show_owner_warning(messages.join(' '));
+    }
+
+    let unresolved_structural_sheet_names: ReadonlySet<string> = new Set();
+    /**
+     * Durable state holds a structural save's intent this process is not
+     * running: unresolved, or live in another process. Either blocks editing
+     * and saving here.
+     */
+    let unresolved_structural_save_present = false;
+    /** The blocking intent belongs to a save another process is still running. */
+    let blocking_save_is_live = false;
+    let rekey_intent_recheck: unknown;
+
+    function blocking_save_message(): string {
+        return blocking_save_is_live
+            ? FOREIGN_STRUCTURAL_SAVE_EDIT_MESSAGE
+            : UNRESOLVED_STRUCTURAL_SAVE_EDIT_MESSAGE;
+    }
+
+    function schedule_rekey_intent_recheck(lease_expires_at_ms: number): void {
+        if (rekey_intent_recheck !== undefined) return;
+        rekey_intent_recheck = scheduler.setTimeout(() => {
+            rekey_intent_recheck = undefined;
+            if (disposed) return;
+            void resolve_stored_rekey_intent(undefined).then(async (outcome) => {
+                if (disposed) return;
+                if (outcome !== 'unresolved') await refresh_panel_source(true, 'recovery');
+                else observe_unresolved_structural_save((await read_file_state(false)).state as PerFileState);
+            }).catch((error) => {
+                log_sanitized_failure('Could not recheck a structural save after its lease', error);
+            });
+        }, Math.max(0, lease_expires_at_ms - Date.now()) + 50);
+    }
+
+    /**
+     * Whether worksheet `sheet_index` was restructured by an unresolved save.
+     * Its source-keyed annotations (highlights, hidden rows, row heights,
+     * column widths) refuse writes until the user answers: the receipt cannot
+     * say which rows or columns a new one meant.
+     */
+    function unresolved_structural_sheet(sheet_index: number): boolean {
+        const sheet = source?.meta().sheets[sheet_index];
+        return sheet !== undefined && unresolved_structural_sheet_names.has(sheet.name);
+    }
+    let posted_unresolved_save_id: string | undefined;
+
+    /**
+     * Track whether the durable state holds an unresolved structural save, and
+     * tell the renderer when that changes: it shows the notice bar with the
+     * two choices, defaulting to the shape hint.
+     */
+    function observe_unresolved_structural_save(state: PerFileState): void {
+        const intent = unresolved_rekey_intent(state);
+        const blocking = blocking_rekey_intent(state);
+        unresolved_structural_save_present = blocking !== undefined;
+        blocking_save_is_live = blocking !== undefined && rekey_intent_is_live(blocking);
+        // Another process's save: recover its intent if the lease lapses
+        // without it settling, as a load would.
+        if (blocking_save_is_live && blocking?.owner !== undefined) {
+            schedule_rekey_intent_recheck(blocking.owner.leaseExpiresAtMs);
+        }
+        // The hint and the affected worksheets are answered by the installed
+        // workbook; before the first adoption there is none to ask.
+        if (source === undefined) return;
+        const sheets = source.meta().sheets;
+        unresolved_structural_sheet_names = intent === undefined
+            ? new Set()
+            : new Set(structurally_affected_sheets(intent, sheets).map((index) => sheets[index]!.name));
+        const notice = unresolved_structural_save_notice(state);
+        const key = notice === null ? undefined : `${notice.saveId}\u0000${notice.suggestion}`;
+        if (key === posted_unresolved_save_id) return;
+        posted_unresolved_save_id = key;
+        void post_to_receiver({ type: 'structuralSaveUnresolved', notice });
+    }
+
+    function unresolved_structural_save_notice(state: PerFileState): StructuralSaveUnresolvedNotice | null {
+        const intent = unresolved_rekey_intent(state);
+        const sheets = source?.meta().sheets ?? [];
+        return intent === undefined ? null : {
+            saveId: intent.saveId,
+            message: `Table Viewer can't tell whether your last save of ${display_file_name()} finished, `
+                + 'because the file has changed since.',
+            suggestion: structural_receipt_shape_matches(
+                intent.receipt,
+                sheets,
+                (target) => structural_payload_for(state, sheets, target),
+            ) ? 'finished' : 'notFinished',
+        };
+    }
+
+    function display_file_name(): string {
+        const slash = Math.max(file_path.lastIndexOf('/'), file_path.lastIndexOf('\\'));
+        return file_path.slice(slash + 1);
+    }
+
+    /**
+     * The user's answer to an unresolved structural save. "It finished"
+     * applies the intent and parks the payload until the next successful save,
+     * so a wrong answer can still be recovered; "It didn't finish" clears the
+     * intent and keeps the payload, which then meets the Structural Basis
+     * check against the file as it is.
+     */
+    async function handle_resolve_structural_save(message: unknown): Promise<void> {
+        if (
+            !is_plain_record(message)
+            || typeof message.saveId !== 'string'
+            || (message.choice !== 'finished' && message.choice !== 'notFinished')
+        ) return;
+        const save_id = message.saveId;
+        const finished = message.choice === 'finished';
+        const src = source;
+        const digest = session.acknowledged_physical_digest();
+        if (src === undefined || digest === undefined) return;
+        const sheets = src.meta().sheets;
+        await update_file_state((current) => {
+            const intent = unresolved_rekey_intent(current);
+            if (intent?.saveId !== save_id) return current;
+            if (!finished) {
+                return reconcile_structural_bases(
+                    without_structural_rekey_intent(current, save_id),
+                    src,
+                    digest,
+                );
+            }
+            return structural_rekey_transition(current, intent, sheets, {
+                retire: () => true,
+                park: true,
+                schemaAfter: (sheet_index) => {
+                    const sheet = sheets[sheet_index];
+                    return sheet === undefined ? undefined : transform_schema_for_sheet(sheet);
+                },
+            })?.state ?? current;
+        }, undefined, undefined, null);
+        await refresh_panel_source(true, 'recovery');
+    }
+
+    /** A stored rekey intent no running save owns: the file's state is unresolved. */
+    function unresolved_rekey_intent(state: StoredPerFileState): StructuralRekeyIntent | undefined {
+        const intent = (state as PerFileState).structuralRekeyIntent;
+        return intent === undefined || rekey_intent_is_live(intent) ? undefined : intent;
+    }
+
+    /**
+     * A stored rekey intent that blocks editing and saving here: any intent
+     * except one this process is running. A live intent another process
+     * owns blocks too, without a notice, until it settles or its lease lapses.
+     */
+    function blocking_rekey_intent(state: StoredPerFileState): StructuralRekeyIntent | undefined {
+        const intent = (state as PerFileState).structuralRekeyIntent;
+        return intent === undefined || IN_FLIGHT_STRUCTURAL_SAVES.has(intent.saveId) ? undefined : intent;
+    }
+
+    /**
+     * Resolve a stored rekey intent against the file's current digest
+     * (design "Recovery"): the after-digest applies it and retires the
+     * payload; the before-digest clears it and keeps the payload; anything
+     * else leaves it for the user to resolve. `sheets` and `schema_after`
+     * describe the file as it is now.
+     */
+    function resolve_rekey_intent_in_state(
+        current: PerFileState,
+        digest: string,
+        sheets: readonly SheetMeta[],
+    ): PerFileState {
+        const intent = unresolved_rekey_intent(current);
+        if (intent === undefined) return current;
+        if (digest === intent.beforeDigest) return without_structural_rekey_intent(current, intent.saveId);
+        if (digest !== intent.afterDigest) return current;
+        return structural_rekey_transition(current, intent, sheets, {
+            retire: () => true,
+            schemaAfter: (sheet_index) => {
+                const sheet = sheets[sheet_index];
+                return sheet === undefined ? undefined : transform_schema_for_sheet(sheet);
+            },
+        })?.state ?? current;
+    }
+
+    /**
+     * Reconcile each worksheet layout with the file being installed (design
+     * "External changes"). A live layout change whose Structural Basis still
+     * matches is unchanged; CSV/TSV rows appended on disk join the layout as
+     * one source run and advance the basis; any other change records a
+     * `structuralBasisChanged` conflict, which refuses Save until the user
+     * discards the row and column changes. A layout that holds only discarded
+     * tombstones records no basis, so it is dropped on any external change
+     * (the physical digest moved); with no formulas in a delimited file, no
+     * anchor renders differently. `.xlsx` bases are reconciled with the
+     * structural writer (delivery step 9), which no save can reach before.
+     */
+    function reconcile_structural_bases(
+        current: PerFileState,
+        candidate: DataSource,
+        digest: string,
+    ): PerFileState {
+        const slots = current.pendingEdits;
+        if (!slots?.some((slot) => slot !== undefined && pending_changes_carry_layout(slot))) return current;
+        const sheets = candidate.meta().sheets;
+        const previous_digest = file_coordinator.authority().physicalDigest;
+        const file_changed = previous_digest !== undefined && previous_digest !== digest;
+        const bytes = candidate instanceof CsvDataSource ? candidate.file_bytes() : undefined;
+        let next: typeof slots | undefined;
+        for (const [index, slot] of slots.entries()) {
+            if (slot === undefined || !pending_changes_carry_layout(slot)) continue;
+            const changes = own_pending_structural_changes(slot);
+            const sheet = sheets[worksheet_target_index(sheets, {
+                sheetIndex: index,
+                sheetName: slot.sheetName,
+                worksheetId: slot.worksheetId,
+            }) ?? -1];
+            let replacement: WorksheetPendingEdits | undefined;
+            if (!has_live_layout_change(changes)) {
+                if (!file_changed || (changes.rowLayout === undefined && changes.columnLayout === undefined)) continue;
+                const { rowLayout: _rows, columnLayout: _columns, ...rest } = slot;
+                replacement = rest;
+            } else {
+                const basis = changes.structuralBasis;
+                if (
+                    bytes === undefined
+                    || sheet === undefined
+                    || candidate.truncationMessage
+                    || basis?.kind !== 'delimited'
+                ) continue;
+                // The snapshot's basis, from the digest this commit verified.
+                const current_basis = current_structural_basis(
+                    file_format.id,
+                    { digest, byteLength: bytes.byteLength },
+                    sheet,
+                );
+                if (current_basis === undefined) continue;
+                const others = changes.conflicts.filter((conflict) => conflict.reason !== 'structuralBasisChanged');
+                if (structural_bases_equal(basis, current_basis)) {
+                    if (others.length === changes.conflicts.length) continue;
+                    replacement = { ...slot, conflicts: others };
+                } else if (
+                    changes.rowLayout !== undefined
+                    && is_delimited_prefix_growth(
+                        basis,
+                        bytes,
+                        get_delimiter(file_path),
+                        (prefix) => delimited_records_of(prefix, get_delimiter(file_path)),
+                    )
+                ) {
+                    replacement = {
+                        ...slot,
+                        rowLayout: rebase_row_layout_on_growth(
+                            changes.rowLayout,
+                            0,
+                            basis.sourceRowCount,
+                            sheet.sourceRowCount,
+                        ),
+                        structuralBasis: current_basis,
+                        conflicts: others,
+                    };
+                } else {
+                    if (others.length !== changes.conflicts.length) continue;
+                    replacement = {
+                        ...slot,
+                        conflicts: [...changes.conflicts, Object.freeze({
+                            reason: 'structuralBasisChanged' as const,
+                            pendingRowIds: Object.freeze([]),
+                            tailRemovalIds: Object.freeze([]),
+                        })],
+                    };
+                }
+            }
+            next ??= [...slots];
+            next[index] = replacement;
+        }
+        return next === undefined ? current : { ...current, pendingEdits: next };
+    }
+
+    /**
+     * Resolve the stored intent now, against the file as it is: re-read and
+     * hashed here, never assumed, so an external write after the save's own
+     * leaves the intent unresolved. `sheets` is the workbook the rekey applies
+     * to; without one (a disposed panel) the intent stays stored for the next
+     * load. Answers how `intent` (when given) settled: `applied` when the
+     * file had its after-digest and the rekey was applied, `cleared` when the
+     * file never changed, `unresolved` when it is still stored.
+     */
+    async function resolve_stored_rekey_intent(
+        intent: StructuralRekeyIntent | undefined,
+        sheets: readonly SheetMeta[] | undefined = source?.meta().sheets,
+    ): Promise<'applied' | 'cleared' | 'unresolved'> {
+        if (sheets === undefined || sheets.length === 0) return 'unresolved';
+        let digest: string;
+        try {
+            digest = content_digest(await host.fs.read_file(uri));
+        } catch (error) {
+            log_sanitized_failure('Could not read the file to resolve a structural save', error);
+            return 'unresolved';
+        }
+        const committed = await update_file_state(
+            (current) => resolve_rekey_intent_in_state(current, digest, sheets),
+            sheets,
+            undefined,
+            null,
+        );
+        const latest = committed ?? await read_file_state(false);
+        const stored = (latest.state as PerFileState).structuralRekeyIntent;
+        // Without a specific intent, any intent still stored (a live one
+        // another process renewed, or one still unresolved) is unresolved.
+        if (intent === undefined ? stored !== undefined : stored?.saveId === intent.saveId) {
+            return 'unresolved';
+        }
+        return intent !== undefined && digest === intent.afterDigest ? 'applied' : 'cleared';
     }
 
     function retire_pending_edit_target(
@@ -4482,12 +5081,18 @@ export function attach_viewer(
         readonly revision: number;
         readonly heights: readonly (Record<number, number> | undefined)[];
     } {
+        const heights = normalize_sheet_state_array<Record<number, number>>(
+            durable_row_heights_state,
+            [...sheet_names],
+        );
         return {
             revision: durable_row_heights_revision,
-            heights: normalize_sheet_state_array<Record<number, number>>(
-                durable_row_heights_state,
-                [...sheet_names],
-            ),
+            // An unresolved structural save: heights are keyed to rows that
+            // may have moved, so affected worksheets render without them.
+            heights: unresolved_structural_sheet_names.size === 0
+                ? heights
+                : heights.map((entry, index) =>
+                    unresolved_structural_sheet_names.has(sheet_names[index]!) ? undefined : entry),
         };
     }
 
@@ -5513,6 +6118,70 @@ export function attach_viewer(
     function project_state_for_panel(
         snapshot: Readonly<FileStateSnapshot>,
         allow_claim = false,
+        sheets?: readonly WorksheetIdentityInput[],
+    ): FileStateSnapshot {
+        return without_unresolved_view_state(
+            project_state_for_panel_unstripped(snapshot, allow_claim, sheets),
+            sheets ?? source?.meta().sheets ?? [],
+        );
+    }
+
+    /**
+     * While a structural save is unresolved, the worksheets it restructured
+     * render without source-keyed highlights, hidden rows, and widths: they
+     * are keyed to rows and columns that may or may not have moved. Durable
+     * state keeps them; only the panel's projection omits them.
+     */
+    function without_unresolved_view_state(
+        projected: FileStateSnapshot,
+        sheets: readonly WorksheetIdentityInput[],
+    ): FileStateSnapshot {
+        const state = projected.state as PerFileState;
+        const stripped = state_without_unresolved_view(state, sheets);
+        return stripped === state ? projected : { revision: projected.revision, state: stripped };
+    }
+
+    /**
+     * `without_unresolved_view_state` on a state: what the panel may show,
+     * and what the core may install, while a structural save is unresolved.
+     * Sorts, filters, and schemas are column-keyed and stay.
+     */
+    function state_without_unresolved_view(
+        state: PerFileState,
+        sheets: readonly WorksheetIdentityInput[],
+    ): PerFileState {
+        const intent = unresolved_rekey_intent(state);
+        if (intent === undefined) return state;
+        const affected = structurally_affected_sheets(intent, sheets);
+        if (affected.length === 0) return state;
+        const highlights = state.cellHighlights === undefined ? undefined : {
+            ...state.cellHighlights,
+            sheets: state.cellHighlights.sheets.map((entry, index) => affected.includes(index) ? undefined : entry),
+        };
+        return {
+            ...state,
+            ...(highlights === undefined ? {} : { cellHighlights: highlights }),
+            ...(state.columnWidths === undefined ? {} : {
+                columnWidths: state.columnWidths.map((entry, index) =>
+                    affected.includes(index) ? undefined : entry),
+            }),
+            ...(state.rowHeights === undefined ? {} : {
+                rowHeights: state.rowHeights.map((entry, index) =>
+                    affected.includes(index) ? undefined : entry),
+            }),
+            ...(state.transforms === undefined ? {} : {
+                transforms: state.transforms.map((entry, index) => {
+                    if (entry === undefined || !affected.includes(index)) return entry;
+                    const { hiddenRows: _hidden, ...rest } = entry;
+                    return rest;
+                }),
+            }),
+        };
+    }
+
+    function project_state_for_panel_unstripped(
+        snapshot: Readonly<FileStateSnapshot>,
+        allow_claim = false,
         // The workbook being adopted, when that is not yet the installed `source`:
         // adoption projects *before* `source = next`, so a name resolved against
         // the module-level source there is answered by the outgoing workbook or,
@@ -5548,6 +6217,7 @@ export function attach_viewer(
         // A claim is only worth making when some slot describes a worksheet this
         // workbook actually has. Already-owned projections never need this scan.
         const rehydratable = !owns_session && allow_claim && editing_supported
+            && blocking_rekey_intent(state) === undefined
             && has_rehydratable_pending_edits(state.pendingEdits, sheets);
         if (rehydratable && layout_peer_blocked && renderer_ready) {
             show_owner_warning('Reload this window to keep editing this file.');
@@ -5794,7 +6464,14 @@ export function attach_viewer(
         }
         const basis = layout_basis;
         const incoming = complete_normalized_per_file_state(message.state, sheets);
-        const patch = derive_layout_state_patch(basis.state, incoming);
+        const derived = derive_layout_state_patch(basis.state, incoming);
+        // Column widths are keyed by source column, so an unresolved
+        // structural save's affected sheets keep theirs as stored.
+        const patch = unresolved_structural_sheet_names.size === 0 ? derived : {
+            ...derived,
+            columnWidths: derived.columnWidths.filter((entry) =>
+                !unresolved_structural_sheet(entry.sheetIndex)),
+        };
         const next_basis = complete_normalized_per_file_state(
             apply_layout_state_patch(basis.state, patch),
             sheets,
@@ -5934,8 +6611,8 @@ export function attach_viewer(
             const snapshot = await read_file_state(false);
             if (!transform_authority_is_current(message, authority)) return;
             const sheets = reconciliation_core.snapshot_material().core.meta.sheets;
-            const durable = normalize_host_state(
-                snapshot.state,
+            const durable = state_without_unresolved_view(
+                normalize_host_state(snapshot.state, sheets),
                 sheets,
             );
             const transforms = sheets.map((sheet, index) => {
@@ -6778,7 +7455,16 @@ export function attach_viewer(
                 const plan = planning_input
                     ? plan_excel_candidate_state(normalized, planning_input)
                     : undefined;
-                const planned_state = plan?.state ?? normalized;
+                const excel_planned_state = plan?.state ?? normalized;
+                // Before any edit grant: settle an interrupted structural save
+                // against these exact bytes, then reconcile every worksheet
+                // layout's Structural Basis with them.
+                const planned_state = reconcile_structural_bases(
+                    resolve_rekey_intent_in_state(excel_planned_state, digest, candidate_meta.sheets),
+                    ds,
+                    digest,
+                );
+                const structural_state_changed = planned_state !== excel_planned_state;
                 const next_highlights = reconcile_physical_cell_highlights(
                     planned_state.cellHighlights,
                     digest,
@@ -6787,7 +7473,7 @@ export function attach_viewer(
                     planned_state.cellHighlights,
                     next_highlights,
                 );
-                const next_state = plan?.changed || highlight_state_changed
+                const next_state = plan?.changed || highlight_state_changed || structural_state_changed
                     ? { ...planned_state, cellHighlights: next_highlights }
                     : undefined;
                 const staged = await stage_authority(
@@ -7173,6 +7859,9 @@ export function attach_viewer(
                     core = installed;
                     source = next;
                     source_authority = committed.receipt.resultingBasis;
+                    observe_unresolved_structural_save(
+                        committed.receipt.stateSnapshot.state as PerFileState,
+                    );
                     // An unspent replay lease is bound to the source and core
                     // being replaced here, so it can no longer be spent. Its own
                     // currency predicate would refuse the commit anyway; dropping
@@ -7463,8 +8152,14 @@ export function attach_viewer(
     // physical/projection/layout writes use the coordinator serialization above.
     async function clear_pending_edits(
         scope: EditCleanupScope,
+        // A successful save ends the recovery window of payloads parked by an
+        // unresolved structural save's "It finished".
+        drop_parked_structural_payloads = false,
     ): Promise<FileStateSnapshot> {
-        const committed = await update_file_state((current, sheets) => {
+        const committed = await update_file_state((stored, sheets) => {
+            const current = drop_parked_structural_payloads
+                ? without_parked_structural_payloads(stored)
+                : stored;
             if (!current.pendingEdits) return current;
             if (scope.type === 'workbook') {
                 // The one workbook dialog discards the entire session, including
@@ -9110,7 +9805,16 @@ export function attach_viewer(
         };
     }
 
-    async function persist_accepted_save(operation: CsvSaveHostOperation): Promise<void> {
+    /**
+     * Persist the accepted payload (step 1), unless another save's rekey
+     * intent is stored: then nothing is written and the blocking intent is
+     * answered. The check is inside the same compare-and-set as the payload
+     * write, so a structural save another process started after this panel
+     * loaded can never have its accepted payload replaced by this one.
+     */
+    async function persist_accepted_save(
+        operation: CsvSaveHostOperation,
+    ): Promise<StructuralRekeyIntent | undefined> {
         // Recorded *before* the CAS, because `release_edit_session` reads this set
         // while the CAS is still in flight. `compare_and_set` validates currency and
         // then awaits the medium's durable write — a real filesystem write on a
@@ -9122,9 +9826,12 @@ export function attach_viewer(
         persisted_save_targets.set(operation.identity, operation.durableTargets);
         let conflict_overlays_authenticated = false;
         let drops_stored_layout = false;
+        let blocked_by: StructuralRekeyIntent | undefined;
         const committed = await update_file_state((current) => {
             conflict_overlays_authenticated = false;
             drops_stored_layout = false;
+            blocked_by = blocking_rekey_intent(current);
+            if (blocked_by !== undefined) return current;
             for (const [index, worksheet] of operation.identity.worksheets.entries()) {
                 const target = operation.durableTargets[index];
                 const durable_slot = pending_changes_for_sheet(
@@ -9143,7 +9850,10 @@ export function attach_viewer(
                     drops_stored_layout = true;
                     return current;
                 }
-                const canonical = own_pending_structural_changes(durable_slot ?? {}).conflicts;
+                const canonical = conflicts_after_publication(
+                    own_pending_structural_changes(durable_slot ?? {}).conflicts,
+                    worksheet.structuralChanges ?? EMPTY_PENDING_STRUCTURAL_CHANGES,
+                );
                 const submitted = worksheet.structuralChanges?.conflicts ?? [];
                 if (JSON.stringify(submitted) !== JSON.stringify(canonical)) {
                     return current;
@@ -9177,6 +9887,20 @@ export function attach_viewer(
             });
             return { ...current, pendingEdits: pending };
         }, undefined, () => save_operation_is_current(operation));
+        if (committed === undefined) {
+            // Nothing was written: refused before the updater ran, a no-op
+            // (another save's intent, a dropped layout, unauthenticated
+            // conflicts). The target was recorded before the compare-and-set
+            // so a release landing during it could tombstone this save; with
+            // nothing persisted there is nothing to undo, and a tombstone would
+            // strip matching cells from whatever payload is stored, such as
+            // another save's accepted edits. Retract both.
+            persisted_save_targets.delete(operation.identity);
+            if (file_edit_state?.failedSaveTombstone === operation.identity) {
+                file_edit_state.failedSaveTombstone = undefined;
+            }
+        }
+        if (blocked_by !== undefined) return blocked_by;
         if (drops_stored_layout) {
             throw new Error('Reload this window to keep editing this file.');
         }
@@ -9188,6 +9912,70 @@ export function attach_viewer(
             throw new Error('The save operation changed before its edits were accepted.');
         }
         notify_edit_state(committed);
+        return undefined;
+    }
+
+    /**
+     * The structural checks a save makes before planning bytes (design "Host"
+     * → "Save"): each worksheet's complete Pending Changes against the layout
+     * validator with the live worksheet and the session ledger, and, for a
+     * worksheet with a live layout change, its Structural Basis against the
+     * verified file. A basis that no longer matches is a structural
+     * rejection Review Changes shows; anything else is an internal error.
+     */
+    function structural_save_precheck(
+        identity: CsvSaveOperation,
+        src: DataSource,
+        verified_digest: string,
+        verified_observation: Readonly<PhysicalSourceObservation> | undefined,
+    ):
+        | { readonly kind: 'invalid' }
+        | { readonly kind: 'rejected'; readonly rejection: CsvSaveRejection }
+        | undefined {
+        for (const [index, worksheet] of identity.worksheets.entries()) {
+            const changes = worksheet.structuralChanges;
+            if (changes === undefined || !pending_changes_carry_layout(changes)) continue;
+            const sheet = src.meta().sheets[worksheet.sheetIndex];
+            if (sheet === undefined) return { kind: 'invalid' };
+            const target: WorksheetTarget = {
+                sheetIndex: worksheet.sheetIndex,
+                ...(worksheet.sheetName === undefined ? {} : { sheetName: worksheet.sheetName }),
+                ...(worksheet.worksheetId ?? sheet.worksheetId) === undefined
+                    ? {}
+                    : { worksheetId: worksheet.worksheetId ?? sheet.worksheetId },
+            };
+            const ledger = append_admission_ledgers.get(append_ledger_key(identity.editSessionId, target));
+            if (!has_live_layout_change(changes)) {
+                if (pending_layout_validation_refusal(target, changes, worksheet.dirtyEdits, ledger) !== undefined) {
+                    return { kind: 'invalid' };
+                }
+                continue;
+            }
+            // The same basis the snapshot reported and publication accepted,
+            // computed from the observation of the file this save verifies.
+            const current = verified_observation?.digest === verified_digest
+                ? current_structural_basis(file_format.id, verified_observation, sheet)
+                : undefined;
+            const basis_matches = structural_bases_equal(changes.structuralBasis, current);
+            if (!basis_matches) {
+                return {
+                    kind: 'rejected',
+                    rejection: structural_save_rejection(new PendingStructuralSaveError(
+                        index,
+                        Object.freeze({
+                            reason: 'structuralBasisChanged',
+                            pendingRowIds: Object.freeze([]),
+                            tailRemovalIds: Object.freeze([]),
+                        }),
+                        'The file changed after rows or columns were inserted, deleted, or moved.',
+                    ))!,
+                };
+            }
+            if (pending_layout_validation_refusal(target, changes, worksheet.dirtyEdits, ledger) !== undefined) {
+                return { kind: 'invalid' };
+            }
+        }
+        return undefined;
     }
 
     async function handle_save(input: unknown): Promise<void> {
@@ -9278,19 +10066,61 @@ export function attach_viewer(
             return;
         }
 
-        // Peer compatibility rule 3. While the flag is off no layout field may
-        // reach a planner. With it on (tests only, until the structural save
-        // lands) the planners still cannot write layouts, so the save is refused
-        // rather than written without them and then cleared as saved.
-        if (identity.worksheets.some((worksheet) =>
-            pending_changes_carry_layout(worksheet.structuralChanges))) {
+        // Peer compatibility rule 3: while the flag is off no layout field may
+        // reach a planner. With it on, CSV and TSV write layouts; `.xlsx`
+        // refuses them until its structural writer lands (delivery step 9).
+        const carries_layout = identity.worksheets.some((worksheet) =>
+            pending_changes_carry_layout(worksheet.structuralChanges));
+        const layout_refusal = !carries_layout
+            ? undefined
+            : !structural_editing_enabled
+                ? 'Saving inserted, deleted, or moved rows and columns is not available in this version.'
+                : file_format.id !== 'csv' && file_format.id !== 'tsv'
+                    ? 'Saving inserted, deleted, or moved rows and columns is not available yet.'
+                    : undefined;
+        // An unresolved structural save: a new save would build on one reading
+        // of the file and could repeat the changes it already wrote.
+        if (unresolved_structural_save_present) {
             const active = begin_save_lifecycle(identity);
             const lifecycle = finish_save_lifecycle(active.operation, 'failed');
-            show_owner_warning(structural_editing_enabled
-                ? 'Saving inserted, deleted, or moved rows and columns is not available yet.'
-                : 'Saving inserted, deleted, or moved rows and columns is not available in this version.');
+            show_owner_warning(blocking_save_message());
             void post_to_receiver({ type: 'saveResult', success: false, lifecycle });
             return;
+        }
+        if (layout_refusal !== undefined) {
+            const active = begin_save_lifecycle(identity);
+            const lifecycle = finish_save_lifecycle(active.operation, 'failed');
+            show_owner_warning(layout_refusal);
+            void post_to_receiver({ type: 'saveResult', success: false, lifecycle });
+            return;
+        }
+        // Before planning bytes: the layout validator with everything the host
+        // knows, and the Structural Basis against the verified file. The
+        // acknowledged digest is the file the planner reads, and the final
+        // verification below proves the bytes on disk still have it.
+        if (carries_layout) {
+            const save_rejection = structural_save_precheck(
+                identity,
+                src,
+                expected_digest,
+                expected_observation,
+            );
+            if (save_rejection !== undefined) {
+                const active = begin_save_lifecycle(identity);
+                const lifecycle = finish_save_lifecycle(active.operation, 'failed');
+                if (save_rejection.kind === 'invalid') {
+                    show_owner_error('Failed to save: the row and column changes are inconsistent.');
+                    void post_to_receiver({ type: 'saveResult', success: false, lifecycle });
+                } else {
+                    void post_to_receiver({
+                        type: 'saveResult',
+                        success: false,
+                        lifecycle,
+                        rejection: save_rejection.rejection,
+                    });
+                }
+                return;
+            }
         }
 
         const save_core = core;
@@ -9421,13 +10251,31 @@ export function attach_viewer(
         // acknowledged digest: an xlsx save splices into exactly those bytes, so
         // it cannot be built before we know which bytes they are.
         let saved_bytes: Uint8Array;
-        let saved_digest: string;
+        // Definitely assigned on every path that reaches the success tail: the
+        // normal one, and recovery after a completed write.
+        let saved_digest!: string;
         let save_receipt = plan.receipt;
         const persisted_append_snapshots = new Map<
             string,
             SavedAppendedRowSnapshot
         >();
         let post_save_reservation: { cancel(): void } | undefined;
+        // A structural save's rekey intent once stored (design "Rekey intent
+        // and post-write rekey", step 3), and whether the write was attempted:
+        // every abort before the write clears the intent and keeps the payload.
+        let rekey_intent: StructuralRekeyIntent | undefined;
+        let write_attempted = false;
+        let write_completed = false;
+        /** A failed write's own recovery already applied the intent. */
+        let structural_write_applied = false;
+        let stop_lease_renewal: (() => void) | undefined;
+        const settle_pre_write_intent = async (): Promise<void> => {
+            if (rekey_intent === undefined) return;
+            await clear_structural_rekey_intent(rekey_intent.saveId).catch((error) => {
+                log_sanitized_failure('Could not clear a structural save intent before its write', error);
+            });
+        };
+        let accepted_sequences: readonly number[] = [];
         try {
             await pending_edit_writes.catch(() => {});
             await save_append_authority.ready;
@@ -9442,13 +10290,28 @@ export function attach_viewer(
             ))) {
                 throw new Error('The pending-row authority changed before Save began.');
             }
-            await persist_accepted_save(operation);
+            const blocking_intent = await persist_accepted_save(operation);
+            if (blocking_intent !== undefined) {
+                // Another save's intent is stored: this save must not replace
+                // that save's accepted payload, so it was never persisted.
+                finish_save_failure(
+                    operation,
+                    rekey_intent_is_live(blocking_intent)
+                        ? FOREIGN_STRUCTURAL_SAVE_EDIT_MESSAGE
+                        : UNRESOLVED_STRUCTURAL_SAVE_EDIT_MESSAGE,
+                );
+                if (!disposed) observe_unresolved_structural_save((await read_file_state(false)).state as PerFileState);
+                return;
+            }
+            accepted_sequences = operation.durableTargets.map((target) =>
+                last_published_sequence(identity.editSessionId, target));
             operation.phase = 'accepted';
 
             // Shared refusal path: the adopted-source check, full verification,
             // and final pre-write re-stat must report the retry identically, so a
             // detected race never surfaces as a generic "Failed to save" error.
             const refuse_as_external_change = async (): Promise<void> => {
+                if (rekey_intent !== undefined) await settle_pre_write_intent();
                 show_owner_warning(
                     'The file changed before the save could finish. No pending edits were written; try saving again.',
                 );
@@ -9552,6 +10415,66 @@ export function attach_viewer(
             }
             saved_digest = content_digest(saved_bytes);
 
+            // Step 3: a save that writes any live layout change records how it
+            // renumbers rows and columns before the file changes, in its own
+            // compare-and-set, never between the final stat and the write.
+            if (receipt_has_structure(save_receipt)) {
+                const intent: StructuralRekeyIntent = Object.freeze({
+                    saveId: randomUUID(),
+                    beforeDigest: expected_digest,
+                    afterDigest: saved_digest,
+                    worksheets: Object.freeze(operation.durableTargets.map((target, index) => Object.freeze({
+                        ...target,
+                        acceptedSequence: accepted_sequences[index] ?? 0,
+                    }))),
+                    receipt: save_receipt!,
+                    owner: Object.freeze({
+                        id: PROCESS_OWNER_ID,
+                        leaseExpiresAtMs: Date.now() + structural_save_lease_ms,
+                    }),
+                });
+                IN_FLIGHT_STRUCTURAL_SAVES.add(intent.saveId);
+                rekey_intent = intent;
+                // One intent per file. Another save's intent, live in another
+                // process or left unresolved, must never be overwritten: its
+                // post-write step would find ours and skip its rekey. Saves on
+                // one file are not serialized across processes (each host has
+                // its own file coordinator), so this compare-and-set is where
+                // two structural saves meet; the second is refused and can be
+                // retried once the first settles.
+                let competing: StructuralRekeyIntent | undefined;
+                const stored = await update_file_state(
+                    (current) => {
+                        const existing = current.structuralRekeyIntent;
+                        competing = existing !== undefined && existing.saveId !== intent.saveId
+                            ? existing
+                            : undefined;
+                        return competing === undefined
+                            ? { ...current, structuralRekeyIntent: intent }
+                            : current;
+                    },
+                    undefined,
+                    () => save_operation_is_current(operation),
+                );
+                if (competing !== undefined) {
+                    const blocking: StructuralRekeyIntent = competing;
+                    finish_save_failure(
+                        operation,
+                        rekey_intent_is_live(blocking)
+                            ? FOREIGN_STRUCTURAL_SAVE_EDIT_MESSAGE
+                            : UNRESOLVED_STRUCTURAL_SAVE_EDIT_MESSAGE,
+                    );
+                    if (!disposed) observe_unresolved_structural_save((await read_file_state(false)).state as PerFileState);
+                    return;
+                }
+                if (!stored || (stored.state as PerFileState).structuralRekeyIntent?.saveId !== intent.saveId) {
+                    throw new Error('The save operation changed before its row and column changes were recorded.');
+                }
+                stop_lease_renewal = renew_structural_save_lease(intent.saveId);
+                // Every pre-write exit clears the intent in the `finally` below.
+                if (!save_may_continue(operation)) return;
+            }
+
             // Narrow (but do not close) the pre-check/pre-write TOCTOU.
             //
             // The verification above has a synchronous sha256 over the whole file as
@@ -9606,7 +10529,25 @@ export function attach_viewer(
             operation.phase = 'writing';
             // Once this call starts, release/discard/disposal cannot transfer the
             // edit epoch until durable completion and cleanup ownership transfer.
-            await host.fs.write_file(uri, saved_bytes);
+            write_attempted = true;
+            try {
+                await host.fs.write_file(uri, saved_bytes);
+            } catch (error) {
+                // The write may have landed before it failed. If the file now
+                // has the saved bytes, recovery applied the intent here: the
+                // rekey is committed and the intent cleared. Record that, so the
+                // catch below reports the save as the success it was without
+                // resolving it a second time.
+                if (
+                    rekey_intent !== undefined
+                    && await settle_failed_structural_write(rekey_intent, src.meta().sheets) === 'applied'
+                ) {
+                    write_completed = true;
+                    structural_write_applied = true;
+                }
+                throw error;
+            }
+            write_completed = true;
 
             // The watcher is reserved across this write and CAS so the state
             // rebase commits against the same save authority.
@@ -9617,8 +10558,42 @@ export function attach_viewer(
             const rebase_is_current = () => save_operation_is_current(operation)
                 && source_authority.authorityRevision === expected_authority
                 && file_coordinator.state_write_is_current(expected_authority);
-            let rebased = await update_file_state((current) => {
+            const structural_intent = rekey_intent;
+            let rekey_announcements: readonly string[] = [];
+            let rebased = await update_file_state((current, sheets) => {
                 if (!save_operation_is_current(operation)) return current;
+                if (structural_intent !== undefined) {
+                    // Step 5, in one transition: apply the rekey, retire each
+                    // worksheet's accepted payload unless a later publication
+                    // replaced it, and clear the intent. An intent another
+                    // reader already resolved as finished has nothing left to do.
+                    if (current.structuralRekeyIntent?.saveId !== structural_intent.saveId) {
+                        rebase_was_noop = true;
+                        return current;
+                    }
+                    const transition = structural_rekey_transition(current, structural_intent, src.meta().sheets, {
+                        retire: (worksheet) => last_published_sequence(identity.editSessionId, worksheet)
+                            === worksheet.acceptedSequence,
+                        schemaAfter: (sheet_index) => {
+                            const sheet = src.meta().sheets[sheet_index];
+                            const entry = structural_intent.receipt.structure?.find((candidate) =>
+                                worksheet_target_index(sheets, candidate) === sheet_index);
+                            return sheet === undefined || entry === undefined
+                                ? undefined
+                                : prospective_transform_schema(
+                                    sheet,
+                                    entry,
+                                    structural_payload_for(current, sheets, entry),
+                                );
+                        },
+                        columnName: (sheet_index, column) => src.meta().sheets[sheet_index]?.columnNames?.[column],
+                    });
+                    if (transition === undefined) {
+                        throw new Error('The saved worksheets could not be found to rekey their view state.');
+                    }
+                    rekey_announcements = transition.announcements;
+                    return transition.state;
+                }
                 let highlights = rebase_cell_highlight_digest(
                     current.cellHighlights,
                     saved_digest,
@@ -9723,47 +10698,89 @@ export function attach_viewer(
                 );
             }
             update_session_state_material(rebased, false);
-            commit_saved_append_authorities(
-                operation,
-                save_receipt,
-                persisted_append_snapshots,
-            );
-        } catch (error) {
-            // A disposed failure releases the edit session from this catch. Do
-            // not let that release wait on the Save's own authority fence; the
-            // finally below would otherwise be unreachable.
-            save_append_authority.release();
-            if (active_save_operation !== operation) return;
-            active_save_operation = undefined;
-            post_save_reservation?.cancel();
-            const lifecycle = finish_save_lifecycle(identity, 'failed');
-            if (disposed) {
-                await release_edit_session(identity.editSessionId);
-                delete_shared_edit_state_if_unused();
-                return;
+            if (rekey_intent === undefined) {
+                commit_saved_append_authorities(
+                    operation,
+                    save_receipt,
+                    persisted_append_snapshots,
+                );
+            } else {
+                // A structural save installs the history barrier, so neither its
+                // inserted nor its appended rows can be undone across it.
+                IN_FLIGHT_STRUCTURAL_SAVES.delete(rekey_intent.saveId);
+                announce_structural_rekey(rekey_announcements);
             }
-            const rejection = structural_save_rejection(error);
-            if (rejection !== undefined) {
+        } catch (error) {
+            let recovered_after_write = false;
+            if (rekey_intent !== undefined) {
+                // A known abort before the write clears the intent and keeps the
+                // payload. After an attempted write the intent stays until the
+                // file says which way it went (`settle_failed_structural_write`).
+                if (!write_attempted) {
+                    await clear_structural_rekey_intent(rekey_intent.saveId).catch(() => {});
+                }
+                IN_FLIGHT_STRUCTURAL_SAVES.delete(rekey_intent.saveId);
+                // The write finished but the post-write transition did not:
+                // the intent is stored, and the file has the bytes it names, so
+                // recovery applies it now. Once it has, the save succeeded: the
+                // renderer must get the receipt and install the barrier, not
+                // restore the written layout as still pending.
+                if (structural_write_applied) {
+                    recovered_after_write = true;
+                } else if (write_completed) {
+                    recovered_after_write = await resolve_stored_rekey_intent(
+                        rekey_intent,
+                        disposed ? undefined : src.meta().sheets,
+                    ).catch((resolve_error) => {
+                        log_sanitized_failure('Could not apply a structural save after its write', resolve_error);
+                        return 'unresolved' as const;
+                    }) === 'applied';
+                }
+            }
+            if (!(recovered_after_write && active_save_operation === operation && !disposed)) {
+                // A disposed failure releases the edit session from this catch. Do
+                // not let that release wait on the Save's own authority fence; the
+                // finally below would otherwise be unreachable.
+                save_append_authority.release();
+                if (active_save_operation !== operation) return;
+                active_save_operation = undefined;
+                post_save_reservation?.cancel();
+                const lifecycle = finish_save_lifecycle(identity, 'failed');
+                if (disposed) {
+                    await release_edit_session(identity.editSessionId);
+                    delete_shared_edit_state_if_unused();
+                    return;
+                }
+                const rejection = structural_save_rejection(error);
+                if (rejection !== undefined) {
+                    void post_to_receiver({
+                        type: 'saveResult',
+                        success: false,
+                        lifecycle,
+                        rejection,
+                        basesValidated: true,
+                    });
+                    return;
+                }
+                show_owner_error(
+                    `Failed to save: ${error instanceof Error ? error.message : String(error)}`,
+                );
                 void post_to_receiver({
                     type: 'saveResult',
                     success: false,
                     lifecycle,
-                    rejection,
                     basesValidated: true,
                 });
                 return;
             }
-            show_owner_error(
-                `Failed to save: ${error instanceof Error ? error.message : String(error)}`,
-            );
-            void post_to_receiver({
-                type: 'saveResult',
-                success: false,
-                lifecycle,
-                basesValidated: true,
-            });
-            return;
         } finally {
+            stop_lease_renewal?.();
+            if (rekey_intent !== undefined) {
+                IN_FLIGHT_STRUCTURAL_SAVES.delete(rekey_intent.saveId);
+                // Any exit before the write settles the intent: clear it and
+                // keep the payload. Idempotent where an exit already did.
+                if (!write_attempted) await settle_pre_write_intent();
+            }
             save_append_authority.release();
         }
 
@@ -9827,7 +10844,7 @@ export function attach_viewer(
         void clear_pending_edits({
             type: 'worksheets',
             targets: operation.durableTargets,
-        }).then((snapshot) => {
+        }, true).then((snapshot) => {
             finish_edit_cleanup(cleanup_operation, true, snapshot);
             if (!disposed) update_session_state_material(snapshot, false);
         }).catch((error) => {
@@ -9849,6 +10866,10 @@ export function attach_viewer(
         // trust boundary: a stale or injected webview message must not
         // reach transform admission, the core, or durable state.
         if (profile.previewMode === true) return;
+        if (unresolved_structural_sheet(message.sheetIndex)) {
+            await core?.reject_transform(message, UNRESOLVED_STRUCTURAL_SAVE_EDIT_MESSAGE, 'terminal');
+            return;
+        }
         const transform_sheet = source?.meta().sheets[message.sheetIndex];
         if (transform_sheet) {
             if (
@@ -9971,6 +10992,9 @@ export function attach_viewer(
                 }
                 renderer_ready = true;
                 renderer_understands_layout = msg.structuralLayout === WEBVIEW_STRUCTURAL_LAYOUT_VERSION;
+                // A new renderer has no notice bar yet: the next durable read
+                // re-posts an unresolved structural save.
+                posted_unresolved_save_id = undefined;
                 renderer_protocol_epoch += 1;
                 const begun = session.begin_ready();
                 // This must happen before the first await: an older receiver's
@@ -10066,8 +11090,11 @@ export function attach_viewer(
                         let reconciled = false;
                         try {
                             const sheets = ready_core.snapshot_material().core.meta.sheets;
-                            const durable = normalize_host_state(
-                                state_snapshot.state,
+                            // The view the snapshot projects: an unresolved
+                            // structural save's affected sheets install no
+                            // hidden rows.
+                            const durable = state_without_unresolved_view(
+                                normalize_host_state(state_snapshot.state, sheets),
                                 sheets,
                             );
                             const transforms = sheets.map((sheet, index) => (
@@ -10442,8 +11469,13 @@ export function attach_viewer(
                         try {
                             const current = await read_file_state(false);
                             state_revision = current.revision;
+                            // What the panel may show: an unresolved structural
+                            // save's affected sheets carry no highlights.
                             state = normalize_workbook_snapshot_state(
-                                current.state,
+                                state_without_unresolved_view(
+                                    current.state as PerFileState,
+                                    current_source.meta().sheets,
+                                ),
                                 current_source.meta(),
                                 current_authority.physicalDigest,
                             ).cellHighlights;
@@ -10468,6 +11500,14 @@ export function attach_viewer(
                         error,
                     }, receiver_epoch);
                 };
+                if (
+                    message.type === 'applyCellHighlights'
+                        ? unresolved_structural_sheet(message.sheetIndex)
+                        : unresolved_structural_sheet_names.size > 0
+                ) {
+                    await reject_highlight_command(UNRESOLVED_STRUCTURAL_SAVE_EDIT_MESSAGE);
+                    return;
+                }
                 if (
                     !command_source
                     || !command_core
@@ -10681,8 +11721,15 @@ export function attach_viewer(
                 const denied_by_layout_peer = edit_state !== undefined
                     && !renderer_understands_layout
                     && stored_pending_edits_version(edit_state.state) === 2;
+                // An unresolved structural save: until the user says whether it
+                // finished, no edit may build on either reading of the file.
+                const blocking_intent = edit_state === undefined
+                    ? undefined
+                    : blocking_rekey_intent(edit_state.state);
+                const denied_by_unresolved_save = blocking_intent !== undefined;
                 can_edit = recovery_authorized
                     && !denied_by_layout_peer
+                    && !denied_by_unresolved_save
                     && editing_supported
                     && !cleanup_blocked
                     && active_save_operation === undefined
@@ -10857,6 +11904,10 @@ export function attach_viewer(
                 }, request.receiverEpoch);
                 if (denied_by_layout_peer) {
                     show_owner_warning('Reload this window to keep editing this file.');
+                } else if (denied_by_unresolved_save) {
+                    show_owner_warning(blocking_intent !== undefined && rekey_intent_is_live(blocking_intent)
+                        ? FOREIGN_STRUCTURAL_SAVE_EDIT_MESSAGE
+                        : UNRESOLVED_STRUCTURAL_SAVE_EDIT_MESSAGE);
                 } else if (cleanup_blocked) {
                     show_owner_warning(
                         'Editing is temporarily unavailable while saved edit state is being cleared.');
@@ -11234,6 +12285,10 @@ export function attach_viewer(
                     return;
                 }
                 if (!source.meta().sheets[message.sheetIndex]) {
+                    settle_resize(false);
+                    return;
+                }
+                if (unresolved_structural_sheet(message.sheetIndex)) {
                     settle_resize(false);
                     return;
                 }
@@ -11758,6 +12813,9 @@ export function attach_viewer(
                     load_all_csv_rows = false;
                 }
                 return;
+            case 'resolveStructuralSave':
+                if (editing_supported) await handle_resolve_structural_save(msg);
+                return;
             case 'saveCsv':
                 if (editing_supported) {
                     const save = handle_save(msg.operation);
@@ -12082,8 +13140,10 @@ export function attach_viewer(
                             if (host_structural_echo) {
                                 if (JSON.stringify(current_structural)
                                     !== JSON.stringify(queued_durable_structural)) return current;
-                            } else if (JSON.stringify(current_structural.conflicts)
-                                !== JSON.stringify(changes.conflicts)) return current;
+                            } else if (JSON.stringify(conflicts_after_publication(
+                                current_structural.conflicts,
+                                changes,
+                            )) !== JSON.stringify(changes.conflicts)) return current;
                             conflict_overlay_authorized = true;
                             const parked = has_identity && live_target_index === undefined;
                             const durable_changes = authority_plan.durableChanges;
@@ -12141,7 +13201,10 @@ export function attach_viewer(
                                     // renderer-authored replacement.
                                     conflicts: host_structural_echo
                                         ? queued_structural.conflicts
-                                        : current_structural.conflicts,
+                                        : conflicts_after_publication(
+                                            current_structural.conflicts,
+                                            changes,
+                                        ),
                                 },
                                 parked ? posted_sheet_name : current_sheets[target_index]?.name,
                                 parked

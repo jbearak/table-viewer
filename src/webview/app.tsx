@@ -38,6 +38,8 @@ import {
     type CsvDirtyEntry,
     type CsvObservedFileBase,
     type PendingChangesSaveReceipt,
+    type StructuralSaveUnresolvedNotice,
+    receipt_has_structure,
     type CsvSaveLifecycle,
     type CsvSaveOperation,
     type CsvSaveWorksheetOperation,
@@ -220,6 +222,14 @@ import { pending_signal, type PendingSignal } from './pending-signal';
 import { run_discard_transaction } from './discard-transaction-model';
 import { highlight_history_source } from './highlight-capture-model';
 import { commit_staged_transaction, type StagedMutation } from './staged-mutation';
+import { discard_layout_changes } from './pending-row-store';
+
+/**
+ * Structural conflicts about a whole worksheet rather than a row or cell:
+ * they carry no row identities, and Review Changes answers them with a
+ * worksheet action ("Discard row and column changes on <sheet>").
+ */
+const WORKSHEET_LEVEL_STRUCTURAL_CONFLICTS: ReadonlySet<string> = new Set(['structuralBasisChanged']);
 import { column_letter } from './grid-model';
 import {
     clamp_row_height,
@@ -1003,6 +1013,46 @@ export function App(): React.JSX.Element {
     }
 
     /**
+     * Review Changes' "Discard row and column changes on <sheet>": drop the
+     * active worksheet's layout, as one history action, after the file changed
+     * under it. Cell edits and appended rows stay and reconcile as usual.
+     */
+    const discard_active_layout_changes = useCallback(() => {
+        const sheet_index = active_sheet_index;
+        const sheet = meta_ref.current?.sheets[sheet_index];
+        const session_id = csv_edit_session_id_ref.current;
+        if (sheet === undefined || session_id === undefined) return;
+        // Admitted like every other edit gesture: not across a save, a
+        // replay, an outstanding highlight, resize, or append.
+        if (save_in_flight_ref.current || !edit_gestures_admitted()) return;
+        const store = edit_session_registry_ref.current!.pending_rows_for_sheet(sheet_index);
+        const before = store.snapshot();
+        const header = sheet.excelFirstRowHeader;
+        const result = discard_layout_changes(before, {
+            worksheet: {
+                sheetIndex: sheet_index,
+                sheetName: sheet.name,
+                ...(sheet.worksheetId === undefined ? {} : { worksheetId: sheet.worksheetId }),
+            },
+            bodyStart: header?.active === true && header.sourceRow !== undefined ? header.sourceRow + 1 : 0,
+            sourceRowCount: sheet.sourceRowCount,
+            sourceColumnCount: sheet.columnCount,
+            bodyViewTransformed: false,
+        });
+        if (!result.ok) {
+            host_bridge.postMessage({ type: 'showWarning', message: result.refusal.message });
+            return;
+        }
+        const staged_store = store.stage_replace(session_id, before, result.outcome.next);
+        if (staged_store === undefined) return;
+        const record = history_store_ref.current!.stage_record({
+            label: `Discard row and column changes on ${sheet.name}`,
+            changes: [result.outcome.change],
+        });
+        commit_staged_transaction([record, staged_store]);
+    }, [active_sheet_index]);
+
+    /**
      * Record a highlight gesture this window made, once the host has applied it.
      *
      * A plain record with nothing staged alongside it: unlike a cell edit, the
@@ -1334,6 +1384,9 @@ export function App(): React.JSX.Element {
     const [pending_preview_scroll, set_pending_preview_scroll] =
         useState<PendingPreviewScroll | null>(null);
     const [saved_row_focus, set_saved_row_focus] = useState<SavedRowFocus | null>(null);
+    /** An unresolved structural save the host asks the user about. */
+    const [structural_save_notice, set_structural_save_notice] =
+        useState<StructuralSaveUnresolvedNotice | null>(null);
     const [pending_row_focus, set_pending_row_focus] = useState<PendingRowFocus | null>(null);
     const [grid_focus_restore, set_grid_focus_restore_state] =
         useState<GridFocusRestoreState | null>(null);
@@ -2431,8 +2484,80 @@ export function App(): React.JSX.Element {
             operation.saveRequestId,
         ]);
         if (processed_save_receipts_ref.current.has(receipt_key)) return false;
+        const mark_processed = () => {
+            processed_save_receipts_ref.current.add(receipt_key);
+            while (processed_save_receipts_ref.current.size > 128) {
+                const oldest = processed_save_receipts_ref.current.values().next().value;
+                if (oldest === undefined) break;
+                processed_save_receipts_ref.current.delete(oldest);
+            }
+        };
 
         const sheets = meta_ref.current?.sheets ?? [];
+        if (receipt_has_structure(receipt)) {
+            // A save that inserted, deleted, or moved rows or columns renumbered
+            // the source coordinates every recorded action names, so it
+            // installs the workbook-wide `structural-save` barrier instead of
+            // rekeying history, and neither its inserted nor its appended rows
+            // feed cross-save undo (design "History" and "Receipt").
+            history_store_ref.current!.install_structural_save_barrier();
+            // Selection by identity: a cursor on a Pending Row lands on the
+            // row it became. A cursor on a source cell is restored by the
+            // grid's own focus restore at its display position.
+            // TODO(structure step 5 UI): map a source-cell cursor through
+            // `structure_row_mapper` once the grid exposes its active source cell.
+            const pending_focus = pending_save_grid_focus_ref.current?.pendingCell;
+            const placements = [
+                ...receipt.appendedRows,
+                ...(receipt.structure ?? []).flatMap((entry) => entry.insertedRows.map((row) => ({
+                    ...entry,
+                    pendingRowId: row.pendingRowId,
+                    sourceRow: row.sourceRow,
+                }))),
+            ];
+            const placed = pending_focus === undefined
+                ? undefined
+                : placements.find((candidate) => candidate.pendingRowId === pending_focus.pendingRowId);
+            const placed_sheet = placed === undefined ? undefined : worksheet_target_index(sheets, placed);
+            if (placed !== undefined && placed_sheet !== undefined && pending_focus !== undefined) {
+                const entry = receipt.structure?.find((candidate) =>
+                    worksheet_target_index(sheets, candidate) === placed_sheet);
+                const column = entry === undefined || pending_focus.sourceColumn >= entry.columnMap.length
+                    ? pending_focus.sourceColumn
+                    : entry.columnMap[pending_focus.sourceColumn] ?? null;
+                if (column !== null) {
+                    set_saved_row_focus({
+                        sequence: ++saved_row_focus_sequence_ref.current,
+                        sheetIndex: placed_sheet,
+                        sourceRow: placed.sourceRow,
+                        sourceColumn: column,
+                        restoreFocus: pending_save_grid_focus_ref.current?.restoreFocus === true,
+                    });
+                }
+            }
+            // Clear what the save wrote from each worksheet's structural store:
+            // its saved Pending Rows, its tail removals, and, where the save
+            // restructured it, its layouts, Pending Columns, and basis.
+            for (const [sheet_index] of sheets.entries()) {
+                const restructured = (receipt.structure ?? []).some((entry) =>
+                    worksheet_target_index(sheets, entry) === sheet_index);
+                const pending_ids = new Set(placements
+                    .filter((assignment) => worksheet_target_index(sheets, assignment) === sheet_index)
+                    .map((assignment) => assignment.pendingRowId));
+                const removed_rows = new Set(receipt.removedSourceRows
+                    .filter((removal) => worksheet_target_index(sheets, removal) === sheet_index)
+                    .flatMap((removal) => removal.sourceRows));
+                if (!restructured && pending_ids.size === 0 && removed_rows.size === 0) continue;
+                edit_session_registry_ref.current!.pending_rows_for_sheet(sheet_index).clear_saved(
+                    operation.editSessionId,
+                    pending_ids,
+                    removed_rows,
+                    restructured,
+                );
+            }
+            mark_processed();
+            return true;
+        }
         const operation_worksheets = save_operation_worksheets(operation);
         const saved_history_rows = receipt.appendedRows.flatMap((assignment) => {
             const sheet_index = worksheet_target_index(sheets, assignment);
@@ -2563,12 +2688,7 @@ export function App(): React.JSX.Element {
             );
         }
 
-        processed_save_receipts_ref.current.add(receipt_key);
-        while (processed_save_receipts_ref.current.size > 128) {
-            const oldest = processed_save_receipts_ref.current.values().next().value;
-            if (oldest === undefined) break;
-            processed_save_receipts_ref.current.delete(oldest);
-        }
+        mark_processed();
         return true;
     }, []);
 
@@ -4181,6 +4301,10 @@ export function App(): React.JSX.Element {
                 }
             }
 
+            if (msg.type === 'structuralSaveUnresolved') {
+                set_structural_save_notice(msg.notice);
+            }
+
             if (
                 msg.type === 'scrollToRow'
                 && preview_mode_ref.current
@@ -5445,14 +5569,15 @@ export function App(): React.JSX.Element {
                         settleRestorations: restoration_settlements,
                     };
                     restorations_handed_off = true;
-                    const barrier_label = history_store_ref.current?.snapshot().barrier?.label;
+                    const barrier = history_store_ref.current?.snapshot().barrier;
                     const outcome = await coordinator.begin(direction);
                     if (document_epoch_ref.current !== replay_document_epoch) return;
                     if (outcome.kind === 'refused') {
                         const warning = history_refusal_warning(
                             outcome.reason,
                             direction,
-                            barrier_label,
+                            barrier?.label,
+                            barrier?.reason,
                         );
                         if (warning !== null) {
                             host_bridge.postMessage({ type: 'showWarning', message: warning });
@@ -5474,11 +5599,16 @@ export function App(): React.JSX.Element {
         }
         // Read BEFORE the replay: a `blocked` refusal is about the barrier that was
         // in the way, and the stack may move under the await.
-        const barrier_label = history_store_ref.current?.snapshot().barrier?.label;
+        const barrier = history_store_ref.current?.snapshot().barrier;
         const outcome = await coordinator.begin(direction);
         if (document_epoch_ref.current !== replay_document_epoch) return;
         if (outcome.kind !== 'refused') return;
-        const warning = history_refusal_warning(outcome.reason, direction, barrier_label);
+        const warning = history_refusal_warning(
+            outcome.reason,
+            direction,
+            barrier?.label,
+            barrier?.reason,
+        );
         if (warning !== null) host_bridge.postMessage({ type: 'showWarning', message: warning });
     }, [active_sheet_index, handle_sheet_select]);
 
@@ -6772,8 +6902,11 @@ export function App(): React.JSX.Element {
                                 formulaCells: Object.freeze(formula_cells),
                             }),
                         });
+                        // A Structural Basis conflict belongs to the whole
+                        // worksheet; its action is a discard, not a row.
                         if (
-                            actionable_conflict.pendingRowIds.length === 0
+                            !WORKSHEET_LEVEL_STRUCTURAL_CONFLICTS.has(actionable_conflict.reason)
+                            && actionable_conflict.pendingRowIds.length === 0
                             && actionable_conflict.tailRemovalIds.length === 0
                             && (actionable_conflict.formulaCells?.length ?? 0) === 0
                         ) {
@@ -8621,7 +8754,11 @@ export function App(): React.JSX.Element {
                                                 ? 'The worksheet no longer has room for every pending row.'
                                                 : conflict.reason === 'templateChanged'
                                                     ? 'The row-format template changed.'
-                                                    : 'The saved worksheet suffix changed.'}
+                                                    : conflict.reason === 'structuralBasisChanged'
+                                                        ? `${current_sheet.name} changed on disk after you inserted, deleted, or moved rows or columns. Table Viewer can't tell where those changes belong in the new version.`
+                                                        : conflict.reason === 'unsupportedStructure'
+                                                            ? 'The worksheet gained a structure Table Viewer cannot shift.'
+                                                            : 'The saved worksheet suffix changed.'}
                             </li>
                         ))}
                     </ul>
@@ -8670,6 +8807,16 @@ export function App(): React.JSX.Element {
                                 Cancel affected row removals
                             </button>
                         )}
+                        {/* "Keep new rows at the end" converts Pending Inserted
+                            Rows to appends, so it is offered once inserting
+                            lands (delivery step 6); until then a worksheet has
+                            no inserted rows for it to keep. */}
+                        {structural_conflicts.some((conflict) =>
+                            conflict.reason === 'structuralBasisChanged') && (
+                            <button onClick={discard_active_layout_changes}>
+                                {`Discard row and column changes on ${current_sheet.name}`}
+                            </button>
+                        )}
                         <button
                             onClick={() => {
                                 set_dismissed_structural_conflict_signature(
@@ -8682,6 +8829,37 @@ export function App(): React.JSX.Element {
                         </button>
                     </div>
                 </section>
+            )}
+            {structural_save_notice !== null && (
+                // The host could not tell whether the last structural save of
+                // this file finished. Editing is refused and the restructured
+                // worksheets render without source-keyed highlights, hidden rows,
+                // and widths until the user answers; the default action is the
+                // host's hint from the file's row and column counts.
+                <div className="external-change-banner structural-save-notice" role="alert">
+                    {structural_save_notice.message}
+                    {structural_save_notice.suggestion === 'finished'
+                        ? " The file's shape matches the saved changes."
+                        : ''}
+                    <div className="external-change-banner-actions">
+                        {(['finished', 'notFinished'] as const).map((choice) => (
+                            <button
+                                key={choice}
+                                autoFocus={structural_save_notice.suggestion === choice}
+                                className={structural_save_notice.suggestion === choice ? 'primary' : undefined}
+                                onClick={() => {
+                                    host_bridge.postMessage({
+                                        type: 'resolveStructuralSave',
+                                        saveId: structural_save_notice.saveId,
+                                        choice,
+                                    });
+                                }}
+                            >
+                                {choice === 'finished' ? 'It finished' : "It didn't finish"}
+                            </button>
+                        ))}
+                    </div>
+                </div>
             )}
             {show_external_change_banner && (
                 <div className="external-change-banner" role="status">
