@@ -781,6 +781,48 @@ describe('rekey intent ownership across processes', () => {
         await viewer.dispose();
     });
 
+    it('refuses a save whose intent would overwrite another save\'s live intent', async () => {
+        // Saves on one file are not serialized across processes: each host
+        // has its own file coordinator. A second process starts a structural
+        // save after this one loaded, so no load-time gate has seen it.
+        const drive = disk(BYTES);
+        const state = store_with({ pendingEdits: slot(REMOVAL) });
+        const viewer = await open_viewer({ state, disk: drive });
+        expect(viewer.session()).toMatchObject({ granted: true });
+        const current = state.get_state(FILE) as PerFileState;
+        await state.store.compare_and_set(FILE, state.revision(FILE), {
+            ...current,
+            structuralRekeyIntent: owned(Date.now() + 60_000),
+        });
+        expect(await viewer.save(REMOVAL)).toMatchObject({ success: false });
+        expect(viewer.warning).toHaveBeenCalledWith(
+            'Another Table Viewer window is saving this file. Try again when it finishes.');
+        expect(drive.file.writes).toHaveLength(0);
+        expect(viewer.durable().structuralRekeyIntent?.saveId).toBe('elsewhere');
+        expect(viewer.durable().pendingEdits?.[0]).toMatchObject(REMOVAL);
+        await viewer.dispose();
+    });
+
+    it('rechecks a lapsing lease without refreshing while the owner keeps it alive', async () => {
+        const state = store_with({ pendingEdits: slot(REMOVAL), structuralRekeyIntent: owned(Date.now() + 300) });
+        const viewer = await open_viewer({ state, disk: disk(BYTES), requestEdit: false });
+        // The owner renews before the recheck fires.
+        const current = state.get_state(FILE) as PerFileState;
+        await state.store.compare_and_set(FILE, state.revision(FILE), {
+            ...current,
+            structuralRekeyIntent: owned(Date.now() + 60_000),
+        });
+        const snapshots = () => viewer.messages().filter((message) => message.type === 'workbookSnapshot').length;
+        const before = snapshots();
+        const read = vi.spyOn(vscode_mock.workspace.fs, 'readFile');
+        // The recheck reads the file once; poll for that, not for time.
+        await vi.waitFor(() => expect(read).toHaveBeenCalled(), { timeout: 3_000 });
+        await viewer.controller.drain();
+        expect(snapshots()).toBe(before);
+        expect(viewer.durable().structuralRekeyIntent?.saveId).toBe('elsewhere');
+        await viewer.dispose();
+    });
+
     it('renews its own lease while a save runs', async () => {
         const drive = disk(BYTES);
         const state = store_with({ pendingEdits: slot(REMOVAL) });

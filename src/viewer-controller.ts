@@ -4945,8 +4945,10 @@ export function attach_viewer(
             null,
         );
         const latest = committed ?? await read_file_state(false);
-        if (intent !== undefined
-            && (latest.state as PerFileState).structuralRekeyIntent?.saveId === intent.saveId) {
+        const stored = (latest.state as PerFileState).structuralRekeyIntent;
+        // Without a specific intent, any intent still stored (a live one
+        // another process renewed, or one still unresolved) is unresolved.
+        if (intent === undefined ? stored !== undefined : stored?.saveId === intent.saveId) {
             return 'unresolved';
         }
         return intent !== undefined && digest === intent.afterDigest ? 'applied' : 'cleared';
@@ -10392,11 +10394,38 @@ export function attach_viewer(
                 });
                 IN_FLIGHT_STRUCTURAL_SAVES.add(intent.saveId);
                 rekey_intent = intent;
+                // One intent per file. Another save's intent, live in another
+                // process or left unresolved, must never be overwritten: its
+                // post-write step would find ours and skip its rekey. Saves on
+                // one file are not serialized across processes (each host has
+                // its own file coordinator), so this compare-and-set is where
+                // two structural saves meet; the second is refused and can be
+                // retried once the first settles.
+                let competing: StructuralRekeyIntent | undefined;
                 const stored = await update_file_state(
-                    (current) => ({ ...current, structuralRekeyIntent: intent }),
+                    (current) => {
+                        const existing = current.structuralRekeyIntent;
+                        competing = existing !== undefined && existing.saveId !== intent.saveId
+                            ? existing
+                            : undefined;
+                        return competing === undefined
+                            ? { ...current, structuralRekeyIntent: intent }
+                            : current;
+                    },
                     undefined,
                     () => save_operation_is_current(operation),
                 );
+                if (competing !== undefined) {
+                    const blocking: StructuralRekeyIntent = competing;
+                    finish_save_failure(
+                        operation,
+                        rekey_intent_is_live(blocking)
+                            ? FOREIGN_STRUCTURAL_SAVE_EDIT_MESSAGE
+                            : UNRESOLVED_STRUCTURAL_SAVE_EDIT_MESSAGE,
+                    );
+                    if (!disposed) observe_unresolved_structural_save((await read_file_state(false)).state as PerFileState);
+                    return;
+                }
                 if (!stored || (stored.state as PerFileState).structuralRekeyIntent?.saveId !== intent.saveId) {
                     throw new Error('The save operation changed before its row and column changes were recorded.');
                 }
