@@ -497,6 +497,43 @@ describe('Pending Columns reachable only from history', () => {
     });
 });
 
+describe('rows appended on disk under column-only changes', () => {
+    it('advances the basis over the grown file, and saves the new column across old and new rows', async () => {
+        const viewer = await open_viewer();
+        const reply = await viewer.insert({ requestId: 'cols' });
+        await viewer.settle('cols', true);
+        const [id] = reply.columnIds!;
+        const changes = inserted_changes(reply.columnIds!);
+        const typed = {
+            ...changes,
+            pendingColumns: [new_column(id!, { cells: { 's:0': { value: 'x' } } })],
+        };
+        expect(await viewer.publish(typed)).toBe(true);
+        expect(viewer.durable().pendingEdits?.[0]?.rowLayout).toBeUndefined();
+        // Another process appends two complete rows.
+        const grown = enc.encode(`${TEXT}c,5,6\nd,7,8\n`);
+        const grown_basis: StructuralBasis = {
+            kind: 'delimited',
+            byteLength: grown.byteLength,
+            digest: hex(grown),
+            sourceRowCount: 4,
+            sourceColumnCount: 3,
+        };
+        viewer.drive.file.bytes = grown;
+        viewer.drive.file.mtime += 1;
+        await vscode_mock.__getWatchers()[0]!.__fireChange();
+        await viewer.controller.drain();
+        await vi.waitFor(() => expect(viewer.durable().pendingEdits?.[0]?.structuralBasis).toEqual(grown_basis));
+        expect(viewer.durable().pendingEdits?.[0]).toMatchObject({ conflicts: [] });
+        expect(viewer.durable().pendingEdits?.[0]?.rowLayout).toBeUndefined();
+        // The column saves across the old rows and, blank, the appended ones.
+        expect(await viewer.save({ ...typed, structuralBasis: grown_basis })).toMatchObject({ success: true });
+        expect(dec.decode(viewer.drive.file.bytes))
+            .toBe('name,New column,"unit, price",qty\na,x,1,2\nb,,3,4\nc,,5,6\nd,,7,8\n');
+        await viewer.dispose();
+    });
+});
+
 describe('saving column changes', () => {
     // Column 1 ("unit, price") deleted, qty moved to the front, a Pending
     // Column "note" at the end.

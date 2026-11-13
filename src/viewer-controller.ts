@@ -5867,23 +5867,26 @@ export function attach_viewer(
                 if (structural_bases_equal(basis, current_basis)) {
                     if (others.length === changes.conflicts.length) continue;
                     replacement = { ...slot, conflicts: others };
-                } else if (
-                    changes.rowLayout !== undefined
-                    && is_delimited_prefix_growth(
-                        basis,
-                        bytes,
-                        get_delimiter(file_path),
-                        (prefix) => delimited_records_of(prefix, get_delimiter(file_path)),
-                    )
-                ) {
+                } else if (is_delimited_prefix_growth(
+                    basis,
+                    bytes,
+                    get_delimiter(file_path),
+                    (prefix) => delimited_records_of(prefix, get_delimiter(file_path)),
+                )) {
+                    // "External changes", step 2, for any layout change: the
+                    // appended rows join after the last source run. Without a
+                    // row layout (column changes only) the implicit source
+                    // layout already covers them, so only the basis advances.
                     replacement = {
                         ...slot,
-                        rowLayout: rebase_row_layout_on_growth(
-                            changes.rowLayout,
-                            0,
-                            basis.sourceRowCount,
-                            sheet.sourceRowCount,
-                        ),
+                        ...(changes.rowLayout === undefined ? {} : {
+                            rowLayout: rebase_row_layout_on_growth(
+                                changes.rowLayout,
+                                0,
+                                basis.sourceRowCount,
+                                sheet.sourceRowCount,
+                            ),
+                        }),
                         structuralBasis: current_basis,
                         conflicts: others,
                     };
