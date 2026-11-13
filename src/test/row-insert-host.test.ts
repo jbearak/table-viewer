@@ -708,3 +708,150 @@ describe('saving inserted rows', () => {
         await viewer.dispose();
     });
 });
+
+describe('review fixes', () => {
+    it('accepts a publication of part of an insert gesture whose other rows were deleted', async () => {
+        const viewer = await open_viewer();
+        const reply = await viewer.insert({ requestId: 'ins', count: 2 });
+        await viewer.settle('ins', true);
+        const [a, b] = reply.rowIds!;
+        const template = reply.formatTemplate!.id;
+        // `b` was deleted before the gesture's first publication, and its
+        // tombstone dropped: only `a` is published.
+        const only_a = insert_changes(reply, [inserted(a!, template, 1)]);
+        expect(await viewer.publish(only_a)).toBe(true);
+        // Undo of that delete brings `b` back; its ID is still owned.
+        expect(await viewer.publish(insert_changes(reply))).toBe(true);
+        expect(await viewer.publish(only_a)).toBe(true);
+        expect(await viewer.save(only_a)).toMatchObject({ success: true });
+        expect(dec.decode(viewer.file.bytes)).toBe('h1,h2\na,1\n,\nb,2\nc,3\n');
+        void b;
+        await viewer.dispose();
+    });
+
+    function set_transform(viewer: Awaited<ReturnType<typeof open_viewer>>, request_id: string) {
+        const snapshot = viewer.last<{ snapshot: { generation: number; sourceGeneration: number } }>(
+            'workbookSnapshot').snapshot;
+        return viewer.panel.__receive({
+            type: 'setTransform',
+            sheetIndex: 0,
+            requestId: request_id,
+            generation: snapshot.generation,
+            sourceGeneration: snapshot.sourceGeneration,
+            intent: 'user',
+            state: { sort: [{ colIndex: 0, direction: 'asc' }], filters: [], schema: SCHEMA },
+        } as never) as Promise<void>;
+    }
+
+    it('refuses a sort commit while an insert is outstanding or inserted rows exist', async () => {
+        const viewer = await open_viewer();
+        const reply = await viewer.insert({ requestId: 'ins' });
+        expect(reply.granted).toBe(true);
+        // Unsettled admission: the sort may not commit.
+        await set_transform(viewer, 'sort-unsettled');
+        await viewer.controller.drain();
+        expect(viewer.durable().transforms?.[0]).toBeUndefined();
+
+        await viewer.settle('ins', true);
+        expect(await viewer.publish(insert_changes(reply))).toBe(true);
+        // Inserted rows in durable Pending Changes: still refused.
+        await set_transform(viewer, 'sort-inserted');
+        await viewer.controller.drain();
+        expect(viewer.durable().transforms?.[0]).toBeUndefined();
+
+        // Once the inserted rows are gone, sorting works again.
+        expect(await viewer.publish({})).toBe(true);
+        await set_transform(viewer, 'sort-after');
+        await viewer.controller.drain();
+        expect(viewer.durable().transforms?.[0]).toMatchObject({ sort: [{ colIndex: 0, direction: 'asc' }] });
+        await viewer.dispose();
+    });
+
+    it('refuses an insert under an installed sort and while a sort is in flight', async () => {
+        const sorted = await open_viewer({
+            state: versioned_state_store({
+                transforms: [{ sort: [{ colIndex: 0, direction: 'desc' }], filters: [], schema: SCHEMA }],
+            }),
+        });
+        expect(await sorted.insert({ requestId: 'sorted' })).toMatchObject({
+            granted: false,
+            reason: 'Clear sorts, filters, and hidden rows to insert or move rows.',
+        });
+        await sorted.dispose();
+
+        const viewer = await open_viewer();
+        viewer.gate.arm();
+        const sort = set_transform(viewer, 'sort-in-flight');
+        await viewer.gate.reached();
+        // The reply is posted while the sort is still computing (its handler
+        // stays parked behind the paused read, so poll rather than await it).
+        void viewer.send_insert({ requestId: 'during-sort' });
+        await vi.waitFor(() => expect(viewer.reply('during-sort')).toMatchObject({
+            granted: false,
+            reason: STRUCTURAL_INSERT_GATE_MESSAGE,
+        }));
+        viewer.gate.release();
+        await sort;
+        await viewer.dispose();
+    });
+
+    it('replays inserted rows into a new session, keeping their insert origin', async () => {
+        const viewer = await open_viewer();
+        const reply = await viewer.insert({ requestId: 'ins' });
+        await viewer.settle('ins', true);
+        const id = reply.rowIds![0]!;
+        // History retains the row, as the webview reports.
+        await viewer.panel.__receive({
+            type: 'retainedSavedAppendAuthoritiesChanged',
+            authorities: [{ sheetIndex: 0, sheetName: 'Sheet1', appendHistoryIds: [], pendingRowIds: [id] }],
+        });
+        const changes = insert_changes(reply, [inserted(id, reply.formatTemplate!.id, 1, {
+            cells: { 0: { value: 'typed', valueEditOrder: 1 } },
+        } as never)]);
+        expect(await viewer.publish(changes)).toBe(true);
+        // Undo the insert, then leave Edit mode: the session's ledger hands
+        // the row's authority to the retained store.
+        expect(await viewer.publish({})).toBe(true);
+        await viewer.panel.__receive({ type: 'releaseEditSession', editSessionId: viewer.session_id()! });
+        await viewer.controller.drain();
+
+        // Back in Edit mode, Redo replays the insert against a new ledger.
+        await viewer.panel.__receive({ type: 'requestEditSession', requestId: 'again' });
+        await viewer.controller.drain();
+        expect(viewer.last<{ granted: boolean }>('editSessionResult').granted).toBe(true);
+        const empty = { formatTemplates: [], appendedRows: [], tailRemovals: [], conflicts: [] };
+        await viewer.panel.__receive({
+            type: 'prepareHistoryReplay',
+            request: {
+                requestId: 'redo-prepare',
+                replayId: 'redo-replay',
+                cells: [],
+                highlights: [],
+                structures: [{
+                    ordinal: 0,
+                    worksheet: { sheetIndex: 0, sheetName: 'Sheet1' },
+                    expected: empty,
+                    desired: changes,
+                }],
+                focus: {
+                    worksheet: { sheetIndex: 0, sheetName: 'Sheet1' },
+                    sourceRowStart: 0,
+                    sourceRowEnd: 0,
+                    sourceColumnStart: 0,
+                    sourceColumnEnd: 0,
+                },
+            },
+        });
+        await viewer.controller.drain();
+        await vi.waitFor(() => expect(viewer.messages().some((message) =>
+            message.type === 'historyReplayPrepared'
+            || message.type === 'historyReplayPrepareRefused')).toBe(true));
+        expect(viewer.last<{ type: string }>('historyReplayPrepareRefused')).toBeUndefined();
+        // The publication the replay leads to is accepted, origin and all.
+        expect(await viewer.publish(changes)).toBe(true);
+        expect(viewer.durable().pendingEdits?.[0]?.appendedRows).toEqual([
+            expect.objectContaining({ id, origin: 'insert' }),
+        ]);
+        await viewer.dispose();
+    });
+});

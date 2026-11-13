@@ -8771,6 +8771,31 @@ describe('row Insert in the row-gutter menu', () => {
         expect(undo.plans[0]!.next).toEqual(inserted);
     });
 
+    it('does not request an insert once a sort has started since the menu opened', async () => {
+        const host = admission(['ins-a']);
+        const base = structure_props({
+            edit_session: create_edit_session_store({ session_id: 'session' }),
+            pending_row_store: create_pending_row_store({ session_id: 'session' }),
+            on_insert_rows: host.on_insert_rows,
+        });
+        const GridShell = await render_grid(base);
+        await open_row_menu(1);
+        const item = menu_item('Insert row above')!;
+        expect(item.getAttribute('aria-disabled')).toBeNull();
+        // A sort request goes out while the menu is still open.
+        await act(async () => {
+            root!.render(React.createElement(GridShell, { ...base, transform_pending: true }));
+        });
+        // The open menu follows: Insert is disabled with the reason.
+        const current = menu_item('Insert row above')!;
+        expect(current.getAttribute('aria-disabled')).toBe('true');
+        expect(current.getAttribute('aria-description'))
+            .toBe('Clear sorts, filters, and hidden rows to insert or move rows.');
+        await act(async () => current.click());
+        await act(async () => item.click());
+        expect(host.on_insert_rows).not.toHaveBeenCalled();
+    });
+
     it('cancels an insert whose anchor was removed while the request was out', async () => {
         const pending = create_pending_row_store({ session_id: 'session' });
         const host = admission(['ins-a']);

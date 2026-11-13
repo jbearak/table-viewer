@@ -489,6 +489,7 @@ import {
     create_pending_row_store,
     type PendingRowStoreChange,
     type PendingRowStore,
+    STRUCTURE_TRANSFORMED_MESSAGE,
     TOO_MANY_PENDING_ROWS_MESSAGE,
     type WorksheetStructureContext,
 } from './pending-row-store';
@@ -4554,6 +4555,12 @@ export function GridShell({
         count: number,
     ): Promise<boolean> => {
         if (on_insert_rows === undefined || !structure_gesture_admitted()) return false;
+        // The menu was built before this click: re-check that no sort,
+        // filter, or hide was installed or started since.
+        if (structure_context_ref.current.bodyViewTransformed) {
+            host_bridge.postMessage({ type: 'showWarning', message: STRUCTURE_TRANSFORMED_MESSAGE });
+            return false;
+        }
         const session_id = edit_session_id;
         const display_column = grid_selection_ref.current.current?.cell[0] ?? 0;
         const admitted = await on_insert_rows({ anchor, side, count });

@@ -6540,6 +6540,16 @@ export function App(): React.JSX.Element {
             || !Number.isSafeInteger(request.count)
             || request.count <= 0
         ) return Promise.resolve(undefined);
+        // A sort, filter, or hide still computing would commit after the
+        // insert, under the inserted-rows lock: the host refuses the overlap
+        // too, and this keeps the request from being sent at all.
+        if (pending_transform_request_ids_ref.current[active_sheet_index] !== undefined) {
+            host_bridge.postMessage({
+                type: 'showWarning',
+                message: 'Wait for sorting and filtering to finish, then insert again.',
+            });
+            return Promise.resolve(undefined);
+        }
         const source_generation = source_generation_ref.current;
         const request_id = [
             'insert',

@@ -5649,6 +5649,33 @@ describe('edit mode save exit', () => {
         });
     });
 
+    it('does not request a row insert while a sort request is pending', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1'], false), {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        await enter_edit_mode(post_message, 'sort-session');
+        const change_transform = grid_shell_mock.latest_props?.on_transform_change as (
+            state: SheetTransformState,
+        ) => void;
+        await act(async () => change_transform({ sort: [{ colIndex: 0, direction: 'asc' }], filters: [] }));
+        expect(post_message.mock.calls.some(([message]) => message?.type === 'setTransform')).toBe(true);
+        post_message.mockClear();
+        const request_insert = grid_shell_mock.latest_props!.on_insert_rows as
+            (request: unknown) => Promise<unknown>;
+        let admitted: unknown = 'unset';
+        await act(async () => {
+            admitted = await request_insert({ anchor: { kind: 'source', sourceRow: 0 }, side: 'after', count: 1 });
+        });
+        expect(admitted).toBeUndefined();
+        expect(post_message.mock.calls.some(([message]) => message?.type === 'requestStructuralInsert'))
+            .toBe(false);
+        expect(post_message.mock.calls.map(([message]) => message)).toContainEqual({
+            type: 'showWarning',
+            message: 'Wait for sorting and filtering to finish, then insert again.',
+        });
+    });
+
     it('keeps new rows at the end from Review Changes', async () => {
         const { post_message } = await render_app();
         const meta = make_meta(['Sheet1'], false);

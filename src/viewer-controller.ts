@@ -699,7 +699,24 @@ const MAX_ACTIONABLE_STRUCTURAL_CONFLICT_ROW_IDS = 16;
 
 /** Why an insert admission was refused while a save, discard, undo, or cleanup runs. */
 export const STRUCTURAL_INSERT_GATE_MESSAGE =
-    'Wait for the current save, discard, or undo to finish, then insert again.';
+    'Wait for the current save, discard, undo, or sort to finish, then insert again.';
+
+/** Why an insert was refused under an installed sort, filter, or hidden rows. */
+export const INSERT_TRANSFORMED_MESSAGE =
+    'Clear sorts, filters, and hidden rows to insert or move rows.';
+
+/** Why a sort, filter, or hide-rows commit was refused while inserted rows exist. */
+export const INSERTED_ROWS_TRANSFORM_MESSAGE =
+    'Save or discard inserted and moved rows to sort, filter, or hide rows.';
+
+/** Whether a transform state reorders, filters, or hides body rows. */
+function transform_moves_rows(state: SheetTransformState | undefined): boolean {
+    return state !== undefined && (
+        state.sort.length > 0
+        || state.filters.some((filter) => filter.enabled)
+        || (state.hiddenRows?.length ?? 0) > 0
+    );
+}
 
 /** Why a save was refused while an insert or append admission is unsettled. */
 export const UNSETTLED_ADMISSION_SAVE_MESSAGE =
@@ -2838,13 +2855,23 @@ export function attach_viewer(
         ledger_key: string,
     ): readonly [string, RowAdmissionReservation][] => [...row_admission_reservations]
         .filter(([, reservation]) => reservation.ledgerKey === ledger_key);
-    /** An admitted gesture may be omitted or included whole, never split. */
+    /**
+     * An admitted gesture may be omitted or included whole, never split.
+     *
+     * Except an insert: each inserted row can be deleted on its own before
+     * the gesture's first publication, and a deleted row's tombstone is
+     * dropped unless a Formula Anchor names it, so any subset of an insert's
+     * IDs is a legitimate publication. Its IDs stay owned while any is
+     * published (see the retirement in `plan_pending_structural_publication`), and a foreign ID is still refused by the
+     * ledger ownership check.
+     */
     const row_admission_gestures_are_complete = (
         reservations: readonly RowAdmissionReservation[],
         rows: readonly Pick<PendingAppendedRow, 'id'>[],
     ): boolean => {
         const row_ids = new Set(rows.map((row) => row.id));
         return reservations.every((reservation) => {
+            if (reservation.purpose === 'insert') return true;
             const included = reservation.gestureRowIds.filter((row_id) =>
                 row_ids.has(row_id)).length;
             return included === 0 || included === reservation.gestureRowIds.length;
@@ -2995,6 +3022,7 @@ export function attach_viewer(
             ) continue;
             if (row.formatTemplateId !== authority.formatTemplateId) continue;
             ledger.ownedRowIds.add(row.id);
+            if (authority.insertMinted === true) ledger.insertMintedRowIds.add(row.id);
             ledger.templateIdByRowId.set(row.id, authority.formatTemplateId);
             templates.set(authority.formatTemplate.id, authority.formatTemplate);
             if (authority.appendBasis !== undefined) {
@@ -3009,6 +3037,21 @@ export function attach_viewer(
         }
         return templates;
     };
+
+    /**
+     * The ledger origin rule's question: did an insert mint `id` on this
+     * worksheet? Yes when the session's ledger says so, or when the retained
+     * authority for this same target does: Undo after a Discard replays
+     * history rows with their insert origin against a new session's ledger,
+     * which learns the origin only when the row is projected, after this
+     * check runs on both the publication and the replay path.
+     */
+    const minted_as_insert = (
+        target: WorksheetTarget,
+        id: string,
+        ledger: AppendAdmissionLedger | undefined,
+    ): boolean => ledger?.insertMintedRowIds.has(id) === true
+        || retained_pending_append_authorities.get(worksheet_target_key(target), id)?.insertMinted === true;
 
     /**
      * Check one worksheet's complete Pending Changes against the layout
@@ -3033,7 +3076,7 @@ export function attach_viewer(
                 : 0,
             sourceRowCount: changes.structuralBasis?.sourceRowCount ?? sheet.sourceRowCount,
             sourceColumnCount: changes.structuralBasis?.sourceColumnCount ?? sheet.columnCount,
-            mintedAsInsert: (id) => ledger?.insertMintedRowIds.has(id) === true,
+            mintedAsInsert: (id) => minted_as_insert(target, id, ledger),
         });
         if (error === undefined) return undefined;
         console.warn('Refused pending layout state', { reason: error });
@@ -3077,7 +3120,7 @@ export function attach_viewer(
     ): string | undefined => {
         if (!pending_changes_carry_layout(changes)) return undefined;
         if (!structural_editing_enabled) return 'structural-editing-disabled';
-        if (inserted_rows(changes).some((row) => ledger?.insertMintedRowIds.has(row.id) !== true)) {
+        if (inserted_rows(changes).some((row) => !minted_as_insert(target, row.id, ledger))) {
             return 'insert-origin-not-minted-by-insert';
         }
         const column_ids = [
@@ -3214,8 +3257,12 @@ export function attach_viewer(
 
         const retiring_ids = new Set(retiring_reservations.map(([request_id]) => request_id));
         for (const [, reservation] of retiring_reservations) {
-            const included = reservation.gestureRowIds.every((row_id) =>
-                published_row_ids.has(row_id));
+            // An insert counts as published when any of its rows, live or
+            // tombstoned, is: the rest may have been deleted before this
+            // publication, and Undo of that delete must still find them owned.
+            const included = reservation.purpose === 'insert'
+                ? reservation.gestureRowIds.some((row_id) => published_row_ids.has(row_id))
+                : reservation.gestureRowIds.every((row_id) => published_row_ids.has(row_id));
             const retained_ids = new Set(reservation.rowIds.filter((row_id) =>
                 retained_pending_append_keys.has(pending_append_history_key(
                     worksheet_target_key(target),
@@ -3525,6 +3572,9 @@ export function attach_viewer(
                     retained_pending_append_authorities.remember(target_key, id, {
                         formatTemplate: format_template,
                         formatTemplateId: format_template_id,
+                        // Undo after Discard replays the row with its insert
+                        // origin, against a new session's ledger.
+                        ...(ledger.insertMintedRowIds.has(id) ? { insertMinted: true as const } : {}),
                         ...(ledger.appendBasis === undefined
                             ? {}
                             : { appendBasis: ledger.appendBasis }),
@@ -4039,12 +4089,54 @@ export function attach_viewer(
     /**
      * Host ordering rule 2 for insert admission: a save, a discard (whose
      * cleanup holds the edit phase), a history replay, or a cleanup holds the
-     * session's lifecycle gate.
+     * session's lifecycle gate. Transform work in flight closes it too: a
+     * sort, filter, or hide admitted before the insert would otherwise commit
+     * after it, under the inserted-rows lock (see `insert_transform_refusal`
+     * for the other direction).
      */
     function structural_insert_gate_closed(): boolean {
         return edit_cleanup_blocked()
             || save_blocks_history_replay()
-            || history_replay_blocks_save();
+            || history_replay_blocks_save()
+            || transform_work_in_flight();
+    }
+
+    /**
+     * The transform side of insert/transform exclusivity, asked at the
+     * commit boundary: a state that sorts, filters, or hides rows on a
+     * worksheet may not commit while an insert admission on it is outstanding
+     * (unsettled, or accepted and not yet published) or while its durable
+     * Pending Changes hold inserted rows.
+     */
+    function insert_transform_refusal(
+        sheet_index: number,
+        state: SheetTransformState,
+        current?: PerFileState,
+    ): string | undefined {
+        if (!transform_moves_rows(state)) return undefined;
+        const sheets = source?.meta().sheets;
+        const sheet = sheets?.[sheet_index];
+        if (sheet === undefined) return undefined;
+        const target_key = worksheet_target_key({
+            sheetIndex: sheet_index,
+            sheetName: sheet.name,
+            ...(sheet.worksheetId === undefined ? {} : { worksheetId: sheet.worksheetId }),
+        });
+        for (const reservation of row_admission_reservations.values()) {
+            if (reservation.purpose === 'insert' && reservation.ledgerKey.endsWith(`\u0000${target_key}`)) {
+                return INSERTED_ROWS_TRANSFORM_MESSAGE;
+            }
+        }
+        if (current !== undefined) {
+            const slot = pending_changes_for_sheet(
+                reconcile_pending_edit_sheets(current.pendingEdits, sheets!),
+                sheet_index,
+                sheet.name,
+                sheet.worksheetId,
+            );
+            if (inserted_rows(slot).length > 0) return INSERTED_ROWS_TRANSFORM_MESSAGE;
+        }
+        return undefined;
     }
 
     /** Mirror of history_replay_blocks_save for replay admission. */
@@ -6967,7 +7059,9 @@ export function attach_viewer(
         const transform_is_current_before_commit = () =>
             authority.receiverEpoch === receiver_epoch
             && transform_authority_is_current(message, authority)
-            && transform_commit_admission_refusal() === undefined;
+            && transform_commit_admission_refusal() === undefined
+            && insert_transform_refusal(message.sheetIndex, state) === undefined;
+        let refused_for_inserted_rows = false;
         const write_basis: FileStateWriteBasis = {
             expectedAuthorityRevision: authority.authorityRevision,
             expectedPhysicalRevision: source_authority.physicalRevision,
@@ -6976,6 +7070,10 @@ export function attach_viewer(
         transform_commit_barriers.add(authority);
         const committed = await update_file_state((current) => {
             const sheet = source?.meta().sheets[message.sheetIndex];
+            if (insert_transform_refusal(message.sheetIndex, state, current) !== undefined) {
+                refused_for_inserted_rows = true;
+                return current;
+            }
             if (
                 !transform_is_current_before_commit()
                 || !sheet
@@ -7008,7 +7106,9 @@ export function attach_viewer(
             // error type and not just its own message, because `panel-core` has to
             // answer the two cases differently — transient here, terminal below — and
             // discriminating on message text is not a discrimination.
-            const refusal = transform_commit_admission_refusal();
+            const refusal = transform_commit_admission_refusal()
+                ?? insert_transform_refusal(message.sheetIndex, state)
+                ?? (refused_for_inserted_rows ? INSERTED_ROWS_TRANSFORM_MESSAGE : undefined);
             if (refusal !== undefined) {
                 throw new TransformAdmissionLapsedError(refusal);
             }
@@ -9443,6 +9543,11 @@ export function attach_viewer(
             return;
         }
         const state = (reconciled_against(state_snapshot, source).state) as PerFileState;
+        // Inserting needs the display order to equal the physical order.
+        if (transform_moves_rows(state.transforms?.[sheet_index] ?? undefined)) {
+            await refuse(INSERT_TRANSFORMED_MESSAGE);
+            return;
+        }
         const reconciled = reconcile_pending_edit_sheets(
             state.pendingEdits,
             source.meta().sheets,
