@@ -408,8 +408,8 @@ describe('apply_structural_rekey', () => {
         transforms: [{
             sort: [{ colIndex: 1, direction: 'asc' }, { colIndex: 2, direction: 'desc' }],
             filters: [
-                { id: 'f1', colIndex: 0, operator: 'contains', value: 'x', enabled: true },
-                { id: 'f2', colIndex: 1, operator: 'isEmpty', enabled: true },
+                { id: 'f1', colIndex: 0, operator: 'contains', value: 'x', enabled: true, caseSensitive: false },
+                { id: 'f2', colIndex: 1, operator: 'isEmpty', enabled: true, caseSensitive: false },
             ],
             hiddenRows: [1, 2, 3],
             schema: 'old',

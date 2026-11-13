@@ -23,7 +23,9 @@ const FILE = '/tmp/structural-layout-host.csv';
 const BASIS: StructuralBasis = {
     kind: 'delimited',
     byteLength: BYTES.length,
-    digest: 'sha256:recorded',
+    // The real basis of BYTES: a recorded basis that no longer matched the
+    // file would (correctly) record a structuralBasisChanged conflict on load.
+    digest: `sha256:${createHash('sha256').update(BYTES).digest('hex')}`,
     sourceRowCount: 3,
     sourceColumnCount: 1,
 };
@@ -358,7 +360,7 @@ describe('peer compatibility rule 3: the release gate', () => {
     it('refuses a save that carries layout fields', async () => {
         const viewer = await open_viewer({
             initial: slot({ rowLayout: REMOVAL_LAYOUT, structuralBasis: BASIS }),
-            structuralEditingEnabled: true,
+            structuralEditingEnabled: false,
         });
         const write = vi.spyOn(vscode_mock.workspace.fs, 'writeFile');
         await viewer.panel.__receive({
@@ -387,7 +389,7 @@ describe('peer compatibility rule 3: the release gate', () => {
             message.type === 'saveResult')).toMatchObject({ success: false });
         expect(write).not.toHaveBeenCalled();
         expect(viewer.warning).toHaveBeenCalledWith(
-            'Saving inserted, deleted, or moved rows and columns is not available yet.',
+            'Saving inserted, deleted, or moved rows and columns is not available in this version.',
         );
         expect(viewer.durable()).toMatchObject({ rowLayout: REMOVAL_LAYOUT });
         await viewer.dispose();

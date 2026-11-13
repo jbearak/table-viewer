@@ -146,6 +146,7 @@ import {
     worksheet_identity,
     worksheet_target_index,
     receipt_has_structure,
+    type StructuralSaveUnresolvedNotice,
     type StructuralRekeyIntent,
     worksheet_target_key,
     worksheet_target_lookup,
@@ -296,14 +297,6 @@ const SAVE_WINDOW = 10_000;
  */
 const IN_FLIGHT_STRUCTURAL_SAVES = new Set<string>();
 
-/**
- * Test seam: forget every in-flight structural save, as a process that died
- * mid-save would. Tests that simulate a stop after each step use it before
- * reopening the file in a new controller.
- */
-export function forget_in_flight_structural_saves_for_tests(): void {
-    IN_FLIGHT_STRUCTURAL_SAVES.clear();
-}
 
 const UNRESOLVED_STRUCTURAL_SAVE_EDIT_MESSAGE =
     "Choose whether your last save finished before editing this file.";
@@ -600,6 +593,16 @@ interface CsvEditFileState {
 // particular, releasing one panel after a successful write must not allow a
 // sibling panel to reclaim durable edits that have not yet been cleared.
 const csv_edit_file_states = new Map<string, CsvEditFileState>();
+
+/**
+ * Test seam: forget every in-process save and edit owner, as a process that
+ * died mid-save would. Tests that stop a structural save after each step use
+ * it before reopening the file in a new controller.
+ */
+export function simulate_process_restart_for_tests(): void {
+    IN_FLIGHT_STRUCTURAL_SAVES.clear();
+    csv_edit_file_states.clear();
+}
 let next_edit_session_host_epoch = 0;
 
 function allocate_edit_session_id(file_key: string): string {
@@ -4587,31 +4590,33 @@ export function attach_viewer(
      */
     function observe_unresolved_structural_save(state: PerFileState): void {
         const intent = unresolved_rekey_intent(state);
-        const sheets = source?.meta().sheets ?? [];
+        // The hint and the affected worksheets are answered by the installed
+        // workbook; before the first adoption there is none to ask.
+        if (source === undefined) return;
+        const sheets = source.meta().sheets;
         unresolved_structural_sheet_names = intent === undefined
             ? new Set()
             : new Set(structurally_affected_sheets(intent, sheets).map((index) => sheets[index]!.name));
-        if (intent?.saveId === posted_unresolved_save_id) return;
-        posted_unresolved_save_id = intent?.saveId;
-        post_unresolved_structural_save_notice(state);
+        const notice = unresolved_structural_save_notice(state);
+        const key = notice === null ? undefined : `${notice.saveId}\u0000${notice.suggestion}`;
+        if (key === posted_unresolved_save_id) return;
+        posted_unresolved_save_id = key;
+        void post_to_receiver({ type: 'structuralSaveUnresolved', notice });
     }
 
-    function post_unresolved_structural_save_notice(state: PerFileState): void {
+    function unresolved_structural_save_notice(state: PerFileState): StructuralSaveUnresolvedNotice | null {
         const intent = unresolved_rekey_intent(state);
         const sheets = source?.meta().sheets ?? [];
-        void post_to_receiver({
-            type: 'structuralSaveUnresolved',
-            notice: intent === undefined ? null : {
-                saveId: intent.saveId,
-                message: `Table Viewer can't tell whether your last save of ${display_file_name()} finished, `
-                    + 'because the file has changed since.',
-                suggestion: structural_receipt_shape_matches(
-                    intent.receipt,
-                    sheets,
-                    (target) => structural_payload_for(state, sheets, target),
-                ) ? 'finished' : 'notFinished',
-            },
-        });
+        return intent === undefined ? null : {
+            saveId: intent.saveId,
+            message: `Table Viewer can't tell whether your last save of ${display_file_name()} finished, `
+                + 'because the file has changed since.',
+            suggestion: structural_receipt_shape_matches(
+                intent.receipt,
+                sheets,
+                (target) => structural_payload_for(state, sheets, target),
+            ) ? 'finished' : 'notFinished',
+        };
     }
 
     function display_file_name(): string {
@@ -7711,6 +7716,9 @@ export function attach_viewer(
                     core = installed;
                     source = next;
                     source_authority = committed.receipt.resultingBasis;
+                    observe_unresolved_structural_save(
+                        committed.receipt.stateSnapshot.state as PerFileState,
+                    );
                     // An unspent replay lease is bound to the source and core
                     // being replaced here, so it can no longer be spent. Its own
                     // currency predicate would refuse the commit anyway; dropping
