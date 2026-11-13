@@ -265,7 +265,7 @@
     "desktop:package:release": "npm run desktop:prepackage && electron-builder --config desktop/electron-builder.yml --publish never --mac --arm64",
     "desktop:package:win": "npm run desktop:prepackage && node scripts/package-desktop-windows.mjs",
     "test:desktop-smoke": "npm run desktop:prepackage && playwright test --config=desktop/test-smoke/playwright.config.ts",
-    "test:desktop-smoke:relaunch": "npm run desktop:prepackage && playwright test --config=desktop/test-smoke/playwright.config.ts desktop/test-smoke/state-relaunch.spec.ts",
+    "test:desktop-smoke:relaunch": "npm run desktop:prepackage && playwright test --config=desktop/test-smoke/playwright.config.ts desktop/test-smoke/state-relaunch.spec.ts desktop/test-smoke/structure-relaunch.spec.ts",
     "test:desktop-perf": "npm run desktop:prepackage && playwright test --config=desktop/test-performance/playwright.config.ts",
     "perf:compare": "node benchmarks/grid/compare.mjs",
     "perf:ooxml": "node benchmarks/ooxml/run.mjs --compare benchmarks/ooxml/baselines/main-string-scanner.json",
