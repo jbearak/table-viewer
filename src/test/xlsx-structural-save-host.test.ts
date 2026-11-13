@@ -20,6 +20,7 @@ import {
     row_move_block_refusal,
     row_move_item_model,
     type RowStructureSelection,
+    row_structure_selection,
 } from '../webview/row-structure-model';
 import { content_digest } from '../content-digest';
 import { parse_xlsx } from '../parse-xlsx';
@@ -709,7 +710,7 @@ describe('row moves through the step 7 model on .xlsx', () => {
             merges: merge_ranges_of(support.merges!),
             structuralBasis: support.basis!,
         };
-        const selection = (rows: readonly number[]): RowStructureSelection => ({
+        const selection = (rows: readonly number[]): RowStructureSelection => row_structure_selection({
             count: rows.length,
             identities: rows.map((sourceRow) => ({ kind: 'source', sourceRow })),
             removedSourceRows: [],

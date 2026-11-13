@@ -36,6 +36,9 @@ import {
     STRUCTURE_BUSY_MESSAGE,
     type RowStructurePlan,
     type RowStructureSelection,
+    row_structure_selection,
+    plan_row_delete_runs,
+    plan_row_restore_runs,
 } from '../webview/row-structure-model';
 
 const worksheet: WorksheetTarget = { sheetIndex: 0, sheetName: 'data' };
@@ -74,7 +77,7 @@ function source(sourceRow: number): RowIdentity {
 }
 
 function selection(overrides: Partial<RowStructureSelection>): RowStructureSelection {
-    return {
+    return row_structure_selection({
         count: 1,
         identities: [source(2)],
         removedSourceRows: [],
@@ -84,7 +87,7 @@ function selection(overrides: Partial<RowStructureSelection>): RowStructureSelec
         bandRows: 0,
         endsAtBandEnd: false,
         ...overrides,
-    };
+    } as Parameters<typeof row_structure_selection>[0]);
 }
 
 describe('row Delete and Restore planning', () => {
@@ -272,7 +275,10 @@ describe('resolving a row selection', () => {
         });
         expect(resolved).toEqual({
             count: 4,
+            runs: [{ kind: 'source', start: 3, count: 2 }, { kind: 'pending', identity: { kind: 'pending', pendingRowId: 'a' } }],
             identities: [source(3), source(4), { kind: 'pending', pendingRowId: 'a' }],
+            removedSourceRuns: [{ start: 3, count: 1 }],
+            removedCount: 1,
             removedSourceRows: [3],
             fixedRows: true,
             tailRemovals: false,
@@ -295,6 +301,89 @@ describe('resolving a row selection', () => {
             resolve_row_structure_selection(projection, rows, { bodyStart: 0, isRemoved: () => false });
         expect(resolve([{ start: 0, end: 0 }]).identities).toEqual([source(4)]);
         expect(resolve([{ start: 0, end: 1 }]).identities).toBeUndefined();
+    });
+});
+
+describe('selections proportional to their runs', () => {
+    const rows = 1_000_000;
+    const big_context = () => context({
+        bodyStart: 1,
+        sourceRowCount: rows,
+        structuralBasis: { kind: 'delimited', byteLength: 4, digest: 'd', sourceRowCount: rows, sourceColumnCount: 2 },
+    });
+
+    it('resolves, plans, and focuses a select-all of a million-row layout without visiting each row', () => {
+        // One deleted row makes a layout; the selection is every display row.
+        const deleted = planned(plan_row_delete(EMPTY, big_context(), [source(10)], new Map())).outcome.next;
+        const base = create_pending_row_projection({
+            sourceDisplayRowCount: rows,
+            sourceRowAt: (row) => row,
+            displayRowForSource: (row) => row,
+            sourceRowCount: rows,
+            changes: deleted,
+            bodyStart: 1,
+            bodyViewTransformed: false,
+        });
+        let row_reads = 0;
+        const projection = { ...base, row_at: (row: number) => { row_reads += 1; return base.row_at(row); } };
+        const selection = resolve_row_structure_selection(projection, [{ start: 0, end: rows - 1 }], {
+            bodyStart: 1,
+            isRemoved: removed_source_row_test(deleted),
+            removedSourceRows: deleted.rowLayout!.removedSourceRows,
+        });
+        // The Header Row is the only row read on its own.
+        expect(row_reads).toBe(1);
+        expect(selection.count).toBe(rows);
+        expect(selection.fixedRows).toBe(true);
+        expect(selection.runs).toEqual([{ kind: 'source', start: 1, count: rows - 1 }]);
+        expect(selection.removedCount).toBe(1);
+        const model = row_structure_menu_model({
+            selection: { ...selection, fixedRows: false },
+            changes: deleted,
+            context: big_context(),
+            support: { supported: true },
+            ready: true,
+        });
+        expect(model.delete).toMatchObject({ enabled: true, count: rows });
+        const plan = planned(plan_row_delete_runs(deleted, big_context(), selection.runs!, new Map()));
+        // The Header Row and the row already deleted are not deleted again.
+        expect(plan.label).toBe(`Delete ${rows - 2} rows`);
+        expect(plan.outcome.next.rowLayout?.removedSourceRows).toEqual([{ start: 1, count: rows - 1 }]);
+        // After the delete, the nearest live row is found by skipping the removed run.
+        const after = create_pending_row_projection({
+            sourceDisplayRowCount: rows,
+            sourceRowAt: (row) => row,
+            displayRowForSource: (row) => row,
+            sourceRowCount: rows,
+            changes: plan.outcome.next,
+            bodyStart: 1,
+            bodyViewTransformed: false,
+        });
+        expect(after.nearest_live_display_row(500)).toBe(0);
+    });
+
+    it('maps an untransformed band-mode run through sourceRowsFor, and restores by intervals', () => {
+        const projection = create_pending_row_projection({
+            sourceDisplayRowCount: 10,
+            sourceRowAt: () => undefined,
+            displayRowForSource: (row) => row,
+            sourceRowCount: 10,
+            changes: EMPTY,
+        });
+        const selection = resolve_row_structure_selection(projection, [{ start: 2, end: 7 }], {
+            bodyStart: 0,
+            isRemoved: () => false,
+            sourceRowsFor: (start, count) => [{ start, count }],
+        });
+        expect(selection.runs).toEqual([{ kind: 'source', start: 2, count: 6 }]);
+        const deleted = planned(plan_row_delete_runs(EMPTY, context(), selection.runs!, new Map())).outcome.next;
+        const restored = planned(plan_row_restore_runs(deleted, context(), [{ start: 3, count: 2 }]));
+        expect(restored.label).toBe('Restore 2 rows');
+        expect(restored.outcome.next.rowLayout?.removedSourceRows).toEqual([
+            { start: 2, count: 1 },
+            { start: 5, count: 3 },
+        ]);
+        expect(plan_row_restore_runs(deleted, context(), [{ start: 8, count: 1 }]).ok).toBe(false);
     });
 });
 

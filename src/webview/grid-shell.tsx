@@ -537,6 +537,7 @@ import {
     STRUCTURE_TRANSFORMED_MESSAGE,
     TOO_MANY_PENDING_ROWS_MESSAGE,
     type WorksheetStructureContext,
+    type RowSelectionRun,
 } from './pending-row-store';
 import {
     nearest_live_row,
@@ -547,8 +548,11 @@ import {
     INSERTED_ROWS_TRANSFORM_MESSAGE,
     plan_row_insert,
     only_appended_rows,
+    only_appended_runs,
     plan_row_delete,
+    plan_row_delete_runs,
     plan_row_restore,
+    plan_row_restore_runs,
     removed_source_row_test,
     moved_block_display_rows,
     plan_row_move,
@@ -606,6 +610,7 @@ import {
     source_column_layout,
     type ColumnIdentity,
     type RowLayout,
+    type SourceInterval,
 } from '../worksheet-layout';
 import { scroll_preview_to_row } from './preview-scroll';
 import {
@@ -3384,6 +3389,7 @@ export function GridShell({
     const row_structure_selection_options = useMemo((): RowStructureSelectionOptions => ({
         bodyStart: body_start,
         isRemoved: is_removed_source_row,
+        removedSourceRows: pending_rows.rowLayout?.removedSourceRows ?? [],
         // Untransformed, a source-display row maps to its source row
         // arithmetically (skipping a promoted header row), so an unloaded row
         // still resolves.
@@ -3397,11 +3403,31 @@ export function GridShell({
                     ? source_row
                     : undefined;
             },
+            // The same mapping for a run: consecutive, except that it steps
+            // over a promoted header row.
+            sourceRowsFor: (source_display_start: number, count: number) => {
+                const out: { start: number; count: number }[] = [];
+                const push = (start: number, length: number) => {
+                    const capped = Math.min(length, sheet_meta.sourceRowCount - start);
+                    if (capped > 0) out.push({ start, count: capped });
+                };
+                const end = source_display_start + count;
+                if (promoted_header_row === undefined || end <= promoted_header_row) {
+                    push(source_display_start, count);
+                } else if (source_display_start >= promoted_header_row) {
+                    push(source_display_start + 1, count);
+                } else {
+                    push(source_display_start, promoted_header_row - source_display_start);
+                    push(promoted_header_row + 1, end - promoted_header_row);
+                }
+                return out;
+            },
         }),
     }), [
         body_start,
         body_view_transformed,
         is_removed_source_row,
+        pending_rows.rowLayout,
         promoted_header_row,
         sheet_meta.sourceRowCount,
     ]);
@@ -4194,14 +4220,8 @@ export function GridShell({
                 if (attempts < 120) window.requestAnimationFrame(poll);
                 return;
             }
-            const target = nearest_live_row(
-                display_row ?? from_row,
-                projection.rowCount,
-                (row) => {
-                    const state = projection.row_state(row);
-                    return state !== 'removed' && state !== 'tail-removal';
-                },
-            );
+            // Removed runs are skipped whole, so a large delete costs its runs.
+            const target = projection.nearest_live_display_row(display_row ?? from_row);
             if (target !== undefined && display_column_count > 0) {
                 select_active_display_cell([
                     Math.min(Math.max(0, display_column), display_column_count - 1),
@@ -4255,7 +4275,7 @@ export function GridShell({
         && (gestures_admitted === undefined || gestures_admitted())
     ), [edit_admission_is_fenced, gestures_admitted, save_in_flight_ref]);
     const delete_rows_gesture = useCallback((
-        identities: readonly RowIdentity[],
+        runs: readonly RowSelectionRun[],
         from_row: number,
     ): boolean => {
         if (!structure_gesture_admitted()) return false;
@@ -4263,24 +4283,26 @@ export function GridShell({
         const before = pending_store.snapshot();
         // Pending Appended Rows alone leave the layout as it is: the existing
         // removal, under the Delete item's name.
-        if (only_appended_rows(before, identities)) {
+        if (only_appended_runs(before, runs)) {
+            const identities = runs.flatMap((run) => run.kind === 'pending' ? [run.identity] : []);
             if (!remove_pending_rows(
-                identities.flatMap((identity) =>
-                    identity.kind === 'pending' ? [identity.pendingRowId] : []),
+                identities.map((identity) => identity.pendingRowId),
                 (count) => row_structure_label('Delete', count),
             )) return false;
             focus_after_row_delete(identities, from_row, display_column);
             return true;
         }
-        const plan = plan_row_delete(before, action_structure_context(), identities, store.snapshot());
+        const plan = plan_row_delete_runs(before, action_structure_context(), runs, store.snapshot());
         if (!plan.ok) {
             host_bridge.postMessage({ type: 'showWarning', message: plan.message });
             return false;
         }
         // Poll on a row this delete changed: one already removed would show
         // `removed` before the grid renders this delete.
-        const affected = identities.filter((identity) => identity.kind === 'pending'
-            || !is_removed_source_row_ref.current(identity.sourceRow));
+        const newly_removed = plan.outcome.removedSourceRows[0];
+        const affected: RowIdentity[] = newly_removed !== undefined
+            ? [{ kind: 'source', sourceRow: newly_removed.start }]
+            : runs.flatMap((run) => run.kind === 'pending' ? [run.identity] : []).slice(0, 1);
         if (!commit_row_structure_plan(plan)) return false;
         focus_after_row_delete(affected, from_row, display_column);
         return true;
@@ -4293,9 +4315,9 @@ export function GridShell({
         store,
         structure_gesture_admitted,
     ]);
-    const restore_rows_gesture = useCallback((source_rows: readonly number[]): boolean => {
+    const restore_rows_gesture = useCallback((source_rows: readonly SourceInterval[]): boolean => {
         if (!structure_gesture_admitted()) return false;
-        const plan = plan_row_restore(pending_store.snapshot(), action_structure_context(), source_rows);
+        const plan = plan_row_restore_runs(pending_store.snapshot(), action_structure_context(), source_rows);
         if (!plan.ok) {
             host_bridge.postMessage({ type: 'showWarning', message: plan.message });
             return false;
@@ -11262,7 +11284,7 @@ export function GridShell({
                                         ? {
                                             on_click: () => {
                                                 delete_rows_gesture(
-                                                    structure_selection.identities ?? [],
+                                                    structure_selection.runs ?? [],
                                                     row_menu.row,
                                                 );
                                             },
@@ -11284,7 +11306,7 @@ export function GridShell({
                                             ? {
                                                 on_click: () => {
                                                     restore_rows_gesture(
-                                                        structure_selection.removedSourceRows,
+                                                        structure_selection.removedSourceRuns,
                                                     );
                                                 },
                                             }
