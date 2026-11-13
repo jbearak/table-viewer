@@ -5325,6 +5325,28 @@ a new line char ""more quotes"" plus a tab  ."	https://google.com`)
             expect(moved).toHaveBeenCalledWith({ start: 5, end: 9 }, 12);
         });
 
+        test("targets the visible bottom edge, not the worksheet end, while rows remain below", () => {
+            // 1,000 rows under a sticky append row (y 968-1000): row 29
+            // (y 964-996) is the bottom edge of the visible data rows.
+            for (const releaseY of [1100, 985]) {
+                const moved = vi.fn();
+                vi.useFakeTimers();
+                const view = render(
+                    <EventedDataEditor
+                        {...basicProps}
+                        rowMarkers="clickable-number"
+                        gridSelection={blockSelection(5, 9)}
+                        onRowMoved={moved}
+                    />,
+                    { wrapper: Context }
+                );
+                prep();
+                markerGesture(screen.getByTestId("data-grid-canvas"), 300, releaseY);
+                expect(moved).toHaveBeenCalledWith({ start: 5, end: 9 }, 29);
+                view.unmount();
+            }
+        });
+
         test("Escape abandons an active move", () => {
             const moved = vi.fn();
             vi.useFakeTimers();

@@ -779,6 +779,35 @@ const DataGridDnd: React.FunctionComponent<DataGridDndProps> = p => {
         [gridRef, rows]
     );
 
+    /**
+     * Fork addition: the viewport Y where visible data rows end: the canvas
+     * bottom, or the top of a sticky append row drawn over it.
+     */
+    const visibleDataBottom = React.useCallback((): number | undefined => {
+        const canvas = canvasRef?.current;
+        if (canvas === null || canvas === undefined) return undefined;
+        let bottom = canvas.getBoundingClientRect().bottom;
+        if (p.hasAppendRow === true) {
+            const appendRow = gridRef?.current?.getBounds(0, rows);
+            if (appendRow !== undefined) bottom = Math.min(bottom, appendRow.y);
+        }
+        return bottom;
+    }, [canvasRef, gridRef, p.hasAppendRow, rows]);
+
+    /**
+     * Fork addition: the drop target for a pointer at or below the visible
+     * bottom edge: the end only once the last row is fully in view, else the
+     * row at that edge, so a release lands where the indicator shows.
+     */
+    const bottomEdgeTarget = React.useCallback(
+        (bottom: number, from: number): number => {
+            const hit = rowAtPointer(bottom - 1, from);
+            if (hit === undefined) return rows;
+            return hit.row === rows - 1 && hit.top + hit.height <= bottom ? rows : hit.row;
+        },
+        [rowAtPointer, rows]
+    );
+
     const headerBottom = p.headerHeight + p.groupHeaderHeight;
     /** Fork addition: follow an armed row move's pointer: threshold, drop target, and edge scrolling. */
     const onMouseMoveImpl = React.useCallback(
@@ -789,7 +818,10 @@ const DataGridDnd: React.FunctionComponent<DataGridDndProps> = p => {
                 if (!rowMove.active && Math.abs(pointerY - rowMove.startY) > ROW_MOVE_THRESHOLD_PX) {
                     rowMove.active = true;
                 }
-                if (args.kind === "cell") {
+                const bottom = visibleDataBottom();
+                if (bottom !== undefined && pointerY >= bottom) {
+                    setRowMoveDrop(bottomEdgeTarget(bottom, rowMove.before ?? rowMove.rows.end));
+                } else if (args.kind === "cell") {
                     const [, row] = args.physicalLocation ?? args.location;
                     const bounds = args.physicalBounds ?? args.bounds;
                     rowMove.rowHeight = bounds.height;
@@ -798,6 +830,7 @@ const DataGridDnd: React.FunctionComponent<DataGridDndProps> = p => {
                     setRowMoveDrop(-1);
                 } else if (args.kind === "out-of-bounds") {
                     if (args.region[1] < 0) setRowMoveDrop(-1);
+                    // Below a short grid's last row, above the visible bottom edge.
                     else if (args.region[1] > 0) setRowMoveDrop(rows);
                     else if (rowMove.before === undefined) setRowMoveDrop(rowMove.rows.start);
                     else setRowMoveDrop(rowMove.before);
@@ -817,7 +850,7 @@ const DataGridDnd: React.FunctionComponent<DataGridDndProps> = p => {
             }
             p.onMouseMove(args);
         },
-        [canvasRef, headerBottom, p.onMouseMove, rows, setRowMoveDrop]
+        [bottomEdgeTarget, canvasRef, headerBottom, p.onMouseMove, rows, setRowMoveDrop, visibleDataBottom]
     );
 
     /** Fork addition: rows scroll under a still pointer while edge scrolling; keep the drop target under it. */
@@ -830,9 +863,15 @@ const DataGridDnd: React.FunctionComponent<DataGridDndProps> = p => {
             setRowMoveDrop(-1);
             return;
         }
-        const hit = rowAtPointer(pointerY, rowMove.before ?? rowMove.rows.start);
+        const from = rowMove.before ?? rowMove.rows.start;
+        const bottom = visibleDataBottom();
+        if (bottom !== undefined && pointerY >= bottom) {
+            setRowMoveDrop(bottomEdgeTarget(bottom, from));
+            return;
+        }
+        const hit = rowAtPointer(pointerY, from);
         if (hit !== undefined) setRowMoveDrop(rowMoveDropBefore(hit.row, pointerY, hit.top, hit.height));
-    }, [canvasRef, headerBottom, rowAtPointer, setRowMoveDrop]);
+    }, [bottomEdgeTarget, canvasRef, headerBottom, rowAtPointer, setRowMoveDrop, visibleDataBottom]);
     useAutoscroll(rowMoveScroll === 0 ? undefined : [0, rowMoveScroll], eventTargetRef ?? nullScrollRef, onRowMoveScroll);
 
     const onDragStartImpl = React.useCallback<NonNullable<DataGridDndProps["onDragStart"]>>(

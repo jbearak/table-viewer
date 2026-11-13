@@ -123,6 +123,7 @@ const resident_display_row = vi.hoisted(() => (source_row: number): number | und
 vi.mock('../webview/use-row-loader', () => ({
     use_row_loader: () => ({
         ensure_rows: vi.fn(),
+        ensure_row_intervals: vi.fn(),
         // Rows are looked up by display row but their *contents* are addressed by
         // source row, exactly as the real loader does: the host ships each page's
         // sourceRows alongside its rows, and a permuted view reorders the rows

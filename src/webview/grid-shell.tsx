@@ -1770,7 +1770,7 @@ export function GridShell({
     );
 
     const {
-        ensure_rows,
+        ensure_row_intervals,
         ensure_rows_loaded,
         trim_rows,
         pin_rows,
@@ -8308,12 +8308,19 @@ export function GridShell({
             sheet_meta.columnCount,
         ), undefined, undefined, sheet_meta.estimatedRowBytes);
         const copy_row_count = Math.min(row_count, copy_row_limit);
+        // The source-display rows behind the copied display rows: after a move
+        // they are not the numeric prefix, and can lie far apart.
+        const source_intervals = pending_projection.source_display_intervals([{
+            start: 0,
+            end: copy_row_count - 1,
+        }]);
         // Keep an operation-owned hold through synchronous serialization. Two
         // concurrent copies can have their load waiters settle together; without
         // separate pins, the first copy's trim could evict the second's rows.
-        const residency_pin = pin_rows(0, copy_row_count - 1);
+        const residency_pins = source_intervals.map((interval) => pin_rows(interval.start, interval.end));
         try {
-            const loaded = await ensure_rows_loaded(0, copy_row_count - 1);
+            const loaded = (await Promise.all(source_intervals.map((interval) =>
+                ensure_rows_loaded(interval.start, interval.end)))).every(Boolean);
             // A sheet switch or reload cleared the cache mid-load: abandon the
             // copy rather than overwrite the clipboard with a now-empty grid.
             if (!loaded) return;
@@ -8326,13 +8333,14 @@ export function GridShell({
         } finally {
             // The TSV is materialized synchronously before the clipboard promise
             // starts, so bulk-loaded pages no longer need waiter protection.
-            unpin_rows(residency_pin);
+            for (const pin of residency_pins) unpin_rows(pin);
             trim_rows();
         }
     }, [
         copy_rect,
         display_column_count,
         ensure_rows_loaded,
+        pending_projection,
         pin_rows,
         row_count,
         sheet_meta.columnCount,
@@ -9072,9 +9080,9 @@ export function GridShell({
                     start,
                     end: source_end,
                 }]);
-                if (intervals.length > 0) {
-                    ensure_rows(intervals[0].start, intervals[intervals.length - 1].end);
-                }
+                // Moved rows can put far-apart source rows on screen together:
+                // load their intervals, not the span between them.
+                if (intervals.length > 0) ensure_row_intervals(intervals);
             }
             // A merged block can be visible while its anchor row sits above the
             // viewport; the grid paints the block from the anchor's content, so
@@ -9118,7 +9126,7 @@ export function GridShell({
             }
         },
         [
-            ensure_rows,
+            ensure_row_intervals,
             ensure_rows_loaded,
             hide_cell_tooltip,
             on_preview_visible_row_change,
@@ -9139,10 +9147,8 @@ export function GridShell({
             start: 0,
             end: Math.min(40, pending_projection.sourceRowCount - 1),
         }]);
-        if (intervals.length > 0) {
-            ensure_rows(intervals[0].start, intervals[intervals.length - 1].end);
-        }
-    }, [ensure_rows, has_visible_columns, pending_projection]);
+        if (intervals.length > 0) ensure_row_intervals(intervals);
+    }, [ensure_row_intervals, has_visible_columns, pending_projection]);
 
     // Full-region repaint on the discrete events that change content or
     // editability of *every* already-painted cell: a page landing (version

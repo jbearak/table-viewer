@@ -134,6 +134,7 @@ const grid_mock = vi.hoisted(() => ({
     // durable edit-key row space is non-vacuous.
     source_row_for_display: null as null | ((display_row: number) => number | undefined),
     ensure_rows: vi.fn(),
+    ensure_row_intervals: vi.fn(),
     ensure_rows_loaded: vi.fn(async (_start?: number, _end?: number) => true),
     trim_rows: vi.fn(),
     // Eviction holds. Recorded rather than simulated: what the loader does with a
@@ -223,6 +224,7 @@ vi.mock('../webview/use-row-loader', () => ({
         grid_mock.loader_enabled.push(enabled);
         return {
             ensure_rows: grid_mock.ensure_rows,
+            ensure_row_intervals: grid_mock.ensure_row_intervals,
             ensure_rows_loaded: grid_mock.ensure_rows_loaded,
             trim_rows: grid_mock.trim_rows,
             pin_rows: grid_mock.pin_rows,
@@ -413,6 +415,7 @@ afterEach(() => {
         x: 30, y: 10, width: 100, height: 36,
     }));
     grid_mock.ensure_rows.mockReset();
+    grid_mock.ensure_row_intervals.mockReset();
     grid_mock.ensure_rows_loaded.mockReset();
     grid_mock.ensure_rows_loaded.mockImplementation(async () => true);
     grid_mock.trim_rows.mockReset();
@@ -671,13 +674,13 @@ describe('GridShell cell wrapping', () => {
             row_heights: { 2: 48 },
         }));
 
-        grid_mock.ensure_rows.mockClear();
+        grid_mock.ensure_row_intervals.mockClear();
         const on_visible = grid_mock.props!.onVisibleRegionChanged as (
             range: { x: number; y: number; width: number; height: number },
         ) => void;
         act(() => on_visible({ x: 0, y: 1, width: 2, height: 2 }));
         // Compressed rows 1–2 are raw source-display rows 2–3, not 1–2.
-        expect(grid_mock.ensure_rows).toHaveBeenCalledWith(2, 3);
+        expect(grid_mock.ensure_row_intervals).toHaveBeenCalledWith([{ start: 2, end: 3 }]);
         const row_height = grid_mock.props!.rowHeight as (row: number) => number;
         expect(row_height(1)).toBe(48);
     });
@@ -4418,6 +4421,7 @@ describe('GridShell column projection', () => {
         expect(container!.querySelector('.data-editor-stub')).toBeNull();
         expect(grid_mock.loader_enabled.at(-1)).toBe(false);
         expect(grid_mock.ensure_rows).not.toHaveBeenCalled();
+        expect(grid_mock.ensure_row_intervals).not.toHaveBeenCalled();
     });
 
     it('renders a recoverable all-hidden status without grid overlays or row requests', async () => {
@@ -4440,6 +4444,7 @@ describe('GridShell column projection', () => {
         expect(container!.querySelector('.row-resize-overlay-stub')).toBeNull();
         expect(grid_mock.loader_enabled.at(-1)).toBe(false);
         expect(grid_mock.ensure_rows).not.toHaveBeenCalled();
+        expect(grid_mock.ensure_row_intervals).not.toHaveBeenCalled();
         expect(editing_ref.current?.has_uncommitted_changes()).toBe(true);
 
         await act(async () => {
@@ -4452,7 +4457,7 @@ describe('GridShell column projection', () => {
         });
         expect(container!.querySelector('.data-editor-stub')).not.toBeNull();
         expect(grid_mock.loader_enabled.at(-1)).toBe(true);
-        expect(grid_mock.ensure_rows).toHaveBeenCalledWith(0, 0);
+        expect(grid_mock.ensure_row_intervals).toHaveBeenCalledWith([{ start: 0, end: 0 }]);
         expect(editing_ref.current?.has_uncommitted_changes()).toBe(true);
     });
 });
@@ -9375,6 +9380,70 @@ describe('row Move by menu, shortcut, and drag', () => {
         ]);
         expect(announcement()).toBe('Moved 2 rows up');
         await vi.waitFor(() => expect(selected_rows()).toEqual([0, 1]));
+    });
+
+    describe('loading rows a move brought on screen', () => {
+        // Ten source rows; source row 9 is moved to the top, so display rows
+        // 0-2 show source-display rows 9, 0, and 1.
+        const render_moved = async (overrides: Partial<GridShellProps> = {}) => {
+            const pending = create_pending_row_store({ session_id: 'session' });
+            await render_grid(structure_props({
+                row_count: 10,
+                sheet_meta: { ...props().sheet_meta, rowCount: 10, sourceRowCount: 10 },
+                structural_support: { ...supported, basis: { ...basis, sourceRowCount: 10 } },
+                edit_session: create_edit_session_store({ session_id: 'session' }),
+                pending_row_store: pending,
+                ...overrides,
+            }));
+            const on_row_moved = grid_mock.props!.onRowMoved as (rows: { start: number; end: number }, before: number) => void;
+            await act(async () => on_row_moved({ start: 9, end: 9 }, 0));
+            expect(pending.snapshot().rowLayout?.runs).toEqual([
+                { kind: 'source', start: 9, count: 1 },
+                { kind: 'source', start: 0, count: 9 },
+            ]);
+        };
+
+        it('loads the source rows behind the visible rows, not the span between them', async () => {
+            await render_moved();
+            grid_mock.ensure_rows.mockClear();
+            grid_mock.ensure_row_intervals.mockClear();
+            const on_visible = grid_mock.props!.onVisibleRegionChanged as (range: Record<string, number>) => void;
+            await act(async () => on_visible({ x: 0, y: 0, width: 2, height: 3 }));
+            expect(grid_mock.ensure_row_intervals).toHaveBeenLastCalledWith([
+                { start: 0, end: 1 },
+                { start: 9, end: 9 },
+            ]);
+            expect(grid_mock.ensure_rows).not.toHaveBeenCalled();
+        });
+
+        it('loads and pins the source rows behind a capped whole-sheet copy', async () => {
+            const write_text = vi.fn(async (_text: string) => {});
+            Object.defineProperty(navigator, 'clipboard', {
+                configurable: true,
+                value: { writeText: write_text },
+            });
+            const grid_actions_ref = React.createRef<
+                import('../webview/grid-shell').GridActionsHandle | null
+            >() as React.MutableRefObject<import('../webview/grid-shell').GridActionsHandle | null>;
+            // A 3-row copy cap: 32 MiB of source bytes at 10 MiB a row.
+            await render_moved({
+                sheet_meta: {
+                    ...props().sheet_meta,
+                    rowCount: 10,
+                    sourceRowCount: 10,
+                    estimatedRowBytes: 10 * 1024 * 1024,
+                },
+                grid_actions_ref,
+            });
+            grid_mock.ensure_rows_loaded.mockClear();
+            grid_mock.pin_rows.mockClear();
+            await act(async () => { await grid_actions_ref.current!.copy_sheet(); });
+            const loaded = grid_mock.ensure_rows_loaded.mock.calls.map(([start, end]) => [start, end]);
+            expect(loaded).toEqual([[0, 1], [9, 9]]);
+            expect(grid_mock.pin_rows.mock.calls.map(([start, end]) => [start, end])).toEqual([[0, 1], [9, 9]]);
+            expect(grid_mock.unpin_rows).toHaveBeenCalledTimes(2);
+            expect(write_text).toHaveBeenCalledTimes(1);
+        });
     });
 
     it('refuses a drop at or above the Header Row', async () => {
