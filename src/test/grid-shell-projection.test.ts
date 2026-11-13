@@ -10040,6 +10040,58 @@ describe('columns: Insert, Delete, Restore, Move, rename, Pending Column cells, 
             .toEqual([1, 1]);
     });
 
+    it('goes to a Pending Column by identity when it moves, or nowhere when it goes, while its row loads', async () => {
+        for (const outcome of ['moved', 'removed'] as const) {
+            grid_mock.source_row_for_display = (display_row: number) => (display_row === 1 ? undefined : display_row);
+            let finish_load: (loaded: boolean) => void = () => {};
+            grid_mock.ensure_rows_loaded.mockImplementation(() => new Promise<boolean>((resolve) => {
+                finish_load = resolve;
+            }));
+            const pending = with_pending_column({});
+            const on_cell_focus_applied = vi.fn();
+            await render_columns({
+                pending_row_store: pending,
+                on_cell_focus_applied,
+                cell_focus: {
+                    sequence: 1,
+                    sheetIndex: 0,
+                    row: { kind: 'source', sourceRow: 1 },
+                    column: { kind: 'pending', pendingColumnId: 'c1' },
+                },
+            });
+            expect(grid_mock.ensure_rows_loaded).toHaveBeenCalled();
+            const caret = () => (grid_mock.props!.gridSelection as { current?: { cell: [number, number] } }).current?.cell;
+            const caret_before = caret();
+            // While the row loads, the Pending Column moves to the end, or goes.
+            await act(async () => {
+                const before = pending.snapshot();
+                const columns = outcome === 'moved'
+                    ? [{ kind: 'source' as const, sourceColumn: 0 }, { kind: 'source' as const, sourceColumn: 1 },
+                        { kind: 'source' as const, sourceColumn: 2 }, { kind: 'pending' as const, pendingColumnId: 'c1' }]
+                    : [{ kind: 'source' as const, sourceColumn: 0 }, { kind: 'source' as const, sourceColumn: 1 },
+                        { kind: 'source' as const, sourceColumn: 2 }];
+                const staged = pending.stage_replace('session', before, {
+                    ...before,
+                    columnLayout: { ...before.columnLayout!, columns },
+                    ...(outcome === 'removed' ? { pendingColumns: [] } : {}),
+                });
+                staged!.commit();
+                staged!.notify();
+            });
+            grid_mock.source_row_for_display = null;
+            await act(async () => { finish_load(true); });
+            if (outcome === 'moved') {
+                await vi.waitFor(() => expect(on_cell_focus_applied).toHaveBeenCalledWith(1, true));
+                expect(caret()).toEqual([3, 1]);
+            } else {
+                await vi.waitFor(() => expect(on_cell_focus_applied).toHaveBeenCalledWith(1, false));
+                expect(caret()).toEqual(caret_before);
+            }
+            act(() => root?.unmount());
+            root = null;
+        }
+    });
+
     it('repaints a Pending Column formula when its result arrives', async () => {
         const pending = with_pending_column({ 's:1': { value: '=1+1' } }, xlsx_basis);
         const sheet_meta = { ...props().sheet_meta, rowCount: 2, sourceRowCount: 2 };

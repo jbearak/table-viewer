@@ -4389,10 +4389,14 @@ export function GridShell({
         pending_projection,
         unloaded_display_row_for_source,
     ]);
-    /** Select `display_column` on a source row, loading the row's page first if it is not resident. */
+    /**
+     * Select a cell on a source row, loading the row's page first if it is
+     * not resident. `display_column` is the column, or a resolver read after
+     * the load, for a column that can move while the page loads.
+     */
     const reveal_source_row_cell = useCallback(async (
         source_row: number,
-        display_column: number,
+        display_column: number | (() => number | undefined),
         is_current?: () => boolean,
         restore_focus = true,
     ): Promise<boolean> => {
@@ -4415,7 +4419,9 @@ export function GridShell({
         }
         if (display_row === undefined) return false;
         if (is_current?.() === false) return false;
-        select_active_display_cell([display_column, display_row]);
+        const column = typeof display_column === 'function' ? display_column() : display_column;
+        if (column === undefined) return false;
+        select_active_display_cell([column, display_row]);
         if (restore_focus) focus_grid();
         return true;
     }, [
@@ -4563,9 +4569,16 @@ export function GridShell({
         if (row.kind === 'source' && (column.kind === 'source' || display_column >= 0)) {
             const is_current = () => cell_focus_mounted_ref.current
                 && applied_cell_focus_ref.current === sequence;
+            // A Pending Column is found again by identity after the load: it
+            // may have moved, or gone, while the page loaded.
+            const pending_column_now = () => {
+                const index = projected_columns_ref.current.findIndex((projected) =>
+                    column_identities_equal(projected.identity, column));
+                return index < 0 ? undefined : index;
+            };
             const revealed = column.kind === 'source'
                 ? reveal_source_cell(row.sourceRow, column.sourceColumn, is_current)
-                : reveal_source_row_cell(row.sourceRow, display_column, is_current);
+                : reveal_source_row_cell(row.sourceRow, pending_column_now, is_current);
             void revealed.then((visible) => {
                 if (is_current()) on_cell_focus_applied(sequence, visible);
             });
