@@ -781,12 +781,22 @@ function formula_targets(formula: string): FormulaTargets {
 // Package reading
 // ---------------------------------------------------------------------------
 
+/** The first part of each package this scan could not read. */
+const UNREADABLE_PARTS = new WeakMap<ZipPackage, string>();
+
+/**
+ * The one way this module reads a part. A part that is present but can't be
+ * read (encrypted, an unsupported method, past the inflate budget) returns
+ * null like a missing one, and is recorded so the scan refuses every
+ * worksheet instead of throwing: it may name any of them.
+ */
 function read_bytes(zip: ZipPackage, path: string): Uint8Array | null {
     try {
         return zip.read(`/${path}`);
     } catch (error) {
-        if (error instanceof ZipPackageError) throw new Error('Not a valid .xlsx file');
-        throw error;
+        if (!(error instanceof ZipPackageError)) throw error;
+        if (!UNREADABLE_PARTS.has(zip)) UNREADABLE_PARTS.set(zip, path);
+        return null;
     }
 }
 
@@ -1998,23 +2008,15 @@ function unclassified_references(
         return types !== undefined && [...types].every((type) => allowed.has(type));
     };
 
-    const record = (indexes: readonly number[], part: string, code: 'unclassified-reference' | 'unreadable-part' = 'unclassified-reference'): void => {
-        for (const index of indexes) if (!found.has(index)) found.set(index, { code, part });
+    const record = (indexes: readonly number[], part: string): void => {
+        for (const index of indexes) if (!found.has(index)) found.set(index, { code: 'unclassified-reference', part });
     };
     const every_index = worksheets.map((_, index) => index);
     for (const part of parts) {
         if (found.size === worksheets.length) break;
         if (only(part, BACKSTOP_SKIPPED_RELATIONSHIPS)) continue;
         if (BACKSTOP_BINARY_EXTENSION.test(part) && (targeted_by.get(part) === undefined || only(part, BACKSTOP_BINARY_RELATIONSHIPS))) continue;
-        let raw: Uint8Array | null;
-        try {
-            raw = read_bytes(zip, part);
-        } catch {
-            // Encrypted, an unsupported method, or past the inflate budget:
-            // the reader and writer never open it, but it may name any sheet.
-            record(every_index, part, 'unreadable-part');
-            continue;
-        }
+        const raw = read_bytes(zip, part);
         if (raw === null) continue;
         const xml = backstop_xml_bytes(raw);
         if (xml === undefined) continue;
@@ -2076,6 +2078,8 @@ export function scan_xlsx_structural_support(
 
     const unreadable = worksheets.find((sheet) => !sheet.readable);
     const backstop = unclassified_references(zip, worksheets, new Set(names.map((name) => name.start)));
+    // Read after every scan above, so a failure anywhere refuses every sheet.
+    const unreadable_part = UNREADABLE_PARTS.get(zip);
     const targets_cache = new Map<string, FormulaTargets>();
     const targets_of = (text: string): FormulaTargets => {
         let targets = targets_cache.get(text);
@@ -2159,7 +2163,9 @@ export function scan_xlsx_structural_support(
             }
             return undefined;
         })();
-        const reason: StructuralRefusalReason | undefined = specific ?? backstop.get(sheet_index);
+        const reason: StructuralRefusalReason | undefined = specific
+            ?? (unreadable_part === undefined ? undefined : { code: 'unreadable-part', part: unreadable_part })
+            ?? backstop.get(sheet_index);
 
         const axis = (name: StructuralAxis): StructuralAxisSupport => reason === undefined
             ? { supported: true }

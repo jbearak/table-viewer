@@ -797,6 +797,18 @@ describe('scan_xlsx_structural_support', () => {
             }
         });
 
+        it('refuses every sheet when it cannot read an unused relationships part', () => {
+            const raw = with_unreadable_entry(build_xlsx({
+                sheets: [sheet('Data'), sheet('Other')],
+                parts: { 'xl/vendor/_rels/thing.xml.rels': rels_xml([]) },
+            }), 'xl/vendor/_rels/thing.xml.rels');
+            const supports = scan_xlsx_structural_support(raw);
+            expect(supports).toHaveLength(2);
+            for (const support of supports) {
+                expect(refused(support)).toMatchObject({ code: 'unreadable-part', part: 'xl/vendor/_rels/thing.xml.rels' });
+            }
+        });
+
         it('refuses every sheet for a 3D span whose other endpoint is not a worksheet', () => {
             const unknown = scan({
                 sheets: [sheet('Data'), sheet('Between'), sheet('Other')],
