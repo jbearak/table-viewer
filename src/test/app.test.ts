@@ -5588,7 +5588,7 @@ describe('edit mode save exit', () => {
                 },
             },
         });
-        const store = grid_shell_mock.latest_props!.pending_row_store!;
+        const store = (grid_shell_mock.latest_props as unknown as GridShellProps).pending_row_store!;
         expect(store.snapshot().rowLayout).toBeDefined();
         // An append admission owns the gesture slot.
         const request_append = grid_shell_mock.latest_props!.on_append_rows as
