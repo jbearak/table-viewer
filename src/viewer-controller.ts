@@ -9252,6 +9252,8 @@ export function attach_viewer(
             tailRemovals: durable?.tailRemovals ?? [],
             appendBasis,
             conflicts: durable?.conflicts ?? [],
+            // Inserted rows are valid only where their layout places them.
+            ...pending_layout_fields(durable),
         }, wire_pending_changes_format)) {
             await refuse('Appending these rows would exceed the pending-changes size limit.');
             return;
@@ -9572,9 +9574,10 @@ export function attach_viewer(
             { length: message.count },
             () => `insert-row:${randomUUID()}`,
         ));
-        // Aggregate size estimate with the rows as appends: the layout and
-        // origin fields add a few bytes per row, which the webview store's own
-        // envelope bound catches at install (and then releases the admission).
+        // Aggregate size estimate over the durable changes, layout included,
+        // with the new rows as appends: their layout entries and origin add a
+        // few bytes per row, which the webview store's own envelope bound
+        // catches at install (and then releases the admission).
         const tentative_templates = durable?.formatTemplates?.some(
             (candidate) => candidate.id === formatTemplate.id,
         ) === true
@@ -9584,8 +9587,9 @@ export function attach_viewer(
             ...target,
             cells: durable?.cells ?? {},
             formatTemplates: tentative_templates,
+            ...pending_layout_fields(durable),
             appendedRows: [
-                ...appended_rows(durable),
+                ...pending_rows(durable),
                 ...rowIds.map((id, index) => Object.freeze({
                     id,
                     cells: Object.freeze({}),
@@ -9595,7 +9599,7 @@ export function attach_viewer(
             ],
             tailRemovals: [],
             appendBasis,
-            conflicts: [],
+            conflicts: durable?.conflicts ?? [],
         })) {
             await refuse('Inserting these rows would exceed the pending-changes size limit.');
             return;
