@@ -24,6 +24,7 @@ import {
     type PendingStructuralChanges,
 } from '../pending-changes';
 import { normalized_column_name } from '../column-name';
+import type { CellHighlightColor } from '../cell-highlight-colors';
 import type { StructuralAxisSupport } from '../viewer-snapshot';
 import {
     column_identities_equal,
@@ -630,6 +631,65 @@ export function plan_pending_column_cells(
         const after = columns[index_of.get(id)!]!;
         return JSON.stringify(after) === JSON.stringify(before) ? [] : [{ id, before, after }];
     });
+    if (transitions.length === 0) return undefined;
+    const layout = changes.columnLayout ?? null;
+    return {
+        next: { ...changes, pendingColumns: columns },
+        change: {
+            kind: 'columnLayout',
+            delta: {
+                worksheet,
+                before: layout,
+                after: layout,
+                pendingRows: [],
+                pendingColumns: transitions,
+                formatTemplates: [],
+            },
+        },
+    };
+}
+
+/** A Pending Column cell's highlight a gesture sets; `color` undefined clears it. */
+export interface PendingColumnHighlightEdit {
+    readonly pendingColumnId: string;
+    /** `s:<sourceRow>`, `p:<pendingRowId>`, or `f:<row>`. */
+    readonly rowKey: string;
+    readonly color: CellHighlightColor | undefined;
+}
+
+/**
+ * Set or clear highlights on Pending Column cells as one `columnLayout` arm
+ * with an unchanged layout, like `plan_pending_column_cells`. Undefined when
+ * no edit names a live Pending Column or nothing changes.
+ */
+export function plan_pending_column_highlights(
+    changes: PendingStructuralChanges,
+    worksheet: WorksheetStructureContext['worksheet'],
+    edits: readonly PendingColumnHighlightEdit[],
+): { readonly next: PendingStructuralChanges; readonly change: LayoutHistoryChange } | undefined {
+    const columns = [...(changes.pendingColumns ?? [])];
+    const index_of = new Map(columns.map((column, index) => [column.id, index]));
+    const highlights_by_index = new Map<number, Record<string, CellHighlightColor>>();
+    for (const edit of edits) {
+        const index = index_of.get(edit.pendingColumnId);
+        if (index === undefined) continue;
+        let highlights = highlights_by_index.get(index);
+        if (highlights === undefined) {
+            highlights = { ...(columns[index]!.highlights ?? {}) };
+            highlights_by_index.set(index, highlights);
+        }
+        if (edit.color === undefined) delete highlights[edit.rowKey];
+        else highlights[edit.rowKey] = edit.color;
+    }
+    const transitions: { id: string; before: PendingColumn; after: PendingColumn }[] = [];
+    for (const [index, highlights] of highlights_by_index) {
+        const before = columns[index]!;
+        const { highlights: _previous, ...rest } = before;
+        const after: PendingColumn = Object.keys(highlights).length === 0 ? rest : { ...rest, highlights };
+        if (JSON.stringify(after.highlights ?? {}) === JSON.stringify(before.highlights ?? {})) continue;
+        columns[index] = after;
+        transitions.push({ id: before.id, before, after });
+    }
     if (transitions.length === 0) return undefined;
     const layout = changes.columnLayout ?? null;
     return {

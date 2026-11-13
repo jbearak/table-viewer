@@ -71,6 +71,7 @@ import {
     plan_column_move,
     plan_column_restore,
     plan_pending_column_cells,
+    plan_pending_column_highlights,
     plan_pending_column_update,
     resolve_column_move_drop,
     resolve_column_structure_selection,
@@ -78,6 +79,7 @@ import {
     type ColumnMoveItemModel,
     type ColumnStructureSelection,
     type PendingColumnCellEdit,
+    type PendingColumnHighlightEdit,
 } from './column-structure-model';
 import {
     column_projections_equal,
@@ -950,6 +952,14 @@ function pending_snapshot_removals_by_id(
 function pending_values_equal(left: unknown, right: unknown): boolean {
     return left === right || JSON.stringify(left) === JSON.stringify(right);
 }
+
+/**
+ * Pending Column cells one Highlight gesture may set: each is a key in the
+ * Pending Changes envelope, so a whole-sheet selection is refused up front.
+ */
+export const MAX_PENDING_COLUMN_HIGHLIGHTS = 100_000;
+export const TOO_MANY_PENDING_COLUMN_HIGHLIGHTS_MESSAGE =
+    'Highlight fewer cells in new columns at once.';
 
 /** Build the row-owned history transition represented by two store snapshots. */
 export function pending_row_history_changes(
@@ -3448,24 +3458,36 @@ export function GridShell({
         },
         on_open_menu: open_row_marker_menu,
     });
+    /**
+     * The cells a Highlight gesture would change: source columns go to the
+     * host, and Pending Columns, which have no source column, are written
+     * into the Pending Column itself.
+     */
     const current_highlight_selection = useCallback(() => {
-        const selection = highlight_selection_from_grid(
+        const result = highlight_selection_from_grid(
             grid_selection_ref.current,
             row_count,
             column_projection,
             merges,
-        )?.selection;
-        if (selection === undefined) return null;
-        const has_highlightable_row = selection.displayRows.some((interval) => (
-            interval.start < pending_projection.deletedBandStart
-            || interval.end >= pending_projection.pendingBandStart
-        ));
-        return has_highlightable_row ? selection : null;
-    }, [column_projection, merges, pending_projection, row_count]);
+        );
+        if (result === null) return null;
+        const { selection } = result;
+        const pending_column_ids = result.pendingDisplayColumns.flatMap((display_column) => {
+            const identity = projected_columns[display_column]?.identity;
+            return identity?.kind === 'pending' ? [identity.pendingColumnId] : [];
+        });
+        const has_highlightable_row = pending_column_ids.length > 0
+            || (selection.sourceColumns.length > 0 && selection.displayRows.some((interval) => (
+                interval.start < pending_projection.deletedBandStart
+                || interval.end >= pending_projection.pendingBandStart
+            )));
+        return has_highlightable_row ? { selection, pendingColumnIds: pending_column_ids } : null;
+    }, [column_projection, merges, pending_projection, projected_columns, row_count]);
     const mutate_highlight_selection = useCallback((mutation: CellHighlightMutation): boolean => {
         if (gestures_admitted !== undefined && !gestures_admitted()) return false;
-        const selection = current_highlight_selection();
-        if (!selection) return false;
+        const target = current_highlight_selection();
+        if (!target) return false;
+        const { selection, pendingColumnIds: pending_column_ids } = target;
         const compressed_source_intervals: DisplayRowInterval[] = [];
         const pending_ids = new Set<string>();
         for (const interval of selection.displayRows) {
@@ -3493,10 +3515,34 @@ export function GridShell({
                 if (projected?.kind === 'pending') pending_ids.add(projected.row.id);
             }
         }
-        const source_intervals = pending_projection.source_display_intervals(
-            compressed_source_intervals,
-        );
-        if (pending_ids.size === 0) {
+        const source_intervals = selection.sourceColumns.length === 0
+            ? []
+            : pending_projection.source_display_intervals(compressed_source_intervals);
+        // Pending Column cells: every live row of the selection, keyed by row identity.
+        const column_highlights: PendingColumnHighlightEdit[] = [];
+        if (pending_column_ids.length > 0) {
+            for (const interval of selection.displayRows) {
+                for (let row = interval.start; row <= interval.end; row += 1) {
+                    const row_target = pending_column_row_target(row);
+                    if (row_target === undefined || !row_target.live) continue;
+                    for (const pendingColumnId of pending_column_ids) {
+                        column_highlights.push({
+                            pendingColumnId,
+                            rowKey: row_target.key,
+                            color: mutation.type === 'set' ? mutation.color : undefined,
+                        });
+                    }
+                    if (column_highlights.length > MAX_PENDING_COLUMN_HIGHLIGHTS) {
+                        host_bridge.postMessage({
+                            type: 'showWarning',
+                            message: TOO_MANY_PENDING_COLUMN_HIGHLIGHTS_MESSAGE,
+                        });
+                        return false;
+                    }
+                }
+            }
+        }
+        if (pending_ids.size === 0 && column_highlights.length === 0) {
             if (source_intervals.length > 0) {
                 on_highlight_selection({
                     ...selection,
@@ -3506,7 +3552,7 @@ export function GridShell({
             return source_intervals.length > 0;
         }
         const before = pending_store.snapshot();
-        const after: PendingStructuralChanges = {
+        const row_highlighted: PendingStructuralChanges = {
             ...before,
             appendedRows: stored_pending_rows(before).map((row) => {
                 if (!pending_ids.has(row.id)) return row;
@@ -3525,6 +3571,13 @@ export function GridShell({
                 };
             }),
         };
+        const column_plan = plan_pending_column_highlights(
+            row_highlighted,
+            structure_context.worksheet,
+            column_highlights,
+        );
+        const after = column_plan?.next ?? row_highlighted;
+        const column_changes = column_plan === undefined ? [] : [column_plan.change];
         const refusal_before = envelope_refusal_sequence_ref.current;
         const pending_stage = pending_store.stage_replace(edit_session_id, before, after);
         if (pending_stage === undefined) {
@@ -3545,6 +3598,8 @@ export function GridShell({
                 },
                 before,
                 after,
+                undefined,
+                column_changes,
             );
             const participants: StagedMutation[] = [pending_stage];
             if (history_capture !== undefined && changes.length > 0) {
@@ -3562,6 +3617,8 @@ export function GridShell({
             },
             before,
             after,
+            undefined,
+            column_changes,
         );
         const pending_gesture: PendingHostGesture = {
             commit: (source_changes, gesture_label) => {
@@ -3587,12 +3644,14 @@ export function GridShell({
         gestures_admitted,
         history_capture,
         on_highlight_selection,
+        pending_column_row_target,
         pending_projection,
         pending_store,
         sheet_index,
         sheet_meta.name,
         sheet_meta.worksheetId,
         show_pending_size_warning,
+        structure_context.worksheet,
     ]);
     useLayoutEffect(() => {
         if (!highlight_ref) return;
@@ -10561,8 +10620,15 @@ export function GridShell({
                 }
                 return pending_projection.inline_pending_display_rows(interval.start, interval.end).length > 0;
             });
-        const highlight_selection = current_highlight_selection();
-        const pending_selection_has_highlight = highlight_selection?.displayRows.some(
+        const highlight_target = current_highlight_selection();
+        const highlight_selection = highlight_target?.selection ?? null;
+        const pending_column_selection_has_highlight = highlight_target !== null
+            && highlight_target.pendingColumnIds.some((id) => {
+                const highlights = pending_columns_by_id.get(id)?.highlights;
+                return highlights !== undefined && Object.keys(highlights).length > 0;
+            });
+        const pending_selection_has_highlight = pending_column_selection_has_highlight
+            || highlight_selection?.displayRows.some(
             (interval) => {
                 for (
                     let candidate = Math.max(interval.start, pending_projection.pendingBandStart);
@@ -10591,7 +10657,7 @@ export function GridShell({
             ? highlight_selection.displayRows.reduce(
                 (total, interval) => total + interval.end - interval.start + 1,
                 0,
-            ) * highlight_selection.sourceColumns.length
+            ) * (highlight_selection.sourceColumns.length + highlight_target!.pendingColumnIds.length)
             : 0;
         // Source-keyed dirty probe. An unresolved source row reports `false` rather
         // than guessing: it is also the case where discard_edit would have no key to

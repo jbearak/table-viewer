@@ -10,7 +10,10 @@ import type { ColumnProjection } from './column-projection';
 import { expand_glide_selection } from './selection-glide';
 
 export interface HighlightSelectionResult {
+    /** The source cells; `sourceColumns` is empty when only Pending Columns are selected. */
     selection: CellHighlightSelection;
+    /** Selected display columns with no source column: Pending Columns, highlighted in the webview. */
+    pendingDisplayColumns: readonly number[];
     /** Saturates at Number.MAX_SAFE_INTEGER. Host validation remains authoritative. */
     estimatedCellCount: number;
 }
@@ -332,15 +335,21 @@ export function highlight_selection_from_grid(
 
     const source_columns = selected_display_columns
         .map((column) => column_projection.visible_to_source[column])
-        // A Pending Column has no source column: host highlights skip it.
+        // A Pending Column has no source column: host highlights skip it,
+        // and the webview highlights it in the Pending Column itself.
         .filter((column): column is number => column !== undefined && Number.isSafeInteger(column) && column >= 0)
         .sort((a, b) => a - b)
         .filter((column, index, values) => index === 0 || column !== values[index - 1]);
-    if (display_rows.length === 0 || source_columns.length === 0) return null;
+    const pending_display_columns = selected_display_columns
+        .filter((column) => column_projection.visible_to_source[column] === undefined);
+    if (display_rows.length === 0 || (source_columns.length === 0 && pending_display_columns.length === 0)) {
+        return null;
+    }
 
-    const count = selected_row_count * BigInt(source_columns.length);
+    const count = selected_row_count * BigInt(source_columns.length + pending_display_columns.length);
     const max = BigInt(Number.MAX_SAFE_INTEGER);
     return {
+        pendingDisplayColumns: pending_display_columns,
         selection: { displayRows: display_rows, sourceColumns: source_columns },
         estimatedCellCount: Number(count > max ? max : count),
     };

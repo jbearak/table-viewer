@@ -10091,6 +10091,46 @@ describe('columns: Insert, Delete, Restore, Move, rename, Pending Column cells, 
         ]);
     });
 
+    it('highlights Pending Column cells by row identity, beside source cells, as one action', async () => {
+        const highlight_ref: { current: HighlightSelectionHandle | null } = { current: null };
+        const on_highlight_selection = vi.fn();
+        const { pending, history } = await render_columns({ highlight_ref, on_highlight_selection });
+        await insert_right_of_first();
+        const on_selection_change = grid_mock.props!.onGridSelectionChange as (selection: unknown) => void;
+        // The Pending Column alone: nothing goes to the host.
+        await act(async () => on_selection_change({
+            columns: compact([]),
+            rows: compact([]),
+            current: { cell: [1, 0], range: { x: 1, y: 0, width: 1, height: 2 }, rangeStack: [] },
+        }));
+        await act(async () => { expect(highlight_ref.current?.apply('yellow')).toBe(true); });
+        expect(on_highlight_selection).not.toHaveBeenCalled();
+        expect(pending.snapshot().pendingColumns?.[0]?.highlights).toEqual({ 's:0': 'yellow', 's:1': 'yellow' });
+        const action = last_action(history);
+        expect(action.label).toBe('Highlight cells');
+        expect(action.changes.map((change) => change.kind)).toEqual(['columnLayout']);
+        const get_cell_content = grid_mock.props!.getCellContent as (cell: [number, number]) => {
+            themeOverride?: { bgCell?: string };
+        };
+        expect(get_cell_content([1, 0]).themeOverride?.bgCell).not.toBe('#81b88b@0.12');
+        // A source column and the Pending Column together: the host gets the
+        // source cells, and its commit records the Pending Column in the same action.
+        await act(async () => on_selection_change({
+            columns: compact([]),
+            rows: compact([]),
+            current: { cell: [0, 0], range: { x: 0, y: 0, width: 2, height: 1 }, rangeStack: [] },
+        }));
+        await act(async () => { expect(highlight_ref.current?.clear()).toBe(true); });
+        const call = on_highlight_selection.mock.calls[0]!;
+        expect(call[0]).toEqual({ displayRows: [{ start: 0, end: 0 }], sourceColumns: [0] });
+        await act(async () => { expect(call[2].commit([], 'Clear highlights')).toBe(true); });
+        expect(pending.snapshot().pendingColumns?.[0]?.highlights).toEqual({ 's:1': 'yellow' });
+        expect(last_action(history).changes.map((change) => change.kind)).toEqual(['columnLayout']);
+        const undo = plan_pending_row_history_replay(last_action(history), 'undo', () => pending.snapshot());
+        if (undo.kind !== 'plan') throw new Error(undo.kind);
+        expect(undo.plans[0]!.next.pendingColumns?.[0]?.highlights).toEqual({ 's:0': 'yellow', 's:1': 'yellow' });
+    });
+
     it('offers no column structure items or drag without structural support', async () => {
         await render_columns({ structural_support: undefined });
         expect(grid_mock.props!.onColumnMoved).toBeUndefined();
