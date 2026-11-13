@@ -8015,6 +8015,17 @@ export function App(): React.JSX.Element {
         active_layout_change_snapshot,
         active_layout_change_snapshot,
     );
+    // The worksheet's discard can't yet drop column changes (delivery step
+    // 8), so an action that relies on it is not offered while they exist.
+    const active_column_changes_snapshot = useCallback(() => {
+        const snapshot = active_pending_row_store.snapshot();
+        return snapshot.columnLayout !== undefined || (snapshot.pendingColumns?.length ?? 0) > 0;
+    }, [active_pending_row_store]);
+    const active_column_changes = useSyncExternalStore(
+        subscribe_active_pending_conflicts,
+        active_column_changes_snapshot,
+        active_column_changes_snapshot,
+    );
     // What "Keep new rows at the end" loses, counted for its notice: Pending
     // Columns that hold typed values. (CSV and TSV have no formulas, so no
     // formula can show #REF! or move.)
@@ -9216,8 +9227,9 @@ export function App(): React.JSX.Element {
                                 </button>
                             </>
                         )}
-                        {!structural_conflicts.some((conflict) =>
-                            conflict.reason === 'structuralBasisChanged')
+                        {!active_column_changes
+                            && !structural_conflicts.some((conflict) =>
+                                conflict.reason === 'structuralBasisChanged')
                             && structural_conflicts.some((conflict) =>
                                 conflict.reason === 'unsupportedStructure') && (
                             <button onClick={discard_active_layout_changes}>

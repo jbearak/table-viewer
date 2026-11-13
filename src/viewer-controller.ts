@@ -64,6 +64,8 @@ import {
 import {
     all_workbook_formula_cells_impact,
     assert_safe_workbook_formula_edits,
+    FORMULA_DEPENDENCY_STRIDE,
+    STRUCTURED_REFERENCE_STRIDE,
     plan_workbook_formula_recalculation,
 } from './formula-dependencies';
 import {
@@ -1684,7 +1686,8 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
         const sheet = src.meta().sheets[worksheet.sheetIndex];
         if (sheet?.excelFirstRowHeader?.active !== true || !sheet.columnNames) continue;
         const header_row = sheet.excelFirstRowHeader.sourceRow ?? 0;
-        const final_names = [...sheet.columnNames];
+        const source_names = sheet.columnNames;
+        const final_names = [...source_names];
         const changed_columns = new Set<number>();
         // Header edits by source column: a layout change moves the cell the
         // save writes, never the column a name belongs to.
@@ -1698,10 +1701,25 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
             final_names[edit.col] = new_name;
             if (new_name !== old_name) changed_columns.add(edit.col);
         }
+        // The names the saved header holds: live source columns and Pending
+        // Columns. A column deleted in this save leaves no name to collide
+        // with, but its name is refused (design "Columns"): a structured
+        // reference to it such as `[Price]` would silently rebind.
+        const removed = new Set(worksheet.structure?.layout.columnLayout.removedSourceColumns ?? []);
+        const pending_names = (worksheet.structure === undefined ? [] : worksheet.structural.pendingColumns ?? [])
+            .map((column) => normalized_column_name(column.header));
         for (const column of changed_columns) {
             const normalized = normalized_column_name(final_names[column]);
-            if (normalized !== '' && final_names.some((name, candidate) => (
-                candidate !== column && normalized_column_name(name) === normalized
+            if (normalized === '') continue;
+            const deleted = [...removed].find((candidate) =>
+                normalized_column_name(source_names[candidate] ?? '') === normalized);
+            if (deleted !== undefined) {
+                throw new Error(`A deleted column on this sheet is named ${source_names[deleted]}. Restore it or choose another name.`);
+            }
+            if (pending_names.includes(normalized) || final_names.some((name, candidate) => (
+                candidate !== column
+                && !removed.has(candidate)
+                && normalized_column_name(name) === normalized
             ))) {
                 throw new Error('Another column already has that name.');
             }
@@ -1763,8 +1781,16 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
         if (too_many_calculation_edits) {
             throw new Error('Workbook would contain too many formulas to save safely.');
         }
+        // The edits are addressed in prospective coordinates, so the source
+        // formulas they may overwrite are too: each restructured worksheet's
+        // formulas where the layout puts them, without those it removes.
+        const structure_by_sheet = new Map(planned.flatMap(({ sheetIndex, structure }) =>
+            structure === undefined ? [] : [[sheetIndex, structure.coordinates] as const]));
         assert_safe_workbook_formula_edits(
-            src.meta().sheets,
+            src.meta().sheets.map((sheet, sheetIndex) => {
+                const coordinates = structure_by_sheet.get(sheetIndex);
+                return coordinates === undefined ? sheet : prospective_formula_sheet(sheet, coordinates);
+            }),
             planned.map((worksheet) => {
                 const values: Record<string, string> = {};
                 const formula_keys = new Set<string>();
@@ -2087,6 +2113,51 @@ function verify_xlsx_structural_save(
             );
         }
     }
+}
+
+/**
+ * A worksheet's formula facts at the coordinates a structural save gives
+ * them: every formula cell (and the formula end of each dependency) mapped
+ * through the coordinate map, those on a removed row or column dropped, the
+ * cells re-sorted row-major as the formula-limit check requires.
+ */
+function prospective_formula_sheet(
+    sheet: SheetMeta,
+    coordinates: WorksheetCoordinateMap,
+): Pick<SheetMeta, 'name' | 'formulaCells' | 'formulaDependencies' | 'structuredFormulaReferences'> {
+    const map_strided = (packed: readonly number[] | undefined, stride: number): number[] | undefined => {
+        if (packed === undefined) return undefined;
+        const out: number[] = [];
+        for (let offset = 0; offset + stride <= packed.length; offset += stride) {
+            const row = coordinates.row(packed[offset]!);
+            const column = coordinates.column(packed[offset + 1]!);
+            if (row === null || column === null) continue;
+            out.push(row, column, ...packed.slice(offset + 2, offset + stride));
+        }
+        return out;
+    };
+    const cells = map_strided(sheet.formulaCells, 2);
+    const sorted: number[] | undefined = cells === undefined ? undefined : [];
+    if (cells !== undefined) {
+        const pairs: [number, number][] = [];
+        for (let offset = 0; offset < cells.length; offset += 2) pairs.push([cells[offset]!, cells[offset + 1]!]);
+        pairs.sort((left, right) => left[0] - right[0] || left[1] - right[1]);
+        for (const [row, column] of pairs) sorted!.push(row, column);
+    }
+    const structured = sheet.structuredFormulaReferences;
+    return {
+        name: sheet.name,
+        ...(sorted === undefined ? {} : { formulaCells: sorted }),
+        ...(sheet.formulaDependencies === undefined
+            ? {}
+            : { formulaDependencies: map_strided(sheet.formulaDependencies, FORMULA_DEPENDENCY_STRIDE)! }),
+        ...(structured === undefined ? {} : {
+            structuredFormulaReferences: {
+                names: structured.names,
+                references: map_strided(structured.references, STRUCTURED_REFERENCE_STRIDE)!,
+            },
+        }),
+    };
 }
 
 /** A Pending Row or Pending Column cell's link as written: external targets must be http(s). */
@@ -16328,14 +16399,22 @@ export function attach_viewer(
                             )
                     ) return false;
                 }
+                // The band's basis carries the append template's fingerprint.
+                // A Pending Inserted Row's template copies the row beside it
+                // (design "Formatting inheritance"), so only the templates
+                // appended rows use must match it; every template already
+                // matched its own style dependencies above. A row's origin
+                // is fixed at admission and checked against the ledger.
+                const append_template_ids = new Set(appended_rows(desired).map((row) => row.formatTemplateId));
                 if (
                     is_xlsx
                     && pending_rows(desired).length > 0
                     && desired.appendBasis !== undefined
                     && desired.formatTemplates.some((template) => (
                         template.format.kind !== 'xlsx'
-                        || desired.appendBasis!.styleFingerprint
-                            !== template.format.styleFingerprint
+                        || (append_template_ids.has(template.id)
+                            && desired.appendBasis!.styleFingerprint
+                                !== template.format.styleFingerprint)
                     ))
                 ) return false;
                 for (const removal of desired.tailRemovals) {

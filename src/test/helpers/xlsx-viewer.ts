@@ -116,6 +116,7 @@ export async function open_xlsx(
     } }>('workbookSnapshot').snapshot;
     const sheet_name = (index: number) => snapshot().meta.sheets[index]!.name;
     let sequence = 0;
+    let save_sequence = 0;
     return {
         file,
         store: state,
@@ -188,11 +189,13 @@ export async function open_xlsx(
                 message.type === 'pendingChangesAcknowledged' && message.sequence === at);
         },
         async save(worksheets) {
+            save_sequence += 1;
+            const save_request_id = `save-${save_sequence}`;
             await panel.__receive({
                 type: 'saveCsv',
                 operation: {
                     editSessionId: session_id()!,
-                    saveRequestId: `save-${Math.random()}`,
+                    saveRequestId: save_request_id,
                     worksheets: worksheets.map(({ sheetIndex, structural, cells = {} }) => ({
                         sheetIndex,
                         sheetName: sheet_name(sheetIndex),
@@ -211,7 +214,13 @@ export async function open_xlsx(
                 },
             });
             await controller.drain();
-            return last('saveResult');
+            // This request's own result, never an earlier save's.
+            const result = [...messages()].reverse().find((message) =>
+                message.type === 'saveResult'
+                && (message.lifecycle as { operation?: { saveRequestId?: string } } | undefined)
+                    ?.operation?.saveRequestId === save_request_id);
+            if (result === undefined) throw new Error(`No saveResult arrived for ${save_request_id}.`);
+            return result as never;
         },
     };
 }

@@ -656,3 +656,128 @@ describe('row moves through the step 7 model on .xlsx', () => {
         expect(part_text(saved, 'xl/worksheets/sheet2.xml')).toContain('<f>Data!B3</f>');
     });
 });
+
+/** Plan an `.xlsx` save directly through the profile's planner, with the file's current basis. */
+async function plan_directly(
+    raw: Uint8Array,
+    state: PerFileState,
+    structural: Partial<WorksheetPendingEdits>,
+    edits: Record<string, string> = {},
+) {
+    const path = '/tmp/plan-directly.xlsx';
+    const profile = profile_for(path);
+    const source = await profile.build_source(raw, path, state);
+    const basis = current_structural_basis(
+        'xlsx',
+        { digest: content_digest(raw), xlsxStructure: observe_xlsx_structure(raw) },
+        source.meta().sheets[0]!,
+        0,
+    )!;
+    try {
+        return profile.plan_save!({
+            source,
+            file_path: path,
+            worksheets: [{
+                sheet_index: 0,
+                edits,
+                wanted_bases: new Set(),
+                dirty_edits: Object.fromEntries(Object.entries(edits).map(([key, value]) => [key, { value, base: '' }])),
+                structural_changes: {
+                    formatTemplates: [],
+                    appendedRows: [],
+                    tailRemovals: [],
+                    conflicts: [],
+                    structuralBasis: basis,
+                    ...structural,
+                },
+            }],
+        });
+    } finally {
+        source.close();
+    }
+}
+
+describe('column names in a structural save', () => {
+    // Data's header: Item, Qty, Price, Total, and two unnamed columns. Price
+    // (source column 2) is deleted in each case.
+    const without_price = (pending: readonly { id: string; header: string }[] = []): Partial<WorksheetPendingEdits> => ({
+        columnLayout: {
+            columns: [
+                ...[0, 1, 2, 3, 4, 5].map((sourceColumn) => ({ kind: 'source' as const, sourceColumn })),
+                ...pending.map(({ id }) => ({ kind: 'pending' as const, pendingColumnId: id })),
+            ],
+            removedSourceColumns: [2],
+            discardedPendingColumns: [],
+        },
+        ...(pending.length === 0 ? {} : {
+            pendingColumns: pending.map(({ id, header }, index) => ({
+                id, header, cells: {}, format: { kind: 'default' as const }, createdOrder: index + 1,
+            })),
+        }),
+    });
+
+    it('checks a rename only against the live prospective columns, Pending Columns included', async () => {
+        const raw = representative_workbook();
+        await expect(plan_directly(raw, HEADER_ON, without_price(), { '0:1': 'Amount' })).resolves.toBeDefined();
+        await expect(plan_directly(raw, HEADER_ON, without_price(), { '0:1': 'Total' }))
+            .rejects.toThrow('Another column already has that name.');
+        await expect(plan_directly(raw, HEADER_ON, without_price([{ id: 'new', header: 'Amount' }]), { '0:1': 'amount' }))
+            .rejects.toThrow('Another column already has that name.');
+    });
+
+    it('refuses a deleted column\'s name with its own reason, since references to it would rebind', async () => {
+        await expect(plan_directly(representative_workbook(), HEADER_ON, without_price(), { '0:1': 'Price' }))
+            .rejects.toThrow('A deleted column on this sheet is named Price. Restore it or choose another name.');
+    });
+});
+
+describe('the workbook formula limit in a structural save', () => {
+    // 100,000 formulas, the limit: B1, then A2:A100000. Moving row 1 to the
+    // end puts the old B1 formula at B100000 and a value cell at B1.
+    function at_the_limit(): Uint8Array {
+        const rows = [row(1, [cell('A1', 'v'), cell('B1', { f: '1' })])];
+        for (let number = 2; number <= 100_000; number += 1) rows.push(row(number, [cell(`A${number}`, { f: '1' })]));
+        return build_fixture_xlsx({ sheets: [{ name: 'Data', body: `<sheetData>${rows.join('')}</sheetData>` }] });
+    }
+    const moved_first_row_to_end: Partial<WorksheetPendingEdits> = {
+        rowLayout: {
+            runs: [{ kind: 'source', start: 1, count: 99_999 }, { kind: 'source', start: 0, count: 1 }],
+            removedSourceRows: [],
+            discardedPendingRows: [],
+        },
+    };
+
+    it('counts moved formulas where they land, so a new formula past the limit is refused', async () => {
+        const raw = at_the_limit();
+        // B2 (source row 1) lands on B1, the old formula's source address,
+        // which must not count as overwriting it: that formula moved to B100000.
+        await expect(plan_directly(raw, {}, moved_first_row_to_end, { '1:1': '=2' }))
+            .rejects.toThrow('Workbook would contain too many formulas to save safely.');
+        // A value there, or a formula over one that moved there, keeps the count.
+        await expect(plan_directly(raw, {}, moved_first_row_to_end, { '1:1': '2' })).resolves.toBeDefined();
+        await expect(plan_directly(raw, {}, moved_first_row_to_end, { '0:1': '=2' })).resolves.toBeDefined();
+    }, 60_000);
+});
+
+describe('publishing inserted .xlsx rows', () => {
+    it('accepts a row whose template copies a row styled unlike the append template', async () => {
+        const viewer = await open_xlsx(representative_workbook(), { state: HEADER_ON });
+        // After Date: its fill and row style, unlike Fig, the append template's row.
+        const insert = await viewer.insert({ requestId: 'styled', anchor: 4, side: 'after' });
+        await viewer.settle('styled', true);
+        const id = insert.rowIds![0]!;
+        expect(insert.formatTemplate!.format.kind === 'xlsx' && insert.formatTemplate!.format.styleFingerprint)
+            .not.toBe(insert.appendBasis!.styleFingerprint);
+        expect(await viewer.publish(0, {
+            formatTemplates: [insert.formatTemplate!],
+            appendedRows: [{ id, origin: 'insert', cells: {}, formatTemplateId: insert.formatTemplate!.id, createdOrder: 1 }],
+            appendBasis: insert.appendBasis!,
+            rowLayout: {
+                runs: [{ kind: 'source', start: 1, count: 4 }, { kind: 'pending', ids: [id] }, { kind: 'source', start: 5, count: 2 }],
+                removedSourceRows: [],
+                discardedPendingRows: [],
+            },
+            structuralBasis: viewer.basis(0),
+        })).toBe(true);
+    });
+});
