@@ -13,6 +13,8 @@ export interface CellContextMenuModelProps {
     can_highlight: boolean;
     can_hide_rows: boolean;
     show_disabled_hide_rows?: boolean;
+    /** Why "Hide row(s)" is disabled, when it is shown disabled. */
+    hide_rows_disabled_reason?: string;
     selected_row_count: number;
     selected_column_count: number;
     can_clear_highlight: boolean;
@@ -113,6 +115,7 @@ export function cell_context_menu_items(props: CellContextMenuModelProps): MenuI
             props.selected_row_count,
             props.on_hide_rows,
             !props.can_hide_rows,
+            props.hide_rows_disabled_reason,
         ));
     }
     hide_items.push(

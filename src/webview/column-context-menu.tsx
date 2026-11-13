@@ -18,12 +18,23 @@ export function header_column_can_be_renamed(sheet: SheetMeta, column: number): 
     return edit_text !== undefined && (edit_text !== '' || displayed_name === '');
 }
 
+function transform_item_state(props: {
+    readonly transform_disabled: boolean;
+    readonly transform_disabled_reason?: string;
+}): { disabled: boolean; disabled_reason?: string } {
+    return props.transform_disabled && props.transform_disabled_reason !== undefined
+        ? { disabled: true, disabled_reason: props.transform_disabled_reason }
+        : { disabled: props.transform_disabled };
+}
+
 export interface ColumnContextMenuProps {
     x: number;
     y: number;
     column_name: string;
     transform_sections: boolean;
     transform_disabled: boolean;
+    /** Why the sort and filter items are disabled, shown as their description. */
+    transform_disabled_reason?: string;
     active_direction: SortDirection | null;
     any_sorted: boolean;
     other_columns_sorted: boolean;
@@ -62,14 +73,14 @@ export function column_context_menu_items(
             label: 'Sort ascending',
             checked: props.active_direction === 'asc',
             shortcut: 'Shift+Alt+A',
-            disabled: props.transform_disabled,
+            ...transform_item_state(props),
             on_click: (event) => props.on_sort('asc', event.shiftKey),
         },
         {
             label: 'Sort descending',
             checked: props.active_direction === 'desc',
             shortcut: 'Shift+Alt+D',
-            disabled: props.transform_disabled,
+            ...transform_item_state(props),
             on_click: (event) => props.on_sort('desc', event.shiftKey),
         },
     );
@@ -78,12 +89,12 @@ export function column_context_menu_items(
             { kind: 'separator' },
             {
                 label: 'Add ascending to sort',
-                disabled: props.transform_disabled,
+                ...transform_item_state(props),
                 on_click: () => props.on_sort('asc', true),
             },
             {
                 label: 'Add descending to sort',
-                disabled: props.transform_disabled,
+                ...transform_item_state(props),
                 on_click: () => props.on_sort('desc', true),
             },
         );
@@ -91,7 +102,7 @@ export function column_context_menu_items(
     if (props.active_direction !== null) {
         items.push({
             label: 'Clear sort on this column',
-            disabled: props.transform_disabled,
+            ...transform_item_state(props),
             on_click: () => props.on_clear_column_sort(),
         });
     }
@@ -99,7 +110,7 @@ export function column_context_menu_items(
         items.push({
             label: 'Clear all sorts',
             shortcut: 'Shift+Alt+0',
-            disabled: props.transform_disabled,
+            ...transform_item_state(props),
             on_click: () => props.on_clear_all_sorts(),
         });
     }
@@ -108,7 +119,7 @@ export function column_context_menu_items(
         {
             label: props.has_filter ? 'Edit filter…' : 'Filter…',
             shortcut: 'Shift+Alt+F',
-            disabled: props.transform_disabled,
+            ...transform_item_state(props),
             on_click: () => props.on_edit_filter(),
         },
     );
@@ -116,7 +127,7 @@ export function column_context_menu_items(
         items.push({
             label: 'Clear filter on this column',
             shortcut: 'Shift+Alt+X',
-            disabled: props.transform_disabled,
+            ...transform_item_state(props),
             on_click: () => props.on_clear_column_filter(),
         });
     }
@@ -124,7 +135,7 @@ export function column_context_menu_items(
         items.push({
             label: 'Clear all filters',
             shortcut: 'Shift+Alt+9',
-            disabled: props.transform_disabled,
+            ...transform_item_state(props),
             on_click: () => props.on_clear_all_filters(),
         });
     }
@@ -149,6 +160,8 @@ export interface MultiColumnContextMenuProps {
     column_count: number;
     transform_sections: boolean;
     transform_disabled: boolean;
+    /** Why the sort items are disabled, shown as their description. */
+    transform_disabled_reason?: string;
     on_copy: () => void;
     on_hide: () => void;
     on_sort: (direction: SortDirection) => void;
@@ -169,12 +182,12 @@ export function multi_column_context_menu_items(
         { kind: 'separator' },
         {
             label: 'Sort ascending',
-            disabled: props.transform_disabled,
+            ...transform_item_state(props),
             on_click: () => props.on_sort('asc'),
         },
         {
             label: 'Sort descending',
-            disabled: props.transform_disabled,
+            ...transform_item_state(props),
             on_click: () => props.on_sort('desc'),
         },
     );

@@ -78,7 +78,7 @@ import {
     selected_source_columns,
     type HeaderDragState,
 } from './column-selection-model';
-import { row_context_menu_items } from './row-context-menu';
+import { row_context_menu_items, type StructureMenuAction } from './row-context-menu';
 import { use_row_marker_selection } from './use-row-marker-selection';
 import { draw_sort_glyphs, header_sort_metadata } from './header-sort-glyph';
 import {
@@ -489,10 +489,17 @@ import {
     create_pending_row_store,
     type PendingRowStoreChange,
     type PendingRowStore,
+    TOO_MANY_PENDING_ROWS_MESSAGE,
     type WorksheetStructureContext,
 } from './pending-row-store';
 import {
     nearest_live_row,
+    has_inserted_rows,
+    insert_anchor_is_live,
+    insert_created_order,
+    INSERT_CANCELED_MESSAGE,
+    INSERTED_ROWS_TRANSFORM_MESSAGE,
+    plan_row_insert,
     only_appended_rows,
     plan_row_delete,
     plan_row_restore,
@@ -500,6 +507,7 @@ import {
     resolve_row_structure_selection,
     row_structure_label,
     row_structure_menu_model,
+    type InsertItemModel,
     type RowStructurePlan,
     type RowStructureSelection,
 } from './row-structure-model';
@@ -520,7 +528,9 @@ import {
     type PendingStructuralChanges,
     type PendingTailRemoval,
     type RowIdentity,
+    type StructuralBasis,
     appended_rows,
+    is_inserted_row,
     has_live_layout_change,
     // `pending_rows` names this shell's structural snapshot below.
     pending_rows as stored_pending_rows,
@@ -1028,6 +1038,23 @@ export interface AppendRowsAdmission {
     readonly settle: (accepted: boolean) => void;
 }
 
+/** One row insert the grid asks the host to admit. */
+export interface StructuralInsertRequest {
+    readonly anchor: RowIdentity;
+    readonly side: 'before' | 'after';
+    readonly count: number;
+}
+
+/** The host's admission of a row insert: insert-origin IDs and what they were authored against. */
+export interface StructuralInsertAdmission {
+    readonly rowIds: readonly string[];
+    readonly formatTemplate: PendingRowFormatTemplate;
+    readonly structuralBasis: StructuralBasis;
+    readonly appendBasis: PendingAppendBasis;
+    /** Settle the host reservation exactly once: installed, or released. */
+    readonly settle: (accepted: boolean) => void;
+}
+
 /**
  * Imperative editing actions GridShell exposes to {@link App} (the toolbar
  * toggle and file-change notice live in App's layout, but the dirty map lives here
@@ -1317,6 +1344,8 @@ export interface GridShellProps {
     on_append_composer_draft_change?: (draft: AppendComposerDraft) => void;
     /** Admit one atomic append gesture against the current source generation. */
     on_append_rows?: (count: number) => Promise<AppendRowsAdmission | undefined>;
+    /** Admit one row insert against the current source generation. */
+    on_insert_rows?: (request: StructuralInsertRequest) => Promise<StructuralInsertAdmission | undefined>;
     /**
      * The workbook's undo history. Hoisted like `edit_session`, and for a
      * stronger reason: history spans every sheet, so it cannot live in a shell
@@ -1470,6 +1499,7 @@ export function GridShell({
     append_composer_draft,
     on_append_composer_draft_change,
     on_append_rows,
+    on_insert_rows,
     history_store,
     gestures_admitted,
     host_rejected_keys,
@@ -2203,6 +2233,11 @@ export function GridShell({
         show_pending_size_warning,
     ]);
     const has_row_layout = pending_rows.rowLayout !== undefined;
+    /**
+     * Inserted rows pin the display order to the layout's: sorting,
+     * filtering, and hiding rows on this worksheet wait for Save or Discard.
+     */
+    const inserted_rows_lock = has_inserted_rows(pending_rows);
     /** Whether a source row is a Pending Row Removal: read-only, tinted, unnumbered. */
     const is_removed_source_row = useMemo(
         () => removed_source_row_test(pending_rows),
@@ -4300,6 +4335,9 @@ export function GridShell({
         && remaining_append_capacity > 0;
     const get_row_accessibility_label = useCallback((row: number) => {
         const projected = pending_projection.row_at(row);
+        if (projected?.kind === 'pending' && is_inserted_row(projected.row)) {
+            return `Row ${projected.intendedPhysicalRow + 1}, inserted`;
+        }
         if (projected?.kind === 'pending') {
             const label = `Pending appended row ${projected.intendedPhysicalRow + 1}`;
             return row === pending_projection.pendingBandStart
@@ -4472,6 +4510,144 @@ export function GridShell({
         };
         poll();
     }), []);
+    /** The live region that announces structure gestures, such as a canceled insert. */
+    const [structure_announcement, set_structure_announcement] = useState<{
+        readonly sequence: number;
+        readonly message: string;
+    } | null>(null);
+    const announce_structure = useCallback((message: string) => {
+        set_structure_announcement((previous) => ({
+            sequence: (previous?.sequence ?? 0) + 1,
+            message,
+        }));
+    }, []);
+    const structure_context_ref = useRef(structure_context);
+    structure_context_ref.current = structure_context;
+    /**
+     * After an Insert (or the append "Insert below" makes on the band's last
+     * row), put the caret on the first new row, in the column that was
+     * focused. Polls the grid's reported rows until the new row is there,
+     * never a fixed delay.
+     */
+    const focus_new_row = useCallback(async (
+        pending_row_id: string,
+        display_column: number,
+    ): Promise<void> => {
+        const display_row = await pending_display_row(pending_row_id);
+        if (display_row === undefined || display_column_count <= 0) return;
+        select_active_display_cell([
+            Math.min(Math.max(0, display_column), display_column_count - 1),
+            display_row,
+        ]);
+        focus_grid();
+    }, [display_column_count, focus_grid, pending_display_row, select_active_display_cell]);
+    /**
+     * Insert `count` blank rows beside the live row `anchor`: ask the host to
+     * admit them (it mints the IDs), then, if the anchor is still live and
+     * nothing fenced editing meanwhile, install them as one history action
+     * and settle the admission as installed. Anything else settles it as
+     * released; a removed anchor also announces the cancellation.
+     */
+    const insert_rows_gesture = useCallback(async (
+        anchor: RowIdentity,
+        side: 'before' | 'after',
+        count: number,
+    ): Promise<boolean> => {
+        if (on_insert_rows === undefined || !structure_gesture_admitted()) return false;
+        const session_id = edit_session_id;
+        const display_column = grid_selection_ref.current.current?.cell[0] ?? 0;
+        const admitted = await on_insert_rows({ anchor, side, count });
+        if (admitted === undefined) return false;
+        const current = () => edit_session_id_ref.current === session_id
+            && pending_store.identity()?.session_id === session_id;
+        if (
+            admitted.rowIds.length !== count
+            || !current()
+            || edit_admission_is_fenced()
+            || save_in_flight_ref.current
+            || (gestures_admitted !== undefined && !gestures_admitted())
+        ) {
+            admitted.settle(false);
+            return false;
+        }
+        const before = pending_store.snapshot();
+        const context = structure_context_ref.current;
+        if (!insert_anchor_is_live(before, context, anchor)) {
+            admitted.settle(false);
+            announce_structure(INSERT_CANCELED_MESSAGE);
+            return false;
+        }
+        const refusal_before = envelope_refusal_sequence_ref.current;
+        const plan = plan_row_insert(
+            before,
+            { ...context, structuralBasis: admitted.structuralBasis },
+            anchor,
+            side,
+            admitted.rowIds,
+            admitted.formatTemplate,
+            insert_created_order(before, issue_value_edit_order()),
+            admitted.appendBasis,
+        );
+        if (!plan.ok) {
+            admitted.settle(false);
+            host_bridge.postMessage({ type: 'showWarning', message: plan.message });
+            return false;
+        }
+        if (!commit_row_structure_plan(plan)) {
+            admitted.settle(false);
+            if (envelope_refusal_sequence_ref.current === refusal_before) {
+                host_bridge.postMessage({
+                    type: 'showWarning',
+                    message: 'The rows could not be inserted because the pending worksheet changed.',
+                });
+            }
+            return false;
+        }
+        admitted.settle(true);
+        void focus_new_row(admitted.rowIds[0]!, display_column);
+        return true;
+    }, [
+        announce_structure,
+        commit_row_structure_plan,
+        edit_admission_is_fenced,
+        edit_session_id,
+        focus_new_row,
+        gestures_admitted,
+        issue_value_edit_order,
+        on_insert_rows,
+        pending_store,
+        save_in_flight_ref,
+        structure_gesture_admitted,
+    ]);
+    /** "Insert below" on the band's last row: append instead, then focus the first new row. */
+    const append_rows_gesture = useCallback(async (count: number): Promise<boolean> => {
+        if (!structure_gesture_admitted()) return false;
+        const display_column = grid_selection_ref.current.current?.cell[0] ?? 0;
+        const appended = await admit_pending_rows(count);
+        if (appended === undefined) return false;
+        void focus_new_row(appended.rowIds[0]!, display_column);
+        return true;
+    }, [admit_pending_rows, focus_new_row, structure_gesture_admitted]);
+    /** An Insert item's menu action: insert beside its anchor, or append below the band. */
+    const insert_menu_action = useCallback((
+        model: InsertItemModel,
+        side: 'before' | 'after',
+    ): StructureMenuAction => {
+        if (!model.enabled) {
+            return {
+                count: model.count,
+                ...(model.reason === undefined ? {} : { disabled_reason: model.reason }),
+            };
+        }
+        const anchor = model.anchor;
+        return {
+            count: model.count,
+            on_click: () => {
+                if (model.action === 'append') void append_rows_gesture(model.count);
+                else if (anchor !== undefined) void insert_rows_gesture(anchor, side, model.count);
+            },
+        };
+    }, [append_rows_gesture, insert_rows_gesture]);
     const pending_paste_history_ref = useRef<{
         readonly before: PendingStructuralChanges;
         readonly rowIds: ReadonlySet<string>;
@@ -8166,7 +8342,7 @@ export function GridShell({
         direction: SortDirection,
         append: boolean,
     ) => {
-        if (!transform_sections || transform_pending) return;
+        if (!transform_sections || transform_pending || inserted_rows_lock) return;
         on_transform_change({
             ...transform_state,
             sort: append
@@ -8174,6 +8350,7 @@ export function GridShell({
                 : replace_sort(source_column, direction),
         });
     }, [
+        inserted_rows_lock,
         on_transform_change,
         transform_pending,
         transform_sections,
@@ -8212,13 +8389,14 @@ export function GridShell({
         source_columns: number[],
         direction: SortDirection,
     ) => {
-        if (!transform_sections || transform_pending) return;
+        if (!transform_sections || transform_pending || inserted_rows_lock) return;
         if (source_columns.length === 0) return;
         on_transform_change({
             ...transform_state,
             sort: source_columns.map((colIndex) => ({ colIndex, direction })),
         });
     }, [
+        inserted_rows_lock,
         on_transform_change,
         transform_pending,
         transform_sections,
@@ -8387,6 +8565,12 @@ export function GridShell({
                 && !transform_pending
                 && !is_editable_target(args.rawEvent?.target ?? null)
             ) {
+                if (inserted_rows_lock) {
+                    args.cancel();
+                    args.preventDefault();
+                    host_bridge.postMessage({ type: 'showWarning', message: INSERTED_ROWS_TRANSFORM_MESSAGE });
+                    return;
+                }
                 const source_column = focused_source_column_ref.current;
                 args.cancel();
                 args.preventDefault();
@@ -8518,6 +8702,7 @@ export function GridShell({
             display_column_count,
             display_column_for_source,
             editable_cells,
+            inserted_rows_lock,
             merge_index,
             merges,
             on_open_filter,
@@ -8933,8 +9118,11 @@ export function GridShell({
                 && transform_sections
                 && !transform_pending
                 && !preview_mode
-                && !selection_has_structural_rows,
-            show_disabled_hide_rows: selection_has_structural_rows,
+                && !selection_has_structural_rows
+                && !inserted_rows_lock,
+            show_disabled_hide_rows: selection_has_structural_rows
+                || (inserted_rows_lock && !!selected_rows && transform_sections),
+            ...(inserted_rows_lock ? { hide_rows_disabled_reason: INSERTED_ROWS_TRANSFORM_MESSAGE } : {}),
             selected_row_count,
             selected_column_count: hide_column_targets.length,
             can_clear_highlight: pending_selection_has_highlight
@@ -9109,6 +9297,18 @@ export function GridShell({
                     Adding rows. Editing is temporarily unavailable.
                 </span>
             )}
+            <span
+                className="sr-only"
+                role="status"
+                aria-live="polite"
+                data-testid="structure-announcement"
+            >
+                {/* A trailing no-break space on alternate announcements makes a
+                    repeated message a change the live region reads again. */}
+                {structure_announcement === null
+                    ? ''
+                    : `${structure_announcement.message}${structure_announcement.sequence % 2 === 0 ? '\u00a0' : ''}`}
+            </span>
             {/*
               * Mounted unconditionally. It used to be withheld under a permutation,
               * because the height a drag committed was persisted at the display row it
@@ -9198,6 +9398,13 @@ export function GridShell({
                         selection: row_menu.structure,
                         changes: pending_rows,
                         context: structure_context,
+                        ...(may_append_rows ? {} : {
+                            appendRefusal: !can_request_append_rows
+                                ? 'Rows can\'t be appended to this sheet right now.'
+                                : stored_pending_rows(pending_rows).length >= MAX_PENDING_APPENDED_ROWS
+                                    ? TOO_MANY_PENDING_ROWS_MESSAGE
+                                    : 'Appending another row would exceed the worksheet row limit.',
+                        }),
                     });
                 const structure_selection = row_menu.structure;
                 return (
@@ -9214,8 +9421,13 @@ export function GridShell({
                             can_hide_rows: transform_sections
                                 && !transform_pending
                                 && !preview_mode
-                                && !has_structural_rows,
-                            show_disabled_hide_rows: has_structural_rows,
+                                && !has_structural_rows
+                                && !inserted_rows_lock,
+                            show_disabled_hide_rows: has_structural_rows
+                                || (inserted_rows_lock && transform_sections),
+                            ...(inserted_rows_lock
+                                ? { hide_rows_disabled_reason: INSERTED_ROWS_TRANSFORM_MESSAGE }
+                                : {}),
                             // Left as it was, `!edit_mode` included. The sort/filter
                             // restriction is about row order — promoting a row hides
                             // the rows above it, which only means anything in
@@ -9242,6 +9454,14 @@ export function GridShell({
                                 show_disabled_remove_pending_rows: true,
                             } : {}),
                             ...(structure_menu === undefined || structure_selection === undefined ? {} : {
+                                insert_rows_above: insert_menu_action(
+                                    structure_menu.insertAbove,
+                                    'before',
+                                ),
+                                insert_rows_below: insert_menu_action(
+                                    structure_menu.insertBelow,
+                                    'after',
+                                ),
                                 delete_rows: {
                                     count: structure_menu.delete.count,
                                     ...(structure_menu.delete.enabled
@@ -9328,7 +9548,10 @@ export function GridShell({
                     y={context_menu.y}
                     column_count={context_menu.source_cols.length}
                     transform_sections={transform_sections}
-                    transform_disabled={transform_pending}
+                    transform_disabled={transform_pending || inserted_rows_lock}
+                    {...(inserted_rows_lock
+                        ? { transform_disabled_reason: INSERTED_ROWS_TRANSFORM_MESSAGE }
+                        : {})}
                     on_copy={() => copy_source_selection({
                         y: 0,
                         height: row_count,
@@ -9358,7 +9581,10 @@ export function GridShell({
                         column_name={columns[context_menu.display_col]?.title
                             ?? `Column ${source_column + 1}`}
                         transform_sections={transform_sections}
-                        transform_disabled={transform_pending}
+                        transform_disabled={transform_pending || inserted_rows_lock}
+                        {...(inserted_rows_lock
+                            ? { transform_disabled_reason: INSERTED_ROWS_TRANSFORM_MESSAGE }
+                            : {})}
                         active_direction={active_sort?.direction ?? null}
                         any_sorted={transform_state.sort.length > 0}
                         other_columns_sorted={transform_state.sort.some((key) =>
