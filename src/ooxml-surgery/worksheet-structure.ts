@@ -634,6 +634,20 @@ export function worksheet_coordinate_map(
     return build_axes(layout, appended_row_count).coordinates;
 }
 
+/**
+ * Cell-set semantics for this layout, as the restructure applies it to every
+ * `sqref`: for later stages that re-render a range the restructure leaves
+ * alone, such as a shared formula master's `ref`. Returns the mapped cells as
+ * row bands in row-major order; empty when every cell was removed.
+ */
+export function worksheet_cell_set_map(
+    layout: WorksheetStructureLayout,
+    appended_row_count: number,
+): (ranges: readonly CellRange[]) => readonly CellRange[] {
+    const axes = build_axes(layout, appended_row_count);
+    return (ranges) => map_cells(axes, ranges).ranges;
+}
+
 // ---------------------------------------------------------------------------
 // Cell-set semantics
 // ---------------------------------------------------------------------------

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { get_attr, remove_attr } from '../ooxml-xml';
+import { get_attr, remove_attr, replace_attr_value } from '../ooxml-xml';
 import {
     find_first_element,
     ignorable_end,
@@ -49,6 +49,17 @@ describe('remove_attr', () => {
     });
 });
 
+
+describe('replace_attr_value', () => {
+    it('encodes the new text for the attribute\'s own delimiter', () => {
+        const single = replace_attr_value(`<hyperlink ref='A1' location='&apos;Old&apos;!A3'/>`, 'location', "'Data Set'!A2");
+        expect(single).toBe(`<hyperlink ref='A1' location='&apos;Data Set&apos;!A2'/>`);
+        expect(get_attr(single, 'location')).toBe("'Data Set'!A2");
+        const double = replace_attr_value('<a v="x" w="1"/>', 'v', 'say "hi" & \'bye\' <now>');
+        expect(double).toBe(`<a v="say &quot;hi&quot; &amp; 'bye' &lt;now&gt;" w="1"/>`);
+        expect(get_attr(double, 'v')).toBe('say "hi" & \'bye\' <now>');
+    });
+});
 
 describe('worksheet element bounds', () => {
     it('keeps repeated unterminated child lookups inside each cell span', () => {
