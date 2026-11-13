@@ -132,8 +132,8 @@ export interface PendingRowCell {
     /**
      * Row and column identities the formula's references name, stored when it
      * was committed against a live layout change or named a Pending Row or
-     * Pending Column. `.xlsx` only; a cell with anchors has no
-     * `formulaReferenceBases`.
+     * Pending Column. `.xlsx` only. Any `formulaReferenceBases` beside them
+     * describe only the references the anchors leave out.
      */
     readonly formulaAnchors?: FormulaAnchors;
     /** Stable cut origin; numeric rows are the last resolved physical fallback. */
@@ -849,9 +849,6 @@ function own_pending_row_cell(value: unknown): PendingRowCell {
         : own_formula_anchors(value.formulaAnchors, value.value);
     if (value.formulaAnchors !== undefined && formulaAnchors === undefined) {
         pending_row_error('contain invalid formula anchors');
-    }
-    if (formulaAnchors !== undefined && formulaReferenceBases !== undefined) {
-        pending_row_error('contain a formula with both anchors and reference bases');
     }
     const movedFrom = value.movedFrom === undefined
         ? undefined

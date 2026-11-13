@@ -35,6 +35,7 @@ import {
 import type { HistoryChange } from './history-stack-model';
 import type { HistoryStore } from './history-store';
 import type { AnchorFormulaResult, FormulaAnchors } from '../formula-anchors';
+import { unanchored_formula_text } from '../formula-anchor-layout';
 import type { PendingFormulaReferenceBasis } from '../pending-changes';
 import { hyperlinks_equal, type CellHyperlink } from '../cell-content';
 import {
@@ -796,6 +797,20 @@ export function use_editing(
         [active_store, capture, gestures_admitted, read_persisted_cell, session_id],
     );
 
+    /**
+     * The append bases a committed formula stores: of its whole text without
+     * anchors, of its unanchored references with them, none when every
+     * reference is anchored.
+     */
+    const formula_reference_bases = options?.formula_reference_bases;
+    const formula_reference_bases_for = useCallback((
+        parsed: ParsedCellEdit,
+        anchors: FormulaAnchors | undefined,
+    ): readonly PendingFormulaReferenceBasis[] | undefined => {
+        if (!xlsx_edit_writes_formula(parsed.text, parsed.rich?.runs)) return undefined;
+        const bases_text = anchors === undefined ? parsed.text : unanchored_formula_text(parsed.text, anchors);
+        return bases_text === undefined ? undefined : formula_reference_bases?.(bases_text);
+    }, [formula_reference_bases]);
     /** The persisted side as the editor shows it: a formula rendered for the current layouts. */
     const rendered_persisted_formula = options?.rendered_persisted_formula;
     const persisted_formula_view = useCallback((base: ParsedCellEdit): ParsedCellEdit => {
@@ -910,9 +925,7 @@ export function use_editing(
                         persisted.history !== undefined,
                         syntax,
                         ordered_edit,
-                        xlsx_edit_writes_formula(parsed.text, parsed.rich?.runs) && formula_anchors === undefined
-                            ? options?.formula_reference_bases?.(parsed.text)
-                            : undefined,
+                        formula_reference_bases_for(parsed, formula_anchors),
                         formula_anchors,
                         persisted_view,
                     );
@@ -924,7 +937,7 @@ export function use_editing(
             active_store,
             get_cell,
             options?.anchor_formula,
-            options?.formula_reference_bases,
+            formula_reference_bases_for,
             options?.on_formula_refused,
             persisted_formula_view,
             options?.next_value_edit_order,

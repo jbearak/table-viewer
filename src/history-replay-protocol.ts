@@ -533,9 +533,7 @@ function sanitized_wire_value_dimension(
     if (formula_reference_bases === null) return undefined;
     const formula_anchors = value.formulaAnchors === undefined
         ? undefined
-        : formula_reference_bases === undefined
-            ? own_formula_anchors(value.formulaAnchors, present.text) ?? null
-            : null;
+        : own_formula_anchors(value.formulaAnchors, present.text) ?? null;
     if (formula_anchors === null) return undefined;
     return Object.freeze({
         kind: 'present' as const,

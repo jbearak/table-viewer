@@ -21,6 +21,7 @@ import {
     prospective_column_of,
     prospective_row_count,
     prospective_row_of,
+    unanchored_formula_text,
     unrenderable_formula_reason,
     workbook_has_live_layout_change,
     type AnchorStructuralChanges,
@@ -198,9 +199,10 @@ export type CommittedFormulaFields =
 /**
  * Anchor a committed formula against the workbook's current layouts. Anchors
  * are stored only where `anchor_formula` keeps them (a target worksheet with a
- * live layout change, or a corner on a Pending Row or Pending Column), and a
- * formula with anchors drops its `formulaReferenceBases`. Without anchors the
- * bases are captured as before. A formula `anchor_formula` refuses is refused
+ * live layout change, or a corner on a Pending Row or Pending Column). The
+ * append bases describe the references the anchors leave out, captured from
+ * the text with anchored references blanked; a formula whose every reference
+ * is anchored stores no bases. A formula `anchor_formula` refuses is refused
  * with its message. Never anchors CSV or TSV, whose `=` values are text.
  */
 export function committed_formula_fields(
@@ -208,16 +210,20 @@ export function committed_formula_fields(
     writes_formula: boolean,
     workbook: FormulaAnchorWorkbook | undefined,
     sheet_index: number,
-    bases?: () => readonly PendingFormulaReferenceBasis[],
+    bases?: (text: string) => readonly PendingFormulaReferenceBasis[],
 ): CommittedFormulaFields {
     if (!writes_formula) return { kind: 'fields' };
-    if (workbook === undefined || workbook.format !== 'xlsx') {
-        return bases === undefined ? { kind: 'fields' } : { kind: 'fields', formulaReferenceBases: bases() };
-    }
+    const with_bases = (bases_text: string | undefined) =>
+        bases === undefined || bases_text === undefined ? {} : { formulaReferenceBases: bases(bases_text) };
+    if (workbook === undefined || workbook.format !== 'xlsx') return { kind: 'fields', ...with_bases(text) };
     const anchored = anchor_formula(text, formula_anchor_context(workbook, sheet_index));
     if (anchored.kind === 'refused') return anchored;
-    if (anchored.anchors !== undefined) return { kind: 'fields', formulaAnchors: anchored.anchors };
-    return bases === undefined ? { kind: 'fields' } : { kind: 'fields', formulaReferenceBases: bases() };
+    if (anchored.anchors === undefined) return { kind: 'fields', ...with_bases(text) };
+    return {
+        kind: 'fields',
+        formulaAnchors: anchored.anchors,
+        ...with_bases(unanchored_formula_text(text, anchored.anchors)),
+    };
 }
 
 /** The stored fields of {@link CommittedFormulaFields}, for spreading into a cell. */

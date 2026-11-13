@@ -96,11 +96,14 @@ describe('committed_formula_fields', () => {
         expect(fields).toEqual({ kind: 'fields', formulaReferenceBases: BASES });
     });
 
-    it('stores anchors, and drops the bases, when the target sheet has a live layout change', () => {
-        const fields = committed_formula_fields('=Data!A3+B1', true, workbook(delete_data_rows([2])), 1, () => BASES);
+    it('stores anchors when the target sheet has a live layout change, and bases for the rest', () => {
+        const bases = vi.fn(() => BASES);
+        const fields = committed_formula_fields('=Data!A3+B1', true, workbook(delete_data_rows([2])), 1, bases);
         expect(fields.kind).toBe('fields');
         if (fields.kind !== 'fields') return;
-        expect(fields.formulaReferenceBases).toBeUndefined();
+        // The unanchored `B1` keeps its bases, captured without the anchored reference.
+        expect(fields.formulaReferenceBases).toEqual(BASES);
+        expect(bases).toHaveBeenCalledWith('=       +B1');
         // Only the reference to the restructured sheet is stored; `B1` on Other stays implicit.
         expect(fields.formulaAnchors?.references).toEqual([{
             start: 1,
@@ -124,7 +127,11 @@ describe('committed_formula_fields', () => {
                 column: { kind: 'identity', column: { kind: 'source', sourceColumn: 0 } },
             }],
         }]);
-        expect(fields.kind === 'fields' && fields.formulaReferenceBases).toBeUndefined();
+        // `A2` is not anchored, so it keeps its bases.
+        expect(fields.kind === 'fields' && fields.formulaReferenceBases).toEqual(BASES);
+        // A formula whose every reference is anchored stores no bases.
+        expect(committed_formula_fields('=A7*2', true, workbook(WITH_BAND), 0, () => BASES))
+            .not.toHaveProperty('formulaReferenceBases');
     });
 
     it('anchors a composed formula to a row of its own batch once Append admits it', () => {

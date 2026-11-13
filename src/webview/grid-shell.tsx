@@ -2438,7 +2438,7 @@ export function GridShell({
         sheet_index,
         formula_reference_bases === undefined
             ? undefined
-            : () => formula_reference_bases(text, additional_pending_rows),
+            : (bases_text) => formula_reference_bases(bases_text, additional_pending_rows),
     ), [formula_reference_bases, formula_workbook, sheet_index]);
     const refuse_formula = useCallback((reason: string) => {
         host_bridge.postMessage({ type: 'showWarning', message: reason });
@@ -4686,7 +4686,7 @@ export function GridShell({
                             sheet_index,
                             formula_reference_bases === undefined
                                 ? undefined
-                                : () => formula_reference_bases(cell.value, rows.length),
+                                : (bases_text) => formula_reference_bases(bases_text, rows.length),
                         )
                         : undefined;
                     if (fields?.kind !== 'fields') {

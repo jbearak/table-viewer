@@ -118,8 +118,9 @@ export function pending_formula_cells_referencing_provisional_rows(
     const conflicts: PendingFormulaConflictCell[] = [];
     for (const row of pending_rows(formula_structural)) {
         for (const [column, cell] of Object.entries(row.cells)) {
-            // Stored anchors already name the rows, so external growth cannot change them.
-            if (cell.formulaAnchors !== undefined) continue;
+            // Anchored references already name their rows; bases beside anchors
+            // describe only the references the anchors leave out.
+            if (cell.formulaAnchors !== undefined && cell.formulaReferenceBases === undefined) continue;
             if (!references_provisional(cell.value, cell.formulaReferenceBases)) continue;
             conflicts.push({
                 rowIdentity: { kind: 'pending', pendingRowId: row.id },
@@ -132,7 +133,9 @@ export function pending_formula_cells_referencing_provisional_rows(
         if (extra !== undefined
             || !Number.isSafeInteger(sourceRow)
             || !Number.isSafeInteger(sourceColumn)) continue;
-        if (typeof entry !== 'string' && entry.formulaAnchors !== undefined) continue;
+        if (typeof entry !== 'string'
+            && entry.formulaAnchors !== undefined
+            && entry.formulaReferenceBases === undefined) continue;
         const value = typeof entry === 'string' ? entry : entry.value;
         const authored = typeof entry === 'string' ? undefined : entry.formulaReferenceBases;
         if (!references_provisional(value, authored)) continue;

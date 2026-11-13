@@ -140,16 +140,9 @@ describe('cell entries', () => {
         expect(copy_dirty_entry(entry)).toEqual(entry);
     });
 
-    it('refuse anchors that do not fit the value, or beside reference bases', () => {
-        const bases = [{
-            targetSheetIndex: 0,
-            targetSheetName: 'S',
-            provisionalStartRow: 4,
-            provisionalRowCount: 1,
-        }];
+    it('refuse anchors that do not fit the value', () => {
         for (const bad of [
             { ...entry, value: '=A3' },
-            { ...entry, formulaReferenceBases: bases },
             { ...entry, formulaAnchors: { references: [{ start: 1, end: 3 }] } },
         ]) {
             expect(is_strict_wire_dirty_entry(bad)).toBe(false);
@@ -157,17 +150,29 @@ describe('cell entries', () => {
         }
     });
 
-    it('drop formula reference bases when anchors are stored', () => {
-        const made = make_dirty_entry(TEXT, '=A1', undefined, undefined, undefined, undefined, {
-            formulaReferenceBases: [{
-                targetSheetIndex: 0,
-                targetSheetName: 'S',
-                provisionalStartRow: 4,
-                provisionalRowCount: 1,
-            }],
+    it('keep formula reference bases beside anchors, for the references the anchors leave out', () => {
+        const bases = [{
+            targetSheetIndex: 0,
+            targetSheetName: 'S',
+            provisionalStartRow: 4,
+            provisionalRowCount: 1,
+        }];
+        const both = { ...entry, formulaReferenceBases: bases };
+        expect(make_dirty_entry(TEXT, '=A1', undefined, undefined, undefined, undefined, {
+            formulaReferenceBases: bases,
             formulaAnchors: ANCHORS,
-        });
-        expect(made).toEqual(entry);
+        })).toEqual(both);
+        expect(is_strict_wire_dirty_entry(both)).toBe(true);
+        expect(sanitized_wire_dirty_entry(both)).toEqual(both);
+        expect(() => own_pending_structural_changes({
+            formatTemplates: [XLSX_TEMPLATE],
+            appendedRows: [{
+                id: 'p1',
+                cells: { 0: { value: TEXT, formulaAnchors: ANCHORS, formulaReferenceBases: bases } },
+                formatTemplateId: 'x',
+                createdOrder: 0,
+            }],
+        })).not.toThrow();
     });
 });
 

@@ -42,7 +42,7 @@ import type {
     FormulaAnchors,
 } from './formula-anchors';
 import { worksheet_target_matches, type WorksheetTarget } from './types';
-import type { FormulaReferenceIssue } from './xlsx-formula';
+import { formula_reference_tokens, type FormulaReferenceIssue } from './xlsx-formula';
 
 // --- Axis views --------------------------------------------------------------
 
@@ -420,4 +420,20 @@ export function referenced_pending_ids(
         }
     }
     return { rows, columns };
+}
+
+/**
+ * `text` with each anchored reference blanked out, when references the
+ * anchors do not cover remain, or `undefined` when every reference is
+ * anchored. The append bases of a partly anchored formula are captured from
+ * this text, so they describe only its unanchored references.
+ */
+export function unanchored_formula_text(text: string, anchors: FormulaAnchors): string | undefined {
+    let masked = text;
+    for (const reference of anchors.references) {
+        masked = masked.slice(0, reference.start)
+            + ' '.repeat(reference.end - reference.start)
+            + masked.slice(reference.end);
+    }
+    return formula_reference_tokens(masked).references.length > 0 ? masked : undefined;
 }

@@ -1893,8 +1893,9 @@ export interface CsvDirtyEntry {
     /**
      * Row and column identities the formula's references name, stored when the
      * value was committed against a live layout change or named a Pending Row
-     * or Pending Column (see `formula-anchors.ts`). `.xlsx` only, and never
-     * alongside `formulaReferenceBases`: the anchors already name the rows.
+     * or Pending Column (see `formula-anchors.ts`). `.xlsx` only. Any
+     * `formulaReferenceBases` beside them describe only the references the
+     * anchors leave out.
      */
     readonly formulaAnchors?: FormulaAnchors;
 }
@@ -2170,7 +2171,6 @@ export interface DirtyEntryOptions {
     readonly movedFrom?: CsvDirtyEntry['movedFrom'];
     readonly valueEditOrder?: number;
     readonly formulaReferenceBases?: readonly PendingFormulaReferenceBasis[];
-    /** Wins over `formulaReferenceBases`, which are then dropped. */
     readonly formulaAnchors?: FormulaAnchors;
 }
 
@@ -2205,7 +2205,7 @@ export function make_dirty_entry(
         ...(options.valueEditOrder !== undefined
             ? { valueEditOrder: options.valueEditOrder }
             : {}),
-        ...(options.formulaReferenceBases !== undefined && options.formulaAnchors === undefined
+        ...(options.formulaReferenceBases !== undefined
             ? { formulaReferenceBases: options.formulaReferenceBases }
             : {}),
         ...(options.formulaAnchors !== undefined ? { formulaAnchors: options.formulaAnchors } : {}),
@@ -2451,14 +2451,10 @@ export function sanitized_wire_dirty_entry(entry: unknown): CsvDirtyEntry | unde
     });
 }
 
-/**
- * Formula Anchors, when present, are valid for the entry's value, and the
- * entry carries no `formulaReferenceBases` beside them.
- */
+/** Formula Anchors, when present, are valid for the entry's value. */
 function formula_anchor_fields_valid(entry: Record<string, unknown>): boolean {
     if (entry.formulaAnchors === undefined) return true;
     return typeof entry.value === 'string'
-        && entry.formulaReferenceBases === undefined
         && own_formula_anchors(entry.formulaAnchors, entry.value) !== undefined;
 }
 
