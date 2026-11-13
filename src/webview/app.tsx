@@ -82,6 +82,7 @@ import {
 } from '../cell-content';
 import {
     all_workbook_formula_cells_impact,
+    workbook_impact_with_cells,
     compile_workbook_formula_graph,
     pending_workbook_formula_targets,
     plan_workbook_formula_recalculation,
@@ -105,8 +106,10 @@ import {
 } from '../spreadsheet-safety';
 import { referenced_pending_ids } from '../formula-anchor-layout';
 import {
+    layout_affected_formula_cells,
     needs_prospective_formula_request,
     prospective_formula_request,
+    prospective_formula_targets,
     webview_formula_workbook,
 } from './formula-anchor-model';
 import { capture_pending_formula_reference_bases } from '../pending-formula-rebase';
@@ -849,7 +852,11 @@ export function App(): React.JSX.Element {
         });
         const pending_by_sheet = new Map(edit_session_registry_ref.current!.pending_entries());
         const changes_for = (sheet_index: number) => pending_by_sheet.get(sheet_index)?.snapshot();
-        if (formula_anchor_workbook !== undefined && needs_prospective_formula_request(
+        // A pending cut move retargets formulas only on the move path, which
+        // calculates nothing live; the two are never combined.
+        if (formula_roots_projection.moves.length === 0
+            && formula_anchor_workbook !== undefined
+            && needs_prospective_formula_request(
             formula_anchor_workbook,
             edits,
             formula_roots_projection.pendingEdits,
@@ -859,7 +866,6 @@ export function App(): React.JSX.Element {
             // for the current layouts, and every formula is recalculated.
             const request = prospective_formula_request({
                 workbook: formula_anchor_workbook,
-                sheets: meta?.sheets ?? [],
                 changes_for,
                 edits,
                 pending_edits: formula_roots_projection.pendingEdits,
@@ -869,8 +875,10 @@ export function App(): React.JSX.Element {
                 prospectiveRowCounts: request.prospectiveRowCounts,
                 removedRows: [],
                 prospective: {
+                    workbook: formula_anchor_workbook,
                     layouts: request.layouts,
-                    targets: request.targets,
+                    editTargets: request.editTargets,
+                    graphRoots: request.graphRoots,
                 },
                 tooManyEdits: formula_roots_projection.tooManyEdits || request.tooMany,
             };
@@ -1827,13 +1835,32 @@ export function App(): React.JSX.Element {
     );
     const formula_calculation_plan = useMemo(() => {
         if (prospective_formula_state !== undefined) {
-            // Layout changes can move any formula's references, so every
-            // formula is stale until its prospective result arrives.
+            // Formulas that name a restructured worksheet, and their
+            // dependents and the edits' dependents, recalculate at their
+            // prospective addresses; every other formula keeps its source
+            // result.
+            const layout_cells = layout_affected_formula_cells(
+                prospective_formula_state.workbook,
+                meta?.sheets ?? [],
+            );
+            const impact = workbook_impact_with_cells(
+                workbook_formula_graph.invalidatedBy([
+                    ...prospective_formula_state.graphRoots,
+                    ...layout_cells,
+                ]),
+                layout_cells,
+            );
+            const planned = prospective_formula_targets(
+                prospective_formula_state.workbook,
+                impact,
+                prospective_formula_state.editTargets,
+            );
+            const exceeded = too_many_formula_calculation_edits || planned.tooMany;
             return {
                 sheetCount: meta?.sheets.length ?? 0,
-                impact: all_workbook_formula_cells_impact(meta?.sheets ?? []),
-                targets: too_many_formula_calculation_edits ? [] : prospective_formula_state.targets,
-                formulaLimitExceeded: too_many_formula_calculation_edits,
+                impact: exceeded ? all_workbook_formula_cells_impact(meta?.sheets ?? []) : impact,
+                targets: exceeded ? [] : planned.targets,
+                formulaLimitExceeded: exceeded,
             };
         }
         if (has_formula_moves) {
@@ -1867,6 +1894,7 @@ export function App(): React.JSX.Element {
         prospective_formula_sheets,
         prospective_formula_state,
         too_many_formula_calculation_edits,
+        workbook_formula_graph,
     ]);
     const formula_impact = formula_calculation_plan.impact;
     const formula_calculation_targets = formula_calculation_plan.targets;
@@ -1884,9 +1912,7 @@ export function App(): React.JSX.Element {
             : undefined);
         set_edit_formula_calculation(undefined);
     }, [formula_graph_key]);
-    // A prospective request recalculates every formula, source-pending ones included.
-    const source_formulas_ready = prospective_formula_state !== undefined
-        || source_pending_formula_targets.length === 0
+    const source_formulas_ready = source_pending_formula_targets.length === 0
         || source_formula_calculation?.graphKey === formula_graph_key;
     const formula_calculation_sequence_ref = useRef(0);
     const active_formula_calculation_ref = useRef<{
@@ -1920,8 +1946,13 @@ export function App(): React.JSX.Element {
             sourceGeneration,
             edits,
             targets,
-            prospectiveRowCounts: prospective_formula_row_counts,
-            removedRows: removed_formula_rows,
+            // Source results are calculated at source addresses, without layouts.
+            ...(kind === 'source' && prospective_formula_state !== undefined
+                ? {}
+                : {
+                    prospectiveRowCounts: prospective_formula_row_counts,
+                    removedRows: removed_formula_rows,
+                }),
             ...(kind === 'edit' && prospective_formula_state !== undefined
                 ? { layouts: prospective_formula_state.layouts }
                 : {}),

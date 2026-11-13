@@ -8,6 +8,7 @@ import type {
     CsvSaveOperation,
     HostMessage,
     SheetTransformState,
+    SheetPendingEditCells,
     SheetViewRecord,
     TransformIntent,
     WebviewMessage,
@@ -5664,6 +5665,68 @@ describe('edit mode save exit', () => {
         expect(post_message.mock.calls.filter(([message]) => (
             message?.type === 'requestEditSession'
         ))).toHaveLength(1);
+    });
+
+    // `=A2` on a one-row sheet, anchored to the first row past the body.
+    const anchored_formula_edit = {
+        value: '=A2',
+        base: '',
+        formulaAnchors: { references: [{
+            start: 1,
+            end: 3,
+            corners: [{
+                row: { kind: 'trailing' as const, offset: 1 },
+                column: { kind: 'identity' as const, column: { kind: 'source' as const, sourceColumn: 0 } },
+            }],
+        }] },
+    };
+
+    async function open_anchored_session(
+        meta: WorkbookMeta,
+        pendingEdits: SheetPendingEditCells,
+    ) {
+        const rendered = await render_app();
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: { csvEditable: true, csvEditingSupported: true, editSyntax: 'markdown' },
+        }));
+        await click_button('Edit');
+        await dispatch_host_message({
+            type: 'editSessionResult',
+            granted: true,
+            editSessionId: 'anchored-formula-session',
+            sheetIndex: 0,
+            pendingEdits,
+        });
+        return rendered.post_message.mock.calls
+            .map(([message]) => message as WebviewMessage)
+            .filter((message): message is Extract<WebviewMessage, { type: 'requestFormulaCalculation' }> =>
+                message.type === 'requestFormulaCalculation');
+    }
+
+    it('calculates stored anchors at prospective addresses, targeting only affected formulas', async () => {
+        const meta = make_meta(['Sheet1'], false);
+        meta.sheets[0].columnCount = 3;
+        // C1 holds a formula naming nothing an edit or layout changes.
+        meta.sheets[0].formulaCells = [0, 2];
+        const requests = await open_anchored_session(meta, { '0:1': anchored_formula_edit });
+        const request = requests.at(-1)!;
+        expect(request.layouts).toBeDefined();
+        expect(request.edits).toMatchObject([{ row: 0, column: 1, formulaAnchors: anchored_formula_edit.formulaAnchors }]);
+        // The unaffected C1 keeps its source result instead of a recalculated one.
+        expect(request.targets).toEqual([{ sheetIndex: 0, row: 0, column: 1 }]);
+    });
+
+    it('keeps a pending cut move on the move path, never a prospective request', async () => {
+        const meta = make_meta(['Sheet1'], false);
+        meta.sheets[0].columnCount = 3;
+        meta.sheets[0].sourceRowCount = 2;
+        meta.sheets[0].rowCount = 2;
+        const requests = await open_anchored_session(meta, {
+            '0:1': anchored_formula_edit,
+            '1:2': { value: 'moved', base: '', movedFrom: { row: 0, col: 2, order: 1 } },
+            '0:2': { value: '', base: 'moved', valueEditOrder: 1 },
+        });
+        expect(requests.some((request) => request.layouts !== undefined)).toBe(false);
     });
 
     it('does not mutate a posted formula request when a later edit lands', async () => {

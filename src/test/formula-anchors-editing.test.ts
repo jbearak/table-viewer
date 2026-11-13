@@ -17,14 +17,17 @@ import {
     formula_display,
     formula_workbook_with_appended_rows,
     formula_result_key,
+    layout_affected_formula_cells,
     needs_prospective_formula_request,
     prospective_formula_request,
+    prospective_formula_targets,
     webview_formula_workbook,
     type AnchorSheetMeta,
 } from '../webview/formula-anchor-model';
 import { delete_rows, type WorksheetStructureContext } from '../webview/pending-row-store';
 import { formula_anchor_context } from '../formula-anchor-layout';
 import { anchor_formula } from '../formula-anchors';
+import { all_workbook_formula_cells_impact, workbook_impact_with_cells } from '../formula-dependencies';
 import {
     EMPTY_PENDING_STRUCTURAL_CHANGES,
     type PendingAppendedRow,
@@ -208,11 +211,10 @@ describe('prospective calculation request', () => {
             .toBe(true);
     });
 
-    it('places edits and formula targets at their prospective coordinates', () => {
+    it('places edits and their targets at their prospective coordinates', () => {
         const changes = delete_data_rows([2]);
         const request = prospective_formula_request({
             workbook: workbook(changes),
-            sheets: [{ ...SHEETS[0], formulaCells: [1, 2, 2, 2, 4, 2] }, SHEETS[1]],
             changes_for: (index) => index === 0 ? changes : undefined,
             edits: [
                 { sheetIndex: 0, row: 4, column: 1, value: '=A2', writesFormula: true },
@@ -222,16 +224,39 @@ describe('prospective calculation request', () => {
             pending_edits: [],
         });
         expect(request.edits).toEqual([{ sheetIndex: 0, row: 3, column: 1, value: '=A2', writesFormula: true }]);
-        expect(request.targets).toEqual(expect.arrayContaining([
-            { sheetIndex: 0, row: 3, column: 1 },
-            { sheetIndex: 0, row: 1, column: 2 },
-            { sheetIndex: 0, row: 3, column: 2 },
-        ]));
-        // The formula on the removed row is not a target.
-        expect(request.targets).toHaveLength(3);
+        expect(request.editTargets).toEqual([{ sheetIndex: 0, row: 3, column: 1 }]);
+        expect(request.graphRoots).toEqual([{ sheetIndex: 0, row: 4, column: 1 }]);
         expect(request.prospectiveRowCounts).toEqual([5, 3]);
         expect(request.layouts[0]).toEqual({ bodyStart: 1, rowLayout: changes.rowLayout, band: [] });
         expect(request.layouts[1]).toEqual({ bodyStart: 0, band: [] });
+    });
+
+    it('targets only the source formulas a layout change affects', () => {
+        const deleted = workbook(delete_data_rows([2]));
+        // Data!C2 sums Data; Data!C5 names only Other; Other!B1 names Data; Other!B2 names Other.
+        const sheets = [
+            {
+                formulaDependencies: [1, 2, 0, 1, 0, 5, 0, 4, 2, 1, 0, 0, 0, 0],
+                structuredFormulaReferences: { names: [], references: [] },
+            },
+            { formulaDependencies: [0, 1, 0, 1, 0, 1, 0, 1, 1, 1, 0, 0, 0, 0] },
+        ];
+        const affected = layout_affected_formula_cells(deleted, sheets);
+        expect(affected).toEqual([
+            { sheetIndex: 0, row: 1, column: 2 },
+            { sheetIndex: 1, row: 0, column: 1 },
+        ]);
+        // Without a live layout change nothing is affected.
+        expect(layout_affected_formula_cells(workbook(), sheets)).toEqual([]);
+        const impact = workbook_impact_with_cells(all_workbook_formula_cells_impact([]), affected);
+        expect(prospective_formula_targets(deleted, impact, [{ sheetIndex: 0, row: 3, column: 1 }])).toEqual({
+            targets: [
+                { sheetIndex: 0, row: 3, column: 1 },
+                { sheetIndex: 0, row: 1, column: 2 },
+                { sheetIndex: 1, row: 0, column: 1 },
+            ],
+            tooMany: false,
+        });
     });
 
     it('keys source results at their prospective coordinates, or at the source without one', () => {

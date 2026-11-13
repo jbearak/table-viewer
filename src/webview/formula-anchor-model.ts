@@ -45,6 +45,7 @@ import {
     type PendingStructuralChanges,
 } from '../pending-changes';
 import { MAX_WORKBOOK_FORMULAS } from '../spreadsheet-safety';
+import type { WorkbookCellAddress, WorkbookFormulaImpact } from '../formula-dependencies';
 import { xlsx_edit_writes_formula } from '../xlsx-cell-value';
 import type { PendingFormulaCalculationEdit } from './edit-session-registry';
 import type { SheetMeta } from '../data-source/interface';
@@ -239,7 +240,6 @@ export function committed_formula_cell_fields(
 /** What the calculation request is built from. */
 export interface ProspectiveFormulaInputs {
     readonly workbook: FormulaAnchorWorkbook;
-    readonly sheets: readonly (AnchorSheetMeta & { readonly formulaCells?: readonly number[] })[];
     readonly changes_for: (sheet_index: number) => PendingStructuralChanges | undefined;
     /** Cell edits at canonical source coordinates. */
     readonly edits: readonly FormulaCalculationEdit[];
@@ -249,10 +249,18 @@ export interface ProspectiveFormulaInputs {
 
 export interface ProspectiveFormulaRequest {
     readonly edits: readonly FormulaCalculationEdit[];
-    readonly targets: readonly FormulaCalculationAddress[];
+    /** Every formula an edit writes, at its prospective address. */
+    readonly editTargets: readonly FormulaCalculationAddress[];
+    /**
+     * The edits as dependency-graph roots, in the graph's coordinates: cell
+     * edits at their source address, Pending Appended Row cells in the band.
+     * Edits on a worksheet with a live layout change are covered by
+     * {@link layout_affected_formula_cells} instead.
+     */
+    readonly graphRoots: readonly WorkbookCellAddress[];
     readonly layouts: readonly FormulaCalculationLayout[];
     readonly prospectiveRowCounts: readonly number[];
-    /** More formulas than one request may calculate; no targets are sent. */
+    /** More edits than one request may calculate; none are sent. */
     readonly tooMany: boolean;
 }
 
@@ -314,6 +322,7 @@ function prospective_row_of_key(worksheet: AnchorWorksheet, key: string): number
 export function prospective_formula_request(inputs: ProspectiveFormulaInputs): ProspectiveFormulaRequest {
     const { workbook } = inputs;
     const edits: FormulaCalculationEdit[] = [];
+    const graph_roots: WorkbookCellAddress[] = [];
     const targets = new Map<string, FormulaCalculationAddress>();
     const target = (sheetIndex: number, row: number | undefined, column: number | undefined) => {
         if (row === undefined || column === undefined) return;
@@ -326,14 +335,20 @@ export function prospective_formula_request(inputs: ProspectiveFormulaInputs): P
         const column = prospective_column_of(worksheet, { kind: 'source', sourceColumn: edit.column });
         if (row === undefined || column === undefined) continue;
         edits.push({ ...edit, row, column });
+        graph_roots.push({ sheetIndex: edit.sheetIndex, row: edit.row, column: edit.column });
         if (edit.writesFormula) target(edit.sheetIndex, row, column);
     }
     for (const edit of inputs.pending_edits) {
         const worksheet = workbook.worksheets[edit.sheetIndex];
         if (worksheet === undefined) continue;
-        const row = prospective_row_of(worksheet, { kind: 'pending', pendingRowId: edit.pendingRowId });
+        const identity = { kind: 'pending', pendingRowId: edit.pendingRowId } as const;
+        const row = prospective_row_of(worksheet, identity);
         const column = prospective_column_of(worksheet, { kind: 'source', sourceColumn: edit.column });
         if (row === undefined || column === undefined) continue;
+        // An appended row's prospective row is its band row, as the graph numbers it.
+        if ((worksheet.rows.position_of(identity) ?? -1) >= worksheet.rows.fullCount) {
+            graph_roots.push({ sheetIndex: edit.sheetIndex, row, column });
+        }
         edits.push({
             sheetIndex: edit.sheetIndex,
             row,
@@ -370,27 +385,79 @@ export function prospective_formula_request(inputs: ProspectiveFormulaInputs): P
                 if (writes_formula) target(sheetIndex, row, column);
             }
         }
-        const packed = inputs.sheets[sheetIndex]?.formulaCells ?? [];
-        for (let offset = 0; offset + 1 < packed.length; offset += 2) {
-            target(
-                sheetIndex,
-                prospective_row_of(worksheet, { kind: 'source', sourceRow: packed[offset] }),
-                prospective_column_of(worksheet, { kind: 'source', sourceColumn: packed[offset + 1] }),
-            );
-        }
         return layout_of(worksheet, changes);
     });
     edits.sort((left, right) => (left.sheetIndex - right.sheetIndex)
         || (left.row - right.row)
         || (left.column - right.column));
-    const too_many = targets.size > MAX_WORKBOOK_FORMULAS || edits.length > MAX_WORKBOOK_FORMULAS;
+    const too_many = edits.length > MAX_WORKBOOK_FORMULAS;
     return {
         edits: too_many ? [] : edits,
-        targets: too_many ? [] : [...targets.values()],
+        editTargets: too_many ? [] : [...targets.values()],
+        graphRoots: graph_roots,
         layouts,
         prospectiveRowCounts: workbook.worksheets.map(prospective_row_count),
         tooMany: too_many,
     };
+}
+
+/** The formula-dependency facts of a worksheet, as snapshot metadata carries them. */
+export type FormulaDependencySheet = Pick<SheetMeta, 'formulaDependencies' | 'structuredFormulaReferences'>;
+
+/**
+ * Source formulas whose references name a worksheet with a live layout
+ * change, at their source address: their rendered text, and so their result,
+ * may change. Formulas that name only other worksheets keep their source
+ * results.
+ */
+export function layout_affected_formula_cells(
+    workbook: FormulaAnchorWorkbook,
+    sheets: readonly FormulaDependencySheet[],
+): readonly WorkbookCellAddress[] {
+    const changed = (sheet_index: number): boolean => {
+        const worksheet = workbook.worksheets[sheet_index];
+        return worksheet !== undefined && (worksheet.rows.hasLiveChange || worksheet.columns.hasLiveChange);
+    };
+    const cells = new Map<string, WorkbookCellAddress>();
+    const add = (sheetIndex: number, row: number, column: number) => {
+        cells.set(`${sheetIndex}:${row}:${column}`, { sheetIndex, row, column });
+    };
+    sheets.forEach((sheet, sheetIndex) => {
+        const dependencies = sheet.formulaDependencies ?? [];
+        for (let offset = 0; offset + 6 < dependencies.length; offset += 7) {
+            if (changed(dependencies[offset + 2])) add(sheetIndex, dependencies[offset], dependencies[offset + 1]);
+        }
+        const structured = sheet.structuredFormulaReferences?.references ?? [];
+        for (let offset = 0; offset + 4 < structured.length; offset += 5) {
+            if (changed(structured[offset + 2])) add(sheetIndex, structured[offset], structured[offset + 1]);
+        }
+    });
+    return [...cells.values()];
+}
+
+/**
+ * Prospective calculation targets: every formula an edit writes, and every
+ * affected source formula (source coordinates in `impact`) that still has a
+ * prospective address. Source formulas outside `impact` keep their source
+ * results.
+ */
+export function prospective_formula_targets(
+    workbook: FormulaAnchorWorkbook,
+    impact: WorkbookFormulaImpact,
+    edit_targets: readonly FormulaCalculationAddress[],
+): { readonly targets: readonly FormulaCalculationAddress[]; readonly tooMany: boolean } {
+    const targets = new Map(edit_targets.map((target) =>
+        [`${target.sheetIndex}:${target.row}:${target.column}`, target]));
+    workbook.worksheets.forEach((worksheet, sheetIndex) => {
+        for (const cell of impact.forSheet(sheetIndex).cells()) {
+            const row = prospective_row_of(worksheet, { kind: 'source', sourceRow: cell.row });
+            const column = prospective_column_of(worksheet, { kind: 'source', sourceColumn: cell.column });
+            if (row === undefined || column === undefined) continue;
+            targets.set(`${sheetIndex}:${row}:${column}`, { sheetIndex, row, column });
+        }
+    });
+    const too_many = targets.size > MAX_WORKBOOK_FORMULAS;
+    return { targets: too_many ? [] : [...targets.values()], tooMany: too_many };
 }
 
 /**
