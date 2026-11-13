@@ -143,7 +143,9 @@ jobs:
       # Clean relaunch and SIGKILL relaunch. A forced termination leaves a hot
       # rollback journal and a stranded reader token on purpose — the token is
       # never reclaimed by PID or age — so the gate asserts the relaunch opens
-      # anyway and claims no recovery it did not perform.
+      # anyway and claims no recovery it did not perform. Then structural
+      # drafts: unsaved row and column changes survive closing the window and
+      # relaunching, and save.
       - name: Packaged desktop relaunch gates
         run: npm run test:desktop-smoke:relaunch
 

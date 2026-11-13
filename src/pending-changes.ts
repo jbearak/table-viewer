@@ -537,6 +537,14 @@ export type StructuralBasis =
         readonly workbookDigest: string;
         readonly sourceRowCount: number;
         readonly sourceColumnCount: number;
+        /**
+         * The first body source row when the layout was authored. An
+         * external edit can turn an auto-detected Header Row on or off, which
+         * moves the current body start; publication validates the layout
+         * against this one. Absent in a basis recorded before it existed,
+         * which means unknown.
+         */
+        readonly bodyStart?: number;
     };
 
 /** Durable refusal state: a reload must not hide why Save is still closed. */
@@ -1334,11 +1342,14 @@ export function own_structural_basis(value: unknown): StructuralBasis {
             'workbookDigest',
             'sourceRowCount',
             'sourceColumnCount',
+            'bodyStart',
         ])
         && is_structural_digest(value.worksheetPartDigest)
         && nullable_digest(value.sharedStringsDigest)
         && nullable_digest(value.stylesDigest)
         && is_structural_digest(value.workbookDigest)
+        && (value.bodyStart === undefined
+            || (is_whole_number(value.bodyStart) && value.bodyStart <= counts.sourceRowCount))
     ) {
         return Object.freeze({
             kind: 'xlsx',
@@ -1347,6 +1358,7 @@ export function own_structural_basis(value: unknown): StructuralBasis {
             stylesDigest: value.stylesDigest,
             workbookDigest: value.workbookDigest,
             ...counts,
+            ...(value.bodyStart === undefined ? {} : { bodyStart: value.bodyStart as number }),
         });
     }
     return pending_row_error('contain an invalid structural basis');

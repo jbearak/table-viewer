@@ -69,7 +69,16 @@ export function structural_bases_equal(
     left: StructuralBasis | undefined,
     right: StructuralBasis | undefined,
 ): boolean {
-    return left !== undefined && right !== undefined && JSON.stringify(left) === JSON.stringify(right);
+    if (left === undefined || right === undefined) return false;
+    // A basis recorded before `bodyStart` existed doesn't know it. The body
+    // start follows from the digested parts, so the rest still decides.
+    const known = (basis: StructuralBasis) => basis.kind === 'xlsx' && basis.bodyStart !== undefined;
+    const comparable = (basis: StructuralBasis): StructuralBasis => {
+        if (basis.kind !== 'xlsx' || (known(left) && known(right))) return basis;
+        const { bodyStart: _unknown, ...rest } = basis;
+        return rest;
+    };
+    return JSON.stringify(comparable(left)) === JSON.stringify(comparable(right));
 }
 
 const QUOTE = 0x22;

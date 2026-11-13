@@ -151,6 +151,8 @@ interface Axis<Identity> {
     identity_anchor(identity: Identity): AxisAnchor;
     identity_of(anchor: AxisAnchor): Identity | undefined;
     source_identity(number: number): Identity;
+    /** 1-based number of a source identity, for the rows above the body. */
+    source_number?(identity: Identity): number | undefined;
 }
 
 const ROW_AXIS: Axis<RowIdentity> = {
@@ -158,6 +160,7 @@ const ROW_AXIS: Axis<RowIdentity> = {
     identity_anchor: (row) => ({ kind: 'identity', row }),
     identity_of: (anchor) => anchor.kind === 'identity' && 'row' in anchor ? anchor.row : undefined,
     source_identity: (number) => ({ kind: 'source', sourceRow: number - 1 }),
+    source_number: (row) => row.kind === 'source' ? row.sourceRow + 1 : undefined,
 };
 
 const COLUMN_AXIS: Axis<ColumnIdentity> = {
@@ -482,6 +485,14 @@ function place<Identity>(
                 };
         case 'identity': {
             const identity = axis.identity_of(anchor);
+            // A source row at or above the Header Row is a fixed row, as
+            // anchoring it now would record. A draft anchored while an
+            // auto-detected Header Row still read as body row 0 holds it as
+            // an identity the layout doesn't have.
+            const fixed = identity === undefined ? undefined : axis.source_number?.(identity);
+            if (fixed !== undefined && fixed >= 1 && fixed <= view.fixedCount) {
+                return { kind: 'fixed', number: fixed };
+            }
             const position = identity === undefined ? undefined : view.position_of(identity);
             return position === undefined
                 ? { kind: 'unknown' }

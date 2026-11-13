@@ -59,6 +59,7 @@ import {
     type WorksheetPendingChanges,
 } from '../types';
 import type { WorkbookMeta } from '../data-source/interface';
+import { header_body_start } from '../worksheet-layout';
 import {
     advance_pending_append_basis,
     assert_pending_changes_encoded_bound,
@@ -1115,7 +1116,7 @@ export function App(): React.JSX.Element {
                 sheetName: sheet.name,
                 ...(sheet.worksheetId === undefined ? {} : { worksheetId: sheet.worksheetId }),
             },
-            bodyStart: header?.active === true && header.sourceRow !== undefined ? header.sourceRow + 1 : 0,
+            bodyStart: header_body_start(header),
             sourceRowCount: sheet.sourceRowCount,
             sourceColumnCount: sheet.columnCount,
             bodyViewTransformed: false,
@@ -1154,7 +1155,7 @@ export function App(): React.JSX.Element {
                 sheetName: sheet.name,
                 ...(sheet.worksheetId === undefined ? {} : { worksheetId: sheet.worksheetId }),
             },
-            bodyStart: header?.active === true && header.sourceRow !== undefined ? header.sourceRow + 1 : 0,
+            bodyStart: header_body_start(header),
             sourceRowCount: sheet.sourceRowCount,
             sourceColumnCount: sheet.columnCount,
             bodyViewTransformed: false,

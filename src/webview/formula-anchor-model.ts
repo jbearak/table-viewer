@@ -51,6 +51,7 @@ import type { WorkbookCellAddress, WorkbookFormulaImpact } from '../formula-depe
 import { xlsx_edit_writes_formula } from '../xlsx-cell-value';
 import type { PendingFormulaCalculationEdit } from './edit-session-registry';
 import type { SheetMeta } from '../data-source/interface';
+import { header_body_start } from '../worksheet-layout';
 import type { WorksheetTarget } from '../types';
 import { UNKNOWN_XLSX_FORMULA_RESULT, type FormulaReferenceIssue } from '../xlsx-formula';
 
@@ -62,8 +63,7 @@ export type AnchorSheetMeta = Pick<
 
 /** H: the Header Row's 1-based number, or 0 without one, as the host and the store compute it. */
 export function sheet_body_start(sheet: Pick<SheetMeta, 'excelFirstRowHeader'>): number {
-    const header = sheet.excelFirstRowHeader;
-    return header?.active === true && header.sourceRow !== undefined ? header.sourceRow + 1 : 0;
+    return header_body_start(sheet.excelFirstRowHeader);
 }
 
 /**

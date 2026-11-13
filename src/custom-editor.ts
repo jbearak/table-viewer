@@ -92,6 +92,9 @@ export class TableViewerEditorProvider
     readonly #drains = new Set<Promise<void>>();
     #close_barrier: Promise<void> | undefined;
     #close_barrier_settled = false;
+    /** Integration-test override of `STRUCTURAL_EDITING_ENABLED` for viewers
+     *  opened from now on; unset outside the extension test host. */
+    #structural_editing_enabled: boolean | undefined;
 
     constructor(
         private readonly extension_uri: vscode.Uri,
@@ -250,6 +253,13 @@ export class TableViewerEditorProvider
         return controller === undefined ? undefined : this.#integration_sessions.get(controller);
     }
 
+    setStructuralEditingEnabled(enabled: boolean | undefined): void {
+        if (!this.options.integrationTests) {
+            throw new Error('Structural editing can be overridden only in the extension test host.');
+        }
+        this.#structural_editing_enabled = enabled;
+    }
+
     /** Open one durable comparison document, or reveal its retained panel. */
     async openTableDiff(
         diff: TableDiffUris,
@@ -394,6 +404,9 @@ export class TableViewerEditorProvider
                 ...(integration_session === undefined
                     ? {}
                     : { integrationTestPort: integration_session.port }),
+                ...(this.#structural_editing_enabled === undefined
+                    ? {}
+                    : { structuralEditingEnabled: this.#structural_editing_enabled }),
                 ...options,
             },
         );
@@ -417,6 +430,9 @@ export interface TableViewerRegistration extends vscode.Disposable {
     ): Promise<void>;
     openWorkingTreeFile(uri: vscode.Uri): Promise<void>;
     integrationSession(uri: vscode.Uri): TableViewerIntegrationSession | undefined;
+    /** Extension test host only: override `STRUCTURAL_EDITING_ENABLED` for
+     *  viewers opened afterwards; `undefined` restores the shipped default. */
+    setStructuralEditingEnabled(enabled: boolean | undefined): void;
 }
 
 export function register_table_viewer(
@@ -462,6 +478,7 @@ export function register_table_viewer(
         openTableDiff: (diff, viewColumn) => provider.openTableDiff(diff, viewColumn),
         openWorkingTreeFile: (uri) => provider.openWorkingTreeFile(uri),
         integrationSession: (uri) => provider.integrationSession(uri),
+        setStructuralEditingEnabled: (enabled) => provider.setStructuralEditingEnabled(enabled),
     };
     context.subscriptions.push(registration);
     return registration;

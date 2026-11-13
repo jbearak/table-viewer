@@ -594,6 +594,7 @@ import {
 } from './pending-row-projection';
 import {
     column_identity_key,
+    header_body_start,
     index_column_layout,
     row_identity_key,
     source_column_layout,
@@ -2172,12 +2173,8 @@ export function GridShell({
     const pending_tail_removal_source_rows = useMemo(() => new Set(
         pending_rows.tailRemovals.map((removal) => removal.sourceRow),
     ), [pending_rows.tailRemovals]);
-    // First body source row, as the host computes it for layout validation:
-    // the Header Row's 1-based number, or 0 without one.
-    const header_meta = sheet_meta.excelFirstRowHeader;
-    const body_start = header_meta?.active === true && header_meta.sourceRow !== undefined
-        ? header_meta.sourceRow + 1
-        : 0;
+    // First body source row, as the host computes it for layout validation.
+    const body_start = header_body_start(sheet_meta.excelFirstRowHeader);
     // The layout mode needs the host's display to be the source order. Any
     // installed transform, or one still computing, keeps the band mode, where
     // Pending Row Removals stay in place too.
