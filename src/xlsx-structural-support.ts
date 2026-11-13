@@ -49,7 +49,7 @@ import {
     type Span,
 } from './ooxml-worksheet-scan';
 import { parse_relationships, rels_path_for_part } from './ooxml-relationships';
-import { worksheet_part_entries_from_package } from './parse-xlsx';
+import { parse_workbook_xml, worksheet_part_entries_from_package } from './parse-xlsx';
 import { writable_worksheet_sheet_data, worksheet_sheet_data_element } from './xlsx-cell-write';
 import { a1_formula_reference_at } from './xlsx-formula';
 import { ZipPackage, ZipPackageError } from './zip-package';
@@ -173,6 +173,11 @@ export type StructuralRefusalReason =
          * somewhere no specific check classifies.
          */
         readonly code: 'unclassified-reference';
+        readonly part: string;
+    }
+    | {
+        /** The backstop could not read a part, which may name any worksheet. */
+        readonly code: 'unreadable-part';
         readonly part: string;
     }
     | {
@@ -557,6 +562,8 @@ function refusal_clause(reason: StructuralRefusalReason): string {
                 : `the conditional formatting on ${qualified(reason.worksheet, reason.sqref)} has a threshold formula that uses this sheet (${reason.value})`;
         case 'unclassified-reference':
             return `${reason.part} refers to it in a way Table Viewer can't adjust`;
+        case 'unreadable-part':
+            return `Table Viewer can't read ${reason.part}`;
         case 'invalid-range':
             return `it has a range Table Viewer can't read in <${reason.element}> (${reason.value})`;
         case 'unwritable-worksheet':
@@ -1963,9 +1970,14 @@ function unclassified_references(
     zip: ZipPackage,
     worksheets: readonly ScannedWorksheet[],
     defined_name_offsets: ReadonlySet<number>,
-): Map<number, string> {
-    const found = new Map<number, string>();
+): Map<number, StructuralRefusalReason> {
+    const found = new Map<number, StructuralRefusalReason>();
     const index_by_name = new Map(worksheets.map((sheet, index) => [sheet.name.toLowerCase(), index]));
+    // Every sheet name, chartsheets included: a 3D span ending on a chartsheet
+    // still covers the worksheets between its endpoints.
+    const workbook_text = read_text(zip, 'xl/workbook.xml');
+    const sheet_names = new Set((workbook_text === null ? [] : parse_workbook_xml(workbook_text).sheets)
+        .map((sheet) => sheet.name.toLowerCase()));
     const worksheet_paths = new Set(worksheets.map((sheet) => sheet.path));
     const parts = zip.part_names();
 
@@ -1986,15 +1998,23 @@ function unclassified_references(
         return types !== undefined && [...types].every((type) => allowed.has(type));
     };
 
-    const record = (indexes: readonly number[], part: string): void => {
-        for (const index of indexes) if (!found.has(index)) found.set(index, part);
+    const record = (indexes: readonly number[], part: string, code: 'unclassified-reference' | 'unreadable-part' = 'unclassified-reference'): void => {
+        for (const index of indexes) if (!found.has(index)) found.set(index, { code, part });
     };
     const every_index = worksheets.map((_, index) => index);
     for (const part of parts) {
         if (found.size === worksheets.length) break;
         if (only(part, BACKSTOP_SKIPPED_RELATIONSHIPS)) continue;
         if (BACKSTOP_BINARY_EXTENSION.test(part) && (targeted_by.get(part) === undefined || only(part, BACKSTOP_BINARY_RELATIONSHIPS))) continue;
-        const raw = read_bytes(zip, part);
+        let raw: Uint8Array | null;
+        try {
+            raw = read_bytes(zip, part);
+        } catch {
+            // Encrypted, an unsupported method, or past the inflate budget:
+            // the reader and writer never open it, but it may name any sheet.
+            record(every_index, part, 'unreadable-part');
+            continue;
+        }
         if (raw === null) continue;
         const xml = backstop_xml_bytes(raw);
         if (xml === undefined) continue;
@@ -2006,10 +2026,16 @@ function unclassified_references(
                 const indexes = names
                     .map((name) => index_by_name.get(name.toLowerCase()))
                     .filter((index): index is number => index !== undefined);
-                // A 3D span between two known sheets covers the sheets between them.
-                record(names.length === 2 && indexes.length === 2
-                    ? Array.from({ length: Math.abs(indexes[1] - indexes[0]) + 1 }, (_, k) => Math.min(...indexes) + k)
-                    : indexes, part);
+                if (names.length === 2 && indexes.length === 2) {
+                    // A 3D span between two worksheets covers the worksheets between them.
+                    record(Array.from({ length: Math.abs(indexes[1] - indexes[0]) + 1 }, (_, k) => Math.min(...indexes) + k), part);
+                } else if (names.length === 2 && names.some((name) => sheet_names.has(name.toLowerCase()))) {
+                    // An endpoint that is a chartsheet or no sheet at all: the
+                    // span is unknown, so it may cover any worksheet.
+                    record(every_index, part);
+                } else {
+                    record(indexes, part);
+                }
             }
         });
         if (!parsed) record(every_index, part);
@@ -2133,9 +2159,7 @@ export function scan_xlsx_structural_support(
             }
             return undefined;
         })();
-        const backstop_part = backstop.get(sheet_index);
-        const reason: StructuralRefusalReason | undefined = specific
-            ?? (backstop_part === undefined ? undefined : { code: 'unclassified-reference', part: backstop_part });
+        const reason: StructuralRefusalReason | undefined = specific ?? backstop.get(sheet_index);
 
         const axis = (name: StructuralAxis): StructuralAxisSupport => reason === undefined
             ? { supported: true }

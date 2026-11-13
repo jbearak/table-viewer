@@ -110,6 +110,24 @@ function sheet(name: string, body = PLAIN_DATA, extra: Partial<SheetSpec> = {}):
     return { name, body, ...extra };
 }
 
+/** Set an unsupported compression method on one entry, in both its central and local headers. */
+function with_unreadable_entry(raw: Uint8Array, name: string): Uint8Array {
+    const bytes = Buffer.from(raw);
+    const eocd = bytes.lastIndexOf(Buffer.from([0x50, 0x4b, 0x05, 0x06]));
+    let offset = bytes.readUInt32LE(eocd + 16);
+    for (let entry = 0; entry < bytes.readUInt16LE(eocd + 10); entry += 1) {
+        const name_length = bytes.readUInt16LE(offset + 28);
+        const entry_name = bytes.subarray(offset + 46, offset + 46 + name_length).toString('utf8');
+        if (entry_name.replace(/^\/+/, '') === name) {
+            bytes.writeUInt16LE(99, offset + 10);
+            bytes.writeUInt16LE(99, bytes.readUInt32LE(offset + 42) + 8);
+            return bytes;
+        }
+        offset += 46 + name_length + bytes.readUInt16LE(offset + 30) + bytes.readUInt16LE(offset + 32);
+    }
+    throw new Error(`no ZIP entry ${name}`);
+}
+
 function scan(spec: WorkbookSpec, options?: XlsxStructuralSupportOptions): WorksheetStructuralSupport[] {
     return scan_xlsx_structural_support(build_xlsx(spec), options);
 }
@@ -763,6 +781,42 @@ describe('scan_xlsx_structural_support', () => {
             });
             expect(refused(spaced)).toMatchObject({ code: 'unclassified-reference', part: 'xl/vendor/thing.xml' });
             expect_supported(other);
+        });
+
+        it('refuses every sheet when it cannot read a part, instead of failing the scan', () => {
+            const raw = with_unreadable_entry(build_xlsx({
+                sheets: [sheet('Data'), sheet('Other')],
+                parts: { 'xl/vendor/thing.xml': '<thing/>' },
+            }), 'xl/vendor/thing.xml');
+            const supports = scan_xlsx_structural_support(raw);
+            expect(supports).toHaveLength(2);
+            for (const support of supports) {
+                const reason = refused(support);
+                expect(reason).toMatchObject({ code: 'unreadable-part', part: 'xl/vendor/thing.xml' });
+                expect(reason.message).toBe("Can't insert, delete, or move rows on this sheet: Table Viewer can't read xl/vendor/thing.xml.");
+            }
+        });
+
+        it('refuses every sheet for a 3D span whose other endpoint is not a worksheet', () => {
+            const unknown = scan({
+                sheets: [sheet('Data'), sheet('Between'), sheet('Other')],
+                parts: { 'xl/vendor/thing.xml': '<r>SUM(Data:Summary!A1)</r>' },
+            });
+            for (const support of unknown) expect(refused(support)).toMatchObject({ code: 'unclassified-reference' });
+
+            const chartsheet_end = scan({
+                sheets: [sheet('Data'), sheet('Other')],
+                chartsheets: [{ name: 'Chart1', relationships: [] }],
+                parts: { 'xl/vendor/thing.xml': '<r>SUM(Chart1:Chart1!A1)</r>' },
+            });
+            for (const support of chartsheet_end) expect(refused(support)).toMatchObject({ code: 'unclassified-reference' });
+
+            // Neither part names a sheet: prose, not a reference.
+            const prose = scan({
+                sheets: [sheet('Data'), sheet('Other')],
+                parts: { 'xl/vendor/thing.xml': '<r>note:see!</r>' },
+            });
+            prose.forEach(expect_supported);
         });
 
         it('refuses every sheet when a part declares a DTD', () => {
