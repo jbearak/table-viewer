@@ -12,7 +12,7 @@
 //     a preload runs before <html> exists, so it cannot style the document yet.
 //
 // Cmd/Ctrl+S is deliberately not handled here: the grid's own window keydown
-// listener (src/webview/grid-shell.tsx) saves in CSV edit mode, and it only
+// listener (src/webview/grid-shell.tsx) saves while an edit is held, and it only
 // sees the keystroke while no application-menu accelerator claims it first.
 import { contextBridge, ipcRenderer } from 'electron';
 import {

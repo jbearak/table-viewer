@@ -146,8 +146,8 @@ async function click_grid_cell(
     await expect(target).toHaveAttribute('aria-selected', 'true');
     if (was_selected) {
         // Only re-clicking an already-selected cell can open the editor, and
-        // only in Edit mode — in read mode it opens nothing, so this is a wait
-        // that is allowed to time out rather than an assertion. Bounded and
+        // only in a file that can be edited — elsewhere it opens nothing, so
+        // this is a wait that is allowed to time out rather than an assertion. Bounded and
         // retried, because `count()` does not retry: a slow-mounting editor
         // read as absent and the caller's Enter then committed into it.
         const editor = page.locator('.cell-editor-input');
@@ -460,7 +460,7 @@ test('Diff default is explained and saved immediately', async () => {
     let control = prefs.locator('#diffOnByDefault');
     try {
         await expect(control).not.toBeChecked();
-        await expect(control).toHaveAccessibleName('Turn Diff on when entering Edit mode');
+        await expect(control).toHaveAccessibleName('Turn Diff on when you start editing');
         await expect(control.locator('xpath=following-sibling::div').locator('.hint'))
             .toContainText('keeps showing its original value next to the new one');
 
@@ -766,9 +766,10 @@ test('the About window shows the app version and its notice links', async () => 
 
 test('CSV keyboard navigation wraps and remains active after editing', async () => {
     const page = await focus_viewer('basic.csv');
-    const edit_toggle = page.getByRole('button', { name: 'Edit' });
-    await edit_toggle.click();
-    await expect(edit_toggle).toHaveAttribute('aria-pressed', 'true');
+    // No mode to enter: the file is editable, and Save is there waiting for
+    // something to save.
+    const save = page.getByRole('button', { name: 'Save' });
+    await expect(save).toHaveAttribute('aria-disabled', 'true');
 
     // Start at the first displayed data cell. Glide's accessibility columns
     // include the row marker at index 0, so the CSV columns are 1..3.
@@ -848,10 +849,10 @@ test('CSV keyboard navigation wraps and remains active after editing', async () 
     await cell_editor.fill('New York');
     await cell_editor.press('Enter');
     await expect(page.locator('#glide-cell-3-0')).toHaveText('New York');
-    await expect(edit_toggle).not.toHaveClass(/has-unsaved/);
-
-    await edit_toggle.click();
-    await expect(edit_toggle).toHaveAttribute('aria-pressed', 'false');
+    // Every value is back where it started, so nothing is unsaved and the
+    // controls that only exist beside unsaved changes are gone again.
+    await expect(save).not.toHaveClass(/has-unsaved/);
+    await expect(page.getByRole('button', { name: 'Discard' })).toHaveCount(0);
 });
 
 // Desktop editing uses the complete shared path: the renderer obtains an edit
@@ -867,11 +868,8 @@ test('CSV edits are marked dirty and save to the opened file', async () => {
     });
     expect(await window_state()).toEqual({ title: 'basic.csv', edited: false });
 
-    // Enter edit mode — and wait for it, or the keystrokes below land in a grid
-    // that is still read-only and are swallowed.
-    const edit_toggle = page.getByRole('button', { name: 'Edit' });
-    await edit_toggle.click();
-    await expect(edit_toggle).toHaveAttribute('aria-pressed', 'true');
+    const save = page.getByRole('button', { name: 'Save' });
+    await expect(save).toHaveAttribute('aria-disabled', 'true');
 
     // Open the first body cell's editor explicitly, replace its value, and commit.
     // Separating activation from entry makes the expected saved bytes unambiguous.
@@ -884,7 +882,9 @@ test('CSV edits are marked dirty and save to the opened file', async () => {
     await cell_editor.fill('Alicia');
     await cell_editor.press('Enter');
     await expect(cell_editor).toBeHidden();
-    await expect(edit_toggle).toHaveClass(/has-unsaved/);
+    await expect(save).toHaveClass(/has-unsaved/);
+    await expect(save).not.toHaveAttribute('aria-disabled', 'true');
+    await expect(page.getByRole('button', { name: 'Discard' })).toBeVisible();
 
     await expect.poll(window_state, { timeout: 15_000 }).toEqual(
         process.platform === 'darwin'
@@ -903,8 +903,9 @@ test('CSV edits are marked dirty and save to the opened file', async () => {
         'Charlie,35,Paris',
         '',
     ].join('\n'));
-    await expect(edit_toggle).not.toHaveClass(/has-unsaved/);
-    await expect(edit_toggle).toHaveAttribute('aria-pressed', 'false');
+    await expect(save).not.toHaveClass(/has-unsaved/);
+    await expect(save).toHaveAttribute('aria-disabled', 'true');
+    await expect(page.getByRole('button', { name: 'Discard' })).toHaveCount(0);
     await expect.poll(window_state, { timeout: 15_000 }).toEqual({
         title: 'basic.csv',
         edited: false,
@@ -943,9 +944,6 @@ const click_history_menu_item = async (label: 'Undo' | 'Redo') => {
 // edit back. Nothing else in the suite covers the `historyMenuStateChanged`
 // projection reaching a real Electron menu.
 //
-// Last in the file on purpose. It ends inside edit mode — undo is never a way out
-// of it — and re-entering edit mode in an already-granted window does not
-// immediately admit an overlay editor, which would strand any test that followed.
 test('Edit menu Undo names the gesture and walks it back', async () => {
     const page = await focus_viewer('basic.csv');
 
@@ -953,9 +951,6 @@ test('Edit menu Undo names the gesture and walks it back', async () => {
     // suite shares one app, so earlier tests in this file have already recorded
     // gestures in this window. What is testable end to end is that the label
     // tracks the newest one, which is the part that crosses the process boundary.
-    const edit_toggle = page.getByRole('button', { name: 'Edit' });
-    await edit_toggle.click();
-    await expect(edit_toggle).toHaveAttribute('aria-pressed', 'true');
     await click_grid_cell(page, { column: 1, row: 0 }, { x: 120, y: 50 });
     await page.keyboard.press('Enter');
     const cell_editor = page.locator('.cell-editor-input');
@@ -985,8 +980,6 @@ test('Edit menu Undo names the gesture and walks it back', async () => {
         .toEqual({ label: 'Redo Edit cell', enabled: true });
 
     // The undo walked the only edit back, so the fixture is pristine again and
-    // this leaves no draft for anything downstream. Edit mode is deliberately
-    // NOT left here: undo may put the user back into editing but is never a way
-    // out of it, and this test is last in the file.
-    await expect(edit_toggle).not.toHaveClass(/has-unsaved/);
+    // this leaves no draft for anything downstream.
+    await expect(page.getByRole('button', { name: 'Save' })).not.toHaveClass(/has-unsaved/);
 });

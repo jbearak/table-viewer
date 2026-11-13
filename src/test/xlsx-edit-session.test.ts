@@ -650,37 +650,6 @@ describe('xlsx edit sessions', () => {
         expect(bytes).toEqual(before);
     });
 
-    it('defers a requested worksheet until the save dialog is answered', async () => {
-        const panel = await open_ready_xlsx(file_path);
-        await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 0 });
-        const session = latest_edit_session(panel)!.editSessionId!;
-        let answer_dialog!: (choice: string | undefined) => void;
-        const answer = new Promise<string | undefined>((resolve) => {
-            answer_dialog = resolve;
-        });
-        const warning = vi.spyOn(vscode_mock.window, 'showWarningMessage')
-            .mockImplementation(() => answer);
-        const dialog = panel.__receive({
-            type: 'showSaveDialog',
-            requestId: 'save-dialog',
-            editSessionId: session,
-        });
-        await wait_for_observable(() => warning.mock.calls.length === 1);
-
-        const selection = controller_of(panel).select_sheet('Inventory');
-        expect(panel.__messages).not.toContainEqual({ type: 'selectSheet', sheetIndex: 1 });
-        answer_dialog(undefined);
-        await dialog;
-        await expect(selection).resolves.toBe(true);
-
-        expect(panel.__messages.flatMap((message) => {
-            if (typeof message !== 'object' || message === null || !('type' in message)) return [];
-            return message.type === 'saveDialogResult' || message.type === 'selectSheet'
-                ? [message.type]
-                : [];
-        })).toEqual(['saveDialogResult', 'selectSheet']);
-    });
-
     it('writes an edit into the worksheet the session named, leaving the other alone', async () => {
         const panel = await open_ready_xlsx(file_path);
         // Sheet 1 is "Inventory"; row 1 col 0 is "Widget" in the fixture.

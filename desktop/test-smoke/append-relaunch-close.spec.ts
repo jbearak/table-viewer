@@ -106,12 +106,9 @@ test('a window with force-quit-surviving pending rows closes cleanly after relau
         let killed = false;
         try {
             const page = await viewer_page(first);
-            const edit_toggle = page.getByRole('button', { name: 'Edit' });
-            await edit_toggle.click();
-            await expect(edit_toggle).toHaveAttribute('aria-pressed', 'true');
             const rows = page.locator('tbody tr');
-            // The accessibility rows mount after the toggle flips; counting
-            // before they exist would record 0 and misread the append below.
+            // Counting before the accessibility rows exist would record 0 and
+            // misread the append below.
             await expect.poll(() => rows.count(), { timeout: 30_000 })
                 .toBeGreaterThan(0);
             const before = await rows.count();
@@ -137,9 +134,9 @@ test('a window with force-quit-surviving pending rows closes cleanly after relau
         const output_of_second = capture_output(second);
         try {
             const page = await viewer_page(second);
-            // The pending row hydrated: edit mode restores as dirty.
-            const edit_toggle = page.getByRole('button', { name: 'Edit' });
-            await expect(edit_toggle).toHaveClass(/has-unsaved/, { timeout: 30_000 });
+            // The pending row hydrated: the window opens with it unsaved.
+            const save = page.getByRole('button', { name: 'Save' });
+            await expect(save).toHaveClass(/has-unsaved/, { timeout: 30_000 });
             await install_dialog_capture(second);
 
             // Native close, exactly as the traffic-light button would.

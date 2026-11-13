@@ -8608,6 +8608,34 @@ describe('row Delete and Restore in the row-gutter menu', () => {
         expect(item.title).toBe('Not available yet');
     });
 
+    it.each([
+        ['row', 'canMoveRows', 'mouseup'],
+        ['column', 'canMoveColumns', 'mouseup'],
+        ['row', 'canMoveRows', 'blur'],
+    ] as const)('keeps the session a %s drag acquired until the drag ends (%s, %s)', async (_kind, prop, ending) => {
+        const editing_ref = React.createRef<EditingHandle | null>();
+        const on_edit_session_idle = vi.fn();
+        await render_grid(structure_props({
+            structural_support: supported,
+            edit_mode: false,
+            edit_session_id: undefined,
+            editing_ref,
+            // Answered at once, so only the drag itself is left holding on.
+            on_request_edit_session: vi.fn(async () => false),
+            on_edit_session_idle,
+        }));
+
+        const can_move = grid_mock.props![prop] as (block: { start: number; end: number }) => boolean;
+        expect(can_move({ start: 1, end: 1 })).toBe(true);
+        await act(async () => { await Promise.resolve(); });
+        // The host has answered and nothing is unsaved, but the drop is still to come.
+        expect(editing_ref.current!.session_busy()).toBe(true);
+
+        window.dispatchEvent(new Event(ending));
+        await vi.waitFor(() => expect(editing_ref.current!.session_busy()).toBe(false));
+        expect(on_edit_session_idle).toHaveBeenCalled();
+    });
+
     it('deletes a row with its cell edits as one action, shows it removed, and restores it', async () => {
         const cells = create_edit_session_store({ session_id: 'session' }, {
             '1:0': { value: 'edited', base: 'source-a' },
@@ -9718,6 +9746,21 @@ describe('columns: Insert, Delete, Restore, Move, rename, Pending Column cells, 
         ]));
         await act(async () => menu_item('Insert column right')!.click());
     };
+
+    it('enables the items of a menu opened before the session it acquired arrived', async () => {
+        const { rerender } = await render_columns({
+            edit_mode: false,
+            edit_session_id: undefined,
+            on_request_edit_session: vi.fn(async () => true),
+        });
+        await open_header_menu(0);
+        expect(menu_item('Insert column right')!.getAttribute('aria-disabled')).toBe('true');
+
+        // The one render the grant causes; nothing renders the menu again after it.
+        await rerender({ edit_mode: true, edit_session_id: 'session', on_request_edit_session: undefined });
+
+        expect(menu_item('Insert column right')!.getAttribute('aria-disabled')).not.toBe('true');
+    });
 
     it('inserts a named Pending Column through host admission, keyed by its identity', async () => {
         const { pending, history, settle, on_insert_columns } = await render_columns();

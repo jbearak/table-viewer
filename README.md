@@ -70,7 +70,7 @@ It also removes other friction from reading tables:
 - **Diffing a spreadsheet in Git shows you a wall of text.** Click a changed `.xlsx`, `.xls`, `.csv`, `.tsv`, `.dta`, or `.parquet` file in VS Code's Source Control or Timeline view and Table Viewer opens the comparison as a table: added and deleted rows banded, changed cells showing before and after in place. The desktop app also compares any two files.
 - **Comparing a Git LFS file shows you the pointer, not the table.** An LFS-tracked file is stored in Git as a small pointer naming the real object, so the version you want to compare against is often not on your machine at all. Table Viewer recognizes the pointer on either side of a comparison and offers to download the object.
 
-**Limitations:** Table Viewer is *not* a full spreadsheet editor. You can't create files or sheets, insert rows in the middle, or add columns. Edit mode can append rows to `.xlsx`, CSV, and TSV worksheets. Formula editing and recalculation intentionally support a documented subset of Excel; see [Excel formula support](docs/excel-formulas.md).
+**Limitations:** Table Viewer is *not* a full spreadsheet editor. You can't create files or sheets, insert rows in the middle, or add columns. You can append rows to `.xlsx`, CSV, and TSV worksheets. Formula editing and recalculation intentionally support a documented subset of Excel; see [Excel formula support](docs/excel-formulas.md).
 
 ## Features
 
@@ -120,7 +120,7 @@ It also removes other friction from reading tables:
 
 **Selection and copy**
 - Click, drag, or shift-click to select cells
-- Arrow keys, and, outside Edit mode, `h`/`j`/`k`/`l` to navigate
+- Arrow keys to navigate. In read-only files (`.xls`, `.dta`, Parquet, comparisons, previews), `h`/`j`/`k`/`l` navigate too; in a file you can edit, typing a letter starts editing the selected cell
 - `Ctrl+C` / `Cmd+C` to copy selected cells as tab-separated text
 - Right-click context menus for copying, selecting or hiding rows and columns, and choosing an Excel row as the header
 
@@ -134,9 +134,9 @@ It also removes other friction from reading tables:
 
 **Undo and redo**
 - `Ctrl+Z` / `Cmd+Z` undoes your last change; `Ctrl+Y` or `Cmd+Shift+Z` redoes it. In the desktop app the **Edit** menu carries both, named after what they would apply — "Undo Paste", "Redo Clear all highlights" — and greyed out when there is nothing left
-- Covers cell edits (values, line breaks, styling, hyperlinks), cell highlights, and discards. A discarded edit session can be undone in full
+- Covers cell edits (values, line breaks, styling, hyperlinks), cell highlights, and discards. **Discard** can be undone in full
 - One history per workbook, in the order you worked: undoing a change on another worksheet switches to it. The cursor moves to what changed and the region flashes briefly, so an undo you cannot see is still findable
-- Undo reaches back past a save. Doing so re-enters edit mode if you had left it, and re-saves are yours to make; undo never exits edit mode or discards an open session
+- Undo reaches back past a save. The file then has unsaved changes again, and re-saving is yours to do
 - If a change is hidden by an active filter or a hidden column, it is still applied and you are told where it went rather than left watching a still cursor
 - Sorts, filters, and column visibility are not part of history — they are view state, with their own toolbar chips and **Columns** menu for undoing them
 - `Ctrl+Z` / `Cmd+Z` **inside** an open cell editor is ordinary text undo for what you are typing, and does not touch the workbook's history
@@ -157,25 +157,24 @@ It also removes other friction from reading tables:
 - Sorting and filtering use raw cell values rather than formatted display text
 - Empty values sort last in both directions
 - When a sorted, filtered, or column-hidden sheet contains merged cells, the view temporarily shows them unmerged. Only the original top-left cell contains the merged value; covered cells remain empty. Restoring the natural rows and all columns restores the exact merge layout.
-- Sorting, filtering, and row-hiding work alongside edit mode in both directions: you can sort or filter while editing, and you can start editing a sheet that is already sorted or filtered. Either way the displayed order stays put while you edit, so rows stay where you left them, and the view reflects your new values once you save and the file reloads. While one tab is editing a file, it is the tab that can change that file's view; another tab showing the same file can change it again once the edit session ends. They are unavailable in synchronized preview panes, which always show rows in source order. Column visibility remains available in every mode
+- Sorting, filtering, and row-hiding work alongside editing in both directions: you can sort or filter with unsaved changes, and you can edit a sheet that is already sorted or filtered. Either way the displayed order stays put while changes are unsaved, so rows stay where you left them, and the view reflects your new values once you save and the file reloads. While one tab has unsaved changes to a file, it is the tab that can change that file's view; another tab showing the same file can change it again once those changes are saved or discarded. They are unavailable in synchronized preview panes, which always show rows in source order. Column visibility remains available in every mode
 
 **Editing (`.xlsx`, CSV, and TSV)**
-- Click the **Edit** button in the toolbar to enter edit mode
+- There is no edit mode to switch on. Double-click a cell, press **Enter**, or just start typing to edit it. **Delete** clears the selected cells, and paste writes into them
+- The toolbar's **Save** button lights up when there are unsaved changes. **Discard** appears beside it and drops them all, and **Diff** shows each edited cell's old value next to its new one
 - Edit, copy, cut, and recalculate `.xlsx` formulas within the [documented Excel formula support](docs/excel-formulas.md)
-- Double-click a cell, press **Enter**, or choose **Edit cell** from the right-click menu to edit its value
-- Use the sticky **Append row** at the bottom of the grid to add a row. Pasting a block there adds the whole block's row count as one undoable change
+- Use the **+** button at the bottom of the row numbers to add rows. Pasting a block past the last row adds the whole block's row count as one undoable change
 - **Enter** confirms and moves to the cell below. When there is no next row, it appends one and continues in the same column. **Tab** moves row-major and appends from the final visible column of the final row
 - Pending rows keep their intended physical row numbers and use the existing added-row tint. Right-click a pending row number to remove it; right-click a pending removal to cancel it
 - Active sorts and filters leave pending rows in a separate section at the end. **Hide row** remains visible for those rows but is disabled
 - **Shift+Enter** or **Alt+Enter** inserts a line break within a cell
 - **Escape** cancels the current edit
-- **Ctrl+S** / **Cmd+S** saves all changes back to the file
+- **Ctrl+S** / **Cmd+S**, or the **Save** button, saves all changes back to the file
 - Edit `.xlsx` cell styling with Markdown syntax: `**bold**`, `*italic*`, `<u>underline</u>`, and `~~strikethrough~~`
 - Add, edit, or remove `.xlsx` hyperlinks to a web address or a place in the workbook from the cell context menu
 - An `.xlsx` append adds worksheet rows. It does not enlarge an OOXML Excel Table region
 - Edited cells are highlighted with a different background color until saved
-- Rows keep their position for the whole edit session, so a cell stays under your cursor while you work on it. You can enter edit mode with a sort or filter already applied, and add or change one while editing; neither moves the rows you are working on. A row you edit so that it no longer matches an active filter stays visible until you save; the view reflects your new values once the file is saved and reloaded
-- When exiting edit mode with unsaved changes, you're prompted to save or discard
+- Rows keep their position while you have unsaved changes, so a cell stays under your cursor while you work on it. You can start editing with a sort or filter already applied, and add or change one while editing; neither moves the rows you are working on. A row you edit so that it no longer matches an active filter stays visible until you save; the view reflects your new values once the file is saved and reloaded
 - Unsaved changes are cached, so you won't lose your work if you close the tab, window, or app
 - If a cell changes in the file while you have a pending edit for that cell, an informational banner appears and the cell gets a neutral blue highlight. **Review changes** shows the original file value, the current file value, and your pending edit. You can go to the cell, dismiss the notice without changing anything, or discard that pending edit individually
 
@@ -217,7 +216,7 @@ Table Viewer uses VS Code's editor font (`editor.fontFamily` and `editor.fontSiz
 | `tableViewer.fontFamily` | empty (editor font) | Font family used in table views. Leave empty to follow `editor.fontFamily`. |
 | `tableViewer.fontSize` | `0` (editor size) | Font size in pixels used in table views. Set to `0` to follow `editor.fontSize`. |
 | `tableViewer.tabOrientation` | `horizontal` | Default worksheet tab orientation (`horizontal` or `vertical`). Can be overridden per file. |
-| `tableViewer.diffOnByDefault` | `false` | Turn the **Diff** toggle on when edit mode is entered, so each edited cell shows the file value it would replace beside the pending edit. If that cell changes in the file, Diff updates to the current file value. The setting can be overridden per viewer from the toolbar. |
+| `tableViewer.diffOnByDefault` | `false` | Turn the **Diff** toggle on when you start editing, so each edited cell shows the file value it would replace beside the pending edit. If that cell changes in the file, Diff updates to the current file value. The setting can be overridden per viewer from the toolbar. |
 | `tableViewer.maxStoredFiles` | `10000` | Maximum number of files whose layout state is remembered. Least recently used entries are evicted first. |
 | `tableViewer.csvMaxRows` | `1000000` | Rows to display by default for CSV/TSV files. A banner on larger files lets you change the limit or load all rows for that view. |
 | `tableViewer.maxFileSizeMiB` | `256` | File-size threshold in MiB. Above it, Table Viewer asks before opening the file and offers **Open Anyway**. |

@@ -8,7 +8,7 @@ import type { SortDirection } from '../types';
 import type { SheetMeta } from '../data-source/interface';
 import type { StructureMenuAction } from './row-context-menu';
 
-/** Insert, Delete, Restore, and Move for a column selection, in Edit mode. */
+/** Insert, Delete, Restore, and Move for a column selection, in an editable file. */
 export interface ColumnStructureMenuActions {
     readonly insert_left: StructureMenuAction;
     readonly insert_right: StructureMenuAction;
@@ -96,7 +96,7 @@ export interface ColumnContextMenuProps {
     rename_disabled?: boolean;
     /** Why "Rename column…" is disabled, shown as its description. */
     rename_disabled_reason?: string;
-    /** Insert, Delete, Restore, and Move, in Edit mode with structural editing on. */
+    /** Insert, Delete, Restore, and Move, in an editable file with structural editing on. */
     structure?: ColumnStructureMenuActions;
     on_sort: (direction: SortDirection, append: boolean) => void;
     on_clear_column_sort: () => void;
@@ -232,7 +232,7 @@ export interface MultiColumnContextMenuProps {
     on_hide: () => void;
     /** Why "Hide N columns" is disabled (the selection holds a Pending Column). */
     hide_disabled_reason?: string;
-    /** Insert, Delete, Restore, and Move, in Edit mode with structural editing on. */
+    /** Insert, Delete, Restore, and Move, in an editable file with structural editing on. */
     structure?: ColumnStructureMenuActions;
     on_sort: (direction: SortDirection) => void;
     on_dismiss: () => void;

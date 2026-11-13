@@ -90,7 +90,7 @@ test('File → Compare Files… opens one read-only comparison window', async ()
             title.includes('before.csv') && title.includes('after.csv')))
         .toBe(true);
     // Read-only: a comparison has no working-tree file to write back to.
-    await expect(page.getByRole('button', { name: 'Edit' })).toHaveCount(0);
+    await expect(page.getByRole('button', { name: 'Save' })).toHaveCount(0);
 });
 
 test('the comparison counts an inserted row as one addition', async () => {

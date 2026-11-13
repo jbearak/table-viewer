@@ -56,7 +56,7 @@ async function append_blank_row_and_save(
             message.type === 'editSessionResult' && message.requestId === edit_request_id,
         'an edit-session grant',
     );
-    assert.strictEqual(edit.granted, true, 'the integration workflow must enter Edit mode');
+    assert.strictEqual(edit.granted, true, 'the integration workflow must be granted an editing session');
     assert.ok(edit.editSessionId, 'the edit-session grant must carry its identity');
 
     const append_request_id = `append:${sheet_index}`;

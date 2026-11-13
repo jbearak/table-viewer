@@ -8,7 +8,6 @@ import type {
     FileSizeLimitDialogDetails,
     FileSystemPort,
     HostUiPort,
-    SaveDialogChoice,
     ViewerSettingTarget,
 } from '../../src/host-ports';
 import type { ResourceUriLike } from '../../src/resource-identity';
@@ -36,7 +35,6 @@ export const node_file_system_port: FileSystemPort = {
 export interface DesktopUiDialogs {
     show_warning(message: string): void;
     show_error(message: string): void | Promise<void>;
-    show_save_discard_dialog(): Promise<SaveDialogChoice>;
     show_file_size_limit_dialog(
         details: FileSizeLimitDialogDetails,
     ): Promise<FileSizeLimitDialogChoice>;
@@ -48,7 +46,6 @@ export function create_desktop_ui_port(dialogs: DesktopUiDialogs): HostUiPort {
     return {
         show_warning: (message) => dialogs.show_warning(message),
         show_error: (message) => dialogs.show_error(message),
-        show_save_discard_dialog: () => dialogs.show_save_discard_dialog(),
         show_file_size_limit_dialog: (details) =>
             dialogs.show_file_size_limit_dialog(details),
         open_setting: (target) => dialogs.open_setting(target),

@@ -103,8 +103,8 @@ export interface ReplayCoordinatorHost extends ReplayRequestSources {
      *
      * Called only for an action that writes CELLS — see
      * `action_requires_edit_session`. Highlights are durable workbook state, and
-     * putting the user into edit mode to undo one would be entering content-editing
-     * for a gesture that was never a content edit.
+     * acquiring an editing session to undo one would be content editing for a
+     * gesture that was never a content edit.
      *
      * Awaited before the prepare request is built, never alongside it. A grant
      * crosses a hydration boundary that replaces the stores wholesale, so a
@@ -114,7 +114,7 @@ export interface ReplayCoordinatorHost extends ReplayRequestSources {
      *
      * `false` is an ordinary refusal: the host would not grant one, or its cleanup
      * after the discard failed and editing is disabled for the file. Undo does not
-     * retry, and never re-enters edit mode on a promise it cannot keep.
+     * retry, and never acquires a session on a promise it cannot keep.
      */
     readonly ensure_session: () => Promise<boolean>;
     readonly post: (

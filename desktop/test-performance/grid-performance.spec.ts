@@ -8,6 +8,10 @@
 //   csv-200k        - merge-free 200k x 8 CSV (the "no regression" gate)
 //   xlsx-merged-5k  - 5k x 8 xlsx with ~1.7k vertical/horizontal/2D merges
 //                     (the "overlay vs native" comparison)
+//   *-editing       - the same file scrolled again with an unsaved edit held.
+//                     There is no edit mode, so a file with unsaved changes is
+//                     the same grid doing more per cell; these scenarios are
+//                     what holds that to the cost of plain viewing.
 //
 // Run: npm run test:desktop-perf
 // Output: test-results/grid-perf.json (or TABLE_VIEWER_PERF_OUT)
@@ -91,6 +95,38 @@ async function run_scenario(name: string, file: string): Promise<void> {
             scroll_p95_ms: scroll.p95_ms,
             scroll_long_frames: scroll.long_frames,
             scroll_total_ms: scroll.total_ms,
+            scroll_script_ms: scroll.script_ms,
+            scroll_task_ms: scroll.task_ms,
+        });
+
+        // The same scroll with an unsaved edit held: type into the first cell,
+        // which acquires the editing session, and commit.
+        await page.evaluate(() => {
+            const el = document.querySelector('.dvn-scroller');
+            if (el) el.scrollTop = 0;
+        });
+        await expect
+            .poll(() => page.locator('#glide-cell-1-0').count(), { timeout: 30_000 })
+            .toBeGreaterThan(0);
+        // A double click on the canvas opens the cell under it for editing.
+        const canvas = (await page.locator(GRID_CANVAS).first().boundingBox())!;
+        await page.mouse.dblclick(canvas.x + 150, canvas.y + 50);
+        const editor = page.locator('.cell-editor-input');
+        await expect(editor).toBeVisible();
+        await editor.fill('edited');
+        await editor.press('Enter');
+        await expect(editor).toBeHidden();
+        await expect(page.getByRole('button', { name: 'Save' })).toHaveClass(/has-unsaved/);
+
+        const editing = summarize_scroll(await measure_scroll(page, SCROLL));
+        expect(editing.frames).toBeGreaterThan(SCROLL.passes * (SCROLL.steps - 1) - 5);
+        record_scenario(results_file, run_label, `${name}-editing`, {
+            scroll_p50_ms: editing.p50_ms,
+            scroll_p95_ms: editing.p95_ms,
+            scroll_long_frames: editing.long_frames,
+            scroll_total_ms: editing.total_ms,
+            scroll_script_ms: editing.script_ms,
+            scroll_task_ms: editing.task_ms,
         });
     } finally {
         // Close and rm independently: a failed launch leaves no app, and a

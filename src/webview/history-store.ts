@@ -8,8 +8,8 @@
  * capture needs the current state synchronously, in the middle of assembling a
  * gesture, without a re-render between reading it and recording into it.
  *
- * Deliberately ignorant of edit sessions, saves and edit mode. History outlives
- * an edit session (undo may re-enter edit mode, and must never be what releases
+ * Deliberately ignorant of edit sessions and saves. History outlives an edit
+ * session (undo may acquire one again, and must never be what releases
  * one), a save is not a boundary, and the only thing that empties it is a
  * different document taking this one's place.
  *

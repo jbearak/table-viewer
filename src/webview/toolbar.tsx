@@ -83,14 +83,18 @@ export interface ToolbarProps {
     auto_fit_disabled?: boolean;
     auto_fit_disabled_reason?: string;
     auto_fit_scope_menu?: ToolbarScopeMenu;
-    edit_mode: boolean;
+    /** The file can be edited: Save is offered, and Diff and Discard with it. */
+    editable: boolean;
+    /** An editing session is held: an edit is open or unsaved, so Diff is offered. */
+    editing: boolean;
     diff_mode: boolean;
     on_toggle_diff_mode: () => void;
+    /** There is unsaved work for Save to write and Discard to drop. */
     is_dirty: boolean;
-    on_toggle_edit_mode: () => void;
-    show_edit_button: boolean;
-    edit_disabled?: boolean;
-    edit_disabled_reason?: string;
+    on_save: () => void;
+    on_discard: () => void;
+    /** A save is being written. */
+    save_busy?: boolean;
 }
 
 export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Toolbar(
@@ -114,13 +118,16 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
         },
         focus_columns: () => columns_ref.current?.focus() ?? false,
     }), []);
-    // Edit changes how the table behaves rather than how the active worksheet is
-    // displayed, so it stands alone to the left of the divider.
+    // Save acts on the file rather than on how the active worksheet is
+    // displayed, so the editing controls stand alone to the left of the divider.
+    //
+    // Save is there whenever the file can be edited, and disabled until there
+    // is something to save: there is no mode to enter, so its presence is what
+    // says cells can be changed and its tooltip says how. Discard only means
+    // anything beside unsaved changes, and Diff while an edit is being made, an
+    // open editor included, so they come and go with those.
     const edit_actions = [
-        // Diff only means anything while edits exist to compare, so it appears
-        // with edit mode and disappears with it — its state (App-owned)
-        // survives the round trip.
-        props.show_edit_button && props.edit_mode && (
+        props.editable && props.editing && (
             <ToolbarButton
                 key="diff"
                 label="Diff"
@@ -132,20 +139,32 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
                 on_action_complete={props.on_action_complete}
             />
         ),
-        props.show_edit_button && (
+        props.editable && props.is_dirty && (
             <ToolbarButton
-                key="edit"
-                label="Edit"
-                active={props.edit_mode}
-                tooltip_text={props.edit_disabled
-                    ? (props.edit_disabled_reason ?? 'Editing is unavailable.')
-                    : props.edit_mode
-                    ? 'Exit edit mode.'
-                    : 'Enter edit mode to modify cell values.'}
-                onClick={props.on_toggle_edit_mode}
+                key="discard"
+                label="Discard"
+                tooltip_text={props.save_busy
+                    ? 'Saving changes.'
+                    : 'Discard all unsaved changes. Undo brings them back.'}
+                onClick={props.on_discard}
+                on_action_complete={props.on_action_complete}
+                disabled={props.save_busy}
+            />
+        ),
+        props.editable && (
+            <ToolbarButton
+                key="save"
+                label="Save"
+                tooltip_text={props.save_busy
+                    ? 'Saving changes.'
+                    : props.is_dirty
+                    ? 'Save changes to the file.'
+                    : 'No unsaved changes. Double-click a cell or start typing to edit it.'}
+                onClick={props.on_save}
                 on_action_complete={props.on_action_complete}
                 extra_class={props.is_dirty ? 'has-unsaved' : undefined}
-                disabled={props.edit_disabled}
+                disabled={props.save_busy || !props.is_dirty}
+                focusable_when_disabled
             />
         ),
     ].filter(Boolean);
@@ -238,11 +257,11 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
                 </div>
             )}
             {/*
-              * Two groups: Edit mode, then controls for how the worksheet is shown.
+              * Two groups: saving, then controls for how the worksheet is shown.
               *
               * Built as two arrays rather than as one JSX sequence so that group
-              * membership is stated once. The divider follows from whether Edit is
-              * present, so it cannot leave a stray leading rule when Edit is hidden.
+              * membership is stated once. The divider follows from whether Save is
+              * present, so it cannot leave a stray leading rule when Save is hidden.
               *
               * Still flat children of one row: `.toolbar-actions > :first-child`
               * carries the right-alignment, so nesting either group in a wrapper
@@ -279,7 +298,8 @@ function ToolbarButton({
     scope_menu,
 }: {
     label: string;
-    active: boolean;
+    /** Pressed state of a toggle. Leave unset for a command such as Save. */
+    active?: boolean;
     tooltip_text: string;
     onClick: () => void;
     on_action_complete: () => void;

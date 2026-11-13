@@ -8,7 +8,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import CFB from 'cfb';
 import { expect } from '@playwright/test';
-import type { Page } from '@playwright/test';
+import type { CDPSession, Page } from '@playwright/test';
 
 export const GRID_CANVAS = '[data-testid="data-grid-canvas"]';
 
@@ -161,6 +161,25 @@ export interface ScrollMetrics {
     frame_ms: number[];
     /** Total wall-clock ms spent scrolling (all passes). */
     total_ms: number;
+    /**
+     * Main-thread ms spent running script during the scroll (all passes), from
+     * the renderer's own accounting. Frame cadence is capped at the display's
+     * refresh rate, so two builds can both hold 16.7 ms frames while one does
+     * twice the work in each; this is the number that tells them apart.
+     */
+    script_ms: number;
+    /** Main-thread ms spent in any task during the scroll: script, layout, paint. */
+    task_ms: number;
+}
+
+/** Cumulative main-thread seconds the renderer reports for this page. */
+async function main_thread_seconds(
+    cdp: CDPSession,
+): Promise<{ script: number; task: number }> {
+    const { metrics } = await cdp.send('Performance.getMetrics');
+    const read = (name: string): number =>
+        metrics.find((metric) => metric.name === name)?.value ?? 0;
+    return { script: read('ScriptDuration'), task: read('TaskDuration') };
 }
 
 /**
@@ -175,8 +194,13 @@ export async function measure_scroll(
     const scroller = page.locator('.dvn-scroller').first();
     await scroller.waitFor({ state: 'attached' });
 
+    const cdp = await page.context().newCDPSession(page);
+    await cdp.send('Performance.enable');
+
     const frame_ms: number[] = [];
     let total_ms = 0;
+    let script_ms = 0;
+    let task_ms = 0;
     for (let pass = 0; pass < opts.passes; pass++) {
         // Reset to the top and let the grid settle: poll until the first row's
         // accessibility cell is back (observable completion of the jump).
@@ -188,6 +212,7 @@ export async function measure_scroll(
             .poll(() => page.locator('#glide-cell-1-0').count(), { timeout: 30_000 })
             .toBeGreaterThan(0);
 
+        const before = await main_thread_seconds(cdp);
         const frames = await page.evaluate(
             async ({ steps, deltaPx }) => {
                 const el = document.querySelector('.dvn-scroller');
@@ -205,12 +230,16 @@ export async function measure_scroll(
             },
             { steps: opts.steps, deltaPx: opts.delta_px },
         );
+        const after = await main_thread_seconds(cdp);
+        script_ms += (after.script - before.script) * 1000;
+        task_ms += (after.task - before.task) * 1000;
         // Drop the first frame of each pass: it absorbs the settle after the
         // jump to the top and is not steady-state scrolling.
         frame_ms.push(...frames.slice(1));
         total_ms += frames.reduce((a, b) => a + b, 0);
     }
-    return { frame_ms, total_ms };
+    await cdp.detach();
+    return { frame_ms, total_ms, script_ms, task_ms };
 }
 
 export function percentile(sorted: number[], p: number): number {
@@ -226,6 +255,8 @@ export interface ScrollSummary {
     long_frames: number;
     frames: number;
     total_ms: number;
+    script_ms: number;
+    task_ms: number;
 }
 
 export function summarize_scroll(metrics: ScrollMetrics): ScrollSummary {
@@ -237,6 +268,8 @@ export function summarize_scroll(metrics: ScrollMetrics): ScrollSummary {
         long_frames: metrics.frame_ms.filter((f) => f > Math.max(2 * p50, 34)).length,
         frames: metrics.frame_ms.length,
         total_ms: round2(metrics.total_ms),
+        script_ms: round2(metrics.script_ms),
+        task_ms: round2(metrics.task_ms),
     };
 }
 

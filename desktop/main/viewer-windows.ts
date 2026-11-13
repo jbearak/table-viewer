@@ -1595,17 +1595,6 @@ export class ViewerWindowManager {
                 show_error: (message) => {
                     return message_box({ type: 'error', message }).then(() => {});
                 },
-                show_save_discard_dialog: async () => {
-                    const { response } = await message_box({
-                        type: 'warning',
-                        message: 'Leave edit mode?',
-                        buttons: ['Save Edits', 'Discard Edits', 'Stay in Edit Mode'],
-                        defaultId: 0,
-                        cancelId: 2,
-                        noLink: true,
-                    });
-                    return response === 0 ? 'save' : response === 1 ? 'discard' : 'cancel';
-                },
                 show_file_size_limit_dialog: async (details) => {
                     const { response } = await message_box({
                         type: 'warning',

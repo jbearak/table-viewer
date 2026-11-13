@@ -73,7 +73,7 @@ export interface NavInput {
     ctrl: boolean;
     meta: boolean;
     alt: boolean;
-    /** True when cells are editable (edit mode) — keep type-to-edit working. */
+    /** True when cells accept an edit — keep type-to-edit working. */
     editable: boolean;
 }
 

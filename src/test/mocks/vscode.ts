@@ -420,24 +420,11 @@ function make_panel(title: string, view_column: number): MockWebviewPanel {
                 && (
                     forwarded.type === 'releaseEditSession'
                     || forwarded.type === 'discardEditSession'
-                    || forwarded.type === 'showSaveDialog'
                 )
                 && !('editSessionId' in forwarded)
             ) {
                 const editSessionId = latest_grant()?.editSessionId;
                 if (editSessionId) forwarded = { ...forwarded, editSessionId };
-            }
-            if (
-                typeof forwarded === 'object'
-                && forwarded !== null
-                && 'type' in forwarded
-                && forwarded.type === 'showSaveDialog'
-                && !('requestId' in forwarded)
-            ) {
-                forwarded = {
-                    ...forwarded,
-                    requestId: `test-dialog-request:${++protocol_sequence}`,
-                };
             }
             if (
                 typeof forwarded === 'object'

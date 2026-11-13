@@ -1947,6 +1947,80 @@ a new line char ""more quotes"" plus a tab  ."	https://google.com`)
         expect(editSpy).not.toHaveBeenCalled();
     });
 
+    test("A host that takes the overlay request opens the editor itself, later", async () => {
+        vi.useFakeTimers();
+        const ref = React.createRef<DataEditorRef>();
+        const request = vi.fn(() => true);
+        render(<DataEditor {...basicProps} ref={ref} onOverlayOpenRequest={request} />, {
+            wrapper: Context,
+        });
+        prep();
+
+        const canvas = screen.getByTestId("data-grid-canvas");
+        sendClick(canvas, {
+            clientX: 300, // Col B
+            clientY: 36 + 32 + 16, // Row 1 (0 indexed)
+        });
+        fireEvent.keyDown(canvas, { keyCode: 74, key: "j" });
+        fireEvent.keyUp(canvas, { keyCode: 74, key: "j" });
+
+        // Asked with the cell and the key, and nothing opened.
+        expect(request).toHaveBeenCalledWith([1, 1], "j");
+        expect(screen.queryByDisplayValue("j")).toBeNull();
+
+        // The host opens it when it is ready, with everything typed meanwhile,
+        // and is not asked a second time about its own request.
+        let opened = false;
+        act(() => {
+            opened = ref.current?.openOverlay([1, 1], "jk") === true;
+        });
+        expect(opened).toBe(true);
+        expect(request).toHaveBeenCalledTimes(1);
+        expect(document.body.contains(screen.getByDisplayValue("jk"))).toBe(true);
+    });
+
+    test("openOverlay does nothing for a cell that is not the selected one", async () => {
+        vi.useFakeTimers();
+        const ref = React.createRef<DataEditorRef>();
+        render(<DataEditor {...basicProps} ref={ref} />, {
+            wrapper: Context,
+        });
+        prep();
+
+        const canvas = screen.getByTestId("data-grid-canvas");
+        sendClick(canvas, {
+            clientX: 300, // Col B
+            clientY: 36 + 32 + 16, // Row 1 (0 indexed)
+        });
+
+        let opened = true;
+        act(() => {
+            opened = ref.current?.openOverlay([1, 2], "x") === true;
+        });
+        expect(opened).toBe(false);
+        expect(screen.queryByDisplayValue("x")).toBeNull();
+    });
+
+    test("A host that declines the overlay request leaves the grid to open it", async () => {
+        vi.useFakeTimers();
+        const request = vi.fn(() => false);
+        render(<DataEditor {...basicProps} onOverlayOpenRequest={request} />, {
+            wrapper: Context,
+        });
+        prep();
+
+        const canvas = screen.getByTestId("data-grid-canvas");
+        sendClick(canvas, {
+            clientX: 300, // Col B
+            clientY: 36 + 32 + 16, // Row 1 (0 indexed)
+        });
+        fireEvent.keyDown(canvas, { keyCode: 74, key: "j" });
+        fireEvent.keyUp(canvas, { keyCode: 74, key: "j" });
+
+        expect(request).toHaveBeenCalledWith([1, 1], "j");
+        expect(document.body.contains(screen.getByDisplayValue("j"))).toBe(true);
+    });
+
     test("Open overlay with keypress", async () => {
         vi.useFakeTimers();
         render(<DataEditor {...basicProps} />, {
@@ -3143,6 +3217,97 @@ a new line char ""more quotes"" plus a tab  ."	https://google.com`)
         ]);
         expect(pasteError).not.toHaveBeenCalled();
         expect(rollback).not.toHaveBeenCalled();
+    });
+
+    test("a paste waits for the host's admission and runs against the props rendered by then", async () => {
+        vi.useFakeTimers();
+        Object.assign(navigator, {
+            clipboard: { read: undefined, readText: vi.fn(async () => "pasted") },
+        });
+        let admit!: () => void;
+        const admission = vi.fn(() => new Promise<void>((resolve) => {
+            admit = resolve;
+        }));
+        const editSpy = vi.fn(() => true);
+        // Not pasteable yet: the host makes the grid editable while it waits.
+        const rendered = render(
+            <EventedDataEditor
+                {...basicProps}
+                onPaste={false}
+                onPasteAdmission={admission}
+                onCellsEdited={editSpy}
+            />,
+            { wrapper: Context }
+        );
+        prep(false);
+        vi.useRealTimers();
+        const canvas = screen.getByTestId("data-grid-canvas");
+        vi.spyOn(document, "activeElement", "get").mockImplementation(() => canvas);
+        sendClick(canvas, { clientX: 140, clientY: 36 + 32 * 2 + 16 });
+
+        fireEvent.paste(window);
+        await vi.waitFor(() => expect(admission).toHaveBeenCalledTimes(1));
+        await drainEventLoop();
+        expect(navigator.clipboard.readText).not.toHaveBeenCalled();
+        expect(editSpy).not.toHaveBeenCalled();
+
+        rendered.rerender(
+            <EventedDataEditor {...basicProps} onPaste={true} onCellsEdited={editSpy} />
+        );
+        admit();
+
+        await vi.waitFor(() => expect(editSpy).toHaveBeenCalledTimes(1));
+        const [, source] = editSpy.mock.calls[0] as unknown as [readonly EditListItem[], string];
+        expect(source).toBe("paste");
+        expect(navigator.clipboard.readText).toHaveBeenCalledTimes(1);
+    });
+
+    test("a paste whose admission is refused is dropped", async () => {
+        vi.useFakeTimers();
+        Object.assign(navigator, {
+            clipboard: { read: undefined, readText: vi.fn(async () => "pasted") },
+        });
+        const admission = vi.fn(async () => false);
+        const editSpy = vi.fn(() => true);
+        render(
+            <EventedDataEditor
+                {...basicProps}
+                onPaste={true}
+                onPasteAdmission={admission}
+                onCellsEdited={editSpy}
+            />,
+            { wrapper: Context }
+        );
+        prep(false);
+        vi.useRealTimers();
+        const canvas = screen.getByTestId("data-grid-canvas");
+        vi.spyOn(document, "activeElement", "get").mockImplementation(() => canvas);
+        sendClick(canvas, { clientX: 140, clientY: 36 + 32 * 2 + 16 });
+
+        fireEvent.paste(window);
+        await vi.waitFor(() => expect(admission).toHaveBeenCalledTimes(1));
+        await drainEventLoop();
+
+        expect(navigator.clipboard.readText).not.toHaveBeenCalled();
+        expect(editSpy).not.toHaveBeenCalled();
+    });
+
+    test("a paste aimed elsewhere asks for no admission", async () => {
+        vi.useFakeTimers();
+        const admission = vi.fn(() => Promise.resolve());
+        render(
+            <EventedDataEditor {...basicProps} onPaste={true} onPasteAdmission={admission} />,
+            { wrapper: Context }
+        );
+        prep(false);
+        vi.useRealTimers();
+        // Focus is in some other field: the paste is not the grid's.
+        vi.spyOn(document, "activeElement", "get").mockImplementation(() => document.body);
+
+        fireEvent.paste(window);
+        await drainEventLoop();
+
+        expect(admission).not.toHaveBeenCalled();
     });
 
     test("refuses a delayed clipboard read after pending-row topology changes", async () => {

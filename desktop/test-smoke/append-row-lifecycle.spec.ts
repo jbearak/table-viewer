@@ -144,35 +144,32 @@ test.afterAll(async () => {
 });
 
 test('saved appended rows settle cleanly and an external Git reset reloads them', async () => {
-    const edit_toggle = page.getByRole('button', { name: 'Edit' });
-    await edit_toggle.click();
-    await expect(edit_toggle).toHaveAttribute('aria-pressed', 'true');
+    const save = page.getByRole('button', { name: 'Save' });
+    const discard = page.getByRole('button', { name: 'Discard' });
     await expect(page.locator('tbody tr')).toHaveCount(original_row_count - 1);
     initial_accessible_row_count = await page.locator('tbody tr').count();
 
     await compose_rows(7, 'Composer Saved');
-    await expect(edit_toggle).toHaveClass(/has-unsaved/);
+    await expect(save).toHaveClass(/has-unsaved/);
     const saved_row = page.locator(`#glide-cell-1-${original_row_count - 1}`);
     await expect(saved_row).toHaveAttribute('aria-selected', 'true');
     const scroller = page.locator('.dvn-scroller');
     const scroll_top_before_save = await scroller.evaluate((element) => element.scrollTop);
 
-    await edit_toggle.click();
+    await save.click();
     await expect.poll(workbook_row_count).toBe(original_row_count + 7);
-    await expect(edit_toggle).toHaveAttribute('aria-pressed', 'false');
+    await expect(discard).toHaveCount(0);
     await expect(page.locator('tbody tr')).toHaveCount(
         initial_accessible_row_count + 7,
     );
-    await expect(edit_toggle).not.toHaveClass(/has-unsaved/);
+    await expect(save).not.toHaveClass(/has-unsaved/);
     await expect(saved_row).toHaveText('Composer Saved');
     await expect(saved_row).toHaveAttribute('aria-selected', 'true');
     await expect.poll(
         () => scroller.evaluate((element) => element.scrollTop),
     ).toBe(scroll_top_before_save);
-    expect(await take_dialogs()).toEqual([{
-        message: 'Leave edit mode?',
-        buttons: ['Save Edits', 'Discard Edits', 'Stay in Edit Mode'],
-    }]);
+    // Saving asks nothing: there is no mode to leave.
+    expect(await take_dialogs()).toEqual([]);
 
     const other_sheet_name = await page.locator('.sheet-tab:not(.active)').first().textContent();
     if (!other_sheet_name) throw new Error('missing inactive worksheet tab');
@@ -183,23 +180,24 @@ test('saved appended rows settle cleanly and an external Git reset reloads them'
     await fruit_sheet.click();
     await expect(fruit_sheet).toHaveClass(/active/);
 
-    await edit_toggle.click();
-    await expect(edit_toggle).toHaveAttribute('aria-pressed', 'true');
-    await edit_toggle.click();
-    await expect(edit_toggle).toHaveAttribute('aria-pressed', 'false');
     expect(await take_dialogs()).toEqual([]);
     await other_sheet.click();
     await expect(other_sheet).toHaveClass(/active/);
     await fruit_sheet.click();
     await expect(fruit_sheet).toHaveClass(/active/);
 
-    await edit_toggle.click();
-    await expect(edit_toggle).toHaveAttribute('aria-pressed', 'true');
     const first_saved_blank = page.locator(`#glide-cell-1-${original_row_count}`);
     await expect(first_saved_blank).toBeAttached();
     await expect(first_saved_blank).toHaveAttribute('aria-readonly', 'false');
+    // Focusing an accessible cell moves the selection only once the grid has
+    // one to move, and a freshly mounted sheet has none. Click into the grid
+    // first, as a person would before reaching for a cell further down.
+    const canvas = (await page.locator(GRID_CANVAS).first().boundingBox())!;
+    await page.mouse.click(canvas.x + 120, canvas.y + 50);
+    await expect(page.locator('#glide-cell-1-0')).toHaveAttribute('aria-selected', 'true');
     await first_saved_blank.focus();
     await expect(first_saved_blank).toBeFocused();
+    await expect(first_saved_blank).toHaveAttribute('aria-selected', 'true');
     await page.keyboard.press('Enter');
     const editor = page.locator('.cell-editor-input');
     await expect(editor).toBeVisible();
@@ -208,18 +206,15 @@ test('saved appended rows settle cleanly and an external Git reset reloads them'
     await editor.press('Enter');
     await expect(editor).toBeHidden();
 
-    await edit_toggle.click();
+    await save.click();
     await expect.poll(() => workbook_cell(original_row_count + 1, 0)).toBe('a');
-    await expect(edit_toggle).toHaveAttribute('aria-pressed', 'false');
+    await expect(discard).toHaveCount(0);
     await expect(first_saved_blank).toHaveText('a');
-    expect(await take_dialogs()).toEqual([{
-        message: 'Leave edit mode?',
-        buttons: ['Save Edits', 'Discard Edits', 'Stay in Edit Mode'],
-    }]);
+    expect(await take_dialogs()).toEqual([]);
 
     run_git(['reset', '--hard', '--quiet', 'HEAD']);
     await expect.poll(workbook_row_count).toBe(original_row_count);
     await expect(first_saved_blank).toHaveCount(0);
-    await expect(edit_toggle).toHaveAttribute('aria-pressed', 'false');
+    await expect(save).not.toHaveClass(/has-unsaved/);
     expect(await take_dialogs()).toEqual([]);
 });

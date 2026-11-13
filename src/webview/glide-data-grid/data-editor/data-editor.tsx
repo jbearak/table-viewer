@@ -650,6 +650,19 @@ export interface DataEditorProps extends Props, Pick<DataGridSearchProps, "image
     ) => Promise<boolean | PasteRowsAdmission>;
     /** Changes whenever numeric paste coordinates acquire a different meaning. */
     readonly pasteTopologyKey?: string | number;
+    /**
+     * Fork addition: asked before a paste into the focused grid reads its target.
+     * The paste waits for the returned promise, then runs against the props of
+     * the render committed by then, so a host can make the grid editable first.
+     * A promise that resolves `false` drops the paste.
+     */
+    readonly onPasteAdmission?: () => Promise<unknown> | undefined;
+    /**
+     * Fork addition: asked before an overlay editor opens on an activatable cell.
+     * Returning true means the host took the request and will call
+     * `openOverlay` itself (or drop it); the grid opens nothing.
+     */
+    readonly onOverlayOpenRequest?: (cell: Item, initialValue: string | undefined) => boolean;
     /** Adds row state to the accessibility tree without changing visible cell text. */
     readonly getRowAccessibilityLabel?: (row: number) => string | undefined;
 
@@ -744,6 +757,13 @@ export interface DataEditorRef {
      * already opened.
      */
     dismissOverlay: () => void;
+    /**
+     * Fork addition: opens the overlay editor on the selected cell as a key press
+     * or double click would, without consulting `onOverlayOpenRequest`. Returns
+     * false, having done nothing, when `cell` is not the selected cell, is
+     * scrolled out of view, or does not allow an overlay.
+     */
+    openOverlay: (cell: Item, initialValue?: string) => boolean;
     /**
      * Generic API for emitting events as if they had been triggered via user interaction.
      */
@@ -843,6 +863,8 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
         onPaste,
         onPasteRowsNeeded,
         pasteTopologyKey,
+        onPasteAdmission,
+        onOverlayOpenRequest,
         getRowAccessibilityLabel,
         onClipboardPasteError,
         cutValidationKey,
@@ -1560,12 +1582,17 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
     );
 
     const reselect = React.useCallback(
-        (bounds: Rectangle, fromKeyboard: boolean, initialValue?: string) => {
+        (bounds: Rectangle, fromKeyboard: boolean, initialValue?: string, requested = false) => {
             if (gridSelection.current === undefined) return;
 
             const [col, row] = gridSelection.current.cell;
             const c = getMangledCellContent([col, row]);
             if (c.kind !== GridCellKind.Boolean && c.allowOverlay) {
+                // Fork addition: the host may take the request and open the
+                // overlay later through `openOverlay`.
+                if (!requested && onOverlayOpenRequest?.([col - rowMarkerOffset, row], initialValue) === true) {
+                    return;
+                }
                 let content = c;
                 if (initialValue !== undefined) {
                     switch (content.kind) {
@@ -1612,7 +1639,14 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
                 gridRef.current?.damage([{ cell: gridSelection.current.cell }]);
             }
         },
-        [getMangledCellContent, gridSelection, mangledOnCellsEdited, setOverlaySimple]
+        [
+            getMangledCellContent,
+            gridSelection,
+            mangledOnCellsEdited,
+            onOverlayOpenRequest,
+            rowMarkerOffset,
+            setOverlaySimple,
+        ]
     );
 
     const focusOnRowFromTrailingBlankRow = React.useCallback(
@@ -4040,7 +4074,16 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
     // pre-admission values. ClipboardEvent data is captured synchronously because
     // browsers may clear its DataTransfer after the event returns.
     const pasteTailRef = React.useRef<Promise<void>>(Promise.resolve());
+    const onPasteAdmissionRef = React.useRef(onPasteAdmission);
+    onPasteAdmissionRef.current = onPasteAdmission;
     const onPasteInternal = React.useCallback((e?: ClipboardEvent) => {
+        // Fork addition: only a paste aimed at the grid asks for admission, and
+        // it asks now, while the event that carries the user's intent is live.
+        const admission =
+            scrollRef.current?.contains(document.activeElement) === true ||
+            canvasRef.current?.contains(document.activeElement) === true
+                ? onPasteAdmissionRef.current?.()
+                : undefined;
         let captured: { html?: string; text?: string } | undefined;
         if (e?.clipboardData !== null && e?.clipboardData !== undefined) {
             captured = {};
@@ -4053,7 +4096,11 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
         }
         const queued = pasteTailRef.current
             .catch(() => undefined)
-            .then(() => {
+            .then(() => admission)
+            .catch(() => undefined)
+            .then(granted => {
+                // Refused: the grid did not become editable, so there is nothing to paste into.
+                if (granted === false) return;
                 const execution = pasteExecutionRef.current;
                 return execution.perform(e, captured, execution.topologyKey);
             });
@@ -4336,6 +4383,18 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
             },
             focus: () => gridRef.current?.focus(),
             dismissOverlay: () => setOverlay(undefined),
+            openOverlay: (cell, initialValue) => {
+                const selected = gridSelection.current?.cell;
+                if (selected === undefined) return false;
+                const [col, row] = cell;
+                if (selected[0] !== col + rowMarkerOffset || selected[1] !== row) return false;
+                const bounds = gridRef.current?.getBounds(selected[0], row);
+                if (bounds === undefined) return false;
+                const content = getMangledCellContent([selected[0], row]);
+                if (content.kind === GridCellKind.Boolean || !content.allowOverlay) return false;
+                reselect(bounds, true, initialValue, true);
+                return true;
+            },
             emit: async e => {
                 switch (e) {
                     case "delete":
@@ -4401,7 +4460,18 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
                 }
             },
         }),
-        [appendRow, normalSizeColumn, onCopy, onKeyDown, onPasteInternal, rowMarkerOffset, scrollTo]
+        [
+            appendRow,
+            getMangledCellContent,
+            gridSelection,
+            normalSizeColumn,
+            onCopy,
+            onKeyDown,
+            onPasteInternal,
+            reselect,
+            rowMarkerOffset,
+            scrollTo,
+        ]
     );
 
     const [selCol, selRow] = currentCell ?? [];

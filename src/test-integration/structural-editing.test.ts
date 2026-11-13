@@ -31,7 +31,7 @@ import {
 type InsertResult = Extract<HostMessage, { type: 'structuralInsertResult' }>;
 type SaveResult = Extract<HostMessage, { type: 'saveResult' }>;
 
-/** One open worksheet in Edit mode, driven through the webview protocol. */
+/** One open worksheet holding an editing session, driven through the webview protocol. */
 class StructuralDriver {
     #sequence = 0;
     #requests = 0;
@@ -58,7 +58,7 @@ class StructuralDriver {
                 message.type === 'editSessionResult' && message.requestId === request_id,
             'an edit-session grant',
         );
-        assert.strictEqual(edit.granted, true, 'the workflow must enter Edit mode');
+        assert.strictEqual(edit.granted, true, 'the workflow must be granted an editing session');
         return { driver: new StructuralDriver(session, edit.editSessionId!, target), initial };
     }
 

@@ -1,12 +1,12 @@
 # Inserting, deleting, and moving rows and columns
 
-In Edit mode you can insert, delete, restore, and move rows and columns in `.xlsx`, CSV, and TSV files. Nothing changes on disk until you save. Until then the grid shows rows and columns in the order the save will write, unless a sort or filter is active, which changes only the view. New rows and columns are tinted green and moved ones purple. Rows and columns you delete stay where they were, tinted red, until the save removes them.
+You can insert, delete, restore, and move rows and columns in `.xlsx`, CSV, and TSV files. Nothing changes on disk until you save. Until then the grid shows rows and columns in the order the save will write, unless a sort or filter is active, which changes only the view. New rows and columns are tinted green and moved ones purple. Rows and columns you delete stay where they were, tinted red, until the save removes them.
 
 These actions are not available for `.xls`, `.dta`, or Parquet files, in a comparison, in a synchronized preview, or in a CSV or TSV file that opened with only its first rows loaded.
 
 ## Rows
 
-Right-click a row number to open the row menu. In Edit mode it has these items:
+Right-click a row number to open the row menu. In a file you can edit, it has these items:
 
 | Item | What it does |
 |---|---|
@@ -30,7 +30,7 @@ Rows you add with **Append row** stay at the end, after every other row, until y
 
 ## Columns
 
-Right-click a column header to open the column menu, or select several columns and right-click one of them. In Edit mode it has these items:
+Right-click a column header to open the column menu, or select several columns and right-click one of them. In a file you can edit, it has these items:
 
 | Item | What it does |
 |---|---|
@@ -84,9 +84,9 @@ Can't undo past a save that inserted, deleted, or moved rows or columns.
 
 ## Saving and discarding
 
-Save with `Ctrl+S` or `Cmd+S`, or leave Edit mode and choose to save. Saving writes rows and columns in their new structural order: the file's order with your inserts and moves applied. A sort never changes the saved order. It only changes the view, so a sorted grid can show rows in a different order than the file will have. Deleted rows and columns are removed from the file at that point, so check the red rows before you save.
+Save with `Ctrl+S` or `Cmd+S`, or with the **Save** button. Saving writes rows and columns in their new structural order: the file's order with your inserts and moves applied. A sort never changes the saved order. It only changes the view, so a sorted grid can show rows in a different order than the file will have. Deleted rows and columns are removed from the file at that point, so check the red rows before you save.
 
-Leaving Edit mode with unsaved row or column changes asks whether to save or discard them, as it does for cell edits. Discarding puts every row and column back where the file has it.
+**Discard** drops unsaved row and column changes along with cell edits, and puts every row and column back where the file has it. Undo brings them back.
 
 Unsaved changes survive closing the tab, the window, or the app. When you open the file again they come back, tinted as before, ready to save or discard.
 

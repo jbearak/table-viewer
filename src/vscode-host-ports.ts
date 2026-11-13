@@ -8,7 +8,6 @@ import {
     type FileSizeLimitDialogChoice,
     type FileSystemPort,
     type HostUiPort,
-    type SaveDialogChoice,
     type ViewerHost,
 } from './host-ports';
 import type { ResourceUriLike } from './resource-identity';
@@ -62,17 +61,6 @@ export const vscode_host_ui_port: HostUiPort = {
     },
     show_error(message) {
         return Promise.resolve(vscode.window.showErrorMessage(message)).then(() => {});
-    },
-    async show_save_discard_dialog(): Promise<SaveDialogChoice> {
-        const choice = await vscode.window.showWarningMessage(
-            'Leave edit mode?',
-            { modal: true },
-            'Save Edits',
-            'Discard Edits',
-        );
-        return choice === 'Save Edits'
-            ? 'save'
-            : choice === 'Discard Edits' ? 'discard' : 'cancel';
     },
     async show_file_size_limit_dialog(details): Promise<FileSizeLimitDialogChoice> {
         const choice = await vscode.window.showWarningMessage(

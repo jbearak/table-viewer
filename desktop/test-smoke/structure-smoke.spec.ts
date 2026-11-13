@@ -3,7 +3,7 @@
 //
 // Each test opens its own copy of a fixture in its own app, drives the shared
 // webview by context menu, keyboard, and drag, checks the Edit menu's Undo label
-// after each gesture, saves by leaving Edit mode, and reads the file back.
+// after each gesture, saves with the Save button, and reads the file back.
 //
 // No focus assertions and no application-menu commands: the Undo labels are
 // read from the history state the renderer reports for the Edit menu (see
@@ -18,15 +18,16 @@ import { build_fixture_xlsx, cell, row } from '../../src/test/helpers/xlsx-struc
 import { isolated_user_data, repo_dir, state_database_path } from './smoke-helpers';
 import {
     choose,
-    edit_toggle,
-    enter_edit_mode,
+    save_button,
+    wait_for_grid,
     exit_app,
     grid_headers,
     grid_rows,
+    header_point,
     install_dialog_capture,
     install_history_menu_capture,
     launch_structural_viewer,
-    leave_edit_mode_saving,
+    save_changes,
     open_column_menu,
     open_row_menu,
     row_marker_point,
@@ -72,7 +73,7 @@ test('CSV rows: insert, delete, restore, move by keyboard and drag, then save', 
         'fruit.csv',
         'name,qty\napple,1\nbanana,2\ncherry,3\ndate,4\nelderberry,5\n',
     );
-    await enter_edit_mode(page);
+    await wait_for_grid(page);
 
     // Insert above banana; focus moves into the new row.
     await choose(await open_row_menu(page, 1), 'Insert row above');
@@ -131,7 +132,7 @@ test('CSV rows: insert, delete, restore, move by keyboard and drag, then save', 
     await expect_undo_label('Move row');
     await save_screenshot(page, '01-csv-rows-before-save');
 
-    await leave_edit_mode_saving(app!, page);
+    await save_changes(page);
     await expect.poll(() => fs.readFileSync(file, 'utf8'))
         .toBe('name,qty\nkiwi,\napple,1\ndate,4\nelderberry,5\nbanana,2\n');
     await expect.poll(() => grid_rows(page)).toEqual([
@@ -145,12 +146,46 @@ test('CSV rows: insert, delete, restore, move by keyboard and drag, then save', 
     await expect.poll(() => undo_menu_label(app!)).toBe('Undo');
 });
 
+test('a row drag and a column drag are the first edits to a file', async () => {
+    const { file, page } = await open_file('fruit.csv', 'name,qty\napple,1\nbanana,2\ncherry,3\n');
+    await wait_for_grid(page);
+
+    // Nothing is unsaved, so the press itself has to bring the session the drop needs.
+    await select_row(page, 2);
+    const from = await row_marker_point(page, 2);
+    const to = await row_marker_point(page, 0);
+    await page.mouse.move(from.x, from.y);
+    await page.mouse.down();
+    await page.mouse.move(from.x, from.y - 10, { steps: 5 });
+    await page.mouse.move(to.x, to.y - 8, { steps: 5 });
+    // A drop is judged against the session, which a scripted drag can outrun.
+    await expect(page.getByRole('button', { name: 'Diff' })).toBeVisible();
+    await page.mouse.up();
+    await expect_undo_label('Move row');
+    await save_changes(page);
+    await expect.poll(() => fs.readFileSync(file, 'utf8')).toBe('name,qty\ncherry,3\napple,1\nbanana,2\n');
+
+    await expect(save_button(page)).toBeDisabled();
+    await select_column(page, 1);
+    const header_from = await header_point(page, 1);
+    const header_to = await header_point(page, 0);
+    await page.mouse.move(header_from.x, header_from.y);
+    await page.mouse.down();
+    await page.mouse.move(header_from.x - 10, header_from.y, { steps: 5 });
+    await page.mouse.move(header_to.x - 40, header_to.y, { steps: 5 });
+    await expect(page.getByRole('button', { name: 'Diff' })).toBeVisible();
+    await page.mouse.up();
+    await expect_undo_label('Move column');
+    await save_changes(page);
+    await expect.poll(() => fs.readFileSync(file, 'utf8')).toBe('qty,name\n3,cherry\n1,apple\n2,banana\n');
+});
+
 test('TSV columns: insert, rename, delete, restore, move, then save', async () => {
     const { file, page } = await open_file(
         'fruit.tsv',
         'name\tqty\tprice\napple\t1\t0.5\nbanana\t2\t0.25\n',
     );
-    await enter_edit_mode(page);
+    await wait_for_grid(page);
 
     await choose(await open_column_menu(page, 1), 'Insert column right');
     await expect.poll(() => grid_headers(page)).toEqual([
@@ -196,7 +231,7 @@ test('TSV columns: insert, rename, delete, restore, move, then save', async () =
     await expect_undo_label('Move column');
     await save_screenshot(page, '02-tsv-columns-before-save');
 
-    await leave_edit_mode_saving(app!, page);
+    await save_changes(page);
     await expect.poll(() => fs.readFileSync(file, 'utf8'))
         .toBe('qty\tname\tnotes\n1\tapple\tripe\n2\tbanana\t\n');
     await expect.poll(() => grid_headers(page)).toEqual(['|qty', '|name', '|notes']);
@@ -205,7 +240,7 @@ test('TSV columns: insert, rename, delete, restore, move, then save', async () =
 test('XLSX rows and columns: insert, delete, move, then save', async () => {
     const fixture = fs.readFileSync(path.join(repo_dir, 'src', 'test', 'fixtures', 'basic.xlsx'));
     const { file, page } = await open_file('basic.xlsx', fixture);
-    await enter_edit_mode(page);
+    await wait_for_grid(page);
     await expect.poll(() => grid_headers(page)).toEqual(['|Name', '|Age', '|Active', '|Joined']);
 
     await choose(await open_row_menu(page, 0), 'Insert row below');
@@ -228,7 +263,7 @@ test('XLSX rows and columns: insert, delete, move, then save', async () => {
     await expect_undo_label('Move row');
     await save_screenshot(page, '03-xlsx-before-save');
 
-    await leave_edit_mode_saving(app!, page);
+    await save_changes(page);
     const saved = async () => {
         const parsed = await parse_xlsx(new Uint8Array(fs.readFileSync(file)));
         return parsed.data.sheets[0].rows.map((row) => row.map((cell) => cell?.formatted ?? ''));
@@ -247,7 +282,7 @@ test('an external change conflicts, and both salvage actions resolve it', async 
         'fruit.csv',
         'name,qty\napple,1\nbanana,2\ncherry,3\ndate,4\n',
     );
-    await enter_edit_mode(page);
+    await wait_for_grid(page);
 
     // Insert a row and a column, type into both, and delete a row.
     await choose(await open_row_menu(page, 1), 'Insert row above');
@@ -279,12 +314,12 @@ test('an external change conflicts, and both salvage actions resolve it', async 
         .toEqual(['apple|10', 'banana|2', 'cherry|3', 'date|4', 'kiwi|']);
     await expect.poll(() => grid_headers(page)).toEqual(['|name', '|qty']);
     await save_screenshot(page, '05-kept-new-rows-at-end');
-    await leave_edit_mode_saving(app!, page);
+    await save_changes(page);
     await expect.poll(() => fs.readFileSync(file, 'utf8'))
         .toBe('name,qty\napple,10\nbanana,2\ncherry,3\ndate,4\nkiwi,\n');
 
     // Discard row and column changes: the source layout comes back.
-    await enter_edit_mode(page);
+    await wait_for_grid(page);
     await choose(await open_row_menu(page, 0), 'Delete row');
     await expect.poll(async () => (await grid_rows(page))[0]).toBe('Row removed, was row 1|apple|10');
     fs.writeFileSync(file, 'name,qty\napple,11\nbanana,2\ncherry,3\ndate,4\nkiwi,\n');
@@ -292,10 +327,30 @@ test('an external change conflicts, and both salvage actions resolve it', async 
     await review.getByRole('button', { name: 'Discard row and column changes on Sheet1' }).click();
     await expect(review).toHaveCount(0);
     await expect.poll(async () => (await grid_rows(page))[0]).toBe('|apple|11');
-    await expect(edit_toggle(page)).not.toHaveClass(/has-unsaved/);
+    await expect(save_button(page)).not.toHaveClass(/has-unsaved/);
     await save_screenshot(page, '06-discarded-layout');
     expect(fs.readFileSync(file, 'utf8'))
         .toBe('name,qty\napple,11\nbanana,2\ncherry,3\ndate,4\nkiwi,\n');
+});
+
+test('the row menu of an .xlsx with nothing unsaved still makes a row the header', async () => {
+    const book = Buffer.from(build_fixture_xlsx({
+        sheets: [{
+            name: 'Data',
+            body: `<sheetData>${[[1, 2], ['name', 'qty'], [5, 6], [7, 8]].map((cells, index) =>
+                row(index + 1, cells.map((value, column) => cell(`${'AB'[column]}${index + 1}`, value))))
+                .join('')}</sheetData>`,
+        }],
+    }));
+    const { page } = await open_file('late-header.xlsx', book);
+    await wait_for_grid(page);
+
+    // The menu holds an editing session for its insert and delete items; with
+    // nothing unsaved that must not take the header item away.
+    await choose(await open_row_menu(page, 1), 'Use row as header');
+    await expect.poll(async () => (await grid_headers(page)).map((header) => header.split('|')[1]))
+        .toEqual(['name', 'qty']);
+    await expect(save_button(page)).toBeDisabled();
 });
 
 test('an external edit that turns on an .xlsx Header Row conflicts, and Keep new rows at the end saves', async () => {
@@ -310,7 +365,7 @@ test('an external edit that turns on an .xlsx Header Row conflicts, and Keep new
         }],
     }));
     const { file, page } = await open_file('numbers.xlsx', book([1, 2]));
-    await enter_edit_mode(page);
+    await wait_for_grid(page);
     await expect.poll(async () => (await grid_rows(page)).map((line) => line.split('|')[1]))
         .toEqual(['1', '3', '5', '7']);
 
@@ -336,7 +391,7 @@ test('an external edit that turns on an .xlsx Header Row conflicts, and Keep new
     await expect(review).toHaveCount(0);
     await expect.poll(async () => (await grid_rows(page)).map((line) => line.split('|').slice(1).join('|')))
         .toEqual(['3|4', '5|6', '7|8', '9|typed-under-conflict']);
-    await leave_edit_mode_saving(app!, page);
+    await save_changes(page);
     const saved = async () => {
         const parsed = await parse_xlsx(new Uint8Array(fs.readFileSync(file)));
         return parsed.data.sheets[0].rows.map((cells) => cells.map((value) => value?.formatted ?? ''));

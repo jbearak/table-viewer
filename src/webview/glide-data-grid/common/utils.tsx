@@ -275,9 +275,17 @@ export function makeAccessibilityStringForArray(arr: readonly string[]): string 
 
 export function useDeepMemo<T>(value: T): T {
     const ref = React.useRef<T>(value);
+    // Fork addition: the last input already compared. An input that arrives
+    // as a new but equal object keeps the old one as the memoized value, so
+    // without this every later render compares the two in full again, which
+    // for a long list (a sheet's merged ranges) is paid on every frame.
+    const lastCompared = React.useRef<T>(value);
 
-    if (!deepEqual(value, ref.current)) {
-        ref.current = value;
+    if (value !== lastCompared.current) {
+        if (!deepEqual(value, ref.current)) {
+            ref.current = value;
+        }
+        lastCompared.current = value;
     }
 
     return ref.current;

@@ -8562,7 +8562,7 @@ describe('CSV edit sessions', () => {
         expect(versioned.get_state(file_path).transforms?.[0]).toBeUndefined();
     });
 
-    it('does not grant edit mode while a transform is computing', async () => {
+    it('does not grant an editing session while a transform is computing', async () => {
         const warning = vi.spyOn(vscode_mock.window, 'showWarningMessage');
         const panel = open_csv_table(uri('/tmp/session.csv'), state_store().store);
         await panel.__receive({ type: 'ready' });
@@ -8589,10 +8589,58 @@ describe('CSV edit sessions', () => {
         // the only observable `may_begin_editing()` owns on its own: the grant itself
         // is refused a second time by `may_reserve_claim()`, so without this assertion
         // the whole suite stays green with `may_begin_editing()` stubbed to yes — and
-        // the user gets an unexplained no-op on the edit control.
+        // the user gets an unexplained no-op on the keystroke that asked.
         expect(warning).toHaveBeenCalledWith(
-            'Wait for sorting and filtering to finish before entering edit mode.',
+            'Wait for sorting and filtering to finish before editing.',
         );
+    });
+
+    it('refuses a quiet request without announcing it', async () => {
+        const warning = vi.spyOn(vscode_mock.window, 'showWarningMessage');
+        const panel = open_csv_table(uri('/tmp/session.csv'), state_store().store);
+        await panel.__receive({ type: 'ready' });
+
+        const transform = panel.__receive({
+            type: 'setTransform',
+            sheetIndex: 0,
+            requestId: 'pending',
+            sourceGeneration: 1,
+            intent: 'user',
+            state: {
+                sort: [{ colIndex: 0, direction: 'asc' }],
+                filters: [],
+                schema: '["Sheet1",1,["h"]]',
+            },
+        } as never);
+        // A menu opening asks quietly: the user did not ask to edit, so the
+        // refusal leaves the menu's editing items unavailable and says nothing.
+        await panel.__receive({ type: 'requestEditSession', quiet: true } as never);
+        await transform;
+
+        expect(edit_session_results(panel)).toEqual([
+            { type: 'editSessionResult', sheetIndex: 0, granted: false },
+        ]);
+        expect(warning).not.toHaveBeenCalled();
+    });
+
+    it('grants a session requested while this panel is still releasing its last one', async () => {
+        // A session is released the moment it holds nothing and acquired again
+        // by the next editing gesture, so the two can cross. The gesture must
+        // not be dropped for arriving a state write too early.
+        const panel = open_csv_table(uri('/tmp/session.csv'), state_store().store);
+        await panel.__receive({ type: 'ready' });
+        await panel.__receive({ type: 'requestEditSession' } as never);
+        const first = latest_edit_session_message(panel)!.editSessionId!;
+
+        const release = panel.__receive({ type: 'releaseEditSession', editSessionId: first });
+        const request = panel.__receive({ type: 'requestEditSession' } as never);
+        await Promise.all([release, request]);
+
+        expect(edit_session_results(panel).map((result) => result.granted))
+            .toEqual([true, true]);
+        const second = latest_edit_session_message(panel)!.editSessionId;
+        expect(second).toEqual(expect.any(String));
+        expect(second).not.toBe(first);
     });
 
     it('projects pending edits for the owner but not a pre-ready watcher adoption in a nonowner', async () => {

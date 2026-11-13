@@ -496,7 +496,7 @@ describe('unsaved-edit indicator', () => {
     });
 
     // A draft restored from a previous session arrives host → webview; the webview
-    // only echoes pendingEditsChanged once it is in edit mode with a session.
+    // only posts pendingEditsChanged once it holds an editing session.
     it('reads a restored draft from the granted session and the snapshot', () => {
         expect(dirty_from_host_message({
             type: 'editSessionResult',

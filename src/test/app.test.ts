@@ -37,6 +37,10 @@ const grid_shell_mock = vi.hoisted(() => ({
     has_live_uncommitted: false,
     save_in_flight: false,
     has_uncommitted_changes: false,
+    // Whether the stub grid still needs its editing session. True unless a test
+    // says otherwise, so a session a test acquires stays held while clean, the
+    // way one does behind an open editor or menu.
+    session_busy: true,
     mount_count: 0,
     on_editing_change: null as null | ((status: { is_dirty: boolean; has_live_uncommitted: boolean; save_in_flight: boolean; edits: Record<string, CsvDirtyEntry>; conflicted: string[] }) => void),
     request_save: vi.fn(() => false),
@@ -253,6 +257,7 @@ vi.mock('../webview/grid-shell', () => ({
                     grid_shell_mock.commit_live_edit_at_close_barrier,
                 flush_live_edit: grid_shell_mock.flush_live_edit,
                 has_uncommitted_changes: () => grid_shell_mock.has_uncommitted_changes,
+                session_busy: () => grid_shell_mock.session_busy,
             };
         }
         // Mirror the real GridShell: publish a measure function into the ref so
@@ -528,15 +533,6 @@ async function dispatch_host_message(input: HostMessage | Record<string, unknown
                 ? { editSessionId: 'test-edit-session' }
                 : {}),
         };
-    } else if (msg.type === 'saveDialogResult' && msg.requestId === undefined) {
-        const request = [...outgoing].reverse().find((candidate) => (
-            candidate?.type === 'showSaveDialog'
-        ));
-        msg = {
-            ...msg,
-            requestId: request?.requestId ?? 'legacy-dialog-request',
-            editSessionId: request?.editSessionId ?? 'test-edit-session',
-        };
     } else if (msg.type === 'saveOperationStarted' && msg.lifecycle === undefined) {
         const operation = msg.operation as CsvSaveOperation;
         msg = {
@@ -791,12 +787,29 @@ function latest_histogram_request(post_message: ReturnType<typeof vi.fn>) {
     return request!;
 }
 
+/**
+ * Make the editing gesture the stub grid stands in for: ask App for the
+ * session, as the real grid does before it opens an editor or applies a paste.
+ */
+async function request_edit_session(
+    quiet?: boolean,
+): Promise<{ readonly granted: Promise<boolean> }> {
+    const request = grid_shell_mock.latest_props?.on_request_edit_session as
+        ((quiet?: boolean) => Promise<boolean>) | undefined;
+    expect(request, 'the grid was not offered an editing session to request').toBeDefined();
+    let granted!: Promise<boolean>;
+    await act(async () => { granted = request!(quiet); });
+    // Wrapped: returned bare, the caller's `await` would wait for the grant
+    // itself, which only the host message the test has yet to send can settle.
+    return { granted };
+}
+
 async function enter_edit_mode(
     post_message: ReturnType<typeof vi.fn>,
     edit_session_id = 'test-edit-session',
     diff_on_by_default?: boolean,
 ) {
-    await click_button('Edit');
+    await request_edit_session();
     expect(post_message).toHaveBeenCalledWith(expect.objectContaining({
         type: 'requestEditSession',
         requestId: expect.any(String),
@@ -807,6 +820,21 @@ async function enter_edit_mode(
         editSessionId: edit_session_id,
         ...(diff_on_by_default === undefined ? {} : { diffOnByDefault: diff_on_by_default }),
     });
+}
+
+/**
+ * Let go of a session that holds nothing, the way the real grid does when its
+ * last reason to keep one ends (an editor closed without a change, say): it
+ * stops reporting itself busy and tells App so.
+ */
+async function release_idle_edit_session() {
+    const idle = grid_shell_mock.latest_props?.on_edit_session_idle as
+        (() => void) | undefined;
+    expect(idle, 'the grid was given no way to report an idle session').toBeDefined();
+    grid_shell_mock.session_busy = false;
+    await act(async () => idle!());
+    // Busy again for whatever session the test acquires next, as at the start.
+    grid_shell_mock.session_busy = true;
 }
 
 function seed_mounted_store(
@@ -820,7 +848,11 @@ function seed_mounted_store(
     } | null;
     expect(props?.edit_session).toBeDefined();
     expect(props?.edit_session_id).toBeDefined();
-    props!.edit_session!.replace(props!.edit_session_id, edits);
+    // Inside `act` so App repaints from the store it subscribes to: Save and
+    // Discard are offered from what the registry holds at the last render.
+    act(() => {
+        props!.edit_session!.replace(props!.edit_session_id, edits);
+    });
 }
 
 async function report_grid_editing(
@@ -991,6 +1023,7 @@ function cleanup() {
     grid_shell_mock.has_live_uncommitted = false;
     grid_shell_mock.save_in_flight = false;
     grid_shell_mock.has_uncommitted_changes = false;
+    grid_shell_mock.session_busy = true;
     grid_shell_mock.mount_count = 0;
     snapshot_delivery_sequence = 0;
     grid_shell_mock.on_editing_change = null;
@@ -1120,10 +1153,10 @@ describe('git compare mode', () => {
         });
     }
 
-    it('offers no Edit or Diff buttons and marks the grid as comparing', async () => {
+    it('offers no Save or Diff buttons and marks the grid as comparing', async () => {
         await render_app();
         await dispatch_host_message(compare_snapshot(['Sheet1'], ['matched']));
-        expect(find_button((text) => text === 'Edit')).toBeUndefined();
+        expect(find_button((text) => text === 'Save')).toBeUndefined();
         expect(find_button((text) => text === 'Diff')).toBeUndefined();
         expect(grid_shell_mock.latest_props?.git_compare).toBe(true);
     });
@@ -2458,7 +2491,7 @@ describe('Excel first-row header toggle', () => {
         expect(grid_shell_mock.focus_grid).toHaveBeenCalledTimes(2);
     });
 
-    it('blocks every header-row command path during Edit mode', async () => {
+    it('blocks every header-row command path while an editing session is held', async () => {
         const { post_message } = await render_app();
         const meta = excel_meta_multi([true, false]);
         meta.sheets[0].sourceRowCount = 4;
@@ -2502,6 +2535,8 @@ describe('Excel first-row header toggle', () => {
         expect(unhide.disabled).toBe(true);
         await click_button('Unhide all');
 
+        // An empty session yields to row promotion; one holding an edit does not.
+        await report_grid_editing(false, true);
         expect(grid_shell_mock.latest_props?.can_promote_row_to_header).toBe(false);
         await act(async () => {
             const promote = grid_shell_mock.latest_props?.on_promote_row_to_header as
@@ -2512,6 +2547,36 @@ describe('Excel first-row header toggle', () => {
         expect(post_message.mock.calls
             .map((call) => call[0] as WebviewMessage)
             .some((message) => message.type === 'setExcelFirstRowHeader')).toBe(false);
+    });
+
+    it('promotes a row under the empty session its menu acquired', async () => {
+        const { post_message } = await render_app();
+        const meta = excel_meta(false, 'off');
+        meta.sheets[0].sourceRowCount = 4;
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        // The row menu acquires the session as it opens.
+        const { granted } = await request_edit_session();
+        await dispatch_host_message({
+            type: 'editSessionResult',
+            granted: true,
+            editSessionId: 'menu-session',
+        });
+        expect(await granted).toBe(true);
+        post_message.mockClear();
+
+        expect(grid_shell_mock.latest_props?.can_promote_row_to_header).toBe(true);
+        await act(async () => {
+            (grid_shell_mock.latest_props?.on_promote_row_to_header as (row: number) => void)(2);
+        });
+
+        const sent = post_message.mock.calls
+            .map((call) => (call[0] as WebviewMessage).type)
+            .filter((type) => type === 'releaseEditSession' || type === 'setExcelFirstRowHeader');
+        // Sent under the session, ahead of the release the closing menu causes:
+        // the host refuses a header request that follows an unacknowledged refresh.
+        expect(sent).toEqual(['setExcelFirstRowHeader']);
     });
 
     it('requests row promotion from the row-header context action', async () => {
@@ -3012,7 +3077,7 @@ describe('Excel first-row header toggle', () => {
             .map((message) => message.sheetIndex)).toEqual([0, 1]);
     });
 
-    it('resumes a retained all-sheets header queue after Edit mode exits', async () => {
+    it('resumes a retained all-sheets header queue after the editing session is released', async () => {
         const { post_message } = await render_app();
         await dispatch_host_message(initial_snapshot_message(
             excel_meta_multi([false, false]),
@@ -3050,7 +3115,7 @@ describe('Excel first-row header toggle', () => {
             .map((message) => message.sheetIndex);
         expect(header_sheets()).toEqual([0]);
 
-        await click_button('Edit');
+        await release_idle_edit_session();
         expect(header_sheets()).toEqual([0, 1]);
     });
 
@@ -3937,7 +4002,7 @@ describe('column visibility projection', () => {
             generation: 2,
         }));
         expect(columns_trigger().disabled).toBe(false);
-        await click_button('Edit');
+        await request_edit_session();
         expect(columns_trigger().disabled).toBe(false);
         await dispatch_host_message({ type: 'editSessionResult', granted: true });
         expect(columns_trigger().disabled).toBe(false);
@@ -4956,7 +5021,7 @@ describe('auto-fit state', () => {
         expect(get_button('Auto-fit Columns').classList.contains('active')).toBe(false);
     });
 
-    it('keeps auto-fit active across a capability-only refresh (entering edit mode)', async () => {
+    it('keeps auto-fit active across a capability-only refresh (acquiring an editing session)', async () => {
         grid_shell_mock.auto_fit_result = { 0: 200 };
         const { post_message } = await render_app();
         await dispatch_host_message(initial_snapshot_message(
@@ -5097,9 +5162,11 @@ describe('truncation banner', () => {
         );
         expect(banner!.textContent).toContain('Change row limit');
         expect(banner!.textContent).toContain('Load all rows');
-        const edit = get_button('Edit');
-        expect(edit.disabled).toBe(true);
-        expect(edit.getAttribute('aria-disabled')).toBe('true');
+        // No editing gesture is accepted: the grid is offered no session to
+        // ask for, and Save has nothing it could ever be given to write.
+        expect(grid_shell_mock.latest_props?.on_request_edit_session).toBeUndefined();
+        expect(get_button('Save').getAttribute('aria-disabled')).toBe('true');
+        expect(find_button((text) => text === 'Discard')).toBeUndefined();
 
         post_message.mockClear();
         await click_button('Change row limit');
@@ -5160,8 +5227,266 @@ describe('truncation banner', () => {
     });
 });
 
-describe('edit mode save exit', () => {
-    it('starts Diff off by default on the first Edit entry', async () => {
+describe('editing without an edit mode', () => {
+    type RequestEditSession = (quiet?: boolean) => Promise<boolean>;
+
+    async function editable_sheet() {
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['Sheet1'], false), {
+                capabilities: { csvEditable: true, csvEditingSupported: true },
+            }),
+        );
+        return post_message;
+    }
+
+    function offered_request(): RequestEditSession | undefined {
+        return grid_shell_mock.latest_props?.on_request_edit_session as
+            RequestEditSession | undefined;
+    }
+
+    function posted(post_message: ReturnType<typeof vi.fn>, type: WebviewMessage['type']) {
+        return post_message.mock.calls
+            .map((call) => call[0] as WebviewMessage)
+            .filter((message) => message.type === type);
+    }
+
+    /** What a toolbar button says about itself once it has keyboard focus. */
+    async function tooltip_of(label: string): Promise<string | null | undefined> {
+        await act(async () => get_button(label).focus());
+        return document.querySelector('[role="tooltip"]')?.textContent;
+    }
+
+    /** Leave a transform request unanswered on the active sheet. */
+    async function transform_in_flight(post_message: ReturnType<typeof vi.fn>) {
+        await click_stub_button('.stub-shortcut-transform');
+        expect(latest_transform_request(post_message)).toBeDefined();
+    }
+
+    it('shows Save disabled, with how to start editing, before anything is edited', async () => {
+        await editable_sheet();
+
+        const save = get_button('Save');
+        expect(save.getAttribute('aria-disabled')).toBe('true');
+        expect(save.classList.contains('has-unsaved')).toBe(false);
+        expect(find_button((text) => text === 'Discard')).toBeUndefined();
+        expect(find_button((text) => text === 'Diff')).toBeUndefined();
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
+        expect(await tooltip_of('Save')).toBe(
+            'No unsaved changes. Double-click a cell or start typing to edit it.',
+        );
+    });
+
+    it('shows no Save and offers the grid no session for a file that cannot be edited', async () => {
+        await render_app();
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1'], false)));
+
+        expect(find_button((text) => text === 'Save')).toBeUndefined();
+        expect(find_button((text) => text === 'Discard')).toBeUndefined();
+        expect(find_button((text) => text === 'Diff')).toBeUndefined();
+        expect(offered_request()).toBeUndefined();
+    });
+
+    it('acquires the session on the grid’s request and then stops offering one', async () => {
+        const post_message = await editable_sheet();
+        post_message.mockClear();
+
+        const { granted } = await request_edit_session();
+        const requests = posted(post_message, 'requestEditSession');
+        expect(requests).toEqual([expect.objectContaining({
+            requestId: expect.any(String),
+            sheetIndex: 0,
+            sheetName: 'Sheet1',
+        })]);
+        // An ordinary editing gesture, so the host is free to announce a refusal.
+        expect(requests[0]).not.toHaveProperty('quiet');
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
+
+        await dispatch_host_message({
+            type: 'editSessionResult',
+            granted: true,
+            editSessionId: 'granted-session',
+        });
+
+        expect(await granted).toBe(true);
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(grid_shell_mock.latest_props?.edit_session_id).toBe('granted-session');
+        expect(offered_request()).toBeUndefined();
+        // Diff has a session to compare against; Discard still has nothing to drop.
+        expect(get_button('Diff')).toBeDefined();
+        expect(find_button((text) => text === 'Discard')).toBeUndefined();
+    });
+
+    it('resolves the request false when the host refuses, and keeps offering one', async () => {
+        const post_message = await editable_sheet();
+
+        const { granted } = await request_edit_session();
+        await dispatch_host_message({ type: 'editSessionResult', granted: false });
+
+        expect(await granted).toBe(false);
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
+        expect(offered_request()).toBeDefined();
+        expect(posted(post_message, 'requestEditSession')).toHaveLength(1);
+    });
+
+    it('marks a quiet request as quiet', async () => {
+        const post_message = await editable_sheet();
+
+        await request_edit_session(true);
+
+        expect(posted(post_message, 'requestEditSession')).toEqual([
+            expect.objectContaining({ quiet: true }),
+        ]);
+    });
+
+    it('refuses a request while a transform is in flight, and says why', async () => {
+        const post_message = await editable_sheet();
+        await transform_in_flight(post_message);
+        post_message.mockClear();
+
+        const { granted } = await request_edit_session();
+
+        expect(await granted).toBe(false);
+        expect(posted(post_message, 'requestEditSession')).toEqual([]);
+        expect(posted(post_message, 'showWarning')).toEqual([{
+            type: 'showWarning',
+            message: 'Wait for sorting and filtering to finish before editing.',
+        }]);
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
+    });
+
+    it('refuses a quiet request while a transform is in flight without a warning', async () => {
+        const post_message = await editable_sheet();
+        await transform_in_flight(post_message);
+        post_message.mockClear();
+
+        const { granted } = await request_edit_session(true);
+
+        expect(await granted).toBe(false);
+        expect(posted(post_message, 'requestEditSession')).toEqual([]);
+        expect(posted(post_message, 'showWarning')).toEqual([]);
+    });
+
+    it('answers two overlapping requests with the one grant', async () => {
+        const post_message = await editable_sheet();
+        post_message.mockClear();
+
+        const first = await request_edit_session();
+        const second = await request_edit_session();
+        expect(posted(post_message, 'requestEditSession')).toHaveLength(1);
+
+        await dispatch_host_message({
+            type: 'editSessionResult',
+            granted: true,
+            editSessionId: 'shared-session',
+        });
+
+        expect(await first.granted).toBe(true);
+        expect(await second.granted).toBe(true);
+        expect(posted(post_message, 'requestEditSession')).toHaveLength(1);
+        expect(grid_shell_mock.latest_props?.edit_session_id).toBe('shared-session');
+    });
+
+    it('releases a clean held session once the grid no longer needs it', async () => {
+        const post_message = await editable_sheet();
+        await enter_edit_mode(post_message, 'idle-session');
+        post_message.mockClear();
+
+        // Still busy (an open editor, say): being told to look again changes nothing.
+        const idle = grid_shell_mock.latest_props?.on_edit_session_idle as () => void;
+        await act(async () => idle());
+        expect(posted(post_message, 'releaseEditSession')).toEqual([]);
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+
+        await release_idle_edit_session();
+
+        expect(posted(post_message, 'releaseEditSession')).toEqual([{
+            type: 'releaseEditSession',
+            editSessionId: 'idle-session',
+        }]);
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
+        expect(find_button((text) => text === 'Diff')).toBeUndefined();
+        // And the next editing gesture can acquire another.
+        expect(offered_request()).toBeDefined();
+    });
+
+    it('releases a clean idle session on the next render, without being told', async () => {
+        const post_message = await editable_sheet();
+        await enter_edit_mode(post_message, 'idle-session');
+        post_message.mockClear();
+
+        // The grid stops needing the session and says nothing; any render will do.
+        grid_shell_mock.session_busy = false;
+        await click_button('Diff');
+
+        expect(posted(post_message, 'releaseEditSession')).toEqual([{
+            type: 'releaseEditSession',
+            editSessionId: 'idle-session',
+        }]);
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
+    });
+
+    it('keeps an idle session that holds unsaved edits', async () => {
+        const post_message = await editable_sheet();
+        await enter_edit_mode(post_message);
+        seed_mounted_store();
+        post_message.mockClear();
+
+        await release_idle_edit_session();
+
+        expect(posted(post_message, 'releaseEditSession')).toEqual([]);
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(latest_store_edits()).toEqual({ '0:0': { value: 'dirty', base: 'base' } });
+        expect(get_button('Save').getAttribute('aria-disabled')).not.toBe('true');
+        expect(await tooltip_of('Save')).toBe('Save changes to the file.');
+    });
+
+    it('keeps an idle, clean session while a save is in flight', async () => {
+        const post_message = await editable_sheet();
+        await enter_edit_mode(post_message);
+        // The grid reports a save in flight with nothing left dirty in the store.
+        await report_grid_editing(false, false, [], {}, true);
+        post_message.mockClear();
+
+        await release_idle_edit_session();
+
+        expect(posted(post_message, 'releaseEditSession')).toEqual([]);
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(await tooltip_of('Save')).toBe('Saving changes.');
+
+        // The save's end is the only thing that was holding it.
+        await report_grid_editing(false, false);
+        await release_idle_edit_session();
+        expect(posted(post_message, 'releaseEditSession')).toHaveLength(1);
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
+    });
+
+    it('discards every unsaved edit from the Discard button', async () => {
+        const post_message = await editable_sheet();
+        await enter_edit_mode(post_message, 'discard-session');
+        seed_mounted_store();
+        expect(await tooltip_of('Discard')).toBe(
+            'Discard all unsaved changes. Undo brings them back.',
+        );
+        post_message.mockClear();
+
+        await click_button('Discard');
+
+        expect(posted(post_message, 'discardEditSession')).toEqual([{
+            type: 'discardEditSession',
+            editSessionId: 'discard-session',
+        }]);
+        expect(latest_store_edits()).toEqual({});
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
+        expect(find_button((text) => text === 'Discard')).toBeUndefined();
+        expect(get_button('Save').getAttribute('aria-disabled')).toBe('true');
+        // Undoable, which is what the tooltip promised.
+        expect(JSON.parse(grid_stub().getAttribute('data-undo-labels')!)).toHaveLength(1);
+    });
+});
+
+describe('editing session save and release', () => {
+    it('starts Diff off by default when a session is first granted', async () => {
         const { post_message } = await render_app();
         await dispatch_host_message(
             initial_snapshot_message(make_meta(['Sheet1'], false), {
@@ -5176,7 +5501,7 @@ describe('edit mode save exit', () => {
         expect(grid_stub().getAttribute('data-diff-mode')).toBe('false');
     });
 
-    it('samples the configured Diff default when Edit is first entered', async () => {
+    it('samples the configured Diff default when a session is first granted', async () => {
         const { post_message } = await render_app();
         await dispatch_host_message(
             initial_snapshot_message(make_meta(['Sheet1'], false), {
@@ -5186,14 +5511,14 @@ describe('edit mode save exit', () => {
         );
 
         // The host samples configuration for the grant, so a setting changed after
-        // the viewer opened still controls the first successful Edit entry.
+        // the viewer opened still controls the first grant.
         await enter_edit_mode(post_message, 'test-edit-session', true);
 
         expect(get_button('Diff').getAttribute('aria-pressed')).toBe('true');
         expect(grid_stub().getAttribute('data-diff-mode')).toBe('true');
     });
 
-    it('does not reapply the Diff default on refresh or Edit re-entry', async () => {
+    it('does not reapply the Diff default on refresh or when a session is acquired again', async () => {
         const { post_message } = await render_app();
         const meta = make_meta(['Sheet1'], false);
         await dispatch_host_message(initial_snapshot_message(meta, {
@@ -5214,13 +5539,14 @@ describe('edit mode save exit', () => {
         }));
         expect(get_button('Diff').getAttribute('aria-pressed')).toBe('false');
 
-        await click_button('Edit');
+        await release_idle_edit_session();
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
         await enter_edit_mode(post_message, 'same-session');
         expect(get_button('Diff').getAttribute('aria-pressed')).toBe('false');
         expect(grid_stub().getAttribute('data-diff-mode')).toBe('false');
     });
 
-    it('uses the configured Diff default for a restored Edit session', async () => {
+    it('uses the configured Diff default for a restored editing session', async () => {
         await render_app();
         await dispatch_host_message(
             initial_snapshot_message(make_meta(['Sheet1'], false), {
@@ -5292,7 +5618,7 @@ describe('edit mode save exit', () => {
         expect(grid_shell_mock.latest_props?.append_composer_draft).toEqual([]);
     });
 
-    it('discarding from the save dialog clears persisted edits before releasing edit ownership', async () => {
+    it('discarding clears persisted edits before releasing edit ownership', async () => {
         grid_shell_mock.is_dirty = true;
         grid_shell_mock.has_uncommitted_changes = true;
 
@@ -5309,12 +5635,7 @@ describe('edit mode save exit', () => {
         seed_mounted_store();
 
         post_message.mockClear();
-        await click_button('Edit');
-        expect(post_message).toHaveBeenCalledWith(expect.objectContaining({
-            type: 'showSaveDialog',
-        }));
-
-        await dispatch_host_message({ type: 'saveDialogResult', choice: 'discard' });
+        await click_button('Discard');
 
         // The mounted store is emptied through the registry rather than through
         // the grid's own clear: the discard snapshots every sheet before emptying
@@ -5356,8 +5677,7 @@ describe('edit mode save exit', () => {
         );
 
         post_message.mockClear();
-        await click_button('Edit');
-        await dispatch_host_message({ type: 'saveDialogResult', choice: 'discard' });
+        await click_button('Discard');
         expect(post_message).toHaveBeenCalledWith(expect.objectContaining({
             type: 'discardEditSession',
         }));
@@ -5381,15 +5701,14 @@ describe('edit mode save exit', () => {
         );
         await enter_edit_mode(post_message);
         seed_mounted_store();
-        await click_button('Edit');
-        await dispatch_host_message({ type: 'saveDialogResult', choice: 'discard' });
+        await click_button('Discard');
 
         const discard = post_message.mock.calls
             .map(([message]) => message as { type?: string; editSessionId?: string })
             .find((message) => message.type === 'discardEditSession');
         expect(discard?.editSessionId).toBeDefined();
 
-        // Re-entering edit mode still works normally, which is what the
+        // Acquiring a session again still works normally, which is what the
         // acknowledgement must not have broken.
         post_message.mockClear();
         await dispatch_host_message({
@@ -5397,13 +5716,13 @@ describe('edit mode save exit', () => {
             editSessionId: discard!.editSessionId!,
             cleared: true,
         });
-        await click_button('Edit');
+        await request_edit_session();
         expect(post_message).toHaveBeenCalledWith(expect.objectContaining({
             type: 'requestEditSession',
         }));
     });
 
-    it('enters edit mode with pending edits returned by the host session grant', async () => {
+    it('starts editing with pending edits returned by the host session grant', async () => {
         const { post_message } = await render_app();
         await dispatch_host_message(
             initial_snapshot_message(make_meta(['Sheet1'], false), {
@@ -5415,7 +5734,7 @@ describe('edit mode save exit', () => {
         );
         const first_mount_id = grid_stub().getAttribute('data-mount-id');
 
-        await click_button('Edit');
+        await request_edit_session();
         expect(post_message).toHaveBeenCalledWith(expect.objectContaining({
             type: 'requestEditSession',
         }));
@@ -5443,7 +5762,7 @@ describe('edit mode save exit', () => {
         await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1'], false), {
             capabilities: { csvEditable: true, csvEditingSupported: true },
         }));
-        await click_button('Edit');
+        await request_edit_session();
         await dispatch_host_message({
             type: 'editSessionResult',
             granted: true,
@@ -5491,7 +5810,7 @@ describe('edit mode save exit', () => {
         await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1'], false), {
             capabilities: { csvEditable: true, csvEditingSupported: true },
         }));
-        await click_button('Edit');
+        await request_edit_session();
         await dispatch_host_message({
             type: 'editSessionResult',
             granted: true,
@@ -5631,7 +5950,7 @@ describe('edit mode save exit', () => {
             await dispatch_host_message(initial_snapshot_message(meta, {
                 capabilities: { csvEditable: true, csvEditingSupported: true },
             }));
-            await click_button('Edit');
+            await request_edit_session();
             // A moved source column and a Pending Column, with no row change.
             await dispatch_host_message({
                 type: 'editSessionResult',
@@ -5838,7 +6157,7 @@ describe('edit mode save exit', () => {
         await dispatch_host_message(initial_snapshot_message(meta, {
             capabilities: { csvEditable: true, csvEditingSupported: true },
         }));
-        await click_button('Edit');
+        await request_edit_session();
         const rows = meta.sheets[0].sourceRowCount;
         await dispatch_host_message({
             type: 'editSessionResult',
@@ -5897,7 +6216,7 @@ describe('edit mode save exit', () => {
         await dispatch_host_message(initial_snapshot_message(meta, {
             capabilities: { csvEditable: true, csvEditingSupported: true },
         }));
-        await click_button('Edit');
+        await request_edit_session();
         await dispatch_host_message({
             type: 'editSessionResult',
             granted: true,
@@ -5953,7 +6272,7 @@ describe('edit mode save exit', () => {
             capabilities: { csvEditable: true, csvEditingSupported: true },
         }));
 
-        await click_button('Edit');
+        await request_edit_session();
         await dispatch_host_message({
             type: 'editSessionResult',
             granted: true,
@@ -6025,7 +6344,7 @@ describe('edit mode save exit', () => {
         await dispatch_host_message(initial_snapshot_message(meta, {
             capabilities: { csvEditable: true, csvEditingSupported: true, editSyntax: 'markdown' },
         }));
-        await click_button('Edit');
+        await request_edit_session();
         await dispatch_host_message({
             type: 'editSessionResult',
             granted: true,
@@ -6080,7 +6399,7 @@ describe('edit mode save exit', () => {
         await dispatch_host_message(initial_snapshot_message(meta, {
             capabilities: { csvEditable: true, csvEditingSupported: true, editSyntax: 'markdown' },
         }));
-        await click_button('Edit');
+        await request_edit_session();
         await dispatch_host_message({
             type: 'editSessionResult',
             granted: true,
@@ -6136,7 +6455,7 @@ describe('edit mode save exit', () => {
         await dispatch_host_message(initial_snapshot_message(meta, {
             capabilities: { csvEditable: true, csvEditingSupported: true },
         }));
-        await click_button('Edit');
+        await request_edit_session();
         await dispatch_host_message({
             type: 'editSessionResult',
             granted: true,
@@ -6196,7 +6515,7 @@ describe('edit mode save exit', () => {
         expect((grid_shell_mock.latest_props?.source_formula_results as Map<string, string>)
             .get('0:1')).toBe('?? (unsupported function)');
 
-        await click_button('Edit');
+        await request_edit_session();
         await dispatch_host_message({
             type: 'editSessionResult',
             granted: true,
@@ -6231,7 +6550,7 @@ describe('edit mode save exit', () => {
             results: [{ sheetIndex: 0, row: 0, column: 1, value: '4' }],
         });
 
-        await click_button('Edit');
+        await request_edit_session();
         await dispatch_host_message({
             type: 'editSessionResult',
             granted: true,
@@ -6276,7 +6595,7 @@ describe('edit mode save exit', () => {
         await dispatch_host_message(initial_snapshot_message(meta, {
             capabilities: { csvEditable: true, csvEditingSupported: true },
         }));
-        await click_button('Edit');
+        await request_edit_session();
         await dispatch_host_message({
             type: 'editSessionResult',
             granted: true,
@@ -6310,7 +6629,7 @@ describe('edit mode save exit', () => {
         await dispatch_host_message(initial_snapshot_message(meta, {
             capabilities: { csvEditable: true, csvEditingSupported: true },
         }));
-        await click_button('Edit');
+        await request_edit_session();
         await dispatch_host_message({
             type: 'editSessionResult',
             granted: true,
@@ -6346,7 +6665,7 @@ describe('edit mode save exit', () => {
         await dispatch_host_message(initial_snapshot_message(meta, {
             capabilities: { csvEditable: true, csvEditingSupported: true },
         }));
-        await click_button('Edit');
+        await request_edit_session();
         await dispatch_host_message({
             type: 'editSessionResult',
             granted: true,
@@ -6374,7 +6693,7 @@ describe('edit mode save exit', () => {
             message?.type === 'requestFormulaCalculation')).toHaveLength(before);
     });
 
-    it('advances the committed activation when the same session re-enters edit mode', async () => {
+    it('advances the committed activation when the same session is acquired again', async () => {
         const { post_message } = await render_app();
         await dispatch_host_message(
             initial_snapshot_message(make_meta(['Sheet1'], false), {
@@ -6389,12 +6708,15 @@ describe('edit mode save exit', () => {
         await enter_edit_mode(post_message, 'same-session');
         expect(grid_stub().getAttribute('data-edit-activation-id')).toBe('1');
 
-        await click_button('Edit');
+        // Releasing is a new activation too: it is what lifts the fence the grid
+        // put on the one that ended, so the next gesture finds cells that accept it.
+        await release_idle_edit_session();
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
+        expect(grid_stub().getAttribute('data-edit-activation-id')).toBe('2');
         await enter_edit_mode(post_message, 'same-session');
 
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
-        expect(grid_stub().getAttribute('data-edit-activation-id')).toBe('2');
+        expect(grid_stub().getAttribute('data-edit-activation-id')).toBe('3');
     });
 
     it('advances the committed activation when an active session is replaced', async () => {
@@ -6426,7 +6748,7 @@ describe('edit mode save exit', () => {
         expect(grid_stub().getAttribute('data-edit-activation-id')).toBe('2');
     });
 
-    it('continues the workbook session when Edit is pressed on another worksheet', async () => {
+    it('continues the workbook session on another worksheet', async () => {
         const { post_message } = await render_app();
         await dispatch_host_message(
             initial_snapshot_message(make_meta(['People', 'Inventory'], false), {
@@ -6438,7 +6760,7 @@ describe('edit mode save exit', () => {
         );
         // Edit the second worksheet, then walk back to the first one.
         await click_sheet_tab('Inventory');
-        await click_button('Edit');
+        await request_edit_session();
         const pendingEdits = { '0:0': { value: 'Gadget', base: 'Widget' } };
         await dispatch_host_message({
             type: 'editSessionResult',
@@ -6455,7 +6777,9 @@ describe('edit mode save exit', () => {
         expect(grid_stub().getAttribute('data-sheet-index')).toBe('0');
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
         expect(grid_stub().getAttribute('data-store-edits')).toBe('{}');
-        expect(get_button('Edit').getAttribute('aria-disabled')).not.toBe('true');
+        // Nothing more to ask for, and Save still answers for Inventory's edits.
+        expect(grid_shell_mock.latest_props?.on_request_edit_session).toBeUndefined();
+        expect(get_button('Save').getAttribute('aria-disabled')).not.toBe('true');
         expect(post_message.mock.calls.filter(([message]) => (
             message?.type === 'requestEditSession'
         ))).toHaveLength(1);
@@ -6478,7 +6802,7 @@ describe('edit mode save exit', () => {
                 },
             })
         );
-        await click_button('Edit');
+        await request_edit_session();
         await dispatch_host_message({
             type: 'editSessionResult',
             granted: true,
@@ -6498,7 +6822,7 @@ describe('edit mode save exit', () => {
         );
     });
 
-    it('switches worksheets after a clean Edit exit fences the mounted editor', async () => {
+    it('switches worksheets after an idle release fences the mounted editor', async () => {
         const { post_message } = await render_app();
         await dispatch_host_message(
             initial_snapshot_message(make_meta(['People', 'Inventory'], false), {
@@ -6514,7 +6838,7 @@ describe('edit mode save exit', () => {
             grid_shell_mock.commit_live_edit.mockReturnValue(false);
         });
 
-        await click_button('Edit');
+        await release_idle_edit_session();
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
         expect(grid_shell_mock.stop_edit_admission).toHaveBeenCalledOnce();
         await click_sheet_tab('Inventory');
@@ -6788,7 +7112,7 @@ describe('edit mode save exit', () => {
         await dispatch_host_message(initial_snapshot_message(meta, {
             capabilities: { csvEditable: true, csvEditingSupported: true },
         }));
-        await click_button('Edit');
+        await request_edit_session();
         await dispatch_host_message({
             type: 'editSessionResult',
             granted: true,
@@ -6844,7 +7168,7 @@ describe('edit mode save exit', () => {
         await dispatch_host_message(initial_snapshot_message(meta, {
             capabilities: { csvEditable: true, csvEditingSupported: true },
         }));
-        await click_button('Edit');
+        await request_edit_session();
         await dispatch_host_message({
             type: 'editSessionResult',
             granted: true,
@@ -6925,7 +7249,7 @@ describe('edit mode save exit', () => {
         await dispatch_host_message(initial_snapshot_message(meta, {
             capabilities: { csvEditable: true, csvEditingSupported: true },
         }));
-        await click_button('Edit');
+        await request_edit_session();
         await dispatch_host_message({
             type: 'editSessionResult',
             granted: true,
@@ -7422,7 +7746,7 @@ describe('edit mode save exit', () => {
             })
         );
         await click_sheet_tab('Inventory');
-        await click_button('Edit');
+        await request_edit_session();
         await dispatch_host_message({
             type: 'editSessionResult',
             granted: true,
@@ -7464,7 +7788,7 @@ describe('edit mode save exit', () => {
             })
         );
         await click_sheet_tab('Inventory');
-        await click_button('Edit');
+        await request_edit_session();
         await dispatch_host_message({
             type: 'editSessionResult',
             granted: true,
@@ -7486,7 +7810,7 @@ describe('edit mode save exit', () => {
         expect(grid_stub().getAttribute('data-sheet-index')).toBe('1');
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
         post_message.mockClear();
-        await click_button('Edit');
+        await request_edit_session();
         expect(post_message).toHaveBeenCalledTimes(1);
         expect(post_message).toHaveBeenCalledWith(expect.objectContaining({
             type: 'requestEditSession',
@@ -7495,11 +7819,11 @@ describe('edit mode save exit', () => {
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
     });
 
-    it('shows the save dialog when only another worksheet\u2019s store is dirty', async () => {
-        // Exiting ends the workbook-scoped session for every sheet, so unsaved
-        // work on a sheet other than the one on screen must raise the same
-        // Save/Discard/Cancel question \u2014 the mounted grid only answers for
-        // the visible sheet.
+    it('keeps the session and offers Save when only another worksheet\u2019s store is dirty', async () => {
+        // The session is workbook-scoped, so unsaved work on a sheet other than
+        // the one on screen is still unsaved work: Save and Discard are offered
+        // for it, and the session is not released as idle \u2014 the mounted
+        // grid only answers for the visible sheet.
         grid_shell_mock.has_uncommitted_changes = false;
 
         const { post_message } = await render_app();
@@ -7521,13 +7845,18 @@ describe('edit mode save exit', () => {
         expect(grid_stub().getAttribute('data-sheet-index')).toBe('0');
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
         expect(grid_stub().getAttribute('data-store-edits')).toBe('{}');
-        expect(get_button('Edit').classList.contains('has-unsaved')).toBe(true);
+        const save = get_button('Save');
+        expect(save.classList.contains('has-unsaved')).toBe(true);
+        expect(save.getAttribute('aria-disabled')).not.toBe('true');
+        expect(get_button('Discard').getAttribute('aria-disabled')).not.toBe('true');
 
+        // The visible grid has nothing of its own to keep the session for.
         post_message.mockClear();
-        await click_button('Edit');
-        expect(post_message).toHaveBeenCalledWith(
-            expect.objectContaining({ type: 'showSaveDialog' })
+        await release_idle_edit_session();
+        expect(post_message).not.toHaveBeenCalledWith(
+            expect.objectContaining({ type: 'releaseEditSession' })
         );
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
     });
 
     it('keeps the workbook session when a dirty sibling blocks save preflight', async () => {
@@ -7552,18 +7881,9 @@ describe('edit mode save exit', () => {
             },
         });
         await click_sheet_tab('People');
-        await click_button('Edit');
-        const dialog = post_message.mock.calls
-            .map(([message]) => message)
-            .find((message) => message?.type === 'showSaveDialog');
         post_message.mockClear();
 
-        await dispatch_host_message({
-            type: 'saveDialogResult',
-            requestId: dialog.requestId,
-            editSessionId: dialog.editSessionId,
-            choice: 'save',
-        });
+        await click_button('Save');
 
         expect(grid_shell_mock.request_save).toHaveBeenCalledTimes(1);
         expect(post_message).toHaveBeenCalledWith(expect.objectContaining({
@@ -7576,10 +7896,10 @@ describe('edit mode save exit', () => {
             type: 'releaseEditSession',
         }));
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
-        expect(get_button('Edit').classList.contains('has-unsaved')).toBe(true);
+        expect(get_button('Save').classList.contains('has-unsaved')).toBe(true);
     });
 
-    it('saves the dirty sibling chosen from a clean pointer sheet', async () => {
+    it('saves the dirty sibling from a clean pointer sheet', async () => {
         grid_shell_mock.has_uncommitted_changes = false;
         grid_shell_mock.request_save.mockReturnValue(true);
         const { post_message } = await render_app();
@@ -7594,17 +7914,8 @@ describe('edit mode save exit', () => {
                 },
             })
         );
-        await click_button('Edit');
-        const dialog = post_message.mock.calls
-            .map(([message]) => message)
-            .find((message) => message?.type === 'showSaveDialog');
         post_message.mockClear();
-        await dispatch_host_message({
-            type: 'saveDialogResult',
-            requestId: dialog.requestId,
-            editSessionId: dialog.editSessionId,
-            choice: 'save',
-        });
+        await click_button('Save');
 
         expect(grid_stub().getAttribute('data-sheet-index')).toBe('0');
         expect(grid_shell_mock.request_save).toHaveBeenCalledTimes(1);
@@ -7625,7 +7936,7 @@ describe('edit mode save exit', () => {
         );
     });
 
-    it('follows the dirty worksheet identity while its save dialog is open', async () => {
+    it('follows the dirty worksheet identity across a reorder before its save', async () => {
         grid_shell_mock.has_uncommitted_changes = false;
         grid_shell_mock.request_save.mockReturnValue(true);
         const { post_message } = await render_app();
@@ -7647,17 +7958,7 @@ describe('edit mode save exit', () => {
                 csvEditSessionId: 'restored-session',
             },
         }));
-        await click_button('Edit');
-        await dispatch_host_message({
-            type: 'editSessionResult',
-            granted: true,
-            editSessionId: 'restored-session',
-            sheetIndex: 0,
-        });
-        await click_button('Edit');
-        const dialog = post_message.mock.calls
-            .map(([message]) => message)
-            .find((message) => message?.type === 'showSaveDialog');
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
 
         const after = make_meta(['Inventory', 'People'], false);
         after.sheets[0].worksheetId = '2';
@@ -7677,12 +7978,7 @@ describe('edit mode save exit', () => {
             },
         }));
         post_message.mockClear();
-        await dispatch_host_message({
-            type: 'saveDialogResult',
-            requestId: dialog.requestId,
-            editSessionId: dialog.editSessionId,
-            choice: 'save',
-        });
+        await click_button('Save');
 
         expect(grid_stub().getAttribute('data-sheet-index')).toBe('0');
         expect(grid_shell_mock.latest_props?.save_operation).toMatchObject({
@@ -7720,17 +8016,8 @@ describe('edit mode save exit', () => {
             })
         );
 
-        await click_button('Edit');
-        const dialog = post_message.mock.calls
-            .map(([message]) => message)
-            .find((message) => message?.type === 'showSaveDialog');
         post_message.mockClear();
-        await dispatch_host_message({
-            type: 'saveDialogResult',
-            requestId: dialog.requestId,
-            editSessionId: dialog.editSessionId,
-            choice: 'save',
-        });
+        await click_button('Save');
 
         expect(grid_shell_mock.request_save).toHaveBeenCalledTimes(1);
         expect(post_message).toHaveBeenCalledWith(expect.objectContaining({
@@ -7997,51 +8284,6 @@ describe('edit mode save exit', () => {
         }));
     });
 
-    it('holds the worksheet tabs while a save dialog is open', async () => {
-        // The dialog asks about one worksheet, and the answer is applied against the
-        // *active* sheet's store. Switching tabs while it was open pointed the answer
-        // at the wrong worksheet: the new sheet's store has no session, so it reports
-        // nothing to save, and a "Save" choice took the exit path — releasing the
-        // session without ever posting the save. The user asked to save and the edits
-        // were dropped.
-        grid_shell_mock.is_dirty = true;
-        grid_shell_mock.has_uncommitted_changes = true;
-        grid_shell_mock.request_save.mockReturnValue(true);
-
-        const { post_message } = await render_app();
-        await dispatch_host_message(
-            initial_snapshot_message(make_meta(['People', 'Inventory'], false), {
-                capabilities: { csvEditable: true, csvEditingSupported: true },
-            })
-        );
-        await click_sheet_tab('Inventory');
-        await click_button('Edit');
-        await dispatch_host_message({
-            type: 'editSessionResult',
-            granted: true,
-            editSessionId: 'inventory-session',
-            sheetIndex: 1,
-            pendingEdits: { '0:0': { value: 'Gadget', base: 'Widget' } },
-        });
-
-        post_message.mockClear();
-        await click_button('Edit');
-        expect(post_message).toHaveBeenCalledWith(
-            expect.objectContaining({ type: 'showSaveDialog' })
-        );
-
-        // The tab click is refused while the question is on screen.
-        await click_sheet_tab('People');
-        expect(grid_stub().getAttribute('data-sheet-index')).toBe('1');
-
-        // So "Save" still reaches the worksheet the dialog was about.
-        await dispatch_host_message({ type: 'saveDialogResult', choice: 'save' });
-        expect(grid_shell_mock.request_save).toHaveBeenCalledTimes(1);
-        expect(post_message).not.toHaveBeenCalledWith(
-            expect.objectContaining({ type: 'releaseEditSession' })
-        );
-    });
-
     it('folds an open editor into the store before switching worksheets', async () => {
         // Worksheet editing made this reachable: the grid is keyed by the active
         // sheet, so clicking another tab unmounts the one holding the open overlay.
@@ -8054,7 +8296,7 @@ describe('edit mode save exit', () => {
                 capabilities: { csvEditable: true, csvEditingSupported: true },
             })
         );
-        await click_button('Edit');
+        await request_edit_session();
         await dispatch_host_message({
             type: 'editSessionResult',
             granted: true,
@@ -8213,7 +8455,7 @@ describe('edit mode save exit', () => {
                 capabilities: { csvEditable: true, csvEditingSupported: true },
             })
         );
-        await click_button('Edit');
+        await request_edit_session();
         await dispatch_host_message({
             type: 'editSessionResult',
             granted: true,
@@ -8244,7 +8486,7 @@ describe('edit mode save exit', () => {
         await dispatch_host_message(initial_snapshot_message(before, {
             capabilities: { csvEditable: true, csvEditingSupported: true },
         }));
-        await click_button('Edit');
+        await request_edit_session();
         await dispatch_host_message({
             type: 'editSessionResult',
             granted: true,
@@ -8457,7 +8699,7 @@ describe('edit mode save exit', () => {
                 capabilities: { csvEditable: true, csvEditingSupported: true },
             })
         );
-        await click_button('Edit');
+        await request_edit_session();
         await dispatch_host_message({
             type: 'editSessionResult',
             granted: true,
@@ -8505,7 +8747,7 @@ describe('edit mode save exit', () => {
                 capabilities: { csvEditable: true, csvEditingSupported: true },
             })
         );
-        await click_button('Edit');
+        await request_edit_session();
         await dispatch_host_message({
             type: 'editSessionResult',
             granted: true,
@@ -8545,7 +8787,8 @@ describe('edit mode save exit', () => {
         // reports `save_in_flight: false` — truthfully, about a save it cannot see.
         grid_shell_mock.save_in_flight = false;
         await click_sheet_tab('Inventory');
-        expect(get_button('Edit').getAttribute('aria-disabled')).toBe('true');
+        expect(get_button('Save').getAttribute('aria-disabled')).toBe('true');
+        expect(get_button('Discard').getAttribute('aria-disabled')).toBe('true');
 
         post_message.mockClear();
         await dispatch_host_message({
@@ -8581,7 +8824,7 @@ describe('edit mode save exit', () => {
                 capabilities: { csvEditable: true, csvEditingSupported: true },
             })
         );
-        await click_button('Edit');
+        await request_edit_session();
         await dispatch_host_message({
             type: 'editSessionResult',
             granted: true,
@@ -8644,7 +8887,7 @@ describe('edit mode save exit', () => {
                 capabilities: { csvEditable: true, csvEditingSupported: true },
             })
         );
-        await click_button('Edit');
+        await request_edit_session();
         await dispatch_host_message({
             type: 'editSessionResult',
             granted: true,
@@ -8697,7 +8940,7 @@ describe('edit mode save exit', () => {
                 capabilities: { csvEditable: true, csvEditingSupported: true },
             })
         );
-        await click_button('Edit');
+        await request_edit_session();
         await dispatch_host_message({
             type: 'editSessionResult',
             granted: true,
@@ -8814,7 +9057,7 @@ describe('edit mode save exit', () => {
             },
         ));
 
-        await click_button('Edit');
+        await request_edit_session();
         const stale = { '0:0': { value: 'stale', base: 'old-base' } };
         await dispatch_host_message({
             type: 'editSessionResult',
@@ -8824,10 +9067,15 @@ describe('edit mode save exit', () => {
         });
         expect(latest_store_edits()).toEqual(stale);
 
-        await click_button('Edit');
-        await dispatch_host_message({ type: 'saveDialogResult', choice: 'discard' });
+        await click_button('Discard');
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
-        await click_button('Edit');
+        // The next request waits out the host's cleanup of the discarded session.
+        await dispatch_host_message({
+            type: 'discardEditSessionResult',
+            editSessionId: 'old-session',
+            cleared: true,
+        });
+        await request_edit_session();
         const before_grant = grid_stub().getAttribute('data-mount-id');
         await dispatch_host_message({
             type: 'editSessionResult',
@@ -8899,7 +9147,7 @@ describe('edit mode save exit', () => {
                 },
             })
         );
-        await click_button('Edit');
+        await request_edit_session();
         await dispatch_host_message({
             type: 'editSessionResult',
             granted: true,
@@ -8964,7 +9212,7 @@ describe('edit mode save exit', () => {
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
     });
 
-    it('disables the edit toolbar while GridShell is saving', async () => {
+    it('disables Save and Discard while GridShell is saving', async () => {
         const { post_message } = await render_app();
         await dispatch_host_message(
             initial_snapshot_message(make_meta(['Sheet1'], false), {
@@ -8975,11 +9223,16 @@ describe('edit mode save exit', () => {
             })
         );
         await enter_edit_mode(post_message);
+        seed_mounted_store();
+        // Enabled by the unsaved edit, so what disables them next is the save.
+        expect(get_button('Save').getAttribute('aria-disabled')).not.toBe('true');
+        expect(get_button('Discard').getAttribute('aria-disabled')).not.toBe('true');
         await report_grid_editing(true, true, [], {
             '0:0': { value: 'dirty', base: 'base' },
         }, true);
 
-        expect(get_button('Edit').getAttribute('aria-disabled')).toBe('true');
+        expect(get_button('Save').getAttribute('aria-disabled')).toBe('true');
+        expect(get_button('Discard').getAttribute('aria-disabled')).toBe('true');
     });
 
     it('retains the exact save guard across a generation remount', async () => {
@@ -8994,8 +9247,7 @@ describe('edit mode save exit', () => {
         seed_mounted_store();
         const before_mount = grid_stub().getAttribute('data-mount-id');
 
-        await click_button('Edit');
-        await dispatch_host_message({ type: 'saveDialogResult', choice: 'save' });
+        await click_button('Save');
         const operation = grid_shell_mock.latest_props?.save_operation as CsvSaveOperation;
         expect(operation.saveRequestId).toEqual(expect.any(String));
 
@@ -9044,8 +9296,7 @@ describe('edit mode save exit', () => {
         await report_grid_editing(true, true, [], dirty);
 
         post_message.mockClear();
-        await click_button('Edit');
-        await dispatch_host_message({ type: 'saveDialogResult', choice: 'save' });
+        await click_button('Save');
         const submitted = grid_shell_mock.latest_props?.save_operation as CsvSaveOperation;
         expect(submitted).toBeDefined();
         await dispatch_host_message({
@@ -9066,8 +9317,7 @@ describe('edit mode save exit', () => {
         expect(latest_store_edits()).toEqual(dirty);
 
         post_message.mockClear();
-        await click_button('Edit');
-        await dispatch_host_message({ type: 'saveDialogResult', choice: 'save' });
+        await click_button('Save');
         const retry = grid_shell_mock.latest_props?.save_operation as CsvSaveOperation;
         expect(retry).toBeDefined();
         expect(retry.saveRequestId).not.toBe(submitted.saveRequestId);
@@ -9128,8 +9378,7 @@ describe('edit mode save exit', () => {
         expect(latest_store_edits()).toEqual(dirty);
 
         post_message.mockClear();
-        await click_button('Edit');
-        await dispatch_host_message({ type: 'saveDialogResult', choice: 'save' });
+        await click_button('Save');
         const retry = grid_shell_mock.latest_props?.save_operation as CsvSaveOperation;
         expect(retry.saveRequestId).not.toBe(malformed.saveRequestId);
         expect(retry.worksheets[0].dirtyEdits).toEqual(dirty);
@@ -9165,8 +9414,7 @@ describe('edit mode save exit', () => {
         }));
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
 
-        await click_button('Edit');
-        await dispatch_host_message({ type: 'saveDialogResult', choice: 'save' });
+        await click_button('Save');
         const proposed = grid_shell_mock.latest_props?.save_operation as CsvSaveOperation;
         expect(proposed.saveRequestId).toEqual(expect.any(String));
 
@@ -9307,8 +9555,7 @@ describe('edit mode save exit', () => {
         }));
         await enter_edit_mode(post_message);
         seed_mounted_store();
-        await click_button('Edit');
-        await dispatch_host_message({ type: 'saveDialogResult', choice: 'save' });
+        await click_button('Save');
         const operation = grid_shell_mock.latest_props?.save_operation as CsvSaveOperation;
 
         await dispatch_host_message(refresh_snapshot_message(meta, {
@@ -9471,7 +9718,7 @@ describe('edit mode save exit', () => {
                 ['0:0', { value: 'saved' }],
             ]));
         });
-        expect(get_button('Edit').classList.contains('has-unsaved')).toBe(true);
+        expect(get_button('Save').classList.contains('has-unsaved')).toBe(true);
 
         await dispatch_host_message({
             type: 'saveResult',
@@ -9480,7 +9727,7 @@ describe('edit mode save exit', () => {
         });
 
         expect(Object.fromEntries(store.snapshot())).toEqual({});
-        expect(get_button('Edit').classList.contains('has-unsaved')).toBe(false);
+        expect(get_button('Save').classList.contains('has-unsaved')).toBe(false);
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
     });
 
@@ -9534,7 +9781,7 @@ describe('edit mode save exit', () => {
         expect(latest_store_edits()).toEqual({});
 
         post_message.mockClear();
-        await click_button('Edit');
+        await request_edit_session();
         const request = post_message.mock.calls.find(
             ([message]) => (message as { type?: string }).type === 'requestEditSession',
         )?.[0] as { requestId: string };
@@ -9587,7 +9834,7 @@ describe('edit mode save exit', () => {
         ['blank', {}],
         ['filled', { 0: { value: 'Pear', valueEditOrder: 1 } }],
     ] as const) {
-    it(`clears a saved ${row_kind} appended row before leaving edit mode (${save_order})`, async () => {
+    it(`clears a saved ${row_kind} appended row before the session ends (${save_order})`, async () => {
         grid_shell_mock.has_uncommitted_changes = true;
         grid_shell_mock.pending_active_cell.mockReturnValue({
             pendingRowId: 'pending-row-1',
@@ -9600,7 +9847,7 @@ describe('edit mode save exit', () => {
             capabilities: { csvEditable: true, csvEditingSupported: true },
         }));
         await click_sheet_tab('Fruit Stand');
-        await click_button('Edit');
+        await request_edit_session();
         await dispatch_host_message({
             type: 'editSessionResult',
             granted: true,
@@ -9634,12 +9881,11 @@ describe('edit mode save exit', () => {
             .toEqual(['pending-row-1']);
 
         post_message.mockClear();
-        await click_button('Edit');
-        // The native Save/Discard dialog can outlive the grid render that owned
-        // this pending-row selection. Save must use the identity captured when
-        // the dialog opened, not sample the possibly remounted grid afterwards.
+        await click_button('Save');
+        // The save can outlive the grid render that owned this pending-row
+        // selection. The saved row's focus must use the identity captured when
+        // Save was pressed, not sample the possibly remounted grid afterwards.
         grid_shell_mock.pending_active_cell.mockReturnValue(undefined);
-        await dispatch_host_message({ type: 'saveDialogResult', choice: 'save' });
         const operation = grid_shell_mock.latest_props?.save_operation as CsvSaveOperation;
         expect(operation.worksheets[0].structuralChanges?.appendedRows.map((row) => row.id))
             .toEqual(['pending-row-1']);
@@ -9709,7 +9955,7 @@ describe('edit mode save exit', () => {
 
         expect(pending_rows().snapshot().appendedRows).toEqual([]);
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
-        expect(get_button('Edit').classList.contains('has-unsaved')).toBe(false);
+        expect(get_button('Save').classList.contains('has-unsaved')).toBe(false);
         expect(grid_shell_mock.latest_props?.saved_row_focus).toMatchObject({
             sheetIndex: 1,
             sourceRow: 1,
@@ -9802,10 +10048,7 @@ describe('edit mode save exit', () => {
         seed_mounted_store();
 
         post_message.mockClear();
-        await click_button('Edit');
-        expect(post_message).toHaveBeenCalledWith(expect.objectContaining({ type: 'showSaveDialog' }));
-
-        await dispatch_host_message({ type: 'saveDialogResult', choice: 'save' });
+        await click_button('Save');
 
         expect(grid_shell_mock.request_save).toHaveBeenCalledTimes(1);
         await dispatch_host_message({ type: 'saveResult', success: true });
@@ -9814,7 +10057,7 @@ describe('edit mode save exit', () => {
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
     });
 
-    it('exits edit mode after a busy save-on-exit succeeds with no remaining dirty work', async () => {
+    it('ends the session after a busy save succeeds with no remaining dirty work', async () => {
         grid_shell_mock.is_dirty = true;
         grid_shell_mock.has_uncommitted_changes = true;
         grid_shell_mock.request_save.mockReturnValue(false);
@@ -9834,10 +10077,7 @@ describe('edit mode save exit', () => {
         seed_mounted_store();
 
         post_message.mockClear();
-        await click_button('Edit');
-        expect(post_message).toHaveBeenCalledWith(expect.objectContaining({ type: 'showSaveDialog' }));
-
-        await dispatch_host_message({ type: 'saveDialogResult', choice: 'save' });
+        await click_button('Save');
         expect(grid_shell_mock.request_save).toHaveBeenCalledTimes(1);
 
         await dispatch_host_message({ type: 'saveResult', success: true });
@@ -9867,10 +10107,7 @@ describe('edit mode save exit', () => {
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
 
         post_message.mockClear();
-        await click_button('Edit');
-        expect(post_message).toHaveBeenCalledWith(expect.objectContaining({ type: 'showSaveDialog' }));
-
-        await dispatch_host_message({ type: 'saveDialogResult', choice: 'save' });
+        await click_button('Save');
         expect(grid_shell_mock.request_save).toHaveBeenCalledTimes(1);
 
         await dispatch_host_message({ type: 'saveResult', success: true });
@@ -9878,7 +10115,7 @@ describe('edit mode save exit', () => {
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
     });
 
-    it('exits after a successful save once a still-open overlay later resolves clean (no timer)', async () => {
+    it('ends the session after a successful save once a still-open overlay later resolves clean (no timer)', async () => {
         grid_shell_mock.is_dirty = false;
         grid_shell_mock.has_uncommitted_changes = true;
         grid_shell_mock.request_save.mockReturnValue(false);
@@ -9899,10 +10136,7 @@ describe('edit mode save exit', () => {
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
 
         post_message.mockClear();
-        await click_button('Edit');
-        expect(post_message).toHaveBeenCalledWith(expect.objectContaining({ type: 'showSaveDialog' }));
-
-        await dispatch_host_message({ type: 'saveDialogResult', choice: 'save' });
+        await click_button('Save');
         await dispatch_host_message({ type: 'saveResult', success: true });
         // The accepted operation owns the overlay, so success is terminal even if
         // a stale editing-status report still says it is open.
@@ -9915,7 +10149,7 @@ describe('edit mode save exit', () => {
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
     });
 
-    it('ignores stray failed save results after a pending exit save already succeeded', async () => {
+    it('ignores stray failed save results after a save already succeeded', async () => {
         grid_shell_mock.is_dirty = false;
         grid_shell_mock.has_uncommitted_changes = true;
         grid_shell_mock.request_save.mockReturnValue(false);
@@ -9934,22 +10168,19 @@ describe('edit mode save exit', () => {
         await report_grid_editing(false, true);
         seed_mounted_store();
         post_message.mockClear();
-        await click_button('Edit');
-        expect(post_message).toHaveBeenCalledWith(expect.objectContaining({ type: 'showSaveDialog' }));
-
-        await dispatch_host_message({ type: 'saveDialogResult', choice: 'save' });
+        await click_button('Save');
         await dispatch_host_message({ type: 'saveResult', success: true });
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
 
-        // A stray failed save after success must not cancel the pending exit;
-        // when the overlay later resolves clean, the exit still completes.
+        // A stray failed save after success must not bring the ended session
+        // back; when the overlay later resolves clean, it stays ended.
         await dispatch_host_message({ type: 'saveResult', success: false });
         await report_grid_editing(false, false);
 
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
     });
 
-    it('does not let a stale pending exit close a fresh document with restored edits', async () => {
+    it('does not let a finished save end a fresh document’s restored session', async () => {
         grid_shell_mock.is_dirty = false;
         grid_shell_mock.has_uncommitted_changes = true;
         grid_shell_mock.request_save.mockReturnValue(false);
@@ -9968,16 +10199,13 @@ describe('edit mode save exit', () => {
         await report_grid_editing(false, true);
         seed_mounted_store();
         post_message.mockClear();
-        await click_button('Edit');
-        expect(post_message).toHaveBeenCalledWith(expect.objectContaining({ type: 'showSaveDialog' }));
-
-        await dispatch_host_message({ type: 'saveDialogResult', choice: 'save' });
+        await click_button('Save');
         await dispatch_host_message({ type: 'saveResult', success: true });
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
 
-        // A fresh document arrives (resetting pending-exit bookkeeping) and brings
-        // restored edits, so edit mode re-engages. The earlier pending exit must
-        // not fire against this new document when its editing state goes clean.
+        // A fresh document arrives (resetting the save's bookkeeping) and brings
+        // restored edits, so editing re-engages. The earlier save's ending must
+        // not fire against this new document when its grid reports clean.
         await dispatch_host_message(
             initial_snapshot_message(make_meta(['Fresh'], false), {
                 capabilities: {
@@ -9995,7 +10223,7 @@ describe('edit mode save exit', () => {
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
     });
 
-    it('discarding from the edit-exit dialog releases edit ownership', async () => {
+    it('a discard fences the mounted editor before releasing edit ownership', async () => {
         grid_shell_mock.is_dirty = true;
         grid_shell_mock.has_uncommitted_changes = true;
 
@@ -10013,8 +10241,7 @@ describe('edit mode save exit', () => {
         seed_mounted_store();
 
         post_message.mockClear();
-        await click_button('Edit');
-        await dispatch_host_message({ type: 'saveDialogResult', choice: 'discard' });
+        await click_button('Discard');
 
         expect(grid_stub().getAttribute('data-store-edits')).toBe('{}');
         expect(grid_shell_mock.stop_edit_admission).toHaveBeenCalledTimes(1);
@@ -10031,7 +10258,7 @@ describe('edit mode save exit', () => {
         // The abandoned outcome means nothing was emptied and nothing recorded, so
         // the user is expected to press Discard again. Fencing before the
         // transaction stopped edit admission for a session that is not leaving:
-        // still in edit mode, still holding the edits, unable to type, and nothing
+        // still holding the session and the edits, unable to type, and nothing
         // lowers the fence.
         discard_transaction_mock.abandon = true;
         grid_shell_mock.is_dirty = true;
@@ -10051,8 +10278,7 @@ describe('edit mode save exit', () => {
         seed_mounted_store();
 
         post_message.mockClear();
-        await click_button('Edit');
-        await dispatch_host_message({ type: 'saveDialogResult', choice: 'discard' });
+        await click_button('Discard');
 
         expect(grid_shell_mock.stop_edit_admission).not.toHaveBeenCalled();
         expect(post_message).not.toHaveBeenCalledWith(
@@ -10087,15 +10313,13 @@ describe('edit mode save exit', () => {
         // across the round trip it would land ahead of the highlight the user made
         // first, and the first undo would repaint cells rather than restore the
         // discarded edits.
-        await click_button('Edit');
-        await dispatch_host_message({ type: 'saveDialogResult', choice: 'discard' });
+        await click_button('Discard');
 
         expect(post_message).not.toHaveBeenCalledWith(
             expect.objectContaining({ type: 'discardEditSession' }),
         );
-        // Answered, not silently dropped: the save dialog's "discard" answer also
-        // lands here, and by then the dialog has closed — so a bare refusal would
-        // leave the user in edit mode with no account of why.
+        // Answered, not silently dropped: a bare refusal would leave the user
+        // with their edits intact and no account of why Discard did nothing.
         // Named for the wait it is actually blocked on. A replay-busy discard is a
         // different wait with no highlight in it, and is asserted where undo is
         // drivable from the renderer.
@@ -11745,10 +11969,9 @@ describe('edit mode save exit', () => {
         });
         await report_grid_editing(true, true, [], dirty);
 
-        await act(async () => seed_mounted_store(dirty));
+        seed_mounted_store(dirty);
         post_message.mockClear();
-        await click_button('Edit');
-        await dispatch_host_message({ type: 'saveDialogResult', choice: 'save' });
+        await click_button('Save');
         const local = grid_shell_mock.latest_props?.save_operation as CsvSaveOperation;
         expect(local).toBeDefined();
 
@@ -11773,7 +11996,8 @@ describe('edit mode save exit', () => {
         });
 
         expect(grid_shell_mock.latest_props?.save_operation).toBe(local);
-        expect(get_button('Edit').getAttribute('aria-disabled')).toBe('true');
+        expect(get_button('Save').getAttribute('aria-disabled')).toBe('true');
+        expect(get_button('Discard').getAttribute('aria-disabled')).toBe('true');
 
         // Settle the retained proposal with an early failure. That makes the old
         // verdict visible again; if the mismatched basesValidated terminal had
@@ -12206,7 +12430,7 @@ describe('sorting and filtering', () => {
         );
 
         post_message.mockClear();
-        await click_button('Edit');
+        await request_edit_session();
         expect(post_message).toHaveBeenCalledWith(expect.objectContaining({
             type: 'requestEditSession',
             sheetIndex: 0,
@@ -12217,7 +12441,7 @@ describe('sorting and filtering', () => {
 
         await dispatch_host_message({ type: 'editSessionResult', granted: true });
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
-        // Specifically the pending window, not edit mode: once the session is
+        // Specifically the pending window, not the held session: once it is
         // granted the controls come back, because the host admits a transform from
         // the panel that owns the session.
         expect(grid_shell_mock.latest_props?.transform_sections).toBe(true);
@@ -12965,7 +13189,11 @@ describe('sorting and filtering', () => {
         });
         // Old rows/merges remain authoritative while the host computes.
         expect(grid_stub().getAttribute('data-merges')).toBe('1');
-        expect(get_button('Edit').disabled).toBe(true);
+        // And no editing session is to be had while it does.
+        expect(await (await request_edit_session(true)).granted).toBe(false);
+        expect(post_message).not.toHaveBeenCalledWith(
+            expect.objectContaining({ type: 'requestEditSession' }),
+        );
 
         await dispatch_host_message(
             transform_installed_message(request, { generation: 2, rowCount: 2 }),
@@ -13027,7 +13255,10 @@ describe('sorting and filtering', () => {
         expect(JSON.parse(grid_stub().getAttribute('data-merges-json')!)).toEqual(
             meta.sheets[0].merges,
         );
-        expect(get_button('Edit').disabled).toBe(false);
+        await request_edit_session();
+        expect(post_message).toHaveBeenCalledWith(
+            expect.objectContaining({ type: 'requestEditSession' }),
+        );
     });
 
     it('does not restore an old filter opener when outside-clicking into another popover', async () => {
@@ -13069,7 +13300,7 @@ describe('edit session store hydration', () => {
     }
 
     it('installs a changed map into the mounted grid without remounting it', async () => {
-        // Entering edit mode redelivers the projection at the same generation, so
+        // Acquiring a session redelivers the projection at the same generation, so
         // nothing about the key moves. Before the store this install could only
         // reach the grid as a prop that a mounted hook ignored.
         const { post_message } = await render_app();
@@ -13436,7 +13667,7 @@ describe('transforms during an edit session', () => {
         return chip!.getAttribute('aria-disabled');
     }
 
-    /** Enter edit mode, then install a sort on column 0 from inside it. */
+    /** Acquire a session, then install a sort on column 0 while it is held. */
     async function edit_mode_with_sort(post_message: ReturnType<typeof vi.fn>) {
         await enter_edit_mode(post_message);
         await act(async () => (
@@ -13495,7 +13726,7 @@ describe('transforms during an edit session', () => {
         const { post_message } = await editable_csv();
         await open_columns();
 
-        await click_button('Edit');
+        await request_edit_session();
         expect(post_message).toHaveBeenCalledWith(expect.objectContaining({
             type: 'requestEditSession',
         }));
@@ -13552,7 +13783,7 @@ describe('snapshots arriving during an in-flight transform', () => {
         csvEditSessionId: 'test-edit-session',
     };
 
-    /** Edit mode over an editable CSV with a user-initiated grid sort outstanding. */
+    /** A held session over an editable CSV with a user-initiated grid sort outstanding. */
     async function sorting_while_editing() {
         const { post_message } = await render_app();
         await dispatch_host_message(initial_snapshot_message(
@@ -14457,7 +14688,7 @@ describe('refused transforms', () => {
         csvEditSessionId: 'test-edit-session',
     };
 
-    /** Edit mode over an editable CSV whose persisted state carries STORED_SORT. */
+    /** A held session over an editable CSV whose persisted state carries STORED_SORT. */
     async function refresh_with_stored_sort(
         post_message: ReturnType<typeof vi.fn>,
     ) {
@@ -14944,7 +15175,7 @@ describe('a refused restore in a sibling panel', () => {
     });
 });
 
-describe('the Edit button and an installed transform', () => {
+describe('acquiring a session and an installed transform', () => {
     const EDITABLE = { csvEditable: true, csvEditingSupported: true };
     // Descending, so the grid stub's ascending shortcut is a real change and
     // actually leaves a request in flight.
@@ -14974,18 +15205,18 @@ describe('the Edit button and an installed transform', () => {
         return post_message;
     }
 
-    it('leaves Edit enabled while a sort is installed', async () => {
+    it('offers the grid a session while a sort is installed', async () => {
         // An *installed* transform is just a view. Edits are source-keyed and the
         // permutation never recomputes mid-session, so there is nothing to clear.
         const post_message = await sorted_sheet_not_yet_editing();
-        expect(get_button('Edit').disabled).toBe(false);
+        expect(grid_shell_mock.latest_props?.on_request_edit_session).toBeDefined();
         expect(warnings(post_message)).toEqual([]);
     });
 
     it('requests a session from a sorted sheet instead of warning', async () => {
         const post_message = await sorted_sheet_not_yet_editing();
 
-        await click_button('Edit');
+        await request_edit_session();
 
         expect(post_message).toHaveBeenCalledWith(expect.objectContaining({
             type: 'requestEditSession',
@@ -14994,9 +15225,10 @@ describe('the Edit button and an installed transform', () => {
         expect(warnings(post_message)).toEqual([]);
     });
 
-    it('disables Edit while transform work is in flight', async () => {
+    it('refuses a session while transform work is in flight', async () => {
         // The half that still blocks: work in flight is file-level concurrency and
-        // the host refuses an edit claim during it, so the button must agree.
+        // the host refuses an edit claim during it, so the renderer answers the
+        // gesture itself rather than asking.
         const post_message = await sorted_sheet_not_yet_editing();
         await act(async () => (
             container!.querySelector('.stub-shortcut-transform') as HTMLButtonElement
@@ -15004,7 +15236,14 @@ describe('the Edit button and an installed transform', () => {
         // Deliberately unacknowledged: the request is in flight.
         expect(latest_transform_request(post_message)).toBeDefined();
 
-        expect(get_button('Edit').disabled).toBe(true);
+        expect(await (await request_edit_session()).granted).toBe(false);
+        expect(post_message).not.toHaveBeenCalledWith(
+            expect.objectContaining({ type: 'requestEditSession' }),
+        );
+        expect(warnings(post_message)).toEqual([{
+            type: 'showWarning',
+            message: 'Wait for sorting and filtering to finish before editing.',
+        }]);
         // The retired copy: nothing in this build tells the user to clear sorting
         // before editing, in a tooltip or anywhere else.
         expect(document.body.textContent ?? '').not.toContain('Clear sorting');
@@ -16962,12 +17201,11 @@ describe('undo and redo, from the keyboard and the desktop menu', () => {
             .toBe('The change was redone, but the affected cells are hidden by the current view.');
     });
 
-    it('shows only the newest replay destination after a blocked sheet switch', async () => {
-        // A cross-sheet replay while a Save/Discard dialog is open. The switch is
-        // refused at the time — answering that dialog against the wrong worksheet
-        // is the worse bug — and if nothing retries it, the focus request outlives
-        // the replay forever: the mounted grid correctly declines a request for
-        // another sheet, so the cursor never moves.
+    it('shows only the newest replay destination when a later replay returns', async () => {
+        // A cross-sheet replay while unsaved edits are held, then a second one
+        // back to the first sheet before the grid has answered the first. Nothing
+        // holds the tabs any more, so each replay's sheet is shown as it lands,
+        // and the newer one owns the whole destination.
         const { post_message } = await render_app();
         await record_highlight(post_message, {
             snapshot_extra: {
@@ -16976,20 +17214,18 @@ describe('undo and redo, from the keyboard and the desktop menu', () => {
         });
         await enter_edit_mode(post_message);
         seed_mounted_store();
-        await click_button('Edit');
-        expect(sent(post_message, 'showSaveDialog')).toBeDefined();
 
         await undo_via_menu();
         await complete_replay(post_message, {
             focusSheetIndex: 1,
             displayFocus: { displayRowStart: 5, displayRowEnd: 5, mappingGeneration: 1 },
         });
-        // Still on the sheet the dialog is about.
-        expect(grid_stub().getAttribute('data-sheet-index')).toBe('0');
+        // Shown at once: unsaved edits on the first sheet do not hold the tabs.
+        expect(grid_stub().getAttribute('data-sheet-index')).toBe('1');
         expect(JSON.parse(grid_stub().getAttribute('data-history-focus')!).sheetIndex).toBe(1);
 
-        // A newer replay lands back on the sheet that is still mounted. It owns
-        // the complete destination and must supersede the older deferred switch.
+        // A newer replay lands back on the first sheet. It owns the complete
+        // destination and must supersede the older one.
         post_message.mockClear();
         await press('z', { shiftKey: true });
         await complete_replay(post_message, {
@@ -17001,52 +17237,19 @@ describe('undo and redo, from the keyboard and the desktop menu', () => {
             displayRowStart: 7,
         });
 
-        // Cancel changes nothing else. The first replay's sheet must not surface
-        // now that the later replay replaced its pending focus plan.
-        await dispatch_host_message({ type: 'saveDialogResult', choice: 'cancel' });
-
+        // The first replay's sheet does not stay on screen now that the later
+        // replay replaced its focus plan.
         expect(grid_stub().getAttribute('data-sheet-index')).toBe('0');
         const focus = JSON.parse(grid_stub().getAttribute('data-history-focus')!);
         expect(focus.sheetIndex).toBe(0);
         expect(focus.displayRowStart).toBe(7);
     });
 
-    it('forgets a waiting sheet switch when the document is replaced', async () => {
-        // The deferred switch describes a workbook that is no longer loaded: an
-        // initial snapshot clears history along with everything else, and honouring
-        // the switch would move the new document's active sheet on its behalf.
-        const { post_message } = await render_app();
-        await record_highlight(post_message, {
-            snapshot_extra: {
-                capabilities: { csvEditable: true, csvEditingSupported: true },
-            },
-        });
-        await enter_edit_mode(post_message);
-        seed_mounted_store();
-        await click_button('Edit');
-        expect(sent(post_message, 'showSaveDialog')).toBeDefined();
-        await undo_via_menu();
-        await complete_replay(post_message, {
-            focusSheetIndex: 1,
-            displayFocus: { displayRowStart: 5, displayRowEnd: 5, mappingGeneration: 1 },
-        });
-        expect(grid_stub().getAttribute('data-sheet-index')).toBe('0');
-
-        await dispatch_host_message(
-            initial_snapshot_message(make_meta(['Sheet1', 'Sheet2'])),
-        );
-
-        expect(grid_stub().getAttribute('data-sheet-index')).toBe('0');
-        expect(grid_stub().getAttribute('data-history-focus')).toBe('null');
-        await click_sheet_tab('Sheet2');
-        expect(grid_stub().getAttribute('data-history-focus')).toBe('null');
-    });
-
-    it('drops an older waiting destination when a newer committed replay diverges', async () => {
+    it('drops an older replay destination when a newer committed replay diverges', async () => {
         // A committed terminal supersedes the whole earlier focus plan even when
-        // its local transaction cannot land. Otherwise dismissing the dialog can
-        // make the stale cross-sheet destination fire after the view has already
-        // warned that it diverged from the file.
+        // its local transaction cannot land. Otherwise the stale cross-sheet
+        // focus request stays live after the view has already warned that it
+        // diverged from the file.
         const { post_message } = await render_app();
         await record_highlight(post_message, {
             snapshot_extra: {
@@ -17055,15 +17258,15 @@ describe('undo and redo, from the keyboard and the desktop menu', () => {
         });
         await enter_edit_mode(post_message);
         seed_mounted_store();
-        await click_button('Edit');
-        expect(sent(post_message, 'showSaveDialog')).toBeDefined();
+        // The first sheet's store, which the diverging replay below writes to.
+        const first_sheet_store = grid_shell_mock.latest_props!.edit_session as EditSessionStore;
 
         await undo_via_menu();
         await complete_replay(post_message, {
             focusSheetIndex: 1,
             displayFocus: { displayRowStart: 5, displayRowEnd: 5, mappingGeneration: 1 },
         });
-        expect(grid_stub().getAttribute('data-sheet-index')).toBe('0');
+        expect(grid_stub().getAttribute('data-sheet-index')).toBe('1');
         expect(JSON.parse(grid_stub().getAttribute('data-history-focus')!).sheetIndex).toBe(1);
 
         post_message.mockClear();
@@ -17081,8 +17284,7 @@ describe('undo and redo, from the keyboard and the desktop menu', () => {
             },
         });
         const commit = sent(post_message, 'commitHistoryReplay');
-        (grid_shell_mock.latest_props!.edit_session as EditSessionStore)
-            .install({ session_id: 'moved-on' });
+        first_sheet_store.install({ session_id: 'moved-on' });
         post_message.mockClear();
         await dispatch_host_message({
             type: 'historyReplayCommitted',
@@ -17101,40 +17303,6 @@ describe('undo and redo, from the keyboard and the desktop menu', () => {
 
         expect(sent(post_message, 'showWarning').message).toContain('could not be updated');
         expect(grid_stub().getAttribute('data-history-focus')).toBe('null');
-        await dispatch_host_message({ type: 'saveDialogResult', choice: 'cancel' });
-        expect(grid_stub().getAttribute('data-sheet-index')).toBe('0');
-        expect(grid_stub().getAttribute('data-history-focus')).toBe('null');
-    });
-
-    it('shows the replayed sheet when the session is revoked from under the dialog', async () => {
-        // The other way the dialog goes away: the host revokes the session while it
-        // is on screen, so no answer to it ever arrives and the handler that drains
-        // the deferred switch never runs. Left there, the focus request would be
-        // stranded for the life of the window.
-        const { post_message } = await render_app();
-        await record_highlight(post_message, {
-            snapshot_extra: {
-                capabilities: { csvEditable: true, csvEditingSupported: true },
-            },
-        });
-        await enter_edit_mode(post_message);
-        seed_mounted_store();
-        await click_button('Edit');
-        expect(sent(post_message, 'showSaveDialog')).toBeDefined();
-
-        await undo_via_menu();
-        await complete_replay(post_message, {
-            focusSheetIndex: 1,
-            displayFocus: { displayRowStart: 5, displayRowEnd: 5, mappingGeneration: 1 },
-        });
-        expect(grid_stub().getAttribute('data-sheet-index')).toBe('0');
-
-        // The helper builds the terminal lifecycle for this session, the way the
-        // host would after saving it out from under the dialog.
-        await dispatch_host_message({ type: 'editSessionRevoked', reason: 'saved' });
-
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
-        expect(grid_stub().getAttribute('data-sheet-index')).toBe('1');
     });
 
     it('describes a redo the view could not follow as redone', async () => {
@@ -17678,7 +17846,7 @@ describe('Review Changes for row and column structure', () => {
                 },
             },
         }));
-        await click_button('Edit');
+        await request_edit_session();
         await dispatch_host_message({
             type: 'editSessionResult',
             granted: true,
@@ -17909,7 +18077,7 @@ describe('cursor after a structural save', () => {
         await dispatch_host_message(initial_snapshot_message(meta, {
             capabilities: { csvEditable: true, csvEditingSupported: true },
         }));
-        await click_button('Edit');
+        await request_edit_session();
         await dispatch_host_message({
             type: 'editSessionResult',
             granted: true,
@@ -17987,7 +18155,7 @@ describe('structural conflict notice counts and Review Changes notes', () => {
                 structuralEditing: { sheets: [{ rows: { supported: true }, columns: { supported: true } }] },
             },
         }));
-        await click_button('Edit');
+        await request_edit_session();
         await dispatch_host_message({
             type: 'editSessionResult',
             granted: true,
@@ -18080,7 +18248,7 @@ describe('structural conflict notice counts and Review Changes notes', () => {
                 structuralEditing: { sheets: [{ rows: { supported: true }, columns: { supported: true } }] },
             },
         }));
-        await click_button('Edit');
+        await request_edit_session();
         await dispatch_host_message({
             type: 'editSessionResult',
             granted: true,

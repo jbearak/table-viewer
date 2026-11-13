@@ -358,6 +358,19 @@ export const pending_changes_durability = {
         const payload = structural
             ? pending_changes_payload(changes)
             : pending_edit_payload(changes.cells);
+        // A session begins holding exactly what its grant handed over, so an
+        // empty map with nothing published before it says only what the host
+        // already knows. Posting it anyway costs a durable write and the
+        // snapshot refresh that follows one, on every session — and sessions
+        // are acquired per editing gesture. That refresh is also unacknowledged
+        // for a moment, which is long enough for the host to refuse the undo
+        // that acquired the session as racing a document change.
+        if (
+            !force
+            && latest === undefined
+            && !structural
+            && Object.keys(changes.cells).length === 0
+        ) return channel.nextSequence - 1;
         if (
             !force
             && latest?.payload === payload
