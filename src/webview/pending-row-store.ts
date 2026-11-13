@@ -11,6 +11,7 @@
  * one with its history change; the store only commits what they planned.
  */
 
+import { referenced_pending_ids } from '../formula-anchor-layout';
 import {
     advance_pending_append_basis,
     appended_rows,
@@ -993,8 +994,13 @@ export interface WorksheetStructureContext {
     /** Merged ranges in canonical source coordinates, for the action-time merge rules. */
     readonly merges?: readonly MergeRange[];
     /**
-     * Whether a stored Formula Anchor names a discarded Pending Row. Defaults to
-     * false, so every discarded tombstone is dropped in the action that makes it.
+     * Whether a stored Formula Anchor outside this worksheet's Pending Rows and
+     * Pending Columns names a Pending Row of this worksheet: one in any
+     * worksheet's cell edits, or in another worksheet's Pending Rows or
+     * Pending Columns. The store adds the anchors in this worksheet's own
+     * Pending Rows and Pending Columns as the action leaves them. Defaults to
+     * false. Every structural action drops the discarded tombstones on its
+     * axis that nothing then names.
      */
     readonly isRowReferenced?: (id: PendingRowId) => boolean;
     /** Like `isRowReferenced`, for discarded Pending Columns. */
@@ -1261,6 +1267,38 @@ interface StructureDraft {
 }
 
 /**
+ * Drop the discarded tombstones on the action's axis that no stored Formula
+ * Anchor names once the action is done: the context answers for every anchor
+ * outside this worksheet's Pending Rows and Pending Columns, and the draft's
+ * own rows and columns supply the rest. Only the acted axis changes, so its
+ * history arm restores the tombstones the action dropped.
+ */
+function without_unreferenced_tombstones(
+    context: WorksheetStructureContext,
+    axis: StructureAxis,
+    draft: StructureDraft,
+): StructureDraft {
+    const own = referenced_pending_ids(context.worksheet, [{
+        target: context.worksheet,
+        changes: { appendedRows: draft.rows, pendingColumns: draft.columns },
+    }]);
+    if (axis === 'rows') {
+        if (draft.rowLayout.discardedPendingRows.length === 0) return draft;
+        return {
+            ...draft,
+            rowLayout: drop_unreferenced_row_tombstones(draft.rowLayout, (id) =>
+                own.rows.has(id) || (context.isRowReferenced?.(id) ?? false)),
+        };
+    }
+    if (draft.columnLayout.discardedPendingColumns.length === 0) return draft;
+    return {
+        ...draft,
+        columnLayout: drop_unreferenced_column_tombstones(draft.columnLayout, (id) =>
+            own.columns.has(id) || (context.isColumnReferenced?.(id) ?? false)),
+    };
+}
+
+/**
  * Own a draft as the worksheet's next snapshot, check it against the full
  * worksheet context, and build the history arm that reaches it. A source
  * layout normalizes to absence; the Structural Basis is recorded with the
@@ -1271,8 +1309,9 @@ function finish_structure(
     before: PendingStructuralChanges,
     context: WorksheetStructureContext,
     axis: StructureAxis,
-    draft: StructureDraft,
+    drafted: StructureDraft,
 ): StructureResult {
+    const draft = without_unreferenced_tombstones(context, axis, drafted);
     const rows = [...draft.rows].sort((left, right) => left.createdOrder - right.createdOrder);
     const templates_by_id = new Map((draft.templates ?? before.formatTemplates).map((template) =>
         [template.id, template]));
@@ -1519,10 +1558,7 @@ export function delete_rows(
         intervals_of_columns(column_layout.removedSourceColumns),
     );
     if (merge !== undefined) return merge;
-    const row_layout = drop_unreferenced_row_tombstones(
-        result.layout,
-        context.isRowReferenced ?? (() => false),
-    );
+    const row_layout = result.layout;
     const rows = pending_rows(changes).filter((row) => !removed_ids.has(row.id));
     const columns = columns_without_cells(changes.pendingColumns ?? [], (key) => {
         if (key.startsWith('p:')) return removed_ids.has(key.slice(2));
@@ -1668,10 +1704,7 @@ export function delete_columns(
         intervals_of_columns(result.layout.removedSourceColumns),
     );
     if (merge !== undefined) return merge;
-    const column_layout = drop_unreferenced_column_tombstones(
-        result.layout,
-        context.isColumnReferenced ?? (() => false),
-    );
+    const column_layout = result.layout;
     const rows = pending_rows(changes).map((row) => {
         const keys = Object.keys(row.cells).filter((column) => newly_removed.has(Number(column)));
         if (keys.length === 0) return row;

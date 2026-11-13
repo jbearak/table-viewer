@@ -259,6 +259,21 @@ export function all_workbook_formula_cells_impact(
     };
 }
 
+/** `base` with `cells` added: each listed formula cell counts as affected too. */
+export function workbook_impact_with_cells(
+    base: WorkbookFormulaImpact,
+    cells: Iterable<WorkbookCellAddress>,
+): WorkbookFormulaImpact {
+    const added = new Map<number, Set<number>>();
+    for (const cell of cells) {
+        if (!valid_coordinate(cell.row, cell.column)) continue;
+        let sheet = added.get(cell.sheetIndex);
+        if (sheet === undefined) added.set(cell.sheetIndex, sheet = new Set());
+        sheet.add(cell_number(cell.row, cell.column));
+    }
+    return impact_with_added_cells(base, added);
+}
+
 function impact_with_added_cells(
     base: WorkbookFormulaImpact,
     added_by_sheet: ReadonlyMap<number, ReadonlySet<number>>,

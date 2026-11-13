@@ -77,6 +77,9 @@ export function wire_overlay_from_cell_overlay_state(
             ...(state.value.formulaReferenceBases === undefined
                 ? {}
                 : { formulaReferenceBases: state.value.formulaReferenceBases }),
+            ...(state.value.formulaAnchors === undefined
+                ? {}
+                : { formulaAnchors: state.value.formulaAnchors }),
         };
     const link = state.hyperlink;
     const hyperlink = link.kind === 'untouched'
@@ -132,6 +135,7 @@ export function cell_overlay_state_from_wire(
             dimension.movedFrom,
             dimension.valueEditOrder,
             dimension.formulaReferenceBases,
+            dimension.formulaAnchors,
         );
     }
     return combined_overlay(
@@ -146,6 +150,7 @@ export function cell_overlay_state_from_wire(
         dimension.movedFrom,
         dimension.valueEditOrder,
         dimension.formulaReferenceBases,
+        dimension.formulaAnchors,
     );
 }
 

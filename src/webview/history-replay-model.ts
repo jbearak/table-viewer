@@ -349,6 +349,8 @@ function value_dimension_matches(
         && current.valueEditOrder === recorded.valueEditOrder
         && JSON.stringify(current.formulaReferenceBases ?? [])
             === JSON.stringify(recorded.formulaReferenceBases ?? [])
+        && JSON.stringify(current.formulaAnchors ?? null)
+            === JSON.stringify(recorded.formulaAnchors ?? null)
         && history_values_equal(current.value, recorded.value)
         && history_values_equal(current.base, recorded.base);
 }

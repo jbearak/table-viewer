@@ -949,6 +949,112 @@ describe('xlsx edit sessions', () => {
         });
     });
 
+    it('saves a formula anchored to an appended row as it renders after an earlier one is discarded', async () => {
+        const panel = await open_ready_xlsx(file_path);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'edit', sheetIndex: 0 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+        const initial = latest_snapshot(panel);
+        const source_rows = initial.meta.sheets[0].sourceRowCount;
+        // Two Append gestures, one row each.
+        const admit = async (request_id: string) => {
+            await panel.__receive({
+                type: 'requestAppendRows',
+                requestId: request_id,
+                editSessionId: session,
+                worksheet: { sheetIndex: 0, sheetName: 'People', worksheetId: '1' },
+                sourceGeneration: initial.sourceGeneration,
+                count: 1,
+            });
+            const result = panel.__messages.find((message) => (
+                typeof message === 'object'
+                && message !== null
+                && (message as { type?: unknown }).type === 'appendRowsResult'
+                && (message as { requestId?: unknown }).requestId === request_id
+            )) as Extract<import('../types').HostMessage, { type: 'appendRowsResult' }>;
+            expect(result.granted, result.reason).toBe(true);
+            await panel.__receive({
+                type: 'settleRowAdmission',
+                requestId: request_id,
+                editSessionId: session,
+                accepted: true,
+            });
+            return result;
+        };
+        await admit('append-first');
+        const admission = await admit('append-second');
+        const [second] = admission.rowIds!;
+        // `=A<n>` names the second appended row, committed while both rows were pending.
+        const written = `=A${source_rows + 2}`;
+        const base = String((await parse_xlsx(bytes)).data.sheets[0].rows[1][1]?.raw ?? '');
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: workbook_request(session, 'save-anchored', save_worksheet({
+                edits: { '1:1': written },
+                dirtyEdits: { '1:1': {
+                    value: written,
+                    base,
+                    formulaAnchors: { references: [{
+                        start: 1,
+                        end: written.length,
+                        corners: [{
+                            row: { kind: 'identity', row: { kind: 'pending', pendingRowId: second } },
+                            column: { kind: 'identity', column: { kind: 'source', sourceColumn: 0 } },
+                        }],
+                    }] },
+                } },
+                // The first appended row was discarded: the band compacts.
+                structuralChanges: {
+                    formatTemplates: [admission.formatTemplate!],
+                    appendedRows: [{
+                        id: second,
+                        cells: { 0: { value: 'second' } },
+                        formatTemplateId: admission.formatTemplate!.id,
+                        createdOrder: 2,
+                    }],
+                    tailRemovals: [],
+                    appendBasis: admission.appendBasis!,
+                    conflicts: [],
+                },
+            })),
+        });
+        await wait_for_observable(() => save_results(panel).length > 0);
+        expect(save_results(panel).at(-1)).toMatchObject({ success: true });
+        const saved = (await parse_xlsx(bytes)).data.sheets[0];
+        expect(saved.rows[1][1]?.formula).toBe(`=A${source_rows + 1}`);
+        expect(saved.rows[source_rows][0]?.raw).toBe('second');
+    });
+
+    it('refuses to save a formula whose anchors cannot render, leaving the file alone', async () => {
+        const original = new Uint8Array(bytes);
+        const panel = await open_ready_xlsx(file_path);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'edit', sheetIndex: 0 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+        const base = String((await parse_xlsx(bytes)).data.sheets[0].rows[1][1]?.raw ?? '');
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: workbook_request(session, 'save-unrenderable', save_worksheet({
+                edits: { '1:1': '=Gone!A1' },
+                dirtyEdits: { '1:1': {
+                    value: '=Gone!A1',
+                    base,
+                    // Names a worksheet the workbook does not have.
+                    formulaAnchors: { references: [{
+                        start: 1,
+                        end: 8,
+                        worksheet: { sheetIndex: 9, sheetName: 'Gone' },
+                        corners: [{
+                            row: { kind: 'fixed', row: 1 },
+                            column: { kind: 'identity', column: { kind: 'source', sourceColumn: 0 } },
+                        }],
+                    }] },
+                } },
+            })),
+        });
+        await wait_for_observable(() => save_results(panel).length > 0);
+        expect(save_results(panel).at(-1)).toMatchObject({ success: false });
+        expect(Buffer.compare(Buffer.from(bytes), Buffer.from(original))).toBe(0);
+    });
+
     it('saves and exits the first of two editing files after an auto-grown row height', async () => {
         // A sparse per-sheet array is persisted with JSON nulls. Editing a long
         // value can auto-grow a row before the save-on-exit request arrives, so

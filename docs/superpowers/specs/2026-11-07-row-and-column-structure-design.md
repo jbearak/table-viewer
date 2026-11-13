@@ -710,11 +710,13 @@ references to a Pending Row render that row's current number, or `#REF!` once
 it is discarded.
 
 The existing `formulaReferenceBases` and the `ambiguousPendingFormula` conflict
-keep working on worksheets with the source layout for formulas without stored
-anchors. A formula that stores anchors drops its bases, because its anchors
-already name the rows: the anchors win, and external growth needs no conflict
-for it. Once a worksheet has a layout change, its Structural Basis refuses the
-external growth that those bases exist to detect.
+keep working on worksheets with the source layout for references without stored
+anchors. Anchored references drop their bases, because their anchors already
+name the rows: the anchors win, and external growth needs no conflict for them.
+A formula's bases are captured from its unanchored references only, and a
+formula whose every reference is anchored stores none. Once a worksheet has a
+layout change, its Structural Basis refuses the external growth that those
+bases exist to detect.
 
 ### Rendering formulas
 

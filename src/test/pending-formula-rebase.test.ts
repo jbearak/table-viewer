@@ -162,6 +162,46 @@ describe('pending formula rebase conflicts', () => {
         }]);
     });
 
+    it('keeps the conflict check for references a partly anchored formula leaves unanchored', () => {
+        // `=X!A3+SUM(Target!A1:A5)`: X!A3 is anchored; the Target range spans
+        // the appended row A5 without a corner on it, so only bases protect it.
+        const text = '=X!A3+SUM(Target!A1:A5)';
+        const target_when_authored = pending('value', 4, 4, 1);
+        const empty = { formatTemplates: [], appendedRows: [], tailRemovals: [], conflicts: [] };
+        const authored = capture_pending_formula_reference_bases(
+            `=${' '.repeat(4)}+SUM(Target!A1:A5)`,
+            0,
+            [sheet('Formula', 2), sheet('Target', 4), sheet('X', 4)],
+            [empty, target_when_authored, empty],
+        );
+        expect(authored).toHaveLength(1);
+        const anchors = { references: [{
+            start: 1,
+            end: 5,
+            worksheet: { sheetIndex: 2, sheetName: 'X' },
+            corners: [{ row: { kind: 'fixed' as const, row: 3 } }],
+        }] };
+        // Target grows by four source rows: its appended row leaves the range.
+        const grown = [sheet('Formula', 2), sheet('Target', 8), sheet('X', 4)];
+        expect(pending_formula_cells_referencing_provisional_rows(
+            empty,
+            { '0:0': { value: text, formulaAnchors: anchors, formulaReferenceBases: authored } },
+            target_when_authored,
+            0,
+            1,
+            grown,
+        )).toEqual([{ rowIdentity: { kind: 'source', sourceRow: 0 }, sourceColumn: 0 }]);
+        // A formula whose every reference is anchored stores no bases and needs no check.
+        expect(pending_formula_cells_referencing_provisional_rows(
+            empty,
+            { '0:0': { value: '=Target!A5', formulaAnchors: anchors } },
+            target_when_authored,
+            0,
+            1,
+            grown,
+        )).toEqual([]);
+    });
+
     it('does not conflict a formula authored after the pending band rebased', () => {
         const target = pending('value', 4, 4, 1);
         const rebased_sheets = [sheet('Formula', 2), sheet('Target', 8)];

@@ -73,6 +73,7 @@ import {
     assert_json_encoded_bound,
     is_valid_hyperlink,
     MAX_PENDING_APPENDED_ROWS,
+    own_formula_anchors,
     own_pending_structural_changes,
     type PendingStructuralChanges,
 } from './pending-changes';
@@ -131,6 +132,7 @@ export interface WirePresentValueDimension {
     readonly movedFrom?: CsvDirtyEntry['movedFrom'];
     readonly valueEditOrder?: number;
     readonly formulaReferenceBases?: CsvDirtyEntry['formulaReferenceBases'];
+    readonly formulaAnchors?: CsvDirtyEntry['formulaAnchors'];
 }
 
 export interface WireUntouchedHyperlinkDimension {
@@ -529,6 +531,10 @@ function sanitized_wire_value_dimension(
             formulaReferenceBases: value.formulaReferenceBases,
         })?.formulaReferenceBases ?? null;
     if (formula_reference_bases === null) return undefined;
+    const formula_anchors = value.formulaAnchors === undefined
+        ? undefined
+        : own_formula_anchors(value.formulaAnchors, present.text) ?? null;
+    if (formula_anchors === null) return undefined;
     return Object.freeze({
         kind: 'present' as const,
         value: present,
@@ -541,6 +547,7 @@ function sanitized_wire_value_dimension(
         ...(value_edit_order === undefined ? {} : { valueEditOrder: value_edit_order }),
         ...(formula_reference_bases === undefined ? {} : { formulaReferenceBases:
             formula_reference_bases }),
+        ...(formula_anchors === undefined ? {} : { formulaAnchors: formula_anchors }),
     });
 }
 
@@ -999,6 +1006,7 @@ export function history_replay_proposal_digest(
                 ],
                 write.entry.valueEditOrder ?? null,
                 write.entry.formulaReferenceBases ?? null,
+                write.entry.formulaAnchors ?? null,
             ],
         ]);
     const highlights = [...request.highlights]

@@ -34,6 +34,8 @@ import {
 } from './history-cell-state-model';
 import type { HistoryChange } from './history-stack-model';
 import type { HistoryStore } from './history-store';
+import type { AnchorFormulaResult, FormulaAnchors } from '../formula-anchors';
+import { unanchored_formula_text } from '../formula-anchor-layout';
 import type { PendingFormulaReferenceBasis } from '../pending-changes';
 import { hyperlinks_equal, type CellHyperlink } from '../cell-content';
 import {
@@ -139,6 +141,20 @@ export interface UseEditingOptions {
     readonly formula_reference_bases?: (
         value: string,
     ) => readonly PendingFormulaReferenceBasis[];
+    /**
+     * Anchor a committed `.xlsx` formula against the workbook's current
+     * layouts (`anchor_formula`). Anchors replace `formula_reference_bases`;
+     * a refusal refuses the whole gesture through `on_formula_refused`.
+     */
+    readonly anchor_formula?: (value: string) => AnchorFormulaResult;
+    /** Told why a gesture was refused because a formula could not be anchored. */
+    readonly on_formula_refused?: (reason: string) => void;
+    /**
+     * A persisted formula as the editor shows it: rendered for the current
+     * layouts. Retyping that text is a revert; retyping the stored text,
+     * which now names other cells, is an edit.
+     */
+    readonly rendered_persisted_formula?: (text: string) => string;
     /** One workbook-wide order for a formula edit gesture. */
     readonly next_value_edit_order?: () => number;
 }
@@ -250,6 +266,8 @@ function plan_value_write(
     syntax: EditSyntax,
     edit?: Pick<CellValueEdit, 'source_row' | 'source_col' | 'editOrder' | 'movedFrom'>,
     formula_reference_bases?: readonly PendingFormulaReferenceBasis[],
+    formula_anchors?: FormulaAnchors,
+    persisted_view: ParsedCellEdit = persisted,
 ): PlannedOverlayWrite {
     const parsed = parse_cell_edit(input, syntax);
     // A pending link change is its own dimension: a text revert must not
@@ -302,8 +320,9 @@ function plan_value_write(
         );
 
     // Semantic comparison: retyping a bold cell's own `**markup**`, however
-    // spelled, is a revert; deleting the `**` is an edit.
-    if (cell_edits_equal(parsed, persisted)) {
+    // spelled, is a revert; deleting the `**` is an edit. A formula compares
+    // as the editor showed it, rendered for the current layouts.
+    if (cell_edits_equal(parsed, persisted_view)) {
         if (link_dimension === undefined && moved_from === undefined && value_edit_order === undefined) {
             return { entry: undefined, overlay: absent_overlay() };
         }
@@ -368,6 +387,7 @@ function plan_value_write(
                 movedFrom: moved_from,
                 valueEditOrder: value_edit_order,
                 formulaReferenceBases: formula_reference_bases,
+                formulaAnchors: formula_anchors,
             },
         ),
         persisted,
@@ -778,6 +798,34 @@ export function use_editing(
     );
 
     /**
+     * The append bases a committed formula stores: of its whole text without
+     * anchors, of its unanchored references with them, none when every
+     * reference is anchored.
+     */
+    const formula_reference_bases = options?.formula_reference_bases;
+    const formula_reference_bases_for = useCallback((
+        parsed: ParsedCellEdit,
+        anchors: FormulaAnchors | undefined,
+    ): readonly PendingFormulaReferenceBasis[] | undefined => {
+        if (!xlsx_edit_writes_formula(parsed.text, parsed.rich?.runs)) return undefined;
+        const bases_text = anchors === undefined ? parsed.text : unanchored_formula_text(parsed.text, anchors);
+        return bases_text === undefined ? undefined : formula_reference_bases?.(bases_text);
+    }, [formula_reference_bases]);
+    /** The persisted side as the editor shows it: a formula rendered for the current layouts. */
+    const rendered_persisted_formula = options?.rendered_persisted_formula;
+    const persisted_formula_view = useCallback((
+        base: ParsedCellEdit,
+        /** The persisted cell holds a formula: text starting with `=` may be a string. */
+        is_formula: boolean,
+    ): ParsedCellEdit => {
+        if (rendered_persisted_formula === undefined
+            || syntax !== 'markdown'
+            || !is_formula) return base;
+        const text = rendered_persisted_formula(base.text);
+        return text === base.text ? base : { text };
+    }, [rendered_persisted_formula, syntax]);
+
+    /**
      * Commit new text into cells: one gesture, one history action.
      *
      * Parses each editor's text in the sheet's syntax and reverts a cell whose
@@ -793,6 +841,24 @@ export function use_editing(
         ): EditGestureResult => {
             let gesture_order = edits.find((edit) => edit.editOrder !== undefined)?.editOrder;
             const next_edit_order = options?.next_value_edit_order;
+            // Anchor every formula the gesture writes before any of it lands: a
+            // formula that cannot be anchored refuses the whole gesture.
+            const anchors_by_edit = new Map<CellValueEdit, FormulaAnchors>();
+            const anchor = syntax === 'markdown' ? options?.anchor_formula : undefined;
+            if (anchor !== undefined) {
+                for (const edit of edits) {
+                    const parsed = parse_cell_edit(edit.value, syntax);
+                    if (!xlsx_edit_writes_formula(parsed.text, parsed.rich?.runs)) continue;
+                    if (edit.openedValue !== undefined
+                        && cell_edits_equal(parsed, parse_cell_edit(edit.openedValue, syntax))) continue;
+                    const anchored = anchor(parsed.text);
+                    if (anchored.kind === 'refused') {
+                        options?.on_formula_refused?.(anchored.reason);
+                        return 'refused';
+                    }
+                    if (anchored.anchors !== undefined) anchors_by_edit.set(edit, anchored.anchors);
+                }
+            }
             const pending_entries = active_store.snapshot();
             const pending_move_source_orders = syntax === 'markdown'
                 && next_edit_order !== undefined
@@ -804,6 +870,14 @@ export function use_editing(
                 additional_history_changes,
                 (edit, before_entry, _before_overlay, persisted) => {
                     const parsed = parse_cell_edit(edit.value, syntax);
+                    const formula_anchors = anchors_by_edit.get(edit);
+                    const persisted_cell = 'persistedCell' in edit
+                        ? edit.persistedCell
+                        : get_cell?.(edit.source_row, edit.source_col);
+                    const persisted_view = persisted_formula_view(
+                        persisted.base,
+                        persisted_cell?.formula !== undefined,
+                    );
                     const explicitly_opened = edit.openedValue === undefined
                         ? undefined
                         : parse_cell_edit(edit.openedValue, syntax);
@@ -825,7 +899,7 @@ export function use_editing(
                         const value_changed = !cell_edits_equal(parsed, opened);
                         const opened_was_retargeted = edit.openedValue !== undefined
                             && !cell_edits_equal(opened, current);
-                        const value_survives = !cell_edits_equal(parsed, persisted.base)
+                        const value_survives = !cell_edits_equal(parsed, persisted_view)
                             || pending_move_source_order !== undefined
                             || opened_was_retargeted;
                         // Glide finishes an overlay even when its text never changed.
@@ -861,9 +935,9 @@ export function use_editing(
                         persisted.history !== undefined,
                         syntax,
                         ordered_edit,
-                        xlsx_edit_writes_formula(parsed.text, parsed.rich?.runs)
-                            ? options?.formula_reference_bases?.(parsed.text)
-                            : undefined,
+                        formula_reference_bases_for(parsed, formula_anchors),
+                        formula_anchors,
+                        persisted_view,
                     );
                 },
                 additional_mutations,
@@ -872,7 +946,10 @@ export function use_editing(
         [
             active_store,
             get_cell,
-            options?.formula_reference_bases,
+            options?.anchor_formula,
+            formula_reference_bases_for,
+            options?.on_formula_refused,
+            persisted_formula_view,
             options?.next_value_edit_order,
             run_edit_gesture,
             syntax,

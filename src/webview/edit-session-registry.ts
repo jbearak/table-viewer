@@ -96,6 +96,7 @@ export interface PendingFormulaCalculationEdit {
     readonly value: string;
     readonly writesFormula: boolean;
     readonly runs?: FormulaCalculationEdit['runs'];
+    readonly formulaAnchors?: FormulaCalculationEdit['formulaAnchors'];
 }
 
 export interface EditSessionSaveWorksheet {
@@ -353,6 +354,7 @@ export function create_edit_session_registry(
                     runs && runs.length > 0 ? runs : undefined,
                 ),
                 ...(runs && runs.length > 0 ? { runs } : {}),
+                ...(cell.formulaAnchors === undefined ? {} : { formulaAnchors: cell.formulaAnchors }),
             }];
         });
     };
@@ -389,6 +391,9 @@ export function create_edit_session_registry(
         right: FormulaCalculationEdit,
     ): boolean => {
         if (left.value !== right.value || left.writesFormula !== right.writesFormula) return false;
+        if (JSON.stringify(left.formulaAnchors ?? null) !== JSON.stringify(right.formulaAnchors ?? null)) {
+            return false;
+        }
         if (left.runs === undefined || right.runs === undefined) {
             return left.runs === right.runs;
         }
@@ -413,6 +418,7 @@ export function create_edit_session_registry(
             value: input.value,
             writesFormula: xlsx_edit_writes_formula(input.value, retained_runs),
             ...(retained_runs !== undefined ? { runs: retained_runs } : {}),
+            ...(input.formulaAnchors !== undefined ? { formulaAnchors: input.formulaAnchors } : {}),
         };
     };
     const formula_input = (entry: DirtyEntry): ReturnType<typeof calculation_input> | undefined =>
@@ -420,6 +426,7 @@ export function create_edit_session_registry(
             ? calculation_input({
                 value: entry.value,
                 ...(entry.valueRuns !== undefined ? { runs: entry.valueRuns.runs } : {}),
+                ...(entry.formulaAnchors !== undefined ? { formulaAnchors: entry.formulaAnchors } : {}),
             })
             : undefined;
     const current_formula_entries = (): FormulaCalculationEdit[] => {
@@ -442,6 +449,7 @@ export function create_edit_session_registry(
                     value: input.value,
                     writesFormula: input.writesFormula,
                     ...(input.runs !== undefined ? { runs: input.runs } : {}),
+                    ...(input.formulaAnchors !== undefined ? { formulaAnchors: input.formulaAnchors } : {}),
                 });
             }
         }
@@ -763,6 +771,7 @@ export function create_edit_session_registry(
             value: value?.value ?? '',
             writesFormula: value?.writesFormula ?? false,
             ...(value?.runs !== undefined ? { runs: value.runs } : {}),
+            ...(value?.formulaAnchors !== undefined ? { formulaAnchors: value.formulaAnchors } : {}),
         };
         const position = formula_edit_position(wanted);
         const existing = formula_edits[position];

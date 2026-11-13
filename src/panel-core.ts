@@ -38,6 +38,8 @@ import {
 } from './types';
 import {
     calculate_workbook_formulas_cooperatively,
+    formula_calculation_edit_anchors_valid,
+    own_formula_calculation_layouts,
     type FormulaCalculationEdit,
     type FormulaCalculationRequest,
     type FormulaCalculationResult,
@@ -933,6 +935,9 @@ export class ViewerPanelCore {
                 || !Number.isSafeInteger(row)
                 || row < 0
                 || row >= this.source.meta().sheets[sheetIndex].sourceRowCount)
+            || (msg.layouts !== undefined
+                && own_formula_calculation_layouts(msg.layouts, this.source.meta().sheets) === undefined)
+            || !formula_calculation_edit_anchors_valid(msg.edits)
         ) {
             await this.post({
                 type: 'formulaCalculation',
@@ -960,6 +965,9 @@ export class ViewerPanelCore {
                         ? {}
                         : { prospectiveRowCounts: msg.prospectiveRowCounts }),
                     ...(msg.removedRows === undefined ? {} : { removedRows: msg.removedRows }),
+                    ...(msg.layouts === undefined ? {} : {
+                        layouts: own_formula_calculation_layouts(msg.layouts, this.source.meta().sheets),
+                    }),
                 },
                 {
                     isCancelled: () => this.disposed
@@ -985,7 +993,9 @@ export class ViewerPanelCore {
         if (this.active_formula_calculation?.operation === operation) {
             this.active_formula_calculation = undefined;
         }
-        if (cacheable_formula_result_bytes(results) !== undefined) {
+        // Results keyed by prospective coordinates are for display only: the
+        // save-time reuse below reads canonical coordinates.
+        if (msg.layouts === undefined && cacheable_formula_result_bytes(results) !== undefined) {
             this.formula_calculation_cache = {
                 sourceGeneration: msg.sourceGeneration,
                 editsKey: formula_edits_key(msg.edits),
