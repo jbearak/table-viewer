@@ -432,12 +432,12 @@ describe('insert admission', () => {
                 }] as never,
             }),
         });
-        if (Object.keys(moved.durable().pendingEdits?.[0]?.cells ?? {}).length > 0) {
-            expect(await moved.insert({ requestId: 'move' })).toMatchObject({
-                granted: false,
-                reason: 'Save or undo the moved cells first.',
-            });
-        }
+        // The fixture's move survives load, so the refusal is always checked.
+        expect(Object.keys(moved.durable().pendingEdits?.[0]?.cells ?? {})).toEqual(['1:0', '0:0']);
+        expect(await moved.insert({ requestId: 'move' })).toMatchObject({
+            granted: false,
+            reason: 'Save or undo the moved cells first.',
+        });
         await moved.dispose();
     });
 

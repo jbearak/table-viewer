@@ -25,7 +25,7 @@ import { peek_history } from '../webview/history-stack-model';
 import { webview_formula_workbook } from '../webview/formula-anchor-model';
 import { EMPTY_PENDING_STRUCTURAL_CHANGES } from '../pending-changes';
 import { plan_pending_row_history_replay } from '../webview/pending-row-history';
-import { create_pending_row_store } from '../webview/pending-row-store';
+import { create_pending_row_store, keep_inserted_rows_at_end } from '../webview/pending-row-store';
 import {
     LAST_COLUMN_RESIZE_GUTTER_PX,
     MAX_AUTO_FIT_COLUMN_WIDTH_PX,
@@ -8794,6 +8794,108 @@ describe('row Insert in the row-gutter menu', () => {
         await act(async () => current.click());
         await act(async () => item.click());
         expect(host.on_insert_rows).not.toHaveBeenCalled();
+    });
+
+    /** Install one inserted row after source row 0 through the grid's own gesture. */
+    const insert_after_first = async (
+        overrides: Partial<GridShellProps> = {},
+        row_ids: readonly string[] = ['ins-a'],
+    ) => {
+        const pending = create_pending_row_store({ session_id: 'session' });
+        const history = create_history_store();
+        const host = admission(row_ids);
+        const GridShell = await render_grid(structure_props({
+            edit_session: create_edit_session_store({ session_id: 'session' }),
+            pending_row_store: pending,
+            history_store: history,
+            on_insert_rows: host.on_insert_rows,
+            ...overrides,
+        }));
+        await open_row_menu(0);
+        await act(async () => menu_item('Insert row below')!.click());
+        await act(async () => host.grant());
+        await vi.waitFor(() => expect(host.settled).toEqual([true]));
+        return { pending, history, GridShell };
+    };
+    const topology_key = () => grid_mock.props!.pasteTopologyKey as string;
+
+    it('changes the paste topology key when layout placement changes without changing the row set', async () => {
+        const { pending } = await insert_after_first();
+        const inserted = topology_key();
+        // Delete in layout mode: the source row stays in place, as a removal.
+        await open_row_menu(2);
+        await act(async () => menu_item('Delete row')!.click());
+        const deleted = topology_key();
+        expect(deleted).not.toBe(inserted);
+        // Restore puts it back: the key follows.
+        await open_row_menu(2);
+        await act(async () => menu_item('Restore row')!.click());
+        const restored = topology_key();
+        expect(restored).not.toBe(deleted);
+        // "Keep new rows at the end" moves the inserted row into the band.
+        const kept = keep_inserted_rows_at_end(pending.snapshot(), {
+            worksheet: { sheetIndex: 0 },
+            bodyStart: 0,
+            sourceRowCount: 4,
+            sourceColumnCount: 3,
+            bodyViewTransformed: false,
+        });
+        if (!kept.ok) throw new Error(kept.refusal.message);
+        await act(async () => { pending.apply_structure('session', kept.outcome); });
+        expect(pending.snapshot().appendedRows.map((row) => row.id)).toEqual(['ins-a']);
+        expect(topology_key()).not.toBe(restored);
+    });
+
+    it('appends after rows "Keep new rows at the end" placed above the edit clock', async () => {
+        const append_basis_for_band = { sourceRowCount: 4, columnCount: 3, schemaFingerprint: 'sha256:x' };
+        const on_append_rows = vi.fn(async () => ({
+            rowIds: ['app-new'],
+            formatTemplate: template,
+            appendBasis: append_basis_for_band,
+            settle: () => {},
+        }));
+        const { pending } = await insert_after_first({ on_append_rows });
+        const far = Date.now() * 1_000 + 1_000_000_000;
+        const kept = keep_inserted_rows_at_end(pending.snapshot(), {
+            worksheet: { sheetIndex: 0 },
+            bodyStart: 0,
+            sourceRowCount: 4,
+            sourceColumnCount: 3,
+            bodyViewTransformed: false,
+        }, far);
+        if (!kept.ok) throw new Error(kept.refusal.message);
+        await act(async () => { pending.apply_structure('session', kept.outcome); });
+        // "Insert row below" on the band's last row appends.
+        await open_row_menu(4);
+        await act(async () => menu_item('Insert row below')!.click());
+        await vi.waitFor(() => expect(pending.snapshot().appendedRows.map((row) => row.id))
+            .toEqual(['ins-a', 'app-new']));
+        const [converted, added] = pending.snapshot().appendedRows;
+        expect(added!.createdOrder).toBeGreaterThan(converted!.createdOrder);
+    });
+
+    it('resizes an inserted row together with the source rows selected around it', async () => {
+        const on_row_resize = vi.fn((
+            _intervals: unknown,
+            _height: number,
+            finish?: (applied: boolean) => void,
+        ) => finish?.(true));
+        const { pending } = await insert_after_first({ on_row_resize });
+        const on_selection_change = grid_mock.props!.onGridSelectionChange as (selection: unknown) => void;
+        // Display rows 0 (source 0), 1 (inserted), 2 (source 1).
+        await act(async () => on_selection_change({ columns: compact([]), rows: compact([0, 1, 2]) }));
+        const on_resize_start = grid_mock.row_resize_props!.on_resize_start as
+            (row: number, height: number) => void;
+        const on_resize = grid_mock.row_resize_props!.on_resize as (row: number, height: number) => void;
+        const on_resize_end = grid_mock.row_resize_props!.on_resize_end as (row: number, height: number) => void;
+        act(() => on_resize_start(1, 24));
+        act(() => on_resize(1, 48));
+        act(() => on_resize_end(1, 48));
+        expect(on_row_resize).toHaveBeenCalledOnce();
+        expect(on_row_resize.mock.calls[0]![0]).toEqual([{ start: 0, end: 1 }]);
+        expect(pending.snapshot().appendedRows).toEqual([
+            expect.objectContaining({ id: 'ins-a', viewerRowHeight: 48 }),
+        ]);
     });
 
     it('cancels an insert whose anchor was removed while the request was out', async () => {

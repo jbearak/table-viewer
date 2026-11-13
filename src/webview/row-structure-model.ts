@@ -16,6 +16,7 @@
 
 import {
     is_inserted_row,
+    MAX_PENDING_APPENDED_ROWS,
     pending_rows,
     type PendingAppendBasis,
     type PendingRowFormatTemplate,
@@ -40,6 +41,7 @@ import {
     source_cells_removed_by,
     STRUCTURE_TAIL_REMOVAL_MESSAGE,
     STRUCTURE_TRANSFORMED_MESSAGE,
+    TOO_MANY_PENDING_ROWS_MESSAGE,
     type StructureOutcome,
     type WorksheetStructureContext,
 } from './pending-row-store';
@@ -324,6 +326,12 @@ function insert_item(
         side,
     );
     if (anchor === undefined) return disabled(INSERT_ONLY_REMOVED_ROWS_MESSAGE);
+    // Refused before any placeholder is allocated: a selection of a million
+    // rows would otherwise build a million probe IDs to learn this.
+    if (pending_rows(changes).length + (changes.rowLayout?.discardedPendingRows.length ?? 0)
+        + Math.max(1, count) > MAX_PENDING_APPENDED_ROWS) {
+        return disabled(TOO_MANY_PENDING_ROWS_MESSAGE);
+    }
     // A dry run with placeholder IDs gives the refusal the gesture would get
     // with the host's (exclusivity, run and row limits), so menu and gesture agree.
     const ids = Array.from({ length: Math.max(1, count) }, (_, index) => `menu-probe:${index}`);

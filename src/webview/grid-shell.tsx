@@ -540,6 +540,7 @@ import {
     create_pending_row_projection,
     type PendingRowProjection,
 } from './pending-row-projection';
+import type { RowLayout } from '../worksheet-layout';
 import { scroll_preview_to_row } from './preview-scroll';
 import {
     formula_anchor_context,
@@ -564,24 +565,54 @@ function pending_topology_signature(
     tail_projection_key: string,
 ): string {
     return pending_topology_signature_for_rows(
-        stored_pending_rows(changes).map((row) => row.id),
+        topology_row_keys(stored_pending_rows(changes)),
         changes.tailRemovals,
         tail_projection_key,
+        changes.rowLayout,
     );
 }
 
+/**
+ * Each Pending Row by ID and origin: an inserted row sits in the layout, an
+ * appended one in the band, so "Keep new rows at the end" moves rows without
+ * changing the row set.
+ */
+function topology_row_keys(rows: readonly PendingAppendedRow[]): string[] {
+    return rows.map((row) => is_inserted_row(row) ? `insert:${row.id}` : row.id);
+}
+
+/** A row layout's signature, computed once per (immutable) layout object. */
+const row_layout_signatures = new WeakMap<RowLayout, string>();
+function row_layout_signature(layout: RowLayout | undefined): string {
+    if (layout === undefined) return '';
+    let signature = row_layout_signatures.get(layout);
+    if (signature === undefined) {
+        signature = JSON.stringify(layout);
+        row_layout_signatures.set(layout, signature);
+    }
+    return signature;
+}
+
+/**
+ * Where every displayed row sits. The layout is part of it, so a gesture
+ * that changes placement without changing the row set (Delete or Restore in
+ * layout mode, and Move from delivery step 7) changes the paste and
+ * selection topology keys too.
+ */
 function pending_topology_signature_for_rows(
-    appended_row_ids: readonly string[],
+    row_keys: readonly string[],
     tail_removals: readonly PendingTailRemoval[],
     tail_projection_key: string,
+    row_layout: RowLayout | undefined,
 ): string {
     return JSON.stringify([
-        appended_row_ids,
+        row_keys,
         tail_removals.map((removal) => [
             removal.appendHistoryId,
             removal.sourceRow,
         ]),
         tail_projection_key,
+        row_layout_signature(row_layout),
     ]);
 }
 
@@ -2189,6 +2220,23 @@ export function GridShell({
                 const projected = projection.row_at(row);
                 if (projected?.kind === 'pending' || projected?.kind === 'replacement') {
                     pending_ids.add(projected.row.id);
+                }
+            }
+        }
+        // In layout mode Pending Inserted Rows sit among the source rows,
+        // before the band, where the source arm above skips them. There are at
+        // most 10,000, so find each by identity rather than walking the
+        // (possibly million-row) selected intervals.
+        if (projection.layoutMode) {
+            for (const row of stored_pending_rows(pending_store.snapshot())) {
+                if (!is_inserted_row(row)) continue;
+                const display_row = projection.display_row_for_identity({
+                    kind: 'pending',
+                    pendingRowId: row.id,
+                });
+                if (display_row !== undefined && intervals.some((interval) =>
+                    display_row >= interval.start && display_row <= interval.end)) {
+                    pending_ids.add(row.id);
                 }
             }
         }
@@ -4447,7 +4495,9 @@ export function GridShell({
                 edit_session_id,
                 admitted.rowIds,
                 admitted.formatTemplate,
-                issue_value_edit_order(),
+                // Past every Pending Row's order: rows "Keep new rows at the
+                // end" converted may sit above the edit-value clock.
+                insert_created_order(before, issue_value_edit_order()),
                 admitted.appendBasis,
                 typeof seed_cells === 'function' ? seed_cells(admitted.rowIds) : seed_cells,
             );
@@ -4679,11 +4729,12 @@ export function GridShell({
         const admitted_ids = new Set(appended.rowIds);
         const admitted_pending_topology_key = pending_topology_signature_for_rows(
             [
-                ...stored_pending_rows(appended.before).map((row) => row.id),
+                ...topology_row_keys(stored_pending_rows(appended.before)),
                 ...appended.rowIds,
             ],
             appended.before.tailRemovals,
             tail_removal_projection_key,
+            appended.before.rowLayout,
         );
         const admitted_topology_key = [
             mapping_generation,

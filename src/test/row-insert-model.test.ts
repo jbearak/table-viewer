@@ -24,6 +24,7 @@ import {
     STRUCTURE_CELL_MOVE_MESSAGE,
     STRUCTURE_TAIL_REMOVAL_MESSAGE,
     STRUCTURE_TRANSFORMED_MESSAGE,
+    TOO_MANY_PENDING_ROWS_MESSAGE,
     type WorksheetStructureContext,
 } from '../webview/pending-row-store';
 import {
@@ -256,6 +257,19 @@ describe('the Insert items', () => {
             identities: [source(9), pending('x')],
             bandRows: 1,
         }).insertBelow.reason).toBe(APPENDED_BAND_MESSAGE);
+    });
+
+    it('refuses an over-limit selection before building any probe IDs', () => {
+        // Larger than any array can be: allocating one probe ID per row would throw.
+        const huge = 2 ** 32;
+        const model = menu(EMPTY, { count: huge, identities: [source(2), source(3)] });
+        expect(model.insertAbove).toEqual({
+            count: huge,
+            enabled: false,
+            reason: TOO_MANY_PENDING_ROWS_MESSAGE,
+            action: 'insert',
+        });
+        expect(model.insertBelow.reason).toBe(TOO_MANY_PENDING_ROWS_MESSAGE);
     });
 
     it('labels the items "Insert row above" and "Insert N rows below", with their reasons', () => {
