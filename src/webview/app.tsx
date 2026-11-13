@@ -103,6 +103,11 @@ import {
     MAX_WORKBOOK_FORMULAS,
     UNBOUNDED_SHEET_ROWS,
 } from '../spreadsheet-safety';
+import {
+    needs_prospective_formula_request,
+    prospective_formula_request,
+    webview_formula_workbook,
+} from './formula-anchor-model';
 import { capture_pending_formula_reference_bases } from '../pending-formula-rebase';
 import {
     classify_snapshot,
@@ -818,6 +823,21 @@ export function App(): React.JSX.Element {
             sheet.excelFirstRowHeader?.sourceRow ?? 0,
         ],
     ));
+    // The workbook every formula renders against: each worksheet's layout and
+    // append band. Rebuilt with the structural revision, which every pending
+    // store change bumps.
+    const formula_anchor_workbook = useMemo(() => {
+        if (!meta) return undefined;
+        const pending_by_sheet = new Map(edit_session_registry_ref.current!.pending_entries());
+        return webview_formula_workbook(
+            edit_syntax === 'markdown',
+            meta.sheets,
+            (sheet_index) => pending_by_sheet.get(sheet_index)?.snapshot(),
+        );
+    },
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+        [formula_roots_projection.structuralRevision, meta, edit_syntax],
+    );
     const structural_formula_state = useMemo(() => {
         const edits: FormulaCalculationEdit[] = formula_roots_projection.edits.map((edit) => {
             const sheet = meta?.sheets[edit.sheetIndex];
@@ -827,6 +847,33 @@ export function App(): React.JSX.Element {
                 : edit;
         });
         const pending_by_sheet = new Map(edit_session_registry_ref.current!.pending_entries());
+        const changes_for = (sheet_index: number) => pending_by_sheet.get(sheet_index)?.snapshot();
+        if (formula_anchor_workbook !== undefined && needs_prospective_formula_request(
+            formula_anchor_workbook,
+            edits,
+            formula_roots_projection.pendingEdits,
+            changes_for,
+        )) {
+            // Every address is prospective: formulas render from their anchors
+            // for the current layouts, and every formula is recalculated.
+            const request = prospective_formula_request({
+                workbook: formula_anchor_workbook,
+                sheets: meta?.sheets ?? [],
+                changes_for,
+                edits,
+                pending_edits: formula_roots_projection.pendingEdits,
+            });
+            return {
+                edits: request.edits,
+                prospectiveRowCounts: request.prospectiveRowCounts,
+                removedRows: [],
+                prospective: {
+                    layouts: request.layouts,
+                    targets: request.targets,
+                },
+                tooManyEdits: formula_roots_projection.tooManyEdits || request.tooMany,
+            };
+        }
         const prospectiveRowCounts = (meta?.sheets ?? []).map((sheet, sheetIndex) => {
             const changes = pending_by_sheet.get(sheetIndex)?.snapshot()
                 ?? EMPTY_PENDING_STRUCTURAL_CHANGES;
@@ -857,6 +904,7 @@ export function App(): React.JSX.Element {
             edits,
             prospectiveRowCounts,
             removedRows,
+            prospective: undefined,
             tooManyEdits: formula_roots_projection.tooManyEdits
                 || edits.length > MAX_WORKBOOK_FORMULAS,
         };
@@ -866,9 +914,12 @@ export function App(): React.JSX.Element {
             formula_roots_projection.structuralRevision,
             formula_roots_projection.calculationRevision,
             formula_header_coordinate_signature,
+            formula_anchor_workbook,
             meta,
         ],
     );
+    /** Layouts and every formula target when addresses are prospective; see `prospective_formula_request`. */
+    const prospective_formula_state = structural_formula_state.prospective;
     const formula_calculation_edits = structural_formula_state.edits;
     const prospective_formula_row_counts = structural_formula_state.prospectiveRowCounts;
     const removed_formula_rows = structural_formula_state.removedRows;
@@ -1774,6 +1825,16 @@ export function App(): React.JSX.Element {
         [formula_graph_key],
     );
     const formula_calculation_plan = useMemo(() => {
+        if (prospective_formula_state !== undefined) {
+            // Layout changes can move any formula's references, so every
+            // formula is stale until its prospective result arrives.
+            return {
+                sheetCount: meta?.sheets.length ?? 0,
+                impact: all_workbook_formula_cells_impact(meta?.sheets ?? []),
+                targets: too_many_formula_calculation_edits ? [] : prospective_formula_state.targets,
+                formulaLimitExceeded: too_many_formula_calculation_edits,
+            };
+        }
         if (has_formula_moves) {
             return {
                 sheetCount: meta?.sheets.length ?? 0,
@@ -1803,6 +1864,7 @@ export function App(): React.JSX.Element {
         has_formula_moves,
         meta?.sheets.length,
         prospective_formula_sheets,
+        prospective_formula_state,
         too_many_formula_calculation_edits,
     ]);
     const formula_impact = formula_calculation_plan.impact;
@@ -1821,7 +1883,9 @@ export function App(): React.JSX.Element {
             : undefined);
         set_edit_formula_calculation(undefined);
     }, [formula_graph_key]);
-    const source_formulas_ready = source_pending_formula_targets.length === 0
+    // A prospective request recalculates every formula, source-pending ones included.
+    const source_formulas_ready = prospective_formula_state !== undefined
+        || source_pending_formula_targets.length === 0
         || source_formula_calculation?.graphKey === formula_graph_key;
     const formula_calculation_sequence_ref = useRef(0);
     const active_formula_calculation_ref = useRef<{
@@ -1857,6 +1921,9 @@ export function App(): React.JSX.Element {
             targets,
             prospectiveRowCounts: prospective_formula_row_counts,
             removedRows: removed_formula_rows,
+            ...(kind === 'edit' && prospective_formula_state !== undefined
+                ? { layouts: prospective_formula_state.layouts }
+                : {}),
         });
         return () => {
             if (active_formula_calculation_ref.current?.requestId === requestId) {
@@ -1875,6 +1942,7 @@ export function App(): React.JSX.Element {
         header_calculation_edits,
         load_epoch,
         prospective_formula_row_counts,
+        prospective_formula_state,
         removed_formula_rows,
         source_formulas_ready,
         source_pending_formula_targets,
@@ -8356,6 +8424,8 @@ export function App(): React.JSX.Element {
             source_formula_results={active_source_formula_results}
             formula_move_retargeter={formula_move_retargeter}
             formula_reference_bases={formula_reference_bases}
+            formula_anchor_workbook={formula_anchor_workbook}
+            formula_results_prospective={prospective_formula_state !== undefined}
             generation={generation}
             source_generation={source_generation_ref.current}
             row_count={effective_row_count}

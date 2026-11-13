@@ -530,6 +530,20 @@ import {
     type PendingRowProjection,
 } from './pending-row-projection';
 import { scroll_preview_to_row } from './preview-scroll';
+import {
+    formula_anchor_context,
+    prospective_column_of,
+    type FormulaAnchorWorkbook,
+} from '../formula-anchor-layout';
+import { anchor_formula, type FormulaAnchors } from '../formula-anchors';
+import {
+    committed_formula_cell_fields,
+    committed_formula_fields,
+    formula_display,
+    formula_result_key,
+    type CommittedFormulaFields,
+    type FormulaDisplay,
+} from './formula-anchor-model';
 import './glide-data-grid/styles.css';
 
 function pending_topology_signature(
@@ -1162,6 +1176,13 @@ export interface GridShellProps {
         value: string,
         additional_pending_rows?: number,
     ) => readonly PendingFormulaReferenceBasis[];
+    /**
+     * Every worksheet's layout and append band, which formulas render and
+     * anchor against. Absent before the workbook's metadata arrives.
+     */
+    formula_anchor_workbook?: FormulaAnchorWorkbook;
+    /** Calculation results are keyed by prospective `row:column` (see `prospective_formula_request`). */
+    formula_results_prospective?: boolean;
     generation: number;
     /** Source revision the pending structural overlay was derived from. */
     source_generation: number;
@@ -1403,6 +1424,8 @@ export function GridShell({
     source_formula_results,
     formula_move_retargeter,
     formula_reference_bases,
+    formula_anchor_workbook,
+    formula_results_prospective = false,
     generation,
     source_generation,
     row_count: source_row_count = sheet_meta.rowCount,
@@ -2356,6 +2379,69 @@ export function GridShell({
         [store, value_edit_order_floor],
     );
 
+    // ---- Formula Anchors (row and column structure design) ----
+    // Every formula this grid shows, opens in an editor, or copies renders
+    // from its anchors for the workbook's current layouts, then through the
+    // pending cell moves. Without a live layout change or stored anchors the
+    // text is untouched. CSV and TSV never render or anchor.
+    const formula_workbook = edit_syntax === 'markdown' ? formula_anchor_workbook : undefined;
+    const formula_display_for = useCallback((
+        text: string,
+        anchors: FormulaAnchors | undefined,
+        after_order?: number,
+    ): FormulaDisplay => formula_display(
+        text,
+        anchors,
+        formula_workbook,
+        sheet_index,
+        (value) => formula_move_retargeter?.(value, sheet_index, after_order) ?? value,
+    ), [formula_move_retargeter, formula_workbook, sheet_index]);
+    /** The formula text to show or copy; an unrenderable formula keeps its stored text. */
+    const formula_text_for = useCallback((
+        text: string,
+        anchors: FormulaAnchors | undefined,
+        after_order?: number,
+    ): string => formula_display_for(text, anchors, after_order).text, [formula_display_for]);
+    /** What a committed formula stores: anchors, else the append bases, or a refusal. */
+    const commit_formula_fields = useCallback((
+        text: string,
+        writes_formula: boolean,
+        additional_pending_rows?: number,
+    ): CommittedFormulaFields => committed_formula_fields(
+        text,
+        writes_formula,
+        formula_workbook,
+        sheet_index,
+        formula_reference_bases === undefined
+            ? undefined
+            : () => formula_reference_bases(text, additional_pending_rows),
+    ), [formula_reference_bases, formula_workbook, sheet_index]);
+    const refuse_formula = useCallback((reason: string) => {
+        host_bridge.postMessage({ type: 'showWarning', message: reason });
+    }, []);
+    /** The key a source cell's calculation result is stored under; undefined for a removed row or column. */
+    const formula_result_key_for = useCallback(
+        (source_row: number, source_column: number): string | undefined => formula_result_key(
+            formula_anchor_workbook?.worksheets[sheet_index],
+            formula_results_prospective,
+            source_row,
+            source_column,
+        ),
+        [formula_anchor_workbook, formula_results_prospective, sheet_index],
+    );
+    /** Like `formula_result_key_for`, for a Pending Row cell at its prospective row. */
+    const pending_formula_result_key_for = useCallback(
+        (prospective_row: number, source_column: number): string | undefined => {
+            const worksheet = formula_anchor_workbook?.worksheets[sheet_index];
+            if (!formula_results_prospective || worksheet === undefined) {
+                return `${prospective_row}:${source_column}`;
+            }
+            const column = prospective_column_of(worksheet, { kind: 'source', sourceColumn: source_column });
+            return column === undefined ? undefined : `${prospective_row}:${column}`;
+        },
+        [formula_anchor_workbook, formula_results_prospective, sheet_index],
+    );
+
     const {
         dirty_cells,
         conflicted_keys: derived_conflicted_keys,
@@ -2378,10 +2464,17 @@ export function GridShell({
                 ? get_cell_for_source_ref.current(source_row, source_column)?.formula !== undefined
                 : xlsx_edit_writes_formula(entry.value, entry.valueRuns?.runs);
             return writes_formula
-                ? formula_move_retargeter?.(text, sheet_index, after_order) ?? text
+                ? formula_text_for(text, entry?.formulaAnchors, after_order)
                 : text;
         },
         formula_reference_bases,
+        ...(formula_workbook === undefined ? {} : {
+            anchor_formula: (value: string) =>
+                anchor_formula(value, formula_anchor_context(formula_workbook, sheet_index)),
+            on_formula_refused: refuse_formula,
+            rendered_persisted_formula: (text: string) =>
+                formula_display(text, undefined, formula_workbook, sheet_index).text,
+        }),
         next_value_edit_order: issue_value_edit_order,
         // Same identity discipline as get_cell_raw: rebinds with `version` so
         // freshly-loaded pages refresh markdown edit text and bases.
@@ -2526,10 +2619,31 @@ export function GridShell({
     ): string | undefined => {
         const affected = known_affected ?? pending_formula_impact_ref.current
             ?.has(source_row, source_column) === true;
-        const raw_result = formula_results_ref.current?.get(key)
+        // Prospective results are keyed where the cell lands after save.
+        const result_key = formula_result_key_for(source_row, source_column);
+        const raw_result = (result_key === undefined ? undefined : formula_results_ref.current?.get(result_key))
             ?? (affected ? undefined : source_formula_results_ref.current?.get(key));
         return calculated_formula_display(raw_result, show_formatting, cell);
-    }, [show_formatting]);
+    }, [formula_result_key_for, show_formatting]);
+    /**
+     * The `??` result of a formula that cannot render for the current layouts,
+     * or undefined. A dirty formula renders from its stored anchors, a clean
+     * source formula from its implicit ones.
+     */
+    const unrenderable_formula_for_cell = useCallback((
+        cell: RenderedCell | null | undefined,
+        dirty: DirtyEntry | undefined,
+    ): Extract<FormulaDisplay, { kind: 'unrenderable' }> | undefined => {
+        if (formula_workbook === undefined) return undefined;
+        const display = dirty !== undefined && dirty_entry_value_dimension_present(dirty)
+            ? xlsx_edit_writes_formula(dirty.value, dirty.valueRuns?.runs)
+                ? formula_display_for(dirty.value, dirty.formulaAnchors, dirty.valueEditOrder ?? 0)
+                : undefined
+            : cell?.formula === undefined
+                ? undefined
+                : formula_display_for(cell.formula, undefined);
+        return display?.kind === 'unrenderable' ? display : undefined;
+    }, [formula_display_for, formula_workbook]);
     const value_overlay_for_cell = useCallback((
         source_row: number,
         source_column: number,
@@ -2541,9 +2655,10 @@ export function GridShell({
         'dirty_value' | 'dirty_display' | 'dirty_rich' | 'diff_base'
             | 'formula_result_pending' | 'formula_result'
     > | undefined => {
-        const formula_is_affected = pending_formula_impact_ref.current
-            ?.has(source_row, source_column) === true;
-        const calculated_formula_result = calculated_formula_result_for_cell(
+        const unrenderable = unrenderable_formula_for_cell(cell, dirty);
+        const formula_is_affected = unrenderable !== undefined
+            || pending_formula_impact_ref.current?.has(source_row, source_column) === true;
+        const calculated_formula_result = unrenderable?.result ?? calculated_formula_result_for_cell(
             source_row,
             source_column,
             key,
@@ -2573,6 +2688,7 @@ export function GridShell({
         diff_mode,
         edit_syntax,
         show_formatting,
+        unrenderable_formula_for_cell,
     ]);
 
     // Tint set = what the webview can derive ∪ what the host named. The union is
@@ -3268,15 +3384,25 @@ export function GridShell({
             const rendered_cell = projected_row.kind === 'removal'
                 ? removal_rendered_rows.get(projected_row.removal.sourceRow)?.[source_column]
                 : pending_rendered_rows.get(projected_row.row.id)?.[source_column];
+            const pending_cell = projected_row.kind === 'removal'
+                ? undefined
+                : projected_row.row.cells[source_column];
+            const unrenderable = rendered_cell?.formula === undefined
+                ? undefined
+                : formula_display_for(rendered_cell.formula, pending_cell?.formulaAnchors);
+            const result_key = pending_formula_result_key_for(
+                projected_row.intendedPhysicalRow,
+                source_column,
+            );
             const formula_result = rendered_cell?.formula === undefined
                 ? undefined
-                : calculated_formula_display(
-                    formula_results_ref.current?.get(
-                        `${projected_row.intendedPhysicalRow}:${source_column}`,
-                    ),
-                    show_formatting,
-                    rendered_cell,
-                );
+                : unrenderable?.kind === 'unrenderable'
+                    ? unrenderable.result
+                    : calculated_formula_display(
+                        result_key === undefined ? undefined : formula_results_ref.current?.get(result_key),
+                        show_formatting,
+                        rendered_cell,
+                    );
             return displayed_text(
                 rendered_cell,
                 show_formatting,
@@ -3309,8 +3435,10 @@ export function GridShell({
             overlay === undefined ? undefined : { editable: false, ...overlay },
         );
     }, [
+        formula_display_for,
         get_row,
         get_source_row,
+        pending_formula_result_key_for,
         pending_rendered_rows,
         removal_rendered_rows,
         show_formatting,
@@ -4476,6 +4604,7 @@ export function GridShell({
         // again filled, which the grid showed as a flicker and which left the
         // second payload outstanding.
         let gesture_order: number | undefined;
+        let formula_refusal: string | undefined;
         const seed_cells = rows.map((values) => {
             const cells: Record<number, PendingRowCell> = {};
             // Only the columns on screen: a draft keeps values for columns that
@@ -4488,24 +4617,28 @@ export function GridShell({
                 // A blank field is not an edit: appended rows start empty, so
                 // writing one would only churn the envelope.
                 if (parsed.text === '' && parsed.rich === undefined) return;
+                const formula_fields = commit_formula_fields(
+                    parsed.text,
+                    edit_syntax === 'markdown' && xlsx_edit_writes_formula(parsed.text, parsed.rich?.runs),
+                    rows.length,
+                );
+                if (formula_fields.kind === 'refused') {
+                    formula_refusal ??= formula_fields.reason;
+                    return;
+                }
                 cells[source_column] = {
                     value: parsed.text,
                     ...(parsed.rich === undefined ? {} : { valueRuns: parsed.rich }),
                     valueEditOrder: gesture_order ??= issue_value_edit_order(),
-                    ...(edit_syntax === 'markdown'
-                        && formula_reference_bases !== undefined
-                        && xlsx_edit_writes_formula(parsed.text, parsed.rich?.runs)
-                        ? {
-                            formulaReferenceBases: formula_reference_bases(
-                                parsed.text,
-                                rows.length,
-                            ),
-                        }
-                        : {}),
+                    ...committed_formula_cell_fields(formula_fields),
                 };
             });
             return cells;
         });
+        if (formula_refusal !== undefined) {
+            refuse_formula(formula_refusal);
+            return false;
+        }
         const appended = await admit_pending_rows(
             rows.length,
             false,
@@ -4527,10 +4660,12 @@ export function GridShell({
         return true;
     }, [
         admit_pending_rows,
+        commit_formula_fields,
         edit_session_id,
         edit_syntax,
         formula_reference_bases,
         issue_value_edit_order,
+        refuse_formula,
         pending_display_row,
         pending_store,
         record_pending_row_gesture,
@@ -4837,11 +4972,11 @@ export function GridShell({
                 ? ''
                 : cell_edit_text(rendered, edit_syntax);
             if (rendered?.formula !== undefined) {
-                original = formula_move_retargeter?.(
+                original = formula_text_for(
                     rendered.formula,
-                    sheet_index,
+                    projected_row.row.cells[source_column]?.formulaAnchors,
                     projected_row.row.cells[source_column]?.valueEditOrder ?? 0,
-                ) ?? rendered.formula;
+                );
             }
             return {
                 kind: 'pending',
@@ -4872,16 +5007,12 @@ export function GridShell({
         if (dirty) {
             original = dirty_value_edit_text(dirty, edit_syntax);
             if (xlsx_edit_writes_formula(dirty.value, dirty.valueRuns?.runs)) {
-                original = formula_move_retargeter?.(
-                    original,
-                    sheet_index,
-                    dirty.valueEditOrder ?? 0,
-                ) ?? original;
+                original = formula_text_for(original, dirty.formulaAnchors, dirty.valueEditOrder ?? 0);
             }
         } else if (edit_syntax === 'markdown') {
             const cell = get_cell_for_source_ref.current(source_row, source_column);
             original = cell?.formula !== undefined
-                ? formula_move_retargeter?.(cell.formula, sheet_index) ?? cell.formula
+                ? formula_text_for(cell.formula, undefined)
                 : cell
                     ? cell_edit_text(cell, edit_syntax)
                 : get_cell_raw(source_row, source_column) ?? '';
@@ -4892,7 +5023,7 @@ export function GridShell({
     }, [
         commit_source_row,
         edit_syntax,
-        formula_move_retargeter,
+        formula_text_for,
         get_cell_raw,
         pending_projection,
         pending_rendered_rows,
@@ -4970,6 +5101,14 @@ export function GridShell({
         const current = stored_pending_rows(before).find(
             (row) => row.id === live.pendingRowId,
         )?.cells[live.sourceColumn];
+        const formula_fields = commit_formula_fields(
+            parsed.text,
+            edit_syntax === 'markdown' && xlsx_edit_writes_formula(parsed.text, parsed.rich?.runs),
+        );
+        if (formula_fields.kind === 'refused') {
+            refuse_formula(formula_fields.reason);
+            return false;
+        }
         const cell: PendingRowCell | undefined = parsed.text === ''
             && parsed.rich === undefined
             && current?.link == null
@@ -4979,11 +5118,7 @@ export function GridShell({
                 ...(parsed.rich === undefined ? {} : { valueRuns: parsed.rich }),
                 ...(current?.link === undefined ? {} : { link: current.link }),
                 valueEditOrder: issue_value_edit_order(),
-                ...(edit_syntax === 'markdown'
-                    && formula_reference_bases !== undefined
-                    && xlsx_edit_writes_formula(parsed.text, parsed.rich?.runs)
-                    ? { formulaReferenceBases: formula_reference_bases(parsed.text) }
-                    : {}),
+                ...committed_formula_cell_fields(formula_fields),
             };
         const planned_height = planned_live_height_ref.current(live);
         const row_heights = planned_height === undefined
@@ -5004,10 +5139,12 @@ export function GridShell({
         return refused();
     }, [
         commit_edit,
+        commit_formula_fields,
         edit_session_id,
         edit_syntax,
         formula_reference_bases,
         history_capture,
+        refuse_formula,
         issue_value_edit_order,
         pending_store,
         record_pending_row_gesture,
@@ -5974,29 +6111,39 @@ export function GridShell({
                     || projected_row.kind === 'replacement'
                     ? projected_row.row.cells[source_column]
                     : undefined;
-                const pending_formula = rendered_cell?.formula === undefined
+                const pending_formula_display = rendered_cell?.formula === undefined
                     ? undefined
-                    : formula_move_retargeter?.(
+                    : formula_display_for(
                         rendered_cell.formula,
-                        sheet_index,
+                        pending_value_cell?.formulaAnchors,
                         pending_value_cell?.valueEditOrder ?? 0,
-                    ) ?? rendered_cell.formula;
+                    );
+                const pending_formula = pending_formula_display?.text;
+                const pending_unrenderable = pending_formula_display?.kind === 'unrenderable'
+                    ? pending_formula_display
+                    : undefined;
+                const pending_result_key = pending_formula_result_key_for(
+                    projected_row.intendedPhysicalRow,
+                    source_column,
+                );
                 const pending_formula_result = rendered_cell?.formula === undefined
                     ? undefined
-                    : calculated_formula_display(
-                        formula_results_ref.current?.get(
-                            `${projected_row.intendedPhysicalRow}:${source_column}`,
-                        ),
+                    : pending_unrenderable?.result ?? calculated_formula_display(
+                        pending_result_key === undefined
+                            ? undefined
+                            : formula_results_ref.current?.get(pending_result_key),
                         show_formatting,
                         rendered_cell,
                     );
+                // A formula that cannot render for the current layouts cannot be edited.
+                const pending_editable = editable && pending_unrenderable === undefined;
                 const overlay: CellEditOverlay = {
-                    editable,
-                    refused: editable_cells && is_removal,
+                    editable: pending_editable,
+                    refused: editable_cells && (is_removal || pending_unrenderable !== undefined),
                     bg: pending_highlight === undefined
                         ? is_removal ? compare_row_bgs.deleted : compare_row_bgs.added
                         : highlight_rgba(pending_highlight, high_contrast),
-                    ...(edit_syntax === 'markdown' && editable && rendered_cell !== null
+                    ...(edit_syntax === 'markdown' && pending_editable && rendered_cell !== null
                         && rendered_cell !== undefined
                         ? {
                             edit_value: pending_formula
@@ -6093,10 +6240,14 @@ export function GridShell({
             // and a cell highlight still wins over the tint.
             const layout_removal = source_row !== undefined
                 && is_removed_source_row(source_row);
-            const editable = editable_cells && source_row !== undefined
-                && !pending_removal && !layout_removal;
             const loaded_row = get_row(source_display_row);
             const loaded_cell = loaded_row?.[source_column];
+            // A formula that cannot render for the current layouts cannot be
+            // edited; it shows `??` with the reason instead.
+            const formula_unrenderable = source_row !== undefined
+                && unrenderable_formula_for_cell(loaded_cell, dirty) !== undefined;
+            const editable = editable_cells && source_row !== undefined
+                && !pending_removal && !layout_removal && !formula_unrenderable;
             const value_overlay = source_row === undefined || key === undefined
                 ? undefined
                 : value_overlay_for_cell(
@@ -6121,11 +6272,11 @@ export function GridShell({
                         () => dirty_value_edit_text(dirty, edit_syntax),
                     );
                     if (xlsx_edit_writes_formula(dirty.value, dirty.valueRuns?.runs)) {
-                        edit_value = formula_move_retargeter?.(
+                        edit_value = formula_text_for(
                             edit_value,
-                            sheet_index,
+                            dirty.formulaAnchors,
                             dirty.valueEditOrder ?? 0,
-                        ) ?? edit_value;
+                        );
                     }
                 } else {
                     const loaded = loaded_row?.[source_column];
@@ -6135,10 +6286,7 @@ export function GridShell({
                             () => cell_edit_text(loaded, edit_syntax),
                         );
                         if (loaded.formula !== undefined) {
-                            edit_value = formula_move_retargeter?.(
-                                loaded.formula,
-                                sheet_index,
-                            ) ?? loaded.formula;
+                            edit_value = formula_text_for(loaded.formula, undefined);
                         }
                     }
                 }
@@ -6180,7 +6328,8 @@ export function GridShell({
                     // and it does reach this branch, via highlight_bg, which is
                     // plain view state independent of edit mode.
                     refused: editable_cells
-                        && (source_row === undefined || pending_removal || layout_removal),
+                        && (source_row === undefined || pending_removal || layout_removal
+                            || formula_unrenderable),
                     ...value_overlay,
                     // Compare's before-text rides the Diff toggle's channel; no
                     // dirty_value, so the "after" side is the cell's own text.
@@ -6230,15 +6379,14 @@ export function GridShell({
                 : undefined;
             const dirty_formula = dirty_formula_source === undefined
                 ? undefined
-                : formula_move_retargeter?.(
+                : formula_text_for(
                     dirty_formula_source,
-                    sheet_index,
+                    dirty?.formulaAnchors,
                     dirty?.valueEditOrder ?? 0,
-                ) ?? dirty_formula_source;
+                );
             const loaded_formula = loaded_cell?.formula === undefined
                 ? undefined
-                : formula_move_retargeter?.(loaded_cell.formula, sheet_index)
-                    ?? loaded_cell.formula;
+                : formula_text_for(loaded_cell.formula, undefined);
             const formula = dirty_formula ?? (
                 dirty === undefined && edit_syntax === 'markdown'
                     ? loaded_formula
@@ -6293,7 +6441,10 @@ export function GridShell({
             value_overlay_for_cell,
             clipboard_source,
             mapping_generation,
-            formula_move_retargeter,
+            formula_display_for,
+            formula_text_for,
+            pending_formula_result_key_for,
+            unrenderable_formula_for_cell,
             sheet_index,
         ],
     );
@@ -6498,6 +6649,14 @@ export function GridShell({
                                     col: movedFrom[0],
                                 };
                             })();
+                    const formula_fields = commit_formula_fields(
+                        parsed.text,
+                        xlsx_edit_writes_formula(parsed.text, parsed.rich?.runs),
+                    );
+                    if (formula_fields.kind === 'refused') {
+                        refuse_formula(formula_fields.reason);
+                        return 'refused';
+                    }
                     const next: PendingRowCell | undefined = parsed.text === ''
                         && parsed.rich === undefined
                         && existing?.link == null
@@ -6508,12 +6667,7 @@ export function GridShell({
                             ...(parsed.rich === undefined ? {} : { valueRuns: parsed.rich }),
                             ...(existing?.link === undefined ? {} : { link: existing.link }),
                             valueEditOrder: pending_gesture_order,
-                            ...(xlsx_edit_writes_formula(parsed.text, parsed.rich?.runs)
-                                && formula_reference_bases !== undefined
-                                ? {
-                                    formulaReferenceBases: formula_reference_bases(parsed.text),
-                                }
-                                : {}),
+                            ...committed_formula_cell_fields(formula_fields),
                             ...(moved_source === undefined
                                 ? existing?.movedFrom === undefined
                                     ? {}
@@ -6896,6 +7050,7 @@ export function GridShell({
             auto_grow_row_for_text,
             can_capture_edits,
             commit_edits_result,
+            commit_formula_fields,
             display_column_count,
             edit_admission_is_fenced,
             gestures_admitted,
@@ -6909,6 +7064,7 @@ export function GridShell({
             pending_store,
             planned_auto_grow_height,
             record_pending_row_gesture,
+            refuse_formula,
             sheet_index,
             sheet_meta.name,
             sheet_meta.unnamedSingleSheet,
@@ -7041,6 +7197,50 @@ export function GridShell({
     // Custom overlay editor (Enter/Tab advance, Shift/Alt+Enter newline, Esc
     // cancel). Rich Markdown cells adapt through the same text editor so their
     // canvas renderer can remain active throughout Edit mode.
+    /**
+     * The editor refuses to open on a formula that cannot render for the
+     * current layouts (the cell is read-only); activating it says why.
+     */
+    const on_cell_activated = useCallback((cell: Item) => {
+        if (!editable_cells) return;
+        const [display_column, row] = cell;
+        const source_column = source_column_for_display(display_column);
+        if (source_column === undefined) return;
+        const projected_row = pending_projection.row_at(row);
+        let unrenderable: FormulaDisplay | undefined;
+        if (projected_row?.kind === 'pending' || projected_row?.kind === 'replacement') {
+            const rendered = pending_rendered_rows.get(projected_row.row.id)?.[source_column];
+            unrenderable = rendered?.formula === undefined
+                ? undefined
+                : formula_display_for(
+                    rendered.formula,
+                    projected_row.row.cells[source_column]?.formulaAnchors,
+                );
+        } else if (projected_row === undefined || projected_row.kind === 'source') {
+            const source_row = commit_source_row(row);
+            if (source_row === undefined) return;
+            const source_display_row = projected_row?.sourceDisplayRow ?? row;
+            unrenderable = unrenderable_formula_for_cell(
+                get_row(source_display_row)?.[source_column],
+                store.get(cell_key(source_row, source_column)),
+            );
+        }
+        if (unrenderable?.kind !== 'unrenderable') return;
+        refuse_formula(`Table Viewer ${unrenderable.reason} while rows or columns are being inserted, `
+            + 'deleted, or moved, so this formula can\'t be edited.');
+    }, [
+        commit_source_row,
+        editable_cells,
+        formula_display_for,
+        get_row,
+        pending_projection,
+        pending_rendered_rows,
+        refuse_formula,
+        source_column_for_display,
+        store,
+        unrenderable_formula_for_cell,
+    ]);
+
     const provide_editor = useCallback<ProvideEditorCallback<GridCell>>(
         (cell) => {
             if (
@@ -8792,6 +8992,7 @@ export function GridShell({
                 customRenderers={custom_renderers}
                 onCellContextMenu={on_cell_context_menu}
                 onKeyDown={on_key_down}
+                onCellActivated={on_cell_activated}
                 provideEditor={provide_editor}
             />
             {may_offer_append_dock && (

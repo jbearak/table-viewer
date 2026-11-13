@@ -121,6 +121,7 @@ export type EditSessionFormulaChange =
 export interface EditSessionFormulaInput {
     readonly value: string;
     readonly runs?: readonly RichTextRun[];
+    readonly formulaAnchors?: DirtyEntry['formulaAnchors'];
 }
 
 function formula_input(entry: DirtyEntry | undefined): EditSessionFormulaInput | undefined {
@@ -128,6 +129,7 @@ function formula_input(entry: DirtyEntry | undefined): EditSessionFormulaInput |
     return {
         value: entry.value,
         ...(entry.valueRuns !== undefined ? { runs: entry.valueRuns.runs } : {}),
+        ...(entry.formulaAnchors !== undefined ? { formulaAnchors: entry.formulaAnchors } : {}),
     };
 }
 
@@ -137,6 +139,9 @@ function formula_inputs_equal(
 ): boolean {
     if (left === undefined || right === undefined) return left === right;
     if (left.value !== right.value) return false;
+    if (JSON.stringify(left.formulaAnchors ?? null) !== JSON.stringify(right.formulaAnchors ?? null)) {
+        return false;
+    }
     if (left.runs === undefined || right.runs === undefined) {
         return left.runs === right.runs;
     }
