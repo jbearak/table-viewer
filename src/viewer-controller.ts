@@ -1251,8 +1251,12 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
         );
         const retained_row_count = sheet_meta.sourceRowCount
             - structural.tailRemovals.length;
+        // With a live layout change the prospective sheet is the layout's live
+        // rows and the append band, which `xlsx_save_structure` checks against
+        // the limit; source rows the layout deletes don't count.
         if (retained_row_count < 0
-            || retained_row_count + appended_rows(structural).length > MAX_SHEET_ROWS) {
+            || (!has_live_layout_change(structural)
+                && retained_row_count + appended_rows(structural).length > MAX_SHEET_ROWS)) {
             structural_save_error(
                 worksheet_operation_index,
                 structural,
