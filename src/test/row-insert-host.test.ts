@@ -855,3 +855,108 @@ describe('review fixes', () => {
         await viewer.dispose();
     });
 });
+
+describe('moving rows (delivery step 7)', () => {
+    const moved_layout = {
+        // c, a, b: source row 2 moved to the top.
+        runs: [
+            { kind: 'source' as const, start: 2, count: 1 },
+            { kind: 'source' as const, start: 0, count: 2 },
+        ],
+        removedSourceRows: [],
+        discardedPendingRows: [],
+    };
+
+    it('publishes a move without any admission, and refuses sorting while moved rows exist', async () => {
+        const viewer = await open_viewer();
+        expect(await viewer.publish({ rowLayout: moved_layout, structuralBasis: BASIS })).toBe(true);
+        expect(viewer.durable().pendingEdits?.[0]?.rowLayout).toEqual(moved_layout);
+        await viewer.panel.__receive({
+            type: 'setTransform',
+            sheetIndex: 0,
+            requestId: 'sort-moved',
+            generation: viewer.last<{ snapshot: { generation: number } }>('workbookSnapshot').snapshot.generation,
+            sourceGeneration: viewer.generation(),
+            intent: 'user',
+            state: { sort: [{ colIndex: 0, direction: 'asc' }], filters: [], schema: SCHEMA },
+        } as never);
+        await viewer.controller.drain();
+        expect(viewer.durable().transforms?.[0]).toBeUndefined();
+        await viewer.dispose();
+    });
+
+    it('refuses a published move whose layout breaks an invariant', async () => {
+        const viewer = await open_viewer();
+        expect(await viewer.publish({
+            rowLayout: { ...moved_layout, runs: [{ kind: 'source', start: 2, count: 1 }, { kind: 'source', start: 0, count: 1 }] },
+            structuralBasis: BASIS,
+        })).toBe(false);
+        await viewer.dispose();
+    });
+
+    it('saves moves with a delete, an insert, and an append, and rekeys highlights and heights', async () => {
+        const state = versioned_state_store({
+            cellHighlights: {
+                sourceDigest: hex(BYTES),
+                sheets: [{ schema: SCHEMA, cells: { '0:0': 'green', '1:1': 'pink', '2:1': 'yellow' } }],
+            },
+            rowHeights: [{ 0: 20, 1: 21, 2: 22 }],
+        });
+        const viewer = await open_viewer({ state });
+        const reply = await viewer.insert({ requestId: 'ins' });
+        await viewer.settle('ins', true);
+        const appended = await viewer.append('app', 1) as {
+            rowIds?: string[];
+            formatTemplate?: { id: string };
+            appendBasis?: unknown;
+        };
+        await viewer.settle('app', true);
+        const ins = inserted(reply.rowIds![0]!, reply.formatTemplate!.id, 1, {
+            cells: { 1: { value: 'new', valueEditOrder: 1 } },
+        } as never);
+        const app = {
+            id: appended.rowIds![0]!,
+            cells: { 0: { value: 'tail', valueEditOrder: 2 } },
+            formatTemplateId: appended.formatTemplate!.id,
+            createdOrder: 2,
+        };
+        const templates = [reply.formatTemplate, appended.formatTemplate]
+            .filter((template, index, all) => all.findIndex((other) => other!.id === template!.id) === index);
+        // c moved to the top, then a, the inserted row, and b deleted after it.
+        const changes: Partial<WorksheetPendingEdits> = {
+            formatTemplates: templates as never,
+            appendedRows: [ins, app] as never,
+            appendBasis: appended.appendBasis as never,
+            rowLayout: {
+                runs: [
+                    { kind: 'source', start: 2, count: 1 },
+                    { kind: 'source', start: 0, count: 1 },
+                    { kind: 'pending', ids: [ins.id] },
+                    { kind: 'source', start: 1, count: 1 },
+                ],
+                removedSourceRows: [{ start: 1, count: 1 }],
+                discardedPendingRows: [],
+            },
+            structuralBasis: reply.structuralBasis!,
+        };
+        expect(await viewer.publish(changes)).toBe(true);
+        const result = await viewer.save(changes);
+        expect(result).toMatchObject({
+            success: true,
+            receipt: {
+                appendedRows: [{ pendingRowId: app.id, sourceRow: 3 }],
+                structure: [{
+                    rowRuns: [{ from: 0, count: 1, to: 1 }, { from: 2, count: 1, to: 0 }],
+                    removedRows: [{ start: 1, count: 1 }],
+                    insertedRows: [{ pendingRowId: ins.id, sourceRow: 2 }],
+                }],
+            },
+        });
+        expect(dec.decode(viewer.file.bytes)).toBe('h1,h2\nc,3\na,1\n,new\ntail,\n');
+        await vi.waitFor(() => expect(viewer.durable().pendingEdits).toBeUndefined());
+        expect(viewer.durable().cellHighlights?.sheets[0]?.cells).toEqual({ '1:0': 'green', '0:1': 'yellow' });
+        expect(viewer.durable().rowHeights?.[0]).toEqual({ 1: 20, 0: 22 });
+        expect(viewer.durable().structuralRekeyIntent).toBeUndefined();
+        await viewer.dispose();
+    });
+});

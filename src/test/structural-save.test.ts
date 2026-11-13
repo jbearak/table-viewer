@@ -172,6 +172,37 @@ describe('plan_csv_save with a row layout', () => {
         ]);
     });
 
+    it('writes moved rows of a TSV file in layout order, beside an inserted row and an append', async () => {
+        const text = 'h\tv\na\t1\nb\t2\nc\t3\nd\t4\n';
+        const { output, result } = await plan(text, '/tmp/s.tsv', (bytes) => changes({
+            // d and c moved above a; b deleted; an inserted row after a.
+            runs: [
+                { kind: 'source', start: 3, count: 1 },
+                { kind: 'source', start: 2, count: 1 },
+                { kind: 'source', start: 0, count: 1 },
+                { kind: 'pending', ids: ['ins'] },
+                { kind: 'source', start: 1, count: 1 },
+            ],
+            removedSourceRows: [{ start: 1, count: 1 }],
+            discardedPendingRows: [],
+        }, basis_of(bytes, 4, 2), {
+            formatTemplates: [APPEND_TEMPLATE],
+            appendBasis: append_basis(2, ['h', 'v'], 4),
+            appendedRows: [
+                { id: 'ins', origin: 'insert', cells: { 1: { value: 'x', valueEditOrder: 1 } }, formatTemplateId: 'plain', createdOrder: 1 },
+                { id: 'app', cells: { 0: { value: 'z', valueEditOrder: 2 } }, formatTemplateId: 'plain', createdOrder: 2 },
+            ],
+        }), { '2:1': 'three' });
+        expect(output).toBe('h\tv\nd\t4\nc\tthree\na\t1\n\tx\nz\t\n');
+        expect(result.receipt?.structure?.[0]?.rowRuns).toEqual([
+            { from: 0, count: 1, to: 2 },
+            { from: 2, count: 1, to: 1 },
+            { from: 3, count: 1, to: 0 },
+        ]);
+        expect(result.receipt?.structure?.[0]?.insertedRows).toEqual([{ pendingRowId: 'ins', sourceRow: 3 }]);
+        expect(result.receipt?.appendedRows.map((row) => [row.pendingRowId, row.sourceRow])).toEqual([['app', 4]]);
+    });
+
     it('keeps a save without a live layout change byte-identical', async () => {
         const text = 'h,"q ""x"""\r\n1,"a\r\nb"\r\n2\r\n';
         const plain = await plan(text, '/tmp/s.csv', undefined, { '1:1': 'z' });
