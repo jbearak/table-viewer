@@ -1012,6 +1012,9 @@ function construct_worksheets(formula: string, start: number, end: number): (str
         const qualifier = sheet_qualifier_at(formula, index);
         if (qualifier !== undefined) {
             add(qualifier.name);
+            // Not a reference, so a structured reference on that sheet, or a
+            // sheet-scoped defined name, which may point at any sheet.
+            if (/[\p{L}_\\]/u.test(formula[qualifier.end] ?? '')) unknown = true;
             index = qualifier.end;
             continue;
         }

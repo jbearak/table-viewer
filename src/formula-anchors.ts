@@ -290,7 +290,8 @@ function lands_on_pending(token: FormulaReferenceToken, worksheet: AnchorWorkshe
 /**
  * Worksheets an unanchorable construct may touch. An empty list, or a 3D
  * bound that names no worksheet, could be any worksheet, so it counts as
- * every one.
+ * every one. A range whose corners name different worksheets may be a 3D
+ * reference (`S1:Sheet3!A1`), so it spans every worksheet between them.
  */
 function issue_worksheets(
     context: FormulaAnchorContext,
@@ -304,7 +305,11 @@ function issue_worksheets(
         if (first === undefined || last === undefined) return every;
         return every.slice(Math.min(first, last), Math.max(first, last) + 1);
     }
-    return resolved.filter((index): index is number => index !== undefined);
+    const known = resolved.filter((index): index is number => index !== undefined);
+    if (issue.kind === 'mixedSheets' && known.length > 0) {
+        return every.slice(Math.min(...known), Math.max(...known) + 1);
+    }
+    return known;
 }
 
 function refusal_reason(

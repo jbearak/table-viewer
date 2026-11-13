@@ -294,6 +294,12 @@ describe('anchoring at commit time', () => {
         // A cell-shaped 3D prefix spans the sheets between its bounds.
         const three_d = [sheet('Sheet1', four), sheet('S1', four), sheet('S2', move_before(four, 4, 1)), sheet('S3', four)];
         expect(anchor_formula('=SUM(S1:S3!A1)', anchor_context(three_d)).kind).toBe('refused');
+        // `S1:Sheet3!A1` may be a 3D reference across every sheet between.
+        const between = [sheet('Home', four), sheet('S1', four), sheet('Middle', move_before(four, 4, 1)), sheet('Sheet3', four)];
+        expect(anchor_formula('=SUM(S1:Sheet3!A1)', anchor_context(between)).kind).toBe('refused');
+        // A sheet-scoped defined name may point at any sheet.
+        const other = [sheet('Sheet1', four), sheet('Data', four), sheet('Other', move_before(four, 4, 1))];
+        expect(anchor_formula('=INDEX(Data!Total,1):B5', anchor_context(other)).kind).toBe('refused');
         // A defined name could be any sheet.
         expect(anchor_formula('=SUM(Total:B5)', anchor_context(three_d)).kind).toBe('refused');
         expect(anchor_formula('=SUM(S1:S3!A1)+SUM(Total:B5)', anchor_context([sheet('Sheet1', four), sheet('S1', four)])))

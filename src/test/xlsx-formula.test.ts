@@ -400,6 +400,14 @@ describe('formula reference tokenizer', () => {
         expect(issues('=SUM(A1:B2:Data!C3)')).toEqual([
             { kind: 'rangeOperand', text: 'A1:B2:Data!C3', worksheets: [undefined, 'Data'] },
         ]);
+        // A sheet-scoped defined name may point at any sheet.
+        expect(issues('=INDEX(Data!Total,1):B5')).toEqual([
+            { kind: 'rangeOperand', text: 'INDEX(Data!Total,1):B5', worksheets: [] },
+        ]);
+        expect(issues("=INDEX(Data![Col],1):B5+INDEX('Da ta'!Total,1):B5")).toEqual([
+            { kind: 'rangeOperand', text: 'INDEX(Data![Col],1):B5', worksheets: ['Data', undefined] },
+            { kind: 'rangeOperand', text: "INDEX('Da ta'!Total,1):B5", worksheets: [] },
+        ]);
         expect(issues('=SUM(Total:B5)')).toEqual([
             // A defined name may lie on any sheet.
             { kind: 'rangeOperand', text: 'Total:B5', worksheets: [] },
