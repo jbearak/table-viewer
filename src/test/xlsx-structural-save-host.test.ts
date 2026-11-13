@@ -4,25 +4,17 @@
 // insert, append, and edit in combination, checked against the written
 // package, the receipt, the rekey, and `parse_xlsx`.
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type * as vscode from 'vscode';
-import {
-    attach_viewer,
-    profile_for,
-    simulate_process_restart_for_tests,
-} from '../viewer-controller';
-import { with_in_memory_authority_transactions } from '../state-authority';
+import { profile_for, simulate_process_restart_for_tests } from '../viewer-controller';
+import { current_structural_basis } from '../structural-editing-capability';
+import { observe_xlsx_structure } from '../xlsx-structural-observation';
 import type { PerFileState, WorksheetPendingEdits } from '../types';
-import type { PendingAppendedRow, PendingRowFormatTemplate, StructuralBasis } from '../pending-changes';
-import type { StructuralEditingCapability } from '../viewer-snapshot';
+import type { PendingAppendedRow } from '../pending-changes';
 import { content_digest } from '../content-digest';
 import { parse_xlsx } from '../parse-xlsx';
 import { ZipPackage } from '../zip-package';
-import { versioned_state_store } from './helpers/versioned-state-store';
 import { build_fixture_xlsx, cell, representative_workbook, row } from './helpers/xlsx-structure-fixture';
+import { FILE, open_xlsx, part_text, with_parts, type OpenXlsx } from './helpers/xlsx-viewer';
 import * as vscode_mock from './mocks/vscode';
-import { fake_viewer_host } from './mocks/host-ports';
-
-const FILE = '/tmp/xlsx-structural-save-host.xlsx';
 
 afterEach(() => {
     for (const panel of vscode_mock.__getPanels()) panel.dispose();
@@ -30,173 +22,6 @@ afterEach(() => {
     vscode_mock.__reset();
     simulate_process_restart_for_tests();
 });
-
-type Message = { type?: string } & Record<string, unknown>;
-
-function disk(initial: Uint8Array) {
-    const file = { bytes: initial, mtime: 1, writes: [] as Uint8Array[] };
-    vscode_mock.__setStatImplementation(async () => ({ size: file.bytes.length, mtime: file.mtime }));
-    vscode_mock.__setReadFileImplementation(async () => file.bytes);
-    vscode_mock.__setWriteFileImplementation(async (_uri, content) => {
-        file.writes.push(content);
-        file.bytes = content;
-        file.mtime += 1;
-    });
-    return file;
-}
-
-export interface OpenXlsx {
-    readonly file: ReturnType<typeof disk>;
-    readonly messages: () => Message[];
-    readonly warning: ReturnType<typeof vi.spyOn>;
-    durable(): PerFileState;
-    capability(): StructuralEditingCapability;
-    basis(sheet_index: number): StructuralBasis;
-    insert(request: { anchor: number; side: 'before' | 'after'; count?: number; requestId: string; sheet?: number }): Promise<{
-        granted: boolean;
-        reason?: string;
-        rowIds?: string[];
-        formatTemplate?: PendingRowFormatTemplate;
-        structuralBasis?: StructuralBasis;
-        appendBasis?: WorksheetPendingEdits['appendBasis'];
-    }>;
-    append(request_id: string, count: number): Promise<{
-        granted: boolean;
-        rowIds?: string[];
-        formatTemplate?: PendingRowFormatTemplate;
-        appendBasis?: WorksheetPendingEdits['appendBasis'];
-    }>;
-    settle(request_id: string, accepted: boolean): Promise<void>;
-    publish(sheet_index: number, changes: Partial<WorksheetPendingEdits>): Promise<boolean>;
-    save(worksheets: readonly {
-        sheetIndex: number;
-        structural?: Partial<WorksheetPendingEdits>;
-        cells?: Record<string, { value: string; base: string }>;
-    }[]): Promise<{ success: boolean; receipt?: Record<string, unknown>; rejection?: Record<string, unknown> }>;
-}
-
-export async function open_xlsx(bytes: Uint8Array, options: { readonly state?: PerFileState } = {}): Promise<OpenXlsx> {
-    const file = disk(bytes);
-    const state = versioned_state_store(options.state ?? {});
-    const panel = vscode_mock.window.createWebviewPanel('tableViewer.editor', 'table');
-    const controller = attach_viewer(
-        panel as unknown as Parameters<typeof attach_viewer>[0],
-        vscode_mock.Uri.file(FILE) as unknown as vscode.Uri,
-        with_in_memory_authority_transactions(state.store),
-        profile_for(FILE),
-        fake_viewer_host,
-        { structuralEditingEnabled: true },
-    );
-    panel.onDidDispose(() => controller.dispose());
-    const warning = vi.spyOn(vscode_mock.window, 'showWarningMessage');
-    await panel.__receive({ type: 'ready', structuralLayout: 1 });
-    await panel.__receive({ type: 'requestEditSession', requestId: 'edit' });
-    await controller.drain();
-    const messages = () => panel.__messages as Message[];
-    const last = <T,>(type: string) => [...messages()].reverse().find((message) => message.type === type) as T;
-    const session_id = () => last<{ editSessionId?: string }>('editSessionResult')?.editSessionId;
-    const snapshot = () => last<{ snapshot: {
-        sourceGeneration: number;
-        meta: { sheets: { name: string }[] };
-        capabilities: { structuralEditing?: StructuralEditingCapability };
-    } }>('workbookSnapshot').snapshot;
-    const sheet_name = (index: number) => snapshot().meta.sheets[index]!.name;
-    let sequence = 0;
-    return {
-        file,
-        messages,
-        warning,
-        durable: () => state.get_state(FILE) as PerFileState,
-        capability: () => snapshot().capabilities.structuralEditing!,
-        basis: (index) => snapshot().capabilities.structuralEditing!.sheets[index]!.basis!,
-        async insert(request) {
-            await panel.__receive({
-                type: 'requestStructuralInsert',
-                requestId: request.requestId,
-                editSessionId: session_id()!,
-                worksheet: { sheetIndex: request.sheet ?? 0, sheetName: sheet_name(request.sheet ?? 0) },
-                sourceGeneration: snapshot().sourceGeneration,
-                axis: 'rows',
-                anchor: { row: { kind: 'source', sourceRow: request.anchor } },
-                side: request.side,
-                count: request.count ?? 1,
-            });
-            await controller.drain();
-            return [...messages()].reverse().find((message) =>
-                message.type === 'structuralInsertResult' && message.requestId === request.requestId) as never;
-        },
-        async append(request_id, count) {
-            await panel.__receive({
-                type: 'requestAppendRows',
-                requestId: request_id,
-                editSessionId: session_id()!,
-                worksheet: { sheetIndex: 0, sheetName: sheet_name(0) },
-                sourceGeneration: snapshot().sourceGeneration,
-                count,
-            });
-            await controller.drain();
-            return [...messages()].reverse().find((message) =>
-                message.type === 'appendRowsResult' && message.requestId === request_id) as never;
-        },
-        async settle(request_id, accepted) {
-            await panel.__receive({ type: 'settleRowAdmission', requestId: request_id, editSessionId: session_id()!, accepted });
-            await controller.drain();
-        },
-        async publish(sheet_index, changes) {
-            sequence += 1;
-            const at = sequence;
-            await panel.__receive({
-                type: 'pendingChangesChanged',
-                editSessionId: session_id()!,
-                sequence: at,
-                sourceGeneration: snapshot().sourceGeneration,
-                changes: {
-                    sheetIndex: sheet_index,
-                    sheetName: sheet_name(sheet_index),
-                    cells: {},
-                    formatTemplates: [],
-                    appendedRows: [],
-                    tailRemovals: [],
-                    conflicts: [],
-                    ...changes,
-                },
-            });
-            await controller.drain();
-            return messages().some((message) =>
-                message.type === 'pendingChangesAcknowledged' && message.sequence === at);
-        },
-        async save(worksheets) {
-            await panel.__receive({
-                type: 'saveCsv',
-                operation: {
-                    editSessionId: session_id()!,
-                    saveRequestId: `save-${Math.random()}`,
-                    worksheets: worksheets.map(({ sheetIndex, structural, cells = {} }) => ({
-                        sheetIndex,
-                        sheetName: sheet_name(sheetIndex),
-                        edits: Object.fromEntries(Object.entries(cells).map(([key, entry]) => [key, entry.value])),
-                        dirtyEdits: cells,
-                        ...(structural === undefined ? {} : {
-                            structuralChanges: {
-                                formatTemplates: [],
-                                appendedRows: [],
-                                tailRemovals: [],
-                                conflicts: [],
-                                ...structural,
-                            },
-                        }),
-                    })),
-                },
-            });
-            await controller.drain();
-            return last('saveResult');
-        },
-    };
-}
-
-export function part_text(bytes: Uint8Array, path: string): string | null {
-    return ZipPackage.open(bytes).read_text(`/${path}`);
-}
 
 const HEADER_ON: PerFileState = { excelFirstRowHeaders: { Data: 'on' } };
 
@@ -386,7 +211,6 @@ describe('saving .xlsx row changes', () => {
         const saved = viewer.file.bytes;
         const data = part_text(saved, 'xl/worksheets/sheet1.xml')!;
         const summary = part_text(saved, 'xl/worksheets/sheet2.xml')!;
-        if (process.env.DUMP_XLSX) { console.log(data); console.log(summary); console.log(part_text(saved, 'xl/workbook.xml')); require('node:fs').writeFileSync(process.env.DUMP_XLSX, saved); }
         const rows = rows_of(data);
         expect([...rows.keys()]).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
         // Cherry moved up a row, with its edit; Grape copies Date's format.
@@ -396,8 +220,9 @@ describe('saving .xlsx row changes', () => {
         expect(rows.get(5)!.inner).toMatch(/<c r="A5" s="3"[^>]*>.*Grape/);
         // The shared Total formula renders per row; every cache is invalidated.
         for (const number of [2, 3, 4, 6, 7]) {
-            expect(data).toMatch(new RegExp(`<c r="D${number}"><f[^>]*>B${number}\\*C${number}</f></c>|<c r="D${number}"><f[^>]*>[^<]*</f></c>`));
+            expect(data).toContain(`<c r="D${number}"><f>B${number}*C${number}</f></c>`);
         }
+        expect(rows.get(5)!.inner).not.toContain('<f>');
         expect(data).toContain('<mergeCell ref="E2:F2"/>');
         expect(data).toContain('sqref="B2:B7"');
         expect(data).toContain('<autoFilter ref="A1:D7"/>');
@@ -432,5 +257,321 @@ describe('saving .xlsx row changes', () => {
         await vi.waitFor(() => expect(viewer.durable().pendingEdits).toBeUndefined());
         expect(viewer.durable().rowHeights?.[0]).toEqual({ 2: 31, 5: 33 });
         expect(viewer.durable().structuralRekeyIntent).toBeUndefined();
+    });
+});
+
+/** Data's body without Banana (source row 2), as a publication or save carries it. */
+function removal(viewer: OpenXlsx): Partial<WorksheetPendingEdits> {
+    return {
+        rowLayout: {
+            runs: [{ kind: 'source', start: 1, count: 6 }],
+            removedSourceRows: [{ start: 2, count: 1 }],
+            discardedPendingRows: [],
+        },
+        structuralBasis: viewer.basis(0),
+    };
+}
+
+describe('the per-part Structural Basis', () => {
+    it.each([
+        ['another worksheet', 'xl/worksheets/sheet2.xml', false],
+        ['the worksheet', 'xl/worksheets/sheet1.xml', true],
+        ['the shared strings', 'xl/sharedStrings.xml', true],
+        ['the styles', 'xl/styles.xml', true],
+        ['the workbook', 'xl/workbook.xml', true],
+    ] as const)('conflicts when %s changes: %s', async (_label, path, conflicts) => {
+        const raw = representative_workbook();
+        const viewer = await open_xlsx(raw, { state: HEADER_ON });
+        const changes = removal(viewer);
+        expect(await viewer.publish(0, changes)).toBe(true);
+        const original = part_text(raw, path)!;
+        // A semantically neutral edit, so the workbook still opens the same.
+        await viewer.change(with_parts(raw, { [path]: original.replace('?>', '?>\n') }));
+        const slot = viewer.durable().pendingEdits?.[0];
+        if (conflicts) {
+            await vi.waitFor(() => expect(viewer.durable().pendingEdits?.[0]?.conflicts)
+                .toEqual([{ reason: 'structuralBasisChanged', pendingRowIds: [], tailRemovalIds: [] }]));
+            const result = await viewer.save([{ sheetIndex: 0, structural: { ...changes, conflicts: viewer.durable().pendingEdits![0]!.conflicts } }]);
+            expect(result).toMatchObject({
+                success: false,
+                rejection: { reason: 'structuralConflict', structuralReason: 'structuralBasisChanged' },
+            });
+            expect(viewer.file.writes).toHaveLength(0);
+        } else {
+            expect(slot?.conflicts ?? []).toEqual([]);
+            expect(viewer.basis(0)).toEqual(changes.structuralBasis);
+            const result = await viewer.save([{ sheetIndex: 0, structural: changes }]);
+            expect(result).toMatchObject({ success: true });
+            expect(rows_of(part_text(viewer.file.bytes, 'xl/worksheets/sheet1.xml')!).size).toBe(6);
+            // The rendering reads the current file: the other sheet's change is kept.
+            expect(part_text(viewer.file.bytes, 'xl/worksheets/sheet2.xml')!.startsWith(original.replace('?>', '?>\n').slice(0, 60))).toBe(true);
+        }
+    });
+});
+
+describe('structural save refusals', () => {
+    async function refused_save(viewer: OpenXlsx, structural: Partial<WorksheetPendingEdits>) {
+        const result = await viewer.save([{ sheetIndex: 0, structural }]);
+        expect(result).toMatchObject({
+            success: false,
+            rejection: { reason: 'structuralConflict', structuralReason: 'unsupportedStructure', worksheetOperationIndex: 0 },
+        });
+        expect(viewer.file.writes).toHaveLength(0);
+        return (result.rejection as { message: string }).message;
+    }
+
+    it('re-runs the support scan on the bytes it rewrites, and records the refusal for Review Changes', async () => {
+        const raw = representative_workbook();
+        const viewer = await open_xlsx(raw, { state: HEADER_ON });
+        const changes = removal(viewer);
+        expect(await viewer.publish(0, changes)).toBe(true);
+        // A table related to Data through its relationships part only: the
+        // Structural Basis (worksheet, strings, styles, workbook) still
+        // matches, but the sheet is no longer supported.
+        const rels = part_text(raw, 'xl/worksheets/_rels/sheet1.xml.rels')!.replace(
+            '</Relationships>',
+            '<Relationship Id="rId9" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/table" Target="../tables/table1.xml"/></Relationships>',
+        );
+        await viewer.change(with_parts(raw, {
+            'xl/worksheets/_rels/sheet1.xml.rels': rels,
+            'xl/tables/table1.xml': '<table xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" id="1" name="T" displayName="T" ref="A1:D7"/>',
+        }));
+        expect(viewer.durable().pendingEdits?.[0]?.conflicts ?? []).toEqual([]);
+        expect(viewer.capability().sheets[0]!.rows.supported).toBe(false);
+        const message = await refused_save(viewer, changes);
+        expect(message).toMatch(/^Can't insert, delete, or move rows on this sheet: /);
+        // Recorded on the worksheet's slot, so the webview's echo of it is
+        // accepted, and a later save re-derives it rather than being blocked.
+        const conflict = { reason: 'unsupportedStructure' as const, pendingRowIds: [], tailRemovalIds: [], message };
+        expect(viewer.durable().pendingEdits?.[0]?.conflicts).toEqual([conflict]);
+        expect(await viewer.publish(0, { ...changes, conflicts: [conflict] })).toBe(true);
+        expect(await refused_save(viewer, { ...changes, conflicts: [conflict] })).toBe(message);
+        // Discarding the layout answers it.
+        expect(await viewer.publish(0, { conflicts: [] })).toBe(true);
+        expect(viewer.durable().pendingEdits?.[0]?.conflicts ?? []).toEqual([]);
+    });
+
+    it('refuses a formula on another worksheet that cannot be adjusted, naming it', async () => {
+        const raw = build_fixture_xlsx({
+            sheets: [
+                { name: 'Data', body: `<sheetData>${[1, 2, 3, 4].map((n) => row(n, [cell(`A${n}`, n)])).join('')}</sheetData>` },
+                { name: 'Other', body: `<sheetData>${row(1, [cell('A1', { f: 'SUM(Data!A1#)' })])}</sheetData>` },
+            ],
+        });
+        const viewer = await open_xlsx(raw);
+        expect(viewer.capability().sheets[0]!.rows.supported).toBe(false);
+        const message = await refused_save(viewer, {
+            rowLayout: { runs: [{ kind: 'source', start: 0, count: 4 }], removedSourceRows: [{ start: 1, count: 1 }], discardedPendingRows: [] },
+            structuralBasis: viewer.basis(0),
+        });
+        expect(message).toMatch(/^Can't insert, delete, or move rows on this sheet: .*Other!A1/);
+    });
+
+    it('refuses a rule that would split into more than 64 rules', async () => {
+        const body_rows = Array.from({ length: 200 }, (_, index) => row(index + 2, [cell(`A${index + 2}`, index)]));
+        const raw = build_fixture_xlsx({
+            sheets: [
+                {
+                    name: 'Data',
+                    body: `<sheetData>${row(1, [cell('A1', 'n')])}${body_rows.join('')}</sheetData>`
+                        + '<conditionalFormatting sqref="A2:A201"><cfRule type="expression" dxfId="0" priority="1"><formula>Other!$B2&gt;0</formula></cfRule></conditionalFormatting>',
+                },
+                { name: 'Other', body: `<sheetData>${row(1, [cell('B1', 1)])}</sheetData>` },
+            ],
+        });
+        const viewer = await open_xlsx(raw);
+        const removed = Array.from({ length: 70 }, (_, index) => ({ start: 2 + index * 2, count: 1 }));
+        const message = await refused_save(viewer, {
+            rowLayout: { runs: [{ kind: 'source', start: 0, count: 201 }], removedSourceRows: removed, discardedPendingRows: [] },
+            structuralBasis: viewer.basis(0),
+        });
+        expect(message).toBe("Can't save these row and column changes: they would split the conditional formatting on Data!A2:A131 into more than 64 rules.");
+    });
+
+    it('refuses a moved run that would leave a merge non-rectangular', async () => {
+        const viewer = await open_xlsx(representative_workbook(), { state: HEADER_ON });
+        // Banana (source row 2, inside the merge E2:F3) moved below Date.
+        const message = await refused_save(viewer, {
+            rowLayout: {
+                runs: [
+                    { kind: 'source', start: 1, count: 1 },
+                    { kind: 'source', start: 3, count: 2 },
+                    { kind: 'source', start: 2, count: 1 },
+                    { kind: 'source', start: 5, count: 2 },
+                ],
+                removedSourceRows: [],
+                discardedPendingRows: [],
+            },
+            structuralBasis: viewer.basis(0),
+        });
+        expect(message).toContain('merged cell E2:F3');
+    });
+});
+
+describe('moved rows', () => {
+    it('writes a layout with moved runs, carrying cells, formulas, and attachments with their rows', async () => {
+        const viewer = await open_xlsx(representative_workbook(), { state: HEADER_ON });
+        // Fig (source row 6) moved to the top of the body; Cherry and Date swapped.
+        const result = await viewer.save([{
+            sheetIndex: 0,
+            structural: {
+                rowLayout: {
+                    runs: [
+                        { kind: 'source', start: 6, count: 1 },
+                        { kind: 'source', start: 1, count: 2 },
+                        { kind: 'source', start: 4, count: 1 },
+                        { kind: 'source', start: 3, count: 1 },
+                        { kind: 'source', start: 5, count: 1 },
+                    ],
+                    removedSourceRows: [],
+                    discardedPendingRows: [],
+                },
+                structuralBasis: viewer.basis(0),
+            },
+        }]);
+        expect(result.rejection).toBeUndefined();
+        expect(result).toMatchObject({
+            success: true,
+            receipt: { structure: [{ rowRuns: [
+                { from: 1, count: 2, to: 2 },
+                { from: 3, count: 1, to: 5 },
+                { from: 4, count: 1, to: 4 },
+                { from: 5, count: 1, to: 6 },
+                { from: 6, count: 1, to: 1 },
+            ] }] },
+        });
+        const saved = viewer.file.bytes;
+        const data = part_text(saved, 'xl/worksheets/sheet1.xml')!;
+        for (const number of [2, 3, 4, 5, 6, 7]) {
+            expect(data).toContain(`<f>B${number}*C${number}</f>`);
+        }
+        // Each row keeps its own attributes: Date (now between Banana and
+        // Cherry, row 5) keeps its row style, and Cherry (row 6) has none.
+        expect(rows_of(data).get(5)!.open).toContain('customFormat="1"');
+        expect(rows_of(data).get(5)!.inner).toContain('Date');
+        expect(rows_of(data).get(6)!.open).not.toContain('customFormat');
+        expect(data).toContain('<mergeCell ref="E3:F4"/>');
+        expect(data).toContain('<hyperlink ref="A4" r:id="rId1"/>');
+        expect(data).toContain('<hyperlink ref="A6" location="Summary!A1" display="Summary"/>');
+        const summary = part_text(saved, 'xl/worksheets/sheet2.xml')!;
+        expect(summary).toContain('<f>Data!B5</f>');
+        expect(summary).toContain('<f>Data!$C$2</f>');
+        const parsed = await parse_xlsx(saved);
+        expect(cell_values(parsed.data.sheets[0]!.rows as unknown[][]).map((cells) => cells[0])).toEqual([
+            'Item', 'Fig', 'Apple', 'Banana', 'Date', 'Cherry', 'Elder',
+        ]);
+    });
+});
+
+describe('an interrupted .xlsx structural save', () => {
+    it('applies the stored rekey intent on the next load after a stop between write and post-write', async () => {
+        const raw = representative_workbook();
+        const first = await open_xlsx(raw, { state: { ...HEADER_ON, rowHeights: [{ 3: 31 }] } });
+        const changes = removal(first);
+        first.file.write = (content) => {
+            first.file.bytes = content;
+            first.file.mtime += 1;
+            return new Promise<never>(() => {});
+        };
+        void first.save([{ sheetIndex: 0, structural: changes }]);
+        await vi.waitFor(() => expect(first.file.writes).toHaveLength(1));
+        expect(first.store.get_state(FILE).structuralRekeyIntent).toBeDefined();
+        first.dispose();
+        simulate_process_restart_for_tests();
+        first.file.write = undefined;
+        const second = await open_xlsx(first.file.bytes, { store: first.store, disk: first.file });
+        const durable = second.durable();
+        expect(durable.structuralRekeyIntent).toBeUndefined();
+        expect(durable.pendingEdits).toBeUndefined();
+        expect(durable.rowHeights?.[0]).toEqual({ 2: 31 });
+    });
+});
+
+describe('Pending Columns at the writer', () => {
+    // No UI admits a Pending Column before delivery step 8, so this drives
+    // the `.xlsx` planner directly with a layout built in the test.
+    it('writes a source-format column beside its neighbor and a default one, with headers and cells', async () => {
+        const raw = representative_workbook();
+        const path = '/tmp/pending-columns.xlsx';
+        const profile = profile_for(path);
+        const source = await profile.build_source(raw, path, HEADER_ON);
+        const sheet = source.meta().sheets[0]!;
+        const basis = current_structural_basis(
+            'xlsx',
+            { digest: content_digest(raw), xlsxStructure: observe_xlsx_structure(raw) },
+            sheet,
+            0,
+        )!;
+        const plan = profile.plan_save!({
+            source,
+            file_path: path,
+            worksheets: [{
+                sheet_index: 0,
+                edits: {},
+                wanted_bases: new Set(),
+                dirty_edits: {},
+                structural_changes: {
+                    formatTemplates: [],
+                    appendedRows: [],
+                    tailRemovals: [],
+                    conflicts: [],
+                    columnLayout: {
+                        columns: [
+                            { kind: 'source', sourceColumn: 0 },
+                            { kind: 'source', sourceColumn: 1 },
+                            { kind: 'source', sourceColumn: 2 },
+                            { kind: 'pending', pendingColumnId: 'col-a' },
+                            { kind: 'source', sourceColumn: 3 },
+                            { kind: 'source', sourceColumn: 4 },
+                            { kind: 'source', sourceColumn: 5 },
+                            { kind: 'pending', pendingColumnId: 'col-b' },
+                        ],
+                        removedSourceColumns: [],
+                        discardedPendingColumns: [],
+                    },
+                    pendingColumns: [
+                        {
+                            id: 'col-a',
+                            header: 'Discount',
+                            cells: { 's:2': { value: '0.1' }, 's:3': { value: '=C4*2' } },
+                            format: { kind: 'source', sourceColumn: 2 },
+                            createdOrder: 1,
+                        },
+                        {
+                            id: 'col-b',
+                            header: 'Note',
+                            cells: { 's:1': { value: 'first' } },
+                            format: { kind: 'default' },
+                            createdOrder: 2,
+                        },
+                    ],
+                    structuralBasis: basis,
+                },
+            }],
+        });
+        expect(plan.receipt?.structure?.[0]).toMatchObject({
+            columnMap: [0, 1, 2, 4, 5, 6],
+            insertedColumns: [{ pendingColumnId: 'col-a', column: 3 }, { pendingColumnId: 'col-b', column: 7 }],
+        });
+        const saved = plan.produce(raw);
+        source.close();
+        const data = part_text(saved, 'xl/worksheets/sheet1.xml')!;
+        const rows = rows_of(data);
+        // Headers, each row copying the inherited column's style (bold in the
+        // Header Row, percent below) in the new
+        // column D; the default column H writes no style.
+        expect(rows.get(1)!.inner).toContain('<c r="D1" s="1" t="inlineStr"><is><t xml:space="preserve">Discount</t></is></c>');
+        expect(rows.get(1)!.inner).toContain('Note');
+        expect(rows.get(3)!.inner).toContain('<c r="D3" s="2"><v>0.1</v></c>');
+        expect(rows.get(4)!.inner).toMatch(/<c r="D4" s="2"><f>C4\*2<\/f><\/c>/);
+        expect(rows.get(2)!.inner).toMatch(/<c r="H2"[^>]*>.*first/);
+        expect(rows.get(2)!.inner).not.toMatch(/<c r="H2" s=/);
+        // Old D (Total) is now E. Its shared group shifted as a whole, so it
+        // stays shared with its master's ref re-rendered; the widths shift.
+        expect(data).toContain('<c r="E2"><f t="shared" si="0" ref="E2:E7">B2*C2</f></c>');
+        expect(data).toContain('<mergeCell ref="F2:G3"/>');
+        expect(data).toContain('<col min="3" max="4" width="10" style="2" customWidth="1"/>');
+        expect(data).toContain('<autoFilter ref="A1:E7"/>');
+        expect(part_text(saved, 'xl/worksheets/sheet2.xml')).toContain('<f>SUM(Data!E2:E7)</f>');
     });
 });

@@ -251,7 +251,7 @@ describe('saving a row removal', () => {
         await viewer.dispose();
     });
 
-    it('refuses with the flag off, and refuses .xlsx with the flag on', async () => {
+    it('refuses with the flag off', async () => {
         const off = await open_viewer({
             state: store_with({ pendingEdits: slot(REMOVAL) }),
             disk: disk(BYTES),
@@ -264,17 +264,19 @@ describe('saving a row removal', () => {
         expect(write).not.toHaveBeenCalled();
         await off.dispose();
 
-        // The `.xlsx` gate is the file format's, not the planner's: a CSV
-        // planner seam behind an `.xlsx` path still refuses until step 9.
+        // An `.xlsx` path is let through the gate (delivery step 9), and its
+        // Structural Basis is the package's: delimited bytes behind an
+        // `.xlsx` path have none, so the save is refused before planning.
         const xlsx = await open_viewer({
             state: versioned_state_store({ pendingEdits: slot(REMOVAL) }),
             disk: disk(BYTES),
             path: '/tmp/structural-save-host.xlsx',
         });
         expect(xlsx.session()).toMatchObject({ granted: true });
-        expect(await xlsx.save(REMOVAL)).toMatchObject({ success: false });
-        expect(xlsx.warning).toHaveBeenCalledWith(
-            'Saving inserted, deleted, or moved rows and columns is not available yet.');
+        expect(await xlsx.save(REMOVAL)).toMatchObject({
+            success: false,
+            rejection: { reason: 'structuralConflict', structuralReason: 'structuralBasisChanged' },
+        });
         expect(write).not.toHaveBeenCalled();
         await xlsx.dispose();
     });

@@ -11191,11 +11191,14 @@ export function attach_viewer(
             await update_file_state((current, sheets) => {
                 const sheet_index = worksheet_target_index(sheets, worksheet);
                 if (sheet_index === undefined) return current;
+                // The slot's identity is the live worksheet's, which may carry
+                // a `worksheetId` the save operation did not name.
+                const sheet = source?.meta().sheets[sheet_index];
                 const slot = pending_changes_for_sheet(
                     current.pendingEdits,
                     sheet_index,
-                    worksheet.sheetName,
-                    worksheet.worksheetId,
+                    sheet?.name ?? worksheet.sheetName,
+                    sheet?.worksheetId ?? worksheet.worksheetId,
                 );
                 if (slot === undefined || !pending_changes_carry_layout(slot)) return current;
                 const conflicts = [
