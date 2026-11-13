@@ -797,16 +797,13 @@ The flag is a deliberate superset, decided per range reference and per axis:
 Step 2 may narrow these rules only with oracle evidence that a narrowed case
 matches Excel.
 
-**Oracle criterion.** Step 2 commits Excel-generated fixtures for insert,
-delete, and move cases. Every case outside those two classes must match Excel
-exactly, or the step does not merge. Cases inside them are recorded in this
-document with both results.
-
-Step 2 had no Excel or LibreOffice to run, so its insert and delete fixtures
-(`src/test/formula-anchors.test.ts`, "Excel oracle fixtures") are hand-written
-from Excel's documented insert and delete adjustment rules and labeled as
-such. Move cases rely on the flagged superset above until an Excel run can
-confirm them.
+**Oracle criterion.** No Excel or LibreOffice is available to step 2, so its
+fixtures (`src/test/formula-anchors.test.ts`, "Excel oracle fixtures") are
+hand-written from Excel's documented insert and delete reference-adjustment
+rules, and every insert and delete case must match those rules exactly. Move
+cases and the three classes above are covered by the flagged superset. Running
+Excel-generated fixtures is a follow-up that must happen before step 10 flips
+the capability flag.
 
 Because rendering is a function of the anchors and the full layouts, two
 operation sequences that produce the same full layouts produce the same text.

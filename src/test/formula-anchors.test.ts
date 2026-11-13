@@ -6,6 +6,7 @@ import {
     render_formula,
     type FormulaAnchors,
 } from '../formula-anchors';
+import { a1_column_letters, formula_reference_tokens } from '../xlsx-formula';
 import {
     anchor_context,
     append,
@@ -96,6 +97,19 @@ describe('rendering implicit anchors', () => {
         // Header Row 2; body rows 3..6.
         const rows = move_before(axis_model(2, 4), 6, 3);
         expect(render_rows('=A1+A2+SUM(A1:A3)+A6', rows)).toBe('=A1+A2+SUM(A1:A4)+A3');
+    });
+
+    it('renders a spaced range as one range and keeps its spacing', () => {
+        expect(render_rows('=SUM(A2 : A5)', delete_member(six, 2))).toBe('=SUM(A2 : A4)');
+        expect(render_rows('=SUM(A2 : A5)+SUM(2 :3)', insert_before(six, 1, ['p'])))
+            .toBe('=SUM(A3 : A6)+SUM(3 :4)');
+    });
+
+    it('leaves structured references with escaped brackets and quotes intact', () => {
+        const rows = insert_before(four, 1, ['p']);
+        expect(render_rows("=Table1[A']+B2]+C3", rows)).toBe("=Table1[A']+B2]+C4");
+        expect(render_rows("=Table1[A'[B]+C3", rows)).toBe("=Table1[A'[B]+C4");
+        expect(render_rows('=Table1[A"B]+C3', rows)).toBe('=Table1[A"B]+C4');
     });
 
     it('leaves external and structured references unchanged', () => {
@@ -266,9 +280,24 @@ describe('anchoring at commit time', () => {
             '=SUM(B5:INDEX(Data!A:A,2))',
             '=INDEX(Data!A:A,MATCH("(",A:A,0)):B5',
             "=INDEX(Data!A:A,MATCH(1,'Da(ta'!A:A,0)):B5",
+            '=INDEX(Data!A:A,MATCH(1,Table1[foo(bar],0)):B5',
         ]) {
             expect(anchor_formula(text, anchor_context(data_changed)).kind).toBe('refused');
         }
+        const quoted_changed = [sheet('Sheet1', four), sheet('Da)ta', move_before(four, 4, 1))];
+        for (const text of ["=B5:INDEX('Da)ta'!A:A,1)", "=INDEX('Da)ta'!A:A,1):B5"]) {
+            expect(anchor_formula(text, anchor_context(quoted_changed)).kind).toBe('refused');
+        }
+        // Both operands are function results.
+        expect(anchor_formula('=INDEX(Data!A:A,1):INDEX(Data!B:B,2)', anchor_context(data_changed)).kind)
+            .toBe('refused');
+        // A cell-shaped 3D prefix spans the sheets between its bounds.
+        const three_d = [sheet('Sheet1', four), sheet('S1', four), sheet('S2', move_before(four, 4, 1)), sheet('S3', four)];
+        expect(anchor_formula('=SUM(S1:S3!A1)', anchor_context(three_d)).kind).toBe('refused');
+        // A defined name could be any sheet.
+        expect(anchor_formula('=SUM(Total:B5)', anchor_context(three_d)).kind).toBe('refused');
+        expect(anchor_formula('=SUM(S1:S3!A1)+SUM(Total:B5)', anchor_context([sheet('Sheet1', four), sheet('S1', four)])))
+            .toEqual({ kind: 'anchored' });
         const columns = [sheet('Sheet1', four), sheet('Data', four, insert_before(axis_model(0, 3), 1, ['c']))];
         expect(anchor_formula('=SUM(Sheet1:Data!A1)', anchor_context(columns))).toEqual({
             kind: 'refused',
@@ -451,4 +480,191 @@ describe('Excel oracle fixtures (hand-written)', () => {
             ]))).toEqual([]);
         });
     }
+});
+
+/**
+ * Random formulas built from labeled pieces: references, opaque spans
+ * (string literals, quoted sheet names, structured references with escapes,
+ * external-workbook references), and range-operator constructs that mix
+ * both. The pieces' own boundaries are the oracle.
+ */
+describe('generated formulas with opaque spans', () => {
+    const SHEETS = ['Sheet1', 'Data', 'Da(ta', 'Da)ta', "It's", 'Q"1 (x)'];
+    const NAME_PARTS = ['A', '1', '(', ')', '[', ']', "'", '"', '#', '@', ':', '!', ',', '+', '$', ' ', 'B2', 'C3:D4'];
+
+    interface Piece {
+        readonly text: string;
+        /** Text after inserting one row above every body row. */
+        readonly shifted: string;
+        /** Offsets of the references the tokenizer must find, relative to the piece. */
+        readonly references: readonly { readonly start: number; readonly end: number }[];
+        /** Worksheets a range-operator issue must name; absent when no issue. */
+        readonly issueWorksheets?: readonly (string | undefined)[];
+    }
+
+    function random(seed: number): () => number {
+        let state = seed;
+        return () => {
+            state = (state * 1_103_515_245 + 12_345) % 2_147_483_648;
+            return state / 2_147_483_648;
+        };
+    }
+
+    function generator(next: () => number) {
+        const pick = <T>(values: readonly T[]): T => values[Math.floor(next() * values.length)];
+        const integer = (low: number, high: number) => low + Math.floor(next() * (high - low + 1));
+        const name = () => Array.from({ length: integer(1, 6) }, () => pick(NAME_PARTS)).join('');
+        const qualifier = (sheet_name: string) => /^[A-Za-z][A-Za-z0-9]*$/.test(sheet_name)
+            ? `${sheet_name}!`
+            : `'${sheet_name.replace(/'/g, "''")}'!`;
+        const dollar = () => (next() < 0.3 ? '$' : '');
+
+        function reference(): Piece & { readonly sheet: string | undefined } {
+            const sheet_name = next() < 0.4 ? undefined : pick(SHEETS);
+            const head = sheet_name === undefined ? '' : qualifier(sheet_name);
+            const kind = pick(['cell', 'range', 'rows', 'columns', 'cornerQualified', 'spaced', 'spacedRows'] as const);
+            const spaces = [pick(['', ' ', '  ']), pick([' ', '\n'])];
+            const rows = [integer(1, 50), integer(1, 50)];
+            const columns = [integer(1, 26), integer(1, 26)];
+            const marks = [dollar(), dollar(), dollar(), dollar()];
+            const corner = (index: number, shift: number) => `${marks[index * 2]}${a1_column_letters(columns[index])}`
+                + `${marks[index * 2 + 1]}${rows[index] + shift}`;
+            const body = (shift: number): string => {
+                switch (kind) {
+                    case 'cell': return head + corner(0, shift);
+                    case 'range': return `${head}${corner(0, shift)}:${corner(1, shift)}`;
+                    case 'rows': return `${head}${marks[0]}${rows[0] + shift}:${marks[1]}${rows[1] + shift}`;
+                    case 'columns': return `${head}${marks[0]}${a1_column_letters(columns[0])}:`
+                        + `${marks[1]}${a1_column_letters(columns[1])}`;
+                    case 'cornerQualified': {
+                        const sheet = qualifier(sheet_name ?? 'Data');
+                        return `${sheet}${corner(0, shift)}:${sheet}${corner(1, shift)}`;
+                    }
+                    case 'spaced': return `${head}${corner(0, shift)}${spaces[0]}:${spaces[1]}${corner(1, shift)}`;
+                    case 'spacedRows': return `${head}${marks[0]}${rows[0] + shift}${spaces[1]}:`
+                        + `${spaces[0]}${marks[1]}${rows[1] + shift}`;
+                }
+            };
+            const text = body(0);
+            const sheet = kind === 'cornerQualified' ? sheet_name ?? 'Data' : sheet_name;
+            return {
+                text,
+                shifted: body(1),
+                references: [{ start: 0, end: text.length }],
+                sheet,
+            };
+        }
+
+        function opaque(): Piece {
+            const escaped = name().replace(/[\[\]#'@]/g, "'$&");
+            const text = pick([
+                () => `"${name().replace(/"/g, '""')}"`,
+                () => `${pick(['Table1', '', 'Data!', "'Da(ta'!", "'Da)ta'!"])}[${escaped}]`,
+                () => `Table1[[#Data],[${escaped}]]`,
+                () => pick(['[1]Sheet1!A1:B2', '[Book.xlsx]Data!C3', "'[Book.xlsx]Da(ta'!A1", '[2]Data![Col]']),
+            ])();
+            return { text, shifted: text, references: [] };
+        }
+
+        function construct(): Piece {
+            const first = reference();
+            const hidden = opaque();
+            const colon = pick([':', ' : ', ': ', ' :']);
+            const shape = pick(['backward', 'forward', 'functions', 'threeD'] as const);
+            if (shape === 'backward') {
+                // The references before the colon are their own tokens.
+                const second = reference();
+                const before = `INDEX(${first.text},MATCH(${hidden.text},`;
+                const text = `${before}${second.text},0))${colon}B5`;
+                return {
+                    text,
+                    shifted: `INDEX(${first.shifted},MATCH(${hidden.text},${second.shifted},0))${colon}B5`,
+                    references: [
+                        { start: 6, end: 6 + first.text.length },
+                        { start: before.length, end: before.length + second.text.length },
+                    ],
+                    issueWorksheets: [first.sheet, second.sheet, undefined],
+                };
+            }
+            if (shape === 'functions') {
+                // Both operands are function results; the second is swallowed.
+                const second = reference();
+                const text = `INDEX(${first.text},1)${colon}INDEX(${second.text},MATCH(${hidden.text},1,0))`;
+                return {
+                    text,
+                    shifted: `INDEX(${first.shifted},1)${colon}INDEX(${second.text},MATCH(${hidden.text},1,0))`,
+                    references: [{ start: 6, end: 6 + first.text.length }],
+                    issueWorksheets: [first.sheet, second.sheet],
+                };
+            }
+            if (shape === 'threeD') {
+                // A cell-shaped 3D prefix names its bounding sheets by its text.
+                const bounds = [`S${integer(1, 9)}`, `S${integer(1, 9)}`];
+                const text = `${bounds[0]}:${bounds[1]}!${pick(['A1', 'B2:C3'])}`;
+                return { text, shifted: text, references: [], issueWorksheets: bounds };
+            }
+            // Forward: the construct swallows the function operand whole.
+            const text = `B5${colon}INDEX(${first.text},MATCH(${hidden.text},1,0))`;
+            return { text, shifted: text, references: [], issueWorksheets: [first.sheet, undefined] };
+        }
+
+        return () => {
+            const pieces = Array.from({ length: integer(1, 6) }, () => {
+                const choice = next();
+                return choice < 0.4 ? reference() : choice < 0.8 ? opaque() : construct();
+            });
+            let text = '=';
+            let shifted = '=';
+            const references: { start: number; end: number }[] = [];
+            const issues: { start: number; end: number; worksheets: readonly (string | undefined)[] }[] = [];
+            pieces.forEach((piece, index) => {
+                if (index > 0) {
+                    const separator = pick(['+', '&', '*']);
+                    text += separator;
+                    shifted += separator;
+                }
+                for (const reference of piece.references) {
+                    references.push({ start: text.length + reference.start, end: text.length + reference.end });
+                }
+                if (piece.issueWorksheets !== undefined) {
+                    issues.push({ start: text.length, end: text.length + piece.text.length, worksheets: piece.issueWorksheets });
+                }
+                text += piece.text;
+                shifted += piece.shifted;
+            });
+            return { text, shifted, references, issues };
+        };
+    }
+
+    const context = (rows: AxisModel) => anchor_context(SHEETS.map((name) => sheet(
+        name,
+        rows,
+        insert_before(axis_model(0, 30), undefined, ['c']),
+    )));
+    // A live change on both axes that moves no referenced row or column.
+    const identity = context(insert_before(axis_model(0, 100), undefined, ['p']));
+    // One row inserted above every body row.
+    const inserted = context(insert_before(axis_model(0, 100), 1, ['p']));
+
+    it('finds exactly the reference pieces and renders opaque spans untouched', () => {
+        const next = random(7);
+        const formula = generator(next);
+        for (let round = 0; round < 1_000; round++) {
+            const { text, shifted, references, issues } = formula();
+            const lex = formula_reference_tokens(text);
+            expect(lex.references.map((token) => ({ start: token.start, end: token.end })), text)
+                .toEqual(references);
+            expect(lex.issues.map((issue) => ({ start: issue.start, end: issue.end })), text)
+                .toEqual(issues.map(({ start, end }) => ({ start, end })));
+            lex.issues.forEach((issue, index) => {
+                // An empty list is unknown: it names every worksheet.
+                if (issue.worksheets.length === 0) return;
+                for (const worksheet of issues[index].worksheets) {
+                    expect(issue.worksheets, text).toContain(worksheet);
+                }
+            });
+            expect(render_formula(text, undefined, identity), text).toBe(text);
+            expect(render_formula(text, undefined, inserted), text).toBe(shifted);
+        }
+    });
 });

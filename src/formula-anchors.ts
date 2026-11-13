@@ -287,19 +287,22 @@ function lands_on_pending(token: FormulaReferenceToken, worksheet: AnchorWorkshe
     });
 }
 
+/**
+ * Worksheets an unanchorable construct may touch. An empty list, or a 3D
+ * bound that names no worksheet, could be any worksheet, so it counts as
+ * every one.
+ */
 function issue_worksheets(
     context: FormulaAnchorContext,
     issue: FormulaReferenceIssue,
 ): readonly number[] {
+    const every = context.worksheets.map((_, index) => index);
+    if (issue.worksheets.length === 0) return every;
     const resolved = issue.worksheets.map((name) => resolve_worksheet_name(context, name));
     if (issue.kind === 'threeDimensional') {
         const [first, last] = resolved;
-        if (first === undefined || last === undefined) return [];
-        const out: number[] = [];
-        for (let index = Math.min(first, last); index <= Math.max(first, last); index++) {
-            out.push(index);
-        }
-        return out;
+        if (first === undefined || last === undefined) return every;
+        return every.slice(Math.min(first, last), Math.max(first, last) + 1);
     }
     return resolved.filter((index): index is number => index !== undefined);
 }

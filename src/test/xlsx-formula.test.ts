@@ -356,6 +356,15 @@ describe('formula reference tokenizer', () => {
         expect(issues('=[Book.xlsx]Sheet1!A1:B2+[Book.xlsx]Sheet1![Revenue]')).toEqual([]);
     });
 
+    it('skips structured references with escaped brackets and quotes', () => {
+        for (const formula of ["=Table1[A']+B2]+C3", "=Table1[A'[B]+C3", '=Table1[A"B]+C3']) {
+            expect(shapes(formula).map((token) => token.text)).toEqual(['C3']);
+            expect(issues(formula)).toEqual([]);
+        }
+        expect(shapes("=Table1[[#Data],[x'] y]]+Data![a'[b]+'Q(1'![c]+D4").map((token) => token.text))
+            .toEqual(['D4']);
+    });
+
     it('reports a range operator with a non-reference operand', () => {
         expect(issues('=SUM(INDEX(A:A,1):B5)')).toEqual([
             { kind: 'rangeOperand', text: 'INDEX(A:A,1):B5', worksheets: [undefined] },
@@ -367,26 +376,99 @@ describe('formula reference tokenizer', () => {
         expect(issues('=INDEX(Data!A:A,MATCH(")",A:A,0)):B5')).toEqual([{
             kind: 'rangeOperand',
             text: 'INDEX(Data!A:A,MATCH(")",A:A,0)):B5',
-            worksheets: [undefined, 'Data'],
+            worksheets: ['Data', undefined],
         }]);
         expect(issues("=INDEX(Data!A:A,MATCH(1,'Da(ta'!A:A,0)):B5")).toEqual([{
             kind: 'rangeOperand',
             text: "INDEX(Data!A:A,MATCH(1,'Da(ta'!A:A,0)):B5",
-            worksheets: [undefined, 'Data', 'Da(ta'],
+            worksheets: ['Data', 'Da(ta', undefined],
+        }]);
+        // Parentheses inside quoted sheet names and structured references
+        // do not nest, scanning forward or backward.
+        expect(issues("=B5:INDEX('Da)ta'!A:A,1)+C3")).toEqual([{
+            kind: 'rangeOperand',
+            text: "B5:INDEX('Da)ta'!A:A,1)",
+            worksheets: [undefined, 'Da)ta'],
+        }]);
+        expect(shapes("=B5:INDEX('Da(ta'!A:A,1)+C3").map((token) => token.text)).toEqual(['C3']);
+        expect(issues('=INDEX(Data!A:A,MATCH(1,Table1[foo(bar],0)):B5')).toEqual([{
+            kind: 'rangeOperand',
+            text: 'INDEX(Data!A:A,MATCH(1,Table1[foo(bar],0)):B5',
+            // A table may lie on any sheet.
+            worksheets: [],
         }]);
         expect(issues('=SUM(A1:B2:Data!C3)')).toEqual([
             { kind: 'rangeOperand', text: 'A1:B2:Data!C3', worksheets: [undefined, 'Data'] },
         ]);
         expect(issues('=SUM(Total:B5)')).toEqual([
-            { kind: 'rangeOperand', text: 'Total:B5', worksheets: [undefined] },
+            // A defined name may lie on any sheet.
+            { kind: 'rangeOperand', text: 'Total:B5', worksheets: [] },
         ]);
         expect(shapes('=SUM(A1:B2:C3)')).toEqual([]);
+    });
+
+    it('reports a range operator between two function results', () => {
+        expect(issues('=INDEX(Data!A:A,1):INDEX(Data!B:B,2)')).toEqual([{
+            kind: 'rangeOperand',
+            text: 'INDEX(Data!A:A,1):INDEX(Data!B:B,2)',
+            worksheets: ['Data'],
+        }]);
+        expect(shapes('=INDEX(Data!A:A,1):INDEX(Data!B:B,2)').map((token) => token.text))
+            .toEqual(['Data!A:A']);
+        expect(issues('=SUM(INDEX(A:A,1) : B5)+SUM(B5 : INDEX(A:A,2))')).toEqual([
+            { kind: 'rangeOperand', text: 'INDEX(A:A,1) : B5', worksheets: [undefined] },
+            { kind: 'rangeOperand', text: 'B5 : INDEX(A:A,2)', worksheets: [undefined] },
+        ]);
+    });
+
+    it('reads whitespace around a range colon as one reference', () => {
+        expect(shapes("=SUM(A2 : $A5)+SUM(2 :3)+SUM(A: C)+Sheet1!B1 :'Sheet1'!B2")).toEqual([
+            {
+                kind: 'range',
+                text: 'A2 : $A5',
+                sheet: undefined,
+                corners: [
+                    { text: 'A2', sheet: undefined, row: '2@2', column: '1@A' },
+                    { text: '$A5', sheet: undefined, row: '5@5', column: '$1@A' },
+                ],
+            },
+            {
+                kind: 'rows',
+                text: '2 :3',
+                sheet: undefined,
+                corners: [
+                    { text: '2', sheet: undefined, row: '2@2', column: undefined },
+                    { text: '3', sheet: undefined, row: '3@3', column: undefined },
+                ],
+            },
+            {
+                kind: 'columns',
+                text: 'A: C',
+                sheet: undefined,
+                corners: [
+                    { text: 'A', sheet: undefined, row: undefined, column: '1@A' },
+                    { text: 'C', sheet: undefined, row: undefined, column: '3@C' },
+                ],
+            },
+            {
+                kind: 'range',
+                text: "Sheet1!B1 :'Sheet1'!B2",
+                sheet: 'Sheet1',
+                corners: [
+                    { text: 'Sheet1!B1', sheet: 'Sheet1!', row: '1@1', column: '2@B' },
+                    { text: "'Sheet1'!B2", sheet: "'Sheet1'!", row: '2@2', column: '2@B' },
+                ],
+            },
+        ]);
+        // A space without a colon is the intersection operator.
+        expect(shapes('=A1:B2 B2:C3').map((token) => token.text)).toEqual(['A1:B2', 'B2:C3']);
     });
 
     it('reports ranges whose corners name different worksheets', () => {
         expect(issues('=SUM(Sheet1!A1:Sheet2!B2)+SUM(A1:Sheet2!B2)')).toEqual([
             { kind: 'mixedSheets', text: 'Sheet1!A1:Sheet2!B2', worksheets: ['Sheet1', 'Sheet2'] },
-            { kind: 'mixedSheets', text: 'A1:Sheet2!B2', worksheets: [undefined, 'Sheet2'] },
+            // `A1:Sheet2!B2` may also be a 3D reference from a sheet named A1.
+            { kind: 'mixedSheets', text: 'A1:Sheet2!B2', worksheets: [undefined, 'A1', 'Sheet2'] },
         ]);
     });
 
@@ -394,6 +476,11 @@ describe('formula reference tokenizer', () => {
         expect(issues("=SUM(Sheet1:Sheet3!A1)+SUM('Jan:Mar'!B2:B4)")).toEqual([
             { kind: 'threeDimensional', text: 'Sheet1:Sheet3!A1', worksheets: ['Sheet1', 'Sheet3'] },
             { kind: 'threeDimensional', text: "'Jan:Mar'!B2:B4", worksheets: ['Jan', 'Mar'] },
+        ]);
+        // A cell- or column-shaped 3D prefix names its bounds by its text.
+        expect(issues('=SUM(S1:S3!A1)+SUM(A:C!B2:B3)')).toEqual([
+            { kind: 'threeDimensional', text: 'S1:S3!A1', worksheets: ['S1', 'S3'] },
+            { kind: 'threeDimensional', text: 'A:C!B2:B3', worksheets: ['A', 'C'] },
         ]);
         expect(issues('=SUM(A1#)+Data!B2#')).toEqual([
             { kind: 'spill', text: 'A1#', worksheets: [undefined] },
