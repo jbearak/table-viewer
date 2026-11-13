@@ -1,0 +1,3373 @@
+{
+  "generator": "scripts/libreoffice-formula-oracle.py",
+  "libreoffice": "LibreOffice 26.8.3.1 861effc5289d539f15c4c18d1ba8579ffd78728b",
+  "rows": 20,
+  "columns": 10,
+  "cases": [
+    {
+      "name": "insert a row above a range",
+      "sheets": [
+        "Sheet1"
+      ],
+      "headerRow": 0,
+      "gestures": [
+        {
+          "op": "insertRows",
+          "sheet": "Sheet1",
+          "before": 2,
+          "count": 1
+        }
+      ],
+      "formulas": [
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B3:B6)",
+          "libreoffice": "=SUM(B4:B7)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM($B$3:$B$6)",
+          "libreoffice": "=SUM($B$4:$B$7)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B$3:$B6)",
+          "libreoffice": "=SUM(B$4:$B7)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=B5+$C$5+D$5+$E5",
+          "libreoffice": "=B6+$C$6+D$6+$E6"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(3:6)",
+          "libreoffice": "=SUM(4:7)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(A:B)",
+          "libreoffice": "=SUM(A:B)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B2:B25)+B24",
+          "libreoffice": "=SUM(B3:B26)+B25"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUMPRODUCT(B3:B6,C8:C12)",
+          "libreoffice": "=SUMPRODUCT(B4:B7,C9:C13)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=VLOOKUP(A5,A2:D10,2,0)",
+          "libreoffice": "=VLOOKUP(A6,A3:D11,2,0)"
+        }
+      ]
+    },
+    {
+      "name": "insert a row at a range's first row",
+      "sheets": [
+        "Sheet1"
+      ],
+      "headerRow": 0,
+      "gestures": [
+        {
+          "op": "insertRows",
+          "sheet": "Sheet1",
+          "before": 3,
+          "count": 1
+        }
+      ],
+      "formulas": [
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B3:B6)",
+          "libreoffice": "=SUM(B4:B7)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM($B$3:$B$6)",
+          "libreoffice": "=SUM($B$4:$B$7)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B$3:$B6)",
+          "libreoffice": "=SUM(B$4:$B7)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=B5+$C$5+D$5+$E5",
+          "libreoffice": "=B6+$C$6+D$6+$E6"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(3:6)",
+          "libreoffice": "=SUM(4:7)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(A:B)",
+          "libreoffice": "=SUM(A:B)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B2:B25)+B24",
+          "libreoffice": "=SUM(B2:B26)+B25"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUMPRODUCT(B3:B6,C8:C12)",
+          "libreoffice": "=SUMPRODUCT(B4:B7,C9:C13)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=VLOOKUP(A5,A2:D10,2,0)",
+          "libreoffice": "=VLOOKUP(A6,A2:D11,2,0)"
+        }
+      ]
+    },
+    {
+      "name": "insert rows inside a range",
+      "sheets": [
+        "Sheet1"
+      ],
+      "headerRow": 0,
+      "gestures": [
+        {
+          "op": "insertRows",
+          "sheet": "Sheet1",
+          "before": 5,
+          "count": 2
+        }
+      ],
+      "formulas": [
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B3:B6)",
+          "libreoffice": "=SUM(B3:B8)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM($B$3:$B$6)",
+          "libreoffice": "=SUM($B$3:$B$8)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B$3:$B6)",
+          "libreoffice": "=SUM(B$3:$B8)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=B5+$C$5+D$5+$E5",
+          "libreoffice": "=B7+$C$7+D$7+$E7"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(3:6)",
+          "libreoffice": "=SUM(3:8)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(A:B)",
+          "libreoffice": "=SUM(A:B)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B2:B25)+B24",
+          "libreoffice": "=SUM(B2:B27)+B26"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUMPRODUCT(B3:B6,C8:C12)",
+          "libreoffice": "=SUMPRODUCT(B3:B8,C10:C14)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=VLOOKUP(A5,A2:D10,2,0)",
+          "libreoffice": "=VLOOKUP(A7,A2:D12,2,0)"
+        }
+      ]
+    },
+    {
+      "name": "insert a row at a range's last row",
+      "sheets": [
+        "Sheet1"
+      ],
+      "headerRow": 0,
+      "gestures": [
+        {
+          "op": "insertRows",
+          "sheet": "Sheet1",
+          "before": 6,
+          "count": 1
+        }
+      ],
+      "formulas": [
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B3:B6)",
+          "libreoffice": "=SUM(B3:B7)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM($B$3:$B$6)",
+          "libreoffice": "=SUM($B$3:$B$7)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B$3:$B6)",
+          "libreoffice": "=SUM(B$3:$B7)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=B5+$C$5+D$5+$E5",
+          "libreoffice": "=B5+$C$5+D$5+$E5"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(3:6)",
+          "libreoffice": "=SUM(3:7)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(A:B)",
+          "libreoffice": "=SUM(A:B)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B2:B25)+B24",
+          "libreoffice": "=SUM(B2:B26)+B25"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUMPRODUCT(B3:B6,C8:C12)",
+          "libreoffice": "=SUMPRODUCT(B3:B7,C9:C13)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=VLOOKUP(A5,A2:D10,2,0)",
+          "libreoffice": "=VLOOKUP(A5,A2:D11,2,0)"
+        }
+      ]
+    },
+    {
+      "name": "insert a row just after a range",
+      "sheets": [
+        "Sheet1"
+      ],
+      "headerRow": 0,
+      "gestures": [
+        {
+          "op": "insertRows",
+          "sheet": "Sheet1",
+          "before": 7,
+          "count": 1
+        }
+      ],
+      "formulas": [
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B3:B6)",
+          "libreoffice": "=SUM(B3:B6)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM($B$3:$B$6)",
+          "libreoffice": "=SUM($B$3:$B$6)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B$3:$B6)",
+          "libreoffice": "=SUM(B$3:$B6)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=B5+$C$5+D$5+$E5",
+          "libreoffice": "=B5+$C$5+D$5+$E5"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(3:6)",
+          "libreoffice": "=SUM(3:6)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(A:B)",
+          "libreoffice": "=SUM(A:B)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B2:B25)+B24",
+          "libreoffice": "=SUM(B2:B26)+B25"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUMPRODUCT(B3:B6,C8:C12)",
+          "libreoffice": "=SUMPRODUCT(B3:B6,C9:C13)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=VLOOKUP(A5,A2:D10,2,0)",
+          "libreoffice": "=VLOOKUP(A5,A2:D11,2,0)"
+        }
+      ]
+    },
+    {
+      "name": "insert rows at the first row",
+      "sheets": [
+        "Sheet1"
+      ],
+      "headerRow": 0,
+      "gestures": [
+        {
+          "op": "insertRows",
+          "sheet": "Sheet1",
+          "before": 1,
+          "count": 3
+        }
+      ],
+      "formulas": [
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B3:B6)",
+          "libreoffice": "=SUM(B6:B9)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM($B$3:$B$6)",
+          "libreoffice": "=SUM($B$6:$B$9)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B$3:$B6)",
+          "libreoffice": "=SUM(B$6:$B9)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=B5+$C$5+D$5+$E5",
+          "libreoffice": "=B8+$C$8+D$8+$E8"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(3:6)",
+          "libreoffice": "=SUM(6:9)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(A:B)",
+          "libreoffice": "=SUM(A:B)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B2:B25)+B24",
+          "libreoffice": "=SUM(B5:B28)+B27"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUMPRODUCT(B3:B6,C8:C12)",
+          "libreoffice": "=SUMPRODUCT(B6:B9,C11:C15)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=VLOOKUP(A5,A2:D10,2,0)",
+          "libreoffice": "=VLOOKUP(A8,A5:D13,2,0)"
+        }
+      ]
+    },
+    {
+      "name": "insert a row after the last body row",
+      "sheets": [
+        "Sheet1"
+      ],
+      "headerRow": 0,
+      "gestures": [
+        {
+          "op": "insertRows",
+          "sheet": "Sheet1",
+          "before": 21,
+          "count": 1
+        }
+      ],
+      "formulas": [
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B3:B6)",
+          "libreoffice": "=SUM(B3:B6)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM($B$3:$B$6)",
+          "libreoffice": "=SUM($B$3:$B$6)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B$3:$B6)",
+          "libreoffice": "=SUM(B$3:$B6)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=B5+$C$5+D$5+$E5",
+          "libreoffice": "=B5+$C$5+D$5+$E5"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(3:6)",
+          "libreoffice": "=SUM(3:6)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(A:B)",
+          "libreoffice": "=SUM(A:B)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B2:B25)+B24",
+          "libreoffice": "=SUM(B2:B26)+B25"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUMPRODUCT(B3:B6,C8:C12)",
+          "libreoffice": "=SUMPRODUCT(B3:B6,C8:C12)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=VLOOKUP(A5,A2:D10,2,0)",
+          "libreoffice": "=VLOOKUP(A5,A2:D10,2,0)"
+        }
+      ]
+    },
+    {
+      "name": "insert many rows inside a range",
+      "sheets": [
+        "Sheet1"
+      ],
+      "headerRow": 0,
+      "gestures": [
+        {
+          "op": "insertRows",
+          "sheet": "Sheet1",
+          "before": 4,
+          "count": 5
+        }
+      ],
+      "formulas": [
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B3:B6)",
+          "libreoffice": "=SUM(B3:B11)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM($B$3:$B$6)",
+          "libreoffice": "=SUM($B$3:$B$11)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B$3:$B6)",
+          "libreoffice": "=SUM(B$3:$B11)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=B5+$C$5+D$5+$E5",
+          "libreoffice": "=B10+$C$10+D$10+$E10"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(3:6)",
+          "libreoffice": "=SUM(3:11)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(A:B)",
+          "libreoffice": "=SUM(A:B)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B2:B25)+B24",
+          "libreoffice": "=SUM(B2:B30)+B29"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUMPRODUCT(B3:B6,C8:C12)",
+          "libreoffice": "=SUMPRODUCT(B3:B11,C13:C17)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=VLOOKUP(A5,A2:D10,2,0)",
+          "libreoffice": "=VLOOKUP(A10,A2:D15,2,0)"
+        }
+      ]
+    },
+    {
+      "name": "delete a range's first row",
+      "sheets": [
+        "Sheet1"
+      ],
+      "headerRow": 0,
+      "gestures": [
+        {
+          "op": "deleteRows",
+          "sheet": "Sheet1",
+          "first": 3,
+          "count": 1
+        }
+      ],
+      "formulas": [
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B3:B6)",
+          "libreoffice": "=SUM(B3:B5)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM($B$3:$B$6)",
+          "libreoffice": "=SUM($B$3:$B$5)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B$3:$B6)",
+          "libreoffice": "=SUM(B$3:$B5)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=B5+$C$5+D$5+$E5",
+          "libreoffice": "=B4+$C$4+D$4+$E4"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(3:6)",
+          "libreoffice": "=SUM(3:5)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(A:B)",
+          "libreoffice": "=SUM(A:B)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B2:B25)+B24",
+          "libreoffice": "=SUM(B2:B24)+B23"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUMPRODUCT(B3:B6,C8:C12)",
+          "libreoffice": "=SUMPRODUCT(B3:B5,C7:C11)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=VLOOKUP(A5,A2:D10,2,0)",
+          "libreoffice": "=VLOOKUP(A4,A2:D9,2,0)"
+        }
+      ]
+    },
+    {
+      "name": "delete a range's last row",
+      "sheets": [
+        "Sheet1"
+      ],
+      "headerRow": 0,
+      "gestures": [
+        {
+          "op": "deleteRows",
+          "sheet": "Sheet1",
+          "first": 6,
+          "count": 1
+        }
+      ],
+      "formulas": [
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B3:B6)",
+          "libreoffice": "=SUM(B3:B5)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM($B$3:$B$6)",
+          "libreoffice": "=SUM($B$3:$B$5)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B$3:$B6)",
+          "libreoffice": "=SUM(B$3:$B5)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=B5+$C$5+D$5+$E5",
+          "libreoffice": "=B5+$C$5+D$5+$E5"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(3:6)",
+          "libreoffice": "=SUM(3:5)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(A:B)",
+          "libreoffice": "=SUM(A:B)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B2:B25)+B24",
+          "libreoffice": "=SUM(B2:B24)+B23"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUMPRODUCT(B3:B6,C8:C12)",
+          "libreoffice": "=SUMPRODUCT(B3:B5,C7:C11)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=VLOOKUP(A5,A2:D10,2,0)",
+          "libreoffice": "=VLOOKUP(A5,A2:D9,2,0)"
+        }
+      ]
+    },
+    {
+      "name": "delete rows inside a range",
+      "sheets": [
+        "Sheet1"
+      ],
+      "headerRow": 0,
+      "gestures": [
+        {
+          "op": "deleteRows",
+          "sheet": "Sheet1",
+          "first": 4,
+          "count": 2
+        }
+      ],
+      "formulas": [
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B3:B6)",
+          "libreoffice": "=SUM(B3:B4)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM($B$3:$B$6)",
+          "libreoffice": "=SUM($B$3:$B$4)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B$3:$B6)",
+          "libreoffice": "=SUM(B$3:$B4)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=B5+$C$5+D$5+$E5",
+          "libreoffice": "=#REF!+#REF!+#REF!+#REF!"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(3:6)",
+          "libreoffice": "=SUM(3:4)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(A:B)",
+          "libreoffice": "=SUM(A:B)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B2:B25)+B24",
+          "libreoffice": "=SUM(B2:B23)+B22"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUMPRODUCT(B3:B6,C8:C12)",
+          "libreoffice": "=SUMPRODUCT(B3:B4,C6:C10)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=VLOOKUP(A5,A2:D10,2,0)",
+          "libreoffice": "=VLOOKUP(#REF!,A2:D8,2,0)"
+        }
+      ]
+    },
+    {
+      "name": "delete every row of a range",
+      "sheets": [
+        "Sheet1"
+      ],
+      "headerRow": 0,
+      "gestures": [
+        {
+          "op": "deleteRows",
+          "sheet": "Sheet1",
+          "first": 3,
+          "count": 4
+        }
+      ],
+      "formulas": [
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B3:B6)",
+          "libreoffice": "=SUM(#REF!)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM($B$3:$B$6)",
+          "libreoffice": "=SUM(#REF!)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B$3:$B6)",
+          "libreoffice": "=SUM(#REF!)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=B5+$C$5+D$5+$E5",
+          "libreoffice": "=#REF!+#REF!+#REF!+#REF!"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(3:6)",
+          "libreoffice": "=SUM(#REF!)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(A:B)",
+          "libreoffice": "=SUM(A:B)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B2:B25)+B24",
+          "libreoffice": "=SUM(B2:B21)+B20"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUMPRODUCT(B3:B6,C8:C12)",
+          "libreoffice": "=SUMPRODUCT(#REF!,C4:C8)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=VLOOKUP(A5,A2:D10,2,0)",
+          "libreoffice": "=VLOOKUP(#REF!,A2:D6,2,0)"
+        }
+      ]
+    },
+    {
+      "name": "delete a referenced cell's row",
+      "sheets": [
+        "Sheet1"
+      ],
+      "headerRow": 0,
+      "gestures": [
+        {
+          "op": "deleteRows",
+          "sheet": "Sheet1",
+          "first": 5,
+          "count": 1
+        }
+      ],
+      "formulas": [
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B3:B6)",
+          "libreoffice": "=SUM(B3:B5)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM($B$3:$B$6)",
+          "libreoffice": "=SUM($B$3:$B$5)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B$3:$B6)",
+          "libreoffice": "=SUM(B$3:$B5)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=B5+$C$5+D$5+$E5",
+          "libreoffice": "=#REF!+#REF!+#REF!+#REF!"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(3:6)",
+          "libreoffice": "=SUM(3:5)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(A:B)",
+          "libreoffice": "=SUM(A:B)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B2:B25)+B24",
+          "libreoffice": "=SUM(B2:B24)+B23"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUMPRODUCT(B3:B6,C8:C12)",
+          "libreoffice": "=SUMPRODUCT(B3:B5,C7:C11)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=VLOOKUP(A5,A2:D10,2,0)",
+          "libreoffice": "=VLOOKUP(#REF!,A2:D9,2,0)"
+        }
+      ]
+    },
+    {
+      "name": "delete rows above a range",
+      "sheets": [
+        "Sheet1"
+      ],
+      "headerRow": 0,
+      "gestures": [
+        {
+          "op": "deleteRows",
+          "sheet": "Sheet1",
+          "first": 1,
+          "count": 2
+        }
+      ],
+      "formulas": [
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B3:B6)",
+          "libreoffice": "=SUM(B1:B4)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM($B$3:$B$6)",
+          "libreoffice": "=SUM($B$1:$B$4)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B$3:$B6)",
+          "libreoffice": "=SUM(B$1:$B4)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=B5+$C$5+D$5+$E5",
+          "libreoffice": "=B3+$C$3+D$3+$E3"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(3:6)",
+          "libreoffice": "=SUM(1:4)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(A:B)",
+          "libreoffice": "=SUM(A:B)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B2:B25)+B24",
+          "libreoffice": "=SUM(B1:B23)+B22"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUMPRODUCT(B3:B6,C8:C12)",
+          "libreoffice": "=SUMPRODUCT(B1:B4,C6:C10)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=VLOOKUP(A5,A2:D10,2,0)",
+          "libreoffice": "=VLOOKUP(A3,A1:D8,2,0)"
+        }
+      ]
+    },
+    {
+      "name": "delete rows straddling a range's first row",
+      "sheets": [
+        "Sheet1"
+      ],
+      "headerRow": 0,
+      "gestures": [
+        {
+          "op": "deleteRows",
+          "sheet": "Sheet1",
+          "first": 2,
+          "count": 3
+        }
+      ],
+      "formulas": [
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B3:B6)",
+          "libreoffice": "=SUM(B2:B3)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM($B$3:$B$6)",
+          "libreoffice": "=SUM($B$2:$B$3)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B$3:$B6)",
+          "libreoffice": "=SUM(B$2:$B3)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=B5+$C$5+D$5+$E5",
+          "libreoffice": "=B2+$C$2+D$2+$E2"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(3:6)",
+          "libreoffice": "=SUM(2:3)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(A:B)",
+          "libreoffice": "=SUM(A:B)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B2:B25)+B24",
+          "libreoffice": "=SUM(B2:B22)+B21"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUMPRODUCT(B3:B6,C8:C12)",
+          "libreoffice": "=SUMPRODUCT(B2:B3,C5:C9)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=VLOOKUP(A5,A2:D10,2,0)",
+          "libreoffice": "=VLOOKUP(A2,A2:D7,2,0)"
+        }
+      ]
+    },
+    {
+      "name": "delete rows straddling a range's last row",
+      "sheets": [
+        "Sheet1"
+      ],
+      "headerRow": 0,
+      "gestures": [
+        {
+          "op": "deleteRows",
+          "sheet": "Sheet1",
+          "first": 5,
+          "count": 3
+        }
+      ],
+      "formulas": [
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B3:B6)",
+          "libreoffice": "=SUM(B3:B4)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM($B$3:$B$6)",
+          "libreoffice": "=SUM($B$3:$B$4)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B$3:$B6)",
+          "libreoffice": "=SUM(B$3:$B4)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=B5+$C$5+D$5+$E5",
+          "libreoffice": "=#REF!+#REF!+#REF!+#REF!"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(3:6)",
+          "libreoffice": "=SUM(3:4)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(A:B)",
+          "libreoffice": "=SUM(A:B)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B2:B25)+B24",
+          "libreoffice": "=SUM(B2:B22)+B21"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUMPRODUCT(B3:B6,C8:C12)",
+          "libreoffice": "=SUMPRODUCT(B3:B4,C5:C9)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=VLOOKUP(A5,A2:D10,2,0)",
+          "libreoffice": "=VLOOKUP(#REF!,A2:D7,2,0)"
+        }
+      ]
+    },
+    {
+      "name": "delete rows past a range",
+      "sheets": [
+        "Sheet1"
+      ],
+      "headerRow": 0,
+      "gestures": [
+        {
+          "op": "deleteRows",
+          "sheet": "Sheet1",
+          "first": 8,
+          "count": 4
+        }
+      ],
+      "formulas": [
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B3:B6)",
+          "libreoffice": "=SUM(B3:B6)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM($B$3:$B$6)",
+          "libreoffice": "=SUM($B$3:$B$6)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B$3:$B6)",
+          "libreoffice": "=SUM(B$3:$B6)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=B5+$C$5+D$5+$E5",
+          "libreoffice": "=B5+$C$5+D$5+$E5"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(3:6)",
+          "libreoffice": "=SUM(3:6)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(A:B)",
+          "libreoffice": "=SUM(A:B)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B2:B25)+B24",
+          "libreoffice": "=SUM(B2:B21)+B20"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUMPRODUCT(B3:B6,C8:C12)",
+          "libreoffice": "=SUMPRODUCT(B3:B6,C8)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=VLOOKUP(A5,A2:D10,2,0)",
+          "libreoffice": "=VLOOKUP(A5,A2:D7,2,0)"
+        }
+      ]
+    },
+    {
+      "name": "delete the last body row",
+      "sheets": [
+        "Sheet1"
+      ],
+      "headerRow": 0,
+      "gestures": [
+        {
+          "op": "deleteRows",
+          "sheet": "Sheet1",
+          "first": 20,
+          "count": 1
+        }
+      ],
+      "formulas": [
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B3:B6)",
+          "libreoffice": "=SUM(B3:B6)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM($B$3:$B$6)",
+          "libreoffice": "=SUM($B$3:$B$6)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B$3:$B6)",
+          "libreoffice": "=SUM(B$3:$B6)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=B5+$C$5+D$5+$E5",
+          "libreoffice": "=B5+$C$5+D$5+$E5"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(3:6)",
+          "libreoffice": "=SUM(3:6)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(A:B)",
+          "libreoffice": "=SUM(A:B)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B2:B25)+B24",
+          "libreoffice": "=SUM(B2:B24)+B23"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUMPRODUCT(B3:B6,C8:C12)",
+          "libreoffice": "=SUMPRODUCT(B3:B6,C8:C12)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=VLOOKUP(A5,A2:D10,2,0)",
+          "libreoffice": "=VLOOKUP(A5,A2:D10,2,0)"
+        }
+      ]
+    },
+    {
+      "name": "insert a column left of a range",
+      "sheets": [
+        "Sheet1"
+      ],
+      "headerRow": 0,
+      "gestures": [
+        {
+          "op": "insertColumns",
+          "sheet": "Sheet1",
+          "before": 2,
+          "count": 1
+        }
+      ],
+      "formulas": [
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(C2:F2)",
+          "libreoffice": "=SUM(D2:G2)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM($C$2:$F$2)",
+          "libreoffice": "=SUM($D$2:$G$2)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(C$2:$F2)",
+          "libreoffice": "=SUM(D$2:$G2)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=E3+$E$4+E$5+$E6",
+          "libreoffice": "=F3+$F$4+F$5+$F6"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(C:F)",
+          "libreoffice": "=SUM(D:G)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(1:2)",
+          "libreoffice": "=SUM(1:2)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B2:N2)+M2",
+          "libreoffice": "=SUM(C2:O2)+N2"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUMPRODUCT(C2:F2,C4:F4)",
+          "libreoffice": "=SUMPRODUCT(D2:G2,D4:G4)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=HLOOKUP(E1,B1:H8,3,0)",
+          "libreoffice": "=HLOOKUP(F1,C1:I8,3,0)"
+        }
+      ]
+    },
+    {
+      "name": "insert a column at a range's first column",
+      "sheets": [
+        "Sheet1"
+      ],
+      "headerRow": 0,
+      "gestures": [
+        {
+          "op": "insertColumns",
+          "sheet": "Sheet1",
+          "before": 3,
+          "count": 1
+        }
+      ],
+      "formulas": [
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(C2:F2)",
+          "libreoffice": "=SUM(D2:G2)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM($C$2:$F$2)",
+          "libreoffice": "=SUM($D$2:$G$2)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(C$2:$F2)",
+          "libreoffice": "=SUM(D$2:$G2)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=E3+$E$4+E$5+$E6",
+          "libreoffice": "=F3+$F$4+F$5+$F6"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(C:F)",
+          "libreoffice": "=SUM(D:G)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(1:2)",
+          "libreoffice": "=SUM(1:2)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B2:N2)+M2",
+          "libreoffice": "=SUM(B2:O2)+N2"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUMPRODUCT(C2:F2,C4:F4)",
+          "libreoffice": "=SUMPRODUCT(D2:G2,D4:G4)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=HLOOKUP(E1,B1:H8,3,0)",
+          "libreoffice": "=HLOOKUP(F1,B1:I8,3,0)"
+        }
+      ]
+    },
+    {
+      "name": "insert columns inside a range",
+      "sheets": [
+        "Sheet1"
+      ],
+      "headerRow": 0,
+      "gestures": [
+        {
+          "op": "insertColumns",
+          "sheet": "Sheet1",
+          "before": 4,
+          "count": 2
+        }
+      ],
+      "formulas": [
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(C2:F2)",
+          "libreoffice": "=SUM(C2:H2)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM($C$2:$F$2)",
+          "libreoffice": "=SUM($C$2:$H$2)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(C$2:$F2)",
+          "libreoffice": "=SUM(C$2:$H2)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=E3+$E$4+E$5+$E6",
+          "libreoffice": "=G3+$G$4+G$5+$G6"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(C:F)",
+          "libreoffice": "=SUM(C:H)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(1:2)",
+          "libreoffice": "=SUM(1:2)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B2:N2)+M2",
+          "libreoffice": "=SUM(B2:P2)+O2"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUMPRODUCT(C2:F2,C4:F4)",
+          "libreoffice": "=SUMPRODUCT(C2:H2,C4:H4)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=HLOOKUP(E1,B1:H8,3,0)",
+          "libreoffice": "=HLOOKUP(G1,B1:J8,3,0)"
+        }
+      ]
+    },
+    {
+      "name": "insert a column at a range's last column",
+      "sheets": [
+        "Sheet1"
+      ],
+      "headerRow": 0,
+      "gestures": [
+        {
+          "op": "insertColumns",
+          "sheet": "Sheet1",
+          "before": 6,
+          "count": 1
+        }
+      ],
+      "formulas": [
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(C2:F2)",
+          "libreoffice": "=SUM(C2:G2)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM($C$2:$F$2)",
+          "libreoffice": "=SUM($C$2:$G$2)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(C$2:$F2)",
+          "libreoffice": "=SUM(C$2:$G2)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=E3+$E$4+E$5+$E6",
+          "libreoffice": "=E3+$E$4+E$5+$E6"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(C:F)",
+          "libreoffice": "=SUM(C:G)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(1:2)",
+          "libreoffice": "=SUM(1:2)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B2:N2)+M2",
+          "libreoffice": "=SUM(B2:O2)+N2"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUMPRODUCT(C2:F2,C4:F4)",
+          "libreoffice": "=SUMPRODUCT(C2:G2,C4:G4)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=HLOOKUP(E1,B1:H8,3,0)",
+          "libreoffice": "=HLOOKUP(E1,B1:I8,3,0)"
+        }
+      ]
+    },
+    {
+      "name": "insert a column just right of a range",
+      "sheets": [
+        "Sheet1"
+      ],
+      "headerRow": 0,
+      "gestures": [
+        {
+          "op": "insertColumns",
+          "sheet": "Sheet1",
+          "before": 7,
+          "count": 1
+        }
+      ],
+      "formulas": [
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(C2:F2)",
+          "libreoffice": "=SUM(C2:F2)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM($C$2:$F$2)",
+          "libreoffice": "=SUM($C$2:$F$2)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(C$2:$F2)",
+          "libreoffice": "=SUM(C$2:$F2)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=E3+$E$4+E$5+$E6",
+          "libreoffice": "=E3+$E$4+E$5+$E6"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(C:F)",
+          "libreoffice": "=SUM(C:F)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(1:2)",
+          "libreoffice": "=SUM(1:2)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B2:N2)+M2",
+          "libreoffice": "=SUM(B2:O2)+N2"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUMPRODUCT(C2:F2,C4:F4)",
+          "libreoffice": "=SUMPRODUCT(C2:F2,C4:F4)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=HLOOKUP(E1,B1:H8,3,0)",
+          "libreoffice": "=HLOOKUP(E1,B1:I8,3,0)"
+        }
+      ]
+    },
+    {
+      "name": "insert columns at column A",
+      "sheets": [
+        "Sheet1"
+      ],
+      "headerRow": 0,
+      "gestures": [
+        {
+          "op": "insertColumns",
+          "sheet": "Sheet1",
+          "before": 1,
+          "count": 2
+        }
+      ],
+      "formulas": [
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(C2:F2)",
+          "libreoffice": "=SUM(E2:H2)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM($C$2:$F$2)",
+          "libreoffice": "=SUM($E$2:$H$2)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(C$2:$F2)",
+          "libreoffice": "=SUM(E$2:$H2)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=E3+$E$4+E$5+$E6",
+          "libreoffice": "=G3+$G$4+G$5+$G6"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(C:F)",
+          "libreoffice": "=SUM(E:H)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(1:2)",
+          "libreoffice": "=SUM(1:2)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B2:N2)+M2",
+          "libreoffice": "=SUM(D2:P2)+O2"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUMPRODUCT(C2:F2,C4:F4)",
+          "libreoffice": "=SUMPRODUCT(E2:H2,E4:H4)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=HLOOKUP(E1,B1:H8,3,0)",
+          "libreoffice": "=HLOOKUP(G1,D1:J8,3,0)"
+        }
+      ]
+    },
+    {
+      "name": "insert a column after the last source column",
+      "sheets": [
+        "Sheet1"
+      ],
+      "headerRow": 0,
+      "gestures": [
+        {
+          "op": "insertColumns",
+          "sheet": "Sheet1",
+          "before": 11,
+          "count": 1
+        }
+      ],
+      "formulas": [
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(C2:F2)",
+          "libreoffice": "=SUM(C2:F2)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM($C$2:$F$2)",
+          "libreoffice": "=SUM($C$2:$F$2)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(C$2:$F2)",
+          "libreoffice": "=SUM(C$2:$F2)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=E3+$E$4+E$5+$E6",
+          "libreoffice": "=E3+$E$4+E$5+$E6"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(C:F)",
+          "libreoffice": "=SUM(C:F)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(1:2)",
+          "libreoffice": "=SUM(1:2)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B2:N2)+M2",
+          "libreoffice": "=SUM(B2:O2)+N2"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUMPRODUCT(C2:F2,C4:F4)",
+          "libreoffice": "=SUMPRODUCT(C2:F2,C4:F4)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=HLOOKUP(E1,B1:H8,3,0)",
+          "libreoffice": "=HLOOKUP(E1,B1:H8,3,0)"
+        }
+      ]
+    },
+    {
+      "name": "delete a range's first column",
+      "sheets": [
+        "Sheet1"
+      ],
+      "headerRow": 0,
+      "gestures": [
+        {
+          "op": "deleteColumns",
+          "sheet": "Sheet1",
+          "first": 3,
+          "count": 1
+        }
+      ],
+      "formulas": [
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(C2:F2)",
+          "libreoffice": "=SUM(C2:E2)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM($C$2:$F$2)",
+          "libreoffice": "=SUM($C$2:$E$2)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(C$2:$F2)",
+          "libreoffice": "=SUM(C$2:$E2)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=E3+$E$4+E$5+$E6",
+          "libreoffice": "=D3+$D$4+D$5+$D6"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(C:F)",
+          "libreoffice": "=SUM(C:E)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(1:2)",
+          "libreoffice": "=SUM(1:2)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B2:N2)+M2",
+          "libreoffice": "=SUM(B2:M2)+L2"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUMPRODUCT(C2:F2,C4:F4)",
+          "libreoffice": "=SUMPRODUCT(C2:E2,C4:E4)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=HLOOKUP(E1,B1:H8,3,0)",
+          "libreoffice": "=HLOOKUP(D1,B1:G8,3,0)"
+        }
+      ]
+    },
+    {
+      "name": "delete a range's last column",
+      "sheets": [
+        "Sheet1"
+      ],
+      "headerRow": 0,
+      "gestures": [
+        {
+          "op": "deleteColumns",
+          "sheet": "Sheet1",
+          "first": 6,
+          "count": 1
+        }
+      ],
+      "formulas": [
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(C2:F2)",
+          "libreoffice": "=SUM(C2:E2)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM($C$2:$F$2)",
+          "libreoffice": "=SUM($C$2:$E$2)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(C$2:$F2)",
+          "libreoffice": "=SUM(C$2:$E2)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=E3+$E$4+E$5+$E6",
+          "libreoffice": "=E3+$E$4+E$5+$E6"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(C:F)",
+          "libreoffice": "=SUM(C:E)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(1:2)",
+          "libreoffice": "=SUM(1:2)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B2:N2)+M2",
+          "libreoffice": "=SUM(B2:M2)+L2"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUMPRODUCT(C2:F2,C4:F4)",
+          "libreoffice": "=SUMPRODUCT(C2:E2,C4:E4)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=HLOOKUP(E1,B1:H8,3,0)",
+          "libreoffice": "=HLOOKUP(E1,B1:G8,3,0)"
+        }
+      ]
+    },
+    {
+      "name": "delete columns inside a range",
+      "sheets": [
+        "Sheet1"
+      ],
+      "headerRow": 0,
+      "gestures": [
+        {
+          "op": "deleteColumns",
+          "sheet": "Sheet1",
+          "first": 4,
+          "count": 2
+        }
+      ],
+      "formulas": [
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(C2:F2)",
+          "libreoffice": "=SUM(C2:D2)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM($C$2:$F$2)",
+          "libreoffice": "=SUM($C$2:$D$2)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(C$2:$F2)",
+          "libreoffice": "=SUM(C$2:$D2)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=E3+$E$4+E$5+$E6",
+          "libreoffice": "=#REF!+#REF!+#REF!+#REF!"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(C:F)",
+          "libreoffice": "=SUM(C:D)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(1:2)",
+          "libreoffice": "=SUM(1:2)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B2:N2)+M2",
+          "libreoffice": "=SUM(B2:L2)+K2"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUMPRODUCT(C2:F2,C4:F4)",
+          "libreoffice": "=SUMPRODUCT(C2:D2,C4:D4)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=HLOOKUP(E1,B1:H8,3,0)",
+          "libreoffice": "=HLOOKUP(#REF!,B1:F8,3,0)"
+        }
+      ]
+    },
+    {
+      "name": "delete every column of a range",
+      "sheets": [
+        "Sheet1"
+      ],
+      "headerRow": 0,
+      "gestures": [
+        {
+          "op": "deleteColumns",
+          "sheet": "Sheet1",
+          "first": 3,
+          "count": 4
+        }
+      ],
+      "formulas": [
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(C2:F2)",
+          "libreoffice": "=SUM(#REF!)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM($C$2:$F$2)",
+          "libreoffice": "=SUM(#REF!)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(C$2:$F2)",
+          "libreoffice": "=SUM(#REF!)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=E3+$E$4+E$5+$E6",
+          "libreoffice": "=#REF!+#REF!+#REF!+#REF!"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(C:F)",
+          "libreoffice": "=SUM(#REF!)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(1:2)",
+          "libreoffice": "=SUM(1:2)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B2:N2)+M2",
+          "libreoffice": "=SUM(B2:J2)+I2"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUMPRODUCT(C2:F2,C4:F4)",
+          "libreoffice": "=SUMPRODUCT(#REF!,#REF!)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=HLOOKUP(E1,B1:H8,3,0)",
+          "libreoffice": "=HLOOKUP(#REF!,B1:D8,3,0)"
+        }
+      ]
+    },
+    {
+      "name": "delete a referenced cell's column",
+      "sheets": [
+        "Sheet1"
+      ],
+      "headerRow": 0,
+      "gestures": [
+        {
+          "op": "deleteColumns",
+          "sheet": "Sheet1",
+          "first": 5,
+          "count": 1
+        }
+      ],
+      "formulas": [
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(C2:F2)",
+          "libreoffice": "=SUM(C2:E2)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM($C$2:$F$2)",
+          "libreoffice": "=SUM($C$2:$E$2)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(C$2:$F2)",
+          "libreoffice": "=SUM(C$2:$E2)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=E3+$E$4+E$5+$E6",
+          "libreoffice": "=#REF!+#REF!+#REF!+#REF!"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(C:F)",
+          "libreoffice": "=SUM(C:E)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(1:2)",
+          "libreoffice": "=SUM(1:2)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B2:N2)+M2",
+          "libreoffice": "=SUM(B2:M2)+L2"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUMPRODUCT(C2:F2,C4:F4)",
+          "libreoffice": "=SUMPRODUCT(C2:E2,C4:E4)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=HLOOKUP(E1,B1:H8,3,0)",
+          "libreoffice": "=HLOOKUP(#REF!,B1:G8,3,0)"
+        }
+      ]
+    },
+    {
+      "name": "delete columns left of a range",
+      "sheets": [
+        "Sheet1"
+      ],
+      "headerRow": 0,
+      "gestures": [
+        {
+          "op": "deleteColumns",
+          "sheet": "Sheet1",
+          "first": 1,
+          "count": 2
+        }
+      ],
+      "formulas": [
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(C2:F2)",
+          "libreoffice": "=SUM(A2:D2)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM($C$2:$F$2)",
+          "libreoffice": "=SUM($A$2:$D$2)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(C$2:$F2)",
+          "libreoffice": "=SUM(A$2:$D2)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=E3+$E$4+E$5+$E6",
+          "libreoffice": "=C3+$C$4+C$5+$C6"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(C:F)",
+          "libreoffice": "=SUM(A:D)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(1:2)",
+          "libreoffice": "=SUM(1:2)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B2:N2)+M2",
+          "libreoffice": "=SUM(A2:L2)+K2"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUMPRODUCT(C2:F2,C4:F4)",
+          "libreoffice": "=SUMPRODUCT(A2:D2,A4:D4)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=HLOOKUP(E1,B1:H8,3,0)",
+          "libreoffice": "=HLOOKUP(C1,A1:F8,3,0)"
+        }
+      ]
+    },
+    {
+      "name": "delete columns straddling a range's first column",
+      "sheets": [
+        "Sheet1"
+      ],
+      "headerRow": 0,
+      "gestures": [
+        {
+          "op": "deleteColumns",
+          "sheet": "Sheet1",
+          "first": 2,
+          "count": 3
+        }
+      ],
+      "formulas": [
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(C2:F2)",
+          "libreoffice": "=SUM(B2:C2)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM($C$2:$F$2)",
+          "libreoffice": "=SUM($B$2:$C$2)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(C$2:$F2)",
+          "libreoffice": "=SUM(B$2:$C2)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=E3+$E$4+E$5+$E6",
+          "libreoffice": "=B3+$B$4+B$5+$B6"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(C:F)",
+          "libreoffice": "=SUM(B:C)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(1:2)",
+          "libreoffice": "=SUM(1:2)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B2:N2)+M2",
+          "libreoffice": "=SUM(B2:K2)+J2"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUMPRODUCT(C2:F2,C4:F4)",
+          "libreoffice": "=SUMPRODUCT(B2:C2,B4:C4)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=HLOOKUP(E1,B1:H8,3,0)",
+          "libreoffice": "=HLOOKUP(B1,B1:E8,3,0)"
+        }
+      ]
+    },
+    {
+      "name": "delete the last source column",
+      "sheets": [
+        "Sheet1"
+      ],
+      "headerRow": 0,
+      "gestures": [
+        {
+          "op": "deleteColumns",
+          "sheet": "Sheet1",
+          "first": 10,
+          "count": 1
+        }
+      ],
+      "formulas": [
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(C2:F2)",
+          "libreoffice": "=SUM(C2:F2)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM($C$2:$F$2)",
+          "libreoffice": "=SUM($C$2:$F$2)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(C$2:$F2)",
+          "libreoffice": "=SUM(C$2:$F2)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=E3+$E$4+E$5+$E6",
+          "libreoffice": "=E3+$E$4+E$5+$E6"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(C:F)",
+          "libreoffice": "=SUM(C:F)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(1:2)",
+          "libreoffice": "=SUM(1:2)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B2:N2)+M2",
+          "libreoffice": "=SUM(B2:M2)+L2"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUMPRODUCT(C2:F2,C4:F4)",
+          "libreoffice": "=SUMPRODUCT(C2:F2,C4:F4)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=HLOOKUP(E1,B1:H8,3,0)",
+          "libreoffice": "=HLOOKUP(E1,B1:H8,3,0)"
+        }
+      ]
+    },
+    {
+      "name": "insert below the Header Row",
+      "sheets": [
+        "Sheet1"
+      ],
+      "headerRow": 1,
+      "gestures": [
+        {
+          "op": "insertRows",
+          "sheet": "Sheet1",
+          "before": 2,
+          "count": 1
+        }
+      ],
+      "formulas": [
+        {
+          "sheet": "Sheet1",
+          "text": "=B1+B2",
+          "libreoffice": "=B1+B3"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B1:B4)",
+          "libreoffice": "=SUM(B1:B5)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(1:3)",
+          "libreoffice": "=SUM(1:4)"
+        }
+      ]
+    },
+    {
+      "name": "delete the first body row under a Header Row",
+      "sheets": [
+        "Sheet1"
+      ],
+      "headerRow": 1,
+      "gestures": [
+        {
+          "op": "deleteRows",
+          "sheet": "Sheet1",
+          "first": 2,
+          "count": 1
+        }
+      ],
+      "formulas": [
+        {
+          "sheet": "Sheet1",
+          "text": "=B1+B2",
+          "libreoffice": "=B1+#REF!"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B1:B4)",
+          "libreoffice": "=SUM(B1:B3)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B2:B4)",
+          "libreoffice": "=SUM(B2:B3)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(1:3)",
+          "libreoffice": "=SUM(1:2)"
+        }
+      ]
+    },
+    {
+      "name": "insert rows on a referenced sheet with a space in its name",
+      "sheets": [
+        "Sheet1",
+        "My Data"
+      ],
+      "headerRow": 0,
+      "gestures": [
+        {
+          "op": "insertRows",
+          "sheet": "My Data",
+          "before": 4,
+          "count": 2
+        }
+      ],
+      "formulas": [
+        {
+          "sheet": "Sheet1",
+          "text": "='My Data'!B5+B5",
+          "libreoffice": "='My Data'!B7+B5"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM('My Data'!B3:B6)+SUM(B3:B6)",
+          "libreoffice": "=SUM('My Data'!B3:B8)+SUM(B3:B6)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM('My Data'!3:6)",
+          "libreoffice": "=SUM('My Data'!3:8)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=COUNTA('My Data'!B:B)",
+          "libreoffice": "=COUNTA('My Data'!B:B)"
+        },
+        {
+          "sheet": "My Data",
+          "text": "=SUM(Sheet1!B3:B6)",
+          "libreoffice": "=SUM(Sheet1!B3:B6)"
+        },
+        {
+          "sheet": "My Data",
+          "text": "=SUM(B3:B6)",
+          "libreoffice": "=SUM(B3:B8)"
+        }
+      ]
+    },
+    {
+      "name": "delete columns on a referenced sheet",
+      "sheets": [
+        "Sheet1",
+        "My Data"
+      ],
+      "headerRow": 0,
+      "gestures": [
+        {
+          "op": "deleteColumns",
+          "sheet": "My Data",
+          "first": 3,
+          "count": 2
+        }
+      ],
+      "formulas": [
+        {
+          "sheet": "Sheet1",
+          "text": "='My Data'!E2+E2",
+          "libreoffice": "='My Data'!C2+E2"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM('My Data'!C2:F2)+SUM(C2:F2)",
+          "libreoffice": "=SUM('My Data'!C2:D2)+SUM(C2:F2)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "='My Data'!D7",
+          "libreoffice": "=#REF!"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM('My Data'!B:E)",
+          "libreoffice": "=SUM('My Data'!B:C)"
+        }
+      ]
+    },
+    {
+      "name": "gestures on both sheets",
+      "sheets": [
+        "Sheet1",
+        "My Data"
+      ],
+      "headerRow": 0,
+      "gestures": [
+        {
+          "op": "insertRows",
+          "sheet": "Sheet1",
+          "before": 2,
+          "count": 1
+        },
+        {
+          "op": "deleteRows",
+          "sheet": "My Data",
+          "first": 5,
+          "count": 1
+        },
+        {
+          "op": "insertColumns",
+          "sheet": "My Data",
+          "before": 1,
+          "count": 1
+        }
+      ],
+      "formulas": [
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM('My Data'!B3:B8)+SUM(B3:B8)",
+          "libreoffice": "=SUM('My Data'!C3:C7)+SUM(B4:B9)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "='My Data'!C5",
+          "libreoffice": "=#REF!"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "='My Data'!C6+C6",
+          "libreoffice": "='My Data'!D5+C7"
+        }
+      ]
+    },
+    {
+      "name": "defined names across row and column changes",
+      "sheets": [
+        "Sheet1",
+        "My Data"
+      ],
+      "headerRow": 0,
+      "gestures": [
+        {
+          "op": "insertRows",
+          "sheet": "Sheet1",
+          "before": 4,
+          "count": 2
+        },
+        {
+          "op": "deleteColumns",
+          "sheet": "My Data",
+          "first": 2,
+          "count": 1
+        }
+      ],
+      "formulas": [
+        {
+          "name": "Block",
+          "text": "=Sheet1!$B$3:$D$6",
+          "libreoffice": "=Sheet1!$B$3:$D$8"
+        },
+        {
+          "name": "Cell",
+          "text": "=Sheet1!$B$8",
+          "libreoffice": "=Sheet1!$B$10"
+        },
+        {
+          "name": "Rows",
+          "text": "=Sheet1!$3:$6",
+          "libreoffice": "=Sheet1!$3:$8"
+        },
+        {
+          "name": "Other",
+          "text": "='My Data'!$C$2:$F$9",
+          "libreoffice": "='My Data'!$B$2:$E$9"
+        },
+        {
+          "name": "Gone",
+          "text": "='My Data'!$B$4",
+          "libreoffice": "=#REF!"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(Block)+Cell",
+          "libreoffice": "=SUM(Block)+Cell"
+        }
+      ]
+    },
+    {
+      "name": "insert and delete around several ranges in one function",
+      "sheets": [
+        "Sheet1"
+      ],
+      "headerRow": 0,
+      "gestures": [
+        {
+          "op": "insertRows",
+          "sheet": "Sheet1",
+          "before": 4,
+          "count": 1
+        },
+        {
+          "op": "deleteRows",
+          "sheet": "Sheet1",
+          "first": 10,
+          "count": 2
+        }
+      ],
+      "formulas": [
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B3:B6,D8:D12,F2)",
+          "libreoffice": "=SUM(B3:B7,D9:D11,F2)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUMIFS(C2:C15,A2:A15,\">2\",B2:B15,\"<9\")",
+          "libreoffice": "=SUMIFS(C2:C14,A2:A14,\">2\",B2:B14,\"<9\")"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=INDEX(A2:E15,MATCH(4,A2:A15,0),2)",
+          "libreoffice": "=INDEX(A2:E14,MATCH(4,A2:A14,0),2)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=IF(B3>0,SUM(B3:B6),AVERAGE(C8:C12))",
+          "libreoffice": "=IF(B3>0,SUM(B3:B7),AVERAGE(C9:C11))"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B3:D6 C4:E8)",
+          "libreoffice": "=SUM(B3:D7 C5:E9)"
+        }
+      ]
+    },
+    {
+      "name": "insert then delete rows",
+      "sheets": [
+        "Sheet1"
+      ],
+      "headerRow": 0,
+      "gestures": [
+        {
+          "op": "insertRows",
+          "sheet": "Sheet1",
+          "before": 4,
+          "count": 2
+        },
+        {
+          "op": "deleteRows",
+          "sheet": "Sheet1",
+          "first": 8,
+          "count": 2
+        }
+      ],
+      "formulas": [
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B3:B6)",
+          "libreoffice": "=SUM(B3:B7)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM($B$3:$B$6)",
+          "libreoffice": "=SUM($B$3:$B$7)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B$3:$B6)",
+          "libreoffice": "=SUM(B$3:$B7)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=B5+$C$5+D$5+$E5",
+          "libreoffice": "=B7+$C$7+D$7+$E7"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(3:6)",
+          "libreoffice": "=SUM(3:7)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(A:B)",
+          "libreoffice": "=SUM(A:B)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B2:B25)+B24",
+          "libreoffice": "=SUM(B2:B25)+B24"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUMPRODUCT(B3:B6,C8:C12)",
+          "libreoffice": "=SUMPRODUCT(B3:B7,C8:C12)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=VLOOKUP(A5,A2:D10,2,0)",
+          "libreoffice": "=VLOOKUP(A7,A2:D10,2,0)"
+        }
+      ]
+    },
+    {
+      "name": "delete then insert rows elsewhere",
+      "sheets": [
+        "Sheet1"
+      ],
+      "headerRow": 0,
+      "gestures": [
+        {
+          "op": "deleteRows",
+          "sheet": "Sheet1",
+          "first": 10,
+          "count": 3
+        },
+        {
+          "op": "insertRows",
+          "sheet": "Sheet1",
+          "before": 2,
+          "count": 1
+        }
+      ],
+      "formulas": [
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B3:B6)",
+          "libreoffice": "=SUM(B4:B7)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM($B$3:$B$6)",
+          "libreoffice": "=SUM($B$4:$B$7)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B$3:$B6)",
+          "libreoffice": "=SUM(B$4:$B7)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=B5+$C$5+D$5+$E5",
+          "libreoffice": "=B6+$C$6+D$6+$E6"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(3:6)",
+          "libreoffice": "=SUM(4:7)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(A:B)",
+          "libreoffice": "=SUM(A:B)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B2:B25)+B24",
+          "libreoffice": "=SUM(B3:B23)+B22"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUMPRODUCT(B3:B6,C8:C12)",
+          "libreoffice": "=SUMPRODUCT(B4:B7,C9:C10)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=VLOOKUP(A5,A2:D10,2,0)",
+          "libreoffice": "=VLOOKUP(A6,A3:D10,2,0)"
+        }
+      ]
+    },
+    {
+      "name": "delete an inserted row",
+      "sheets": [
+        "Sheet1"
+      ],
+      "headerRow": 0,
+      "gestures": [
+        {
+          "op": "insertRows",
+          "sheet": "Sheet1",
+          "before": 5,
+          "count": 1
+        },
+        {
+          "op": "deleteRows",
+          "sheet": "Sheet1",
+          "first": 5,
+          "count": 1
+        }
+      ],
+      "formulas": [
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B3:B6)",
+          "libreoffice": "=SUM(B3:B6)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM($B$3:$B$6)",
+          "libreoffice": "=SUM($B$3:$B$6)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B$3:$B6)",
+          "libreoffice": "=SUM(B$3:$B6)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=B5+$C$5+D$5+$E5",
+          "libreoffice": "=B5+$C$5+D$5+$E5"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(3:6)",
+          "libreoffice": "=SUM(3:6)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(A:B)",
+          "libreoffice": "=SUM(A:B)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B2:B25)+B24",
+          "libreoffice": "=SUM(B2:B25)+B24"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUMPRODUCT(B3:B6,C8:C12)",
+          "libreoffice": "=SUMPRODUCT(B3:B6,C8:C12)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=VLOOKUP(A5,A2:D10,2,0)",
+          "libreoffice": "=VLOOKUP(A5,A2:D10,2,0)"
+        }
+      ]
+    },
+    {
+      "name": "insert then delete columns",
+      "sheets": [
+        "Sheet1"
+      ],
+      "headerRow": 0,
+      "gestures": [
+        {
+          "op": "insertColumns",
+          "sheet": "Sheet1",
+          "before": 4,
+          "count": 2
+        },
+        {
+          "op": "deleteColumns",
+          "sheet": "Sheet1",
+          "first": 2,
+          "count": 1
+        }
+      ],
+      "formulas": [
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(C2:F2)",
+          "libreoffice": "=SUM(B2:G2)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM($C$2:$F$2)",
+          "libreoffice": "=SUM($B$2:$G$2)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(C$2:$F2)",
+          "libreoffice": "=SUM(B$2:$G2)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=E3+$E$4+E$5+$E6",
+          "libreoffice": "=F3+$F$4+F$5+$F6"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(C:F)",
+          "libreoffice": "=SUM(B:G)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(1:2)",
+          "libreoffice": "=SUM(1:2)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B2:N2)+M2",
+          "libreoffice": "=SUM(B2:O2)+N2"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUMPRODUCT(C2:F2,C4:F4)",
+          "libreoffice": "=SUMPRODUCT(B2:G2,B4:G4)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=HLOOKUP(E1,B1:H8,3,0)",
+          "libreoffice": "=HLOOKUP(F1,B1:I8,3,0)"
+        }
+      ]
+    },
+    {
+      "name": "rows and columns together",
+      "sheets": [
+        "Sheet1"
+      ],
+      "headerRow": 0,
+      "gestures": [
+        {
+          "op": "insertRows",
+          "sheet": "Sheet1",
+          "before": 4,
+          "count": 1
+        },
+        {
+          "op": "insertColumns",
+          "sheet": "Sheet1",
+          "before": 3,
+          "count": 1
+        },
+        {
+          "op": "deleteRows",
+          "sheet": "Sheet1",
+          "first": 2,
+          "count": 1
+        },
+        {
+          "op": "deleteColumns",
+          "sheet": "Sheet1",
+          "first": 6,
+          "count": 1
+        }
+      ],
+      "formulas": [
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B3:F8)",
+          "libreoffice": "=SUM(B2:F8)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=D5",
+          "libreoffice": "=E5"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=$E$7*2",
+          "libreoffice": "=#REF!*2"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(C:E)",
+          "libreoffice": "=SUM(D:E)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(2:5)",
+          "libreoffice": "=SUM(2:5)"
+        }
+      ]
+    },
+    {
+      "name": "move a row from inside a range out of it",
+      "sheets": [
+        "Sheet1"
+      ],
+      "headerRow": 0,
+      "gestures": [
+        {
+          "op": "moveRows",
+          "sheet": "Sheet1",
+          "first": 4,
+          "count": 1,
+          "before": 12
+        }
+      ],
+      "formulas": [
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B3:B6)",
+          "libreoffice": "=SUM(B3:B5)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=B4",
+          "libreoffice": "=B11"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B10:B14)",
+          "libreoffice": "=SUM(B9:B14)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(3:6)",
+          "libreoffice": "=SUM(3:5)"
+        }
+      ]
+    },
+    {
+      "name": "move a row from outside a range into it",
+      "sheets": [
+        "Sheet1"
+      ],
+      "headerRow": 0,
+      "gestures": [
+        {
+          "op": "moveRows",
+          "sheet": "Sheet1",
+          "first": 12,
+          "count": 1,
+          "before": 5
+        }
+      ],
+      "formulas": [
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B3:B6)",
+          "libreoffice": "=SUM(B3:B7)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=B12",
+          "libreoffice": "=B5"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B10:B14)",
+          "libreoffice": "=SUM(B11:B14)"
+        }
+      ]
+    },
+    {
+      "name": "move a whole range",
+      "sheets": [
+        "Sheet1"
+      ],
+      "headerRow": 0,
+      "gestures": [
+        {
+          "op": "moveRows",
+          "sheet": "Sheet1",
+          "first": 3,
+          "count": 4,
+          "before": 15
+        }
+      ],
+      "formulas": [
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B3:B6)",
+          "libreoffice": "=SUM(B11:B14)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B10:B14)",
+          "libreoffice": "=SUM(B6:B10)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=B4",
+          "libreoffice": "=B12"
+        }
+      ]
+    },
+    {
+      "name": "move rows to the end",
+      "sheets": [
+        "Sheet1"
+      ],
+      "headerRow": 0,
+      "gestures": [
+        {
+          "op": "moveRows",
+          "sheet": "Sheet1",
+          "first": 2,
+          "count": 2,
+          "before": 21
+        }
+      ],
+      "formulas": [
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B5:B8)",
+          "libreoffice": "=SUM(B3:B6)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=B2+B3",
+          "libreoffice": "=B19+B20"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B2:B25)+B24",
+          "libreoffice": "=SUM(B2:B25)+B24",
+          "expect": {
+            "kind": "flagged",
+            "note": "LibreOffice's move is insert + cut-paste + delete, and cut-paste moves only references wholly inside the moved block, so a range whose corner moves keeps its old bounds. The spec carries each corner with its row (\"Where this differs from Excel\": corner-crossing and displaced corners), so the range is in the flagged superset."
+          }
+        }
+      ]
+    },
+    {
+      "name": "move a column from inside a range out of it",
+      "sheets": [
+        "Sheet1"
+      ],
+      "headerRow": 0,
+      "gestures": [
+        {
+          "op": "moveColumns",
+          "sheet": "Sheet1",
+          "first": 4,
+          "count": 1,
+          "before": 9
+        }
+      ],
+      "formulas": [
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(C2:F2)",
+          "libreoffice": "=SUM(C2:E2)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=D3",
+          "libreoffice": "=H3"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(C:F)",
+          "libreoffice": "=SUM(C:E)"
+        }
+      ]
+    },
+    {
+      "name": "move columns from outside a range into it",
+      "sheets": [
+        "Sheet1"
+      ],
+      "headerRow": 0,
+      "gestures": [
+        {
+          "op": "moveColumns",
+          "sheet": "Sheet1",
+          "first": 8,
+          "count": 2,
+          "before": 4
+        }
+      ],
+      "formulas": [
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(C2:F2)",
+          "libreoffice": "=SUM(C2:H2)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=H3+I3",
+          "libreoffice": "=D3+E3"
+        }
+      ]
+    },
+    {
+      "name": "move a range's last row down past other rows",
+      "sheets": [
+        "Sheet1"
+      ],
+      "headerRow": 0,
+      "gestures": [
+        {
+          "op": "moveRows",
+          "sheet": "Sheet1",
+          "first": 6,
+          "count": 1,
+          "before": 10
+        }
+      ],
+      "formulas": [
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B3:B6)",
+          "libreoffice": "=SUM(B3:B5)",
+          "expect": {
+            "kind": "flagged",
+            "note": "LibreOffice's move is insert + cut-paste + delete, and cut-paste moves only references wholly inside the moved block, so a range whose corner moves keeps its old bounds. The spec carries each corner with its row (\"Where this differs from Excel\": corner-crossing and displaced corners), so the range is in the flagged superset."
+          }
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=B6",
+          "libreoffice": "=B9"
+        }
+      ]
+    },
+    {
+      "name": "move a range's first row above it",
+      "sheets": [
+        "Sheet1"
+      ],
+      "headerRow": 0,
+      "gestures": [
+        {
+          "op": "moveRows",
+          "sheet": "Sheet1",
+          "first": 3,
+          "count": 1,
+          "before": 1
+        }
+      ],
+      "formulas": [
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B3:B6)",
+          "libreoffice": "=SUM(B4:B6)",
+          "expect": {
+            "kind": "flagged",
+            "note": "LibreOffice's move is insert + cut-paste + delete, and cut-paste moves only references wholly inside the moved block, so a range whose corner moves keeps its old bounds. The spec carries each corner with its row (\"Where this differs from Excel\": corner-crossing and displaced corners), so the range is in the flagged superset."
+          }
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=B3",
+          "libreoffice": "=B1"
+        }
+      ]
+    },
+    {
+      "name": "move a range's last row above its first",
+      "sheets": [
+        "Sheet1"
+      ],
+      "headerRow": 0,
+      "gestures": [
+        {
+          "op": "moveRows",
+          "sheet": "Sheet1",
+          "first": 6,
+          "count": 1,
+          "before": 2
+        }
+      ],
+      "formulas": [
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B3:B6)",
+          "libreoffice": "=SUM(B4:B6)",
+          "expect": {
+            "kind": "flagged",
+            "note": "LibreOffice's move is insert + cut-paste + delete, and cut-paste moves only references wholly inside the moved block, so a range whose corner moves keeps its old bounds. The spec carries each corner with its row (\"Where this differs from Excel\": corner-crossing and displaced corners), so the range is in the flagged superset."
+          }
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM($B$3:$B$6)",
+          "libreoffice": "=SUM($B$4:$B$6)",
+          "expect": {
+            "kind": "flagged",
+            "note": "LibreOffice's move is insert + cut-paste + delete, and cut-paste moves only references wholly inside the moved block, so a range whose corner moves keeps its old bounds. The spec carries each corner with its row (\"Where this differs from Excel\": corner-crossing and displaced corners), so the range is in the flagged superset."
+          }
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=$B$6",
+          "libreoffice": "=$B$2"
+        }
+      ]
+    },
+    {
+      "name": "move a range's first column past its last",
+      "sheets": [
+        "Sheet1"
+      ],
+      "headerRow": 0,
+      "gestures": [
+        {
+          "op": "moveColumns",
+          "sheet": "Sheet1",
+          "first": 3,
+          "count": 1,
+          "before": 8
+        }
+      ],
+      "formulas": [
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(C2:F2)",
+          "libreoffice": "=SUM(C2:E2)",
+          "expect": {
+            "kind": "flagged",
+            "note": "LibreOffice's move is insert + cut-paste + delete, and cut-paste moves only references wholly inside the moved block, so a range whose corner moves keeps its old bounds. The spec carries each corner with its row (\"Where this differs from Excel\": corner-crossing and displaced corners), so the range is in the flagged superset."
+          }
+        }
+      ]
+    },
+    {
+      "name": "move rows then insert and delete",
+      "sheets": [
+        "Sheet1"
+      ],
+      "headerRow": 0,
+      "gestures": [
+        {
+          "op": "moveRows",
+          "sheet": "Sheet1",
+          "first": 12,
+          "count": 2,
+          "before": 4
+        },
+        {
+          "op": "insertRows",
+          "sheet": "Sheet1",
+          "before": 2,
+          "count": 1
+        },
+        {
+          "op": "deleteRows",
+          "sheet": "Sheet1",
+          "first": 9,
+          "count": 1
+        }
+      ],
+      "formulas": [
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B3:B8)",
+          "libreoffice": "=SUM(B4:B10)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=B12+B13",
+          "libreoffice": "=B5+B6"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B10:B16)",
+          "libreoffice": "=SUM(B12:B16)"
+        }
+      ]
+    },
+    {
+      "name": "move rows on a referenced sheet",
+      "sheets": [
+        "Sheet1",
+        "My Data"
+      ],
+      "headerRow": 0,
+      "gestures": [
+        {
+          "op": "moveRows",
+          "sheet": "My Data",
+          "first": 10,
+          "count": 2,
+          "before": 4
+        }
+      ],
+      "formulas": [
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM('My Data'!B3:B6)",
+          "libreoffice": "=SUM('My Data'!B3:B8)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "='My Data'!B10+'My Data'!B11",
+          "libreoffice": "='My Data'!B4+'My Data'!B5"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM('My Data'!3:6)",
+          "libreoffice": "=SUM('My Data'!3:8)"
+        }
+      ]
+    },
+    {
+      "name": "move a row into whole rows",
+      "sheets": [
+        "Sheet1"
+      ],
+      "headerRow": 0,
+      "gestures": [
+        {
+          "op": "moveRows",
+          "sheet": "Sheet1",
+          "first": 10,
+          "count": 1,
+          "before": 5
+        }
+      ],
+      "formulas": [
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(3:6)",
+          "libreoffice": "=SUM(3:7)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM($3:$6)",
+          "libreoffice": "=SUM($3:$7)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B3:B6)",
+          "libreoffice": "=SUM(B3:B7)"
+        }
+      ]
+    },
+    {
+      "name": "move columns, then insert and delete columns",
+      "sheets": [
+        "Sheet1"
+      ],
+      "headerRow": 0,
+      "gestures": [
+        {
+          "op": "moveColumns",
+          "sheet": "Sheet1",
+          "first": 2,
+          "count": 2,
+          "before": 9
+        },
+        {
+          "op": "insertColumns",
+          "sheet": "Sheet1",
+          "before": 3,
+          "count": 1
+        },
+        {
+          "op": "deleteColumns",
+          "sheet": "Sheet1",
+          "first": 7,
+          "count": 1
+        }
+      ],
+      "formulas": [
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(D2:G2)",
+          "libreoffice": "=SUM(B2:F2)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=B3+C3",
+          "libreoffice": "=G3+H3"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(E:H)",
+          "libreoffice": "=SUM(D:F)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(H2:I2)",
+          "libreoffice": "=SUM(G2:I2)"
+        }
+      ]
+    },
+    {
+      "name": "delete a range's first row, then insert where it was",
+      "sheets": [
+        "Sheet1"
+      ],
+      "headerRow": 0,
+      "gestures": [
+        {
+          "op": "deleteRows",
+          "sheet": "Sheet1",
+          "first": 3,
+          "count": 1
+        },
+        {
+          "op": "insertRows",
+          "sheet": "Sheet1",
+          "before": 3,
+          "count": 1
+        }
+      ],
+      "formulas": [
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B3:B6)",
+          "libreoffice": "=SUM(B4:B6)",
+          "expect": {
+            "kind": "flagged",
+            "note": "LibreOffice shrinks the deleted first corner to the next row at the moment of deletion, so the later insertion at that row shifts the range. The spec renders from the tombstone's glued position, which puts the inserted row inside the range: the \"refilled corner gap\" class of \"Where this differs from Excel\" (tombstoneCorner)."
+          }
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=B4",
+          "libreoffice": "=B4"
+        }
+      ]
+    },
+    {
+      "name": "delete a range's last row, then insert where it was",
+      "sheets": [
+        "Sheet1"
+      ],
+      "headerRow": 0,
+      "gestures": [
+        {
+          "op": "deleteRows",
+          "sheet": "Sheet1",
+          "first": 6,
+          "count": 1
+        },
+        {
+          "op": "insertRows",
+          "sheet": "Sheet1",
+          "before": 6,
+          "count": 1
+        }
+      ],
+      "formulas": [
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B3:B6)",
+          "libreoffice": "=SUM(B3:B5)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=B7",
+          "libreoffice": "=B7"
+        }
+      ]
+    },
+    {
+      "name": "delete a range's first column, then insert where it was",
+      "sheets": [
+        "Sheet1"
+      ],
+      "headerRow": 0,
+      "gestures": [
+        {
+          "op": "deleteColumns",
+          "sheet": "Sheet1",
+          "first": 3,
+          "count": 1
+        },
+        {
+          "op": "insertColumns",
+          "sheet": "Sheet1",
+          "before": 3,
+          "count": 2
+        }
+      ],
+      "formulas": [
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(C2:F2)",
+          "libreoffice": "=SUM(E2:G2)",
+          "expect": {
+            "kind": "flagged",
+            "note": "As for rows: LibreOffice shrinks the deleted first corner, then shifts it on the insertion; the spec's tombstone glue puts the new columns inside the range (refilled corner gap, tombstoneCorner)."
+          }
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=D3",
+          "libreoffice": "=E3"
+        }
+      ]
+    },
+    {
+      "name": "insert rows, then delete some of them with source rows",
+      "sheets": [
+        "Sheet1"
+      ],
+      "headerRow": 0,
+      "gestures": [
+        {
+          "op": "insertRows",
+          "sheet": "Sheet1",
+          "before": 4,
+          "count": 3
+        },
+        {
+          "op": "deleteRows",
+          "sheet": "Sheet1",
+          "first": 5,
+          "count": 4
+        }
+      ],
+      "formulas": [
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B3:B6)",
+          "libreoffice": "=SUM(B3:B5)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B4:B9)",
+          "libreoffice": "=SUM(B5:B8)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=B4+B7+B8",
+          "libreoffice": "=#REF!+B6+B7"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(2:12)",
+          "libreoffice": "=SUM(2:11)"
+        }
+      ]
+    },
+    {
+      "name": "delete rows, then move a row across the gap",
+      "sheets": [
+        "Sheet1"
+      ],
+      "headerRow": 0,
+      "gestures": [
+        {
+          "op": "deleteRows",
+          "sheet": "Sheet1",
+          "first": 5,
+          "count": 2
+        },
+        {
+          "op": "moveRows",
+          "sheet": "Sheet1",
+          "first": 12,
+          "count": 1,
+          "before": 4
+        }
+      ],
+      "formulas": [
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B3:B8)",
+          "libreoffice": "=SUM(B3:B7)"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=B14",
+          "libreoffice": "=B4"
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B10:B16)",
+          "libreoffice": "=SUM(B9:B14)"
+        }
+      ]
+    }
+  ]
+}

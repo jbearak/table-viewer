@@ -492,8 +492,9 @@ describe('divergence flags', () => {
  * columns", Microsoft Support): references below or right of an insertion
  * shift; an insertion at or inside a range below its first row expands it;
  * an insertion after its last row leaves it alone; deleting rows inside a
- * range shrinks it; deleting every row of a reference makes it #REF!. Move
- * cases are not oracle-checked yet and rely on the divergence flags.
+ * range shrinks it; deleting every row of a reference makes it #REF!. The
+ * generated LibreOffice oracle, moves included, is in
+ * `formula-anchors-libreoffice-oracle.test.ts`.
  */
 describe('Excel oracle fixtures (hand-written)', () => {
     interface OracleCase {

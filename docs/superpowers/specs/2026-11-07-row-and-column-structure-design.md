@@ -799,13 +799,20 @@ The flag is a deliberate superset, decided per range reference and per axis:
 Step 2 may narrow these rules only with oracle evidence that a narrowed case
 matches Excel.
 
-**Oracle criterion.** No Excel or LibreOffice is available to step 2, so its
-fixtures (`src/test/formula-anchors.test.ts`, "Excel oracle fixtures") are
-hand-written from Excel's documented insert and delete reference-adjustment
-rules, and every insert and delete case must match those rules exactly. Move
-cases and the three classes above are covered by the flagged superset. Running
-Excel-generated fixtures is a follow-up that must happen before step 10 flips
-the capability flag.
+**Oracle criterion.** Step 2's fixtures (`src/test/formula-anchors.test.ts`,
+"Excel oracle fixtures") are hand-written from Excel's documented insert and
+delete reference-adjustment rules. With no Excel available, the user chose
+LibreOffice as the generated oracle: `scripts/libreoffice-formula-oracle.py`
+performs each case's gestures through LibreOffice's sheet API and records the
+formulas in Excel syntax (`src/test/fixtures/libreoffice-formula-oracle.json`),
+and `src/test/formula-anchors-libreoffice-oracle.test.ts` replays them through
+the layout. Every insert and delete case must match exactly; a formula in one
+of the three classes above must differ only where it is flagged. Against
+LibreOffice 26.8 the only differences were spelling (LibreOffice drops the
+sheet qualifier on `#REF!` and writes `C8:C8` as `C8`) and moved or refilled
+range corners, all flagged. LibreOffice has no cut-insert, so moves are
+checked as insert, cut-paste, and delete, which agrees with the spec wherever
+no range corner moves.
 
 Because rendering is a function of the anchors and the full layouts, two
 operation sequences that produce the same full layouts produce the same text.
