@@ -534,6 +534,7 @@ import {
     formula_anchor_context,
     prospective_column_of,
     type FormulaAnchorWorkbook,
+    type ReferencedPendingIds,
 } from '../formula-anchor-layout';
 import { anchor_formula, type FormulaAnchors } from '../formula-anchors';
 import {
@@ -1184,6 +1185,12 @@ export interface GridShellProps {
     formula_anchor_workbook?: FormulaAnchorWorkbook;
     /** Calculation results are keyed by prospective `row:column` (see `prospective_formula_request`). */
     formula_results_prospective?: boolean;
+    /**
+     * The Pending Rows and Pending Columns of `target` that stored Formula
+     * Anchors name, outside `target`'s own Pending Rows and Pending Columns
+     * (the store reads those itself). Built once per structural action.
+     */
+    formula_anchor_references?: (target: WorksheetTarget) => ReferencedPendingIds;
     generation: number;
     /** Source revision the pending structural overlay was derived from. */
     source_generation: number;
@@ -1427,6 +1434,7 @@ export function GridShell({
     formula_reference_bases,
     formula_anchor_workbook,
     formula_results_prospective = false,
+    formula_anchor_references,
     generation,
     source_generation,
     row_count: source_row_count = sheet_meta.rowCount,
@@ -2243,6 +2251,21 @@ export function GridShell({
         store,
         structural_support?.basis,
     ]);
+    /**
+     * The structure context for one action, with the Formula Anchor references
+     * that keep discarded tombstones: one set built on the action's first
+     * question, not a scan per tombstone.
+     */
+    const action_structure_context = useCallback((): WorksheetStructureContext => {
+        if (formula_anchor_references === undefined) return structure_context;
+        let referenced: ReferencedPendingIds | undefined;
+        const ids = () => referenced ??= formula_anchor_references(structure_context.worksheet);
+        return {
+            ...structure_context,
+            isRowReferenced: (id) => ids().rows.has(id),
+            isColumnReferenced: (id) => ids().columns.has(id),
+        };
+    }, [formula_anchor_references, structure_context]);
     const row_marker_options = useMemo(() => {
         const physical_row_count = Math.max(
             sheet_meta.sourceRowCount,
@@ -3777,7 +3800,7 @@ export function GridShell({
             focus_after_row_delete(identities, from_row, display_column);
             return true;
         }
-        const plan = plan_row_delete(before, structure_context, identities, store.snapshot());
+        const plan = plan_row_delete(before, action_structure_context(), identities, store.snapshot());
         if (!plan.ok) {
             host_bridge.postMessage({ type: 'showWarning', message: plan.message });
             return false;
@@ -3790,17 +3813,17 @@ export function GridShell({
         focus_after_row_delete(affected, from_row, display_column);
         return true;
     }, [
+        action_structure_context,
         commit_row_structure_plan,
         focus_after_row_delete,
         pending_store,
         remove_pending_rows,
         store,
-        structure_context,
         structure_gesture_admitted,
     ]);
     const restore_rows_gesture = useCallback((source_rows: readonly number[]): boolean => {
         if (!structure_gesture_admitted()) return false;
-        const plan = plan_row_restore(pending_store.snapshot(), structure_context, source_rows);
+        const plan = plan_row_restore(pending_store.snapshot(), action_structure_context(), source_rows);
         if (!plan.ok) {
             host_bridge.postMessage({ type: 'showWarning', message: plan.message });
             return false;
@@ -3809,10 +3832,10 @@ export function GridShell({
         focus_grid();
         return true;
     }, [
+        action_structure_context,
         commit_row_structure_plan,
         focus_grid,
         pending_store,
-        structure_context,
         structure_gesture_admitted,
     ]);
     const rows_are_projected = transform_state.sort.length > 0

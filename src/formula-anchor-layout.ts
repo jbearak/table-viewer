@@ -16,6 +16,7 @@
 
 import {
     appended_rows,
+    pending_rows,
     type PendingRowId,
     type PendingStructuralChanges,
     type RowIdentity,
@@ -40,7 +41,7 @@ import type {
     FormulaAnchorContext,
     FormulaAnchors,
 } from './formula-anchors';
-import type { WorksheetTarget } from './types';
+import { worksheet_target_matches, type WorksheetTarget } from './types';
 import type { FormulaReferenceIssue } from './xlsx-formula';
 
 // --- Axis views --------------------------------------------------------------
@@ -350,3 +351,73 @@ export function unrenderable_formula_reason(issue: FormulaReferenceIssue): Unren
 
 export const UNRENDERABLE_FORMULA_REASONS: readonly UnrenderableFormulaReason[] =
     Object.freeze(Object.values(UNRENDERABLE_REASONS));
+
+// --- Pending identities stored anchors name ---------------------------------
+
+/** One worksheet's stored formulas, as {@link referenced_pending_ids} reads them. */
+export interface AnchorReferenceSource {
+    readonly target: WorksheetTarget;
+    /** Cell entries; only their `formulaAnchors` are read. */
+    readonly cells?: Iterable<{ readonly formulaAnchors?: FormulaAnchors } | string>;
+    /** Pending Rows and Pending Columns, whose cells may store anchors. */
+    readonly changes?: Partial<Pick<PendingStructuralChanges, 'appendedRows' | 'pendingColumns'>>;
+}
+
+export interface ReferencedPendingIds {
+    readonly rows: ReadonlySet<PendingRowId>;
+    readonly columns: ReadonlySet<string>;
+}
+
+function add_referenced_ids(
+    anchors: FormulaAnchors | undefined,
+    own: boolean,
+    target: WorksheetTarget,
+    rows: Set<PendingRowId>,
+    columns: Set<string>,
+): void {
+    for (const reference of anchors?.references ?? []) {
+        const names_target = reference.worksheet === undefined
+            ? own
+            : worksheet_target_matches(reference.worksheet, target);
+        if (!names_target) continue;
+        for (const corner of reference.corners) {
+            if (corner.row?.kind === 'identity' && corner.row.row.kind === 'pending') {
+                rows.add(corner.row.row.pendingRowId);
+            }
+            if (corner.column?.kind === 'identity' && corner.column.column.kind === 'pending') {
+                columns.add(corner.column.column.pendingColumnId);
+            }
+        }
+    }
+}
+
+/**
+ * Every Pending Row and Pending Column of `target` that a stored Formula
+ * Anchor names, across the cell entries, Pending Row cells, and Pending
+ * Column cells of every source worksheet. One pass, so a structural action
+ * builds the sets once and asks them about each tombstone.
+ */
+export function referenced_pending_ids(
+    target: WorksheetTarget,
+    sources: readonly AnchorReferenceSource[],
+): ReferencedPendingIds {
+    const rows = new Set<PendingRowId>();
+    const columns = new Set<string>();
+    for (const source of sources) {
+        const own = source.target.sheetIndex === target.sheetIndex;
+        for (const cell of source.cells ?? []) {
+            if (typeof cell !== 'string') add_referenced_ids(cell.formulaAnchors, own, target, rows, columns);
+        }
+        for (const row of pending_rows(source.changes)) {
+            for (const cell of Object.values(row.cells)) {
+                add_referenced_ids(cell.formulaAnchors, own, target, rows, columns);
+            }
+        }
+        for (const column of source.changes?.pendingColumns ?? []) {
+            for (const cell of Object.values(column.cells)) {
+                add_referenced_ids(cell.formulaAnchors, own, target, rows, columns);
+            }
+        }
+    }
+    return { rows, columns };
+}

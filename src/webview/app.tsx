@@ -103,6 +103,7 @@ import {
     MAX_WORKBOOK_FORMULAS,
     UNBOUNDED_SHEET_ROWS,
 } from '../spreadsheet-safety';
+import { referenced_pending_ids } from '../formula-anchor-layout';
 import {
     needs_prospective_formula_request,
     prospective_formula_request,
@@ -7684,6 +7685,29 @@ export function App(): React.JSX.Element {
     const current_sheet = meta?.sheets[active_sheet_index];
     const active_pending_row_store = edit_session_registry_ref.current!
         .pending_rows_for_sheet(active_sheet_index);
+    // Discarded tombstones a stored Formula Anchor names must survive a
+    // structural action: every worksheet's cell edits, and every other
+    // worksheet's Pending Rows and Pending Columns. The acting worksheet's own
+    // are read by the store from the action's result.
+    const formula_anchor_references = useCallback((target: WorksheetTarget) => {
+        const registry = edit_session_registry_ref.current!;
+        const cells = new Map(registry.entries());
+        const pending = new Map(registry.pending_entries());
+        return referenced_pending_ids(target, (meta?.sheets ?? []).map((sheet, sheetIndex) => {
+            const structure = sheetIndex === target.sheetIndex
+                ? undefined
+                : pending.get(sheetIndex)?.snapshot();
+            return {
+                target: {
+                    sheetIndex,
+                    sheetName: sheet.name,
+                    ...(sheet.worksheetId === undefined ? {} : { worksheetId: sheet.worksheetId }),
+                },
+                cells: cells.get(sheetIndex)?.snapshot().values() ?? [],
+                ...(structure === undefined ? {} : { changes: structure }),
+            };
+        }));
+    }, [meta]);
     const formula_reference_bases = useCallback((
         value: string,
         additional_pending_rows = 0,
@@ -8425,6 +8449,7 @@ export function App(): React.JSX.Element {
             formula_move_retargeter={formula_move_retargeter}
             formula_reference_bases={formula_reference_bases}
             formula_anchor_workbook={formula_anchor_workbook}
+            formula_anchor_references={formula_anchor_references}
             formula_results_prospective={prospective_formula_state !== undefined}
             generation={generation}
             source_generation={source_generation_ref.current}
