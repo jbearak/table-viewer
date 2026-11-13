@@ -119,6 +119,8 @@ export type StructuralRefusalReason =
         readonly uri: string;
         /** The worksheet child that carries the extension list. */
         readonly element: string;
+        /** Set when the extension is on another worksheet and its formulas read this one. */
+        readonly worksheet?: string;
     }
     | {
         /** `mc:AlternateContent` wrapping worksheet content. */
@@ -503,6 +505,9 @@ function refusal_clause(reason: StructuralRefusalReason): string {
             return INVENTORY_BY_ELEMENT.get(reason.element)?.refusal ?? `it contains <${reason.element}>`;
         case 'unsupported-extension': {
             const known = KNOWN_EXTENSIONS.get(reason.uri.toUpperCase());
+            if (reason.worksheet !== undefined) {
+                return `${known ?? 'an Excel extension'} on ${reason.worksheet} uses data from this sheet`;
+            }
             return known !== undefined
                 ? `it contains ${known}`
                 : `it contains an Excel extension Table Viewer hasn't reviewed (${reason.uri || 'no URI'})`;
@@ -897,6 +902,22 @@ function xml_character_data(xml: Uint8Array, from: number, to: number): string {
     return out;
 }
 
+/** Character data of every live element in `[from, to)` whose local name matches. */
+function* element_texts(
+    xml: Uint8Array,
+    from: number,
+    to: number,
+    ranges: IgnorableRangeIndex,
+    wanted: (local: string) => boolean,
+): Generator<string> {
+    for (const tag of start_tags(xml, from, to, ranges)) {
+        const name = utf8_text(xml, tag.start + 1, tag.nameEnd);
+        if (!wanted(local_name(name)) || is_self_closing(xml, tag.start, tag.tagEnd)) continue;
+        const close = end_tag_after(xml, name, tag.tagEnd + 1, ranges, to);
+        if (close !== null) yield xml_character_data(xml, tag.tagEnd + 1, close[0]);
+    }
+}
+
 function element_text(xml: Uint8Array, element: Span): string {
     return xml_character_data(xml, element.inner_start, element.inner_end);
 }
@@ -952,7 +973,9 @@ interface ScannedWorksheet {
 interface ForeignReference {
     readonly targets: FormulaTargets;
     /** The reason given to a referenced worksheet; `worksheet` is filled in then. */
-    readonly reason: Extract<StructuralRefusalReason, { code: 'conditional-formatting-threshold' | 'unsupported-worksheet-child' }>;
+    readonly reason: Extract<StructuralRefusalReason, {
+        code: 'conditional-formatting-threshold' | 'unsupported-worksheet-child' | 'unsupported-extension';
+    }>;
 }
 
 const NUMERIC_LITERAL = /^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$/;
@@ -1234,7 +1257,16 @@ function scan_worksheet(
                 }
                 continue;
             }
-            consider(nested_extension_refusal(xml, child));
+            const extension = nested_extension_refusal(xml, child);
+            consider(extension);
+            if (extension?.code === 'unsupported-extension' && local !== 'sheetData') {
+                // x14 conditional formatting, data validation, and sparklines
+                // keep formulas in `<xm:f>`; Excel writes cross-sheet rules there.
+                const ranges = ignorable_ranges(xml, child.element.start, child.element.end);
+                for (const text of element_texts(xml, child.element.start, child.element.end, ranges, (name) => name === 'f')) {
+                    foreign_references.push({ targets: formula_targets(text), reason: extension });
+                }
+            }
             if (local === 'sheetData') continue;
             consider(covered_range_refusal(xml, child));
 
@@ -1481,13 +1513,7 @@ function scan_workbook_parts(
         wanted: (local: string) => boolean,
         visit: (text: string) => void,
     ): void => {
-        const ranges = ignorable_ranges(raw, 0, raw.length);
-        for (const tag of start_tags(raw, 0, raw.length, ranges)) {
-            const name = utf8_text(raw, tag.start + 1, tag.nameEnd);
-            if (!wanted(local_name(name)) || is_self_closing(raw, tag.start, tag.tagEnd)) continue;
-            const close = end_tag_after(raw, name, tag.tagEnd + 1, ranges);
-            if (close !== null) visit(xml_character_data(raw, tag.tagEnd + 1, close[0]));
-        }
+        for (const text of element_texts(raw, 0, raw.length, ignorable_ranges(raw, 0, raw.length), wanted)) visit(text);
     };
     const scan_chart = (relationship: PartRelationship, host: string | undefined): void => {
         const raw = read_bytes(zip, relationship.part);

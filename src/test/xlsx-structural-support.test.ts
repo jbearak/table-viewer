@@ -260,6 +260,24 @@ describe('scan_xlsx_structural_support', () => {
                 .toBe("Can't insert, delete, or move rows on this sheet: it contains conditional formatting from Excel 2010 or later.");
         });
 
+        it('refuses a sheet that an x14 rule on another sheet reads', () => {
+            const [lists, report, other] = scan({
+                sheets: [
+                    sheet('Lists'),
+                    sheet('Report', `${PLAIN_DATA}<extLst><ext uri="{CCE6A557-97BC-4b89-ADB6-D9C93CAAB3DF}" xmlns:x14="urn:x14">`
+                        + '<x14:dataValidations count="1" xmlns:xm="urn:xm"><x14:dataValidation type="list"><x14:formula1><xm:f>Lists!$A$1:$A$9</xm:f></x14:formula1>'
+                        + '<xm:sqref>B2:B20</xm:sqref></x14:dataValidation></x14:dataValidations></ext></extLst>'),
+                    sheet('Other'),
+                ],
+            });
+            const reason = refused(lists);
+            expect(reason).toMatchObject({ code: 'unsupported-extension', element: 'extLst', worksheet: 'Report' });
+            expect(reason.message).toBe("Can't insert, delete, or move rows on this sheet: data validation from Excel 2010 or later on Report uses data from this sheet.");
+            expect(refused(report)).toMatchObject({ code: 'unsupported-extension' });
+            expect(refused(report)).not.toHaveProperty('worksheet');
+            expect_supported(other);
+        });
+
         it('accepts an empty extLst', () => {
             const [support] = scan({ sheets: [sheet('S', `${PLAIN_DATA}<extLst/>`)] });
             expect_supported(support);
