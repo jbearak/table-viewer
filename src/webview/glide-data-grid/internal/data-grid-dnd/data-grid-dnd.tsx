@@ -701,7 +701,8 @@ const DataGridDnd: React.FunctionComponent<DataGridDndProps> = p => {
 
     // Fork change: a row move shows a drop indicator instead of previewing the
     // rows in their new order.
-    const rows = p.rows;
+    // The trailing append row, when shown, is not a row a block can land among.
+    const rows = p.hasAppendRow === true ? Math.max(0, p.rows - 1) : p.rows;
     const indicatorBefore =
         rowMoveView?.before !== undefined &&
         rowMoveView.allowed &&
@@ -736,9 +737,10 @@ const DataGridDnd: React.FunctionComponent<DataGridDndProps> = p => {
 
     /** Fork addition: record a row move's drop target and ask whether it may land there. */
     const setRowMoveDrop = React.useCallback(
-        (before: number) => {
+        (target: number) => {
             const rowMove = rowMoveRef.current;
             if (rowMove === undefined) return;
+            const before = Math.min(target, rows);
             if (rowMove.before !== before) {
                 rowMove.before = before;
                 rowMove.allowed = rowMoveIsNoOp(rowMove.rows, before)
@@ -756,7 +758,7 @@ const DataGridDnd: React.FunctionComponent<DataGridDndProps> = p => {
                 );
             }
         },
-        [onRowProposeMove]
+        [onRowProposeMove, rows]
     );
 
     /** Fork addition: the row under a viewport Y, found by walking from a nearby row's bounds. */

@@ -5306,6 +5306,25 @@ a new line char ""more quotes"" plus a tab  ."	https://google.com`)
             expect(moved).not.toHaveBeenCalled();
         });
 
+        test("lands at the end, not on the trailing append row, when dropped over it", () => {
+            const moved = vi.fn();
+            vi.useFakeTimers();
+            render(
+                <EventedDataEditor
+                    {...basicProps}
+                    rows={12}
+                    rowMarkers="clickable-number"
+                    gridSelection={blockSelection(5, 9)}
+                    onRowMoved={moved}
+                />,
+                { wrapper: Context }
+            );
+            prep();
+            // Rows 0-11 end at y 420; the trailing append row follows them.
+            markerGesture(screen.getByTestId("data-grid-canvas"), 300, 440);
+            expect(moved).toHaveBeenCalledWith({ start: 5, end: 9 }, 12);
+        });
+
         test("Escape abandons an active move", () => {
             const moved = vi.fn();
             vi.useFakeTimers();
