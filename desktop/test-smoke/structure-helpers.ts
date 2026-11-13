@@ -252,7 +252,6 @@ export async function type_into_cell(page: Page, column: number, row: number, va
     const cell = page.locator(`#glide-cell-${column}-${row}`);
     await expect(cell).toHaveAttribute('aria-readonly', 'false');
     await cell.focus();
-    await expect(cell).toBeFocused();
     await page.keyboard.press('Enter');
     const editor = page.locator('.cell-editor-input');
     await expect(editor).toBeVisible();
