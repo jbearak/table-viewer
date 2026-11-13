@@ -84,7 +84,7 @@ Can't undo past a save that inserted, deleted, or moved rows or columns.
 
 ## Saving and discarding
 
-Save with `Ctrl+S` or `Cmd+S`, or leave Edit mode and choose to save. Saving writes the rows and columns in the order the grid shows. Deleted rows and columns are removed from the file at that point, so check the red rows before you save.
+Save with `Ctrl+S` or `Cmd+S`, or leave Edit mode and choose to save. Saving writes rows and columns in their new structural order: the file's order with your inserts and moves applied. A sort never changes the saved order. It only changes the view, so a sorted grid can show rows in a different order than the file will have. Deleted rows and columns are removed from the file at that point, so check the red rows before you save.
 
 Leaving Edit mode with unsaved row or column changes asks whether to save or discard them, as it does for cell edits. Discarding puts every row and column back where the file has it.
 
@@ -122,10 +122,16 @@ Table Viewer moves the parts of a worksheet it understands along with the rows a
 
 ### Sheets Table Viewer can't restructure
 
-A sheet that contains something Table Viewer can't shift keeps its row or column items in the menus, disabled, with the reason as the tooltip:
+A sheet that contains something Table Viewer can't shift keeps its row or column items in the menus, disabled, with the reason as the tooltip. Insert, Delete, and Restore say:
 
 ```text
-Can't insert, delete, or move rows on this sheet: it contains an Excel table.
+Can't insert or delete rows on this sheet: it contains an Excel table.
+```
+
+Move says:
+
+```text
+Can't move rows on this sheet: it contains an Excel table.
 ```
 
 These are the reasons you are most likely to see:

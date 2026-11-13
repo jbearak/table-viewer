@@ -3714,8 +3714,15 @@ export function attach_viewer(
         if (!pending_changes_carry_layout(changes)) return undefined;
         const sheet = source?.meta().sheets[target.sheetIndex];
         if (sheet === undefined) return 'layout-worksheet-unresolved';
+        // The body start the layout was authored against: an external edit
+        // can turn an auto-detected Header Row on or off under it, and the
+        // layout must stay publishable so the conflict can be salvaged. An
+        // `.xlsx` basis recorded without one leaves it to the layout.
+        const basis = changes.structuralBasis;
         const error = pending_structure_error(changes, cells, {
-            bodyStart: header_body_start(sheet.excelFirstRowHeader),
+            bodyStart: basis?.kind === 'xlsx'
+                ? basis.bodyStart
+                : header_body_start(sheet.excelFirstRowHeader),
             sourceRowCount: changes.structuralBasis?.sourceRowCount ?? sheet.sourceRowCount,
             sourceColumnCount: changes.structuralBasis?.sourceColumnCount ?? sheet.columnCount,
             mintedAsInsert: (id) => minted_as_insert(target, id, ledger),
@@ -3738,16 +3745,14 @@ export function attach_viewer(
         basis: StructuralBasis,
         ledger: AppendAdmissionLedger | undefined,
     ): boolean => {
-        const posted = JSON.stringify(basis);
-        if (ledger?.structuralBasis !== undefined
-            && posted === JSON.stringify(ledger.structuralBasis)) return true;
+        if (structural_bases_equal(basis, ledger?.structuralBasis)) return true;
         const current = current_structural_basis(
             file_format.id,
             source_observation,
             source?.meta().sheets[target.sheetIndex],
             target.sheetIndex,
         );
-        return current !== undefined && posted === JSON.stringify(current);
+        return structural_bases_equal(basis, current);
     };
 
     /**
@@ -5135,7 +5140,10 @@ export function attach_viewer(
                 if (!slot || !sheet) continue;
                 const structural = own_pending_structural_changes(slot);
                 const basis = structural.appendBasis;
-                if (basis === undefined || appended_rows(structural).length === 0) continue;
+                // Inserted rows share the append basis their admission issued,
+                // so they reconcile by the same rules as appended rows: a
+                // "Keep new rows at the end" turns them into appended rows.
+                if (basis === undefined || pending_rows(structural).length === 0) continue;
                 const schema_fingerprint = worksheet_append_schema_fingerprint(sheet);
                 const schema_changed = basis.columnCount !== sheet.columnCount
                     || basis.schemaFingerprint !== schema_fingerprint;
@@ -5144,7 +5152,7 @@ export function attach_viewer(
                 // not carry pending content. Content in retained columns does
                 // not make a presentation-only width reconciliation ambiguous.
                 const has_truncated_content = sheet.columnCount < basis.columnCount
-                    && appended_rows(structural).some((row) =>
+                    && pending_rows(structural).some((row) =>
                         Object.entries(row.cells).some(([column, cell]) =>
                             Number(column) >= sheet.columnCount
                             && (cell.value !== ''
@@ -5185,7 +5193,7 @@ export function attach_viewer(
                     next_slots ??= projected.slice();
                     next_slots[sheet_index] = reconciliation_conflict_slot(
                         'ambiguousColumns',
-                        appended_rows(structural).map((row) => row.id),
+                        pending_rows(structural).map((row) => row.id),
                     );
                     continue;
                 }
@@ -5242,7 +5250,7 @@ export function attach_viewer(
                     next_slots ??= projected.slice();
                     next_slots[sheet_index] = reconciliation_conflict_slot(
                         'templateChanged',
-                        appended_rows(structural)
+                        pending_rows(structural)
                             .filter((row) => changed_template_ids.has(row.formatTemplateId))
                             .map((row) => row.id),
                     );
@@ -5377,7 +5385,7 @@ export function attach_viewer(
                 if (!candidate_is_bounded) {
                     next_slots[sheet_index] = reconciliation_conflict_slot(
                         'templateChanged',
-                        appended_rows(structural)
+                        pending_rows(structural)
                             .filter((row) => reconciled_template_ids.has(
                                 row.formatTemplateId,
                             ))

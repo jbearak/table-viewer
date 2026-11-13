@@ -14,7 +14,8 @@ import * as path from 'path';
 import { expect, test } from '@playwright/test';
 import type { ElectronApplication, Page } from '@playwright/test';
 import { parse_xlsx } from '../../src/parse-xlsx';
-import { isolated_user_data, repo_dir } from './smoke-helpers';
+import { build_fixture_xlsx, cell, row } from '../../src/test/helpers/xlsx-structure-fixture';
+import { isolated_user_data, repo_dir, state_database_path } from './smoke-helpers';
 import {
     choose,
     edit_toggle,
@@ -295,4 +296,51 @@ test('an external change conflicts, and both salvage actions resolve it', async 
     await save_screenshot(page, '06-discarded-layout');
     expect(fs.readFileSync(file, 'utf8'))
         .toBe('name,qty\napple,11\nbanana,2\ncherry,3\ndate,4\nkiwi,\n');
+});
+
+test('an external edit that turns on an .xlsx Header Row conflicts, and Keep new rows at the end saves', async () => {
+    // No detected header while row 1 holds numbers; text in row 1 turns one on,
+    // which moves the body start under the layout.
+    const book = (first: readonly [string | number, string | number]) => Buffer.from(build_fixture_xlsx({
+        sheets: [{
+            name: 'Data',
+            body: `<sheetData>${[first, [3, 4], [5, 6], [7, 8]].map((cells, index) =>
+                row(index + 1, cells.map((value, column) => cell(`${'AB'[column]}${index + 1}`, value))))
+                .join('')}</sheetData>`,
+        }],
+    }));
+    const { file, page } = await open_file('numbers.xlsx', book([1, 2]));
+    await enter_edit_mode(page);
+    await expect.poll(async () => (await grid_rows(page)).map((line) => line.split('|')[1]))
+        .toEqual(['1', '3', '5', '7']);
+
+    await choose(await open_row_menu(page, 0), 'Insert row below');
+    await expect.poll(async () => (await grid_rows(page))[1]).toBe('Row 2, inserted||');
+    await type_into_cell(page, 1, 1, '9');
+    await choose(await open_row_menu(page, 2), 'Delete row');
+    await expect.poll(() => grid_rows(page)).toContain('Row removed, was row 2|3|4');
+
+    fs.writeFileSync(file, book(['x', 'y']));
+    const review = page.getByRole('alert').filter({ hasText: 'Pending rows need review' });
+    await expect(review).toContainText('Data changed on disk after you inserted, deleted, or moved rows or columns.',
+        { timeout: 30_000 });
+    // Editing still works while the notice is up, and the edit is durable:
+    // the flush republishes the layout against the body start it was
+    // authored at, so the host accepts it.
+    await type_into_cell(page, 2, 1, 'typed-under-conflict');
+    await expect.poll(() => fs.readFileSync(state_database_path(path.join(test_root, 'user-data')))
+        .includes('typed-under-conflict'), { timeout: 30_000 }).toBe(true);
+    await save_screenshot(page, '09-xlsx-header-conflict');
+
+    await review.getByRole('button', { name: 'Keep new rows at the end' }).click();
+    await expect(review).toHaveCount(0);
+    await expect.poll(async () => (await grid_rows(page)).map((line) => line.split('|').slice(1).join('|')))
+        .toEqual(['3|4', '5|6', '7|8', '9|typed-under-conflict']);
+    await leave_edit_mode_saving(app!, page);
+    const saved = async () => {
+        const parsed = await parse_xlsx(new Uint8Array(fs.readFileSync(file)));
+        return parsed.data.sheets[0].rows.map((cells) => cells.map((value) => value?.formatted ?? ''));
+    };
+    await expect.poll(saved)
+        .toEqual([['x', 'y'], ['3', '4'], ['5', '6'], ['7', '8'], ['9', 'typed-under-conflict']]);
 });

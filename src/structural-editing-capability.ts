@@ -26,7 +26,7 @@ import type {
     StructuralEditingCapability,
     WorksheetStructuralSupport,
 } from './viewer-snapshot';
-import { TOO_WIDE_TO_RESTRUCTURE_MESSAGE } from './worksheet-layout';
+import { header_body_start, TOO_WIDE_TO_RESTRUCTURE_MESSAGE } from './worksheet-layout';
 import type { XlsxStructuralObservation } from './xlsx-structural-observation';
 import {
     structural_refusal_message,
@@ -65,7 +65,7 @@ export interface StructuralBasisObservation {
 export function current_structural_basis(
     format: TableFormatId,
     observation: StructuralBasisObservation | undefined,
-    sheet: Pick<SheetMeta, 'sourceRowCount' | 'columnCount'> | undefined,
+    sheet: Pick<SheetMeta, 'sourceRowCount' | 'columnCount' | 'excelFirstRowHeader'> | undefined,
     sheet_index: number,
 ): StructuralBasis | undefined {
     if (observation === undefined || sheet === undefined) return undefined;
@@ -83,6 +83,7 @@ export function current_structural_basis(
             workbookDigest: parts.workbookDigest,
             sourceRowCount: sheet.sourceRowCount,
             sourceColumnCount: sheet.columnCount,
+            bodyStart: header_body_start(sheet.excelFirstRowHeader),
         });
     }
     if (format !== 'csv' && format !== 'tsv') return undefined;

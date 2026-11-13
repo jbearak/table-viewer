@@ -44,11 +44,17 @@ export async function launch_structural_viewer(
     file: string,
 ): Promise<{ app: ElectronApplication; page: Page }> {
     const app = await launch_app(user_data_dir, [file], STRUCTURAL_EDITING_ENV);
-    const pages = () => app.windows().filter((page) => page.url().startsWith(VIEWER_URL_PREFIX));
-    await expect.poll(() => pages().length, { timeout: 30_000 }).toBe(1);
-    const page = pages()[0];
-    await page.locator(GRID_CANVAS).first().waitFor({ state: 'visible' });
-    return { app, page };
+    try {
+        const pages = () => app.windows().filter((page) => page.url().startsWith(VIEWER_URL_PREFIX));
+        await expect.poll(() => pages().length, { timeout: 30_000 }).toBe(1);
+        const page = pages()[0];
+        await page.locator(GRID_CANVAS).first().waitFor({ state: 'visible' });
+        return { app, page };
+    } catch (error) {
+        // The caller never receives `app`, so it can't clean up.
+        await app.close().catch(() => {});
+        throw error;
+    }
 }
 
 export async function viewer_count(app: ElectronApplication): Promise<number> {
@@ -71,26 +77,41 @@ export interface CapturedDialog {
     readonly buttons?: readonly string[];
 }
 
-/** Answer every message box with its first button and record it. */
-export async function install_dialog_capture(app: ElectronApplication): Promise<void> {
-    await app.evaluate(({ dialog }) => {
+/**
+ * Answer every message box with its first button and record it. With
+ * `record_file`, each dialog is also appended to that file as a JSON line, so
+ * it can be read after the process exits: on Windows and Linux, closing the
+ * last window quits the app, and an in-memory record would race that exit.
+ */
+export async function install_dialog_capture(
+    app: ElectronApplication,
+    record_file?: string,
+): Promise<void> {
+    await app.evaluate(({ dialog }, file) => {
         const main = globalThis as typeof globalThis & {
             __tableViewerSmokeDialogs?: Array<{ message?: string; buttons?: readonly string[] }>;
         };
         main.__tableViewerSmokeDialogs = [];
+        const fs = process.getBuiltinModule('fs');
         const replacement = async (...args: unknown[]) => {
             const options = (args.length === 1 ? args[0] : args[1]) as {
                 message?: string;
                 buttons?: readonly string[];
             };
-            main.__tableViewerSmokeDialogs?.push({
-                message: options.message,
-                buttons: options.buttons,
-            });
+            const entry = { message: options.message, buttons: options.buttons };
+            main.__tableViewerSmokeDialogs?.push(entry);
+            if (file !== undefined) fs.appendFileSync(file, `${JSON.stringify(entry)}\n`);
             return { response: 0, checkboxChecked: false };
         };
         dialog.showMessageBox = replacement as typeof dialog.showMessageBox;
-    });
+    }, record_file);
+}
+
+/** The dialogs `install_dialog_capture` appended to `record_file`. */
+export function recorded_dialogs(record_file: string): CapturedDialog[] {
+    if (!fs.existsSync(record_file)) return [];
+    return fs.readFileSync(record_file, 'utf8').split('\n').filter((line) => line !== '')
+        .map((line) => JSON.parse(line) as CapturedDialog);
 }
 
 export async function take_dialogs(app: ElectronApplication): Promise<CapturedDialog[]> {
@@ -247,12 +268,29 @@ export async function grid_headers(page: Page): Promise<string[]> {
         `${header.getAttribute('aria-label') ?? ''}|${header.textContent ?? ''}`));
 }
 
-/** Type `value` into an accessible grid cell through the cell editor. */
+/**
+ * Type `value` into a grid cell through the cell editor. Focusing the
+ * accessible cell selects it and Enter opens the editor, except after a
+ * refresh, when focus no longer moves the grid's selection and Enter would
+ * edit whichever cell is selected. Then the cell is double-clicked on the
+ * canvas, at default widths, which opens its editor directly.
+ */
 export async function type_into_cell(page: Page, column: number, row: number, value: string): Promise<void> {
     const cell = page.locator(`#glide-cell-${column}-${row}`);
     await expect(cell).toHaveAttribute('aria-readonly', 'false');
     await cell.focus();
-    await page.keyboard.press('Enter');
+    const selected = await expect.poll(() => cell.getAttribute('aria-selected'), { timeout: 3_000 })
+        .toBe('true').then(() => true, () => false);
+    if (selected) {
+        await page.keyboard.press('Enter');
+    } else {
+        const box = await canvas_box(page);
+        await page.mouse.dblclick(
+            box.x + ROW_MARKER_WIDTH_PX + (column - 1) * COLUMN_WIDTH_PX + COLUMN_WIDTH_PX / 2,
+            box.y + HEADER_HEIGHT_PX + row * ROW_HEIGHT_PX + ROW_HEIGHT_PX / 2,
+        );
+        await expect(cell).toHaveAttribute('aria-selected', 'true');
+    }
     const editor = page.locator('.cell-editor-input');
     await expect(editor).toBeVisible();
     await editor.fill(value);

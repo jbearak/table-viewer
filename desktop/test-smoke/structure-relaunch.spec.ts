@@ -23,7 +23,7 @@ import {
     open_column_menu,
     open_row_menu,
     save_screenshot,
-    take_dialogs,
+    recorded_dialogs,
     type_into_cell,
     viewer_count,
 } from './structure-helpers';
@@ -47,13 +47,14 @@ test('unsaved row and column changes survive closing the window and relaunching,
     fs.mkdirSync(user_data_dir);
     const file = path.join(test_root, 'fruit.csv');
     fs.writeFileSync(file, 'name,qty\napple,1\nbanana,2\ncherry,3\ndate,4\n');
+    const close_dialogs = path.join(test_root, 'close-dialogs.jsonl');
 
     try {
         // --- First launch: insert, delete, and type; then close the window. ---
         const first = await launch_structural_viewer(user_data_dir, file);
         try {
             const page = first.page;
-            await install_dialog_capture(first.app);
+            await install_dialog_capture(first.app, close_dialogs);
             await enter_edit_mode(page);
             await choose(await open_row_menu(page, 1), 'Insert row above');
             await expect.poll(async () => (await grid_rows(page))[1]).toBe('Row 2, inserted||');
@@ -70,16 +71,18 @@ test('unsaved row and column changes survive closing the window and relaunching,
             await save_screenshot(page, '07-relaunch-before-close');
 
             // Closing keeps the drafts: no prompt, and the file is untouched.
+            // On Windows and Linux the close also quits the app, so the
+            // dialogs are read from their record after the process is gone.
             await first.app.evaluate(({ BrowserWindow }) => {
                 for (const window of BrowserWindow.getAllWindows()) window.close();
             });
             await expect.poll(() => viewer_count(first.app), { timeout: 30_000 }).toBe(0);
-            expect(await take_dialogs(first.app)).toEqual([]);
-            expect(fs.readFileSync(file, 'utf8'))
-                .toBe('name,qty\napple,1\nbanana,2\ncherry,3\ndate,4\n');
         } finally {
             await exit_app(first.app);
         }
+        expect(recorded_dialogs(close_dialogs)).toEqual([]);
+        expect(fs.readFileSync(file, 'utf8'))
+            .toBe('name,qty\napple,1\nbanana,2\ncherry,3\ndate,4\n');
 
         // --- Second launch: the drafts come back, and Save writes them. -----
         const second = await launch_structural_viewer(user_data_dir, file);
