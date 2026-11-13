@@ -218,8 +218,8 @@ import {
     source_row_layout,
     type RowLayout,
 } from './worksheet-layout';
+import { content_digest } from './content-digest';
 import {
-    current_structural_basis,
     delimited_records_of,
     is_delimited_prefix_growth,
     rebase_row_layout_on_growth,
@@ -645,10 +645,6 @@ const COMPARE_DIFF_INCOMPLETE_WARNING =
 const MAX_SAVED_APPEND_AUTHORITIES = 100_000;
 const MAX_SAVED_APPEND_AUTHORITY_BYTES = 256 * 1024 * 1024;
 const MAX_ACTIONABLE_STRUCTURAL_CONFLICT_ROW_IDS = 16;
-
-function content_digest(bytes: Uint8Array): string {
-    return createHash('sha256').update(bytes).digest('hex');
-}
 
 function worksheet_append_schema_fingerprint(sheet: SheetMeta): string {
     return `sha256:${createHash('sha256').update(JSON.stringify({
@@ -4719,7 +4715,6 @@ export function attach_viewer(
         const previous_digest = file_coordinator.authority().physicalDigest;
         const file_changed = previous_digest !== undefined && previous_digest !== digest;
         const bytes = candidate instanceof CsvDataSource ? candidate.file_bytes() : undefined;
-        let current_basis: StructuralBasis | undefined;
         let next: typeof slots | undefined;
         for (const [index, slot] of slots.entries()) {
             if (slot === undefined || !pending_changes_carry_layout(slot)) continue;
@@ -4742,7 +4737,13 @@ export function attach_viewer(
                     || candidate.truncationMessage
                     || basis?.kind !== 'delimited'
                 ) continue;
-                current_basis ??= current_structural_basis(bytes, sheet);
+                // The snapshot's basis, from the digest this commit verified.
+                const current_basis = current_structural_basis(
+                    file_format.id,
+                    { digest, byteLength: bytes.byteLength },
+                    sheet,
+                );
+                if (current_basis === undefined) continue;
                 const others = changes.conflicts.filter((conflict) => conflict.reason !== 'structuralBasisChanged');
                 if (structural_bases_equal(basis, current_basis)) {
                     if (others.length === changes.conflicts.length) continue;
@@ -4783,34 +4784,6 @@ export function attach_viewer(
             next[index] = replacement;
         }
         return next === undefined ? current : { ...current, pendingEdits: next };
-    }
-
-    /**
-     * A physical commit can advance a worksheet's Structural Basis (rows
-     * appended on disk). The live session's ledger records the basis later
-     * publications must match, so it follows the durable slot.
-     */
-    function sync_ledger_structural_bases(
-        slots: PerFileState['pendingEdits'],
-        sheets: readonly SheetMeta[],
-    ): void {
-        if (active_edit_session_id === undefined || slots === undefined) return;
-        for (const [index, slot] of slots.entries()) {
-            if (slot?.structuralBasis === undefined) continue;
-            const sheet_index = worksheet_target_index(sheets, {
-                sheetIndex: index,
-                sheetName: slot.sheetName,
-                worksheetId: slot.worksheetId,
-            });
-            const sheet = sheet_index === undefined ? undefined : sheets[sheet_index];
-            if (sheet === undefined) continue;
-            const ledger = append_admission_ledgers.get(append_ledger_key(active_edit_session_id, {
-                sheetIndex: sheet_index!,
-                sheetName: sheet.name,
-                ...(sheet.worksheetId === undefined ? {} : { worksheetId: sheet.worksheetId }),
-            }));
-            if (ledger !== undefined) ledger.structuralBasis = slot.structuralBasis;
-        }
     }
 
     /** Resolve the stored intent now, against `digest`, with the installed workbook. */
@@ -7561,10 +7534,6 @@ export function attach_viewer(
                         projected_state ?? committed.receipt.stateSnapshot,
                         next,
                     );
-                    sync_ledger_structural_bases(
-                        (reconciled_snapshot.state as PerFileState).pendingEdits,
-                        next_sheets,
-                    );
                     const adoption_state = project_state_for_panel(
                         reconciled_snapshot,
                         true,
@@ -9754,6 +9723,7 @@ export function attach_viewer(
         identity: CsvSaveOperation,
         src: DataSource,
         verified_digest: string,
+        verified_observation: Readonly<PhysicalSourceObservation> | undefined,
     ):
         | { readonly kind: 'invalid' }
         | { readonly kind: 'rejected'; readonly rejection: CsvSaveRejection }
@@ -9777,12 +9747,12 @@ export function attach_viewer(
                 }
                 continue;
             }
-            const basis = changes.structuralBasis;
-            const basis_matches = basis !== undefined
-                && basis.kind === 'delimited'
-                && basis.digest === `sha256:${verified_digest}`
-                && basis.sourceRowCount === sheet.sourceRowCount
-                && basis.sourceColumnCount === sheet.columnCount;
+            // The same basis the snapshot reported and publication accepted,
+            // computed from the observation of the file this save verifies.
+            const current = verified_observation?.digest === verified_digest
+                ? current_structural_basis(file_format.id, verified_observation, sheet)
+                : undefined;
+            const basis_matches = structural_bases_equal(changes.structuralBasis, current);
             if (!basis_matches) {
                 return {
                     kind: 'rejected',
@@ -9916,7 +9886,12 @@ export function attach_viewer(
         // acknowledged digest is the file the planner reads, and the final
         // verification below proves the bytes on disk still have it.
         if (carries_layout) {
-            const save_rejection = structural_save_precheck(identity, src, expected_digest);
+            const save_rejection = structural_save_precheck(
+                identity,
+                src,
+                expected_digest,
+                expected_observation,
+            );
             if (save_rejection !== undefined) {
                 const active = begin_save_lifecycle(identity);
                 const lifecycle = finish_save_lifecycle(active.operation, 'failed');

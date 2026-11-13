@@ -5,11 +5,12 @@
 import { createHash } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 import { build_csv_source, plan_csv_save, type SavePlanInput } from '../viewer-controller';
+import { current_structural_basis } from '../structural-editing-capability';
+import { content_digest } from '../content-digest';
 import type { PendingStructuralChanges, StructuralBasis } from '../pending-changes';
 import type { RowLayout } from '../worksheet-layout';
 import {
     apply_structural_rekey,
-    current_structural_basis,
     delimited_records_of,
     ends_with_unquoted_record_terminator,
     is_delimited_prefix_growth,
@@ -37,7 +38,7 @@ function basis_of(bytes: Uint8Array, rows: number, columns: number): StructuralB
     return {
         kind: 'delimited',
         byteLength: bytes.byteLength,
-        digest: `sha256:${createHash('sha256').update(bytes).digest('hex')}`,
+        digest: createHash('sha256').update(bytes).digest('hex'),
         sourceRowCount: rows,
         sourceColumnCount: columns,
     };
@@ -309,7 +310,12 @@ describe('Structural Basis', () => {
 
     it('records the byte length and digest with the source dimensions', async () => {
         const source = await build_csv_source(old_bytes, '/tmp/s.csv');
-        expect(current_structural_basis(old_bytes, source.meta().sheets[0]!)).toEqual(basis);
+        // One basis implementation: the snapshot's, from the host's content digest.
+        expect(current_structural_basis(
+            'csv',
+            { digest: content_digest(old_bytes), byteLength: old_bytes.byteLength },
+            source.meta().sheets[0]!,
+        )).toEqual(basis);
     });
 
     it('accepts rows appended after an unquoted record terminator', () => {

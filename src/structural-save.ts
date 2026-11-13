@@ -1,8 +1,11 @@
 // Structural save (row and column structure design, delivery step 5): the
 // host's pure pieces of saving a Worksheet Layout.
 //
-//   - The **Structural Basis** of a delimited file, and the prefix-growth test
-//     that lets rows appended on disk join a layout instead of conflicting.
+//   - The prefix-growth test that lets rows appended on disk join a layout
+//     instead of conflicting. The basis itself is computed in one place,
+//     `current_structural_basis` in `structural-editing-capability.ts`, from
+//     `content_digest`, so the basis the webview records at delete time is the
+//     one Save and refresh check.
 //   - The **receipt** entry for one restructured worksheet, built from the
 //     layout's save maps.
 //   - The **rekey** of durable view state after the write (or on recovery):
@@ -15,7 +18,7 @@
 // The controller owns sequencing (persist, plan, intent, stat, write,
 // post-write transition, recovery); this module owns only what each step
 // computes, so every step is testable without a filesystem.
-import { createHash } from 'node:crypto';
+import { content_digest } from './content-digest';
 import {
     appended_rows,
     inserted_rows,
@@ -58,28 +61,6 @@ import {
 // ---------------------------------------------------------------------------
 // Structural Basis
 // ---------------------------------------------------------------------------
-
-/** The digest a delimited Structural Basis records: `sha256:<hex>` of the whole file. */
-export function delimited_basis_digest(bytes: Uint8Array): string {
-    return `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
-}
-
-/**
- * The current Structural Basis of a CSV or TSV file: its byte length and
- * digest, with the parsed worksheet's canonical source row and column counts.
- */
-export function current_structural_basis(
-    bytes: Uint8Array,
-    sheet: Pick<SheetMeta, 'sourceRowCount' | 'columnCount'>,
-): StructuralBasis {
-    return Object.freeze({
-        kind: 'delimited',
-        byteLength: bytes.byteLength,
-        digest: delimited_basis_digest(bytes),
-        sourceRowCount: sheet.sourceRowCount,
-        sourceColumnCount: sheet.columnCount,
-    });
-}
 
 export function structural_bases_equal(
     left: StructuralBasis | undefined,
@@ -152,7 +133,7 @@ export function is_delimited_prefix_growth(
 ): boolean {
     if (bytes.byteLength <= basis.byteLength) return false;
     const prefix = bytes.subarray(0, basis.byteLength);
-    if (delimited_basis_digest(prefix) !== basis.digest) return false;
+    if (content_digest(prefix) !== basis.digest) return false;
     if (!ends_with_unquoted_record_terminator(prefix, delimiter)) return false;
     const before = parse(prefix);
     const after = parse(bytes);

@@ -25,7 +25,7 @@ const BASIS: StructuralBasis = {
     byteLength: BYTES.length,
     // The real basis of BYTES: a recorded basis that no longer matched the
     // file would (correctly) record a structuralBasisChanged conflict on load.
-    digest: `sha256:${createHash('sha256').update(BYTES).digest('hex')}`,
+    digest: createHash('sha256').update(BYTES).digest('hex'),
     sourceRowCount: 3,
     sourceColumnCount: 1,
 };

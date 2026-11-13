@@ -37,7 +37,7 @@ function basis_of(bytes: Uint8Array, rows: number): StructuralBasis {
     return {
         kind: 'delimited',
         byteLength: bytes.byteLength,
-        digest: `sha256:${hex(bytes)}`,
+        digest: hex(bytes),
         sourceRowCount: rows,
         sourceColumnCount: 1,
     };
@@ -280,6 +280,50 @@ describe('saving a row removal', () => {
             rejection: { reason: 'structuralConflict', structuralReason: 'structuralBasisChanged' },
         });
         expect(drive.file.writes).toHaveLength(0);
+        await viewer.dispose();
+    });
+});
+
+describe('a deletion recorded through the snapshot basis', () => {
+    // End to end through the webview-facing path: no hand-built basis. The
+    // webview store records the basis the snapshot's structural-editing
+    // capability reports, publishes the layout with it, and saves it.
+    it('publishes, saves without a conflict, and removes the row', async () => {
+        const drive = disk(BYTES);
+        const viewer = await open_viewer({ state: versioned_state_store({}), disk: drive });
+        const snapshot = viewer.last<{
+            snapshot: {
+                sourceGeneration: number;
+                capabilities: { structuralEditing?: { sheets: { basis?: StructuralBasis }[] } };
+            };
+        }>('workbookSnapshot').snapshot;
+        const basis = snapshot.capabilities.structuralEditing?.sheets[0]?.basis;
+        expect(basis).toBeDefined();
+        const changes = {
+            formatTemplates: [],
+            appendedRows: [],
+            tailRemovals: [],
+            conflicts: [],
+            rowLayout: REMOVAL_LAYOUT,
+            structuralBasis: basis!,
+        };
+        await viewer.panel.__receive({
+            type: 'pendingChangesChanged',
+            editSessionId: viewer.session()!.editSessionId!,
+            sequence: 1,
+            sourceGeneration: snapshot.sourceGeneration,
+            changes: { sheetIndex: 0, sheetName: 'Sheet1', cells: {}, ...changes },
+        });
+        await viewer.controller.drain();
+        expect(viewer.messages().some((message) =>
+            message.type === 'pendingChangesAcknowledged' && message.sequence === 1)).toBe(true);
+        expect(viewer.durable().pendingEdits?.[0]?.conflicts ?? []).toEqual([]);
+
+        const result = await viewer.save(changes);
+        expect(result).toMatchObject({ success: true });
+        expect(result.rejection).toBeUndefined();
+        expect(dec.decode(drive.file.bytes)).toBe('h\na\nc\n');
+        await vi.waitFor(() => expect(viewer.durable().pendingEdits).toBeUndefined());
         await viewer.dispose();
     });
 });
