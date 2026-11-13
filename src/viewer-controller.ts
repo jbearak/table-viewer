@@ -9805,7 +9805,16 @@ export function attach_viewer(
         };
     }
 
-    async function persist_accepted_save(operation: CsvSaveHostOperation): Promise<void> {
+    /**
+     * Persist the accepted payload (step 1), unless another save's rekey
+     * intent is stored: then nothing is written and the blocking intent is
+     * answered. The check is inside the same compare-and-set as the payload
+     * write, so a structural save another process started after this panel
+     * loaded can never have its accepted payload replaced by this one.
+     */
+    async function persist_accepted_save(
+        operation: CsvSaveHostOperation,
+    ): Promise<StructuralRekeyIntent | undefined> {
         // Recorded *before* the CAS, because `release_edit_session` reads this set
         // while the CAS is still in flight. `compare_and_set` validates currency and
         // then awaits the medium's durable write — a real filesystem write on a
@@ -9817,9 +9826,12 @@ export function attach_viewer(
         persisted_save_targets.set(operation.identity, operation.durableTargets);
         let conflict_overlays_authenticated = false;
         let drops_stored_layout = false;
+        let blocked_by: StructuralRekeyIntent | undefined;
         const committed = await update_file_state((current) => {
             conflict_overlays_authenticated = false;
             drops_stored_layout = false;
+            blocked_by = blocking_rekey_intent(current);
+            if (blocked_by !== undefined) return current;
             for (const [index, worksheet] of operation.identity.worksheets.entries()) {
                 const target = operation.durableTargets[index];
                 const durable_slot = pending_changes_for_sheet(
@@ -9875,6 +9887,11 @@ export function attach_viewer(
             });
             return { ...current, pendingEdits: pending };
         }, undefined, () => save_operation_is_current(operation));
+        if (blocked_by !== undefined) {
+            // Nothing was written; the recorded target was never persisted.
+            persisted_save_targets.delete(operation.identity);
+            return blocked_by;
+        }
         if (drops_stored_layout) {
             throw new Error('Reload this window to keep editing this file.');
         }
@@ -9886,6 +9903,7 @@ export function attach_viewer(
             throw new Error('The save operation changed before its edits were accepted.');
         }
         notify_edit_state(committed);
+        return undefined;
     }
 
     /**
@@ -10261,7 +10279,19 @@ export function attach_viewer(
             ))) {
                 throw new Error('The pending-row authority changed before Save began.');
             }
-            await persist_accepted_save(operation);
+            const blocking_intent = await persist_accepted_save(operation);
+            if (blocking_intent !== undefined) {
+                // Another save's intent is stored: this save must not replace
+                // that save's accepted payload, so it was never persisted.
+                finish_save_failure(
+                    operation,
+                    rekey_intent_is_live(blocking_intent)
+                        ? FOREIGN_STRUCTURAL_SAVE_EDIT_MESSAGE
+                        : UNRESOLVED_STRUCTURAL_SAVE_EDIT_MESSAGE,
+                );
+                if (!disposed) observe_unresolved_structural_save((await read_file_state(false)).state as PerFileState);
+                return;
+            }
             accepted_sequences = operation.durableTargets.map((target) =>
                 last_published_sequence(identity.editSessionId, target));
             operation.phase = 'accepted';

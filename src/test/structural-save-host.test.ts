@@ -781,25 +781,38 @@ describe('rekey intent ownership across processes', () => {
         await viewer.dispose();
     });
 
-    it('refuses a save whose intent would overwrite another save\'s live intent', async () => {
+    it('refuses a save that another process\'s live save started after load, keeping that save\'s payload', async () => {
         // Saves on one file are not serialized across processes: each host
         // has its own file coordinator. A second process starts a structural
-        // save after this one loaded, so no load-time gate has seen it.
+        // save after this one loaded, so no load-time gate has seen it: it
+        // has persisted its accepted payload (cell 0:0) and stored its intent.
         const drive = disk(BYTES);
         const state = store_with({ pendingEdits: slot(REMOVAL) });
         const viewer = await open_viewer({ state, disk: drive });
         expect(viewer.session()).toMatchObject({ granted: true });
+        const first_payload = slot({ ...REMOVAL, cells: { '0:0': { value: 'first', base: 'a' } } });
         const current = state.get_state(FILE) as PerFileState;
         await state.store.compare_and_set(FILE, state.revision(FILE), {
             ...current,
+            pendingEdits: first_payload,
             structuralRekeyIntent: owned(Date.now() + 60_000),
         });
-        expect(await viewer.save(REMOVAL)).toMatchObject({ success: false });
+
+        // This window saves a different payload (cell 2:0).
+        expect(await viewer.save(REMOVAL, { '2:0': { value: 'second', base: 'c' } })).toMatchObject({ success: false });
         expect(viewer.warning).toHaveBeenCalledWith(
             'Another Table Viewer window is saving this file. Try again when it finishes.');
         expect(drive.file.writes).toHaveLength(0);
         expect(viewer.durable().structuralRekeyIntent?.saveId).toBe('elsewhere');
-        expect(viewer.durable().pendingEdits?.[0]).toMatchObject(REMOVAL);
+        expect(viewer.durable().pendingEdits).toEqual(first_payload);
+
+        // The first save aborts before its write: it clears its own intent and
+        // keeps its accepted payload, which this save never replaced.
+        const aborted = state.get_state(FILE) as PerFileState;
+        const { structuralRekeyIntent: _intent, ...rest } = aborted;
+        await state.store.compare_and_set(FILE, state.revision(FILE), rest);
+        expect((state.get_state(FILE) as PerFileState).pendingEdits?.[0]?.cells)
+            .toEqual({ '0:0': { value: 'first', base: 'a' } });
         await viewer.dispose();
     });
 
