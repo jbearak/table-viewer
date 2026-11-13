@@ -297,9 +297,49 @@ const SAVE_WINDOW = 10_000;
  */
 const IN_FLIGHT_STRUCTURAL_SAVES = new Set<string>();
 
+/**
+ * This host process, as the owner a stored rekey intent names. Another
+ * process sharing the state (VS Code and the desktop app, or two windows) sees
+ * a different id and leaves the intent alone while its lease is live. The
+ * SQLite writer sessions cannot answer this: their activity time moves only
+ * on commits, and the repository treats another session's leases as
+ * unprovable; the VS Code memento backend has no sessions at all. So the
+ * lease lives in the intent, and the owner renews it while the save runs.
+ */
+const PROCESS_OWNER_ID = randomUUID();
+
+/** How long a structural save's intent lease lasts between renewals. */
+const STRUCTURAL_SAVE_LEASE_MS = 30_000;
+
+/** Whether a stored intent belongs to a save that is still running, here or elsewhere. */
+function rekey_intent_is_live(intent: StructuralRekeyIntent, now = Date.now()): boolean {
+    return IN_FLIGHT_STRUCTURAL_SAVES.has(intent.saveId)
+        || (intent.owner !== undefined
+            && intent.owner.id !== PROCESS_OWNER_ID
+            && intent.owner.leaseExpiresAtMs > now);
+}
+
+
+/**
+ * The host-owned conflicts a worksheet keeps once `changes` are published.
+ * Conflicts are the host's to record, so a publication must echo them, with
+ * one exception: a `structuralBasisChanged` conflict belongs to a live layout
+ * change, and a publication with none left ("Discard row and column changes")
+ * answers it, so it goes.
+ */
+function conflicts_after_publication(
+    durable: PendingStructuralChanges['conflicts'],
+    changes: Pick<PendingStructuralChanges, 'rowLayout' | 'columnLayout'>,
+): PendingStructuralChanges['conflicts'] {
+    return has_live_layout_change(changes)
+        ? durable
+        : durable.filter((conflict) => conflict.reason !== 'structuralBasisChanged');
+}
 
 const UNRESOLVED_STRUCTURAL_SAVE_EDIT_MESSAGE =
     "Choose whether your last save finished before editing this file.";
+const FOREIGN_STRUCTURAL_SAVE_EDIT_MESSAGE =
+    'Another Table Viewer window is saving this file. Try again when it finishes.';
 
 /**
  * What a profile needs to turn one worksheet's edits into bytes.
@@ -448,6 +488,8 @@ export interface ViewerControllerOptions {
      * the layout publication and save gates before the flag ships on.
      */
     readonly structuralEditingEnabled?: boolean;
+    /** Test seam: the lease a structural save's intent holds between renewals. */
+    readonly structuralSaveLeaseMs?: number;
     /** Test-host protocol seam. It is supplied only by the VS Code integration
      * runner and observes the real controller transport without replacing it. */
     readonly integrationTestPort?: {
@@ -4553,23 +4595,51 @@ export function attach_viewer(
      * Otherwise keep the intent and let recovery decide, now, which way the
      * file went.
      */
-    async function settle_failed_structural_write(intent: StructuralRekeyIntent): Promise<void> {
-        let digest: string | undefined;
-        try {
-            digest = content_digest(await host.fs.read_file(uri));
-        } catch (error) {
-            log_sanitized_failure('Could not read the file after a failed structural write', error);
-        }
-        if (digest === intent.beforeDigest) {
-            await clear_structural_rekey_intent(intent.saveId).catch(() => {});
-            return;
-        }
+    async function settle_failed_structural_write(
+        intent: StructuralRekeyIntent,
+        sheets: readonly SheetMeta[],
+    ): Promise<'applied' | 'cleared' | 'unresolved'> {
         IN_FLIGHT_STRUCTURAL_SAVES.delete(intent.saveId);
-        if (digest !== undefined) {
-            await resolve_stored_rekey_intent(digest).catch((error) => {
-                log_sanitized_failure('Could not resolve a structural save after a failed write', error);
-            });
-        }
+        return resolve_stored_rekey_intent(intent, sheets).catch((error) => {
+            log_sanitized_failure('Could not resolve a structural save after a failed write', error);
+            return 'unresolved' as const;
+        });
+    }
+
+    const structural_save_lease_ms = options.structuralSaveLeaseMs ?? STRUCTURAL_SAVE_LEASE_MS;
+
+    /**
+     * Keep renewing a running save's intent lease, so another process sharing
+     * this state never mistakes it for an interrupted one. Answers a stop.
+     */
+    function renew_structural_save_lease(save_id: string): () => void {
+        let stopped = false;
+        let handle: unknown;
+        const schedule = (): void => {
+            handle = scheduler.setTimeout(() => {
+                if (stopped || disposed) return;
+                void update_file_state((current) => {
+                    const intent = current.structuralRekeyIntent;
+                    if (stopped || intent?.saveId !== save_id) return current;
+                    return {
+                        ...current,
+                        structuralRekeyIntent: {
+                            ...intent,
+                            owner: { id: PROCESS_OWNER_ID, leaseExpiresAtMs: Date.now() + structural_save_lease_ms },
+                        },
+                    };
+                }, undefined, undefined, null).catch((error) => {
+                    log_sanitized_failure('Could not renew a structural save lease', error);
+                }).finally(() => {
+                    if (!stopped && !disposed) schedule();
+                });
+            }, Math.max(1, Math.floor(structural_save_lease_ms / 3)));
+        };
+        schedule();
+        return () => {
+            stopped = true;
+            scheduler.clearTimeout(handle);
+        };
     }
 
     function announce_structural_rekey(messages: readonly string[]): void {
@@ -4577,8 +4647,36 @@ export function attach_viewer(
     }
 
     let unresolved_structural_sheet_names: ReadonlySet<string> = new Set();
-    /** Durable state holds a structural save's intent that no running save owns. */
+    /**
+     * Durable state holds a structural save's intent this process is not
+     * running: unresolved, or live in another process. Either blocks editing
+     * and saving here.
+     */
     let unresolved_structural_save_present = false;
+    /** The blocking intent belongs to a save another process is still running. */
+    let blocking_save_is_live = false;
+    let rekey_intent_recheck: unknown;
+
+    function blocking_save_message(): string {
+        return blocking_save_is_live
+            ? FOREIGN_STRUCTURAL_SAVE_EDIT_MESSAGE
+            : UNRESOLVED_STRUCTURAL_SAVE_EDIT_MESSAGE;
+    }
+
+    function schedule_rekey_intent_recheck(lease_expires_at_ms: number): void {
+        if (rekey_intent_recheck !== undefined) return;
+        rekey_intent_recheck = scheduler.setTimeout(() => {
+            rekey_intent_recheck = undefined;
+            if (disposed) return;
+            void resolve_stored_rekey_intent(undefined).then(async (outcome) => {
+                if (disposed) return;
+                if (outcome !== 'unresolved') await refresh_panel_source(true, 'recovery');
+                else observe_unresolved_structural_save((await read_file_state(false)).state as PerFileState);
+            }).catch((error) => {
+                log_sanitized_failure('Could not recheck a structural save after its lease', error);
+            });
+        }, Math.max(0, lease_expires_at_ms - Date.now()) + 50);
+    }
 
     /**
      * Whether worksheet `sheet_index` was restructured by an unresolved save.
@@ -4599,7 +4697,14 @@ export function attach_viewer(
      */
     function observe_unresolved_structural_save(state: PerFileState): void {
         const intent = unresolved_rekey_intent(state);
-        unresolved_structural_save_present = intent !== undefined;
+        const blocking = blocking_rekey_intent(state);
+        unresolved_structural_save_present = blocking !== undefined;
+        blocking_save_is_live = blocking !== undefined && rekey_intent_is_live(blocking);
+        // Another process's save: recover its intent if the lease lapses
+        // without it settling, as a load would.
+        if (blocking_save_is_live && blocking?.owner !== undefined) {
+            schedule_rekey_intent_recheck(blocking.owner.leaseExpiresAtMs);
+        }
         // The hint and the affected worksheets are answered by the installed
         // workbook; before the first adoption there is none to ask.
         if (source === undefined) return;
@@ -4670,13 +4775,23 @@ export function attach_viewer(
                     const sheet = sheets[sheet_index];
                     return sheet === undefined ? undefined : transform_schema_for_sheet(sheet);
                 },
-            }).state;
+            })?.state ?? current;
         }, undefined, undefined, null);
         await refresh_panel_source(true, 'recovery');
     }
 
     /** A stored rekey intent no running save owns: the file's state is unresolved. */
     function unresolved_rekey_intent(state: StoredPerFileState): StructuralRekeyIntent | undefined {
+        const intent = (state as PerFileState).structuralRekeyIntent;
+        return intent === undefined || rekey_intent_is_live(intent) ? undefined : intent;
+    }
+
+    /**
+     * A stored rekey intent that blocks editing and saving here: any intent
+     * except one this process is running. A live intent another process
+     * owns blocks too, without a notice, until it settles or its lease lapses.
+     */
+    function blocking_rekey_intent(state: StoredPerFileState): StructuralRekeyIntent | undefined {
         const intent = (state as PerFileState).structuralRekeyIntent;
         return intent === undefined || IN_FLIGHT_STRUCTURAL_SAVES.has(intent.saveId) ? undefined : intent;
     }
@@ -4703,7 +4818,7 @@ export function attach_viewer(
                 const sheet = sheets[sheet_index];
                 return sheet === undefined ? undefined : transform_schema_for_sheet(sheet);
             },
-        }).state;
+        })?.state ?? current;
     }
 
     /**
@@ -4801,20 +4916,38 @@ export function attach_viewer(
     }
 
     /**
-     * Resolve the stored intent now, against `digest`, with the installed
-     * workbook. Answers whether intent `save_id` is settled: no longer stored.
+     * Resolve the stored intent now, against the file as it is: re-read and
+     * hashed here, never assumed, so an external write after the save's own
+     * leaves the intent unresolved. `sheets` is the workbook the rekey applies
+     * to; without one (a disposed panel) the intent stays stored for the next
+     * load. Answers how `intent` (when given) settled: `applied` when the
+     * file had its after-digest and the rekey was applied, `cleared` when the
+     * file never changed, `unresolved` when it is still stored.
      */
-    async function resolve_stored_rekey_intent(digest: string, save_id?: string): Promise<boolean> {
-        const sheets = source?.meta().sheets ?? [];
+    async function resolve_stored_rekey_intent(
+        intent: StructuralRekeyIntent | undefined,
+        sheets: readonly SheetMeta[] | undefined = source?.meta().sheets,
+    ): Promise<'applied' | 'cleared' | 'unresolved'> {
+        if (sheets === undefined || sheets.length === 0) return 'unresolved';
+        let digest: string;
+        try {
+            digest = content_digest(await host.fs.read_file(uri));
+        } catch (error) {
+            log_sanitized_failure('Could not read the file to resolve a structural save', error);
+            return 'unresolved';
+        }
         const committed = await update_file_state(
             (current) => resolve_rekey_intent_in_state(current, digest, sheets),
-            undefined,
+            sheets,
             undefined,
             null,
         );
         const latest = committed ?? await read_file_state(false);
-        return (latest.state as PerFileState).structuralRekeyIntent?.saveId !== save_id
-            || save_id === undefined;
+        if (intent !== undefined
+            && (latest.state as PerFileState).structuralRekeyIntent?.saveId === intent.saveId) {
+            return 'unresolved';
+        }
+        return intent !== undefined && digest === intent.afterDigest ? 'applied' : 'cleared';
     }
 
     function retire_pending_edit_target(
@@ -6080,7 +6213,7 @@ export function attach_viewer(
         // A claim is only worth making when some slot describes a worksheet this
         // workbook actually has. Already-owned projections never need this scan.
         const rehydratable = !owns_session && allow_claim && editing_supported
-            && unresolved_rekey_intent(state) === undefined
+            && blocking_rekey_intent(state) === undefined
             && has_rehydratable_pending_edits(state.pendingEdits, sheets);
         if (rehydratable && layout_peer_blocked && renderer_ready) {
             show_owner_warning('Reload this window to keep editing this file.');
@@ -9701,7 +9834,10 @@ export function attach_viewer(
                     drops_stored_layout = true;
                     return current;
                 }
-                const canonical = own_pending_structural_changes(durable_slot ?? {}).conflicts;
+                const canonical = conflicts_after_publication(
+                    own_pending_structural_changes(durable_slot ?? {}).conflicts,
+                    worksheet.structuralChanges ?? EMPTY_PENDING_STRUCTURAL_CHANGES,
+                );
                 const submitted = worksheet.structuralChanges?.conflicts ?? [];
                 if (JSON.stringify(submitted) !== JSON.stringify(canonical)) {
                     return current;
@@ -9916,7 +10052,7 @@ export function attach_viewer(
         if (unresolved_structural_save_present) {
             const active = begin_save_lifecycle(identity);
             const lifecycle = finish_save_lifecycle(active.operation, 'failed');
-            show_owner_warning(UNRESOLVED_STRUCTURAL_SAVE_EDIT_MESSAGE);
+            show_owner_warning(blocking_save_message());
             void post_to_receiver({ type: 'saveResult', success: false, lifecycle });
             return;
         }
@@ -10099,6 +10235,13 @@ export function attach_viewer(
         let rekey_intent: StructuralRekeyIntent | undefined;
         let write_attempted = false;
         let write_completed = false;
+        let stop_lease_renewal: (() => void) | undefined;
+        const settle_pre_write_intent = async (): Promise<void> => {
+            if (rekey_intent === undefined) return;
+            await clear_structural_rekey_intent(rekey_intent.saveId).catch((error) => {
+                log_sanitized_failure('Could not clear a structural save intent before its write', error);
+            });
+        };
         let accepted_sequences: readonly number[] = [];
         try {
             await pending_edit_writes.catch(() => {});
@@ -10123,7 +10266,7 @@ export function attach_viewer(
             // and final pre-write re-stat must report the retry identically, so a
             // detected race never surfaces as a generic "Failed to save" error.
             const refuse_as_external_change = async (): Promise<void> => {
-                if (rekey_intent !== undefined) await clear_structural_rekey_intent(rekey_intent.saveId);
+                if (rekey_intent !== undefined) await settle_pre_write_intent();
                 show_owner_warning(
                     'The file changed before the save could finish. No pending edits were written; try saving again.',
                 );
@@ -10240,6 +10383,10 @@ export function attach_viewer(
                         acceptedSequence: accepted_sequences[index] ?? 0,
                     }))),
                     receipt: save_receipt!,
+                    owner: Object.freeze({
+                        id: PROCESS_OWNER_ID,
+                        leaseExpiresAtMs: Date.now() + structural_save_lease_ms,
+                    }),
                 });
                 IN_FLIGHT_STRUCTURAL_SAVES.add(intent.saveId);
                 rekey_intent = intent;
@@ -10251,10 +10398,9 @@ export function attach_viewer(
                 if (!stored || (stored.state as PerFileState).structuralRekeyIntent?.saveId !== intent.saveId) {
                     throw new Error('The save operation changed before its row and column changes were recorded.');
                 }
-                if (!save_may_continue(operation)) {
-                    await clear_structural_rekey_intent(intent.saveId);
-                    return;
-                }
+                stop_lease_renewal = renew_structural_save_lease(intent.saveId);
+                // Every pre-write exit clears the intent in the `finally` below.
+                if (!save_may_continue(operation)) return;
             }
 
             // Narrow (but do not close) the pre-check/pre-write TOCTOU.
@@ -10298,10 +10444,7 @@ export function attach_viewer(
                 await refuse_as_external_change();
                 return;
             }
-            if (!save_may_continue(operation)) {
-                if (rekey_intent !== undefined) await clear_structural_rekey_intent(rekey_intent.saveId);
-                return;
-            }
+            if (!save_may_continue(operation)) return;
             if (
                 final_stat.mtime !== verified_stat.mtime
                 || final_stat.size !== verified_stat.size
@@ -10318,7 +10461,14 @@ export function attach_viewer(
             try {
                 await host.fs.write_file(uri, saved_bytes);
             } catch (error) {
-                if (rekey_intent !== undefined) await settle_failed_structural_write(rekey_intent);
+                // The write may have landed before it failed. If the file now
+                // has the saved bytes, recovery applied the intent: report the
+                // save as the success it was (the catch below sees the intent
+                // settled and falls through to the success tail).
+                if (
+                    rekey_intent !== undefined
+                    && await settle_failed_structural_write(rekey_intent, src.meta().sheets) === 'applied'
+                ) write_completed = true;
                 throw error;
             }
             write_completed = true;
@@ -10345,7 +10495,7 @@ export function attach_viewer(
                         rebase_was_noop = true;
                         return current;
                     }
-                    const transition = structural_rekey_transition(current, structural_intent, sheets, {
+                    const transition = structural_rekey_transition(current, structural_intent, src.meta().sheets, {
                         retire: (worksheet) => last_published_sequence(identity.editSessionId, worksheet)
                             === worksheet.acceptedSequence,
                         schemaAfter: (sheet_index) => {
@@ -10362,6 +10512,9 @@ export function attach_viewer(
                         },
                         columnName: (sheet_index, column) => src.meta().sheets[sheet_index]?.columnNames?.[column],
                     });
+                    if (transition === undefined) {
+                        throw new Error('The saved worksheets could not be found to rekey their view state.');
+                    }
                     rekey_announcements = transition.announcements;
                     return transition.state;
                 }
@@ -10498,12 +10651,12 @@ export function attach_viewer(
                 // restore the written layout as still pending.
                 if (write_completed) {
                     recovered_after_write = await resolve_stored_rekey_intent(
-                        rekey_intent.afterDigest,
-                        rekey_intent.saveId,
+                        rekey_intent,
+                        disposed ? undefined : src.meta().sheets,
                     ).catch((resolve_error) => {
                         log_sanitized_failure('Could not apply a structural save after its write', resolve_error);
-                        return false;
-                    });
+                        return 'unresolved' as const;
+                    }) === 'applied';
                 }
             }
             if (!(recovered_after_write && active_save_operation === operation && !disposed)) {
@@ -10543,6 +10696,13 @@ export function attach_viewer(
                 return;
             }
         } finally {
+            stop_lease_renewal?.();
+            if (rekey_intent !== undefined) {
+                IN_FLIGHT_STRUCTURAL_SAVES.delete(rekey_intent.saveId);
+                // Any exit before the write settles the intent: clear it and
+                // keep the payload. Idempotent where an exit already did.
+                if (!write_attempted) await settle_pre_write_intent();
+            }
             save_append_authority.release();
         }
 
@@ -11485,8 +11645,10 @@ export function attach_viewer(
                     && stored_pending_edits_version(edit_state.state) === 2;
                 // An unresolved structural save: until the user says whether it
                 // finished, no edit may build on either reading of the file.
-                const denied_by_unresolved_save = edit_state !== undefined
-                    && unresolved_rekey_intent(edit_state.state) !== undefined;
+                const blocking_intent = edit_state === undefined
+                    ? undefined
+                    : blocking_rekey_intent(edit_state.state);
+                const denied_by_unresolved_save = blocking_intent !== undefined;
                 can_edit = recovery_authorized
                     && !denied_by_layout_peer
                     && !denied_by_unresolved_save
@@ -11665,7 +11827,9 @@ export function attach_viewer(
                 if (denied_by_layout_peer) {
                     show_owner_warning('Reload this window to keep editing this file.');
                 } else if (denied_by_unresolved_save) {
-                    show_owner_warning(UNRESOLVED_STRUCTURAL_SAVE_EDIT_MESSAGE);
+                    show_owner_warning(blocking_intent !== undefined && rekey_intent_is_live(blocking_intent)
+                        ? FOREIGN_STRUCTURAL_SAVE_EDIT_MESSAGE
+                        : UNRESOLVED_STRUCTURAL_SAVE_EDIT_MESSAGE);
                 } else if (cleanup_blocked) {
                     show_owner_warning(
                         'Editing is temporarily unavailable while saved edit state is being cleared.');
@@ -12898,8 +13062,10 @@ export function attach_viewer(
                             if (host_structural_echo) {
                                 if (JSON.stringify(current_structural)
                                     !== JSON.stringify(queued_durable_structural)) return current;
-                            } else if (JSON.stringify(current_structural.conflicts)
-                                !== JSON.stringify(changes.conflicts)) return current;
+                            } else if (JSON.stringify(conflicts_after_publication(
+                                current_structural.conflicts,
+                                changes,
+                            )) !== JSON.stringify(changes.conflicts)) return current;
                             conflict_overlay_authorized = true;
                             const parked = has_identity && live_target_index === undefined;
                             const durable_changes = authority_plan.durableChanges;
@@ -12957,7 +13123,10 @@ export function attach_viewer(
                                     // renderer-authored replacement.
                                     conflicts: host_structural_echo
                                         ? queued_structural.conflicts
-                                        : current_structural.conflicts,
+                                        : conflicts_after_publication(
+                                            current_structural.conflicts,
+                                            changes,
+                                        ),
                                 },
                                 parked ? posted_sheet_name : current_sheets[target_index]?.name,
                                 parked

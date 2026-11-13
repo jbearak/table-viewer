@@ -2823,6 +2823,19 @@ export interface StructuralRekeyIntent {
     readonly worksheets: readonly (WorksheetTarget & { readonly acceptedSequence: number })[];
     /** The complete save receipt: structure entries and appended-row assignments. */
     readonly receipt: PendingChangesSaveReceipt;
+    /**
+     * The host process running the save, and until when it holds the intent.
+     * The owner renews the lease while the save runs, so another process
+     * sharing this state (VS Code and the desktop app, or two windows) leaves
+     * a live intent alone and recovers only one whose owner stopped renewing.
+     * Absent on an intent nobody owns any more.
+     */
+    readonly owner?: StructuralRekeyIntentOwner;
+}
+
+export interface StructuralRekeyIntentOwner {
+    readonly id: string;
+    readonly leaseExpiresAtMs: number;
 }
 
 const MAX_REKEY_INTENT_ID_LENGTH = 256;
@@ -2858,7 +2871,7 @@ export function own_structural_rekey_intent(value: unknown): StructuralRekeyInte
     if (
         !is_plain_record(value)
         || Object.keys(value).some((key) => ![
-            'saveId', 'beforeDigest', 'afterDigest', 'worksheets', 'receipt',
+            'saveId', 'beforeDigest', 'afterDigest', 'worksheets', 'receipt', 'owner',
         ].includes(key))
         || !is_rekey_intent_digest(value.saveId)
         || !is_rekey_intent_digest(value.beforeDigest)
@@ -2938,6 +2951,18 @@ export function own_structural_rekey_intent(value: unknown): StructuralRekeyInte
     const structure = value.receipt.structure === undefined
         ? undefined
         : own_worksheet_structure_receipts(value.receipt.structure, rekey_intent_error);
+    let owner: StructuralRekeyIntentOwner | undefined;
+    if (value.owner !== undefined) {
+        const candidate = value.owner;
+        if (
+            !is_plain_record(candidate)
+            || Object.keys(candidate).length !== 2
+            || !is_rekey_intent_digest(candidate.id)
+            || !Number.isSafeInteger(candidate.leaseExpiresAtMs)
+            || (candidate.leaseExpiresAtMs as number) < 0
+        ) rekey_intent_error();
+        owner = Object.freeze({ id: candidate.id as string, leaseExpiresAtMs: candidate.leaseExpiresAtMs as number });
+    }
     return Object.freeze({
         saveId: value.saveId,
         beforeDigest: value.beforeDigest,
@@ -2948,6 +2973,7 @@ export function own_structural_rekey_intent(value: unknown): StructuralRekeyInte
             removedSourceRows: Object.freeze(removedSourceRows),
             ...(structure === undefined ? {} : { structure }),
         }),
+        ...(owner === undefined ? {} : { owner }),
     });
 }
 

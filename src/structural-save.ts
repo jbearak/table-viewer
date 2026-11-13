@@ -673,7 +673,18 @@ export function structural_rekey_transition(
     intent: StructuralRekeyIntent,
     sheets: readonly WorksheetIdentityInput[],
     options: StructuralRekeyTransitionOptions,
-): StructuralRekeyResult {
+): StructuralRekeyResult | undefined {
+    // Never retire an intent whose rekey cannot be applied: every worksheet it
+    // names must resolve in the workbook it is applied against. Without one
+    // (a disposed panel, a workbook that lost the sheet), the intent stays
+    // stored for the next load.
+    const targets = [
+        ...(intent.receipt.structure ?? []),
+        ...intent.receipt.appendedRows,
+        ...intent.receipt.removedSourceRows,
+        ...intent.worksheets,
+    ];
+    if (targets.some((target) => worksheet_target_index(sheets, target) === undefined)) return undefined;
     const rekeyed = apply_structural_rekey(current, intent.receipt, {
         sheets,
         afterDigest: intent.afterDigest,

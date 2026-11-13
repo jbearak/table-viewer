@@ -521,20 +521,27 @@ describe('structural_rekey_transition', () => {
     const options = { schemaAfter: () => undefined };
 
     it('applies the rekey, retires the payload, and clears the intent in one state', () => {
-        const next = structural_rekey_transition(state, intent, SHEETS, { ...options, retire: () => true }).state;
+        const next = structural_rekey_transition(state, intent, SHEETS, { ...options, retire: () => true })!.state;
         expect(next.structuralRekeyIntent).toBeUndefined();
         expect(next.pendingEdits).toBeUndefined();
         expect(next.rowHeights).toEqual([{ 1: 30 }]);
     });
 
     it('keeps a payload a later publication replaced', () => {
-        const next = structural_rekey_transition(state, intent, SHEETS, { ...options, retire: () => false }).state;
+        const next = structural_rekey_transition(state, intent, SHEETS, { ...options, retire: () => false })!.state;
         expect(next.structuralRekeyIntent).toBeUndefined();
         expect(next.pendingEdits?.[0]?.rowLayout).toBeDefined();
     });
 
+    it('never retires an intent whose worksheets the workbook cannot resolve', () => {
+        // A disposed panel has no workbook; one without the sheet cannot rekey it.
+        expect(structural_rekey_transition(state, intent, [], { ...options, retire: () => true })).toBeUndefined();
+        expect(structural_rekey_transition(state, intent, [{ name: 'Other' }], { ...options, retire: () => true }))
+            .toBeUndefined();
+    });
+
     it('parks the payload for "It finished", until the next successful save drops it', () => {
-        const next = structural_rekey_transition(state, intent, SHEETS, { ...options, retire: () => true, park: true }).state;
+        const next = structural_rekey_transition(state, intent, SHEETS, { ...options, retire: () => true, park: true })!.state;
         expect(next.pendingEdits).toEqual([{
             ...state.pendingEdits![0],
             sheetName: `${PARKED_STRUCTURAL_PAYLOAD_PREFIX}Sheet1`,

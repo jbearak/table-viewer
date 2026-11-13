@@ -122,6 +122,7 @@ async function open_viewer(options: {
     readonly structuralEditingEnabled?: boolean;
     readonly path?: string;
     readonly requestEdit?: boolean;
+    readonly structuralSaveLeaseMs?: number;
 }) {
     options.disk.install();
     const path = options.path ?? FILE;
@@ -132,7 +133,12 @@ async function open_viewer(options: {
         with_in_memory_authority_transactions(options.state.store),
         csv_table_profile(),
         fake_viewer_host,
-        { structuralEditingEnabled: options.structuralEditingEnabled ?? true },
+        {
+            structuralEditingEnabled: options.structuralEditingEnabled ?? true,
+            ...(options.structuralSaveLeaseMs === undefined
+                ? {}
+                : { structuralSaveLeaseMs: options.structuralSaveLeaseMs }),
+        },
     );
     panel.onDidDispose(() => controller.dispose());
     const warning = vi.spyOn(vscode_mock.window, 'showWarningMessage');
@@ -720,5 +726,190 @@ describe('an unresolved rekey intent', () => {
             conflicts: [{ reason: 'structuralBasisChanged' }],
         });
         await viewer.dispose();
+    });
+});
+
+describe('rekey intent ownership across processes', () => {
+    const owned = (lease_expires_at_ms: number): StructuralRekeyIntent => ({
+        saveId: 'elsewhere',
+        beforeDigest: hex(BYTES),
+        afterDigest: hex(SAVED),
+        worksheets: [{ sheetIndex: 0, sheetName: 'Sheet1', acceptedSequence: 1 }],
+        receipt: {
+            appendedRows: [],
+            removedSourceRows: [],
+            structure: [{
+                sheetIndex: 0,
+                sheetName: 'Sheet1',
+                rowRuns: [{ from: 0, count: 1, to: 0 }, { from: 2, count: 1, to: 1 }],
+                removedRows: [{ start: 1, count: 1 }],
+                columnMap: [0],
+                insertedRows: [],
+                insertedColumns: [],
+            }],
+        },
+        owner: { id: 'another-process', leaseExpiresAtMs: lease_expires_at_ms },
+    });
+
+    it('leaves a live intent another process owns alone, and blocks editing without a notice', async () => {
+        // The file still has the bytes the save read: its owner has not written yet.
+        const state = store_with({ pendingEdits: slot(REMOVAL), structuralRekeyIntent: owned(Date.now() + 60_000) });
+        const viewer = await open_viewer({ state, disk: disk(BYTES) });
+        expect(viewer.durable().structuralRekeyIntent?.saveId).toBe('elsewhere');
+        expect(viewer.session()).toMatchObject({ granted: false });
+        expect(viewer.warning).toHaveBeenCalledWith(
+            'Another Table Viewer window is saving this file. Try again when it finishes.');
+        expect(viewer.last<{ notice: unknown } | undefined>('structuralSaveUnresolved')?.notice ?? null).toBeNull();
+        await viewer.dispose();
+    });
+
+    it('recovers the intent once its owner stops renewing the lease', async () => {
+        const state = store_with({ pendingEdits: slot(REMOVAL), structuralRekeyIntent: owned(Date.now() + 300) });
+        const viewer = await open_viewer({ state, disk: disk(BYTES), requestEdit: false });
+        expect(viewer.durable().structuralRekeyIntent?.saveId).toBe('elsewhere');
+        await vi.waitFor(() => expect(viewer.durable().structuralRekeyIntent).toBeUndefined(), { timeout: 3_000 });
+        expect(viewer.durable().pendingEdits?.[0]).toMatchObject(REMOVAL);
+        await viewer.dispose();
+    });
+
+    it('recovers an expired lease on load', async () => {
+        const state = store_with({ pendingEdits: slot(REMOVAL), structuralRekeyIntent: owned(Date.now() - 1) });
+        const viewer = await open_viewer({ state, disk: disk(SAVED) });
+        expect(viewer.durable().structuralRekeyIntent).toBeUndefined();
+        expect(viewer.durable().pendingEdits).toBeUndefined();
+        expect(viewer.durable().cellHighlights?.sheets[0]?.cells).toEqual({ '0:0': 'yellow', '1:0': 'blue' });
+        await viewer.dispose();
+    });
+
+    it('renews its own lease while a save runs', async () => {
+        const drive = disk(BYTES);
+        const state = store_with({ pendingEdits: slot(REMOVAL) });
+        const viewer = await open_viewer({ state, disk: drive, structuralSaveLeaseMs: 300 });
+        drive.file.stat_calls = 0;
+        drive.file.hang_stat_at = 3;
+        void viewer.send_save(REMOVAL);
+        await vi.waitFor(() => expect(drive.file.hung).toBe(true));
+        const first = (state.get_state(FILE) as PerFileState).structuralRekeyIntent!.owner!.leaseExpiresAtMs;
+        await vi.waitFor(() => expect((state.get_state(FILE) as PerFileState).structuralRekeyIntent?.owner
+            ?.leaseExpiresAtMs).toBeGreaterThan(first), { timeout: 3_000 });
+        await viewer.dispose();
+    });
+});
+
+describe('recovery after the write', () => {
+    it('keeps the intent stored when the panel closes during the write', async () => {
+        const drive = disk(BYTES);
+        const state = store_with({ pendingEdits: slot(REMOVAL) });
+        const viewer = await open_viewer({ state, disk: drive });
+        drive.file.write = async (content) => {
+            drive.file.bytes = content;
+            drive.file.mtime += 1;
+            viewer.panel.dispose();
+        };
+        void viewer.send_save(REMOVAL);
+        await vi.waitFor(() => expect(drive.file.writes).toHaveLength(1));
+        await viewer.controller.drain();
+        // Nothing could rekey the closed panel's state, so nothing was retired.
+        expect(viewer.durable().structuralRekeyIntent?.afterDigest).toBe(hex(SAVED));
+        expect(viewer.durable().cellHighlights?.sheets[0]?.cells).toEqual(VIEW_STATE.cellHighlights!.sheets[0]!.cells);
+
+        simulate_process_restart_for_tests();
+        drive.file.write = undefined;
+        const reopened = await open_viewer({ state, disk: drive });
+        expect(reopened.durable().structuralRekeyIntent).toBeUndefined();
+        expect(reopened.durable().pendingEdits).toBeUndefined();
+        expect(reopened.durable().cellHighlights?.sheets[0]?.cells).toEqual({ '0:0': 'yellow', '1:0': 'blue' });
+        await reopened.dispose();
+    });
+
+    it('reports a write that landed and then failed as the success it was', async () => {
+        const drive = disk(BYTES);
+        const state = store_with({ pendingEdits: slot(REMOVAL) });
+        const viewer = await open_viewer({ state, disk: drive });
+        drive.file.write = async (content) => {
+            drive.file.bytes = content;
+            drive.file.mtime += 1;
+            throw new Error('EIO after write');
+        };
+        const result = await viewer.save(REMOVAL);
+        expect(result).toMatchObject({ success: true, receipt: { structure: [{ removedRows: [{ start: 1, count: 1 }] }] } });
+        expect(viewer.durable().structuralRekeyIntent).toBeUndefined();
+        expect(viewer.durable().cellHighlights?.sheets[0]?.cells).toEqual({ '0:0': 'yellow', '1:0': 'blue' });
+        await viewer.dispose();
+    });
+
+    it('re-reads the file and leaves the intent unresolved when it changed again', async () => {
+        const drive = disk(BYTES);
+        const state = store_with({ pendingEdits: slot(REMOVAL) });
+        const viewer = await open_viewer({ state, disk: drive });
+        const compare_and_set = state.store.compare_and_set.bind(state.store);
+        let failed = false;
+        vi.spyOn(state.store, 'compare_and_set').mockImplementation(async (...args) => {
+            if (!failed && drive.file.writes.length > 0) {
+                failed = true;
+                // Someone else writes the file between our write and recovery.
+                drive.file.bytes = enc.encode('h\nsomeone else\n');
+                drive.file.mtime += 1;
+                throw new Error('state write failed');
+            }
+            return compare_and_set(...args);
+        });
+        expect(await viewer.save(REMOVAL)).toMatchObject({ success: false });
+        expect(viewer.durable().structuralRekeyIntent?.afterDigest).toBe(hex(SAVED));
+        expect(viewer.durable().cellHighlights?.sheets[0]?.cells).toEqual(VIEW_STATE.cellHighlights!.sheets[0]!.cells);
+        await viewer.dispose();
+    });
+});
+
+describe('discarding row and column changes after a basis conflict', () => {
+    it('publishes the discard, which clears the worksheet-level conflict', async () => {
+        const drive = disk(enc.encode('h\na\nX\nc\n'));
+        const viewer = await open_viewer({ state: store_with({ pendingEdits: slot(REMOVAL) }), disk: drive });
+        expect(viewer.durable().pendingEdits?.[0]?.conflicts).toHaveLength(1);
+        const snapshot = viewer.last<{ snapshot: { sourceGeneration: number } }>('workbookSnapshot').snapshot;
+        await viewer.panel.__receive({
+            type: 'pendingChangesChanged',
+            editSessionId: viewer.session()!.editSessionId!,
+            sequence: 1,
+            sourceGeneration: snapshot.sourceGeneration,
+            changes: {
+                sheetIndex: 0,
+                sheetName: 'Sheet1',
+                cells: { '0:0': { value: 'kept', base: 'a' } },
+                formatTemplates: [],
+                appendedRows: [],
+                tailRemovals: [],
+                conflicts: [],
+            },
+        });
+        await viewer.controller.drain();
+        expect(viewer.messages().some((message) =>
+            message.type === 'pendingChangesAcknowledged' && message.sequence === 1)).toBe(true);
+        expect(viewer.durable().pendingEdits?.[0]?.conflicts ?? []).toEqual([]);
+        expect(viewer.durable().pendingEdits?.[0]?.rowLayout).toBeUndefined();
+        await viewer.dispose();
+    });
+});
+
+describe('every exit before the write settles the intent', () => {
+    it('clears it when the panel closes while the final stat fails', async () => {
+        const drive = disk(BYTES);
+        const state = store_with({ pendingEdits: slot(REMOVAL) });
+        const viewer = await open_viewer({ state, disk: drive });
+        drive.file.stat_calls = 0;
+        vscode_mock.__setStatImplementation(async () => {
+            drive.file.stat_calls += 1;
+            if (drive.file.stat_calls === 3) {
+                viewer.panel.dispose();
+                throw new Error('EBUSY');
+            }
+            return { size: drive.file.bytes.length, mtime: drive.file.mtime };
+        });
+        void viewer.send_save(REMOVAL);
+        await vi.waitFor(() => expect(drive.file.stat_calls).toBeGreaterThanOrEqual(3));
+        await viewer.controller.drain();
+        await vi.waitFor(() => expect(viewer.durable().structuralRekeyIntent).toBeUndefined());
+        expect(drive.file.writes).toHaveLength(0);
+        expect(viewer.durable().pendingEdits?.[0]).toMatchObject(REMOVAL);
     });
 });
