@@ -414,7 +414,7 @@ const DataGridDnd: React.FunctionComponent<DataGridDndProps> = p => {
 
     const onItemHoveredImpl = React.useCallback(
         (args: GridMouseEventArgs) => {
-            const [col, row] = args.location;
+            const [col] = args.location;
             if (dragCol !== undefined && dropCol !== col && col >= lockColumns) {
                 setDragColActive(true);
                 setDropCol(col);
@@ -489,6 +489,7 @@ const DataGridDnd: React.FunctionComponent<DataGridDndProps> = p => {
                     // that selection. Release replays it if no move started.
                     const rows = rowMoveBlockForPress(selection.rows, row);
                     if (rows !== undefined && canMoveRows?.(rows) !== false) {
+                        lastPointerYRef.current = args.bounds.y + args.localEventY;
                         rowMoveRef.current = {
                             rows,
                             startY: args.bounds.y + args.localEventY,
