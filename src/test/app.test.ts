@@ -5555,6 +5555,105 @@ describe('edit mode save exit', () => {
             button.textContent === 'Discard row and column changes on Sheet1')).toBe(true);
     });
 
+    it('shows an unsupportedStructure save refusal with its reason, naming the worksheet, with its discard', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1'], false), {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        await enter_edit_mode(post_message, 'unsupported-session');
+        const operation: CsvSaveOperation = {
+            editSessionId: 'unsupported-session',
+            saveRequestId: 'save-unsupported',
+            worksheets: [{ sheetIndex: 0, sheetName: 'Sheet1', edits: {}, dirtyEdits: {} }],
+        };
+        await dispatch_host_message({
+            type: 'saveOperationStarted',
+            lifecycle: { revision: 1, state: 'active', operation },
+        });
+        post_message.mockClear();
+        const message = "Can't save these row and column changes: they would split the conditional formatting on Sheet1!A2:A131 into more than 64 rules.";
+        await dispatch_host_message({
+            type: 'saveResult',
+            success: false,
+            lifecycle: { revision: 2, state: 'failed', operation },
+            rejection: {
+                reason: 'structuralConflict',
+                worksheetOperationIndex: 0,
+                structuralReason: 'unsupportedStructure',
+                pendingRowIds: [],
+                tailRemovalIds: [],
+                message,
+            },
+            basesValidated: true,
+        });
+        expect(post_message.mock.calls.some(([sent]) => sent?.type === 'showWarning')).toBe(false);
+        const review = document.querySelector('[aria-label="Pending rows that need review"]');
+        expect(review?.textContent).toContain(`Sheet1: ${message}`);
+        expect([...document.querySelectorAll('button')].some((button) =>
+            button.textContent === 'Discard row and column changes on Sheet1')).toBe(true);
+        expect([...document.querySelectorAll('button')].some((button) =>
+            button.textContent === 'Keep new rows at the end')).toBe(false);
+    });
+
+    it('does not offer the unsupportedStructure discard while the worksheet has column changes', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1'], false), {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        await click_button('Edit');
+        // A Pending Column (no UI creates one before delivery step 8), which
+        // the worksheet's discard can't drop yet.
+        await dispatch_host_message({
+            type: 'editSessionResult',
+            granted: true,
+            editSessionId: 'columns-session',
+            sheetIndex: 0,
+            pendingChanges: {
+                sheetIndex: 0,
+                sheetName: 'Sheet1',
+                cells: {},
+                formatTemplates: [],
+                appendedRows: [],
+                tailRemovals: [],
+                conflicts: [],
+                columnLayout: {
+                    columns: [{ kind: 'source', sourceColumn: 0 }, { kind: 'pending', pendingColumnId: 'column-a' }],
+                    removedSourceColumns: [],
+                    discardedPendingColumns: [],
+                },
+                pendingColumns: [{ id: 'column-a', header: 'New column', cells: {}, format: { kind: 'none' }, createdOrder: 1 }],
+                structuralBasis: {
+                    kind: 'delimited', byteLength: 1, digest: 'x', sourceRowCount: 1, sourceColumnCount: 1,
+                },
+            },
+        });
+        expect(post_message).toHaveBeenCalledWith(expect.objectContaining({ type: 'requestEditSession' }));
+        const operation: CsvSaveOperation = {
+            editSessionId: 'columns-session',
+            saveRequestId: 'save-columns',
+            worksheets: [{ sheetIndex: 0, sheetName: 'Sheet1', edits: {}, dirtyEdits: {} }],
+        };
+        await dispatch_host_message({ type: 'saveOperationStarted', lifecycle: { revision: 1, state: 'active', operation } });
+        await dispatch_host_message({
+            type: 'saveResult',
+            success: false,
+            lifecycle: { revision: 2, state: 'failed', operation },
+            rejection: {
+                reason: 'structuralConflict',
+                worksheetOperationIndex: 0,
+                structuralReason: 'unsupportedStructure',
+                pendingRowIds: [],
+                tailRemovalIds: [],
+                message: "Can't save these row and column changes: no.",
+            },
+            basesValidated: true,
+        });
+        expect(document.querySelector('[aria-label="Pending rows that need review"]')?.textContent)
+            .toContain("Sheet1: Can't save these row and column changes: no.");
+        expect([...document.querySelectorAll('button')].some((button) =>
+            button.textContent === 'Discard row and column changes on Sheet1')).toBe(false);
+    });
+
     it('requests a row insert, installs a granted reply, and releases a stale one', async () => {
         const { post_message } = await render_app();
         const meta = make_meta(['Sheet1'], false);

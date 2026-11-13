@@ -953,6 +953,7 @@ export const STRUCTURE_TRANSFORMED_MESSAGE =
 export const APPENDED_BAND_MESSAGE = 'Appended rows stay at the end until you save.';
 export const LAST_LIVE_COLUMN_MESSAGE = 'A sheet needs at least one column.';
 export const MERGE_SPLIT_MESSAGE = "Can't move part of a merged cell.";
+export const FILTERED_COLUMN_MOVE_MESSAGE = "Can't move a filtered column outside the sheet's filter range.";
 export const TOO_MANY_PENDING_ROWS_MESSAGE =
     `A worksheet may keep at most ${MAX_PENDING_APPENDED_ROWS.toLocaleString('en-US')} pending rows.`;
 export const TOO_MANY_PENDING_COLUMNS_MESSAGE =
@@ -994,6 +995,16 @@ export interface WorksheetStructureContext {
     /** Merged ranges in canonical source coordinates, for the action-time merge rules. */
     readonly merges?: readonly MergeRange[];
     /**
+     * The `.xlsx` worksheet AutoFilter: its range's first and last columns
+     * and the 0-based worksheet columns with a `<filterColumn>`, for the
+     * action-time filtered-column move rule.
+     */
+    readonly autoFilter?: {
+        readonly firstColumn: number;
+        readonly lastColumn: number;
+        readonly filteredColumns: readonly number[];
+    };
+    /**
      * Whether a stored Formula Anchor outside this worksheet's Pending Rows and
      * Pending Columns names a Pending Row of this worksheet: one in any
      * worksheet's cell edits, or in another worksheet's Pending Rows or
@@ -1020,6 +1031,7 @@ export type StructureRefusalReason =
     | 'merge-anchor'
     | 'merge-split'
     | 'merge-destination'
+    | 'filtered-column'
     | 'last-live-column'
     | 'too-many-pending-rows'
     | 'too-many-pending-columns'
@@ -1216,6 +1228,35 @@ function merge_move_refusal<I>(
         const high = live_body_index(span.end, span.start, -1);
         if (low !== undefined && high !== undefined && low < first && last < high) {
             return refuse_structure('merge-destination', merge_destination_message(axis));
+        }
+    }
+    return undefined;
+}
+
+/**
+ * A column move that would leave a filtered column outside the rendered
+ * AutoFilter range is refused (design "XLSX" → "AutoFilter"). The range is
+ * rendered by interval semantics: everything between its corner columns'
+ * positions in the full layout, where each corner moves with its column.
+ */
+function filtered_column_move_refusal(
+    context: WorksheetStructureContext,
+    after: ColumnLayout,
+): StructureResult | undefined {
+    const filter = context.autoFilter;
+    if (filter === undefined || filter.filteredColumns.length === 0) return undefined;
+    const index = index_column_layout(after);
+    const first = index.position_of({ kind: 'source', sourceColumn: filter.firstColumn });
+    const last = index.position_of({ kind: 'source', sourceColumn: filter.lastColumn });
+    if (first === undefined || last === undefined) return undefined;
+    const low = Math.min(first, last);
+    const high = Math.max(first, last);
+    for (const sourceColumn of filter.filteredColumns) {
+        const identity: ColumnIdentity = { kind: 'source', sourceColumn };
+        const position = index.position_of(identity);
+        if (position === undefined || !index.is_live(identity)) continue;
+        if (position < low || position > high) {
+            return refuse_structure('filtered-column', FILTERED_COLUMN_MOVE_MESSAGE);
         }
     }
     return undefined;
@@ -1436,7 +1477,10 @@ export function discard_layout_changes(
     if (!result.ok) return result;
     const next = own_pending_structural_changes({
         ...result.outcome.next,
-        conflicts: result.outcome.next.conflicts.filter((conflict) => conflict.reason !== 'structuralBasisChanged'),
+        // A refused structural save's `unsupportedStructure` belongs to the
+        // layout too, so the discard answers it as well.
+        conflicts: result.outcome.next.conflicts.filter((conflict) =>
+            conflict.reason !== 'structuralBasisChanged' && conflict.reason !== 'unsupportedStructure'),
     });
     return { ok: true, outcome: Object.freeze({ ...result.outcome, next }) };
 }
@@ -1831,6 +1875,8 @@ export function move_columns(
         (sourceColumn): ColumnIdentity => ({ kind: 'source', sourceColumn }),
     );
     if (merge !== undefined) return merge;
+    const filtered = filtered_column_move_refusal(context, result.layout);
+    if (filtered !== undefined) return filtered;
     return finish_structure(changes, context, 'columns', {
         rowLayout: row_layout_of(changes, context),
         columnLayout: result.layout,

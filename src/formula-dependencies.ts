@@ -18,6 +18,8 @@ import {
 const MAX_ROW = 1_048_576;
 const MAX_COLUMN = 16_384;
 const DEPENDENCY_STRIDE = 7;
+/** Numbers per formula dependency in `PackedFormulaDependencies`. */
+export const FORMULA_DEPENDENCY_STRIDE = DEPENDENCY_STRIDE;
 const RANGE_STRIDE = 5;
 const EXACT_STRIDE = 3;
 const COLUMN_TREE_LEAVES = MAX_COLUMN;

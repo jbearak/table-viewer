@@ -110,6 +110,7 @@ import {
     needs_prospective_formula_request,
     prospective_formula_request,
     prospective_formula_targets,
+    webview_anchor_inputs,
     webview_formula_workbook,
 } from './formula-anchor-model';
 import { capture_pending_formula_reference_bases } from '../pending-formula-rebase';
@@ -234,14 +235,23 @@ import { run_discard_transaction } from './discard-transaction-model';
 import { highlight_history_source } from './highlight-capture-model';
 import { commit_staged_transaction, type StagedMutation } from './staged-mutation';
 import { discard_layout_changes, keep_inserted_rows_at_end } from './pending-row-store';
-import { has_inserted_or_moved_rows, INSERTED_ROWS_TRANSFORM_MESSAGE } from './row-structure-model';
+import {
+    has_inserted_or_moved_rows,
+    INSERTED_ROWS_TRANSFORM_MESSAGE,
+    rule_split_warning_message,
+    rule_split_warnings,
+} from './row-structure-model';
 
 /**
  * Structural conflicts about a whole worksheet rather than a row or cell:
  * they carry no row identities, and Review Changes answers them with a
- * worksheet action ("Discard row and column changes on <sheet>").
+ * worksheet action ("Discard row and column changes on <sheet>"). An
+ * `unsupportedStructure` refusal names its reason in `message` instead.
  */
-const WORKSHEET_LEVEL_STRUCTURAL_CONFLICTS: ReadonlySet<string> = new Set(['structuralBasisChanged']);
+const WORKSHEET_LEVEL_STRUCTURAL_CONFLICTS: ReadonlySet<string> = new Set([
+    'structuralBasisChanged',
+    'unsupportedStructure',
+]);
 import { column_letter } from './grid-model';
 import {
     clamp_row_height,
@@ -1428,6 +1438,31 @@ export function App(): React.JSX.Element {
     // One granted session makes every worksheet editable. The active tab chooses
     // only which per-sheet store the mounted grid views; it is not an edit pointer.
     const edit_mode_on_active_sheet = edit_mode;
+    // Review Changes' warning before Save: an `.xlsx` conditional-formatting
+    // element or data-validation rule on this worksheet that the current
+    // layouts would split past the writer's cap, counted with the writer's
+    // own partition. Rebuilt with the structural revision.
+    const rule_split_warning_messages = useMemo(() => {
+        const rules = structural_editing?.sheets[active_sheet_index]?.relativeRules ?? [];
+        if (!meta || edit_syntax !== 'markdown' || !edit_mode_on_active_sheet || rules.length === 0) return [];
+        const pending_by_sheet = new Map(edit_session_registry_ref.current!.pending_entries());
+        const changes_for = (sheet_index: number) => pending_by_sheet.get(sheet_index)?.snapshot();
+        try {
+            const warnings = rule_split_warnings(
+                webview_anchor_inputs(meta.sheets, changes_for),
+                active_sheet_index,
+                rules,
+            );
+            const changes = changes_for(active_sheet_index) ?? EMPTY_PENDING_STRUCTURAL_CHANGES;
+            return warnings.map((warning) => rule_split_warning_message(warning, changes));
+        } catch {
+            return [];
+        }
+    },
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+        [formula_roots_projection.structuralRevision, meta, edit_syntax, structural_editing,
+            active_sheet_index, edit_mode_on_active_sheet],
+    );
     const [edit_session_pending, set_edit_session_pending] = useState(false);
     const [save_operation, set_save_operation] = useState<CsvSaveOperation>();
     const [save_lifecycle, set_save_lifecycle] = useState<CsvSaveLifecycle>(
@@ -7202,6 +7237,7 @@ export function App(): React.JSX.Element {
                             ...(formula_cells === undefined ? {} : {
                                 formulaCells: Object.freeze(formula_cells),
                             }),
+                            ...(rejection.message === undefined ? {} : { message: rejection.message }),
                         });
                         // A Structural Basis conflict belongs to the whole
                         // worksheet; its action is a discard, not a row.
@@ -7978,6 +8014,17 @@ export function App(): React.JSX.Element {
         subscribe_active_pending_conflicts,
         active_layout_change_snapshot,
         active_layout_change_snapshot,
+    );
+    // The worksheet's discard can't yet drop column changes (delivery step
+    // 8), so an action that relies on it is not offered while they exist.
+    const active_column_changes_snapshot = useCallback(() => {
+        const snapshot = active_pending_row_store.snapshot();
+        return snapshot.columnLayout !== undefined || (snapshot.pendingColumns?.length ?? 0) > 0;
+    }, [active_pending_row_store]);
+    const active_column_changes = useSyncExternalStore(
+        subscribe_active_pending_conflicts,
+        active_column_changes_snapshot,
+        active_column_changes_snapshot,
     );
     // What "Keep new rows at the end" loses, counted for its notice: Pending
     // Columns that hold typed values. (CSV and TSV have no formulas, so no
@@ -9069,6 +9116,21 @@ export function App(): React.JSX.Element {
                     </div>
                 </div>
             )}
+            {rule_split_warning_messages.length > 0 && (
+                // Before Save, not after: Save refuses a rule split past the
+                // cap, so the user sees which rule while the layout can change.
+                <section
+                    className="external-change-review structural-split-warning"
+                    role="status"
+                    aria-label="Row and column changes Save will refuse"
+                >
+                    <ul className="external-change-list">
+                        {rule_split_warning_messages.map((message) => (
+                            <li key={message}>{message}</li>
+                        ))}
+                    </ul>
+                </section>
+            )}
             {show_structural_conflicts && (
                 <section
                     className="external-change-review structural-conflict-review"
@@ -9098,7 +9160,7 @@ export function App(): React.JSX.Element {
                                                     : conflict.reason === 'structuralBasisChanged'
                                                         ? `${current_sheet.name} changed on disk after you inserted, deleted, or moved rows or columns. Table Viewer can't tell where those changes belong in the new version.`
                                                         : conflict.reason === 'unsupportedStructure'
-                                                            ? 'The worksheet gained a structure Table Viewer cannot shift.'
+                                                            ? `${current_sheet.name}: ${conflict.message ?? "Can't save these row and column changes: the worksheet has a structure Table Viewer can't shift."}`
                                                             : 'The saved worksheet suffix changed.'}
                             </li>
                         ))}
@@ -9164,6 +9226,15 @@ export function App(): React.JSX.Element {
                                     {`Discard row and column changes on ${current_sheet.name}`}
                                 </button>
                             </>
+                        )}
+                        {!active_column_changes
+                            && !structural_conflicts.some((conflict) =>
+                                conflict.reason === 'structuralBasisChanged')
+                            && structural_conflicts.some((conflict) =>
+                                conflict.reason === 'unsupportedStructure') && (
+                            <button onClick={discard_active_layout_changes}>
+                                {`Discard row and column changes on ${current_sheet.name}`}
+                            </button>
                         )}
                         <button
                             onClick={() => {

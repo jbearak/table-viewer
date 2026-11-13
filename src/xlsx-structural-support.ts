@@ -206,7 +206,14 @@ export type StructuralAxisSupport =
     | { readonly supported: true }
     | { readonly supported: false; readonly reason: StructuralRefusal };
 
+/**
+ * One `conditionalFormatting` element or one `dataValidation`, with every
+ * formula it holds. The formulas of all `cfRule`s in one element share its
+ * `sqref`, so the writer splits them together and caps the split per
+ * element; the webview's warning counts the same unit.
+ */
 export interface StructuralRelativeRule {
+    readonly kind: 'conditionalFormatting' | 'dataValidation';
     readonly sqref: string;
     readonly formulas: readonly string[];
 }
@@ -228,9 +235,9 @@ export interface WorksheetStructuralSupport {
      */
     readonly autoFilter?: StructuralAutoFilter;
     /**
-     * Every conditional-formatting rule (one entry per `cfRule`, with its
-     * element's `sqref`) and data-validation rule, with its formula texts.
-     * Consumers filter for relative references.
+     * Every conditional-formatting element (one entry per element, holding
+     * the formulas of all its `cfRule`s) and data-validation rule, with its
+     * formula texts. Consumers filter for relative references.
      */
     readonly relativeRules: readonly StructuralRelativeRule[];
 }
@@ -1349,6 +1356,7 @@ function scan_worksheet(
                 if (!valid_sqref(sqref)) {
                     consider({ code: 'invalid-range', element: 'conditionalFormatting', value: sqref });
                 }
+                const element_formulas: string[] = [];
                 for (const rule of children_named(xml, child.element, 'cfRule')) {
                     // Color scales, data bars, and icon sets keep thresholds in
                     // `<cfvo val>`, which may be a formula; the writer does not
@@ -1366,11 +1374,12 @@ function scan_worksheet(
                     }
                     const formulas = children_named(xml, rule.element, 'formula')
                         .map((formula) => element_text(xml, formula.element));
-                    relative_rules.push({ sqref, formulas });
+                    element_formulas.push(...formulas);
                     for (const text of formulas) {
                         other_formulas.push({ location: { kind: 'conditional-formatting', sqref }, text });
                     }
                 }
+                relative_rules.push({ kind: 'conditionalFormatting', sqref, formulas: element_formulas });
             } else if (local === 'dataValidations') {
                 for (const validation of children_named(xml, child.element, 'dataValidation')) {
                     const sqref = get_attr(opening_tag_text(xml, validation.element), 'sqref') ?? '';
@@ -1381,7 +1390,7 @@ function scan_worksheet(
                         .filter((formula) => local_name(formula.name) === 'formula1'
                             || local_name(formula.name) === 'formula2')
                         .map((formula) => element_text(xml, formula.element));
-                    relative_rules.push({ sqref, formulas });
+                    relative_rules.push({ kind: 'dataValidation', sqref, formulas });
                     for (const text of formulas) {
                         other_formulas.push({ location: { kind: 'data-validation', sqref }, text });
                     }

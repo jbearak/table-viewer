@@ -7,6 +7,7 @@
  */
 
 import {
+    has_live_layout_change,
     own_pending_structural_changes,
     type PendingAppendedRow,
     type PendingColumn,
@@ -138,8 +139,19 @@ function with_layout_change(
     }
     const used = new Set(rows.map((row) => row.formatTemplateId));
     const row_ids = new Set(rows.map((row) => row.id));
+    const rowLayout = axis === 'rows' ? (desired_layout ?? undefined) as RowLayout | undefined : current.rowLayout;
+    const columnLayout = axis === 'columns'
+        ? (desired_layout ?? undefined) as ColumnLayout | undefined
+        : current.columnLayout;
+    const live_layout = has_live_layout_change({ rowLayout, columnLayout });
     // Conflicts name live rows only; the host derives them afresh after replay.
+    // A worksheet-level conflict (`structuralBasisChanged`,
+    // `unsupportedStructure`) names none; it stays while a live layout change
+    // remains, the host's replay rule.
     const conflicts = current.conflicts.flatMap((conflict) => {
+        if (conflict.reason === 'structuralBasisChanged' || conflict.reason === 'unsupportedStructure') {
+            return live_layout ? [conflict] : [];
+        }
         const pendingRowIds = conflict.pendingRowIds.filter((id) => row_ids.has(id));
         const formulaCells = conflict.formulaCells?.filter((cell) =>
             cell.rowIdentity.kind !== 'pending' || row_ids.has(cell.rowIdentity.pendingRowId));
@@ -158,15 +170,8 @@ function with_layout_change(
             appendedRows: rows,
             conflicts,
             ...(append_basis.value === undefined ? {} : { appendBasis: append_basis.value }),
-            ...(axis === 'rows'
-                ? {
-                    ...(desired_layout === null ? {} : { rowLayout: desired_layout }),
-                    ...(current.columnLayout === undefined ? {} : { columnLayout: current.columnLayout }),
-                }
-                : {
-                    ...(current.rowLayout === undefined ? {} : { rowLayout: current.rowLayout }),
-                    ...(desired_layout === null ? {} : { columnLayout: desired_layout }),
-                }),
+            ...(rowLayout === undefined ? {} : { rowLayout }),
+            ...(columnLayout === undefined ? {} : { columnLayout }),
             ...(columns.length === 0 ? {} : { pendingColumns: columns }),
             ...(structural_basis.value === undefined ? {} : { structuralBasis: structural_basis.value }),
         });

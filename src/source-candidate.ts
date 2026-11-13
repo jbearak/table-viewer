@@ -1,10 +1,19 @@
 import type { DataSource } from './data-source/interface';
 
+import type { XlsxStructuralObservation } from './xlsx-structural-observation';
+
 export interface PhysicalSourceObservation {
     readonly fingerprint: string;
     readonly digest: string;
     /** Byte length of the bytes `digest` covers, for the Structural Basis. */
     readonly byteLength?: number;
+    /**
+     * An editable `.xlsx` source's per-part digests and structural support
+     * scan, taken from the bytes `digest` covers while structural editing
+     * is enabled: once per source generation, so the snapshot capability and
+     * every basis check read one answer.
+     */
+    readonly xlsxStructure?: XlsxStructuralObservation;
     /** A file-backed source was content-digested through its own descriptor and
      * bracketed by descriptor/path identity checks during construction. */
     readonly verification?: 'bracketedDigest';

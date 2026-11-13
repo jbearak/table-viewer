@@ -195,7 +195,25 @@ export interface WorkbookSnapshotCapabilities {
 /** Whether the host can restructure one axis of a worksheet, and why not. */
 export type StructuralAxisSupport =
     | { readonly supported: true }
-    | { readonly supported: false; readonly reason: string };
+    | {
+        readonly supported: false;
+        /** For Insert, Delete, and Restore. */
+        readonly reason: string;
+        /** For Move, when it reads differently ("Can't move rows on this sheet: ..."). */
+        readonly moveReason?: string;
+    };
+
+/**
+ * One `.xlsx` conditional-formatting element or data-validation rule with its
+ * formulas, as the writer splits it: the webview counts the split for the
+ * current layouts and warns before Save when it would pass the cap.
+ */
+export interface WorksheetRelativeRule {
+    readonly kind: 'conditionalFormatting' | 'dataValidation';
+    readonly sqref: string;
+    /** Without a leading `=`. */
+    readonly formulas: readonly string[];
+}
 
 export interface WorksheetStructuralSupport {
     readonly rows: StructuralAxisSupport;
@@ -206,6 +224,15 @@ export interface WorksheetStructuralSupport {
      * whenever either axis is supported.
      */
     readonly basis?: StructuralBasis;
+    /** `.xlsx`: merged ranges (A1), for the action-time merge rules. */
+    readonly merges?: readonly string[];
+    /**
+     * `.xlsx`: the worksheet AutoFilter, for the action-time filtered-column
+     * move rule. `filteredColumns` are 0-based worksheet columns.
+     */
+    readonly autoFilter?: { readonly ref: string; readonly filteredColumns: readonly number[] };
+    /** `.xlsx`: every conditional-formatting element and data-validation rule. */
+    readonly relativeRules?: readonly WorksheetRelativeRule[];
 }
 
 export interface StructuralEditingCapability {

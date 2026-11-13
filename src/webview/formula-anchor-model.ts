@@ -25,6 +25,7 @@ import {
     unrenderable_formula_reason,
     workbook_has_live_layout_change,
     type AnchorStructuralChanges,
+    type AnchorWorksheetInput,
     type FormulaAnchorWorkbook,
 } from '../formula-anchor-layout';
 import type {
@@ -75,7 +76,15 @@ export function webview_formula_workbook(
     sheets: readonly AnchorSheetMeta[],
     changes_for: (sheet_index: number) => AnchorStructuralChanges | undefined,
 ): FormulaAnchorWorkbook {
-    return formula_anchor_workbook(xlsx ? 'xlsx' : 'csv', sheets.map((sheet, sheetIndex) => {
+    return formula_anchor_workbook(xlsx ? 'xlsx' : 'csv', webview_anchor_inputs(sheets, changes_for));
+}
+
+/** Each worksheet as anchoring, rendering, and the rule split read it. */
+export function webview_anchor_inputs(
+    sheets: readonly AnchorSheetMeta[],
+    changes_for: (sheet_index: number) => AnchorStructuralChanges | undefined,
+): AnchorWorksheetInput[] {
+    return sheets.map((sheet, sheetIndex) => {
         const target: WorksheetTarget = {
             sheetIndex,
             sheetName: sheet.name,
@@ -90,7 +99,7 @@ export function webview_formula_workbook(
             sourceColumnCount: sheet.columnCount,
             ...(changes === undefined ? {} : { changes }),
         };
-    }));
+    });
 }
 
 export { unrenderable_formula_reason } from '../formula-anchor-layout';

@@ -445,6 +445,7 @@ describe('Structural Basis', () => {
             'csv',
             { digest: content_digest(old_bytes), byteLength: old_bytes.byteLength },
             source.meta().sheets[0]!,
+            0,
         )).toEqual(basis);
     });
 

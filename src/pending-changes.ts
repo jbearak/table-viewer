@@ -549,7 +549,15 @@ export interface PendingStructuralConflict {
         readonly rowIdentity: RowIdentity;
         readonly sourceColumn: number;
     }[];
+    /**
+     * Why an `unsupportedStructure` save was refused, in the user's words
+     * ("Can't save these row and column changes: ..."), for Review Changes.
+     */
+    readonly message?: string;
 }
+
+/** The longest conflict `message` the codecs accept; hosts truncate to it. */
+export const MAX_STRUCTURAL_CONFLICT_MESSAGE_LENGTH = 1024;
 
 export interface PendingStructuralChanges {
     readonly formatTemplates: readonly PendingRowFormatTemplate[];
@@ -1831,8 +1839,14 @@ export function own_pending_structural_changes(value: {
                 'pendingRowIds',
                 'tailRemovalIds',
                 'formulaCells',
+                'message',
             ])
             || !conflict_reasons.has(entry.reason as PendingStructuralConflictReason)
+            || (entry.message !== undefined && (
+                entry.reason !== 'unsupportedStructure'
+                || typeof entry.message !== 'string'
+                || entry.message.length === 0
+                || entry.message.length > MAX_STRUCTURAL_CONFLICT_MESSAGE_LENGTH))
             || !Array.isArray(entry.pendingRowIds)
             || !Array.isArray(entry.tailRemovalIds)
             || entry.pendingRowIds.length > MAX_PENDING_APPENDED_ROWS
@@ -1880,6 +1894,7 @@ export function own_pending_structural_changes(value: {
                     readonly sourceColumn: number;
                 }>),
             }),
+            ...(entry.message === undefined ? {} : { message: entry.message as string }),
         });
     });
 

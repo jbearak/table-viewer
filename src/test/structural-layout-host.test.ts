@@ -597,6 +597,24 @@ describe('history replay commit', () => {
         await viewer.dispose();
     });
 
+    it('keeps a basis change across a replayed cell edit while the layout change stands', async () => {
+        const conflict = { reason: 'structuralBasisChanged', pendingRowIds: [], tailRemovalIds: [] };
+        const viewer = await open_viewer({
+            initial: slot({
+                cells: { '0:0': { value: 'x', base: 'a' } },
+                rowLayout: REMOVAL_LAYOUT,
+                // A recorded basis the file no longer matches.
+                structuralBasis: { ...BASIS, digest: '0'.repeat(64) },
+            }),
+            structuralEditingEnabled: true,
+        });
+        expect(viewer.durable()?.conflicts).toEqual([conflict]);
+        expect(await replay(viewer, 'cell', { cells: [undo_cell(0, 'x', 'a')] })).toBe(true);
+        expect(viewer.durable()?.cells ?? {}).toEqual({});
+        expect(viewer.durable()?.conflicts).toEqual([conflict]);
+        await viewer.dispose();
+    });
+
     it('refuses a replayed layout while structural editing is disabled', async () => {
         const viewer = await open_viewer({ initial: slot({ cells: { '0:0': { value: 'x', base: 'a' } } }) });
         expect(viewer.session).toMatchObject({ granted: true });

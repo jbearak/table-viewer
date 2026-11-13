@@ -514,6 +514,8 @@ import {
     row_move_item_model,
     row_structure_label,
     row_structure_menu_model,
+    merge_ranges_of,
+    structure_auto_filter,
     type InsertItemModel,
     type MoveItemModel,
     type RowStructurePlan,
@@ -2350,8 +2352,13 @@ export function GridShell({
             return false;
         },
         // Canonical merges for the action-time merge rules; the grid's own
-        // `merges` prop is withheld under transforms and layout changes.
-        merges: sheet_meta.merges,
+        // `merges` prop is withheld under transforms and layout changes. An
+        // `.xlsx` worksheet's come from the host's structural support scan,
+        // the same reading of the file the save-time check uses.
+        merges: structural_support?.merges === undefined
+            ? sheet_meta.merges
+            : merge_ranges_of(structural_support.merges),
+        ...structure_auto_filter(structural_support?.autoFilter),
         ...(structural_support?.basis === undefined
             ? {}
             : { structuralBasis: structural_support.basis }),
@@ -2370,6 +2377,8 @@ export function GridShell({
         sheet_meta.worksheetId,
         store,
         structural_support?.basis,
+        structural_support?.merges,
+        structural_support?.autoFilter,
     ]);
     /**
      * The structure context for one action, with the Formula Anchor references

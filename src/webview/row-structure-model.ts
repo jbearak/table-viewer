@@ -19,6 +19,7 @@
 import {
     appended_rows,
     has_inserted_or_moved_rows,
+    has_live_layout_change,
     is_inserted_row,
     MAX_PENDING_APPENDED_ROWS,
     pending_rows,
@@ -27,8 +28,17 @@ import {
     type PendingStructuralChanges,
     type RowIdentity,
 } from '../pending-changes';
-import type { StructuralAxisSupport } from '../viewer-snapshot';
+import type { StructuralAxisSupport, WorksheetRelativeRule } from '../viewer-snapshot';
+import type { AnchorWorksheetInput } from '../formula-anchor-layout';
 import {
+    MAX_RULE_SPLIT,
+    parse_rule_sqref,
+    relative_rule_split_count,
+    rule_split_workbook,
+} from '../formula-rule-split';
+import type { MergeRange } from '../types';
+import {
+    has_live_column_layout_change,
     index_row_layout,
     insert_anchor_for_selection,
     source_row_layout,
@@ -42,6 +52,7 @@ import {
     APPENDED_BAND_MESSAGE,
     delete_rows,
     insert_rows,
+    MERGE_SPLIT_MESSAGE,
     move_rows,
     restore_rows,
     source_cells_removed_by,
@@ -338,7 +349,9 @@ export function row_move_block_refusal(
     input: Pick<RowStructureMenuInput, 'support' | 'ready' | 'selection' | 'changes' | 'context'>,
 ): string | undefined {
     const { selection, changes, context } = input;
-    const reason = shared_structure_reason(input)
+    // An `.xlsx` sheet the host can't restructure says so in Move's words.
+    const reason = (input.support.supported ? undefined : input.support.moveReason)
+        ?? shared_structure_reason(input)
         ?? (selection.fixedRows ? MOVE_FIXED_ROWS_MESSAGE : undefined)
         ?? (selection.tailRemovals ? STRUCTURE_TAIL_REMOVAL_MESSAGE : undefined)
         ?? (selection.identities === undefined ? ROWS_NOT_LOADED_MESSAGE : undefined)
@@ -347,12 +360,44 @@ export function row_move_block_refusal(
         // into the band moves nothing.
         ?? (selection.bandRows > 0 ? APPENDED_BAND_MESSAGE : undefined)
         ?? (context.bodyViewTransformed ? STRUCTURE_TRANSFORMED_MESSAGE : undefined)
-        ?? structure_exclusivity_message(changes, context);
+        ?? structure_exclusivity_message(changes, context)
+        ?? merge_split_refusal(changes, context, selection.identities!);
     if (reason !== undefined) return reason;
     const index = index_row_layout(row_layout_for(changes, context));
     return insert_anchor_for_selection(index, selection.identities!, 'before') === undefined
         ? MOVE_ONLY_REMOVED_ROWS_MESSAGE
         : undefined;
+}
+
+/**
+ * Moving part of a merge is refused whatever the destination, so the Move
+ * items and the drag refuse it before a target is chosen, with the store's
+ * own message (`move_rows` refuses the same block). A merge's part is the
+ * block's live source rows inside its row span, against all its live rows.
+ */
+function merge_split_refusal(
+    changes: PendingStructuralChanges,
+    context: WorksheetStructureContext,
+    identities: readonly RowIdentity[],
+): string | undefined {
+    const merges = context.merges ?? [];
+    if (merges.length === 0) return undefined;
+    const is_removed = removed_source_row_test(changes);
+    const moved = identities.flatMap((identity) =>
+        identity.kind === 'source' && !is_removed(identity.sourceRow) ? [identity.sourceRow] : []);
+    if (moved.length === 0) return undefined;
+    for (const merge of merges) {
+        if (merge.endRow <= merge.startRow) continue;
+        let inside = 0;
+        for (const row of moved) if (row >= merge.startRow && row <= merge.endRow) inside += 1;
+        if (inside === 0) continue;
+        let live = 0;
+        for (let row = merge.startRow; row <= merge.endRow && live <= inside; row += 1) {
+            if (!is_removed(row)) live += 1;
+        }
+        if (inside < live) return MERGE_SPLIT_MESSAGE;
+    }
+    return undefined;
 }
 
 /**
@@ -692,4 +737,99 @@ export function nearest_live_row(
         if (is_live(row)) return row;
     }
     return undefined;
+}
+
+/**
+ * The shipped `.xlsx` merges (A1 ranges) as the store's merge rules read them,
+ * in canonical source coordinates. A range the parser cannot read is left
+ * out: the host's support scan already refused the worksheet over it.
+ */
+export function merge_ranges_of(refs: readonly string[]): MergeRange[] {
+    return refs.flatMap((ref) => {
+        const cells = parse_rule_sqref(ref);
+        if (cells === undefined || cells.length !== 1) return [];
+        const [range] = cells;
+        return [{
+            startRow: range!.firstRow,
+            startCol: range!.firstColumn,
+            endRow: range!.lastRow,
+            endCol: range!.lastColumn,
+        }];
+    });
+}
+
+/** One `.xlsx` rule that Save would refuse to split. */
+export interface RuleSplitWarning {
+    readonly kind: WorksheetRelativeRule['kind'];
+    readonly sqref: string;
+}
+
+/**
+ * The conditional-formatting elements and data-validation rules on
+ * `sheet_index` that the current layouts would split into more than
+ * `MAX_RULE_SPLIT` rules, which Save refuses. Counted with the writer's own
+ * partition (`relative_rule_split_count`), per element, so the warning names
+ * exactly what Save would refuse. A rule the layouts cannot render at all is
+ * refused at Save with its own reason, so it is not repeated here.
+ */
+export function rule_split_warnings(
+    inputs: readonly AnchorWorksheetInput[],
+    sheet_index: number,
+    rules: readonly WorksheetRelativeRule[],
+): RuleSplitWarning[] {
+    if (rules.length === 0 || !inputs.some((input) =>
+        input.changes !== undefined && has_live_layout_change(input.changes))) return [];
+    const workbook = rule_split_workbook(inputs);
+    return rules.flatMap((rule) => {
+        if (rule.formulas.length === 0) return [];
+        const cells = parse_rule_sqref(rule.sqref);
+        if (cells === undefined) return [];
+        const split = relative_rule_split_count(workbook, {
+            worksheet: sheet_index,
+            cells,
+            formulas: rule.formulas,
+        });
+        return split.kind === 'count' && split.count > MAX_RULE_SPLIT
+            ? [Object.freeze({ kind: rule.kind, sqref: rule.sqref })]
+            : [];
+    });
+}
+
+/**
+ * "Moving these rows would split the conditional formatting on B2:B500 into
+ * more than 64 rules. Save will refuse it." The lead names the worksheet's
+ * gestures when they are of one kind. The split count stops at the cap, so
+ * the message says "more than" rather than a number.
+ */
+export function rule_split_warning_message(
+    warning: RuleSplitWarning,
+    changes: Pick<PendingStructuralChanges, 'rowLayout' | 'columnLayout' | 'appendedRows'>,
+): string {
+    const rows = changes.rowLayout === undefined ? undefined : index_row_layout(changes.rowLayout);
+    const columns_changed = changes.columnLayout !== undefined
+        && has_live_column_layout_change(changes.columnLayout);
+    const moved = rows?.hasOutOfOrderRun === true;
+    const inserted = rows?.hasLiveInserted === true;
+    const deleted = (changes.rowLayout?.removedSourceRows.length ?? 0) > 0;
+    const lead = columns_changed || [moved, inserted, deleted].filter(Boolean).length !== 1
+        ? 'These row and column changes'
+        : moved ? 'Moving these rows' : inserted ? 'Inserting these rows' : 'Deleting these rows';
+    const what = warning.kind === 'conditionalFormatting' ? 'conditional formatting' : 'data validation';
+    return `${lead} would split the ${what} on ${warning.sqref} into more than ${MAX_RULE_SPLIT} rules. Save will refuse it.`;
+}
+
+/** The shipped AutoFilter as the store's filtered-column move rule reads it, or nothing. */
+export function structure_auto_filter(
+    auto_filter: { readonly ref: string; readonly filteredColumns: readonly number[] } | undefined,
+): { readonly autoFilter?: NonNullable<WorksheetStructureContext['autoFilter']> } {
+    if (auto_filter === undefined || auto_filter.filteredColumns.length === 0) return {};
+    const cells = parse_rule_sqref(auto_filter.ref);
+    if (cells === undefined || cells.length !== 1) return {};
+    return {
+        autoFilter: Object.freeze({
+            firstColumn: cells[0]!.firstColumn,
+            lastColumn: cells[0]!.lastColumn,
+            filteredColumns: Object.freeze([...auto_filter.filteredColumns]),
+        }),
+    };
 }
