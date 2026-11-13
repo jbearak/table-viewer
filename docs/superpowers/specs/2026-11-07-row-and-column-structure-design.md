@@ -1070,18 +1070,21 @@ Two reference semantics apply, chosen per structure:
 | `<rowBreaks>` / `<colBreaks>` | cell-set | shift; breaks on removed rows dropped | same |
 | `<ignoredErrors>` `sqref` | cell-set | shift; empty entries dropped | same |
 | Cell formulas, every worksheet | interval | render | render |
-| Shared formula groups | — | a group whose cells all shift together, keeping their relative positions, and whose rendered master text is unchanged gets its master's `ref` re-rendered by cell-set semantics; unshare any other affected group, writing each follower's formula explicitly | same |
-| `<definedNames>`, including `_xlnm.Print_Area`, `_xlnm.Print_Titles`, `_xlnm._FilterDatabase` | interval | render | render |
+| Shared formula groups | — | a group whose cells all shift together, keeping their relative positions, and none of whose formulas, master or follower, would change when rendered gets its master's `ref` re-rendered by cell-set semantics; unshare any other affected group, writing each follower's formula explicitly | same |
+| `<definedNames>`, including `_xlnm.Print_Area`, `_xlnm.Print_Titles`, `_xlnm._FilterDatabase` | interval | render; a workbook-scoped name with a reference that names no worksheet is refused, since it could mean any sheet | render |
 | `calcChain.xml` | — | remove (existing path) | same |
-| Formula caches | — | invalidate (existing path) | same |
+| Formula caches | — | invalidate (existing path), per worksheet: see below | same |
 
 **Anchor-relative formulas.** Conditional-formatting and data-validation
 formulas are relative to the top-left cell of their `sqref`: each covered cell
 evaluates the formula shifted by its offset from that cell. One rewritten rule
 cannot always preserve that for every cell after a move. For `sqref="A1:A2"`
-with formula `B1`, moving row 1 below row 2 makes the old A1 cell refer to the
-old B1 from row 2 and the old A2 cell refer to the old B2 from row 1, so no
-single relative formula covers both.
+with formula `Other!B1`, moving row 1 below row 2 makes the cell now in row 1
+(the old A2) refer to `Other!B2` and the cell now in row 2 refer to
+`Other!B1`, so no single relative formula covers both. The same happens for a
+same-sheet reference to a row the move does not carry. A whole-row move
+carries a same-row reference along with its cell: with formula `B1`, each moved
+cell still names the B cell on its own row, so the rule stays one rule.
 
 The writer therefore splits rules by meaning:
 
@@ -1106,6 +1109,15 @@ The writer therefore splits rules by meaning:
    the referenced worksheet's layout shifted back by *d*. A rule over a whole
    column of unchanged rows is one piece. The writer and the webview's split
    count use the same partition function.
+
+The base cell is the top-left of the bounding box of the whole
+`conditionalFormatting` element's or `dataValidation`'s `sqref`. The formulas of
+every `cfRule` in one element split together, because they share one `sqref`,
+so the split count is per element; the structural support's `relativeRules`
+must group its entries by element for the webview to count what the writer
+splits. Relative references wrap around the sheet edge, as Excel evaluates
+them, so a whole-column rule such as `A2<>A1` keeps one formula on its last
+row.
 
 Any operation can split a rule, including an insertion or deletion between a
 covered cell and the cell its relative reference names. For `sqref="A1:A5"`
@@ -1144,6 +1156,11 @@ check.
 **Unsharing** is capped. If unsharing would write more than 1,000,000 follower
 formulas or more than 64 MiB of formula text in one save, the save is refused
 with an `unsupportedStructure` conflict naming the worksheet.
+
+**Formula caches** are invalidated per worksheet: every formula cell on a
+worksheet with a live layout change and, repeated until nothing is added, on
+any worksheet with a formula that may read one of those, directly, through a
+defined name, or through `INDIRECT`.
 
 ### Physical write
 
@@ -1674,8 +1691,9 @@ release can restructure a workbook even with the flag on.
 - Tombstone gluing under every operation, including insert at the start of
   the layout, delete then restore, one-step moves past glued tombstones, and
   drops between a live row and its glued tombstones.
-- CF/DV split pieces: the insertion example above, moves through a rule, and
-  the piece-count bound.
+- CF/DV split pieces: the insertion and deletion examples above, a move that
+  splits a rule naming another sheet and one that keeps a same-row rule whole,
+  wrapping whole-column rules, and the piece-count bound.
 
 ### Model
 
