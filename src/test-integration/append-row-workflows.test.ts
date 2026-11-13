@@ -10,11 +10,12 @@ import {
     close_all_editors,
     fixture_uri,
     has_custom_tab,
-    integration_api,
+    open_session,
     wait_for,
+    wait_for_latest_snapshot_ack,
+    wait_for_message,
+    type SnapshotMessage,
 } from './helpers';
-
-type SnapshotMessage = Extract<HostMessage, { type: 'workbookSnapshot' }>;
 
 function run_git(directory: string, args: readonly string[]): void {
     execFileSync('git', [...args], {
@@ -28,61 +29,6 @@ function run_git(directory: string, args: readonly string[]): void {
         },
         stdio: 'pipe',
     });
-}
-
-async function wait_for_message<T extends HostMessage>(
-    session: TableViewerIntegrationSession,
-    predicate: (message: HostMessage) => message is T,
-    description: string,
-): Promise<T> {
-    let found: T | undefined;
-    const observed = await wait_for(() => {
-        found = [...session.messages()].reverse().find(predicate);
-        return found !== undefined;
-    }, 20_000, 20);
-    assert.ok(observed && found, `timed out waiting for ${description}`);
-    return found;
-}
-
-async function wait_for_latest_snapshot_ack(
-    session: TableViewerIntegrationSession,
-): Promise<SnapshotMessage> {
-    let latest: SnapshotMessage | undefined;
-    const acknowledged = await wait_for(() => {
-        latest = session.messages().filter(
-            (message): message is SnapshotMessage => message.type === 'workbookSnapshot',
-        ).at(-1);
-        return latest !== undefined && session.receivedMessages().some((message) =>
-            message.type === 'snapshotApplied'
-            && message.identity.deliveryId === latest?.snapshot.identity.deliveryId);
-    }, 20_000, 20);
-    assert.ok(acknowledged && latest, 'the real webview must acknowledge the latest snapshot');
-    return latest;
-}
-
-async function open_session(uri: vscode.Uri): Promise<{
-    session: TableViewerIntegrationSession;
-    initial: SnapshotMessage;
-}> {
-    const api = await integration_api();
-    await vscode.commands.executeCommand('vscode.openWith', uri, 'tableViewer.editor');
-    assert.ok(
-        await wait_for(() => has_custom_tab('tableViewer.editor'), 20_000, 20),
-        `expected a custom editor for ${path.basename(uri.fsPath)}`,
-    );
-    let session: TableViewerIntegrationSession | undefined;
-    assert.ok(await wait_for(() => {
-        session = api.integrationSession(uri);
-        return session !== undefined;
-    }, 20_000, 20), `expected an integration session for ${uri.fsPath}`);
-    const initial = await wait_for_message(
-        session!,
-        (message): message is SnapshotMessage => message.type === 'workbookSnapshot'
-            && message.snapshot.presentation === 'initial',
-        'the initial workbook snapshot',
-    );
-    await wait_for_latest_snapshot_ack(session!);
-    return { session: session!, initial };
 }
 
 async function append_blank_row_and_save(

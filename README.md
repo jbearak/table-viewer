@@ -70,7 +70,7 @@ It also removes other friction from reading tables:
 - **Diffing a spreadsheet in Git shows you a wall of text.** Click a changed `.xlsx`, `.xls`, `.csv`, `.tsv`, `.dta`, or `.parquet` file in VS Code's Source Control or Timeline view and Table Viewer opens the comparison as a table: added and deleted rows banded, changed cells showing before and after in place. The desktop app also compares any two files.
 - **Comparing a Git LFS file shows you the pointer, not the table.** An LFS-tracked file is stored in Git as a small pointer naming the real object, so the version you want to compare against is often not on your machine at all. Table Viewer recognizes the pointer on either side of a comparison and offers to download the object.
 
-**Limitations:** Table Viewer is *not* a full spreadsheet editor. You can't create files or sheets, insert rows in the middle, or add columns. Edit mode can append rows to `.xlsx`, CSV, and TSV worksheets. Formula editing and recalculation intentionally support a documented subset of Excel; see [Excel formula support](docs/excel-formulas.md).
+**Limitations:** Table Viewer is *not* a full spreadsheet editor. You can't create files or sheets. Edit mode can insert, delete, and move rows and columns in `.xlsx`, CSV, and TSV worksheets, but an `.xlsx` sheet with an Excel table, a chart, notes, a PivotTable, or an array formula can't be restructured; see [Inserting, deleting, and moving rows and columns](docs/rows-and-columns.md). Formula editing and recalculation intentionally support a documented subset of Excel; see [Excel formula support](docs/excel-formulas.md).
 
 ## Features
 
@@ -134,9 +134,9 @@ It also removes other friction from reading tables:
 
 **Undo and redo**
 - `Ctrl+Z` / `Cmd+Z` undoes your last change; `Ctrl+Y` or `Cmd+Shift+Z` redoes it. In the desktop app the **Edit** menu carries both, named after what they would apply — "Undo Paste", "Redo Clear all highlights" — and greyed out when there is nothing left
-- Covers cell edits (values, line breaks, styling, hyperlinks), cell highlights, and discards. A discarded edit session can be undone in full
+- Covers cell edits (values, line breaks, styling, hyperlinks), inserted, deleted, and moved rows and columns, cell highlights, and discards. A discarded edit session can be undone in full
 - One history per workbook, in the order you worked: undoing a change on another worksheet switches to it. The cursor moves to what changed and the region flashes briefly, so an undo you cannot see is still findable
-- Undo reaches back past a save. Doing so re-enters edit mode if you had left it, and re-saves are yours to make; undo never exits edit mode or discards an open session
+- Undo reaches back past a save, except a save that inserted, deleted, or moved rows or columns. Doing so re-enters edit mode if you had left it, and re-saves are yours to make; undo never exits edit mode or discards an open session
 - If a change is hidden by an active filter or a hidden column, it is still applied and you are told where it went rather than left watching a still cursor
 - Sorts, filters, and column visibility are not part of history — they are view state, with their own toolbar chips and **Columns** menu for undoing them
 - `Ctrl+Z` / `Cmd+Z` **inside** an open cell editor is ordinary text undo for what you are typing, and does not touch the workbook's history
@@ -165,14 +165,15 @@ It also removes other friction from reading tables:
 - Double-click a cell, press **Enter**, or choose **Edit cell** from the right-click menu to edit its value
 - Use the sticky **Append row** at the bottom of the grid to add a row. Pasting a block there adds the whole block's row count as one undoable change
 - **Enter** confirms and moves to the cell below. When there is no next row, it appends one and continues in the same column. **Tab** moves row-major and appends from the final visible column of the final row
-- Pending rows keep their intended physical row numbers and use the existing added-row tint. Right-click a pending row number to remove it; right-click a pending removal to cancel it
+- Pending rows keep their intended physical row numbers and use the existing added-row tint. Right-click a pending row number and choose **Delete row** to remove it; right-click a pending removal to cancel it
+- Right-click a row number or column header to insert, delete, restore, or move rows and columns. `Alt+Shift+Arrow` moves selected rows or columns, and you can drag selected rows or column headers. New rows and columns are tinted green, deleted ones red, and moved ones purple until you save. Details, including what an `.xlsx` sheet must not contain, are in [Inserting, deleting, and moving rows and columns](docs/rows-and-columns.md)
 - Active sorts and filters leave pending rows in a separate section at the end. **Hide row** remains visible for those rows but is disabled
 - **Shift+Enter** or **Alt+Enter** inserts a line break within a cell
 - **Escape** cancels the current edit
 - **Ctrl+S** / **Cmd+S** saves all changes back to the file
 - Edit `.xlsx` cell styling with Markdown syntax: `**bold**`, `*italic*`, `<u>underline</u>`, and `~~strikethrough~~`
 - Add, edit, or remove `.xlsx` hyperlinks to a web address or a place in the workbook from the cell context menu
-- An `.xlsx` append adds worksheet rows. It does not enlarge an OOXML Excel Table region
+- An `.xlsx` append adds worksheet rows. It does not enlarge an OOXML Excel Table region. Inserting, deleting, and moving rows and columns is refused on a sheet with an Excel table
 - Edited cells are highlighted with a different background color until saved
 - Rows keep their position for the whole edit session, so a cell stays under your cursor while you work on it. You can enter edit mode with a sort or filter already applied, and add or change one while editing; neither moves the rows you are working on. A row you edit so that it no longer matches an active filter stays visible until you save; the view reflects your new values once the file is saved and reloaded
 - When exiting edit mode with unsaved changes, you're prompted to save or discard
