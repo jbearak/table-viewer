@@ -8898,6 +8898,96 @@ describe('row Insert in the row-gutter menu', () => {
         ]);
     });
 
+    const keep_at_end = async (pending: ReturnType<typeof create_pending_row_store>) => {
+        const kept = keep_inserted_rows_at_end(pending.snapshot(), {
+            worksheet: { sheetIndex: 0 },
+            bodyStart: 0,
+            sourceRowCount: 4,
+            sourceColumnCount: 3,
+            bodyViewTransformed: false,
+        });
+        if (!kept.ok) throw new Error(kept.refusal.message);
+        await act(async () => { pending.apply_structure('session', kept.outcome); });
+    };
+    const selected_rows = () => {
+        const rows = (grid_mock.props!.gridSelection as { rows: { toArray(): number[] } }).rows;
+        return rows.toArray();
+    };
+
+    it('keeps an inline inserted row selected through "Keep new rows at the end"', async () => {
+        const { pending } = await insert_after_first();
+        const on_selection_change = grid_mock.props!.onGridSelectionChange as (selection: unknown) => void;
+        // Display rows 0 (source 0), 1 (inserted), 2 (source 1).
+        // Let the insert's focus move land first, so it does not replace this selection.
+        await vi.waitFor(() => expect((grid_mock.props!.gridSelection as {
+            current?: { cell: [number, number] };
+        }).current?.cell).toEqual([0, 1]));
+        await act(async () => on_selection_change({ columns: compact([]), rows: compact([0, 1, 2]) }));
+        expect(selected_rows()).toEqual([0, 1, 2]);
+        await keep_at_end(pending);
+        // Source rows 0 and 1 are now display rows 0 and 1; the row moved to
+        // the band's end, display row 4, and stays selected. As for a row that
+        // moves into a band today, the remapped selection spans its rows.
+        await vi.waitFor(() => expect(selected_rows()).toEqual([0, 1, 2, 3, 4]));
+    });
+
+    it('highlights an inserted row selected with the source row above it', async () => {
+        const highlight_ref: { current: HighlightSelectionHandle | null } = { current: null };
+        const on_highlight_selection = vi.fn();
+        const { pending } = await insert_after_first({ highlight_ref, on_highlight_selection });
+        const on_selection_change = grid_mock.props!.onGridSelectionChange as (selection: unknown) => void;
+        await act(async () => on_selection_change({
+            columns: compact([]),
+            rows: compact([]),
+            current: { cell: [0, 0], range: { x: 0, y: 0, width: 1, height: 2 }, rangeStack: [] },
+        }));
+        expect(highlight_ref.current?.apply('yellow')).toBe(true);
+        const call = on_highlight_selection.mock.calls[0]!;
+        expect(call[0]).toEqual({ displayRows: [{ start: 0, end: 0 }], sourceColumns: [0] });
+        const pending_gesture = call[2];
+        expect(pending_gesture).toBeDefined();
+        expect(pending_gesture.commit([], 'Highlight cells')).toBe(true);
+        expect(pending.snapshot().appendedRows[0]?.highlights).toEqual({ 0: 'yellow' });
+    });
+
+    it('offers Clear highlight for a highlighted inserted row', async () => {
+        const { pending } = await insert_after_first();
+        const inserted = pending.snapshot();
+        await act(async () => {
+            pending.stage_replace('session', inserted, {
+                ...inserted,
+                appendedRows: inserted.appendedRows.map((row) => ({ ...row, highlights: { 0: 'pink' } })),
+            })?.commit();
+        });
+        const on_selection_change = grid_mock.props!.onGridSelectionChange as (selection: unknown) => void;
+        await act(async () => on_selection_change({
+            columns: compact([]),
+            rows: compact([]),
+            current: { cell: [0, 1], range: { x: 0, y: 1, width: 1, height: 1 }, rangeStack: [] },
+        }));
+        const on_cell_context_menu = grid_mock.props!.onCellContextMenu as
+            (cell: [number, number], event: Record<string, unknown>) => void;
+        await act(async () => on_cell_context_menu([0, 1], {
+            preventDefault: vi.fn(),
+            bounds: { x: 40, y: 60, width: 100, height: 24 },
+            localEventX: 10,
+            localEventY: 10,
+        }));
+        expect(menu_button_labels()).toContain('Clear highlight');
+    });
+
+    it('repaints an inline inserted row whose physical row a changed key names', async () => {
+        await insert_after_first({ edit_session: create_edit_session_store({ session_id: 'session' }) });
+        grid_mock.update_cells.mockClear();
+        const on_cells_edited = grid_mock.props!.onCellsEdited as (items: readonly unknown[]) => unknown;
+        // Source row 1 (display row 2) is edited; the inserted row now sits at
+        // physical row 1 (display row 1), whose formula results key the same way.
+        await act(async () => on_cells_edited([{ location: [0, 2], value: { kind: 'text', data: 'x' } }]));
+        const damaged = grid_mock.update_cells.mock.calls.flatMap(([cells]) =>
+            (cells as { cell: [number, number] }[]).map(({ cell }) => cell.join(',')));
+        expect(damaged).toContain('0,1');
+    });
+
     it('cancels an insert whose anchor was removed while the request was out', async () => {
         const pending = create_pending_row_store({ session_id: 'session' });
         const host = admission(['ins-a']);

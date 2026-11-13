@@ -694,6 +694,13 @@ function selection_identity_bounds(
         const identity = projected_selection_row_identity(projection, row);
         if (identity !== undefined) interior.push(identity);
     }
+    // Pending Inserted Rows sit inline in layout mode, before the bands the
+    // loop above scans; capture the ones inside the range by identity too, so
+    // a topology change (such as "Keep new rows at the end") keeps them selected.
+    for (const row of projection.inline_pending_display_rows(start + 1, end - 1)) {
+        const identity = projected_selection_row_identity(projection, row);
+        if (identity !== undefined) interior.push(identity);
+    }
     // A saved source row can enter the bounded deletion band only AFTER the
     // topology mutation. Capture just those incoming removal identities while
     // they still live in the old source band; scanning the whole selected source
@@ -2104,6 +2111,14 @@ export function GridShell({
                 rows.set(projected.intendedPhysicalRow, display_row);
             }
         }
+        // Pending Inserted Rows, inline in layout mode.
+        for (const display_row of pending_projection.inline_pending_display_rows(
+            0,
+            pending_projection.pendingBandStart - 1,
+        )) {
+            const projected = pending_projection.row_at(display_row);
+            if (projected?.kind === 'pending') rows.set(projected.intendedPhysicalRow, display_row);
+        }
         return rows;
     }, [pending_projection]);
     const pending_template_formats = useMemo(() => new Map(
@@ -2224,20 +2239,11 @@ export function GridShell({
             }
         }
         // In layout mode Pending Inserted Rows sit among the source rows,
-        // before the band, where the source arm above skips them. There are at
-        // most 10,000, so find each by identity rather than walking the
-        // (possibly million-row) selected intervals.
-        if (projection.layoutMode) {
-            for (const row of stored_pending_rows(pending_store.snapshot())) {
-                if (!is_inserted_row(row)) continue;
-                const display_row = projection.display_row_for_identity({
-                    kind: 'pending',
-                    pendingRowId: row.id,
-                });
-                if (display_row !== undefined && intervals.some((interval) =>
-                    display_row >= interval.start && display_row <= interval.end)) {
-                    pending_ids.add(row.id);
-                }
+        // before the band, where the source arm above skips them.
+        for (const interval of intervals) {
+            for (const row of projection.inline_pending_display_rows(interval.start, interval.end)) {
+                const projected = projection.row_at(row);
+                if (projected?.kind === 'pending') pending_ids.add(projected.row.id);
             }
         }
         const source_intervals = projection.source_display_intervals(
@@ -3118,6 +3124,11 @@ export function GridShell({
                     pending_ids.add(projected.row.id);
                 }
             }
+            // Pending Inserted Rows, inline in layout mode.
+            for (const row of pending_projection.inline_pending_display_rows(interval.start, interval.end)) {
+                const projected = pending_projection.row_at(row);
+                if (projected?.kind === 'pending') pending_ids.add(projected.row.id);
+            }
         }
         set_context_menu({
             kind: 'row',
@@ -3218,6 +3229,12 @@ export function GridShell({
                 if (projected?.kind === 'pending' || projected?.kind === 'replacement') {
                     pending_ids.add(projected.row.id);
                 }
+            }
+            // Pending Inserted Rows, inline in layout mode, where the source
+            // arm above skips them.
+            for (const row of pending_projection.inline_pending_display_rows(interval.start, interval.end)) {
+                const projected = pending_projection.row_at(row);
+                if (projected?.kind === 'pending') pending_ids.add(projected.row.id);
             }
         }
         const source_intervals = pending_projection.source_display_intervals(
@@ -9075,7 +9092,7 @@ export function GridShell({
                     const projected = pending_projection.row_at(candidate);
                     if (projected !== undefined && projected.kind !== 'source') return true;
                 }
-                return false;
+                return pending_projection.inline_pending_display_rows(interval.start, interval.end).length > 0;
             });
         const highlight_selection = current_highlight_selection();
         const pending_selection_has_highlight = highlight_selection?.displayRows.some(
@@ -9093,7 +9110,14 @@ export function GridShell({
                         )
                     ) return true;
                 }
-                return false;
+                return pending_projection.inline_pending_display_rows(interval.start, interval.end)
+                    .some((candidate) => {
+                        const projected = pending_projection.row_at(candidate);
+                        return projected?.kind === 'pending'
+                            && highlight_selection.sourceColumns.some(
+                                (column) => projected.row.highlights?.[column] !== undefined,
+                            );
+                    });
             },
         ) === true;
         const highlight_cell_count = highlight_selection

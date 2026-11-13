@@ -89,6 +89,12 @@ export interface PendingRowProjection {
     /** Compress one host/source-display coordinate into the current source band. */
     display_row_for_source_display(source_display_row: number): number | undefined;
     display_row_for_tail_removal_id(append_history_id: string): number | undefined;
+    /**
+     * Display rows of the live Pending Inserted Rows in `[start, end]`,
+     * ascending. In layout mode these sit inline, before `deletedBandStart`,
+     * where a scan of the bands does not reach; the band mode has none.
+     */
+    inline_pending_display_rows(start: number, end: number): readonly number[];
     /** Expand compressed source-band intervals back into host display space. */
     source_display_intervals(
         intervals: readonly { readonly start: number; readonly end: number }[],
@@ -358,6 +364,7 @@ function create_band_row_projection(
                 ? filtered_source_display_row(source_display_row)
                 : undefined
         ),
+        inline_pending_display_rows: () => [],
         display_row_for_tail_removal_id: (append_history_id: string): number | undefined => {
             const deleted_index = deleted_index_by_removal_id.get(append_history_id);
             if (deleted_index !== undefined) return deletedBandStart + deleted_index;
@@ -404,6 +411,9 @@ function create_layout_row_projection(
     const pending_by_id = new Map(pending_rows(input.changes).map((row) => [row.id, row]));
     const band_index_by_id = new Map(band.map((row, band_index) => [row.id, band_index]));
     const displayed = index.segments.filter((segment) => segment.status !== 'discarded');
+    // At most 10,000 inserted rows: their display rows, ascending.
+    const inline_pending: number[] = displayed.flatMap((segment) =>
+        segment.kind === 'pending' ? [fixed_count + segment.displayBefore] : []);
 
     const is_moved = (source_row: number): boolean => {
         let low = 0;
@@ -518,6 +528,20 @@ function create_layout_row_projection(
             return display_index === undefined ? undefined : fixed_count + display_index;
         },
         display_row_for_tail_removal_id: () => undefined,
+        inline_pending_display_rows: (start, end) => {
+            let low = 0;
+            let high = inline_pending.length;
+            while (low < high) {
+                const middle = (low + high) >>> 1;
+                if (inline_pending[middle]! < start) low = middle + 1;
+                else high = middle;
+            }
+            const rows: number[] = [];
+            for (let at = low; at < inline_pending.length && inline_pending[at]! <= end; at++) {
+                rows.push(inline_pending[at]!);
+            }
+            return rows;
+        },
         source_display_intervals: (intervals) => {
             const out: { start: number; end: number }[] = [];
             for (const interval of intervals) {

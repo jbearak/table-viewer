@@ -349,6 +349,34 @@ describe('projecting inserted rows', () => {
         expect(has_inserted_rows(changes)).toBe(true);
         expect(has_inserted_rows(EMPTY)).toBe(false);
     });
+
+    it('lists the inline inserted rows in a display range, which the band scans miss', () => {
+        let changes = insert(EMPTY, source(3), 'before', ['a', 'b']).outcome.next;
+        changes = insert(changes, source(7), 'after', ['c'], 200).outcome.next;
+        const projection = create_pending_row_projection({
+            sourceDisplayRowCount: 10,
+            sourceRowAt: (row) => row,
+            displayRowForSource: (row) => row,
+            sourceRowCount: 10,
+            changes,
+            bodyViewTransformed: false,
+        });
+        // Display: rows 0-2, a (3), b (4), rows 3-7 (5-9), c (10), rows 8-9.
+        expect(projection.deletedBandStart).toBe(13);
+        expect(projection.inline_pending_display_rows(0, 12)).toEqual([3, 4, 10]);
+        expect(projection.inline_pending_display_rows(4, 9)).toEqual([4]);
+        expect(projection.inline_pending_display_rows(11, 12)).toEqual([]);
+        // The band mode (a transformed view) has none.
+        const band = create_pending_row_projection({
+            sourceDisplayRowCount: 10,
+            sourceRowAt: (row) => row,
+            displayRowForSource: (row) => row,
+            sourceRowCount: 10,
+            changes: EMPTY,
+            bodyViewTransformed: true,
+        });
+        expect(band.inline_pending_display_rows(0, 9)).toEqual([]);
+    });
 });
 
 describe('Keep new rows at the end', () => {
