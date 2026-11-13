@@ -7687,9 +7687,15 @@ export function GridShell({
             let displayed_row: (RenderedCell | null)[] | undefined;
             for (const source_column of selection.source_columns) {
                 const key = cell_key(source_row, source_column);
+                const entry = dirty.get(key);
+                // A pending formula copies as it renders for the current layouts.
                 const displayed_value = live?.kind === 'source' && live.key === key
                     ? live.value
-                    : dirty.get(key)?.value;
+                    : entry !== undefined
+                        && edit_syntax === 'markdown'
+                        && xlsx_edit_writes_formula(entry.value, entry.valueRuns?.runs)
+                        ? formula_text_for(entry.value, entry.formulaAnchors, entry.valueEditOrder ?? 0)
+                        : entry?.value;
                 if (displayed_value === undefined) continue;
                 displayed_row ??= [...source_cells];
                 const source_cell = source_cells[source_column];
@@ -7728,7 +7734,9 @@ export function GridShell({
     }, [
         columns,
         display_column_for_source,
+        edit_syntax,
         effective_column_names,
+        formula_text_for,
         get_source_row,
         merge_index,
         pending_projection,

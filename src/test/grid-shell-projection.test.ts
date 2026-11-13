@@ -20,6 +20,8 @@ import {
 } from '../webview/edit-session-store';
 import { create_history_store, type HistoryStore } from '../webview/history-store';
 import { peek_history } from '../webview/history-stack-model';
+import { webview_formula_workbook } from '../webview/formula-anchor-model';
+import { EMPTY_PENDING_STRUCTURAL_CHANGES } from '../pending-changes';
 import { create_pending_row_store } from '../webview/pending-row-store';
 import {
     LAST_COLUMN_RESIZE_GUTTER_PX,
@@ -3326,6 +3328,50 @@ describe('GridShell column projection', () => {
             type: 'showWarning',
             message: expect.stringMatching(/loaded range/),
         });
+    });
+
+    it('copies a pending formula as its anchors render, not its stored text', async () => {
+        const write_text = vi.fn(async () => {});
+        Object.defineProperty(navigator, 'clipboard', {
+            configurable: true,
+            value: { writeText: write_text },
+        });
+        const sheet_meta = props().sheet_meta;
+        // `=A3` was written while appended rows a1 (row 2) and a2 (row 3) were
+        // pending, anchored to a2; a1 has since been discarded, so a2 is row 2.
+        const formula_anchor_workbook = webview_formula_workbook(true, [sheet_meta], () => ({
+            ...EMPTY_PENDING_STRUCTURAL_CHANGES,
+            appendedRows: [{ id: 'a2', cells: {}, formatTemplateId: 't', createdOrder: 2 }],
+        }));
+        await render_grid(props({
+            edit_mode: true,
+            csv_editable: true,
+            edit_syntax: 'markdown',
+            formula_anchor_workbook,
+            initial_edits: { '0:2': {
+                value: '=A3',
+                base: 'source-c',
+                formulaAnchors: { references: [{
+                    start: 1,
+                    end: 3,
+                    corners: [{
+                        row: { kind: 'identity', row: { kind: 'pending', pendingRowId: 'a2' } },
+                        column: { kind: 'identity', column: { kind: 'source', sourceColumn: 0 } },
+                    }],
+                }] },
+            } },
+        }));
+        const on_cell_context_menu = grid_mock.props!.onCellContextMenu as
+            (cell: [number, number], event: Record<string, unknown>) => void;
+        await act(async () => on_cell_context_menu([1, 0], {
+            preventDefault: vi.fn(),
+            bounds: { x: 100, y: 36, width: 100, height: 24 },
+            localEventX: 10,
+            localEventY: 10,
+        }));
+        await act(async () => Array.from(document.querySelectorAll('button'))
+            .find((button) => button.textContent === 'Copy cell')!.click());
+        expect(write_text).toHaveBeenCalledWith('=A2');
     });
 
     it('guards keyboard header copy with projected source order and headers', async () => {
