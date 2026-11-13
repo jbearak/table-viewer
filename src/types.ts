@@ -78,6 +78,7 @@ import type {
 import type {
     FormulaCalculationAddress,
     FormulaCalculationEdit,
+    FormulaCalculationLayout,
     FormulaCalculationResult,
 } from './formula-calculation';
 
@@ -3599,6 +3600,8 @@ export type WebviewMessage =
         targets: readonly FormulaCalculationAddress[];
         prospectiveRowCounts?: readonly number[];
         removedRows?: readonly { readonly sheetIndex: number; readonly row: number }[];
+        /** One per worksheet; when present, every address is prospective. */
+        layouts?: readonly FormulaCalculationLayout[];
     }
     | { type: 'cancelFormulaCalculation'; requestId: string; sourceGeneration: number }
     | { type: 'stateChanged'; state: PerFileState; sourceGeneration: number; snapshotIdentity: WorkbookSnapshotIdentity }

@@ -41,6 +41,7 @@ import type {
     FormulaAnchors,
 } from './formula-anchors';
 import type { WorksheetTarget } from './types';
+import type { FormulaReferenceIssue } from './xlsx-formula';
 
 // --- Axis views --------------------------------------------------------------
 
@@ -323,3 +324,29 @@ export function prospective_row_count(worksheet: AnchorWorksheet): number {
 export function prospective_column_count(worksheet: AnchorWorksheet): number {
     return worksheet.columns.liveCount;
 }
+
+// --- Unrenderable formulas -----------------------------------------------------
+
+/** Why a formula cannot be rendered for the current layouts: an Unknown formula result's reason. */
+export type UnrenderableFormulaReason =
+    | "can't adjust a range built from a function"
+    | "can't adjust a range across worksheets"
+    | "can't adjust a 3D reference"
+    | "can't adjust a spill reference"
+    | "can't adjust an R1C1 reference";
+
+const UNRENDERABLE_REASONS: Readonly<Record<FormulaReferenceIssue['kind'], UnrenderableFormulaReason>> = {
+    rangeOperand: "can't adjust a range built from a function",
+    mixedSheets: "can't adjust a range across worksheets",
+    threeDimensional: "can't adjust a 3D reference",
+    spill: "can't adjust a spill reference",
+    r1c1: "can't adjust an R1C1 reference",
+};
+
+/** The reason an `unrenderable` formula shows, for its `??` result and the editor refusal. */
+export function unrenderable_formula_reason(issue: FormulaReferenceIssue): UnrenderableFormulaReason {
+    return UNRENDERABLE_REASONS[issue.kind];
+}
+
+export const UNRENDERABLE_FORMULA_REASONS: readonly UnrenderableFormulaReason[] =
+    Object.freeze(Object.values(UNRENDERABLE_REASONS));

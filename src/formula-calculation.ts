@@ -17,6 +17,31 @@ import {
 } from './xlsx-cell-value';
 import type { RichTextRun } from './cell-content';
 import { cell_whole_style } from './cell-edit-model';
+import {
+    formula_anchor_context,
+    formula_anchor_workbook,
+    prospective_column_count,
+    prospective_row_count,
+    unrenderable_formula_reason,
+    type FormulaAnchorWorkbook,
+    type UnrenderableFormulaReason,
+} from './formula-anchor-layout';
+import { render_formula, type FormulaAnchors } from './formula-anchors';
+import {
+    MAX_PENDING_APPENDED_ROWS,
+    MAX_PENDING_ROW_ID_LENGTH,
+    own_column_layout,
+    own_formula_anchors,
+    own_row_layout,
+    type PendingRowId,
+} from './pending-changes';
+import {
+    validate_column_layout,
+    validate_row_layout,
+    type ColumnLayout,
+    type RowLayout,
+} from './worksheet-layout';
+import { is_plain_record } from './plain-record';
 
 const MAX_RANGE_CELLS_PER_READ = 8_192;
 const MAX_RANGE_COLUMNS_PER_READ = 256;
@@ -40,6 +65,122 @@ export interface FormulaCalculationEdit extends FormulaCalculationAddress {
     /** Exact classification chosen by the eventual XLSX writer. */
     readonly writesFormula: boolean;
     readonly runs?: readonly RichTextRun[];
+    /** Stored Formula Anchors of a formula edit; rendered only when the request carries `layouts`. */
+    readonly formulaAnchors?: FormulaAnchors;
+}
+
+/**
+ * One worksheet's Worksheet Layout, as the calculator reads it. When a request
+ * carries layouts, every address in it is prospective: the 0-based row and
+ * column the cell will occupy after save, as the grid displays it.
+ */
+export interface FormulaCalculationLayout {
+    /** H: the Header Row's 1-based number, or 0 without one. */
+    readonly bodyStart: number;
+    /** Absent means the source layout. */
+    readonly rowLayout?: RowLayout;
+    /** Absent means the source layout. */
+    readonly columnLayout?: ColumnLayout;
+    /** Live Pending Appended Rows, in `createdOrder`. */
+    readonly band: readonly PendingRowId[];
+    /** Source rows of Pending Tail Removals. */
+    readonly tailRemovedSourceRows?: readonly number[];
+}
+
+const LAYOUT_KEYS = new Set(['bodyStart', 'rowLayout', 'columnLayout', 'band', 'tailRemovedSourceRows']);
+
+function own_formula_calculation_layout(
+    value: unknown,
+    sheet: { readonly sourceRowCount: number; readonly columnCount: number },
+): FormulaCalculationLayout | undefined {
+    if (!is_plain_record(value) || Object.keys(value).some((key) => !LAYOUT_KEYS.has(key))) return undefined;
+    const whole = (entry: unknown, minimum: number, maximum: number): entry is number =>
+        Number.isSafeInteger(entry) && (entry as number) >= minimum && (entry as number) <= maximum;
+    if (!whole(value.bodyStart, 0, sheet.sourceRowCount)) return undefined;
+    const body_start = value.bodyStart;
+    if (
+        !Array.isArray(value.band)
+        || value.band.length > MAX_PENDING_APPENDED_ROWS
+        || value.band.some((id) => typeof id !== 'string' || id.length === 0
+            || id.length > MAX_PENDING_ROW_ID_LENGTH)
+        || new Set(value.band).size !== value.band.length
+    ) return undefined;
+    const band = Object.freeze([...value.band as string[]]);
+    const tail = value.tailRemovedSourceRows;
+    if (tail !== undefined && (
+        !Array.isArray(tail)
+        || tail.length > MAX_PENDING_APPENDED_ROWS
+        || tail.some((row) => !whole(row, body_start, sheet.sourceRowCount - 1))
+    )) return undefined;
+    let rowLayout: RowLayout | undefined;
+    if (value.rowLayout !== undefined) {
+        rowLayout = own_row_layout(value.rowLayout);
+        const discarded = new Set(rowLayout.discardedPendingRows.map((row) => row.id));
+        let created = rowLayout.discardedPendingRows.reduce(
+            (maximum, row) => Math.max(maximum, row.createdOrder + 1), 0);
+        const inserted = rowLayout.runs.flatMap((run) => run.kind === 'pending'
+            ? run.ids.filter((id) => !discarded.has(id))
+            : []);
+        const error = validate_row_layout(rowLayout, {
+            bodyStart: body_start,
+            bodyRowCount: sheet.sourceRowCount - body_start,
+            pendingRows: [
+                ...inserted.map((id) => ({ id, origin: 'insert' as const, createdOrder: created++ })),
+                ...band.map((id) => ({ id, createdOrder: created++ })),
+            ],
+            mintedAsInsert: () => true,
+        });
+        if (error !== undefined) return undefined;
+    }
+    let columnLayout: ColumnLayout | undefined;
+    if (value.columnLayout !== undefined) {
+        columnLayout = own_column_layout(value.columnLayout);
+        const discarded = new Set(columnLayout.discardedPendingColumns.map((column) => column.id));
+        let created = columnLayout.discardedPendingColumns.reduce(
+            (maximum, column) => Math.max(maximum, column.createdOrder + 1), 0);
+        const error = validate_column_layout(columnLayout, {
+            sourceColumnCount: sheet.columnCount,
+            pendingColumns: columnLayout.columns.flatMap((column) =>
+                column.kind === 'pending' && !discarded.has(column.pendingColumnId)
+                    ? [{ id: column.pendingColumnId, createdOrder: created++ }]
+                    : []),
+        });
+        if (error !== undefined) return undefined;
+    }
+    return Object.freeze({
+        bodyStart: body_start,
+        ...(rowLayout === undefined ? {} : { rowLayout }),
+        ...(columnLayout === undefined ? {} : { columnLayout }),
+        band,
+        ...(tail === undefined ? {} : { tailRemovedSourceRows: Object.freeze([...tail as number[]]) }),
+    });
+}
+
+/**
+ * Own the layouts of a calculation request from the wire, one per worksheet,
+ * each checked against its worksheet; `undefined` when any is malformed.
+ */
+export function own_formula_calculation_layouts(
+    value: unknown,
+    sheets: readonly { readonly sourceRowCount: number; readonly columnCount: number }[],
+): readonly FormulaCalculationLayout[] | undefined {
+    if (!Array.isArray(value) || value.length !== sheets.length) return undefined;
+    try {
+        const owned = value.map((entry, index) => own_formula_calculation_layout(entry, sheets[index]));
+        return owned.every((entry) => entry !== undefined)
+            ? Object.freeze(owned as FormulaCalculationLayout[])
+            : undefined;
+    } catch {
+        return undefined;
+    }
+}
+
+/** Whether every edit's Formula Anchors, when present, are valid for its value. */
+export function formula_calculation_edit_anchors_valid(
+    edits: readonly FormulaCalculationEdit[],
+): boolean {
+    return edits.every((edit) => edit.formulaAnchors === undefined
+        || own_formula_anchors(edit.formulaAnchors, edit.value) !== undefined);
 }
 
 export type FormulaCalculationError =
@@ -51,7 +192,9 @@ export type FormulaCalculationError =
     | 'ambiguous column'
     | 'Header Row is off'
     | 'row outside worksheet body'
-    | 'range cannot be displayed';
+    | 'range cannot be displayed'
+    /** A construct no layout change can adjust touches a worksheet with one. */
+    | UnrenderableFormulaReason;
 
 /** A calculation always settles as either a numeric value or a specific failure. */
 export type FormulaCalculationResult = FormulaCalculationAddress & (
@@ -69,6 +212,14 @@ export interface FormulaCalculationRequest {
         readonly sheetIndex: number;
         readonly row: number;
     }[];
+    /**
+     * One layout per worksheet. When present, every address is prospective,
+     * formulas render from their anchors for these layouts before they are
+     * evaluated, and `prospectiveRowCounts` and `removedRows` are ignored:
+     * removed rows and columns have no prospective address, so they are not
+     * addressable.
+     */
+    readonly layouts?: readonly FormulaCalculationLayout[];
 }
 
 export interface FormulaCalculationSchedule {
@@ -241,18 +392,82 @@ function* calculate_workbook_formula_steps(
     max_work?: number,
 ): CalculationSteps<readonly FormulaCalculationResult[]> {
     const sheets = source.meta().sheets;
-    const row_counts = sheets.map((sheet, sheet_index) =>
-        request.prospectiveRowCounts?.[sheet_index] ?? sheet.sourceRowCount);
-    const removed_rows = new Set((request.removedRows ?? []).map(
+    const layouts = request.layouts !== undefined && request.layouts.length === sheets.length
+        ? request.layouts
+        : undefined;
+    // The prospective cell accessor: every address maps through the layouts
+    // to an identity, and only a source identity reads the file.
+    const workbook: FormulaAnchorWorkbook | undefined = layouts === undefined
+        ? undefined
+        : formula_anchor_workbook('xlsx', sheets.map((sheet, sheetIndex) => ({
+            target: {
+                sheetIndex,
+                sheetName: sheet.name,
+                ...(sheet.worksheetId === undefined ? {} : { worksheetId: sheet.worksheetId }),
+            },
+            name: sheet.name,
+            bodyStart: layouts[sheetIndex].bodyStart,
+            sourceRowCount: sheet.sourceRowCount,
+            sourceColumnCount: sheet.columnCount,
+            changes: {
+                appendedRows: layouts[sheetIndex].band.map((id, createdOrder) => ({
+                    id,
+                    cells: {},
+                    formatTemplateId: '',
+                    createdOrder,
+                })),
+                tailRemovals: (layouts[sheetIndex].tailRemovedSourceRows ?? []).map((sourceRow) => ({
+                    appendHistoryId: '',
+                    sourceRow,
+                    savedFingerprint: '',
+                    savedRow: { cells: {}, format: { kind: 'none' } },
+                })),
+                ...(layouts[sheetIndex].rowLayout === undefined
+                    ? {}
+                    : { rowLayout: layouts[sheetIndex].rowLayout }),
+                ...(layouts[sheetIndex].columnLayout === undefined
+                    ? {}
+                    : { columnLayout: layouts[sheetIndex].columnLayout }),
+            },
+        })));
+    const row_counts = sheets.map((sheet, sheet_index) => workbook !== undefined
+        ? prospective_row_count(workbook.worksheets[sheet_index])
+        : request.prospectiveRowCounts?.[sheet_index] ?? sheet.sourceRowCount);
+    const column_counts = sheets.map((sheet, sheet_index) => workbook !== undefined
+        ? prospective_column_count(workbook.worksheets[sheet_index])
+        : sheet.columnCount);
+    /** Source column of each prospective column; `undefined` for a Pending Column. */
+    const source_columns = sheets.map((sheet, sheet_index) => {
+        if (workbook === undefined) return undefined;
+        return Array.from({ length: column_counts[sheet_index] }, (_, column) => {
+            const identity = workbook.worksheets[sheet_index].columns.identity_at(column + 1);
+            return identity?.kind === 'source' ? identity.sourceColumn : undefined;
+        });
+    });
+    /** Header names in prospective column order; a Pending Column has no source name. */
+    const column_names = sheets.map((sheet, sheet_index) => {
+        const mapped = source_columns[sheet_index];
+        if (mapped === undefined || sheet.columnNames === undefined) return sheet.columnNames;
+        return mapped.map((column) => column === undefined ? '' : sheet.columnNames![column] ?? '');
+    });
+    /** Source row of a prospective row, or `undefined` for a Pending Row or an empty row. */
+    const source_row_of = (sheet_index: number, row: number): number | undefined => {
+        if (workbook === undefined) return row;
+        const rows = workbook.worksheets[sheet_index].rows;
+        if (row < rows.fixedCount) return row;
+        const identity = rows.identity_at(row + 1);
+        return identity?.kind === 'source' ? identity.sourceRow : undefined;
+    };
+    const removed_rows = new Set(workbook !== undefined ? [] : (request.removedRows ?? []).map(
         ({ sheetIndex, row }) => `${sheetIndex}:${row}`,
     ));
     const sheet_names = sheets.map((sheet) => sheet.name);
     const sheet_lookup = new Map(sheet_names.map((name, index) => [name.toUpperCase(), index]));
     const edits = new Map(request.edits.map((edit) => [address_key(edit), edit]));
     const pending_header_names = new Map<string, string>();
-    const header_name_counts = sheets.map((sheet) => {
+    const header_name_counts = sheets.map((_sheet, sheet_index) => {
         const counts = new Map<string, number>();
-        for (const name of sheet.columnNames ?? []) {
+        for (const name of column_names[sheet_index] ?? []) {
             const key = name.toLocaleLowerCase();
             counts.set(key, (counts.get(key) ?? 0) + 1);
         }
@@ -265,7 +480,7 @@ function* calculate_workbook_formula_steps(
             sheet?.excelFirstRowHeader?.active === true
             && edit.row === header_row
             && edit.column >= 0
-            && edit.column < (sheet.columnNames?.length ?? 0)
+            && edit.column < (column_names[edit.sheetIndex]?.length ?? 0)
             && !edit.writesFormula
         ) pending_header_names.set(`${edit.sheetIndex}:${edit.column}`, edit.value.trim());
     }
@@ -297,7 +512,7 @@ function* calculate_workbook_formula_steps(
             && address.row < row_counts[address.sheetIndex]
             && Number.isInteger(address.column)
             && address.column >= 0
-            && address.column < sheet.columnCount;
+            && address.column < column_counts[address.sheetIndex];
     };
 
     const read_cells = (
@@ -311,6 +526,10 @@ function* calculate_workbook_formula_steps(
             { length: count },
             () => columns.map(() => null as RenderedCell | null),
         );
+        if (workbook !== undefined) {
+            read_prospective_cells(sheet_index, start_row, columns, rows);
+            return rows;
+        }
         const physical_row_count = sheets[sheet_index]?.sourceRowCount ?? 0;
         const physical_count = Math.max(
             0,
@@ -332,9 +551,72 @@ function* calculate_workbook_formula_steps(
         return rows;
     };
 
+    /**
+     * Fill `rows` (prospective rows from `start_row`, prospective `columns`)
+     * from the file: each run of prospective rows whose source rows are
+     * consecutive is one read of the source columns those columns map to.
+     * Pending Rows, Pending Columns, and empty rows stay blank.
+     */
+    const read_prospective_cells = (
+        sheet_index: number,
+        start_row: number,
+        columns: readonly number[],
+        rows: (RenderedCell | null)[][],
+    ): void => {
+        const mapped = columns.map((column) => source_columns[sheet_index]?.[column]);
+        const read_columns = [...new Set(mapped.filter((column): column is number => column !== undefined))];
+        if (read_columns.length === 0) return;
+        const position = new Map(read_columns.map((column, index) => [column, index]));
+        const physical_row_count = sheets[sheet_index]?.sourceRowCount ?? 0;
+        let offset = 0;
+        while (offset < rows.length) {
+            const first = source_row_of(sheet_index, start_row + offset);
+            if (first === undefined || first >= physical_row_count) {
+                offset += 1;
+                continue;
+            }
+            let length = 1;
+            while (offset + length < rows.length
+                && source_row_of(sheet_index, start_row + offset + length) === first + length
+                && first + length < physical_row_count) length += 1;
+            const canonical = source.read_canonical_columns?.(sheet_index, first, length, read_columns);
+            const physical_rows = (canonical ?? read_source_columns(
+                source, sheet_index, first, length, read_columns,
+            )).rows;
+            for (let index = 0; index < length; index += 1) {
+                const physical = physical_rows[index];
+                if (physical === undefined) continue;
+                rows[offset + index] = mapped.map((column) =>
+                    column === undefined ? null : physical[position.get(column)!] ?? null);
+            }
+            offset += length;
+        }
+    };
+
     const read_cell = (address: FormulaCalculationAddress): RenderedCell | null | undefined => (
         read_cells(address.sheetIndex, address.row, 1, [address.column])[0]?.[0]
     );
+
+    /**
+     * The text a formula evaluates as: rendered from its anchors for the
+     * request's layouts, implicit anchors for a source formula. Without
+     * layouts it is the stored text.
+     */
+    const rendered_formula = (
+        text: string,
+        anchors: FormulaAnchors | undefined,
+        sheet_index: number,
+    ): string | Scalar => {
+        if (workbook === undefined) return text;
+        try {
+            const rendered = render_formula(text, anchors, formula_anchor_context(workbook, sheet_index));
+            return rendered.kind === 'rendered'
+                ? rendered.text
+                : { kind: 'unknown', error: unrenderable_formula_reason(rendered.issue) };
+        } catch {
+            return PARSE_ERROR;
+        }
+    };
 
     let evaluate_cell!: (
         address: FormulaCalculationAddress,
@@ -474,12 +756,16 @@ function* calculate_workbook_formula_steps(
                     ) === 0);
                 if (source_sheet < 0) return PARSE_ERROR;
                 const sheet = sheets[source_sheet];
-                if (!sheet.excelFirstRowHeader?.active || !sheet.columnNames) {
+                const names = column_names[source_sheet];
+                if (!sheet.excelFirstRowHeader?.active || !names) {
                     return HEADER_ROW_OFF;
                 }
                 const matches: number[] = [];
-                for (let column = 0; column < sheet.columnNames.length; column += 1) {
-                    const original = sheet.columnNames[column];
+                for (let column = 0; column < names.length; column += 1) {
+                    const original = names[column];
+                    // A Pending Column has no source header to match.
+                    if (source_columns[source_sheet] !== undefined
+                        && source_columns[source_sheet]![column] === undefined) continue;
                     const pending = pending_header_names.get(`${source_sheet}:${column}`);
                     const original_is_unique = header_name_counts[source_sheet]
                         .get(original.toLocaleLowerCase()) === 1;
@@ -529,7 +815,7 @@ function* calculate_workbook_formula_steps(
                 const first_row = Math.max(0, ref.firstRow);
                 const first_column = Math.max(0, ref.firstColumn);
                 const last_row = Math.min(ref.lastRow, row_counts[source_sheet] - 1);
-                const last_column = Math.min(ref.lastColumn, sheet.columnCount - 1);
+                const last_column = Math.min(ref.lastColumn, column_counts[source_sheet] - 1);
                 const single_cell = ref.firstRow === ref.lastRow
                     && ref.firstColumn === ref.lastColumn;
                 if (single_cell && (first_row > last_row || first_column > last_column)) {
@@ -663,9 +949,17 @@ function* calculate_workbook_formula_steps(
 
         const edit = edits.get(key);
         const cell = supplied === undefined ? read_cell(address) : supplied;
-        const formula = edit?.writesFormula === true
+        const stored_formula = edit?.writesFormula === true
             ? edit.value
             : edit === undefined ? cell?.formula : undefined;
+        const rendered = stored_formula === undefined
+            ? undefined
+            : rendered_formula(stored_formula, edit?.formulaAnchors, address.sheetIndex);
+        if (rendered !== undefined && typeof rendered !== 'string') {
+            memo.set(key, rendered);
+            return rendered;
+        }
+        const formula = rendered;
         // Some OOXML formula producers (notably what-if data tables) expose a
         // dependency target but no evaluable formula text. A requested target
         // without source text is opaque, not the cached literal currently in
