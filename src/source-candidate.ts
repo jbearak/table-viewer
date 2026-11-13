@@ -3,6 +3,8 @@ import type { DataSource } from './data-source/interface';
 export interface PhysicalSourceObservation {
     readonly fingerprint: string;
     readonly digest: string;
+    /** Byte length of the bytes `digest` covers, for the Structural Basis. */
+    readonly byteLength?: number;
     /** A file-backed source was content-digested through its own descriptor and
      * bracketed by descriptor/path identity checks during construction. */
     readonly verification?: 'bracketedDigest';

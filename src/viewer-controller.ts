@@ -36,7 +36,11 @@ import {
 import { create_resource_identity, type ResourceUriLike } from './resource-identity';
 import { CompareDataSource, align_workbook } from './diff-compare/compare-session';
 import { AlignmentCancelledError } from './diff-compare/row-alignment';
-import type { UnresolvedLfsObject, WorkbookSnapshotCompare } from './viewer-snapshot';
+import type {
+    StructuralEditingCapability,
+    UnresolvedLfsObject,
+    WorkbookSnapshotCompare,
+} from './viewer-snapshot';
 import type { GitLfsResolveOutcome } from './host-ports';
 import { MAX_POINTER_BYTES, parse_git_lfs_pointer } from './git-lfs-pointer';
 import { UnresolvedLfsDataSource } from './data-source/unresolved-lfs-source';
@@ -96,6 +100,10 @@ import {
 import { parse_http_external_url } from './external-url';
 import { is_plain_record } from './plain-record';
 import { parser_format_for, type TableFormat } from './table-format';
+import {
+    current_structural_basis,
+    structural_editing_capability,
+} from './structural-editing-capability';
 import {
     persisted_saved_row_snapshot,
     physical_row_format,
@@ -2000,6 +2008,24 @@ export function attach_viewer(
     );
     const structural_editing_enabled = options.structuralEditingEnabled
         ?? STRUCTURAL_EDITING_ENABLED;
+    /**
+     * The snapshot's `structuralEditing` capability: present only while
+     * structural editing is enabled for a panel that can edit at all.
+     */
+    const projected_structural_editing = (
+        observation: Readonly<PhysicalSourceObservation> | undefined,
+        projected_source: DataSource,
+    ): { readonly structuralEditing?: StructuralEditingCapability } => (
+        structural_editing_enabled && editing_supported
+            ? {
+                structuralEditing: structural_editing_capability(
+                    file_format.id,
+                    observation,
+                    projected_source.meta().sheets,
+                ),
+            }
+            : {}
+    );
     // VS Code may make panel.webview throw as soon as the panel is disposed.
     // Capture the live transport once; every later post is liveness-gated below.
     const webview = panel.webview;
@@ -2674,6 +2700,30 @@ export function attach_viewer(
     };
 
     /**
+     * A layout's Structural Basis is either the one the session recorded for
+     * the worksheet, which keeps an existing layout publishable after the
+     * file changes, or the current file's, as the snapshot capability
+     * reported it: Delete, Restore, and Move need no admission round trip, so
+     * a first layout change, or one started after a Discard, arrives with it.
+     * Publication records whichever it accepted.
+     */
+    const structural_basis_authorized = (
+        target: WorksheetTarget,
+        basis: StructuralBasis,
+        ledger: AppendAdmissionLedger | undefined,
+    ): boolean => {
+        const posted = JSON.stringify(basis);
+        if (ledger?.structuralBasis !== undefined
+            && posted === JSON.stringify(ledger.structuralBasis)) return true;
+        const current = current_structural_basis(
+            file_format.id,
+            source_observation,
+            source?.meta().sheets[target.sheetIndex],
+        );
+        return current !== undefined && posted === JSON.stringify(current);
+    };
+
+    /**
      * The layout rules a new-protocol publication must meet beyond the append
      * rules: the release gate, the ledger origin rule (origin `insert` only for
      * an ID an insert minted; origin `append` for any admitted ID), host-issued
@@ -2698,7 +2748,7 @@ export function attach_viewer(
         }
         if (
             changes.structuralBasis !== undefined
-            && JSON.stringify(changes.structuralBasis) !== JSON.stringify(ledger?.structuralBasis)
+            && !structural_basis_authorized(target, changes.structuralBasis, ledger)
         ) return 'structural-basis-mismatch';
         if (has_live_layout_change(changes) && changes.structuralBasis === undefined) {
             return 'structural-basis-missing';
@@ -2719,7 +2769,7 @@ export function attach_viewer(
     ): PendingStructuralPublicationPlan | undefined => {
         const ledger_key = append_ledger_key(edit_session_id, target);
         const prior_ledger = append_admission_ledgers.get(ledger_key);
-        const next_ledger = prior_ledger === undefined
+        let next_ledger = prior_ledger === undefined
             ? undefined
             : clone_append_admission_ledger(prior_ledger);
         // A refused plan is a silently dropped publication upstream, so each
@@ -2738,6 +2788,20 @@ export function attach_viewer(
         };
         const layout_refusal = pending_layout_publication_refusal(target, changes, prior_ledger);
         if (layout_refusal !== undefined) return refuse(layout_refusal);
+        // Record the accepted Structural Basis, so later publications of this
+        // layout keep matching it after the file changes.
+        if (changes.structuralBasis !== undefined) {
+            next_ledger ??= {
+                ownedRowIds: new Set<string>(),
+                insertMintedRowIds: new Set<string>(),
+                ownedColumnIds: new Set<string>(),
+                templateIdByRowId: new Map<string, string>(),
+                reservedRowIds: new Map<string, number>(),
+                unsettledRequestByRowId: new Map<string, string>(),
+                sourceGeneration: core?.source_generation ?? 0,
+            };
+            next_ledger.structuralBasis = changes.structuralBasis;
+        }
         if (changes_use_unsettled_row_authority(
             prior_ledger,
             ledger_key,
@@ -3243,12 +3307,35 @@ export function attach_viewer(
         }
     }
 
+    /**
+     * The latest publication the host refused. A flush waiting on exactly
+     * that sequence fails at once instead of timing out: nothing later will
+     * acknowledge it.
+     */
+    let refused_edit_publication: { editSessionId: string; sequence: number } | undefined;
+    const refused_publication_error = () =>
+        new Error('The viewer refused the pending changes a flush was waiting for.');
+
+    function refuse_pending_edit_ack(edit_session_id: string, sequence: number): void {
+        if (!Number.isSafeInteger(sequence)) return;
+        refused_edit_publication = { editSessionId: edit_session_id, sequence };
+        for (const waiter of pending_edit_ack_waiters) {
+            if (waiter.editSessionId !== edit_session_id || waiter.sequence !== sequence) continue;
+            pending_edit_ack_waiters.delete(waiter);
+            waiter.reject(refused_publication_error());
+        }
+    }
+
     function wait_for_pending_edit_ack(edit_session_id: string, sequence: number): Promise<void> {
         if (
             pending_edit_sequence_session_id === edit_session_id
             && highest_acknowledged_edit_sequence >= sequence
         ) return Promise.resolve();
         if (disposed) return Promise.reject(new Error('Viewer controller is disposed.'));
+        if (
+            refused_edit_publication?.editSessionId === edit_session_id
+            && refused_edit_publication.sequence === sequence
+        ) return Promise.reject(refused_publication_error());
         return new Promise<void>((resolve, reject) => {
             pending_edit_ack_waiters.add({
                 editSessionId: edit_session_id,
@@ -6184,6 +6271,7 @@ export function attach_viewer(
                 observation = {
                     fingerprint,
                     digest: built.digest,
+                    byteLength: built.size,
                     verification: 'bracketedDigest',
                 };
             } finally {
@@ -6200,6 +6288,7 @@ export function attach_viewer(
                 // smudged bytes must not make the panel look like it has already
                 // seen a file it has not, or the next real change is missed.
                 digest: content_digest(read_raw_main),
+                byteLength: read_raw_main.byteLength,
             };
             // Before the parser, which is the whole point: a `.csv` pointer parses
             // into a convincing three-row grid of LFS metadata and an `.xlsx`
@@ -6998,6 +7087,10 @@ export function attach_viewer(
                                 appendRowCeiling: projected_append_row_ceiling(
                                     profile,
                                 ),
+                                ...projected_structural_editing(
+                                    candidate.observation,
+                                    next,
+                                ),
                                 ...(owns_edit_session() && active_edit_session_id
                                     ? { csvEditSessionId: active_edit_session_id }
                                     : {}),
@@ -7263,6 +7356,10 @@ export function attach_viewer(
                                         csvSaveLifecycle: projected_save_lifecycle(),
                                         appendRowCeiling: projected_append_row_ceiling(
                                             profile,
+                                        ),
+                                        ...projected_structural_editing(
+                                            source_observation,
+                                            source!,
                                         ),
                                         ...(owns_edit_session() && active_edit_session_id
                                             ? { csvEditSessionId: active_edit_session_id }
@@ -11691,6 +11788,11 @@ export function attach_viewer(
                         sequence: msg.sequence,
                         ...detail,
                     });
+                    // A replayed sequence whose first write is still queued is
+                    // that write's to acknowledge or refuse.
+                    if (reason !== 'sequence-claimed-but-unacknowledged') {
+                        refuse_pending_edit_ack(msg.editSessionId, msg.sequence);
+                    }
                 };
                 if (
                     !editing_supported

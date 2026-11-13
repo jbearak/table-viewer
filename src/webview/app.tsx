@@ -61,6 +61,7 @@ import {
     advance_pending_append_basis,
     assert_pending_changes_encoded_bound,
     EMPTY_PENDING_STRUCTURAL_CHANGES,
+    has_live_layout_change,
     type PendingAppendBasis,
     type PendingStructuralChanges,
     pending_rows,
@@ -106,6 +107,7 @@ import {
     normalize_complete_per_file_state,
     normalize_workbook_snapshot_state,
     type RetainedSnapshotCommandResult,
+    type StructuralEditingCapability,
     type UnresolvedLfsObject,
     type WorkbookSnapshotCompare,
     type WorkbookSnapshotIdentity,
@@ -751,6 +753,10 @@ export function App(): React.JSX.Element {
     // widened to Infinity here; absent means an older host, which reads as the
     // worksheet ceiling every format used to be checked against.
     const [append_row_ceiling, set_append_row_ceiling] = useState(MAX_SHEET_ROWS);
+    // Row and column structure support per worksheet; undefined while the host
+    // has structural editing off, which hides every structure item.
+    const [structural_editing, set_structural_editing] =
+        useState<StructuralEditingCapability>();
     const [csv_edit_session_id, set_csv_edit_session_id_state] = useState<string>();
     const csv_edit_session_id_ref = useRef<string>();
     const append_composer_drafts_ref = useRef<Map<
@@ -4156,6 +4162,7 @@ export function App(): React.JSX.Element {
                             ? MAX_SHEET_ROWS
                             : ceiling ?? UNBOUNDED_SHEET_ROWS,
                     );
+                    set_structural_editing(snapshot.capabilities.structuralEditing);
 
                     // Acknowledge the exact delivered identity before an optional
                     // corrective CAS write.
@@ -5355,6 +5362,13 @@ export function App(): React.JSX.Element {
                     // fingerprints; this immediate check keeps an obviously-grown
                     // worksheet from appearing to accept the undo meanwhile.
                     const suffix_is_safe = planned.plans.every((plan) => {
+                        // Undoing a saved append on a worksheet with a layout
+                        // change is refused: both assume the source rows keep
+                        // their physical place.
+                        if (
+                            plan.next.tailRemovals.length > 0
+                            && has_live_layout_change(plan.next)
+                        ) return false;
                         const sheet_index = worksheet_target_index(sheets, plan.worksheet);
                         if (sheet_index === undefined) return false;
                         const source_row_count = sheets[sheet_index]?.sourceRowCount;
@@ -7496,6 +7510,18 @@ export function App(): React.JSX.Element {
         active_pending_conflict_snapshot,
         active_pending_conflict_snapshot,
     );
+    // Merges display unmerged on a worksheet with a layout change, as they do
+    // in a transformed view: a removed row inside a merge keeps its place, so
+    // the merge's display span no longer means its saved span.
+    const active_layout_change_snapshot = useCallback(
+        () => has_live_layout_change(active_pending_row_store.snapshot()),
+        [active_pending_row_store],
+    );
+    const active_layout_changed = useSyncExternalStore(
+        subscribe_active_pending_conflicts,
+        active_layout_change_snapshot,
+        active_layout_change_snapshot,
+    );
     const current_column_projection = useMemo(
         () => create_column_projection(
             current_sheet?.columnCount ?? 0,
@@ -7789,7 +7815,7 @@ export function App(): React.JSX.Element {
         < current_sheet.columnCount;
     const merges_flattened =
         current_sheet.merges.length > 0
-        && (transform_active || has_hidden_columns);
+        && (transform_active || has_hidden_columns || active_layout_changed);
     const transform_pending = pending_transforms[active_sheet_index] ?? false;
     const hidden_row_count = visible_transform.hiddenRows?.length ?? 0;
     const show_formatting = show_formatting_by_sheet[active_sheet_index] ?? true;
@@ -8236,6 +8262,7 @@ export function App(): React.JSX.Element {
             append_in_flight={append_request_pending}
             csv_editable={csv_editable}
             append_row_ceiling={append_row_ceiling}
+            structural_support={structural_editing?.sheets[active_sheet_index]}
             edit_syntax={edit_syntax}
             edit_session_id={csv_edit_session_id}
             value_edit_order_floor={value_edit_order_floor}

@@ -12,6 +12,8 @@ export interface ActionMenuItem {
     label: string;
     on_click: (event: React.MouseEvent<HTMLButtonElement>) => void;
     disabled?: boolean;
+    /** Why a disabled item is disabled: its accessible description and tooltip. */
+    disabled_reason?: string;
     checked?: boolean;
     shortcut?: string;
 }
@@ -245,6 +247,8 @@ function MenuLevel({
                         role={item.checked === undefined ? 'menuitem' : 'menuitemcheckbox'}
                         aria-checked={item.checked}
                         aria-disabled={item.disabled === true ? 'true' : undefined}
+                        aria-description={item.disabled === true ? item.disabled_reason : undefined}
+                        title={item.disabled === true ? item.disabled_reason : undefined}
                         tabIndex={active_index === index ? 0 : -1}
                         onFocus={() => set_active_index(index)}
                         onPointerEnter={() => hover_item(index)}
