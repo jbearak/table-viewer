@@ -74,7 +74,17 @@ function source(sourceRow: number): RowIdentity {
 }
 
 function selection(overrides: Partial<RowStructureSelection>): RowStructureSelection {
-    return { count: 1, identities: [source(2)], removedSourceRows: [], fixedRows: false, tailRemovals: false, ...overrides };
+    return {
+        count: 1,
+        identities: [source(2)],
+        removedSourceRows: [],
+        fixedRows: false,
+        tailRemovals: false,
+        contiguous: true,
+        bandRows: 0,
+        endsAtBandEnd: false,
+        ...overrides,
+    };
 }
 
 describe('row Delete and Restore planning', () => {
