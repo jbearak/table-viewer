@@ -317,3 +317,25 @@ describe('wire codec', () => {
         })).toBeUndefined();
     });
 });
+
+describe('cell history', () => {
+    it('keeps anchors through the overlay state, the replay wire, and back', async () => {
+        const { overlay_state_from_dirty_entry, dirty_entry_from_overlay_state } =
+            await import('../webview/history-cell-state-model');
+        const { wire_overlay_from_cell_overlay_state, cell_overlay_state_from_wire } =
+            await import('../webview/history-replay-wire-model');
+        const { sanitized_wire_cell_overlay_state } = await import('../history-replay-protocol');
+        const entry = { value: TEXT, base: '=A1', formulaAnchors: ANCHORS };
+        const state = overlay_state_from_dirty_entry(entry);
+        expect(dirty_entry_from_overlay_state(state)).toEqual(entry);
+        const wire = sanitized_wire_cell_overlay_state(
+            JSON.parse(JSON.stringify(wire_overlay_from_cell_overlay_state(state))),
+        );
+        expect(wire).toBeDefined();
+        expect(dirty_entry_from_overlay_state(cell_overlay_state_from_wire(wire!) as never)).toEqual(entry);
+        // Anchors that do not fit the value do not cross the wire.
+        const bad = JSON.parse(JSON.stringify(wire_overlay_from_cell_overlay_state(state)));
+        bad.value.value.text = '=A3';
+        expect(sanitized_wire_cell_overlay_state(bad)).toBeUndefined();
+    });
+});
