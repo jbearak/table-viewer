@@ -319,10 +319,10 @@ describe('removed rows in the projection', () => {
         expect(projection.prospective_row(6)).toBeUndefined();
     });
 
-    it('finds the nearest live row below, then above', () => {
+    it('focuses the row after a deleted block, or the nearest above at the end', () => {
         const live = (row: number) => row !== 2 && row !== 3;
-        expect(nearest_live_row(2, 10, live)).toBe(1);
-        expect(nearest_live_row(3, 10, live)).toBe(4);
+        expect(nearest_live_row(2, 10, live)).toBe(4);
+        expect(nearest_live_row(8, 10, (row) => row < 8)).toBe(7);
         expect(nearest_live_row(0, 2, () => false)).toBeUndefined();
     });
 });

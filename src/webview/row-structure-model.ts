@@ -282,9 +282,10 @@ export function plan_row_restore(
 }
 
 /**
- * Where focus goes after a Delete: the nearest displayed row that is not
- * removed, searching outward from `from` (below first, then above), at most
- * `limit` rows each way. `is_live` answers for one display row.
+ * Where focus goes after a Delete: the first displayed row at or after `from`
+ * that is not removed, so the caret lands on the row that followed the
+ * deleted block; failing that, the nearest one above. At most `limit` rows
+ * are examined each way. `is_live` answers for one display row.
  */
 export function nearest_live_row(
     from: number,
@@ -292,12 +293,12 @@ export function nearest_live_row(
     is_live: (display_row: number) => boolean,
     limit = row_count,
 ): number | undefined {
-    for (let distance = 0; distance <= limit; distance += 1) {
-        const below = from + distance;
-        const above = from - distance;
-        if (below >= row_count && above < 0) return undefined;
-        if (below < row_count && is_live(below)) return below;
-        if (distance > 0 && above >= 0 && above < row_count && is_live(above)) return above;
+    const start = Math.max(0, Math.min(from, row_count - 1));
+    for (let row = start; row < row_count && row - start <= limit; row += 1) {
+        if (is_live(row)) return row;
+    }
+    for (let row = start - 1; row >= 0 && start - row <= limit; row -= 1) {
+        if (is_live(row)) return row;
     }
     return undefined;
 }

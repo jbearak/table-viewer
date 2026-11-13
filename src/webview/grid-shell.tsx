@@ -3548,7 +3548,8 @@ export function GridShell({
      * After a Delete, move the caret to the nearest live row. Polls the
      * projection the grid renders until it shows the delete (a deleted source
      * row reports `removed`, a deleted Pending Row is gone), never a fixed
-     * delay, then selects from where the first deleted row was.
+     * delay, then selects the first live row from where the first deleted
+     * row was (see `nearest_live_row`).
      */
     const focus_after_row_delete = useCallback((
         deleted: readonly RowIdentity[],
@@ -3570,7 +3571,7 @@ export function GridShell({
                 return;
             }
             const target = nearest_live_row(
-                Math.min(display_row ?? from_row, projection.rowCount - 1),
+                display_row ?? from_row,
                 projection.rowCount,
                 (row) => {
                     const state = projection.row_state(row);
