@@ -674,6 +674,38 @@ describe('scan_xlsx_structural_support', () => {
             expect_supported(other);
         });
 
+        it('expands a 3D span even when its endpoints were already found', () => {
+            const [, middle] = scan({
+                sheets: [sheet('First'), sheet('Middle'), sheet('Last')],
+                parts: { 'xl/vendor/thing.xml': '<r>First!A1 Last!A1 SUM(First:Last!A1)</r>' },
+            });
+            expect(refused(middle)).toMatchObject({ code: 'unclassified-reference', part: 'xl/vendor/thing.xml' });
+        });
+
+        it('does not exempt cell-shaped text inside an extension', () => {
+            const [data, , other] = scan({
+                sheets: [
+                    sheet('Data'),
+                    sheet('Report', `${PLAIN_DATA}<extLst><ext uri="urn:unreviewed"><t>Data!A1</t></ext></extLst>`
+                        + '<conditionalFormatting sqref="A1"><cfRule type="expression" priority="1"><formula>TRUE</formula>'
+                        + '<extLst><ext uri="urn:unreviewed"><formula>Other!A1</formula></ext></extLst></cfRule></conditionalFormatting>'),
+                    sheet('Other'),
+                ],
+            });
+            expect(refused(data)).toMatchObject({ code: 'unclassified-reference', part: 'xl/worksheets/sheet2.xml' });
+            expect(refused(other)).toMatchObject({ code: 'unclassified-reference', part: 'xl/worksheets/sheet2.xml' });
+        });
+
+        it('reads quotes and bangs written as numeric character references', () => {
+            const [quoted, banged, other] = scan({
+                sheets: [sheet('My Sheet'), sheet('Data'), sheet('Other')],
+                parts: { 'customXml/item1.xml': '<root a="&#39;My Sheet&#x27;!A1" b="Data&#33;B2"/>' },
+            });
+            expect(refused(quoted)).toMatchObject({ code: 'unclassified-reference', part: 'customXml/item1.xml' });
+            expect(refused(banged)).toMatchObject({ code: 'unclassified-reference', part: 'customXml/item1.xml' });
+            expect_supported(other);
+        });
+
         it('leaves a sheet supported when it is named only where the writer renders it or in data', () => {
             const [data, report] = scan({
                 sheets: [

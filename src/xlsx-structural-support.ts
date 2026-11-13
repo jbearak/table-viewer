@@ -984,6 +984,23 @@ interface ScannedWorksheet {
      * already; each also refuses every other worksheet it may reference.
      */
     readonly foreignReferences: readonly ForeignReference[];
+    /**
+     * Byte ranges where the backstop may treat text as handled: sheetData
+     * (cell formulas and values), conditional formatting and data validations
+     * (rule formulas), and hyperlinks (`location`). Ranges in `opaqueSpans`
+     * (extensions, markup-compatibility content) are never exempt.
+     */
+    readonly coveredSpans: readonly CoveredSpan[];
+    readonly opaqueSpans: readonly ByteRange[];
+}
+
+interface ByteRange {
+    readonly start: number;
+    readonly end: number;
+}
+
+interface CoveredSpan extends ByteRange {
+    readonly element: 'sheetData' | 'conditionalFormatting' | 'dataValidations' | 'hyperlinks';
 }
 
 interface ForeignReference {
@@ -1205,6 +1222,7 @@ function scan_worksheet(
 ): ScannedWorksheet {
     const empty = {
         name, path, merges: [], relativeRules: [], cellFormulas: [], otherFormulas: [], foreignReferences: [],
+        coveredSpans: [], opaqueSpans: [],
     };
     const raw = read_bytes(zip, path);
     if (raw === null) {
@@ -1234,6 +1252,8 @@ function scan_worksheet(
     const relative_rules: StructuralRelativeRule[] = [];
     const other_formulas: { location: StructuralFormulaLocation; text: string }[] = [];
     const foreign_references: ForeignReference[] = [];
+    const covered_spans: CoveredSpan[] = [];
+    const opaque_spans: ByteRange[] = [];
     if (root !== null) {
         const root_open = opening_tag_text(xml, root.element);
         for (const child of direct_child_elements(xml, root.element)) {
@@ -1285,17 +1305,24 @@ function scan_worksheet(
             }
             const extension = nested_extension_refusal(xml, child);
             consider(extension);
-            if (extension?.code === 'unsupported-extension') {
+            if (local === 'sheetData' || local === 'conditionalFormatting' || local === 'dataValidations' || local === 'hyperlinks') {
+                covered_spans.push({ element: local, start: child.element.start, end: child.element.end });
+            }
+            if (extension !== undefined) {
                 // x14 conditional formatting, data validation, and sparklines
                 // keep formulas in `<xm:f>`; Excel writes cross-sheet rules there.
                 // Only `f` inside an `<ext>` counts, so cell formulas in
-                // sheetData stay with the formula checks.
+                // sheetData stay with the formula checks. Every extension and
+                // markup-compatibility element is also opaque to the backstop.
                 const ranges = ignorable_ranges(xml, child.element.start, child.element.end);
                 for (const tag of start_tags(xml, child.element.start, child.element.end, ranges)) {
-                    if (!has_local_name(xml, tag.start, tag.nameEnd, 'ext') || is_self_closing(xml, tag.start, tag.tagEnd)) continue;
+                    const is_ext = has_local_name(xml, tag.start, tag.nameEnd, 'ext');
+                    if (!is_ext && !has_local_name(xml, tag.start, tag.nameEnd, 'AlternateContent')) continue;
+                    if (is_self_closing(xml, tag.start, tag.tagEnd)) continue;
                     const name = utf8_text(xml, tag.start + 1, tag.nameEnd);
                     const close = end_tag_after(xml, name, tag.tagEnd + 1, ranges, child.element.end);
-                    if (close === null) continue;
+                    opaque_spans.push({ start: tag.start, end: close === null ? child.element.end : close[1] });
+                    if (!is_ext || close === null || extension.code !== 'unsupported-extension') continue;
                     for (const text of element_texts(xml, tag.tagEnd + 1, close[0], ranges, (local_part) => local_part === 'f')) {
                         foreign_references.push({ targets: formula_targets(text), reason: extension });
                     }
@@ -1396,6 +1423,8 @@ function scan_worksheet(
         cellFormulas: cell_formulas,
         otherFormulas: other_formulas,
         foreignReferences: foreign_references,
+        coveredSpans: covered_spans,
+        opaqueSpans: opaque_spans,
     };
 }
 
@@ -1704,8 +1733,6 @@ function with_worksheet(
 /** Parts that hold no references, or only data that is never read as one. */
 const BACKSTOP_SKIPPED_RELATIONSHIPS: ReadonlySet<string> = new Set(['styles', 'sharedStrings', 'theme']);
 const BACKSTOP_BINARY_EXTENSION = /\.(?:png|jpe?g|jfif|gif|bmp|tiff?|emf|wmf|wdp|ico|bin|mp3|mp4|wav|avi|mov)$/i;
-/** Worksheet elements whose text the writer renders, or that hold cell values. */
-const BACKSTOP_WORKSHEET_TEXT = new Set(['f', 'v', 't', 'formula', 'formula1', 'formula2']);
 
 function is_backstop_name_byte(code: number): boolean {
     return code >= 0x80
@@ -1716,7 +1743,17 @@ function is_backstop_name_byte(code: number): boolean {
 /** Length of a single-quote token (`'` or `&apos;`) ending just before `end`, or 0. */
 function quote_ending_at(xml: Uint8Array, end: number): number {
     if (xml[end - 1] === 0x27) return 1;
-    return starts_with_bytes(xml, '&apos;', end - 6) ? 6 : 0;
+    if (xml[end - 1] !== 0x3b) return 0; // `;`
+    const tail = utf8_text(xml, Math.max(0, end - 12), end);
+    return /&(?:apos|#0*39|#[xX]0*27);$/.exec(tail)?.[0].length ?? 0;
+}
+
+/** Every `!` in a part, including ones written as numeric character references. */
+function* bang_positions(xml: Uint8Array): Generator<number> {
+    for (let at = index_of_bytes(xml, '!'); at !== -1; at = index_of_bytes(xml, '!', at + 1)) yield at;
+    for (let at = index_of_bytes(xml, '&#'); at !== -1; at = index_of_bytes(xml, '&#', at + 2)) {
+        if (/^&#(?:0*33|[xX]0*21);/.test(utf8_text(xml, at, Math.min(xml.length, at + 12)))) yield at;
+    }
 }
 
 /** The sheet names in the qualifier that ends just before the `!` at `bang`. */
@@ -1767,10 +1804,34 @@ function attribute_containing(xml: Uint8Array, tag_start: number, at: number): s
     return undefined;
 }
 
-type BackstopPartKind = 'worksheet' | 'workbook' | 'relationships' | 'other';
+type BackstopPartKind =
+    | { readonly kind: 'worksheet'; readonly sheet: ScannedWorksheet }
+    | { readonly kind: 'workbook'; readonly definedNames: ByteRange | null }
+    | { readonly kind: 'relationships' }
+    | { readonly kind: 'other' };
+
+function within(ranges: readonly ByteRange[], at: number): boolean {
+    return ranges.some((range) => at >= range.start && at < range.end);
+}
+
+/** Whether `at` is in a worksheet child the writer covers, and in no extension. */
+function in_covered(sheet: ScannedWorksheet, at: number, element: CoveredSpan['element']): boolean {
+    return !within(sheet.opaqueSpans, at)
+        && sheet.coveredSpans.some((span) => span.element === element && at >= span.start && at < span.end);
+}
+
+const BACKSTOP_TEXT_OWNER: Readonly<Record<string, CoveredSpan['element']>> = {
+    f: 'sheetData',
+    v: 'sheetData',
+    t: 'sheetData',
+    formula: 'conditionalFormatting',
+    formula1: 'dataValidations',
+    formula2: 'dataValidations',
+};
 
 /** Whether a sheet qualifier at `bang` sits where a specific check already handles it. */
-function backstop_skips(xml: Uint8Array, bang: number, kind: BackstopPartKind): boolean {
+function backstop_skips(xml: Uint8Array, bang: number, part: BackstopPartKind): boolean {
+    const kind = part.kind;
     if (kind === 'other') return false;
     const bytes = Buffer.from(xml.buffer, xml.byteOffset, xml.byteLength);
     const last_open = bang === 0 ? -1 : bytes.lastIndexOf(0x3c, bang - 1);
@@ -1781,8 +1842,10 @@ function backstop_skips(xml: Uint8Array, bang: number, kind: BackstopPartKind): 
         // Inside a tag: an attribute value.
         const attribute = attribute_containing(xml, last_open, bang);
         if (attribute === undefined) return false;
-        const element = local_name(qname_at(xml, last_open + 1));
-        if (kind === 'worksheet') return element === 'hyperlink' && attribute === 'location';
+        const element = qname_at(xml, last_open + 1);
+        if (part.kind === 'worksheet') {
+            return element === 'hyperlink' && attribute === 'location' && in_covered(part.sheet, bang, 'hyperlinks');
+        }
         if (kind === 'relationships') return attribute === 'Id' || attribute === 'Type';
         return false;
     }
@@ -1793,8 +1856,13 @@ function backstop_skips(xml: Uint8Array, bang: number, kind: BackstopPartKind): 
     }
     if (parent < 0 || xml[parent + 1] === 0x2f) return false; // mixed content: keep it
     const name = qname_at(xml, parent + 1);
-    if (kind === 'worksheet') return BACKSTOP_WORKSHEET_TEXT.has(name);
-    if (kind === 'workbook') return name === 'definedName';
+    if (part.kind === 'worksheet') {
+        const owner = BACKSTOP_TEXT_OWNER[name];
+        return owner !== undefined && in_covered(part.sheet, bang, owner);
+    }
+    if (part.kind === 'workbook') {
+        return name === 'definedName' && part.definedNames !== null && within([part.definedNames], bang);
+    }
     return false;
 }
 
@@ -1814,7 +1882,7 @@ function unclassified_references(
     for (const relationship of relationships_of(zip, 'xl/workbook.xml')) {
         if (BACKSTOP_SKIPPED_RELATIONSHIPS.has(relationship_key(relationship.type))) skipped.add(relationship.part);
     }
-    const worksheet_paths = new Set(worksheets.map((sheet) => sheet.path));
+    const worksheet_by_path = new Map(worksheets.map((sheet) => [sheet.path, sheet]));
     for (const part of zip.part_names()) {
         if (found.size === worksheets.length) break;
         if (skipped.has(part) || part.startsWith('docProps/') || part.startsWith('xl/theme/')) continue;
@@ -1824,21 +1892,24 @@ function unclassified_references(
         let first = raw[0] === 0xef && raw[1] === 0xbb && raw[2] === 0xbf ? 3 : 0;
         while (first < raw.length && (raw[first] === 0x20 || raw[first] === 0x09 || raw[first] === 0x0a || raw[first] === 0x0d)) first += 1;
         if (raw[first] !== 0x3c) continue; // not XML
-        const kind: BackstopPartKind = worksheet_paths.has(part)
-            ? 'worksheet'
-            : part === 'xl/workbook.xml' ? 'workbook' : part.endsWith('.rels') ? 'relationships' : 'other';
-        for (let bang = index_of_bytes(raw, '!'); bang !== -1; bang = index_of_bytes(raw, '!', bang + 1)) {
+        const worksheet = worksheet_by_path.get(part);
+        const kind: BackstopPartKind = worksheet !== undefined
+            ? { kind: 'worksheet', sheet: worksheet }
+            : part === 'xl/workbook.xml'
+                ? { kind: 'workbook', definedNames: find_first_element_by_local_name(raw, 'definedNames')?.element ?? null }
+                : part.endsWith('.rels') ? { kind: 'relationships' } : { kind: 'other' };
+        for (const bang of bang_positions(raw)) {
             const names = qualifier_names_before(raw, bang);
             if (names === undefined) continue;
             const indexes = names
                 .map((name) => index_by_name.get(name.toLowerCase()))
                 .filter((index): index is number => index !== undefined);
-            if (indexes.length === 0 || indexes.every((index) => found.has(index))) continue;
-            if (backstop_skips(raw, bang, kind)) continue;
             // A 3D span between two known sheets covers the sheets between them.
             const named = names.length === 2 && indexes.length === 2
                 ? Array.from({ length: Math.abs(indexes[1] - indexes[0]) + 1 }, (_, k) => Math.min(...indexes) + k)
                 : indexes;
+            if (named.length === 0 || named.every((index) => found.has(index))) continue;
+            if (backstop_skips(raw, bang, kind)) continue;
             for (const index of named) if (!found.has(index)) found.set(index, part);
         }
     }
