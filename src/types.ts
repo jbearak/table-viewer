@@ -83,6 +83,7 @@ import type {
     FormulaCalculationLayout,
     FormulaCalculationResult,
 } from './formula-calculation';
+import type { FormulaDivergenceReview } from './formula-divergence-review';
 
 export interface WorkbookData {
     sheets: SheetData[];
@@ -3408,6 +3409,8 @@ export type HostMessage =
         mappingGeneration: number;
     }
     | { type: 'formulaCalculation'; requestId: string; sourceGeneration: number; results: readonly FormulaCalculationResult[] }
+    /** Review Changes' divergence list; `null` when the request was refused. */
+    | { type: 'formulaDivergence'; requestId: string; sourceGeneration: number; review: FormulaDivergenceReview | null }
     /** Git compare mode: sparse positional diff for the same page a rowData
      *  answered. `rowStatus[i]` describes row `startRow + i`; `changedCells`
      *  carries original raw (`base`) and formatted text for differing cells. */
@@ -3633,6 +3636,17 @@ export type WebviewMessage =
         layouts?: readonly FormulaCalculationLayout[];
     }
     | { type: 'cancelFormulaCalculation'; requestId: string; sourceGeneration: number }
+    /**
+     * Review Changes asks which formulas might render differently from Excel
+     * for these layouts. `edits` are the calculator's prospective edits.
+     */
+    | {
+        type: 'requestFormulaDivergence';
+        requestId: string;
+        sourceGeneration: number;
+        edits: readonly FormulaCalculationEdit[];
+        layouts: readonly FormulaCalculationLayout[];
+    }
     | { type: 'stateChanged'; state: PerFileState; sourceGeneration: number; snapshotIdentity: WorkbookSnapshotIdentity }
     | { type: 'visibleRowChanged'; row: number }
     // `sheetIndex` is optional so a single-sheet source can omit it; the host

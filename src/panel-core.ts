@@ -44,6 +44,7 @@ import {
     type FormulaCalculationRequest,
     type FormulaCalculationResult,
 } from './formula-calculation';
+import { review_formula_divergence_cooperatively } from './formula-divergence-review';
 import { MAX_SHEET_ROWS, MAX_WORKBOOK_FORMULAS } from './spreadsheet-safety';
 import { MAX_PENDING_APPENDED_ROWS } from './pending-changes';
 
@@ -417,6 +418,8 @@ export class ViewerPanelCore {
     private readonly histogram_cache: HistogramLruCache;
     private readonly histogram_operations = new Map<string, TransformOperationToken>();
     private formula_calculation_operation = 0;
+    /** Bumped by each divergence review request, so only the latest answers. */
+    private formula_divergence_operation = 0;
     private active_formula_calculation?: {
         readonly requestId: string;
         readonly sourceGeneration: number;
@@ -897,6 +900,8 @@ export class ViewerPanelCore {
             await this.handle_formula_calculation(msg);
         } else if (msg.type === 'cancelFormulaCalculation') {
             this.cancel_formula_calculation(msg);
+        } else if (msg.type === 'requestFormulaDivergence') {
+            await this.handle_formula_divergence(msg);
         }
     }
 
@@ -1012,6 +1017,53 @@ export class ViewerPanelCore {
             requestId: msg.requestId,
             sourceGeneration: msg.sourceGeneration,
             results,
+        }, receiver_epoch);
+    }
+
+    private async handle_formula_divergence(
+        msg: Extract<WebviewMessage, { type: 'requestFormulaDivergence' }>,
+    ): Promise<void> {
+        const receiver_epoch = this.receiver_epoch;
+        if (msg.sourceGeneration !== this._source_generation) return;
+        this.formula_divergence_operation += 1;
+        const operation = this.formula_divergence_operation;
+        const sheets = this.source.meta().sheets;
+        const layouts = own_formula_calculation_layouts(msg.layouts, sheets);
+        const edits_valid = Array.isArray(msg.edits)
+            && msg.edits.length <= MAX_WORKBOOK_FORMULAS
+            && msg.edits.every((edit) => Number.isSafeInteger(edit?.sheetIndex)
+                && edit.sheetIndex >= 0
+                && edit.sheetIndex < sheets.length
+                && Number.isSafeInteger(edit.row) && edit.row >= 0
+                && Number.isSafeInteger(edit.column) && edit.column >= 0
+                && typeof edit.value === 'string'
+                && typeof edit.writesFormula === 'boolean')
+            && formula_calculation_edit_anchors_valid(msg.edits);
+        let review = null;
+        if (layouts !== undefined && edits_valid) {
+            try {
+                review = await review_formula_divergence_cooperatively(this.source, msg.edits, layouts, {
+                    isCancelled: () => this.disposed
+                        || operation !== this.formula_divergence_operation
+                        || receiver_epoch !== this.receiver_epoch
+                        || msg.sourceGeneration !== this._source_generation,
+                }) ?? undefined;
+            } catch {
+                review = null;
+            }
+            if (review === undefined) return;
+        }
+        if (
+            this.disposed
+            || operation !== this.formula_divergence_operation
+            || receiver_epoch !== this.receiver_epoch
+            || msg.sourceGeneration !== this._source_generation
+        ) return;
+        await this.post({
+            type: 'formulaDivergence',
+            requestId: msg.requestId,
+            sourceGeneration: msg.sourceGeneration,
+            review,
         }, receiver_epoch);
     }
 

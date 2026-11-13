@@ -788,6 +788,12 @@ export interface FormulaDivergenceFlag {
     readonly end: number;
     readonly axis: 'row' | 'column';
     readonly reason: FormulaDivergenceReason;
+    /**
+     * Indexes into the context's `worksheets` of the worksheets the flagged
+     * reference or construct names: the one a range reference targets, or
+     * each worksheet with a live change on `axis` that the construct touches.
+     */
+    readonly worksheets: readonly number[];
 }
 
 function axis_flags<Identity>(
@@ -837,19 +843,24 @@ export function formula_divergence_flags(
     const lex = formula_reference_tokens(text);
     const workbook = workbook_of(context);
     for (const { issue } of blocking_issues(lex.issues, workbook)) {
-        const touched = issue_worksheets(workbook, issue).map((index) => context.worksheets[index]);
+        const touched = issue_worksheets(workbook, issue);
         for (const axis of ['row', 'column'] as const) {
-            if (touched.some((worksheet) => (axis === 'row' ? worksheet.rows : worksheet.columns).hasLiveChange)) {
-                flags.push({ start: issue.start, end: issue.end, axis, reason: 'unadjustable' });
+            const changed = touched.filter((index) => {
+                const worksheet = context.worksheets[index];
+                return (axis === 'row' ? worksheet.rows : worksheet.columns).hasLiveChange;
+            });
+            if (changed.length > 0) {
+                flags.push({ start: issue.start, end: issue.end, axis, reason: 'unadjustable', worksheets: changed });
             }
         }
     }
     for (const reference of resolved_references(lex.references, anchors, context)) {
         const { token, worksheet, anchor } = reference;
         if (token.corners.length < 2) continue;
+        const worksheets = [context.worksheets.indexOf(worksheet)];
         const push = (axis: 'row' | 'column', reasons: readonly FormulaDivergenceReason[]) => {
             for (const reason of reasons) {
-                flags.push({ start: token.start, end: token.end, axis, reason });
+                flags.push({ start: token.start, end: token.end, axis, reason, worksheets });
             }
         };
         if (token.corners[0].row !== undefined) {
