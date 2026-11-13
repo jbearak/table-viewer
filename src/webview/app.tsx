@@ -6411,7 +6411,10 @@ export function App(): React.JSX.Element {
         // request goes ahead of the release the closing menu causes.
         const session_is_empty = edit_mode_ref.current
             && !edit_session_registry_ref.current!.has_dirty_entries()
-            && editing_ref.current?.has_uncommitted_changes() === false;
+            && editing_ref.current?.has_uncommitted_changes() === false
+            // Text typed into the append composer is unsaved work too.
+            && ![...append_composer_drafts_ref.current.values()].some(({ draft }) =>
+                draft.some((row) => Object.values(row).some((value) => value !== '')));
         request_excel_header(true, false, display_row, undefined, undefined, session_is_empty);
     }, [active_sheet_index, request_excel_header]);
 
