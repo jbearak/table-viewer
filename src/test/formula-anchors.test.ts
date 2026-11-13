@@ -1,10 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import {
     anchor_formula,
+    formula_blocks_structure,
     formula_divergence_flags,
     implicit_formula_anchors,
     render_formula,
     type FormulaAnchors,
+    type RenderFormulaResult,
 } from '../formula-anchors';
 import { a1_column_letters, formula_reference_tokens } from '../xlsx-formula';
 import {
@@ -20,16 +22,22 @@ import {
     type SheetModel,
 } from './helpers/array-anchor-axis';
 
+/** The rendered text; an `unrenderable` result fails the test. */
+function text_of(result: RenderFormulaResult): string {
+    if (result.kind !== 'rendered') throw new Error(`unrenderable: ${result.issue.kind}`);
+    return result.text;
+}
+
 /** Render `text` with no stored anchors on a one-sheet workbook. */
 function render_rows(text: string, rows: AxisModel, columns?: AxisModel): string {
-    return render_formula(text, undefined, anchor_context([sheet('Sheet1', rows, columns)]));
+    return text_of(render_formula(text, undefined, anchor_context([sheet('Sheet1', rows, columns)])));
 }
 
 /** Commit `text` against `before`, then render it against `after`. */
 function committed(text: string, before: readonly SheetModel[], after: readonly SheetModel[]): string {
     const result = anchor_formula(text, anchor_context(before));
     if (result.kind !== 'anchored') throw new Error(result.reason);
-    return render_formula(text, result.anchors, anchor_context(after));
+    return text_of(render_formula(text, result.anchors, anchor_context(after)));
 }
 
 function anchors_of(text: string, sheets: readonly SheetModel[]): FormulaAnchors | undefined {
@@ -48,7 +56,7 @@ describe('rendering implicit anchors', () => {
             sheet('Sheet1', append(axis_model(1, 10), 'x')),
             sheet('Sheet2', axis_model(0, 3, { order: [1, 2, 3, 'gone'], tombstones: ['gone'] })),
         ]);
-        expect(render_formula(text, undefined, context)).toBe(text);
+        expect(text_of(render_formula(text, undefined, context))).toBe(text);
     });
 
     it('reproduces the reviewed row-move sequences', () => {
@@ -123,16 +131,62 @@ describe('rendering implicit anchors', () => {
             sheet('Sheet1', four),
             sheet('Data', insert_before(four, 1, ['p'])),
         ]);
-        expect(render_formula('=Data!A1:Data!A2+data!B3+A1', undefined, context))
+        expect(text_of(render_formula('=Data!A1:Data!A2+data!B3+A1', undefined, context)))
             .toBe('=Data!A2:Data!A3+data!B4+A1');
-        expect(render_formula('=Missing!A1+A1', undefined, context)).toBe('=Missing!A1+A1');
+        expect(text_of(render_formula('=Missing!A1+A1', undefined, context))).toBe('=Missing!A1+A1');
+    });
+
+    it('never renders a formula half shifted around a construct it cannot adjust', () => {
+        const text = '=SUM(INDEX(A:A,MATCH("x",A:A,0)):B5)+C3';
+        const issue = { kind: 'rangeOperand', text: 'INDEX(A:A,MATCH("x",A:A,0)):B5' };
+        const shape = (result: RenderFormulaResult) => result.kind === 'rendered'
+            ? result
+            : { kind: result.issue.kind, text: text.slice(result.issue.start, result.issue.end) };
+        // A live change on the construct's worksheet: no text at all.
+        const inserted = anchor_context([sheet('Sheet1', insert_before(six, 1, ['p']))]);
+        expect(render_formula(text, undefined, inserted)).toMatchObject({ kind: 'unrenderable' });
+        expect(shape(render_formula(text, undefined, inserted))).toEqual(issue);
+        expect(formula_divergence_flags(text, undefined, inserted).map(
+            (flag) => `${text.slice(flag.start, flag.end)} ${flag.axis} ${flag.reason}`,
+        )).toEqual(['INDEX(A:A,MATCH("x",A:A,0)):B5 row unadjustable']);
+        // The source layout, or a change only on another worksheet: unchanged.
+        const source = anchor_context([sheet('Sheet1', six), sheet('Data', insert_before(six, 1, ['p']))]);
+        expect(render_formula(text, undefined, source)).toEqual({ kind: 'rendered', text });
+        expect(formula_divergence_flags(text, undefined, source)).toEqual([]);
+        // A construct that could name any worksheet blocks on any change.
+        const named = '=SUM(Total:B5)+C3';
+        expect(render_formula(named, undefined, source)).toMatchObject({ kind: 'unrenderable' });
+        expect(render_formula(named, undefined, anchor_context([sheet('Sheet1', six)])))
+            .toEqual({ kind: 'rendered', text: named });
+    });
+
+    it('reports a construct that blocks structure, with or without a workbook', () => {
+        const text = '=SUM(INDEX(Data!A:A,1):B5)';
+        const blocked = (workbook?: Parameters<typeof formula_blocks_structure>[1]) => {
+            const issue = formula_blocks_structure(text, workbook);
+            return issue && text.slice(issue.start, issue.end);
+        };
+        // Without a workbook: whether the formula lexes completely.
+        expect(blocked()).toBe('INDEX(Data!A:A,1):B5');
+        expect(formula_blocks_structure('SUM(A1:B2)+Data!C3')).toBeUndefined();
+        // XML formula text has no leading `=`.
+        expect(formula_blocks_structure('INDEX(A:A,1):B5')?.kind).toBe('rangeOperand');
+        const workbook = (changed: readonly string[]) => ({
+            names: ['Sheet1', 'Data', 'Other'],
+            formulaWorksheet: 0,
+            has_layout_change: (index: number) => changed.includes(['Sheet1', 'Data', 'Other'][index]),
+        });
+        expect(blocked(workbook([]))).toBeUndefined();
+        expect(blocked(workbook(['Other']))).toBeUndefined();
+        expect(blocked(workbook(['Data']))).toBe('INDEX(Data!A:A,1):B5');
+        expect(blocked(workbook(['Sheet1']))).toBe('INDEX(Data!A:A,1):B5');
     });
 
     it('never renders a CSV or TSV value', () => {
         const rows = insert_before(four, 1, ['p']);
         for (const format of ['csv', 'tsv'] as const) {
             const context = anchor_context([sheet('Sheet1', rows)], 0, format);
-            expect(render_formula('=A1', undefined, context)).toBe('=A1');
+            expect(text_of(render_formula('=A1', undefined, context))).toBe('=A1');
             expect(anchor_formula('=A1', context)).toEqual({ kind: 'anchored' });
             expect(() => render_formula('=A1', {
                 references: [{ start: 1, end: 3, corners: [{ row: { kind: 'edge' } }] }],
@@ -351,8 +405,8 @@ describe('path independence', () => {
             const steps = 1 + Math.floor(next() * 4);
             for (let index = 0; index < steps; index++) rows = step(rows, next, counter);
             const context = anchor_context([sheet('Sheet1', rows)]);
-            const rendered = render_formula(text, undefined, context)
-                + render_formula('=A3+SUM(A2:A4)', stored, context);
+            const rendered = text_of(render_formula(text, undefined, context))
+                + text_of(render_formula('=A3+SUM(A2:A4)', stored, context));
             const key = layout_key(rows);
             const previous = seen.get(key);
             if (previous !== undefined) {
@@ -500,7 +554,10 @@ describe('generated formulas with opaque spans', () => {
 
     interface Piece {
         readonly text: string;
-        /** Text after inserting one row above every body row. */
+        /**
+         * Text after inserting one row above every body row. A construct is
+         * never rendered, because the whole formula is `unrenderable`.
+         */
         readonly shifted: string;
         /** Offsets of the references the tokenizer must find, relative to the piece. */
         readonly references: readonly { readonly start: number; readonly end: number }[];
@@ -584,7 +641,7 @@ describe('generated formulas with opaque spans', () => {
                 const text = `${before}${second.text},0))${colon}B5`;
                 return {
                     text,
-                    shifted: `INDEX(${first.shifted},MATCH(${hidden.text},${second.shifted},0))${colon}B5`,
+                    shifted: text,
                     references: [
                         { start: 6, end: 6 + first.text.length },
                         { start: before.length, end: before.length + second.text.length },
@@ -598,7 +655,7 @@ describe('generated formulas with opaque spans', () => {
                 const text = `INDEX(${first.text},1)${colon}INDEX(${second.text},MATCH(${hidden.text},1,0))`;
                 return {
                     text,
-                    shifted: `INDEX(${first.shifted},1)${colon}INDEX(${second.text},MATCH(${hidden.text},1,0))`,
+                    shifted: text,
                     references: [{ start: 6, end: 6 + first.text.length }],
                     issueWorksheets: [first.sheet, second.sheet],
                 };
@@ -647,6 +704,8 @@ describe('generated formulas with opaque spans', () => {
         rows,
         insert_before(axis_model(0, 30), undefined, ['c']),
     )));
+    // The source layout on every worksheet.
+    const source = anchor_context(SHEETS.map((name) => sheet(name, axis_model(0, 100), axis_model(0, 30))));
     // A live change on both axes that moves no referenced row or column.
     const identity = context(insert_before(axis_model(0, 100), undefined, ['p']));
     // One row inserted above every body row.
@@ -669,8 +728,19 @@ describe('generated formulas with opaque spans', () => {
                     expect(issue.worksheets, text).toContain(worksheet);
                 }
             });
-            expect(render_formula(text, undefined, identity), text).toBe(text);
-            expect(render_formula(text, undefined, inserted), text).toBe(shifted);
+            // Without a layout change, every formula renders as written.
+            expect(render_formula(text, undefined, source), text).toEqual({ kind: 'rendered', text });
+            if (issues.length > 0) {
+                // A construct the anchors cannot adjust touches a changed
+                // worksheet, so no part of the formula is rendered.
+                expect(render_formula(text, undefined, identity), text)
+                    .toEqual({ kind: 'unrenderable', issue: lex.issues[0] });
+                expect(render_formula(text, undefined, inserted), text)
+                    .toEqual({ kind: 'unrenderable', issue: lex.issues[0] });
+                continue;
+            }
+            expect(render_formula(text, undefined, identity), text).toEqual({ kind: 'rendered', text });
+            expect(render_formula(text, undefined, inserted), text).toEqual({ kind: 'rendered', text: shifted });
         }
     });
 });

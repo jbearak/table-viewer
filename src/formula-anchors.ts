@@ -171,15 +171,27 @@ const COLUMN_AXIS: Axis<ColumnIdentity> = {
 
 // --- Anchoring --------------------------------------------------------------
 
+function resolve_name(
+    names: readonly string[],
+    formula_worksheet: number,
+    name: string | undefined,
+): number | undefined {
+    if (name === undefined) return formula_worksheet;
+    const index = names.findIndex((candidate) => candidate.localeCompare(
+        name, undefined, { sensitivity: 'accent' },
+    ) === 0);
+    return index < 0 ? undefined : index;
+}
+
 function resolve_worksheet_name(
     context: FormulaAnchorContext,
     name: string | undefined,
 ): number | undefined {
-    if (name === undefined) return context.formulaWorksheet;
-    const index = context.worksheets.findIndex((worksheet) => worksheet.name.localeCompare(
-        name, undefined, { sensitivity: 'accent' },
-    ) === 0);
-    return index < 0 ? undefined : index;
+    return resolve_name(
+        context.worksheets.map((worksheet) => worksheet.name),
+        context.formulaWorksheet,
+        name,
+    );
 }
 
 function has_live_change(worksheet: AnchorWorksheet): boolean {
@@ -294,12 +306,14 @@ function lands_on_pending(token: FormulaReferenceToken, worksheet: AnchorWorkshe
  * reference (`S1:Sheet3!A1`), so it spans every worksheet between them.
  */
 function issue_worksheets(
-    context: FormulaAnchorContext,
+    workbook: StructureCheckWorkbook,
     issue: FormulaReferenceIssue,
 ): readonly number[] {
-    const every = context.worksheets.map((_, index) => index);
+    const every = workbook.names.map((_, index) => index);
     if (issue.worksheets.length === 0) return every;
-    const resolved = issue.worksheets.map((name) => resolve_worksheet_name(context, name));
+    const resolved = issue.worksheets.map(
+        (name) => resolve_name(workbook.names, workbook.formulaWorksheet, name),
+    );
     if (issue.kind === 'threeDimensional') {
         const [first, last] = resolved;
         if (first === undefined || last === undefined) return every;
@@ -310,6 +324,61 @@ function issue_worksheets(
         return every.slice(Math.min(...known), Math.max(...known) + 1);
     }
     return known;
+}
+
+/** The workbook as {@link formula_blocks_structure} sees it. */
+export interface StructureCheckWorkbook {
+    /** Every worksheet name, in workbook order. */
+    readonly names: readonly string[];
+    /** Index into `names` of the formula's own worksheet. */
+    readonly formulaWorksheet: number;
+    /** Whether the worksheet at an index into `names` has a live layout change. */
+    has_layout_change(index: number): boolean;
+}
+
+interface BlockingIssue {
+    readonly issue: FormulaReferenceIssue;
+    /** A worksheet with a live layout change that the issue touches. */
+    readonly worksheet: number;
+}
+
+function workbook_of(context: FormulaAnchorContext): StructureCheckWorkbook {
+    return {
+        names: context.worksheets.map((worksheet) => worksheet.name),
+        formulaWorksheet: context.formulaWorksheet,
+        has_layout_change: (index) => has_live_change(context.worksheets[index]),
+    };
+}
+
+/** Every reported construct that touches a worksheet with a live layout change. */
+function blocking_issues(
+    issues: readonly FormulaReferenceIssue[],
+    workbook: StructureCheckWorkbook,
+): readonly BlockingIssue[] {
+    return issues.flatMap((issue) => {
+        const worksheet = issue_worksheets(workbook, issue)
+            .find((index) => workbook.has_layout_change(index));
+        return worksheet === undefined ? [] : [{ issue, worksheet }];
+    });
+}
+
+/**
+ * The first construct in a formula that a layout change could not adjust,
+ * such as `INDEX(A:A,1):B5`, a 3D reference, or a spill reference, or
+ * `undefined` when there is none. Rendering such a formula would shift some
+ * of its references and not others.
+ *
+ * Without `workbook`, every reported construct counts: the formula does not
+ * lex completely. With it, only a construct that touches a worksheet with a
+ * live layout change counts, including one whose worksheets cannot be
+ * resolved, which could be any worksheet. `text` may omit the leading `=`.
+ */
+export function formula_blocks_structure(
+    text: string,
+    workbook?: StructureCheckWorkbook,
+): FormulaReferenceIssue | undefined {
+    const { issues } = formula_reference_tokens(text);
+    return workbook === undefined ? issues[0] : blocking_issues(issues, workbook)[0]?.issue;
 }
 
 function refusal_reason(
@@ -337,12 +406,12 @@ function refusal_reason(
 export function anchor_formula(text: string, context: FormulaAnchorContext): AnchorFormulaResult {
     if (context.format !== 'xlsx' || !text.startsWith('=')) return { kind: 'anchored' };
     const lex = formula_reference_tokens(text);
-    for (const issue of lex.issues) {
-        const changed = issue_worksheets(context, issue)
-            .find((index) => has_live_change(context.worksheets[index]));
-        if (changed !== undefined) {
-            return { kind: 'refused', reason: refusal_reason(context, text, issue, changed) };
-        }
+    const blocking = blocking_issues(lex.issues, workbook_of(context))[0];
+    if (blocking !== undefined) {
+        return {
+            kind: 'refused',
+            reason: refusal_reason(context, text, blocking.issue, blocking.worksheet),
+        };
     }
     const references: FormulaReferenceAnchor[] = [];
     for (const token of lex.references) {
@@ -552,7 +621,7 @@ function check_stored_anchor(token: FormulaReferenceToken, anchor: FormulaRefere
  * stored anchor needs no rendering, so it is left out.
  */
 function resolved_references(
-    text: string,
+    tokens: readonly FormulaReferenceToken[],
     anchors: FormulaAnchors | undefined,
     context: FormulaAnchorContext,
 ): readonly ResolvedReference[] {
@@ -561,7 +630,7 @@ function resolved_references(
         stored.set(`${anchor.start}:${anchor.end}`, anchor);
     }
     const resolved: ResolvedReference[] = [];
-    for (const token of formula_reference_tokens(text).references) {
+    for (const token of tokens) {
         const key = `${token.start}:${token.end}`;
         const anchor = stored.get(key);
         if (anchor !== undefined) {
@@ -634,32 +703,46 @@ function render_reference(text: string, reference: ResolvedReference): string {
     return out + text.slice(cursor, token.end);
 }
 
+export type RenderFormulaResult =
+    | { readonly kind: 'rendered'; readonly text: string }
+    /**
+     * A construct that a layout change could not adjust touches a worksheet
+     * with one (see {@link formula_blocks_structure}). Rendering would shift
+     * some references and not others, so there is no text.
+     */
+    | { readonly kind: 'unrenderable'; readonly issue: FormulaReferenceIssue };
+
 /**
  * Render stored formula text for the current layouts. Only the coordinate
  * characters inside each reference change; `$` flags, qualifiers, external
  * and structured references, and everything else stay as written. On
  * worksheets without a live layout change and without stored anchors the
- * result is the input text exactly.
+ * result is the input text exactly. A formula is never partly rendered: one
+ * whose unadjustable construct touches a worksheet with a live layout
+ * change is `unrenderable`.
  */
 export function render_formula(
     text: string,
     anchors: FormulaAnchors | undefined,
     context: FormulaAnchorContext,
-): string {
+): RenderFormulaResult {
     if (context.format !== 'xlsx') {
         if (anchors !== undefined && anchors.references.length > 0) {
             throw new Error('A CSV or TSV value cannot carry formula anchors.');
         }
-        return text;
+        return { kind: 'rendered', text };
     }
-    if (!text.startsWith('=')) return text;
+    if (!text.startsWith('=')) return { kind: 'rendered', text };
+    const lex = formula_reference_tokens(text);
+    const blocking = blocking_issues(lex.issues, workbook_of(context))[0];
+    if (blocking !== undefined) return { kind: 'unrenderable', issue: blocking.issue };
     let out = '';
     let cursor = 0;
-    for (const reference of resolved_references(text, anchors, context)) {
+    for (const reference of resolved_references(lex.references, anchors, context)) {
         out += text.slice(cursor, reference.token.start) + render_reference(text, reference);
         cursor = reference.token.end;
     }
-    return cursor === 0 ? text : out + text.slice(cursor);
+    return { kind: 'rendered', text: cursor === 0 ? text : out + text.slice(cursor) };
 }
 
 // --- Divergence flags -------------------------------------------------------
@@ -676,16 +759,20 @@ export function render_formula(
  *   identity the layout no longer holds, such as a discarded Pending Appended
  *   Row;
  * - `displacedCorner`: a corner lies in a source run out of ascending source
- *   order with its nearest source neighbors, so a move carried it.
+ *   order with its nearest source neighbors, so a move carried it;
+ * - `unadjustable`: a construct no layout change can adjust, such as
+ *   `INDEX(A:A,1):B5`, touches a worksheet with a live layout change on this
+ *   axis, so the formula is `unrenderable`.
  */
 export type FormulaDivergenceReason =
     | 'cornersCrossed'
     | 'tombstoneCorner'
     | 'discardedCorner'
-    | 'displacedCorner';
+    | 'displacedCorner'
+    | 'unadjustable';
 
 export interface FormulaDivergenceFlag {
-    /** UTF-16 span of the range reference in the stored text. */
+    /** UTF-16 span of the range reference, or of the construct, in the stored text. */
     readonly start: number;
     readonly end: number;
     readonly axis: 'row' | 'column';
@@ -736,7 +823,17 @@ export function formula_divergence_flags(
 ): readonly FormulaDivergenceFlag[] {
     if (context.format !== 'xlsx' || !text.startsWith('=')) return [];
     const flags: FormulaDivergenceFlag[] = [];
-    for (const reference of resolved_references(text, anchors, context)) {
+    const lex = formula_reference_tokens(text);
+    const workbook = workbook_of(context);
+    for (const { issue } of blocking_issues(lex.issues, workbook)) {
+        const touched = issue_worksheets(workbook, issue).map((index) => context.worksheets[index]);
+        for (const axis of ['row', 'column'] as const) {
+            if (touched.some((worksheet) => (axis === 'row' ? worksheet.rows : worksheet.columns).hasLiveChange)) {
+                flags.push({ start: issue.start, end: issue.end, axis, reason: 'unadjustable' });
+            }
+        }
+    }
+    for (const reference of resolved_references(lex.references, anchors, context)) {
         const { token, worksheet, anchor } = reference;
         if (token.corners.length < 2) continue;
         const push = (axis: 'row' | 'column', reasons: readonly FormulaDivergenceReason[]) => {
