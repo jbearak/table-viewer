@@ -10525,8 +10525,10 @@ export function attach_viewer(
      * column ledger, bounded at `MAX_PENDING_COLUMNS` admissions per session,
      * and the reservation shares the worksheet's one slot with row
      * admissions: while either kind is unsettled the other is refused. The
-     * webview builds the blank columns itself (CSV and TSV columns have no
-     * format), so the reply carries the IDs and the Structural Basis.
+     * webview builds the blank columns itself, resolving an `.xlsx` column's
+     * format from its live neighbor (design "Formatting inheritance"; the
+     * writer reads that column's styles from the Structural Basis bytes), so
+     * the reply carries only the IDs and the Structural Basis.
      */
     async function admit_column_insert(
         message: Extract<WebviewMessage, { type: 'requestStructuralInsert' }>,

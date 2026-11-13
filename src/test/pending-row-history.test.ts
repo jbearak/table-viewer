@@ -9,6 +9,7 @@ import {
     delete_columns,
     delete_rows,
     insert_rows,
+    move_columns,
     type StructureResult,
     type WorksheetStructureContext,
 } from '../webview/pending-row-store';
@@ -805,6 +806,26 @@ describe('layout history arms', () => {
         const first_action = recorded({ label: 'Delete row', changes: [first.change] });
         const second_action = recorded({ label: 'Delete row', changes: [second.change] });
         // Row 2's delete is still pending, so the refusal stands.
+        expect(replay(second_action, 'undo', refused(second.next))?.conflicts).toEqual([refusal]);
+        // Undoing the only layout change answers it.
+        expect(replay(first_action, 'undo', refused(first.next))?.conflicts).toEqual([]);
+    });
+
+    it.each([
+        {
+            reason: 'unsupportedStructure' as const,
+            pendingRowIds: [],
+            tailRemovalIds: [],
+            message: "Can't insert, delete, or move columns on this sheet: it contains an Excel table.",
+        },
+        { reason: 'structuralBasisChanged' as const, pendingRowIds: [], tailRemovalIds: [] },
+    ])('keeps a worksheet-level $reason while only a column layout change remains', (refusal) => {
+        const refused = (changes: PendingStructuralChanges) => ({ ...changes, conflicts: [refusal] });
+        const first = planned(move_columns(state([]), structure_context(), [{ kind: 'source', sourceColumn: 1 }], { kind: 'source', sourceColumn: 0 }));
+        const second = planned(delete_columns(first.next, structure_context(), [{ kind: 'source', sourceColumn: 0 }]));
+        const first_action = recorded({ label: 'Move column', changes: [first.change] });
+        const second_action = recorded({ label: 'Delete column', changes: [second.change] });
+        // The column move is still pending, so the refusal stands.
         expect(replay(second_action, 'undo', refused(second.next))?.conflicts).toEqual([refusal]);
         // Undoing the only layout change answers it.
         expect(replay(first_action, 'undo', refused(first.next))?.conflicts).toEqual([]);

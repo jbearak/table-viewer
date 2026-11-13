@@ -2,9 +2,8 @@
 // source formulas render through the column layout after columns move and
 // are deleted, a formula committed in a Pending Column cell is anchored
 // through `committed_formula_fields` and follows the columns it names, and
-// CSV and TSV values are never anchored. Columns are CSV/TSV-only in step 8,
-// so this anchors formulas the way an `.xlsx` commit does, at the
-// format-agnostic layers step 9's `.xlsx` columns run through unchanged.
+// CSV and TSV values are never anchored. These run at the format-agnostic
+// layers; `xlsx-column-structure.test.ts` saves the result through `.xlsx`.
 import { describe, expect, it } from 'vitest';
 import {
     EMPTY_PENDING_STRUCTURAL_CHANGES,
