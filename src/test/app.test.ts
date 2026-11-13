@@ -5555,6 +5555,46 @@ describe('edit mode save exit', () => {
             button.textContent === 'Discard row and column changes on Sheet1')).toBe(true);
     });
 
+    it('shows an unsupportedStructure save refusal with its reason, naming the worksheet, with its discard', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1'], false), {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        await enter_edit_mode(post_message, 'unsupported-session');
+        const operation: CsvSaveOperation = {
+            editSessionId: 'unsupported-session',
+            saveRequestId: 'save-unsupported',
+            worksheets: [{ sheetIndex: 0, sheetName: 'Sheet1', edits: {}, dirtyEdits: {} }],
+        };
+        await dispatch_host_message({
+            type: 'saveOperationStarted',
+            lifecycle: { revision: 1, state: 'active', operation },
+        });
+        post_message.mockClear();
+        const message = "Can't save these row and column changes: they would split the conditional formatting on Sheet1!A2:A131 into more than 64 rules.";
+        await dispatch_host_message({
+            type: 'saveResult',
+            success: false,
+            lifecycle: { revision: 2, state: 'failed', operation },
+            rejection: {
+                reason: 'structuralConflict',
+                worksheetOperationIndex: 0,
+                structuralReason: 'unsupportedStructure',
+                pendingRowIds: [],
+                tailRemovalIds: [],
+                message,
+            },
+            basesValidated: true,
+        });
+        expect(post_message.mock.calls.some(([sent]) => sent?.type === 'showWarning')).toBe(false);
+        const review = document.querySelector('[aria-label="Pending rows that need review"]');
+        expect(review?.textContent).toContain(`Sheet1: ${message}`);
+        expect([...document.querySelectorAll('button')].some((button) =>
+            button.textContent === 'Discard row and column changes on Sheet1')).toBe(true);
+        expect([...document.querySelectorAll('button')].some((button) =>
+            button.textContent === 'Keep new rows at the end')).toBe(false);
+    });
+
     it('requests a row insert, installs a granted reply, and releases a stale one', async () => {
         const { post_message } = await render_app();
         const meta = make_meta(['Sheet1'], false);

@@ -189,6 +189,22 @@ describe('scan_xlsx_structural_support', () => {
         ]);
     });
 
+    it('groups every cfRule of one conditionalFormatting element into one relative rule', () => {
+        const [support] = scan({
+            sheets: [sheet('S', `${PLAIN_DATA}<conditionalFormatting sqref="A2:A9">`
+                + '<cfRule type="expression" dxfId="0" priority="1"><formula>A2&gt;B2</formula></cfRule>'
+                + '<cfRule type="expression" dxfId="0" priority="2"><formula>A2&lt;B3</formula></cfRule>'
+                + '</conditionalFormatting><conditionalFormatting sqref="B2"><cfRule type="expression" dxfId="0" priority="3"><formula>TRUE</formula></cfRule></conditionalFormatting>')],
+        });
+        expect_supported(support);
+        // The writer splits an element's rules together, so the webview's
+        // count must see them together.
+        expect(support.relativeRules).toEqual([
+            { kind: 'conditionalFormatting', sqref: 'A2:A9', formulas: ['A2>B2', 'A2<B3'] },
+            { kind: 'conditionalFormatting', sqref: 'B2', formulas: ['TRUE'] },
+        ]);
+    });
+
     it('ships the AutoFilter range and its filtered columns as worksheet columns', () => {
         const [filtered, plain] = scan({
             sheets: [

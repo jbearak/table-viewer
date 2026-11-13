@@ -22,6 +22,7 @@ import {
 } from '../types';
 import { MAX_PENDING_APPENDED_ROWS, type PendingAppendedRow, type StructuralBasis } from '../pending-changes';
 import { versioned_state_store } from './helpers/versioned-state-store';
+import { XLSX_STRUCTURE_UNREADABLE_MESSAGE } from '../structural-editing-capability';
 import * as vscode_mock from './mocks/vscode';
 import { fake_viewer_host } from './mocks/host-ports';
 
@@ -340,10 +341,12 @@ describe('insert admission', () => {
         expect(await off.insert({ requestId: 'off' })).toMatchObject({ granted: false });
         await off.dispose();
 
+        // Delimited bytes behind an `.xlsx` path: the package's structure
+        // can't be read, so its worksheets are unsupported with that reason.
         const xlsx = await open_viewer({ path: '/tmp/row-insert-host.xlsx' });
         expect(await xlsx.insert({ requestId: 'xlsx' })).toMatchObject({
             granted: false,
-            reason: 'Not available yet',
+            reason: XLSX_STRUCTURE_UNREADABLE_MESSAGE,
         });
         await xlsx.dispose();
 
