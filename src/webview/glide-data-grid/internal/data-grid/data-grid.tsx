@@ -92,6 +92,8 @@ export interface DataGridProps {
     readonly isResizing: boolean;
     readonly resizeColumn: number | undefined;
     readonly isDragging: boolean;
+    /** Fork addition: the drag in progress may not drop here; shows the not-allowed cursor. */
+    readonly isDragRefused?: boolean;
     readonly isFilling: boolean;
     readonly isFocused: boolean;
 
@@ -360,6 +362,7 @@ const DataGrid: React.ForwardRefRenderFunction<DataGridRef, DataGridProps> = (p,
         isResizing,
         resizeColumn: resizeCol,
         isDragging,
+        isDragRefused = false,
         isDraggable = false,
         allowResize,
         disabledRows,
@@ -983,7 +986,9 @@ const DataGrid: React.ForwardRefRenderFunction<DataGridRef, DataGridProps> = (p,
     }
     const canDrag = hoveredOnEdge ?? false;
     const cursor = isDragging
-        ? "grabbing"
+        ? isDragRefused
+            ? "not-allowed"
+            : "grabbing"
         : canDrag || isResizing
         ? "col-resize"
         : overFill || isFilling

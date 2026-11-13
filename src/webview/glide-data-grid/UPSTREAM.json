@@ -11,6 +11,7 @@
     "Stripped @linaria styled components: each became a plain element with a semantic gdg-* class; rules live in styles.css (imported by the app instead of dist/index.css).",
     "OverlayImageEditorProps kept as a standalone type (internal/data-grid-overlay-editor/overlay-image-editor-props.ts) because the editor-callback contract references it.",
     "index.ts re-created as the trimmed public facade; docs, stories and unused entry points omitted.",
-    "Subsequent commits add native merged-cell support; see git history of this directory."
+    "Subsequent commits add native merged-cell support; see git history of this directory.",
+    "Row moves (row and column structure design, delivery step 7): onRowMoved now reports a block and the row it lands before, `(rows: { start, end }, before)`. A marker drag arms only when a plain primary press lands inside the current contiguous row selection (and the new canMoveRows allows it); the armed press is withheld from the data editor and replayed on release if the pointer never passed the 20 px threshold, so drag-to-select, menus, touch, and resize from any other press are unchanged. The new onRowProposeMove refuses a drop target (not-allowed cursor via the new DataGrid isDragRefused prop). A drop shows a 2 px indicator between rows instead of upstream's live single-row reorder preview, and the pointer within one row height of the top or bottom edge auto-scrolls through useAutoscroll. Markers no longer draw a drag handle or select only through their checkbox when onRowMoved is set."
   ]
 }
