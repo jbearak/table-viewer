@@ -14,6 +14,7 @@
  */
 
 import {
+    anchor_worksheet,
     formula_anchor_context,
     formula_anchor_workbook,
     formula_needs_rendering,
@@ -38,6 +39,7 @@ import {
 } from '../formula-anchors';
 import {
     appended_rows,
+    pending_rows,
     pending_structure_carries_formula_anchors,
     type PendingFormulaReferenceBasis,
     type PendingStructuralChanges,
@@ -140,6 +142,47 @@ export function formula_display(
         };
     }
     return { kind: 'text', text: retarget(rendered.text) };
+}
+
+/**
+ * The workbook with `row_ids` appended to one worksheet's band, after its
+ * live Pending Appended Rows: what a formula composed into those rows anchors
+ * against once Append has admitted them.
+ */
+export function formula_workbook_with_appended_rows(
+    workbook: FormulaAnchorWorkbook,
+    sheet_index: number,
+    sheet: AnchorSheetMeta,
+    changes: PendingStructuralChanges,
+    row_ids: readonly string[],
+): FormulaAnchorWorkbook {
+    const current = workbook.worksheets[sheet_index];
+    if (current === undefined || row_ids.length === 0) return workbook;
+    const rows = pending_rows(changes);
+    const next_order = rows.reduce((maximum, row) => Math.max(maximum, row.createdOrder + 1), 0);
+    const worksheet = anchor_worksheet({
+        target: current.target,
+        name: current.name,
+        bodyStart: sheet_body_start(sheet),
+        sourceRowCount: sheet.sourceRowCount,
+        sourceColumnCount: sheet.columnCount,
+        changes: {
+            ...changes,
+            appendedRows: [
+                ...rows,
+                ...row_ids.map((id, index) => ({
+                    id,
+                    cells: {},
+                    formatTemplateId: '',
+                    createdOrder: next_order + index,
+                })),
+            ],
+        },
+    });
+    return {
+        ...workbook,
+        worksheets: workbook.worksheets.map((entry, index) => index === sheet_index ? worksheet : entry),
+    };
 }
 
 /** What a committed `.xlsx` formula stores beside its text. */

@@ -15,6 +15,7 @@ import { create_edit_session_store, type EditSessionStore } from '../webview/edi
 import {
     committed_formula_fields,
     formula_display,
+    formula_workbook_with_appended_rows,
     formula_result_key,
     needs_prospective_formula_request,
     prospective_formula_request,
@@ -121,6 +122,21 @@ describe('committed_formula_fields', () => {
             }],
         }]);
         expect(fields.kind === 'fields' && fields.formulaReferenceBases).toBeUndefined();
+    });
+
+    it('anchors a composed formula to a row of its own batch once Append admits it', () => {
+        // Composing rows 7 and 8 of Data: `=A7` in row 8 names the first composed row.
+        const extended = formula_workbook_with_appended_rows(
+            workbook(), 0, SHEETS[0], EMPTY_PENDING_STRUCTURAL_CHANGES, ['c1', 'c2'],
+        );
+        const fields = committed_formula_fields('=A7', true, extended, 0, () => BASES);
+        expect(fields.kind === 'fields' && fields.formulaAnchors?.references[0]?.corners[0]?.row).toEqual({
+            kind: 'identity',
+            row: { kind: 'pending', pendingRowId: 'c1' },
+        });
+        // Before admission the same text names no Pending Row, so only the bases are kept.
+        expect(committed_formula_fields('=A7', true, workbook(), 0, () => BASES))
+            .toEqual({ kind: 'fields', formulaReferenceBases: BASES });
     });
 
     it('refuses a formula the tokenizer cannot anchor on a restructured sheet', () => {

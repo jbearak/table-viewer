@@ -541,6 +541,7 @@ import {
     committed_formula_fields,
     formula_display,
     formula_result_key,
+    formula_workbook_with_appended_rows,
     type CommittedFormulaFields,
     type FormulaDisplay,
 } from './formula-anchor-model';
@@ -4326,7 +4327,8 @@ export function GridShell({
          * store mutation, so the host sees one structural payload rather than a
          * blank row followed by a filled one.
          */
-        seed_cells?: readonly Readonly<Record<number, PendingRowCell>>[],
+        seed_cells?: readonly Readonly<Record<number, PendingRowCell>>[]
+            | ((row_ids: readonly string[]) => readonly Readonly<Record<number, PendingRowCell>>[]),
     ) => {
         // Capture the activation before joining the serialization tail. The
         // first request's busy affordance may render while a second gesture is
@@ -4385,7 +4387,7 @@ export function GridShell({
                 admitted.formatTemplate,
                 issue_value_edit_order(),
                 admitted.appendBasis,
-                seed_cells,
+                typeof seed_cells === 'function' ? seed_cells(admitted.rowIds) : seed_cells,
             );
             if (!added) {
                 admitted.settle(false);
@@ -4639,11 +4641,50 @@ export function GridShell({
             refuse_formula(formula_refusal);
             return false;
         }
+        // A formula in the batch may name a row of the batch, which only has an
+        // identity once admitted: anchor again against the band that holds it.
+        const anchored_seed_cells = (row_ids: readonly string[]) => {
+            if (formula_workbook === undefined) return seed_cells;
+            const extended = formula_workbook_with_appended_rows(
+                formula_workbook,
+                sheet_index,
+                sheet_meta,
+                pending_store.snapshot(),
+                row_ids,
+            );
+            return seed_cells.map((cells) => {
+                const next: Record<number, PendingRowCell> = {};
+                for (const [column, cell] of Object.entries(cells)) {
+                    const fields = xlsx_edit_writes_formula(cell.value, cell.valueRuns?.runs)
+                        ? committed_formula_fields(
+                            cell.value,
+                            true,
+                            extended,
+                            sheet_index,
+                            formula_reference_bases === undefined
+                                ? undefined
+                                : () => formula_reference_bases(cell.value, rows.length),
+                        )
+                        : undefined;
+                    if (fields?.kind !== 'fields') {
+                        next[Number(column)] = cell;
+                        continue;
+                    }
+                    const {
+                        formulaAnchors: _anchors,
+                        formulaReferenceBases: _bases,
+                        ...rest
+                    } = cell;
+                    next[Number(column)] = { ...rest, ...committed_formula_cell_fields(fields) };
+                }
+                return next;
+            });
+        };
         const appended = await admit_pending_rows(
             rows.length,
             false,
             () => true,
-            seed_cells,
+            anchored_seed_cells,
         );
         // An envelope too large to hold the composed values now refuses the
         // whole gesture rather than staging blank rows beside a warning.
@@ -4664,8 +4705,11 @@ export function GridShell({
         edit_session_id,
         edit_syntax,
         formula_reference_bases,
+        formula_workbook,
         issue_value_edit_order,
         refuse_formula,
+        sheet_index,
+        sheet_meta,
         pending_display_row,
         pending_store,
         record_pending_row_gesture,
