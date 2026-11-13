@@ -40,6 +40,7 @@ import {
     type PendingChangesSaveReceipt,
     type StructuralSaveUnresolvedNotice,
     receipt_has_structure,
+    structure_row_mapper,
     type CsvSaveLifecycle,
     type CsvSaveOperation,
     type CsvSaveWorksheetOperation,
@@ -671,6 +672,13 @@ function ExternalChangeItem({
 }
 
 /** Webview root for snapshot metadata plus paginated row delivery. */
+/** A cursor on a source cell, by worksheet and source coordinates. */
+interface SourceCellFocus {
+    readonly sheetIndex: number;
+    readonly sourceRow: number;
+    readonly sourceColumn: number;
+}
+
 export function App(): React.JSX.Element {
     const [meta, set_meta] = useState<WorkbookMeta | null>(null);
     const [generation, set_generation] = useState(0);
@@ -687,6 +695,9 @@ export function App(): React.JSX.Element {
     // its display-row mapping before the transform is restored.
     const [grid_mount_epoch, set_grid_mount_epoch] = useState(0);
     const [active_sheet_index, set_active_sheet_index] = useState(0);
+    // Read when a save captures the cursor, from callbacks that may be stale.
+    const active_sheet_index_for_focus_ref = useRef(0);
+    active_sheet_index_for_focus_ref.current = active_sheet_index;
     // The sheet React has selected, kept separate from the host-authored
     // activeSheetIndex in state_ref. A refresh can clamp the rendered index
     // while the durable host value still names a removed sheet.
@@ -1828,6 +1839,7 @@ export function App(): React.JSX.Element {
             readonly pendingRowId: string;
             readonly sourceColumn: number;
         };
+        sourceCell?: SourceCellFocus;
         restoreFocus: boolean;
     } | null>(null);
     // GridShell blurs the active element once a save is admitted. Remember that
@@ -1841,8 +1853,15 @@ export function App(): React.JSX.Element {
             readonly pendingRowId: string;
             readonly sourceColumn: number;
         };
+        /** A cursor on a source cell, which a structural save renumbers. */
+        sourceCell?: SourceCellFocus;
         restoreFocus: boolean;
     } | null>(null);
+    /** The active grid's cursor on a source cell, with the sheet it is on. */
+    const active_source_cell_focus = (): SourceCellFocus | undefined => {
+        const cell = grid_focus_ref.current?.source_active_cell?.();
+        return cell === undefined ? undefined : { ...cell, sheetIndex: active_sheet_index_for_focus_ref.current };
+    };
     const saved_row_focus_sequence_ref = useRef(0);
     const pending_row_focus_sequence_ref = useRef(0);
     const save_projection_ref = useRef<CsvSaveProjection>(
@@ -2619,12 +2638,17 @@ export function App(): React.JSX.Element {
         const restore_focus = dialog_focus !== undefined
             ? dialog_focus.restoreFocus
             : grid_focus_ref.current?.has_focus() === true;
-        pending_save_grid_focus_ref.current = pending_cell !== undefined || restore_focus
+        const source_cell = dialog_focus !== undefined
+            ? dialog_focus.sourceCell
+            : active_source_cell_focus();
+        pending_save_grid_focus_ref.current = pending_cell !== undefined || source_cell !== undefined
+            || restore_focus
             ? {
                 editSessionId: operation.editSessionId,
                 saveRequestId: operation.saveRequestId,
                 restoreFocus: restore_focus,
                 ...(pending_cell === undefined ? {} : { pendingCell: pending_cell }),
+                ...(source_cell === undefined ? {} : { sourceCell: source_cell }),
             }
             : null;
         set_save_operation(operation);
@@ -2845,10 +2869,8 @@ export function App(): React.JSX.Element {
             // feed cross-save undo (design "History" and "Receipt").
             history_store_ref.current!.install_structural_save_barrier();
             // Selection by identity: a cursor on a Pending Row lands on the
-            // row it became. A cursor on a source cell is restored by the
-            // grid's own focus restore at its display position.
-            // TODO(structure step 5 UI): map a source-cell cursor through
-            // `structure_row_mapper` once the grid exposes its active source cell.
+            // row it became, and a cursor on a source cell on the saved
+            // coordinate the receipt maps it to.
             const pending_focus = pending_save_grid_focus_ref.current?.pendingCell;
             const placements = [
                 ...receipt.appendedRows,
@@ -2862,6 +2884,27 @@ export function App(): React.JSX.Element {
                 ? undefined
                 : placements.find((candidate) => candidate.pendingRowId === pending_focus.pendingRowId);
             const placed_sheet = placed === undefined ? undefined : worksheet_target_index(sheets, placed);
+            // A cursor on a source cell follows it to its saved coordinate.
+            const source_focus = pending_save_grid_focus_ref.current?.sourceCell;
+            const source_entry = source_focus === undefined
+                ? undefined
+                : receipt.structure?.find((candidate) =>
+                    worksheet_target_index(sheets, candidate) === source_focus.sheetIndex);
+            if (source_focus !== undefined && source_entry !== undefined && pending_focus === undefined) {
+                const row = structure_row_mapper(source_entry)(source_focus.sourceRow);
+                const column = source_focus.sourceColumn < source_entry.columnMap.length
+                    ? source_entry.columnMap[source_focus.sourceColumn] ?? null
+                    : source_focus.sourceColumn;
+                if (row !== null && column !== null) {
+                    set_saved_row_focus({
+                        sequence: ++saved_row_focus_sequence_ref.current,
+                        sheetIndex: source_focus.sheetIndex,
+                        sourceRow: row,
+                        sourceColumn: column,
+                        restoreFocus: pending_save_grid_focus_ref.current?.restoreFocus === true,
+                    });
+                }
+            }
             if (placed !== undefined && placed_sheet !== undefined && pending_focus !== undefined) {
                 const entry = receipt.structure?.find((candidate) =>
                     worksheet_target_index(sheets, candidate) === placed_sheet);
@@ -6534,10 +6577,12 @@ export function App(): React.JSX.Element {
             };
             pending_save_dialog_ref.current = request;
             const pending_cell = grid_focus_ref.current?.pending_active_cell?.();
+            const source_cell = active_source_cell_focus();
             pending_save_dialog_grid_focus_ref.current = {
                 editSessionId: csv_edit_session_id,
                 restoreFocus: grid_focus_ref.current?.has_focus() === true,
                 ...(pending_cell === undefined ? {} : { pendingCell: pending_cell }),
+                ...(source_cell === undefined ? {} : { sourceCell: source_cell }),
             };
             host_bridge.postMessage({
                 type: 'showSaveDialog',

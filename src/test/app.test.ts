@@ -63,6 +63,10 @@ const grid_shell_mock = vi.hoisted(() => ({
         pendingRowId: string;
         sourceColumn: number;
     } | undefined),
+    source_active_cell: vi.fn(() => undefined as {
+        sourceRow: number;
+        sourceColumn: number;
+    } | undefined),
     select_all: vi.fn(),
     copy_sheet: vi.fn(async () => {}),
     copy_selection: vi.fn(),
@@ -169,6 +173,7 @@ vi.mock('../webview/grid-shell', () => ({
                     return true;
                 },
                 pending_active_cell: () => grid_shell_mock.pending_active_cell(),
+                source_active_cell: () => grid_shell_mock.source_active_cell(),
             };
             props.grid_focus_ref.current = handle;
             return () => {
@@ -1015,6 +1020,8 @@ function cleanup() {
     grid_shell_mock.has_grid_focus.mockReturnValue(true);
     grid_shell_mock.pending_active_cell.mockReset();
     grid_shell_mock.pending_active_cell.mockReturnValue(undefined);
+    grid_shell_mock.source_active_cell.mockReset();
+    grid_shell_mock.source_active_cell.mockReturnValue(undefined);
     grid_shell_mock.select_all.mockReset();
     grid_shell_mock.copy_sheet.mockReset();
     grid_shell_mock.copy_selection.mockReset();
@@ -17779,5 +17786,71 @@ describe('auto-fit with Pending Columns', () => {
         expect(grid_shell_mock.latest_props!.auto_fit_active).toBe(true);
         await click_button('Auto-fit Columns');
         expect(store.snapshot().pendingColumns?.[0]?.viewerWidth).toBe(90);
+    });
+});
+
+describe('cursor after a structural save', () => {
+    it('moves a cursor on a source cell to the coordinate the receipt maps it to', async () => {
+        await render_app();
+        const meta = make_meta(['Sheet1'], false);
+        Object.assign(meta.sheets[0], { rowCount: 5, sourceRowCount: 5, columnCount: 2 });
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        await click_button('Edit');
+        await dispatch_host_message({
+            type: 'editSessionResult',
+            granted: true,
+            editSessionId: 'cursor-session',
+            sheetIndex: 0,
+            pendingChanges: {
+                sheetIndex: 0,
+                sheetName: 'Sheet1',
+                cells: { '0:0': { value: 'edited', base: 'a' } },
+                formatTemplates: [],
+                appendedRows: [],
+                tailRemovals: [],
+                conflicts: [],
+                rowLayout: {
+                    runs: [{ kind: 'source', start: 0, count: 5 }],
+                    removedSourceRows: [{ start: 1, count: 1 }],
+                    discardedPendingRows: [],
+                },
+                structuralBasis: {
+                    kind: 'delimited', byteLength: 1, digest: 'x', sourceRowCount: 5, sourceColumnCount: 2,
+                },
+            },
+        });
+        // The cursor is on source row 3, column B.
+        grid_shell_mock.source_active_cell.mockReturnValue({ sourceRow: 3, sourceColumn: 1 });
+        await act(async () => {
+            (grid_shell_mock.latest_props as unknown as GridShellProps).on_save_request?.();
+        });
+        const operation = grid_shell_mock.latest_props?.save_operation as CsvSaveOperation;
+        expect(operation).toBeDefined();
+        await dispatch_host_message({
+            type: 'saveResult',
+            success: true,
+            lifecycle: { revision: 1, state: 'succeeded', operation },
+            receipt: {
+                appendedRows: [],
+                removedSourceRows: [],
+                // Row 1 deleted, so rows 2-4 move up one; columns A and B swapped.
+                structure: [{
+                    sheetIndex: 0,
+                    sheetName: 'Sheet1',
+                    rowRuns: [{ from: 0, count: 1, to: 0 }, { from: 2, count: 3, to: 1 }],
+                    removedRows: [{ start: 1, count: 1 }],
+                    columnMap: [1, 0],
+                    insertedRows: [],
+                    insertedColumns: [],
+                }],
+            },
+        });
+        expect(grid_shell_mock.latest_props?.saved_row_focus).toMatchObject({
+            sheetIndex: 0,
+            sourceRow: 2,
+            sourceColumn: 0,
+        });
     });
 });

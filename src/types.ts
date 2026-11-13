@@ -2849,6 +2849,39 @@ export interface PendingChangesSaveReceipt {
 }
 
 /** Whether a receipt describes a save that inserted, deleted, or moved rows or columns. */
+/**
+ * Map an old canonical source row through a structure entry. Rows before the
+ * body map to themselves; removed rows and rows past the old body map to null.
+ */
+export function structure_row_mapper(entry: WorksheetStructureReceipt): (row: number) => number | null {
+    const runs = [...entry.rowRuns].sort((left, right) => left.from - right.from);
+    const removed = entry.removedRows;
+    let body_start = Infinity;
+    let body_end = -Infinity;
+    for (const run of runs) {
+        body_start = Math.min(body_start, run.from);
+        body_end = Math.max(body_end, run.from + run.count);
+    }
+    for (const run of removed) {
+        body_start = Math.min(body_start, run.start);
+        body_end = Math.max(body_end, run.start + run.count);
+    }
+    return (row) => {
+        if (!(row >= body_start)) return row;
+        if (row >= body_end) return null;
+        let low = 0;
+        let high = runs.length - 1;
+        while (low <= high) {
+            const middle = (low + high) >> 1;
+            const run = runs[middle]!;
+            if (row < run.from) high = middle - 1;
+            else if (row >= run.from + run.count) low = middle + 1;
+            else return run.to + (row - run.from);
+        }
+        return null;
+    };
+}
+
 export function receipt_has_structure(receipt: PendingChangesSaveReceipt | undefined): boolean {
     return (receipt?.structure?.length ?? 0) > 0;
 }

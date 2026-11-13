@@ -1256,6 +1256,11 @@ export interface GridFocusHandle {
         readonly pendingRowId: string;
         readonly sourceColumn: number;
     } | undefined;
+    /** Source cell under the active cell, captured before a structural save renumbers it. */
+    source_active_cell?(): {
+        readonly sourceRow: number;
+        readonly sourceColumn: number;
+    } | undefined;
 }
 
 export interface SavedRowFocus {
@@ -3332,6 +3337,17 @@ export function GridShell({
             sourceColumn: source_column,
         };
     }, [pending_projection, source_column_for_display]);
+    const source_active_cell = useCallback(() => {
+        const cell = grid_selection_ref.current.current?.cell;
+        if (cell === undefined) return undefined;
+        const projected = pending_projection.row_at(cell[1]);
+        if (projected?.kind !== 'source') return undefined;
+        const source_row = projected.identity?.sourceRow ?? get_source_row(projected.sourceDisplayRow);
+        const source_column = source_column_for_display(cell[0]);
+        return source_row === undefined || source_column === undefined
+            ? undefined
+            : { sourceRow: source_row, sourceColumn: source_column };
+    }, [get_source_row, pending_projection, source_column_for_display]);
     useLayoutEffect(() => {
         if (!grid_focus_ref) return;
         const handle: GridFocusHandle = {
@@ -3342,12 +3358,13 @@ export function GridShell({
             ),
             focus: focus_grid,
             pending_active_cell,
+            source_active_cell,
         };
         grid_focus_ref.current = handle;
         return () => {
             if (grid_focus_ref.current === handle) grid_focus_ref.current = null;
         };
-    }, [focus_grid, generation, grid_focus_ref, pending_active_cell]);
+    }, [focus_grid, generation, grid_focus_ref, pending_active_cell, source_active_cell]);
     // Populated once the truncated-cell tooltip helpers mount below; row menus
     // open from an earlier hook, so they clear via this ref rather than a TDZ.
     const hide_cell_tooltip_ref = useRef<() => void>(() => {});
