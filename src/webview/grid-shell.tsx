@@ -2067,6 +2067,24 @@ export function GridShell({
     // installed transform, or one still computing, keeps the band mode, where
     // Pending Row Removals stay in place too.
     const body_view_transformed = projected_source_rows || transform_pending;
+    // The live Pending Row for an ID, from the latest store snapshot. Indexed
+    // once per snapshot, so a lookup per painted row stays O(1).
+    const live_pending_rows_index_ref = useRef<{
+        readonly snapshot: PendingStructuralChanges;
+        readonly rows: ReadonlyMap<string, PendingAppendedRow>;
+    }>();
+    const live_pending_row_by_id = useCallback((id: string): PendingAppendedRow | undefined => {
+        const snapshot = pending_rows_ref.current;
+        let index = live_pending_rows_index_ref.current;
+        if (index?.snapshot !== snapshot) {
+            index = {
+                snapshot,
+                rows: new Map(stored_pending_rows(snapshot).map((row) => [row.id, row])),
+            };
+            live_pending_rows_index_ref.current = index;
+        }
+        return index.rows.get(id);
+    }, []);
     const pending_projection = useMemo(() => create_pending_row_projection({
         sourceDisplayRowCount: source_row_count,
         sourceRowAt: get_source_row,
@@ -2074,6 +2092,7 @@ export function GridShell({
         sourceRowCount: sheet_meta.sourceRowCount,
         changes: pending_rows,
         appendedRowAt: (index) => appended_rows(pending_rows_ref.current)[index],
+        pendingRowById: live_pending_row_by_id,
         removedSourceDisplayRows: removed_source_display_rows,
         projectedTailRemovalIds: projected_tail_removal_ids,
         bodyStart: body_start,

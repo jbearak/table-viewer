@@ -112,6 +112,13 @@ export interface PendingRowProjectionInput {
     readonly changes: PendingStructuralChanges;
     /** Latest row payload for a topology-stable index. */
     readonly appendedRowAt?: (index: number) => PendingAppendedRow | undefined;
+    /**
+     * Latest payload of a Pending Inserted Row, by ID. A rows-only change
+     * (a height, a highlight, a cell) keeps the topology and so this
+     * projection; without it inline rows would report the payload captured
+     * when the projection was built.
+     */
+    readonly pendingRowById?: (id: string) => PendingAppendedRow | undefined;
     /** Display positions occupied by visible tail removals in the source view. */
     readonly removedSourceDisplayRows?: readonly number[];
     /** Removal identities whose transformed inverse lookup has completed. */
@@ -475,7 +482,8 @@ function create_layout_row_projection(
             return {
                 kind: 'pending',
                 identity,
-                row: pending_by_id.get(identity.pendingRowId)!,
+                row: input.pendingRowById?.(identity.pendingRowId)
+                    ?? pending_by_id.get(identity.pendingRowId)!,
                 intendedPhysicalRow: body_start + index.body_index_of(identity)! - 1,
             };
         },

@@ -377,6 +377,23 @@ describe('projecting inserted rows', () => {
         });
         expect(band.inline_pending_display_rows(0, 9)).toEqual([]);
     });
+
+    it('reads an inline inserted row’s payload from the live store', () => {
+        const changes = insert(EMPTY, source(3), 'before', ['a']).outcome.next;
+        let live = pending_rows(changes)[0]!;
+        const projection = create_pending_row_projection({
+            sourceDisplayRowCount: 10,
+            sourceRowAt: (row) => row,
+            displayRowForSource: (row) => row,
+            sourceRowCount: 10,
+            changes,
+            bodyViewTransformed: false,
+            pendingRowById: (id) => id === 'a' ? live : undefined,
+        });
+        live = { ...live, viewerRowHeight: 50, highlights: { 0: 'pink' } };
+        const row = projection.row_at(3);
+        expect(row?.kind === 'pending' ? row.row : undefined).toBe(live);
+    });
 });
 
 describe('Keep new rows at the end', () => {

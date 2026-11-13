@@ -196,6 +196,23 @@ const resident_display_row = vi.hoisted(() => (source_row: number): number | und
     return undefined;
 });
 
+// Stable across renders, as the real loader's `useCallback`s are: a fresh
+// closure per render would rebuild every memo keyed on them and hide a memo
+// that misses a dependency.
+// Identity unless a test installs a permutation. See the knob's declaration:
+// with display === source, a display-keyed and a source-keyed implementation
+// cannot be told apart.
+const mock_get_source_row = vi.hoisted(() => (display_row: number) => (
+    grid_mock.source_row_for_display
+        ? grid_mock.source_row_for_display(display_row)
+        : display_row
+));
+const mock_get_display_row_for_source = vi.hoisted(() => (source_row: number) => (
+    additionally_loaded_source_rows.has(source_row)
+        ? additionally_loaded_source_rows.get(source_row)
+        : resident_display_row(source_row)
+));
+
 vi.mock('../webview/use-row-loader', () => ({
     use_row_loader: (
         _sheet: number,
@@ -211,14 +228,7 @@ vi.mock('../webview/use-row-loader', () => ({
             pin_rows: grid_mock.pin_rows,
             unpin_rows: grid_mock.unpin_rows,
             get_row: grid_mock.get_row,
-            // Identity unless a test installs a permutation. See the knob's
-            // declaration: with display === source, a display-keyed and a
-            // source-keyed implementation cannot be told apart.
-            get_source_row: (display_row: number) => (
-                grid_mock.source_row_for_display
-                    ? grid_mock.source_row_for_display(display_row)
-                    : display_row
-            ),
+            get_source_row: mock_get_source_row,
             // Residency as the real loader's source→page index defines it: a source
             // row is readable exactly when some display row in the window claims it.
             get_cell_raw_for_source: (source_row: number, col: number) => {
@@ -236,11 +246,7 @@ vi.mock('../webview/use-row-loader', () => ({
                 additionally_loaded_source_rows.has(source_row)
                 || resident_display_row(source_row) !== undefined
             ),
-            get_display_row_for_source: (source_row: number) => (
-                additionally_loaded_source_rows.has(source_row)
-                    ? additionally_loaded_source_rows.get(source_row)
-                    : resident_display_row(source_row)
-            ),
+            get_display_row_for_source: mock_get_display_row_for_source,
             get_compare_status: (row: number) => grid_mock.compare_status[row],
             get_compare_base: (row: number, col: number) =>
                 grid_mock.compare_base[`${row}:${col}`],
@@ -8986,6 +8992,24 @@ describe('row Insert in the row-gutter menu', () => {
         const damaged = grid_mock.update_cells.mock.calls.flatMap(([cells]) =>
             (cells as { cell: [number, number] }[]).map(({ cell }) => cell.join(',')));
         expect(damaged).toContain('0,1');
+    });
+
+    it('shows an inline inserted row’s new height and highlight after a rows-only change', async () => {
+        const { pending } = await insert_after_first();
+        const row_height = () => (grid_mock.props!.rowHeight as (row: number) => number)(1);
+        const default_height = row_height();
+        const inserted_id = pending.snapshot().appendedRows[0].id;
+        // A height and a highlight publish rows-kind changes: the row's payload
+        // moves, the topology does not, so the projection is not rebuilt.
+        await act(async () => {
+            pending.set_row_heights('session', new Set([inserted_id]), default_height + 40);
+            pending.set_highlights('session', new Set([inserted_id]), [0], 'pink');
+        });
+        expect(row_height()).toBe(default_height + 40);
+        const get_cell_content = grid_mock.props!.getCellContent as (cell: [number, number]) => {
+            themeOverride?: { bgCell?: string };
+        };
+        expect(get_cell_content([0, 1]).themeOverride?.bgCell).toBe(highlight_rgba('pink', false));
     });
 
     it('cancels an insert whose anchor was removed while the request was out', async () => {
