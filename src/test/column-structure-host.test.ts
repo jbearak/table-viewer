@@ -414,6 +414,30 @@ describe('Pending Columns reachable only from history', () => {
         await viewer.dispose();
     });
 
+    it('counts a retained column against the new session\'s 256 column admissions', async () => {
+        const viewer = await open_viewer();
+        const reply = await viewer.insert({ requestId: 'cols' });
+        await viewer.settle('cols', true);
+        const changes = inserted_changes(reply.columnIds!);
+        expect(await viewer.publish(changes)).toBe(true);
+        await retain(viewer, reply.columnIds!);
+        expect(await viewer.publish({})).toBe(true);
+        await new_session(viewer, 'again');
+        // The new session owns 256 column admissions: 253 inserted and
+        // undone, then 3 more.
+        const many = await viewer.insert({ requestId: 'many', count: 253 });
+        await viewer.settle('many', true);
+        expect(await viewer.publish(inserted_changes(many.columnIds!))).toBe(true);
+        expect(await viewer.publish({})).toBe(true);
+        const more = await viewer.insert({ requestId: 'more', count: 3 });
+        expect(more.granted).toBe(true);
+        await viewer.settle('more', true);
+        // Undo the Discard: one more owned ID would be the 257th.
+        expect(await prepare_replay(viewer, 'undo-discard', changes)).toBe(false);
+        expect(await viewer.publish(changes)).toBe(false);
+        await viewer.dispose();
+    });
+
     it('does not widen ownership: an ID history names but no session owned, or one history let go, stays refused', async () => {
         const viewer = await open_viewer();
         const reply = await viewer.insert({ requestId: 'cols' });

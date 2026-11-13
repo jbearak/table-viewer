@@ -3784,6 +3784,12 @@ export function attach_viewer(
             && !retained_pending_column_owned(target, id))) {
             return 'pending-column-not-owned-by-ledger';
         }
+        // A retained column re-enters the session's ledger on this publication,
+        // so it counts against the same 256 admissions a fresh insert does.
+        const restored = new Set(column_ids.filter((id) => ledger?.ownedColumnIds.has(id) !== true));
+        if ((ledger?.ownedColumnIds.size ?? 0) + restored.size > MAX_PENDING_COLUMNS) {
+            return 'too-many-pending-columns';
+        }
         if (
             changes.structuralBasis !== undefined
             && !structural_basis_authorized(target, changes.structuralBasis, ledger)
