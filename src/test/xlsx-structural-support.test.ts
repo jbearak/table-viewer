@@ -310,6 +310,50 @@ describe('scan_xlsx_structural_support', () => {
             expect(refused(support)).toMatchObject({ code: 'alternate-content', element: 'mc:AlternateContent' });
         });
 
+        it('refuses a sheet that another sheet\'s formula threshold reads', () => {
+            const [data, report, other] = scan({
+                sheets: [
+                    sheet('Data'),
+                    sheet('Report', `${PLAIN_DATA}<conditionalFormatting sqref="A1:A5"><cfRule type="colorScale" priority="1"><colorScale>`
+                        + '<cfvo type="min"/><cfvo type="formula" val="Data!$A$1"/><color rgb="FFF8696B"/><color rgb="FF63BE7B"/></colorScale></cfRule></conditionalFormatting>'),
+                    sheet('Other'),
+                ],
+            });
+            const reason = refused(data);
+            expect(reason).toMatchObject({ code: 'conditional-formatting-threshold', value: 'Data!$A$1', worksheet: 'Report' });
+            expect(reason.message).toBe("Can't insert, delete, or move rows on this sheet: the conditional formatting on Report!A1:A5 has a threshold formula that uses this sheet (Data!$A$1).");
+            expect(refused(report)).toMatchObject({ code: 'conditional-formatting-threshold' });
+            expect(refused(report)).not.toHaveProperty('worksheet');
+            expect_supported(other);
+        });
+
+        it('refuses a sheet that a data consolidation on another sheet reads', () => {
+            const [data, , other] = scan({
+                sheets: [
+                    sheet('Data'),
+                    sheet('Report', `${PLAIN_DATA}<dataConsolidate><dataRefs count="1"><dataRef ref="A1:B5" sheet="Data"/></dataRefs></dataConsolidate>`),
+                    sheet('Other'),
+                ],
+            });
+            const reason = refused(data);
+            expect(reason).toMatchObject({ code: 'unsupported-worksheet-child', element: 'dataConsolidate', worksheet: 'Report' });
+            expect(reason.message).toBe("Can't insert, delete, or move rows on this sheet: a data consolidation on Report uses data from this sheet.");
+            expect_supported(other);
+        });
+
+        it.each([
+            ['hyperlink', '<hyperlinks><hyperlink ref="A0" location="S!A1"/></hyperlinks>', 'A0'],
+            ['hyperlink', '<hyperlinks><hyperlink r:id="rId1"/></hyperlinks>', ''],
+            ['sortState', '<sortState ref="A1:B"/>', 'A1:B'],
+            ['sortCondition', '<autoFilter ref="A1:B5"><sortState ref="A2:B5"><sortCondition ref="Q"/></sortState></autoFilter>', 'Q'],
+            ['selection', '<sheetViews><sheetView workbookViewId="0"><selection activeCell="A1" sqref="A1 ZZZZ9"/></sheetView></sheetViews>', 'A1 ZZZZ9'],
+            ['pane', '<sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A0" state="frozen"/></sheetView></sheetViews>', 'A0'],
+            ['ignoredError', '<ignoredErrors><ignoredError sqref="" numberStoredAsText="1"/></ignoredErrors>', ''],
+        ])('refuses an unreadable <%s> range', (element, child, value) => {
+            const [support] = scan({ sheets: [sheet('S', `${PLAIN_DATA}${child}`)] });
+            expect(refused(support)).toMatchObject({ code: 'invalid-range', element, value });
+        });
+
         it('refuses a merged range it cannot read', () => {
             const [support] = scan({
                 sheets: [sheet('S', `${PLAIN_DATA}<mergeCells><mergeCell ref="A1:ZZZZ2"/></mergeCells>`)],
@@ -437,6 +481,104 @@ describe('scan_xlsx_structural_support', () => {
         });
     });
 
+    describe('parts on another sheet that read this one', () => {
+        const DRAWING_REL = (target = '../drawings/drawing1.xml') => ({ type: `${OD}/drawing`, target });
+        const WS_DR = 'xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"';
+        const report = (relationships: readonly Relationship[], body = PLAIN_DATA) => sheet('Report', body, { relationships });
+
+        it('refuses a sheet that a shape\'s text link reads', () => {
+            const [data, , other] = scan({
+                sheets: [sheet('Data'), report([DRAWING_REL()], `${PLAIN_DATA}<drawing r:id="rId1"/>`), sheet('Other')],
+                parts: {
+                    'xl/drawings/drawing1.xml': `<xdr:wsDr ${WS_DR}><xdr:twoCellAnchor><xdr:sp macro="" textlink="Data!$A$1"/></xdr:twoCellAnchor>`
+                        + `<xdr:twoCellAnchor><xdr:sp macro="" textlink=""/></xdr:twoCellAnchor></xdr:wsDr>`,
+                },
+            });
+            const reason = refused(data);
+            expect(reason).toMatchObject({ code: 'unsupported-part', partKind: 'drawing', part: 'xl/drawings/drawing1.xml', host: 'Report' });
+            expect(reason.message).toBe("Can't insert, delete, or move rows on this sheet: a shape on Report uses data from this sheet.");
+            expect_supported(other);
+        });
+
+        it('refuses a sheet that a drawing hyperlink points into', () => {
+            const [data, , other] = scan({
+                sheets: [sheet('Data'), report([DRAWING_REL()]), sheet('Other')],
+                parts: {
+                    'xl/drawings/drawing1.xml': `<xdr:wsDr ${WS_DR}/>`,
+                    'xl/drawings/_rels/drawing1.xml.rels': rels_xml([
+                        { type: `${OD}/hyperlink`, target: "#'Data'!A1", external: true },
+                        { type: `${OD}/hyperlink`, target: 'https://example.com', external: true },
+                        { type: `${OD}/image`, target: '../media/image1.png' },
+                    ]),
+                },
+            });
+            expect(refused(data)).toMatchObject({ code: 'unsupported-part', partKind: 'drawing', host: 'Report' });
+            expect_supported(other);
+        });
+
+        it('refuses every sheet when a drawing has a relationship it cannot classify', () => {
+            const supports = scan({
+                sheets: [sheet('Data'), report([DRAWING_REL()])],
+                parts: {
+                    'xl/drawings/drawing1.xml': `<xdr:wsDr ${WS_DR}/>`,
+                    'xl/drawings/_rels/drawing1.xml.rels': rels_xml([{ type: 'urn:example:drawing-thing', target: 'thing.xml' }]),
+                },
+            });
+            expect(refused(supports[0])).toMatchObject({ code: 'unsupported-part', partKind: 'unknown', relationshipType: 'urn:example:drawing-thing' });
+        });
+
+        it('refuses a sheet that a chart\'s user shape reads', () => {
+            const [data, , other] = scan({
+                sheets: [sheet('Data'), report([DRAWING_REL()]), sheet('Other')],
+                parts: {
+                    'xl/drawings/drawing1.xml': `<xdr:wsDr ${WS_DR}/>`,
+                    'xl/drawings/_rels/drawing1.xml.rels': rels_xml([{ type: `${OD}/chart`, target: '../charts/chart1.xml' }]),
+                    'xl/charts/chart1.xml': '<c:chartSpace xmlns:c="urn:c"><c:f>Report!$A$1</c:f></c:chartSpace>',
+                    'xl/charts/_rels/chart1.xml.rels': rels_xml([{ type: `${OD}/chartUserShapes`, target: '../drawings/drawing2.xml' }]),
+                    'xl/drawings/drawing2.xml': '<c:userShapes xmlns:c="urn:c" xmlns:cdr="urn:cdr"><cdr:relSizeAnchor><cdr:sp textlink="Data!$B$2"/></cdr:relSizeAnchor></c:userShapes>',
+                },
+            });
+            expect(refused(data)).toMatchObject({ code: 'unsupported-part', partKind: 'drawing', part: 'xl/drawings/drawing2.xml', host: 'Report' });
+            expect_supported(other);
+        });
+
+        it('refuses a sheet that a form control links to', () => {
+            const [vml_data, ctrl_data, , other] = scan({
+                sheets: [
+                    sheet('VmlData'),
+                    sheet('CtrlData'),
+                    report([
+                        { type: `${OD}/vmlDrawing`, target: '../drawings/vmlDrawing1.vml' },
+                        { type: `${OD}/ctrlProp`, target: '../ctrlProps/ctrlProp1.xml' },
+                    ]),
+                    sheet('Other'),
+                ],
+                parts: {
+                    'xl/drawings/vmlDrawing1.vml': '<xml xmlns:x="urn:schemas-microsoft-com:office:excel"><v:shape><x:ClientData ObjectType="Checkbox"><x:FmlaLink>VmlData!$A$1</x:FmlaLink></x:ClientData></v:shape></xml>',
+                    'xl/ctrlProps/ctrlProp1.xml': '<formControlPr xmlns="http://schemas.microsoft.com/office/spreadsheetml/2009/9/main" objectType="Drop" fmlaRange="CtrlData!$A$1:$A$5"/>',
+                },
+            });
+            expect(refused(vml_data)).toMatchObject({ code: 'unsupported-part', partKind: 'legacy-drawing', host: 'Report' });
+            expect(refusal(vml_data.rows).message).toBe("Can't insert, delete, or move rows on this sheet: a form control on Report uses data from this sheet.");
+            expect(refused(ctrl_data)).toMatchObject({ code: 'unsupported-part', partKind: 'control', host: 'Report' });
+            expect_supported(other);
+        });
+
+        it('refuses a sheet that an Excel table\'s column formula reads', () => {
+            const [data, , other] = scan({
+                sheets: [sheet('Data'), report([{ type: `${OD}/table`, target: '../tables/table1.xml' }]), sheet('Other')],
+                parts: {
+                    'xl/tables/table1.xml': `<table xmlns="${MAIN_NS}" id="1" name="T" ref="A1:B3"><tableColumns count="2"><tableColumn id="1" name="A"/>`
+                        + '<tableColumn id="2" name="B"><calculatedColumnFormula>Data!A2*2</calculatedColumnFormula></tableColumn></tableColumns></table>',
+                },
+            });
+            const reason = refused(data);
+            expect(reason).toMatchObject({ code: 'unsupported-part', partKind: 'table', host: 'Report' });
+            expect(reason.message).toBe("Can't insert, delete, or move rows on this sheet: an Excel table on Report uses data from this sheet.");
+            expect_supported(other);
+        });
+    });
+
     describe('array formulas and data tables', () => {
         it('refuses an array formula on the sheet, naming the cell', () => {
             const [support] = scan({
@@ -515,6 +657,59 @@ describe('scan_xlsx_structural_support', () => {
             });
             expect(refused(first)).toMatchObject({ code: 'array-formula', worksheet: 'Report' });
             expect(refused(third)).toMatchObject({ code: 'array-formula', worksheet: 'Report' });
+        });
+
+        it('reads numeric sheet names and numeric 3D endpoints as sheet qualifiers', () => {
+            const [year, , other] = scan({
+                sheets: [
+                    sheet('2024'),
+                    sheet('Report', '<sheetData><row r="2"><c r="D2"><f t="array" ref="D2">2024!A1:A3*2</f></c></row></sheetData>'),
+                    sheet('Other'),
+                ],
+            });
+            expect(refused(year)).toMatchObject({ code: 'array-formula', cell: 'D2', worksheet: 'Report' });
+            expect_supported(other);
+
+            const [first] = scan({
+                sheets: [
+                    sheet('First'),
+                    sheet('Report', '<sheetData><row r="2"><c r="D2"><f t="array" ref="D2">SUM(2023:2025!A1)</f></c></row></sheetData>'),
+                ],
+            });
+            expect(refused(first)).toMatchObject({ code: 'array-formula', worksheet: 'Report' });
+        });
+
+        it('reads formula text in CDATA and ignores comments', () => {
+            const [data, , other] = scan({
+                sheets: [
+                    sheet('Data'),
+                    sheet('Report', '<sheetData><row r="2"><c r="D2"><f t="array" ref="D2"><![CDATA[Data!A1:A3*2]]></f></c>'
+                        + '<c r="E2"><f t="array" ref="E2">A1<!-- Other!A1 --></f></c></row></sheetData>'),
+                    sheet('Other'),
+                ],
+            });
+            expect(refused(data)).toMatchObject({ code: 'array-formula', cell: 'D2', worksheet: 'Report' });
+            expect_supported(other);
+        });
+
+        it('reads chart and defined-name formulas in CDATA', () => {
+            const [data, chart_data] = scan({
+                sheets: [
+                    sheet('Data'),
+                    sheet('ChartData'),
+                    sheet('Report', `${PLAIN_DATA}<drawing r:id="rId1"/>`, { relationships: [{ type: `${OD}/drawing`, target: '../drawings/drawing1.xml' }] }),
+                ],
+                definedNames: '<definedName name="Window"><![CDATA[INDEX(Data!$A:$A,1):Data!$B$5]]></definedName>',
+                parts: {
+                    'xl/drawings/drawing1.xml': '<xdr:wsDr xmlns:xdr="urn:xdr"/>',
+                    'xl/drawings/_rels/drawing1.xml.rels': rels_xml([{ type: `${OD}/chart`, target: '../charts/chart1.xml' }]),
+                    'xl/charts/chart1.xml': '<c:chartSpace xmlns:c="urn:c"><c:f><![CDATA[ChartData!$A$1:$A$3]]></c:f></c:chartSpace>',
+                },
+            }, {
+                formula_is_anchorable: (formula) => formula.startsWith('INDEX(') ? unanchorable_formula_refusal(formula) : undefined,
+            });
+            expect(refused(data)).toMatchObject({ code: 'unanchorable-formula', formula: 'INDEX(Data!$A:$A,1):Data!$B$5', location: { kind: 'defined-name', name: 'Window' } });
+            expect(refused(chart_data)).toMatchObject({ code: 'unsupported-part', partKind: 'chart', host: 'Report' });
         });
 
         it('ignores references into another workbook', () => {
@@ -650,9 +845,11 @@ describe('worksheet child inventory', () => {
             .filter((row) => row.disposition === 'covered' || row.disposition === 'coordinate-free')
             .map((row) => row.element === 'sheetData'
                 ? PLAIN_DATA
-                : row.element === 'conditionalFormatting' || row.element === 'autoFilter'
-                    ? `<${row.element} ${row.element === 'autoFilter' ? 'ref' : 'sqref'}="A1"/>`
-                    : `<${row.element}/>`)
+                : row.element === 'conditionalFormatting'
+                    ? '<conditionalFormatting sqref="A1"/>'
+                    : row.element === 'autoFilter' || row.element === 'sortState'
+                        ? `<${row.element} ref="A1"/>`
+                        : `<${row.element}/>`)
             .join('');
         const [support] = scan({ sheets: [sheet('S', body)] });
         expect_supported(support);

@@ -41,6 +41,7 @@ import {
     is_self_closing,
     is_tag_boundary,
     opening_tag_text,
+    starts_with_bytes,
     utf8_text,
     worksheet_scan_input,
     type IgnorableRangeIndex,
@@ -109,6 +110,8 @@ export type StructuralRefusalReason =
         /** An inventoried worksheet child whose coordinates the writer does not shift. */
         readonly code: 'unsupported-worksheet-child';
         readonly element: RefusedWorksheetChild;
+        /** Set when the child is on another worksheet and reads this one. */
+        readonly worksheet?: string;
     }
     | {
         /** An `<ext>` whose URI is not in the reviewed coordinate-free list. */
@@ -158,6 +161,8 @@ export type StructuralRefusalReason =
         readonly code: 'conditional-formatting-threshold';
         readonly sqref: string;
         readonly value: string;
+        /** Set when the rule is on another worksheet and its threshold reads this one. */
+        readonly worksheet?: string;
     }
     | {
         /** A range attribute the writer would have to shift but cannot read. */
@@ -397,6 +402,28 @@ const WORKBOOK_RELATIONSHIPS: ReadonlyMap<string, RelationshipDisposition> = new
     ['http://schemas.microsoft.com/office/2011/relationships/timelineCache', refused('timeline-cache')],
 ]);
 
+const CHART_EX_RELATIONSHIP = 'http://schemas.microsoft.com/office/2014/relationships/chartEx';
+
+/** Drawing relationships that cannot name a cell; anything else refuses every sheet. */
+const DRAWING_RELATIONSHIPS_WITHOUT_REFERENCES: ReadonlySet<string> = new Set([
+    'image',
+    'diagramData',
+    'diagramLayout',
+    'diagramQuickStyle',
+    'diagramColors',
+    'http://schemas.microsoft.com/office/2007/relationships/diagramDrawing',
+    'http://schemas.microsoft.com/office/2007/relationships/hdphoto',
+]);
+
+/** Chart relationships that cannot name a cell; `chartUserShapes` is scanned as a drawing. */
+const CHART_RELATIONSHIPS_WITHOUT_REFERENCES: ReadonlySet<string> = new Set([
+    'image',
+    'themeOverride',
+    'package',
+    'http://schemas.microsoft.com/office/2011/relationships/chartStyle',
+    'http://schemas.microsoft.com/office/2011/relationships/chartColorStyle',
+]);
+
 function relationship_key(type: string): string {
     for (const base of OFFICE_DOCUMENT_RELATIONSHIP_BASES) {
         if (type.startsWith(base)) return type.slice(base.length);
@@ -441,6 +468,15 @@ const PART_CLAUSES: Readonly<Record<UnsupportedPartKind, string>> = {
     'unknown': '',
 };
 
+/** Parts on another sheet that refuse a worksheet because they read it. */
+const LINKED_PART_SUBJECTS: Partial<Record<UnsupportedPartKind, string>> = {
+    'chart': 'a chart',
+    'drawing': 'a shape',
+    'legacy-drawing': 'a form control',
+    'control': 'a form control',
+    'table': 'an Excel table',
+};
+
 function location_text(location: StructuralFormulaLocation | undefined): string {
     if (location === undefined) return 'a formula';
     switch (location.kind) {
@@ -460,6 +496,10 @@ function refusal_clause(reason: StructuralRefusalReason): string {
         case 'unknown-worksheet-child':
             return `it contains content Table Viewer doesn't recognize (<${reason.element}>)`;
         case 'unsupported-worksheet-child':
+            if (reason.worksheet !== undefined) {
+                const subject = reason.element === 'dataConsolidate' ? 'a data consolidation' : `<${reason.element}>`;
+                return `${subject} on ${reason.worksheet} uses data from this sheet`;
+            }
             return INVENTORY_BY_ELEMENT.get(reason.element)?.refusal ?? `it contains <${reason.element}>`;
         case 'unsupported-extension': {
             const known = KNOWN_EXTENSIONS.get(reason.uri.toUpperCase());
@@ -475,8 +515,9 @@ function refusal_clause(reason: StructuralRefusalReason): string {
                     ? `it has related content Table Viewer doesn't recognize (${reason.relationshipType})`
                     : `the workbook has content Table Viewer doesn't recognize (${reason.relationshipType})`;
             }
-            if (reason.partKind === 'chart' && reason.host !== undefined) {
-                return `a chart on ${reason.host} uses data from this sheet`;
+            const subject = reason.scope === 'workbook' ? LINKED_PART_SUBJECTS[reason.partKind] : undefined;
+            if (subject !== undefined) {
+                return `${subject}${reason.host === undefined ? '' : ` on ${reason.host}`} uses data from this sheet`;
             }
             return PART_CLAUSES[reason.partKind];
         }
@@ -492,7 +533,9 @@ function refusal_clause(reason: StructuralRefusalReason): string {
             return `Table Viewer can't adjust ${location_text(reason.location)}`
                 + (reason.construct === undefined ? '' : ` (${reason.construct})`);
         case 'conditional-formatting-threshold':
-            return `the conditional formatting on ${reason.sqref} has a threshold formula Table Viewer can't adjust (${reason.value})`;
+            return reason.worksheet === undefined
+                ? `the conditional formatting on ${reason.sqref} has a threshold formula Table Viewer can't adjust (${reason.value})`
+                : `the conditional formatting on ${qualified(reason.worksheet, reason.sqref)} has a threshold formula that uses this sheet (${reason.value})`;
         case 'invalid-range':
             return `it has a range Table Viewer can't read in <${reason.element}> (${reason.value})`;
         case 'unwritable-worksheet':
@@ -567,6 +610,17 @@ function identifier_end(formula: string, offset: number): number {
     return end;
 }
 
+/**
+ * End of an unquoted worksheet name. The worksheet-reference grammar is not
+ * the defined-name grammar: a sheet name may begin with a digit (`2024!A1`),
+ * so this accepts any identifier character in the first position too.
+ */
+function sheet_name_end(formula: string, offset: number): number {
+    let end = offset;
+    while (end < formula.length && IDENTIFIER_PART.test(formula[end])) end += 1;
+    return end;
+}
+
 interface Qualifier {
     readonly names: readonly string[];
     readonly length: number;
@@ -585,13 +639,13 @@ function qualifier_at(formula: string, offset: number): Qualifier | undefined {
         }
         return undefined;
     }
-    const first_end = identifier_end(formula, offset);
+    const first_end = sheet_name_end(formula, offset);
     if (first_end === offset) return undefined;
     if (formula[first_end] === '!') {
         return { names: [formula.slice(offset, first_end)], length: first_end + 1 - offset };
     }
     if (formula[first_end] === ':') {
-        const second_end = identifier_end(formula, first_end + 1);
+        const second_end = sheet_name_end(formula, first_end + 1);
         if (second_end > first_end + 1 && formula[second_end] === '!') {
             return {
                 names: [formula.slice(offset, first_end), formula.slice(first_end + 1, second_end)],
@@ -729,6 +783,8 @@ function resolve_target(source_part: string, target: string): string {
 
 interface PartRelationship {
     readonly type: string;
+    /** The target as written, for hyperlink locations such as `#Data!A1`. */
+    readonly target: string;
     readonly part: string;
     readonly external: boolean;
 }
@@ -738,6 +794,7 @@ function relationships_of(zip: ZipPackage, part: string): PartRelationship[] {
     if (xml === null) return [];
     return [...parse_relationships(xml).values()].map((relationship) => ({
         type: relationship.type,
+        target: relationship.target,
         part: relationship.external ? relationship.target : resolve_target(part, relationship.target),
         external: relationship.external,
     }));
@@ -803,8 +860,51 @@ function has_local_name(xml: Uint8Array, start: number, name_end: number, wanted
     return true;
 }
 
+/**
+ * The character data an XML parser reports for `[from, to)`: text with
+ * entities decoded, CDATA contents verbatim, and comments, processing
+ * instructions, and any element tags dropped. Every formula or reference read
+ * from element content goes through this, so `<![CDATA[Data!A1]]>` is read as
+ * `Data!A1` and a comment inside `<f>` is not read as formula text.
+ */
+function xml_character_data(xml: Uint8Array, from: number, to: number): string {
+    let out = '';
+    let position = from;
+    while (position < to) {
+        const at = index_of_bytes(xml, '<', position, to);
+        const text_end = at === -1 ? to : at;
+        if (text_end > position) out += decode_xml(utf8_text(xml, position, text_end));
+        if (at === -1) break;
+        let close: string;
+        let content_start = -1;
+        if (starts_with_bytes(xml, '<![CDATA[', at)) {
+            close = ']]>';
+            content_start = at + 9;
+        } else if (starts_with_bytes(xml, '<!--', at)) {
+            close = '-->';
+        } else if (starts_with_bytes(xml, '<?', at)) {
+            close = '?>';
+        } else {
+            const tag_end = find_tag_end(xml, at, to);
+            position = tag_end === -1 ? to : tag_end + 1;
+            continue;
+        }
+        const end = index_of_bytes(xml, close, at + 2, to);
+        const stop = end === -1 ? to : end;
+        if (content_start !== -1 && stop > content_start) out += utf8_text(xml, content_start, stop);
+        position = end === -1 ? to : end + close.length;
+    }
+    return out;
+}
+
 function element_text(xml: Uint8Array, element: Span): string {
-    return decode_xml(utf8_text(xml, element.inner_start, element.inner_end));
+    return xml_character_data(xml, element.inner_start, element.inner_end);
+}
+
+function descendants_named(xml: Uint8Array, parent: Span, wanted: string): QualifiedElementSpan[] {
+    return direct_child_elements(xml, parent).flatMap((child) => local_name(child.name) === wanted
+        ? [child]
+        : descendants_named(xml, child.element, wanted));
 }
 
 function children_named(xml: Uint8Array, parent: Span, wanted: string): QualifiedElementSpan[] {
@@ -841,6 +941,18 @@ interface ScannedWorksheet {
     readonly cellFormulas: readonly CellFormula[];
     /** CF, DV, and internal hyperlink formulas (texts without the location's worksheet). */
     readonly otherFormulas: readonly { readonly location: StructuralFormulaLocation; readonly text: string }[];
+    /**
+     * References held in content the writer does not rewrite (formula
+     * thresholds, data consolidation sources). They refuse this worksheet
+     * already; each also refuses every other worksheet it may reference.
+     */
+    readonly foreignReferences: readonly ForeignReference[];
+}
+
+interface ForeignReference {
+    readonly targets: FormulaTargets;
+    /** The reason given to a referenced worksheet; `worksheet` is filled in then. */
+    readonly reason: Extract<StructuralRefusalReason, { code: 'conditional-formatting-threshold' | 'unsupported-worksheet-child' }>;
 }
 
 const NUMERIC_LITERAL = /^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$/;
@@ -954,7 +1066,7 @@ function scan_cell_formulas(xml: Uint8Array, sheet_data: Span): CellFormula[] {
             const name = utf8_text(xml, tag.start + 1, tag.nameEnd);
             const close = end_tag_after(xml, name, tag.tagEnd + 1, ranges, to);
             if (close !== null) {
-                const value = decode_xml(utf8_text(xml, tag.tagEnd + 1, close[0]));
+                const value = xml_character_data(xml, tag.tagEnd + 1, close[0]);
                 if (value !== '') text = value;
             }
         }
@@ -991,6 +1103,45 @@ function nested_extension_refusal(
     return undefined;
 }
 
+/**
+ * Range attributes the coverage table shifts, by element. The merge, CF, DV,
+ * and AutoFilter ranges are read (and validated) where they are collected.
+ */
+const COVERED_RANGE_ATTRIBUTES: ReadonlyMap<string, readonly {
+    readonly attribute: string;
+    readonly list: boolean;
+    readonly required: boolean;
+}[]> = new Map([
+    ['hyperlink', [{ attribute: 'ref', list: false, required: true }]],
+    ['sortState', [{ attribute: 'ref', list: false, required: true }]],
+    ['sortCondition', [{ attribute: 'ref', list: false, required: true }]],
+    ['sheetView', [{ attribute: 'topLeftCell', list: false, required: false }]],
+    ['pane', [{ attribute: 'topLeftCell', list: false, required: false }]],
+    ['selection', [
+        { attribute: 'activeCell', list: false, required: false },
+        { attribute: 'sqref', list: true, required: false },
+    ]],
+    ['ignoredError', [{ attribute: 'sqref', list: true, required: true }]],
+]);
+
+/** The first covered range attribute in one worksheet child that the writer could not read. */
+function covered_range_refusal(
+    xml: Uint8Array,
+    child: QualifiedElementSpan,
+): StructuralRefusalReason | undefined {
+    const { element } = child;
+    const ranges = ignorable_ranges(xml, element.start, element.end);
+    for (const tag of start_tags(xml, element.start, element.end, ranges)) {
+        const local = local_name(utf8_text(xml, tag.start + 1, tag.nameEnd));
+        for (const { attribute, list, required } of COVERED_RANGE_ATTRIBUTES.get(local) ?? []) {
+            const value = get_tag_attr(xml, tag.start, tag.tagEnd + 1, attribute);
+            if (value === null ? !required : list ? valid_sqref(value) : valid_range(value)) continue;
+            return { code: 'invalid-range', element: local, value: value ?? '' };
+        }
+    }
+    return undefined;
+}
+
 function worksheet_relationship_refusal(
     relationships: readonly PartRelationship[],
 ): StructuralRefusalReason | undefined {
@@ -1014,7 +1165,7 @@ function scan_worksheet(
     path: string,
 ): ScannedWorksheet {
     const empty = {
-        name, path, merges: [], relativeRules: [], cellFormulas: [], otherFormulas: [],
+        name, path, merges: [], relativeRules: [], cellFormulas: [], otherFormulas: [], foreignReferences: [],
     };
     const raw = read_bytes(zip, path);
     if (raw === null) {
@@ -1043,6 +1194,7 @@ function scan_worksheet(
     let auto_filter: StructuralAutoFilter | undefined;
     const relative_rules: StructuralRelativeRule[] = [];
     const other_formulas: { location: StructuralFormulaLocation; text: string }[] = [];
+    const foreign_references: ForeignReference[] = [];
     if (root !== null) {
         const root_open = opening_tag_text(xml, root.element);
         for (const child of direct_child_elements(xml, root.element)) {
@@ -1059,11 +1211,32 @@ function scan_worksheet(
                 continue;
             }
             if (row.disposition === 'refused') {
-                consider({ code: 'unsupported-worksheet-child', element: row.element as RefusedWorksheetChild });
+                const reason = { code: 'unsupported-worksheet-child', element: row.element as RefusedWorksheetChild } as const;
+                consider(reason);
+                if (local === 'dataConsolidate') {
+                    // Each source names its sheet or a defined name; one without
+                    // either is on this sheet, which already refuses.
+                    for (const source of descendants_named(xml, child.element, 'dataRef')) {
+                        const open = opening_tag_text(xml, source.element);
+                        const sheet = get_attr(open, 'sheet');
+                        const named = get_attr(open, 'name');
+                        if (get_attr(open, 'r:id') !== null) continue; // another workbook
+                        foreign_references.push({
+                            targets: {
+                                sheets: new Set(sheet === null ? [] : [sheet.toLowerCase()]),
+                                everySheet: false,
+                                unqualified: false,
+                                identifiers: new Set(named === null ? [] : [named.toLowerCase()]),
+                            },
+                            reason,
+                        });
+                    }
+                }
                 continue;
             }
             consider(nested_extension_refusal(xml, child));
             if (local === 'sheetData') continue;
+            consider(covered_range_refusal(xml, child));
 
             if (local === 'autoFilter') {
                 const ref = get_attr(child_open, 'ref') ?? '';
@@ -1103,7 +1276,9 @@ function scan_worksheet(
                         const type = get_tag_attr(xml, tag.start, tag.tagEnd + 1, 'type');
                         const value = get_tag_attr(xml, tag.start, tag.tagEnd + 1, 'val');
                         if (type === 'formula' || (value !== null && !NUMERIC_LITERAL.test(value.trim()))) {
-                            consider({ code: 'conditional-formatting-threshold', sqref, value: value ?? '' });
+                            const reason = { code: 'conditional-formatting-threshold', sqref, value: value ?? '' } as const;
+                            consider(reason);
+                            foreign_references.push({ targets: formula_targets(value ?? ''), reason });
                         }
                     }
                     const formulas = children_named(xml, rule.element, 'formula')
@@ -1154,6 +1329,7 @@ function scan_worksheet(
         relativeRules: relative_rules,
         cellFormulas: cell_formulas,
         otherFormulas: other_formulas,
+        foreignReferences: foreign_references,
     };
 }
 
@@ -1209,7 +1385,6 @@ function scan_workbook_parts(
     const refusals: WorkbookRefusals = { byWorksheet: new Map(), byNameReference: [] };
     let every: StructuralRefusalReason | undefined;
     const all_sheets = worksheets.map((sheet) => sheet.name.toLowerCase());
-    const sheet_names_by_path = new Map(worksheets.map((sheet) => [sheet.path, sheet.name]));
     const chartsheet_paths: string[] = [];
 
     for (const relationship of relationships_of(zip, 'xl/workbook.xml')) {
@@ -1265,39 +1440,131 @@ function scan_workbook_parts(
         }
     }
 
-    const hosts: { readonly path: string; readonly name?: string }[] = [
-        ...worksheets.map((sheet) => ({ path: sheet.path, name: sheet.name })),
-        ...chartsheet_paths.map((path) => ({ path, name: undefined })),
-    ];
-    const seen_charts = new Set<string>();
-    for (const host of hosts) {
-        for (const drawing of relationships_of(zip, host.path)) {
-            if (drawing.external || relationship_key(drawing.type) !== 'drawing') continue;
-            for (const chart of relationships_of(zip, drawing.part)) {
-                const key = relationship_key(chart.type);
-                if (chart.external || (key !== 'chart' && key !== 'http://schemas.microsoft.com/office/2014/relationships/chartEx')) continue;
-                if (seen_charts.has(chart.part)) continue;
-                seen_charts.add(chart.part);
-                const raw = read_bytes(zip, chart.part);
-                if (raw === null) continue;
-                const reason: StructuralRefusalReason = {
-                    code: 'unsupported-part',
-                    partKind: 'chart',
-                    part: chart.part,
-                    relationshipType: chart.type,
-                    scope: 'workbook',
-                    ...(host.name === undefined ? {} : { host: sheet_names_by_path.get(host.path) ?? host.name }),
-                };
-                const ranges = ignorable_ranges(raw, 0, raw.length);
-                for (const tag of start_tags(raw, 0, raw.length, ranges)) {
-                    if (!has_local_name(raw, tag.start, tag.nameEnd, 'f')) continue;
-                    if (is_self_closing(raw, tag.start, tag.tagEnd)) continue;
-                    const name = utf8_text(raw, tag.start + 1, tag.nameEnd);
-                    const close = end_tag_after(raw, name, tag.tagEnd + 1, ranges);
-                    if (close === null) continue;
-                    const text = decode_xml(utf8_text(raw, tag.tagEnd + 1, close[0]));
-                    add_worksheet_refusal(refusals, formula_targets(text), reason, all_sheets);
+    // Parts that refuse their own sheet can also read other sheets: charts,
+    // shape text links and hyperlinks in drawings, form-control links in VML
+    // and control properties, and table column formulas. Each such reference
+    // refuses the sheets it names. Unqualified references name the host,
+    // which already refuses, except in charts, where the older conservative
+    // reading (every sheet) is kept.
+    const scanned_parts = new Set<string>();
+    const refuse = (
+        text: string,
+        reason: StructuralRefusalReason,
+        host_key: string | undefined,
+    ): void => {
+        if (text.trim() === '') return;
+        const targets = formula_targets(text);
+        const scoped = host_key !== undefined && targets.unqualified && !targets.everySheet
+            ? { ...targets, unqualified: false, sheets: new Set([...targets.sheets, host_key]) }
+            : targets;
+        add_worksheet_refusal(refusals, scoped, reason, all_sheets);
+    };
+    const part_reason = (
+        partKind: UnsupportedPartKind,
+        relationship: PartRelationship,
+        host: string | undefined,
+    ): StructuralRefusalReason => ({
+        code: 'unsupported-part',
+        partKind,
+        part: relationship.part,
+        relationshipType: relationship.type,
+        scope: 'workbook',
+        ...(host === undefined ? {} : { host }),
+    });
+    const refuse_unclassified = (relationship: PartRelationship): void => {
+        add_worksheet_refusal(refusals, {
+            sheets: new Set(), everySheet: true, unqualified: false, identifiers: new Set(),
+        }, part_reason('unknown', relationship, undefined), all_sheets);
+    };
+    const each_element_text = (
+        raw: Uint8Array,
+        wanted: (local: string) => boolean,
+        visit: (text: string) => void,
+    ): void => {
+        const ranges = ignorable_ranges(raw, 0, raw.length);
+        for (const tag of start_tags(raw, 0, raw.length, ranges)) {
+            const name = utf8_text(raw, tag.start + 1, tag.nameEnd);
+            if (!wanted(local_name(name)) || is_self_closing(raw, tag.start, tag.tagEnd)) continue;
+            const close = end_tag_after(raw, name, tag.tagEnd + 1, ranges);
+            if (close !== null) visit(xml_character_data(raw, tag.tagEnd + 1, close[0]));
+        }
+    };
+    const scan_chart = (relationship: PartRelationship, host: string | undefined): void => {
+        const raw = read_bytes(zip, relationship.part);
+        if (raw === null) return;
+        const reason = part_reason('chart', relationship, host);
+        each_element_text(raw, (local) => local === 'f', (text) => refuse(text, reason, undefined));
+        for (const child of relationships_of(zip, relationship.part)) {
+            const key = relationship_key(child.type);
+            if (key === 'chartUserShapes' && !child.external) scan_drawing(child, host);
+            else if (!CHART_RELATIONSHIPS_WITHOUT_REFERENCES.has(key)) refuse_unclassified(child);
+        }
+    };
+    const scan_drawing = (relationship: PartRelationship, host: string | undefined): void => {
+        if (scanned_parts.has(relationship.part)) return;
+        scanned_parts.add(relationship.part);
+        const raw = read_bytes(zip, relationship.part);
+        if (raw === null) return;
+        const host_key = host?.toLowerCase();
+        const reason = part_reason('drawing', relationship, host);
+        const ranges = ignorable_ranges(raw, 0, raw.length);
+        for (const tag of start_tags(raw, 0, raw.length, ranges)) {
+            refuse(get_tag_attr(raw, tag.start, tag.tagEnd + 1, 'textlink') ?? '', reason, host_key);
+        }
+        for (const child of relationships_of(zip, relationship.part)) {
+            const key = relationship_key(child.type);
+            if (key === 'chart' || key === CHART_EX_RELATIONSHIP) {
+                if (child.external || scanned_parts.has(child.part)) continue;
+                scanned_parts.add(child.part);
+                scan_chart(child, host);
+            } else if (key === 'hyperlink') {
+                // `#Data!A1` is a location in this workbook; anything else is a URI.
+                if (child.target.startsWith('#')) refuse(child.target.slice(1), reason, host_key);
+            } else if (!DRAWING_RELATIONSHIPS_WITHOUT_REFERENCES.has(key)) {
+                refuse_unclassified(child);
+            }
+        }
+    };
+
+    for (const sheet of worksheets) {
+        const host_key = sheet.name.toLowerCase();
+        for (const relationship of relationships_of(zip, sheet.path)) {
+            if (relationship.external) continue;
+            const key = relationship_key(relationship.type);
+            if (key === 'drawing') {
+                scan_drawing(relationship, sheet.name);
+                continue;
+            }
+            const raw = key === 'vmlDrawing' || key === 'ctrlProp' || key === 'table'
+                ? read_bytes(zip, relationship.part)
+                : null;
+            if (raw === null) continue;
+            if (key === 'vmlDrawing') {
+                // Legacy form controls: `<x:FmlaLink>`, `<x:FmlaRange>`, and kin.
+                const reason = part_reason('legacy-drawing', relationship, sheet.name);
+                each_element_text(raw, (local) => local.startsWith('Fmla'), (text) => refuse(text, reason, host_key));
+            } else if (key === 'ctrlProp') {
+                const reason = part_reason('control', relationship, sheet.name);
+                const properties = find_first_element_by_local_name(raw, 'formControlPr');
+                if (properties === null) continue;
+                const open = opening_tag_text(raw, properties.element);
+                for (const attribute of ['fmlaLink', 'fmlaRange', 'fmlaGroup', 'fmlaTxbx']) {
+                    refuse(get_attr(open, attribute) ?? '', reason, host_key);
                 }
+            } else {
+                const reason = part_reason('table', relationship, sheet.name);
+                each_element_text(
+                    raw,
+                    (local) => local === 'calculatedColumnFormula' || local === 'totalsRowFormula',
+                    (text) => refuse(text, reason, host_key),
+                );
+            }
+        }
+    }
+    for (const path of chartsheet_paths) {
+        for (const relationship of relationships_of(zip, path)) {
+            if (!relationship.external && relationship_key(relationship.type) === 'drawing') {
+                scan_drawing(relationship, undefined);
             }
         }
     }
@@ -1432,6 +1699,15 @@ export function scan_xlsx_structural_support(
                     if (formula.kind !== 'array' || formula.text === undefined) continue;
                     if (!may_reference(targets_of(formula.text), other_key, sheet_key, referencing_names)) continue;
                     return { code: 'array-formula', cell: formula.cell, worksheet: other.name };
+                }
+            }
+
+            for (const other of worksheets) {
+                if (other === sheet) continue;
+                const other_key = other.name.toLowerCase();
+                for (const { targets, reason: foreign } of other.foreignReferences) {
+                    if (!may_reference(targets, other_key, sheet_key, referencing_names)) continue;
+                    return { ...foreign, worksheet: other.name };
                 }
             }
 
