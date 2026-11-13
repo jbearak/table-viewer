@@ -51,11 +51,45 @@ import {
     type WorksheetPendingChanges,
 } from '../types';
 import {
+    column_insert_anchor_is_live,
+    column_insert_created_order,
+    column_move_announcement,
+    column_move_block_refusal,
+    column_move_item_model,
+    column_structure_menu_model,
+    default_pending_column_names,
+    INSERT_COLUMN_CANCELED_MESSAGE,
+    moved_block_display_columns,
+    PENDING_COLUMN_HIDE_MESSAGE,
+    PENDING_COLUMN_TRANSFORM_MESSAGE,
+    RENAME_ONLY_NEW_COLUMNS_MESSAGE,
+    nearest_live_column,
+    pending_column_format,
+    pending_column_rename_names,
+    plan_column_delete,
+    plan_column_insert,
+    plan_column_move,
+    plan_column_restore,
+    plan_pending_column_cells,
+    plan_pending_column_update,
+    resolve_column_move_drop,
+    resolve_column_structure_selection,
+    type ColumnInsertItemModel,
+    type ColumnMoveItemModel,
+    type ColumnStructureSelection,
+    type PendingColumnCellEdit,
+} from './column-structure-model';
+import {
     column_projections_equal,
+    create_layout_column_projection,
+    with_column_layout,
     type ColumnProjection,
+    type ProjectedColumn,
 } from './column-projection';
 import {
-    build_grid_columns,
+    build_layout_grid_columns,
+    clamp_column_width,
+    column_letter,
     LAST_COLUMN_RESIZE_GUTTER_PX,
     MAX_AUTO_FIT_COLUMN_WIDTH_PX,
     MAX_COLUMN_WIDTH_PX,
@@ -69,6 +103,7 @@ import {
     ColumnContextMenu,
     header_column_can_be_renamed,
     MultiColumnContextMenu,
+    type ColumnStructureMenuActions,
 } from './column-context-menu';
 import {
     grid_selection_contains_column,
@@ -206,6 +241,12 @@ type LiveEdit = {
     kind: 'pending';
     pendingRowId: string;
     sourceColumn: number;
+    value: string;
+    original: string;
+} | {
+    kind: 'pendingColumn';
+    pendingColumnId: string;
+    rowKey: string;
     value: string;
     original: string;
 };
@@ -531,6 +572,7 @@ import {
     has_pending_structural_changes,
     MAX_PENDING_APPENDED_ROWS,
     type PendingAppendedRow,
+    type PendingColumn,
     type PendingAppendBasis,
     type PendingFormulaReferenceBasis,
     type PendingRowCell,
@@ -550,7 +592,14 @@ import {
     create_pending_row_projection,
     type PendingRowProjection,
 } from './pending-row-projection';
-import type { RowLayout } from '../worksheet-layout';
+import {
+    column_identity_key,
+    index_column_layout,
+    row_identity_key,
+    source_column_layout,
+    type ColumnIdentity,
+    type RowLayout,
+} from '../worksheet-layout';
 import { scroll_preview_to_row } from './preview-scroll';
 import {
     formula_anchor_context,
@@ -565,6 +614,7 @@ import {
     formula_display,
     formula_result_key,
     formula_workbook_with_appended_rows,
+    pending_column_result_key,
     type CommittedFormulaFields,
     type FormulaDisplay,
 } from './formula-anchor-model';
@@ -905,6 +955,13 @@ export function pending_row_history_changes(
     before: PendingStructuralChanges,
     after: PendingStructuralChanges,
     changed_rows?: readonly { readonly id: string; readonly index: number }[],
+    /**
+     * Arms of the same gesture that replay after its row and removal arms and
+     * before its metadata arm, such as a Pending Column cell change. The
+     * metadata arm's snapshots are the post-gesture state, which these arms
+     * have reached on redo and not yet left on undo.
+     */
+    before_metadata: readonly HistoryChange[] = [],
 ): HistoryChange[] {
     const templates = new Map([
         ...before.formatTemplates,
@@ -1055,7 +1112,7 @@ export function pending_row_history_changes(
             after,
         },
     }];
-    return [...row_changes, ...removal_changes, ...metadata_change];
+    return [...row_changes, ...removal_changes, ...before_metadata, ...metadata_change];
 }
 
 /**
@@ -1100,6 +1157,21 @@ export interface StructuralInsertAdmission {
     readonly formatTemplate: PendingRowFormatTemplate;
     readonly structuralBasis: StructuralBasis;
     readonly appendBasis: PendingAppendBasis;
+    /** Settle the host reservation exactly once: installed, or released. */
+    readonly settle: (accepted: boolean) => void;
+}
+
+/** One column insert the grid asks the host to admit. */
+export interface StructuralColumnInsertRequest {
+    readonly anchor: ColumnIdentity;
+    readonly side: 'before' | 'after';
+    readonly count: number;
+}
+
+/** The host's admission of a column insert: Pending Column IDs and the basis they were authored against. */
+export interface StructuralColumnInsertAdmission {
+    readonly columnIds: readonly string[];
+    readonly structuralBasis: StructuralBasis;
     /** Settle the host reservation exactly once: installed, or released. */
     readonly settle: (accepted: boolean) => void;
 }
@@ -1395,6 +1467,10 @@ export interface GridShellProps {
     on_append_rows?: (count: number) => Promise<AppendRowsAdmission | undefined>;
     /** Admit one row insert against the current source generation. */
     on_insert_rows?: (request: StructuralInsertRequest) => Promise<StructuralInsertAdmission | undefined>;
+    /** Ask the host to admit a column insert; resolves undefined when it is refused. */
+    on_insert_columns?: (
+        request: StructuralColumnInsertRequest,
+    ) => Promise<StructuralColumnInsertAdmission | undefined>;
     /**
      * The workbook's undo history. Hoisted like `edit_session`, and for a
      * stronger reason: history spans every sheet, so it cannot live in a shell
@@ -1518,7 +1594,7 @@ export function GridShell({
     row_count: source_row_count = sheet_meta.rowCount,
     show_formatting,
     auto_fit_active = false,
-    column_projection,
+    column_projection: base_column_projection,
     column_widths,
     on_column_resize,
     row_heights,
@@ -1549,6 +1625,7 @@ export function GridShell({
     on_append_composer_draft_change,
     on_append_rows,
     on_insert_rows,
+    on_insert_columns,
     history_store,
     gestures_admitted,
     host_rejected_keys,
@@ -1587,7 +1664,35 @@ export function GridShell({
     on_highlight_selection_available_change,
     highlight_ref,
 }: GridShellProps): React.JSX.Element {
+    // The Worksheet Layout's columns: display columns follow column identity
+    // (`s:<n>`, `p:<id>`), so widths, sorts, filters, selection, and find
+    // stay on their column wherever it moves.
+    const fallback_pending_store_ref = useRef<PendingRowStore | null>(null);
+    if (pending_row_store === undefined && fallback_pending_store_ref.current === null) {
+        fallback_pending_store_ref.current = create_pending_row_store({
+            session_id: edit_session_id,
+        });
+    }
+    const pending_store = pending_row_store ?? fallback_pending_store_ref.current!;
+    const subscribe_column_layout = useCallback(
+        (listener: () => void) => pending_store.subscribe(() => listener()),
+        [pending_store],
+    );
+    const read_column_layout = useCallback(() => pending_store.snapshot().columnLayout, [pending_store]);
+    const column_layout = useSyncExternalStore(subscribe_column_layout, read_column_layout, read_column_layout);
+    const column_layout_key = column_layout === undefined ? '' : JSON.stringify(column_layout);
+    const column_projection = useMemo(
+        () => with_column_layout(base_column_projection, sheet_meta.columnCount, column_layout),
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+        [base_column_projection, sheet_meta.columnCount, column_layout_key],
+    );
     const visible_source_columns = column_projection.visible_to_source;
+    const projected_columns = column_projection.columns;
+    const column_layout_index = useMemo(
+        () => index_column_layout(column_layout ?? source_column_layout(sheet_meta.columnCount)),
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+        [column_layout_key, sheet_meta.columnCount],
+    );
     const display_column_count = visible_source_columns.length;
     const has_visible_columns = display_column_count > 0;
     const loader = use_row_loader(
@@ -1694,15 +1799,19 @@ export function GridShell({
         x: number;
         y: number;
         display_col: number;
-        source_col: number;
+        /** Undefined for a Pending Column. */
+        source_col: number | undefined;
+        /** The column's identity and the structure selection, captured at open. */
+        structure: ColumnStructureSelection;
     } | {
         kind: 'multi-column';
         x: number;
         y: number;
         /** Selected display columns (ascending) snapshotted at menu-open time. */
         display_cols: number[];
-        /** Matching canonical source columns, in display order. */
+        /** Matching canonical source columns, in display order; Pending Columns have none. */
         source_cols: number[];
+        structure: ColumnStructureSelection;
     } | {
         kind: 'row';
         x: number;
@@ -1825,13 +1934,6 @@ export function GridShell({
         );
     }
     const store = edit_session ?? fallback_store_ref.current!;
-    const fallback_pending_store_ref = useRef<PendingRowStore | null>(null);
-    if (pending_row_store === undefined && fallback_pending_store_ref.current === null) {
-        fallback_pending_store_ref.current = create_pending_row_store({
-            session_id: edit_session_id,
-        });
-    }
-    const pending_store = pending_row_store ?? fallback_pending_store_ref.current!;
     const pending_store_changes_ref = useRef<PendingRowStoreChange>({ kind: 'reset' });
     const pending_topology_revision_ref = useRef(0);
     const pending_payload_revision_ref = useRef(0);
@@ -2053,9 +2155,12 @@ export function GridShell({
         pending_rows,
         tail_removal_projection_key,
     );
+    // Column identity keys, not source indexes: every Pending Column has no
+    // source index, so two of them trading places must still change the key.
+    const column_topology_key = projected_columns.map((column) => column.key).join(',');
     const paste_topology_key = [
         mapping_generation,
-        column_projection.visible_to_source.join(','),
+        column_topology_key,
         pending_topology_key,
     ].join(':');
     const pending_selection_topology_key = [
@@ -2700,12 +2805,98 @@ export function GridShell({
         sheet_meta.columnNames,
         sheet_meta.excelFirstRowHeader?.active,
     ]);
+    const [pending_column_width_drafts, set_pending_column_width_drafts] =
+        useState<ReadonlyMap<string, number>>(() => new Map());
+    const pending_columns_by_id = useMemo(
+        () => new Map((pending_rows.pendingColumns ?? []).map((column) => [column.id, column])),
+        [pending_rows.pendingColumns],
+    );
+    const pending_column_headers = useMemo(() => {
+        if (pending_column_width_drafts.size === 0) return pending_columns_by_id;
+        const out = new Map<string, { header: string; viewerWidth?: number }>(pending_columns_by_id);
+        for (const [id, width] of pending_column_width_drafts) {
+            const column = pending_columns_by_id.get(id);
+            if (column !== undefined) out.set(id, { header: column.header, viewerWidth: width });
+        }
+        return out;
+    }, [pending_column_width_drafts, pending_columns_by_id]);
+    const pending_columns_by_id_ref = useRef(pending_columns_by_id);
+    pending_columns_by_id_ref.current = pending_columns_by_id;
+    /**
+     * The Pending Column cell key a display row's cells use (`s:<row>`,
+     * `p:<id>`, or `f:<row>` at or above the Header Row), and whether the row
+     * is live: a Pending Row Removal's cells are read-only. Undefined for a
+     * row with no identity yet, or a tail removal.
+     */
+    const pending_column_row_target = useCallback(
+        (display_row: number): { readonly key: string; readonly live: boolean } | undefined => {
+            const projected = pending_projection.row_at(display_row);
+            if (projected === undefined || projected.kind === 'removal') return undefined;
+            if (projected.kind !== 'source') {
+                // A replacement row is a Pending Row too, keyed by its own
+                // identity. (A live Pending Column cannot coexist with the tail
+                // removal a replacement needs; this keeps the key uniform.)
+                return projected.kind === 'pending' || projected.kind === 'replacement'
+                    ? { key: row_identity_key(projected.identity), live: true }
+                    : undefined;
+            }
+            const source_row = projected.identity?.sourceRow ?? get_source_row(projected.sourceDisplayRow);
+            if (source_row === undefined) return undefined;
+            if (source_row < body_start) return { key: `f:${source_row}`, live: true };
+            return {
+                key: row_identity_key({ kind: 'source', sourceRow: source_row }),
+                live: !is_removed_source_row(source_row),
+            };
+        },
+        [body_start, get_source_row, is_removed_source_row, pending_projection],
+    );
+    /** The Pending Column cell at a display cell: its column and live row key. */
+    const pending_column_overlay_target = useCallback(
+        (display_column: number, display_row: number):
+        { readonly pendingColumnId: string; readonly rowKey: string } | undefined => {
+            const identity = projected_columns[display_column]?.identity;
+            if (identity?.kind !== 'pending') return undefined;
+            const target = pending_column_row_target(display_row);
+            return target === undefined || !target.live
+                ? undefined
+                : { pendingColumnId: identity.pendingColumnId, rowKey: target.key };
+        },
+        [pending_column_row_target, projected_columns],
+    );
+    const pending_column_overlay_target_ref = useRef(pending_column_overlay_target);
+    pending_column_overlay_target_ref.current = pending_column_overlay_target;
+    /**
+     * A Pending Column cell's text as the grid shows and copies it: an `.xlsx`
+     * formula rendered through its anchors, anything else as stored.
+     */
+    const pending_column_cell_text = useCallback((cell: PendingRowCell | undefined): string => {
+        if (cell === undefined) return '';
+        return edit_syntax === 'markdown' && xlsx_edit_writes_formula(cell.value, cell.valueRuns?.runs)
+            ? formula_text_for(cell.value, cell.formulaAnchors, cell.valueEditOrder ?? 0)
+            : cell.value;
+    }, [edit_syntax, formula_text_for]);
+    /**
+     * The text a Pending Column cell's editor opens with: the rendered formula,
+     * or the value in edit syntax, so a styled cell reopens with its markup
+     * and an untouched commit keeps its runs.
+     */
+    const pending_column_cell_edit_text = useCallback((cell: PendingRowCell | undefined): string => {
+        if (cell === undefined) return '';
+        return edit_syntax === 'markdown' && xlsx_edit_writes_formula(cell.value, cell.valueRuns?.runs)
+            ? pending_column_cell_text(cell)
+            : dirty_value_edit_text(cell, edit_syntax);
+    }, [edit_syntax, pending_column_cell_text]);
     const columns = useMemo<GridColumn[]>(
         () => {
-            const built = build_grid_columns(
-                visible_source_columns,
+            const built = build_layout_grid_columns(
+                projected_columns,
                 column_widths,
                 effective_column_names,
+                pending_column_headers,
+                (column) => {
+                    const body = column_layout_index.body_index_of(column.identity);
+                    return body === undefined ? undefined : body - 1;
+                },
             );
             if (!compare_changed_column_names?.length) return built;
             const base_by_col = new Map(compare_changed_column_names
@@ -2722,6 +2913,9 @@ export function GridShell({
         },
         [
             visible_source_columns,
+            projected_columns,
+            column_layout_index,
+            pending_column_headers,
             column_widths,
             effective_column_names,
             compare_changed_column_names,
@@ -3548,10 +3742,42 @@ export function GridShell({
         find_epoch_ref.current += 1;
     }, []);
     const find_in_flight_ref = useRef<Promise<unknown>>(Promise.resolve());
+    /**
+     * The text a Pending Column cell paints: a formula's calculated result
+     * once known (its rendered text until then), or the value.
+     */
+    const pending_column_painted_text = useCallback((display_column: number, row: number): string => {
+        const identity = projected_columns[display_column]?.identity;
+        if (identity?.kind !== 'pending') return '';
+        const target = pending_column_row_target(row);
+        const cell = target === undefined
+            ? undefined
+            : pending_columns_by_id.get(identity.pendingColumnId)?.cells[target.key];
+        if (cell === undefined || target === undefined) return '';
+        const text = pending_column_cell_text(cell);
+        if (edit_syntax !== 'markdown' || !xlsx_edit_writes_formula(cell.value, cell.valueRuns?.runs)) return text;
+        const display = formula_display_for(cell.value, cell.formulaAnchors, cell.valueEditOrder ?? 0);
+        if (display.kind === 'unrenderable') return display.result;
+        const key = pending_column_result_key(
+            formula_anchor_workbook?.worksheets[sheet_index],
+            identity.pendingColumnId,
+            target.key,
+        );
+        return (key === undefined ? undefined : formula_results_ref.current?.get(key)) ?? text;
+    }, [
+        edit_syntax,
+        formula_anchor_workbook,
+        formula_display_for,
+        pending_column_cell_text,
+        pending_column_row_target,
+        pending_columns_by_id,
+        projected_columns,
+        sheet_index,
+    ]);
     /** The text a cell paints, from the same inputs `get_cell_content` uses. */
     const find_text_at = useCallback((position: FindPosition): string => {
         const source_column = visible_source_columns[position.column];
-        if (source_column === undefined) return '';
+        if (source_column === undefined) return pending_column_painted_text(position.column, position.row);
         const projected_row = pending_projection_ref.current.row_at(position.row);
         if (projected_row !== undefined && projected_row.kind !== 'source') {
             const rendered_cell = projected_row.kind === 'removal'
@@ -3611,6 +3837,7 @@ export function GridShell({
         formula_display_for,
         get_row,
         get_source_row,
+        pending_column_painted_text,
         pending_formula_result_key_for,
         pending_rendered_rows,
         removal_rendered_rows,
@@ -4488,6 +4715,28 @@ export function GridShell({
         }
         return undefined;
     }, [is_removed_source_row, pending_projection]);
+    /**
+     * A banded column's state in its header's accessibility label: "Column C,
+     * inserted", "Column removed, was Price", "Column D, moved from column B".
+     * Labels follow the moved tint, so they can name a column the user did
+     * not drag.
+     */
+    const get_column_accessibility_label = useCallback((display_column: number): string | undefined => {
+        const column = projected_columns[display_column];
+        if (column === undefined || column.state === 'source') return undefined;
+        const prospective = column_layout_index.body_index_of(column.identity);
+        if (column.state === 'inserted') {
+            return prospective === undefined ? undefined : `Column ${column_letter(prospective - 1)}, inserted`;
+        }
+        if (column.identity.kind !== 'source') return undefined;
+        const source_column = column.identity.sourceColumn;
+        if (column.state === 'removed') {
+            return `Column removed, was ${effective_column_names?.[source_column] || column_letter(source_column)}`;
+        }
+        return prospective === undefined
+            ? undefined
+            : `Column ${column_letter(prospective - 1)}, moved from column ${column_letter(source_column)}`;
+    }, [column_layout_index, effective_column_names, projected_columns]);
     const draw_pending_divider = useCallback<
         NonNullable<React.ComponentProps<typeof DataEditor>['drawCell']>
     >((args, draw_content) => {
@@ -4968,6 +5217,436 @@ export function GridShell({
     ]);
     const move_rows_by_keyboard_ref = useRef(move_rows_by_keyboard);
     move_rows_by_keyboard_ref.current = move_rows_by_keyboard;
+
+    // --- Columns ----------------------------------------------------------
+    const projected_columns_ref = useRef(projected_columns);
+    projected_columns_ref.current = projected_columns;
+    /** Column moves and inserts are offered where row structure items are. */
+    const column_structure_offered = structure_items_offered && structural_support !== undefined;
+    /** Whether the worksheet has an active Header Row, so new columns get default names. */
+    const has_header_row = sheet_meta.excelFirstRowHeader === undefined
+        ? sheet_meta.columnNames !== undefined
+        : sheet_meta.excelFirstRowHeader.active === true;
+    /** Prospective column names: every live column's, source and pending. */
+    const prospective_column_names = useCallback((): string[] => {
+        const index = column_layout_index;
+        const names: string[] = [];
+        for (let source_column = 0; source_column < sheet_meta.columnCount; source_column++) {
+            if (index.status_of({ kind: 'source', sourceColumn: source_column }) !== 'live') continue;
+            const name = effective_column_names?.[source_column];
+            if (name !== undefined && name !== '') names.push(name);
+        }
+        for (const column of pending_rows_ref.current.pendingColumns ?? []) {
+            if (column.header !== '') names.push(column.header);
+        }
+        return names;
+    }, [column_layout_index, effective_column_names, sheet_meta.columnCount]);
+    /** The display name a column's header shows, for rename checks and announcements. */
+    const column_display_name = useCallback((column: ProjectedColumn): string =>
+        column.identity.kind === 'pending'
+            ? pending_columns_by_id_ref.current.get(column.identity.pendingColumnId)?.header ?? ''
+            : effective_column_names?.[column.identity.sourceColumn] ?? '',
+    [effective_column_names]);
+    /** Wait (by polling, never a fixed delay) for the grid to show a column, then act. */
+    const when_columns_show = useCallback((
+        ready: (columns: readonly ProjectedColumn[]) => boolean,
+        then: (columns: readonly ProjectedColumn[]) => void,
+    ): void => {
+        let attempts = 0;
+        const poll = () => {
+            const current = projected_columns_ref.current;
+            if (!ready(current)) {
+                attempts += 1;
+                if (attempts < 120) window.requestAnimationFrame(poll);
+                return;
+            }
+            then(current);
+        };
+        poll();
+    }, []);
+    const focus_column_cell = useCallback((display_column: number, row: number | undefined) => {
+        const target_row = row ?? grid_selection_ref.current.current?.cell[1] ?? 0;
+        if (row_count > 0) {
+            select_active_display_cell([display_column, Math.min(Math.max(0, target_row), row_count - 1)]);
+        }
+        focus_grid();
+    }, [focus_grid, row_count, select_active_display_cell]);
+    /**
+     * Insert `count` blank Pending Columns beside the live column `anchor`:
+     * the host mints the IDs; if the anchor is still live when they arrive,
+     * install them as one history action and settle the admission as
+     * installed, then focus the first new cell in the row that was focused.
+     * Anything else settles it as released; a removed anchor also announces
+     * the cancellation.
+     */
+    const insert_columns_gesture = useCallback(async (
+        anchor: ColumnIdentity,
+        side: 'before' | 'after',
+        count: number,
+    ): Promise<boolean> => {
+        if (on_insert_columns === undefined || !structure_gesture_admitted()) return false;
+        const session_id = edit_session_id;
+        const focused_row = grid_selection_ref.current.current?.cell[1];
+        const admitted = await on_insert_columns({ anchor, side, count });
+        if (admitted === undefined) return false;
+        const current = () => edit_session_id_ref.current === session_id
+            && pending_store.identity()?.session_id === session_id;
+        if (
+            admitted.columnIds.length !== count
+            || !current()
+            || edit_admission_is_fenced()
+            || save_in_flight_ref.current
+            || (gestures_admitted !== undefined && !gestures_admitted())
+        ) {
+            admitted.settle(false);
+            return false;
+        }
+        const before = pending_store.snapshot();
+        const context = action_structure_context_ref.current();
+        if (!column_insert_anchor_is_live(before, context, anchor)) {
+            admitted.settle(false);
+            announce_structure(INSERT_COLUMN_CANCELED_MESSAGE);
+            return false;
+        }
+        const names = has_header_row
+            ? default_pending_column_names(prospective_column_names(), count)
+            : Array.from({ length: count }, () => '');
+        const format = pending_column_format(before, context, anchor, side, edit_syntax !== 'markdown');
+        const first_order = column_insert_created_order(before, issue_value_edit_order());
+        const new_columns = admitted.columnIds.map((id, index): PendingColumn => ({
+            id,
+            header: names[index] ?? '',
+            cells: {},
+            format,
+            createdOrder: first_order + index,
+        }));
+        const refusal_before = envelope_refusal_sequence_ref.current;
+        const plan = plan_column_insert(
+            before,
+            { ...context, structuralBasis: admitted.structuralBasis },
+            anchor,
+            side,
+            new_columns,
+        );
+        if (!plan.ok) {
+            admitted.settle(false);
+            host_bridge.postMessage({ type: 'showWarning', message: plan.message });
+            return false;
+        }
+        if (!commit_row_structure_plan(plan)) {
+            admitted.settle(false);
+            if (envelope_refusal_sequence_ref.current === refusal_before) {
+                host_bridge.postMessage({
+                    type: 'showWarning',
+                    message: 'The columns could not be inserted because the pending worksheet changed.',
+                });
+            }
+            return false;
+        }
+        admitted.settle(true);
+        const key = `p:${admitted.columnIds[0]!}`;
+        when_columns_show(
+            (columns) => columns.some((column) => column.key === key),
+            (columns) => focus_column_cell(columns.findIndex((column) => column.key === key), focused_row),
+        );
+        return true;
+    }, [
+        announce_structure,
+        commit_row_structure_plan,
+        edit_admission_is_fenced,
+        edit_session_id,
+        edit_syntax,
+        focus_column_cell,
+        gestures_admitted,
+        has_header_row,
+        issue_value_edit_order,
+        on_insert_columns,
+        pending_store,
+        prospective_column_names,
+        save_in_flight_ref,
+        structure_gesture_admitted,
+        when_columns_show,
+    ]);
+    /** Delete columns: one history action; focus moves to the nearest live column. */
+    const delete_columns_gesture = useCallback((
+        identities: readonly ColumnIdentity[],
+        from_display_column: number,
+    ): boolean => {
+        if (!structure_gesture_admitted()) return false;
+        const plan = plan_column_delete(
+            pending_store.snapshot(),
+            action_structure_context_ref.current(),
+            identities,
+            store.snapshot(),
+        );
+        if (!plan.ok) {
+            host_bridge.postMessage({ type: 'showWarning', message: plan.message });
+            return false;
+        }
+        const focused_row = grid_selection_ref.current.current?.cell[1];
+        const before_columns = projected_columns_ref.current;
+        if (!commit_row_structure_plan(plan)) return false;
+        when_columns_show(
+            (columns) => columns !== before_columns,
+            (columns) => {
+                const target = nearest_live_column(columns, from_display_column);
+                if (target !== undefined) focus_column_cell(target, focused_row);
+            },
+        );
+        return true;
+    }, [commit_row_structure_plan, focus_column_cell, pending_store, store, structure_gesture_admitted, when_columns_show]);
+    const restore_columns_gesture = useCallback((source_columns: readonly number[]): boolean => {
+        if (!structure_gesture_admitted()) return false;
+        const plan = plan_column_restore(pending_store.snapshot(), action_structure_context_ref.current(), source_columns);
+        if (!plan.ok) {
+            host_bridge.postMessage({ type: 'showWarning', message: plan.message });
+            return false;
+        }
+        if (!commit_row_structure_plan(plan)) return false;
+        focus_grid();
+        return true;
+    }, [commit_row_structure_plan, focus_grid, pending_store, structure_gesture_admitted]);
+    /**
+     * Move the live columns of `identities` (each with its glued tombstones)
+     * to just before `before`: one history action, announced through the live
+     * region, with the column selection following the moved columns.
+     */
+    const move_columns_gesture = useCallback((
+        identities: readonly ColumnIdentity[],
+        before: ColumnIdentity | 'end',
+    ): boolean => {
+        if (!structure_gesture_admitted()) return false;
+        const plan = plan_column_move(
+            pending_store.snapshot(),
+            action_structure_context_ref.current(),
+            identities,
+            before,
+        );
+        if (!plan.ok) {
+            if (plan.unchanged !== true) host_bridge.postMessage({ type: 'showWarning', message: plan.message });
+            return false;
+        }
+        const before_columns = projected_columns_ref.current;
+        if (!commit_row_structure_plan(plan)) return false;
+        announce_structure(column_move_announcement(plan.movedColumns, plan.direction));
+        when_columns_show(
+            (columns) => columns !== before_columns
+                && moved_block_display_columns(columns, plan.movedIdentities) !== undefined,
+            (columns) => {
+                const block = moved_block_display_columns(columns, plan.movedIdentities)!;
+                write_grid_selection({
+                    columns: CompactSelection.fromSingleSelection([block.start, block.end + 1]),
+                    rows: CompactSelection.empty(),
+                });
+                grid_ref.current?.scrollTo(
+                    plan.direction === 'left' ? block.start : block.end,
+                    0,
+                    'horizontal',
+                );
+                focus_grid();
+            },
+        );
+        return true;
+    }, [
+        announce_structure,
+        commit_row_structure_plan,
+        focus_grid,
+        pending_store,
+        structure_gesture_admitted,
+        when_columns_show,
+        write_grid_selection,
+    ]);
+    /** The structure items' actions for a header selection captured when its menu opened. */
+    const column_structure_actions = useCallback((
+        selection: ColumnStructureSelection,
+        from_display_column: number,
+    ): ColumnStructureMenuActions | undefined => {
+        if (!column_structure_offered || structural_support === undefined) return undefined;
+        const model = column_structure_menu_model({
+            support: structural_support.columns,
+            ready: editable_cells && structure_gesture_admitted(),
+            selection,
+            changes: pending_rows_ref.current,
+            context: structure_context,
+            columns: projected_columns,
+        });
+        const disabled = (count: number, reason: string | undefined): StructureMenuAction =>
+            ({ count, ...(reason === undefined ? {} : { disabled_reason: reason }) });
+        const insert = (item: ColumnInsertItemModel, side: 'before' | 'after'): StructureMenuAction =>
+            item.enabled && item.anchor !== undefined
+                ? { count: item.count, on_click: () => { void insert_columns_gesture(item.anchor!, side, Math.max(1, item.count)); } }
+                : disabled(item.count, item.reason);
+        const move = (item: ColumnMoveItemModel): StructureMenuAction =>
+            item.enabled && item.before !== undefined
+                ? { count: item.count, on_click: () => { move_columns_gesture(selection.identities, item.before!); } }
+                : disabled(item.count, item.reason);
+        return {
+            insert_left: insert(model.insertLeft, 'before'),
+            insert_right: insert(model.insertRight, 'after'),
+            delete: model.delete.enabled
+                ? { count: model.delete.count, on_click: () => { delete_columns_gesture(selection.identities, from_display_column); } }
+                : disabled(model.delete.count, model.delete.reason),
+            ...(model.restore === undefined ? {} : {
+                restore: model.restore.enabled
+                    ? { count: model.restore.count, on_click: () => { restore_columns_gesture(selection.removedSourceColumns); } }
+                    : disabled(model.restore.count, model.restore.reason),
+            }),
+            move_left: move(model.moveLeft),
+            move_right: move(model.moveRight),
+        };
+    }, [
+        column_structure_offered,
+        delete_columns_gesture,
+        editable_cells,
+        insert_columns_gesture,
+        move_columns_gesture,
+        projected_columns,
+        restore_columns_gesture,
+        structural_support,
+        structure_context,
+        structure_gesture_admitted,
+    ]);
+    /** `Alt+Shift+←`/`→`: move the selected whole columns one step, or announce why not. */
+    const move_columns_by_keyboard = useCallback((direction: 'backward' | 'forward'): boolean => {
+        if (!column_structure_offered || structural_support === undefined) return false;
+        const selected = grid_selection_ref.current.columns;
+        if (selected.length === 0) return false;
+        const selection = resolve_column_structure_selection(projected_columns_ref.current, selected);
+        const model = column_move_item_model({
+            support: structural_support.columns,
+            ready: editable_cells_ref.current && structure_gesture_admitted(),
+            selection,
+            changes: pending_store.snapshot(),
+            context: structure_context_ref.current,
+            columns: projected_columns_ref.current,
+        }, direction);
+        if (!model.enabled || model.before === undefined) {
+            if (model.reason !== undefined) announce_structure(model.reason);
+            return true;
+        }
+        move_columns_gesture(selection.identities, model.before);
+        return true;
+    }, [
+        announce_structure,
+        column_structure_offered,
+        move_columns_gesture,
+        pending_store,
+        structural_support,
+        structure_gesture_admitted,
+    ]);
+    const move_columns_by_keyboard_ref = useRef(move_columns_by_keyboard);
+    move_columns_by_keyboard_ref.current = move_columns_by_keyboard;
+    /** A drag's block, resolved once per block rather than once per drop target. */
+    const column_drag_selection_ref = useRef<{
+        readonly start: number;
+        readonly end: number;
+        readonly columns: readonly ProjectedColumn[];
+        readonly selection: ColumnStructureSelection;
+    } | null>(null);
+    const column_drag_selection = useCallback((block: { start: number; end: number }): ColumnStructureSelection => {
+        const columns = projected_columns_ref.current;
+        const cached = column_drag_selection_ref.current;
+        if (cached !== null && cached.start === block.start && cached.end === block.end
+            && cached.columns === columns) return cached.selection;
+        const selection = resolve_column_structure_selection(
+            columns,
+            Array.from({ length: block.end - block.start + 1 }, (_, offset) => block.start + offset),
+        );
+        column_drag_selection_ref.current = { ...block, columns, selection };
+        return selection;
+    }, []);
+    const can_drag_columns = useCallback((block: { start: number; end: number }): boolean => {
+        if (!column_structure_offered || structural_support === undefined || !structure_gesture_admitted()) {
+            return false;
+        }
+        return column_move_block_refusal({
+            support: structural_support.columns,
+            ready: true,
+            selection: column_drag_selection(block),
+            changes: pending_store.snapshot(),
+            context: structure_context_ref.current,
+        }) === undefined;
+    }, [column_drag_selection, column_structure_offered, pending_store, structural_support, structure_gesture_admitted]);
+    /** Where a column drag dropping before display column `before` lands, or undefined when it may not. */
+    const column_drop_target = useCallback((
+        block: { start: number; end: number },
+        before: number,
+    ): { identities: readonly ColumnIdentity[]; before: ColumnIdentity | 'end' } | undefined => {
+        const selection = column_drag_selection(block);
+        const target = resolve_column_move_drop(projected_columns_ref.current, before);
+        if (target === undefined) return undefined;
+        const plan = plan_column_move(
+            pending_store.snapshot(),
+            structure_context_ref.current,
+            selection.identities,
+            target,
+        );
+        return plan.ok || plan.unchanged === true
+            ? { identities: selection.identities, before: target }
+            : undefined;
+    }, [column_drag_selection, pending_store]);
+    const propose_column_move = useCallback((block: { start: number; end: number }, before: number): boolean =>
+        column_drop_target(block, before) !== undefined, [column_drop_target]);
+    const on_columns_moved = useCallback((block: { start: number; end: number }, before: number): void => {
+        const target = column_drop_target(block, before);
+        column_drag_selection_ref.current = null;
+        if (target !== undefined) move_columns_gesture(target.identities, target.before);
+    }, [column_drop_target, move_columns_gesture]);
+    /** Rename a Pending Column: one history action, "Rename column". */
+    const [rename_pending_column, set_rename_pending_column] = useState<{
+        readonly pendingColumnId: string;
+        readonly initial: string;
+        readonly names: readonly string[];
+        readonly self: number;
+        readonly removed: readonly string[];
+    } | null>(null);
+    const open_pending_column_rename = useCallback((display_column: number) => {
+        const column = projected_columns[display_column];
+        if (column?.identity.kind !== 'pending') return;
+        // Every column of the layout, hidden ones included: a hidden column's
+        // name is still taken, and a hidden removal's is still refused.
+        const names = pending_column_rename_names(
+            create_layout_column_projection(sheet_meta.columnCount, column_layout).columns,
+            column_display_name,
+        );
+        set_rename_pending_column({
+            pendingColumnId: column.identity.pendingColumnId,
+            initial: column_display_name(column),
+            names: names.live.map((entry) => entry.name),
+            self: names.live.findIndex((entry) => entry.key === column.key),
+            removed: names.removed,
+        });
+    }, [column_display_name, column_layout, projected_columns, sheet_meta.columnCount]);
+    const apply_pending_column_rename = useCallback((value: string): boolean => {
+        const target = rename_pending_column;
+        if (target === null || !structure_gesture_admitted()) return false;
+        const before = pending_store.snapshot();
+        const plan = plan_pending_column_update(
+            before,
+            structure_context.worksheet,
+            target.pendingColumnId,
+            (column) => ({ ...column, header: value }),
+        );
+        if (plan === undefined) return true;
+        const staged = pending_store.stage_replace(edit_session_id, before, plan.next);
+        if (staged === undefined) {
+            show_pending_size_warning();
+            return false;
+        }
+        const transaction: StagedMutation[] = [staged];
+        if (history_capture !== undefined) {
+            transaction.push(history_capture.history.stage_record({ label: 'Rename column', changes: [plan.change] }));
+        }
+        return commit_staged_transaction(transaction);
+    }, [
+        edit_session_id,
+        history_capture,
+        pending_store,
+        rename_pending_column,
+        show_pending_size_warning,
+        structure_context.worksheet,
+        structure_gesture_admitted,
+    ]);
     const pending_paste_history_ref = useRef<{
         readonly before: PendingStructuralChanges;
         readonly rowIds: ReadonlySet<string>;
@@ -5001,7 +5680,7 @@ export function GridShell({
         );
         const admitted_topology_key = [
             mapping_generation,
-            column_projection.visible_to_source.join(','),
+            column_topology_key,
             admitted_pending_topology_key,
         ].join(':');
         return new Promise((resolve) => {
@@ -5062,7 +5741,7 @@ export function GridShell({
         });
     }, [
         admit_pending_rows,
-        column_projection.visible_to_source,
+        column_topology_key,
         edit_session_id,
         mapping_generation,
         pending_store,
@@ -5131,8 +5810,11 @@ export function GridShell({
             const cells: Record<number, PendingRowCell> = {};
             // Only the columns on screen: a draft keeps values for columns that
             // have since been hidden, and staging one the user cannot see would
-            // write a column they did not choose.
-            visible_source_columns.forEach((source_column) => {
+            // write a column they did not choose. A deleted column takes no
+            // value, and a Pending Column has no source column to key one by.
+            projected_columns.forEach((column) => {
+                if (column.identity.kind !== 'source' || column.state === 'removed') return;
+                const source_column = column.identity.sourceColumn;
                 const raw = values[source_column];
                 if (raw === undefined) return;
                 const parsed = parse_cell_edit(raw, edit_syntax);
@@ -5233,7 +5915,7 @@ export function GridShell({
         pending_display_row,
         pending_store,
         record_pending_row_gesture,
-        visible_source_columns,
+        projected_columns,
     ]);
     const [local_composer_draft, set_local_composer_draft] = useState<AppendComposerDraft>(
         EMPTY_APPEND_COMPOSER_DRAFT,
@@ -5265,9 +5947,22 @@ export function GridShell({
      * Labels for the composer's fields — the same titles the grid header
      * paints, so a field is identifiable by the column the user can see.
      */
+    // The composer stages Pending Row cells, keyed by source column: it
+    // offers the live source columns only.
+    const composer_columns = useMemo(
+        () => projected_columns.flatMap((column, display) =>
+            column.identity.kind === 'source' && column.state !== 'removed'
+                ? [{ source: column.identity.sourceColumn, title: columns[display]?.title ?? '' }]
+                : []),
+        [columns, projected_columns],
+    );
     const composer_column_labels = useMemo(
-        () => columns.map((column) => column.title),
-        [columns],
+        () => composer_columns.map((column) => column.title),
+        [composer_columns],
+    );
+    const composer_source_columns = useMemo(
+        () => composer_columns.map((column) => column.source),
+        [composer_columns],
     );
     /**
      * The worksheet row number the first composed row will take, 1-based — the
@@ -5384,8 +6079,11 @@ export function GridShell({
     // unreadable.
     const open_overlay_row_ref = useRef<{
         display_cell: Item;
-        source_row: number;
-        source_column: number;
+        /** Undefined for a Pending Column cell, which `pending_column` names instead. */
+        source_row: number | undefined;
+        source_column: number | undefined;
+        /** A Pending Column cell's identity, pinned until the editor closes. */
+        pending_column?: { readonly pendingColumnId: string; readonly rowKey: string };
         edit_session_id: string | undefined;
         pin: symbol;
         opened_value?: string;
@@ -5435,10 +6133,26 @@ export function GridShell({
             ? projected.sourceDisplayRow
             : display_row;
         const source_column = source_column_for_display_ref.current(loc[0]);
+        if (source_column === undefined) {
+            // A Pending Column cell: keep the identity the editor opened on, so
+            // its commit does not depend on the row's page staying resident.
+            const pending_column = pending_column_overlay_target_ref.current(loc[0], display_row);
+            if (pending_column === undefined) return;
+            overlay_admission_revoked_ref.current = false;
+            open_overlay_row_ref.current = {
+                display_cell: [loc[0], display_row],
+                source_row,
+                source_column: undefined,
+                pending_column,
+                edit_session_id: edit_session_id_ref.current,
+                pin: pin_rows_ref.current(loader_row, loader_row),
+            };
+            return;
+        }
         // Unresolved identity: nothing to remember and nothing worth pinning. The
         // overlay-open gate means this is unreachable for a real editor mount, and
         // leaving the ref null keeps the commit guards' early return intact.
-        if (source_row === undefined || source_column === undefined) return;
+        if (source_row === undefined) return;
         overlay_admission_revoked_ref.current = false;
         open_overlay_row_ref.current = {
             display_cell: [loc[0], display_row],
@@ -5524,7 +6238,22 @@ export function GridShell({
         const source_column = captured_matches
             ? captured.source_column
             : source_column_for_display(display_column);
-        if (source_column === undefined) return null;
+        if (source_column === undefined) {
+            const target = captured_matches && captured.pending_column !== undefined
+                ? captured.pending_column
+                : pending_column_overlay_target_ref.current(display_column, row);
+            if (target === undefined) return null;
+            const original = pending_column_cell_edit_text(
+                pending_columns_by_id.get(target.pendingColumnId)?.cells[target.rowKey],
+            );
+            return {
+                kind: 'pendingColumn',
+                pendingColumnId: target.pendingColumnId,
+                rowKey: target.rowKey,
+                value,
+                original,
+            };
+        }
         const projected_row = pending_projection.row_at(row);
         if (
             projected_row?.kind === 'pending'
@@ -5591,6 +6320,8 @@ export function GridShell({
         get_cell_raw,
         pending_projection,
         pending_rendered_rows,
+        pending_column_cell_edit_text,
+        pending_columns_by_id,
         sheet_index,
         source_column_for_display,
         store,
@@ -5606,6 +6337,79 @@ export function GridShell({
         const live = read_live_edit_ref.current();
         set_live_uncommitted(!!live && live.value !== live.original);
     }, []);
+
+    /**
+     * Write typed text into Pending Column cells as one history action: a
+     * `columnLayout` arm whose layout is unchanged. A committed formula is
+     * anchored like any other (`committed_formula_fields`); CSV and TSV values
+     * are text and never anchored.
+     */
+    const plan_pending_column_text = useCallback((
+        edits: readonly { readonly pendingColumnId: string; readonly rowKey: string; readonly text: string }[],
+        before: PendingStructuralChanges,
+    ): ReturnType<typeof plan_pending_column_cells> | 'refused' => {
+        const gesture_order = issue_value_edit_order();
+        const planned: PendingColumnCellEdit[] = [];
+        for (const edit of edits) {
+            const parsed = parse_cell_edit(edit.text, edit_syntax);
+            const existing = before.pendingColumns
+                ?.find((column) => column.id === edit.pendingColumnId)?.cells[edit.rowKey];
+            const formula_fields = commit_formula_fields(
+                parsed.text,
+                edit_syntax === 'markdown' && xlsx_edit_writes_formula(parsed.text, parsed.rich?.runs),
+            );
+            if (formula_fields.kind === 'refused') {
+                refuse_formula(formula_fields.reason);
+                return 'refused';
+            }
+            planned.push({
+                pendingColumnId: edit.pendingColumnId,
+                rowKey: edit.rowKey,
+                cell: parsed.text === '' && parsed.rich === undefined && existing?.link == null
+                    ? undefined
+                    : {
+                        value: parsed.text,
+                        ...(parsed.rich === undefined ? {} : { valueRuns: parsed.rich }),
+                        ...(existing?.link === undefined ? {} : { link: existing.link }),
+                        valueEditOrder: gesture_order,
+                        ...committed_formula_cell_fields(formula_fields),
+                    },
+            });
+        }
+        return plan_pending_column_cells(before, structure_context.worksheet, planned);
+    }, [
+        commit_formula_fields,
+        edit_syntax,
+        issue_value_edit_order,
+        refuse_formula,
+        structure_context.worksheet,
+    ]);
+    const commit_pending_column_cells = useCallback((
+        edits: readonly { readonly pendingColumnId: string; readonly rowKey: string; readonly text: string }[],
+        label: string,
+    ): boolean => {
+        const before = pending_store.snapshot();
+        const plan = plan_pending_column_text(edits, before);
+        if (plan === 'refused') return false;
+        if (plan === undefined) return true;
+        const refusal_before = envelope_refusal_sequence_ref.current;
+        const staged = pending_store.stage_replace(edit_session_id, before, plan.next);
+        if (staged === undefined) {
+            if (envelope_refusal_sequence_ref.current !== refusal_before) show_pending_size_warning();
+            return false;
+        }
+        const transaction: StagedMutation[] = [staged];
+        if (history_capture !== undefined) {
+            transaction.push(history_capture.history.stage_record({ label, changes: [plan.change] }));
+        }
+        return commit_staged_transaction(transaction);
+    }, [
+        edit_session_id,
+        history_capture,
+        pending_store,
+        plan_pending_column_text,
+        show_pending_size_warning,
+    ]);
 
     const planned_live_height_ref = useRef<(
         live: LiveEdit,
@@ -5660,6 +6464,13 @@ export function GridShell({
             }
             return refused();
         }
+        if (live.kind === 'pendingColumn') {
+            return commit_pending_column_cells([{
+                pendingColumnId: live.pendingColumnId,
+                rowKey: live.rowKey,
+                text: live.value,
+            }], 'Edit cell') || refused();
+        }
         const parsed = parse_cell_edit(live.value, edit_syntax);
         const before = pending_store.snapshot();
         const current = stored_pending_rows(before).find(
@@ -5704,6 +6515,7 @@ export function GridShell({
     }, [
         commit_edit,
         commit_formula_fields,
+        commit_pending_column_cells,
         edit_session_id,
         edit_syntax,
         formula_reference_bases,
@@ -5915,6 +6727,7 @@ export function GridShell({
         if (active_cell === undefined) return undefined;
         const [display_column, display_row] = active_cell;
         const projected = pending_projection.row_at(display_row);
+        if (live.kind === 'pendingColumn') return undefined;
         const same_cell = live.kind === 'pending'
             ? (projected?.kind === 'pending' || projected?.kind === 'replacement')
                 && projected.row.id === live.pendingRowId
@@ -6589,9 +7402,13 @@ export function GridShell({
         if (!ctx) return null;
         const sample = sample_loaded_rows_ref.current(AUTO_FIT_SAMPLE_ROWS);
         if (sample.length === 0) return null;
+        // Widths are keyed by source column; a Pending Column keeps its own.
+        const fit_columns = visible_source_columns.filter(
+            (column): column is number => column !== undefined,
+        );
         const cells = sample.map((row) => {
             const visible_cells: Partial<Record<number, MeasurableCell | null>> = {};
-            for (const source_column of visible_source_columns) {
+            for (const source_column of fit_columns) {
                 visible_cells[source_column] = measurable_from_rendered(
                     row[source_column] ?? null,
                     show_formatting,
@@ -6608,7 +7425,7 @@ export function GridShell({
             );
             return ctx.measureText(cell.text).width;
         };
-        return fit_column_widths(cells, visible_source_columns, measure);
+        return fit_column_widths(cells, fit_columns, measure);
     }, [
         has_visible_columns,
         show_formatting,
@@ -6638,18 +7455,119 @@ export function GridShell({
         return color ? highlight_rgba(color, high_contrast) : undefined;
     }, [cell_highlights, high_contrast]);
 
+    /**
+     * A Pending Column's cell: its value for the row's identity key, editable
+     * on a live row, with the added tint (deleted on a Pending Row Removal)
+     * under any highlight it carries. Undefined for a display column that is
+     * not a Pending Column.
+     */
+    const pending_column_cell_content = useCallback(
+        (display_column: number, row: number): GridCell | undefined => {
+            const identity = projected_columns[display_column]?.identity;
+            if (identity?.kind !== 'pending') return undefined;
+            const column = pending_columns_by_id.get(identity.pendingColumnId);
+            if (column === undefined) return undefined;
+            const target = pending_column_row_target(row);
+            const value_cell = target === undefined ? undefined : column.cells[target.key];
+            const highlight = target === undefined ? undefined : column.highlights?.[target.key];
+            const editable = editable_cells && target !== undefined && target.live;
+            const shown = pending_column_cell_text(value_cell);
+            // An `.xlsx` formula shows its calculated result, as a Pending Row
+            // cell's does, and its rendered text in the editor; one that cannot
+            // render for the current layouts shows its error and is read-only.
+            const is_formula = value_cell !== undefined
+                && edit_syntax === 'markdown'
+                && xlsx_edit_writes_formula(value_cell.value, value_cell.valueRuns?.runs);
+            const formula = is_formula
+                ? formula_display_for(value_cell.value, value_cell.formulaAnchors, value_cell.valueEditOrder ?? 0)
+                : undefined;
+            const unrenderable = formula?.kind === 'unrenderable' ? formula : undefined;
+            const result_key = !is_formula || target === undefined
+                ? undefined
+                : pending_column_result_key(
+                    formula_anchor_workbook?.worksheets[sheet_index],
+                    identity.pendingColumnId,
+                    target.key,
+                );
+            const formula_result = !is_formula
+                ? undefined
+                : unrenderable?.result
+                    ?? (result_key === undefined ? undefined : formula_results_ref.current?.get(result_key));
+            const cell_editable = editable && unrenderable === undefined;
+            const overlay: CellEditOverlay = {
+                editable: cell_editable,
+                refused: editable_cells && !cell_editable,
+                bg: highlight !== undefined
+                    ? highlight_rgba(highlight, high_contrast)
+                    : target?.live === false ? compare_row_bgs.deleted : compare_row_bgs.added,
+                ...(cell_editable && edit_syntax === 'markdown'
+                    ? { edit_value: pending_column_cell_edit_text(value_cell) }
+                    : {}),
+                ...(!is_formula
+                    ? {}
+                    : formula_result === undefined
+                        ? { formula_result_pending: true as const }
+                        : { formula_result }),
+            };
+            const runs = !is_formula && edit_syntax === 'markdown' ? value_cell?.valueRuns : undefined;
+            return build_grid_cell(
+                0,
+                [{
+                    raw: shown === '' ? null : shown,
+                    formatted: shown,
+                    bold: false,
+                    italic: false,
+                    ...(is_formula ? { formula: shown } : {}),
+                    ...(runs === undefined ? {} : { richText: runs }),
+                }],
+                show_formatting,
+                overlay,
+                font_size_px,
+                auto_fit_active || get_cell_height(row, display_column) > default_row_height,
+                link_modifier_held,
+                diff_colors,
+            );
+        },
+        [
+            auto_fit_active,
+            compare_row_bgs,
+            default_row_height,
+            diff_colors,
+            edit_syntax,
+            editable_cells,
+            font_size_px,
+            formula_text_for,
+            get_cell_height,
+            high_contrast,
+            link_modifier_held,
+            formula_anchor_workbook,
+            formula_display_for,
+            pending_column_cell_edit_text,
+            pending_column_cell_text,
+            pending_column_row_target,
+            pending_columns_by_id,
+            sheet_index,
+            projected_columns,
+            show_formatting,
+        ],
+    );
+
     const get_cell_content = useCallback(
         (cell: Item): GridCell => {
             const [display_column, row] = cell;
             const source_column = source_column_for_display(display_column);
             if (source_column === undefined) {
-                return {
+                return pending_column_cell_content(display_column, row) ?? {
                     kind: GridCellKind.Text,
                     data: '',
                     displayData: '',
                     allowOverlay: false,
                 };
             }
+            // A Pending Column Removal stays in place, read-only, with the
+            // deleted tint; a Moved Column keeps its values under the moved tint.
+            const column_state = projected_columns[display_column]?.state;
+            const column_removed = column_state === 'removed';
             const projected_row = pending_projection.row_at(row);
             if (projected_row !== undefined && projected_row.kind !== 'source') {
                 const is_removal = projected_row.kind === 'removal';
@@ -6666,7 +7584,7 @@ export function GridShell({
                         projected_row.removal.sourceRow,
                     )?.[source_column]
                     : undefined;
-                const editable = editable_cells && !is_removal;
+                const editable = editable_cells && !is_removal && !column_removed;
                 const pending_highlight = projected_row.kind === 'pending'
                     || projected_row.kind === 'replacement'
                     ? projected_row.row.highlights?.[source_column]
@@ -6703,9 +7621,10 @@ export function GridShell({
                 const pending_editable = editable && pending_unrenderable === undefined;
                 const overlay: CellEditOverlay = {
                     editable: pending_editable,
-                    refused: editable_cells && (is_removal || pending_unrenderable !== undefined),
+                    refused: editable_cells
+                        && (is_removal || column_removed || pending_unrenderable !== undefined),
                     bg: pending_highlight === undefined
-                        ? is_removal ? compare_row_bgs.deleted : compare_row_bgs.added
+                        ? is_removal || column_removed ? compare_row_bgs.deleted : compare_row_bgs.added
                         : highlight_rgba(pending_highlight, high_contrast),
                     ...(edit_syntax === 'markdown' && pending_editable && rendered_cell !== null
                         && rendered_cell !== undefined
@@ -6802,13 +7721,13 @@ export function GridShell({
             // A Pending Row Removal stays in place, read-only, with the deleted
             // tint; unlike a tail removal it shows its current values plainly,
             // and a cell highlight still wins over the tint.
-            const layout_removal = source_row !== undefined
-                && is_removed_source_row(source_row);
+            const layout_removal = column_removed || (source_row !== undefined
+                && is_removed_source_row(source_row));
             // A Moved Row keeps its values and stays editable, with the moved
             // band tint under any cell highlight, edit, or compare tint.
-            const layout_moved = projected_row?.kind === 'source'
-                && !layout_removal
-                && pending_projection.row_state(row) === 'moved';
+            const layout_moved = !layout_removal && (column_state === 'moved' || (
+                projected_row?.kind === 'source'
+                && pending_projection.row_state(row) === 'moved'));
             const loaded_row = get_row(source_display_row);
             const loaded_cell = loaded_row?.[source_column];
             // A formula that cannot render for the current layouts cannot be
@@ -7016,6 +7935,8 @@ export function GridShell({
             pending_formula_result_key_for,
             unrenderable_formula_for_cell,
             sheet_index,
+            projected_columns,
+            pending_column_cell_content,
         ],
     );
 
@@ -7093,6 +8014,50 @@ export function GridShell({
                 });
                 return 'refused';
             }
+
+            // Pending Column cells belong to their column, keyed by row
+            // identity. Alone they are one `columnLayout` action; beside
+            // source or Pending Row cells they join that gesture's pending
+            // arm below, so the whole gesture is one action, all or nothing.
+            const column_edits: { pendingColumnId: string; rowKey: string; text: string }[] = [];
+            const rest: EditListItem[] = [];
+            for (const item of items) {
+                const identity = projected_columns[item.location[0]]?.identity;
+                if (identity?.kind !== 'pending' || item.targetSourceColumn !== undefined) {
+                    rest.push(item);
+                    continue;
+                }
+                // An overlay commit lands on the identity its editor opened
+                // on, never on whatever row now occupies its display cell.
+                const captured = source === 'edit'
+                    && open_overlay?.pending_column !== undefined
+                    && open_overlay.display_cell[0] === item.location[0]
+                    && open_overlay.display_cell[1] === item.location[1]
+                    ? open_overlay.pending_column
+                    : undefined;
+                const target = captured
+                    ?? pending_column_overlay_target(item.location[0], item.location[1]);
+                if (target === undefined) continue;
+                const value = item.value;
+                column_edits.push({
+                    pendingColumnId: target.pendingColumnId,
+                    rowKey: target.rowKey,
+                    text: value.kind === GridCellKind.Text
+                        ? value.data ?? ''
+                        : value.kind === GridCellKind.Custom && is_rich_text_cell(value)
+                            ? value.data.edit_value ?? ''
+                            : '',
+                });
+            }
+            // A paste that admitted rows below the sheet records them in the
+            // same action, so it takes the combined path below.
+            if (column_edits.length > 0 && rest.length === 0 && pending_paste_history_ref.current === null) {
+                return commit_pending_column_cells(
+                    column_edits,
+                    edit_history_label(source, column_edits.length),
+                ) ? true : 'refused';
+            }
+            items = rest;
 
             const edits: CellValueEdit[] = [];
             const pending_before = pending_store.snapshot();
@@ -7306,7 +8271,7 @@ export function GridShell({
                 // captured row as well as the captured column. Other gestures use
                 // current residency, with the capture only as an eviction fallback.
                 const source_row = captured_matches
-                    ? captured.source_row
+                    ? captured.source_row ?? null
                     : targetRowIdentity?.kind === 'source'
                         ? targetRowIdentity.sourceRow
                         : resolve_source_row(target_display_row);
@@ -7394,7 +8359,9 @@ export function GridShell({
             let pending_changed = false;
             const deferred_paste = pending_paste_history_ref.current;
             pending_paste_history_ref.current = null;
-            const has_pending_arm = pending_cell_edits.length > 0 || deferred_paste !== null;
+            const has_pending_arm = pending_cell_edits.length > 0
+                || column_edits.length > 0
+                || deferred_paste !== null;
             if (has_pending_arm && edits.length > 0 && !can_capture_edits(edits)) {
                 if (deferred_paste !== null) {
                     const current = pending_store.snapshot();
@@ -7492,9 +8459,45 @@ export function GridShell({
                     return 'refused' as const;
                 }
             }
+            // The gesture's Pending Column cells, applied after its Pending
+            // Row cells and rolled back with them by every refusal below.
+            let column_change: HistoryChange | undefined;
+            if (column_edits.length > 0) {
+                const roll_back = () => {
+                    const rollback = pending_store.stage_replace(
+                        edit_session_id,
+                        pending_store.snapshot(),
+                        deferred_paste?.before ?? pending_before,
+                    );
+                    if (rollback?.valid()) {
+                        rollback.commit();
+                        rollback.notify();
+                    }
+                };
+                const plan = plan_pending_column_text(column_edits, pending_store.snapshot());
+                if (plan === 'refused') {
+                    roll_back();
+                    return 'refused' as const;
+                }
+                if (plan !== undefined) {
+                    const staged = pending_store.stage_replace(edit_session_id, pending_store.snapshot(), plan.next);
+                    if (staged === undefined || !staged.valid()) {
+                        roll_back();
+                        host_bridge.postMessage({
+                            type: 'showWarning',
+                            message: 'The edit is too large to keep as pending changes.',
+                        });
+                        return 'refused' as const;
+                    }
+                    staged.commit();
+                    staged.notify();
+                    pending_changed = true;
+                    column_change = plan.change;
+                }
+            }
             const label = edit_history_label(
                 source,
-                edits.length + pending_cell_edits.length,
+                edits.length + pending_cell_edits.length + column_edits.length,
             );
             const pending_after_cells = pending_store.snapshot();
             const formula_conflict_staging = edits.length === 0
@@ -7527,6 +8530,7 @@ export function GridShell({
                 deferred_paste?.before ?? pending_before,
                 pending_after,
                 pending_history_rows,
+                column_change === undefined ? [] : [column_change],
             );
             const source_result = edits.length > 0
                 ? commit_edits_result(
@@ -7577,11 +8581,19 @@ export function GridShell({
                 return 'refused' as const;
             }
             if ((pending_changed || deferred_paste !== null) && source_result === 'noop') {
-                record_pending_row_gesture(
-                    label,
-                    deferred_paste?.before ?? pending_before,
-                    pending_after_cells,
-                );
+                if (column_change === undefined) {
+                    record_pending_row_gesture(
+                        label,
+                        deferred_paste?.before ?? pending_before,
+                        pending_after_cells,
+                    );
+                } else if (history_capture !== undefined) {
+                    const record = history_capture.history.stage_record({
+                        label,
+                        changes: structural_history_changes,
+                    });
+                    commit_staged_transaction([record]);
+                }
             }
 
             // Height is part of the gesture's commit, not an eager side effect of
@@ -7641,6 +8653,10 @@ export function GridShell({
             sheet_meta.worksheetId,
             source_column_for_display,
             commit_source_row,
+            commit_pending_column_cells,
+            pending_column_overlay_target,
+            plan_pending_column_text,
+            projected_columns,
             save_in_flight_ref,
         ],
     );
@@ -8130,6 +9146,22 @@ export function GridShell({
     // write it to the clipboard. Reads via get_row_ref so the callback stays stable
     // across page loads. When the copy is clipped (non-resident rows or the row
     // cap) the available data is still copied, but the host surfaces a warning.
+    /**
+     * The column index each display column copies through: its source column,
+     * or for a Pending Column a virtual index past the source width that
+     * `copy_virtual_column` resolves.
+     */
+    const copy_columns = useMemo(() => {
+        let virtual = sheet_meta.columnCount;
+        return projected_columns.map((column) =>
+            column.identity.kind === 'source' ? column.identity.sourceColumn : virtual++);
+    }, [projected_columns, sheet_meta.columnCount]);
+    const copy_virtual_column = useCallback((column: number): PendingColumn | undefined => {
+        if (column < sheet_meta.columnCount) return undefined;
+        const display = copy_columns.indexOf(column);
+        const identity = projected_columns[display]?.identity;
+        return identity?.kind === 'pending' ? pending_columns_by_id.get(identity.pendingColumnId) : undefined;
+    }, [copy_columns, pending_columns_by_id, projected_columns, sheet_meta.columnCount]);
     const copy_source_selection = useCallback((
         selection: Parameters<typeof format_selection_tsv>[0],
         include_header = false,
@@ -8145,10 +9177,49 @@ export function GridShell({
         // otherwise-unloaded row look complete or suppress the nonresident warning.
         const dirty = store.snapshot();
         const live = read_live_edit();
+        // Pending Columns copy through virtual indexes past the source width
+        // (`copy_column_index`); each row reads them by its identity key.
+        const virtual_columns = selection.source_columns.flatMap((column) => {
+            const pending = copy_virtual_column(column);
+            return pending === undefined ? [] : [{ column, pending }];
+        });
+        const with_pending_columns = (
+            cells: (RenderedCell | null)[] | undefined,
+            row_key: string | undefined,
+        ): (RenderedCell | null)[] | undefined => {
+            if (cells === undefined || virtual_columns.length === 0 || row_key === undefined) return cells;
+            const displayed = [...cells];
+            for (const { column, pending } of virtual_columns) {
+                const cell = pending.cells[row_key];
+                // An open editor's uncommitted text, as the source and Pending
+                // Row paths copy it.
+                const value = live?.kind === 'pendingColumn'
+                    && live.pendingColumnId === pending.id
+                    && live.rowKey === row_key
+                    ? live.value
+                    : cell === undefined ? undefined : pending_column_cell_text(cell);
+                displayed[column] = value === undefined ? null : {
+                    raw: value,
+                    formatted: value,
+                    bold: false,
+                    italic: false,
+                    rawType: value === '' ? 'empty' : 'string',
+                };
+            }
+            return displayed;
+        };
         const get_displayed_row = (
             row_index: number,
         ): (RenderedCell | null)[] | undefined => {
             const projected = pending_projection.row_at(row_index);
+            // The key the cell was edited under: `f:` above a promoted Header Row.
+            const row_key = pending_column_row_target(row_index)?.key;
+            return with_pending_columns(get_displayed_source_row(row_index, projected), row_key);
+        };
+        const get_displayed_source_row = (
+            row_index: number,
+            projected: ReturnType<typeof pending_projection.row_at>,
+        ): (RenderedCell | null)[] | undefined => {
             if (projected !== undefined && projected.kind !== 'source') {
                 const pending_id = projected.kind === 'pending'
                     || projected.kind === 'replacement'
@@ -8189,6 +9260,7 @@ export function GridShell({
             if (source_row === undefined) return undefined;
             let displayed_row: (RenderedCell | null)[] | undefined;
             for (const source_column of selection.source_columns) {
+                if (source_column >= sheet_meta.columnCount) continue;
                 const key = cell_key(source_row, source_column);
                 const entry = dirty.get(key);
                 // A pending formula copies as it renders for the current layouts.
@@ -8225,7 +9297,8 @@ export function GridShell({
         }
         const header = include_header
             ? selection.source_columns.map((source_column) =>
-                effective_column_names?.[source_column]
+                copy_virtual_column(source_column)?.header
+                || effective_column_names?.[source_column]
                 || sheet_meta.columnNames?.[source_column]
                 || columns[display_column_for_source(source_column) ?? -1]?.title
                 || `Column ${source_column + 1}`,
@@ -8236,12 +9309,15 @@ export function GridShell({
         );
     }, [
         columns,
+        copy_virtual_column,
         display_column_for_source,
         edit_syntax,
         effective_column_names,
         formula_text_for,
         get_source_row,
         merge_index,
+        pending_column_cell_text,
+        pending_column_row_target,
         pending_projection,
         pending_rendered_rows,
         read_live_edit,
@@ -8267,13 +9343,13 @@ export function GridShell({
             copy_source_selection({
                 y: rect.y,
                 height: rect.height,
-                source_columns: visible_source_columns.slice(
+                source_columns: copy_columns.slice(
                     rect.x,
                     rect.x + rect.width,
                 ),
             }, include_header, max_rows);
         },
-        [copy_source_selection, sheet_meta.estimatedRowBytes, visible_source_columns],
+        [copy_columns, copy_source_selection, sheet_meta.estimatedRowBytes],
     );
 
     const copy_display_rows = useCallback((intervals: readonly DisplayRowInterval[]) => {
@@ -8284,7 +9360,7 @@ export function GridShell({
         copy_source_selection({
             row_indices: display_row_indices(intervals),
             row_count: row_count_total,
-            source_columns: visible_source_columns,
+            source_columns: copy_columns,
         });
     }, [copy_source_selection, visible_source_columns]);
 
@@ -8738,20 +9814,24 @@ export function GridShell({
         transform_state,
     ]);
 
+    // A Pending Column has no source column: focusing it leaves sort and
+    // filter shortcuts with none to act on.
     const focus_header_column = useCallback((display_column: number) => {
         const source_column = source_column_for_display(display_column);
-        if (source_column !== undefined) focused_source_column_ref.current = source_column;
-    }, [source_column_for_display]);
+        if (source_column !== undefined || projected_columns[display_column]?.identity.kind === 'pending') {
+            focused_source_column_ref.current = source_column;
+        }
+    }, [projected_columns, source_column_for_display]);
 
     const select_header_column = useCallback((display_column: number) => {
         const source_column = source_column_for_display(display_column);
-        if (source_column === undefined) return;
+        if (source_column === undefined && projected_columns[display_column]?.identity.kind !== 'pending') return;
         focused_source_column_ref.current = source_column;
         write_grid_selection({
             columns: CompactSelection.fromSingleSelection(display_column),
             rows: CompactSelection.empty(),
         });
-    }, [source_column_for_display, write_grid_selection]);
+    }, [projected_columns, source_column_for_display, write_grid_selection]);
 
     const on_header_context_menu = useCallback((
         display_column: number,
@@ -8760,7 +9840,7 @@ export function GridShell({
         event.preventDefault();
         header_drag_ref.current = null;
         const source_column = source_column_for_display(display_column);
-        if (source_column === undefined) return;
+        if (source_column === undefined && projected_columns[display_column]?.identity.kind !== 'pending') return;
         suppress_menu_restore_ref.current = false;
         const x = event.bounds.x + event.localEventX;
         const y = event.bounds.y + event.localEventY;
@@ -8768,12 +9848,14 @@ export function GridShell({
         // range menu (mirrors the row-marker menu); outside, collapse to the
         // clicked column as before.
         if (grid_selection_contains_column(grid_selection_ref.current, display_column)) {
-            const { display_cols, source_cols } = selected_source_columns(
-                grid_selection_ref.current,
-                source_column_for_display,
-            );
-            if (source_cols.length > 1) {
-                focused_source_column_ref.current = source_column;
+            const display_cols = [...grid_selection_ref.current.columns]
+                .filter((column) => column >= 0 && column < projected_columns.length);
+            if (display_cols.length > 1) {
+                const { source_cols } = selected_source_columns(
+                    grid_selection_ref.current,
+                    source_column_for_display,
+                );
+                if (source_column !== undefined) focused_source_column_ref.current = source_column;
                 hide_cell_tooltip();
                 set_context_menu({
                     kind: 'multi-column',
@@ -8781,6 +9863,7 @@ export function GridShell({
                     y,
                     display_cols,
                     source_cols,
+                    structure: resolve_column_structure_selection(projected_columns, display_cols),
                 });
                 return;
             }
@@ -8793,8 +9876,9 @@ export function GridShell({
             y,
             display_col: display_column,
             source_col: source_column,
+            structure: resolve_column_structure_selection(projected_columns, [display_column]),
         });
-    }, [hide_cell_tooltip, select_header_column, source_column_for_display]);
+    }, [hide_cell_tooltip, projected_columns, select_header_column, source_column_for_display]);
 
     // Glide gives no clientX/clientY — derive them from the cell bounds plus the
     // in-cell offset. Right-clicking outside the current selection collapses it to
@@ -8898,6 +9982,17 @@ export function GridShell({
                 args.preventDefault();
                 return;
             }
+            // Alt+Shift+Left/Right move whole selected columns.
+            if (
+                args.altKey && args.shiftKey && !args.ctrlKey && !args.metaKey
+                && (args.key === 'ArrowLeft' || args.key === 'ArrowRight')
+                && !is_editable_target(args.rawEvent?.target ?? null)
+                && move_columns_by_keyboard_ref.current(args.key === 'ArrowLeft' ? 'backward' : 'forward')
+            ) {
+                args.cancel();
+                args.preventDefault();
+                return;
+            }
             const shortcut = transform_shortcut({
                 shiftKey: args.shiftKey,
                 altKey: args.altKey,
@@ -8963,7 +10058,7 @@ export function GridShell({
                 if (selection.columns.length > 0) {
                     const source_columns = Array.from(
                         selection.columns,
-                        (display_column) => source_column_for_display(display_column),
+                        (display_column) => copy_columns[display_column],
                     ).filter((source_column): source_column is number =>
                         source_column !== undefined);
                     args.cancel();
@@ -8979,7 +10074,7 @@ export function GridShell({
                     copy_source_selection({
                         row_indices: selection.rows,
                         row_count: selection.rows.length,
-                        source_columns: visible_source_columns,
+                        source_columns: copy_columns,
                     });
                 } else if (selection.current) {
                     args.cancel();
@@ -9233,13 +10328,16 @@ export function GridShell({
             }
             prev_pending_formula_impact_ref.current = pending_formula_impact;
         }
+        let pending_column_results_changed = false;
         if (prev_formula_results_ref.current !== formula_results) {
+            const before_size = changed.size;
             for (const [key, value] of prev_formula_results_ref.current) {
                 if (formula_results?.get(key) !== value) changed.add(key);
             }
             for (const [key, value] of formula_results ?? []) {
                 if (prev_formula_results_ref.current.get(key) !== value) changed.add(key);
             }
+            pending_column_results_changed = changed.size !== before_size;
             prev_formula_results_ref.current = formula_results ?? new Map();
         }
         if (prev_source_formula_results_ref.current !== source_formula_results) {
@@ -9257,6 +10355,19 @@ export function GridShell({
         prev_conflicted_keys_ref.current = conflicted_keys;
         const grid = grid_ref.current;
         if (!grid || changed.size === 0) return;
+        // Result keys are prospective addresses, which no source key names for
+        // a Pending Column: repaint its visible cells when any result moved.
+        const pending_column_cells: { cell: Item }[] = [];
+        if (pending_column_results_changed) {
+            const visible = visible_ref.current;
+            projected_columns.forEach((column, display_column) => {
+                if (column.identity.kind !== 'pending') return;
+                if (display_column < visible.x || display_column >= visible.x + visible.width) return;
+                for (let row = visible.y; row < visible.y + visible.height; row++) {
+                    pending_column_cells.push({ cell: [display_column, row] });
+                }
+            });
+        }
         // Dirty keys are source-keyed, so a changed key's row is a source row and
         // cannot be used as a display coordinate. source_key_damage maps source →
         // display over the visible range (handling one source row appearing at
@@ -9278,11 +10389,13 @@ export function GridShell({
                 cells.push({ cell: [display_column, display_row] });
             }
         }
+        cells.push(...pending_column_cells);
         if (cells.length > 0) grid.updateCells(cells);
     }, [
         dirty_cells,
         conflicted_keys,
         pending_formula_impact,
+        projected_columns,
         formula_results,
         source_formula_results,
         display_column_for_source,
@@ -9320,9 +10433,44 @@ export function GridShell({
             const source_column = source_column_for_display(display_column);
             if (source_column !== undefined) {
                 on_column_resize(source_column, new_size);
+                return;
             }
+            // A Pending Column carries its own width: shown live while the
+            // drag runs, stored once it ends.
+            const identity = projected_columns[display_column]?.identity;
+            if (identity?.kind !== 'pending') return;
+            set_pending_column_width_drafts((current) =>
+                current.get(identity.pendingColumnId) === new_size
+                    ? current
+                    : new Map(current).set(identity.pendingColumnId, new_size));
         },
-        [on_column_resize, source_column_for_display],
+        [on_column_resize, projected_columns, source_column_for_display],
+    );
+    const handle_column_resize_end = useCallback(
+        (_column: GridColumn, new_size: number, display_column: number) => {
+            const identity = projected_columns[display_column]?.identity;
+            if (identity?.kind !== 'pending') return;
+            set_pending_column_width_drafts((current) => {
+                if (!current.has(identity.pendingColumnId)) return current;
+                const next = new Map(current);
+                next.delete(identity.pendingColumnId);
+                return next;
+            });
+            // View state, like a Pending Row's height: stored without a history entry.
+            const before = pending_store.snapshot();
+            const columns = before.pendingColumns ?? [];
+            if (!columns.some((column) => column.id === identity.pendingColumnId)) return;
+            const staged = pending_store.stage_replace(edit_session_id, before, {
+                ...before,
+                pendingColumns: columns.map((column) => column.id === identity.pendingColumnId
+                    ? { ...column, viewerWidth: clamp_column_width(new_size) }
+                    : column),
+            });
+            if (staged === undefined || !staged.valid()) return;
+            staged.commit();
+            staged.notify();
+        },
+        [edit_session_id, pending_store, projected_columns],
     );
 
     // Snapshot the cell menu's effective selection while rendering so every model
@@ -9579,6 +10727,16 @@ export function GridShell({
                         onRowProposeMove: propose_row_move,
                     }
                     : {})}
+                // Likewise a drag from a header inside the selected columns
+                // moves them; any other header press keeps drag-to-select.
+                {...(column_structure_offered
+                    ? {
+                        onColumnMoved: on_columns_moved,
+                        canMoveColumns: can_drag_columns,
+                        onColumnProposeMove: propose_column_move,
+                    }
+                    : {})}
+                getColumnAccessibilityLabel={get_column_accessibility_label}
                 theme={theme}
                 smoothScrollX
                 smoothScrollY
@@ -9593,6 +10751,7 @@ export function GridShell({
                 onHeaderContextMenu={on_header_context_menu}
                 onVisibleRegionChanged={on_visible_region_changed}
                 onColumnResize={handle_column_resize}
+                onColumnResizeEnd={handle_column_resize_end}
                 onItemHovered={on_item_hovered}
                 onCellsEdited={on_cells_edited}
                 onPaste={editable_cells
@@ -9636,7 +10795,7 @@ export function GridShell({
                     secondary_actions={(
                         <AppendComposer
                             column_labels={composer_column_labels}
-                            source_columns={visible_source_columns}
+                            source_columns={composer_source_columns}
                             first_row_number={composer_first_row_number}
                             draft={composer_draft}
                             on_draft_change={set_composer_draft}
@@ -9726,6 +10885,19 @@ export function GridShell({
                     on_commit={apply_column_rename}
                     on_cancel={() => {
                         set_rename_column(null);
+                        window.setTimeout(() => grid_ref.current?.focus(), 0);
+                    }}
+                />
+            )}
+            {rename_pending_column && (
+                <RenameColumnDialog
+                    initial={rename_pending_column.initial}
+                    column_names={rename_pending_column.names}
+                    source_column={rename_pending_column.self}
+                    removed_names={rename_pending_column.removed}
+                    on_commit={apply_pending_column_rename}
+                    on_cancel={() => {
+                        set_rename_pending_column(null);
                         window.setTimeout(() => grid_ref.current?.focus(), 0);
                     }}
                 />
@@ -9902,7 +11074,7 @@ export function GridShell({
                                 copy_source_selection({
                                     row_indices: ordered_rows,
                                     row_count: ordered_rows.length,
-                                    source_columns: visible_source_columns,
+                                    source_columns: copy_columns,
                                 });
                             },
                         })}
@@ -9911,20 +11083,30 @@ export function GridShell({
                     />
                 );
             })()}
-            {context_menu?.kind === 'multi-column' && (
+            {context_menu?.kind === 'multi-column' && (() => {
+                const has_pending = context_menu.source_cols.length < context_menu.display_cols.length;
+                const structure = column_structure_actions(
+                    context_menu.structure,
+                    context_menu.display_cols[0] ?? 0,
+                );
+                return (
                 <MultiColumnContextMenu
                     x={context_menu.x}
                     y={context_menu.y}
-                    column_count={context_menu.source_cols.length}
+                    column_count={context_menu.display_cols.length}
                     transform_sections={transform_sections}
-                    transform_disabled={transform_pending || inserted_rows_lock}
+                    transform_disabled={transform_pending || inserted_rows_lock || has_pending}
                     {...(inserted_rows_lock
                         ? { transform_disabled_reason: INSERTED_ROWS_TRANSFORM_MESSAGE }
-                        : {})}
+                        : has_pending
+                            ? { transform_disabled_reason: PENDING_COLUMN_TRANSFORM_MESSAGE }
+                            : {})}
+                    {...(has_pending ? { hide_disabled_reason: PENDING_COLUMN_HIDE_MESSAGE } : {})}
+                    {...(structure === undefined ? {} : { structure })}
                     on_copy={() => copy_source_selection({
                         y: 0,
                         height: row_count,
-                        source_columns: context_menu.source_cols,
+                        source_columns: context_menu.display_cols.map((display) => copy_columns[display]!),
                     }, true)}
                     on_hide={() => hide_source_columns_multi(context_menu.source_cols)}
                     on_sort={(direction) =>
@@ -9936,13 +11118,69 @@ export function GridShell({
                         }
                     }}
                 />
-            )}
-            {context_menu?.kind === 'header' && (() => {
+                );
+            })()}
+            {context_menu?.kind === 'header' && context_menu.source_col === undefined && (() => {
+                // A Pending Column: no source column to sort, filter, or hide by.
+                const pending_structure = column_structure_actions(context_menu.structure, context_menu.display_col);
+                return (
+                    <ColumnContextMenu
+                        x={context_menu.x}
+                        y={context_menu.y}
+                        column_name={columns[context_menu.display_col]?.title ?? 'New column'}
+                        transform_sections={transform_sections}
+                        transform_disabled
+                        transform_disabled_reason={PENDING_COLUMN_TRANSFORM_MESSAGE}
+                        active_direction={null}
+                        any_sorted={false}
+                        other_columns_sorted={false}
+                        has_filter={false}
+                        any_filtered={false}
+                        on_copy={() => copy_rect({
+                            x: context_menu.display_col,
+                            y: 0,
+                            width: 1,
+                            height: row_count,
+                        }, true)}
+                        on_hide={() => {}}
+                        hide_disabled_reason={PENDING_COLUMN_HIDE_MESSAGE}
+                        {...(editable_cells && column_structure_offered
+                            ? {
+                                on_rename: () => {
+                                    suppress_menu_restore_ref.current = true;
+                                    open_pending_column_rename(context_menu.display_col);
+                                },
+                            }
+                            : {})}
+                        {...(pending_structure === undefined ? {} : { structure: pending_structure })}
+                        on_sort={() => {}}
+                        on_clear_column_sort={() => {}}
+                        on_clear_all_sorts={() => {}}
+                        on_edit_filter={() => {}}
+                        on_clear_column_filter={() => {}}
+                        on_clear_all_filters={() => {}}
+                        on_dismiss={dismiss_context_menu}
+                        restore_focus={() => {
+                            if (!suppress_menu_restore_ref.current) {
+                                grid_ref.current?.focus();
+                            }
+                        }}
+                    />
+                );
+            })()}
+            {context_menu?.kind === 'header' && context_menu.source_col !== undefined && (() => {
                 const source_column = context_menu.source_col;
                 const active_sort = transform_state.sort.find((key) =>
                     key.colIndex === source_column);
                 const existing_filter = transform_state.filters.find((entry) =>
                     entry.colIndex === source_column);
+                const structure = column_structure_actions(context_menu.structure, context_menu.display_col);
+                // A column with a structure change other than a removal renames
+                // only as a Pending Column does; renaming a source column's
+                // header stays the `.xlsx` header edit it was.
+                const source_rename_offered = editable_cells
+                    && edit_syntax === 'markdown'
+                    && sheet_meta.excelFirstRowHeader?.active === true;
                 return (
                     <ColumnContextMenu
                         x={context_menu.x}
@@ -9954,6 +11192,7 @@ export function GridShell({
                         {...(inserted_rows_lock
                             ? { transform_disabled_reason: INSERTED_ROWS_TRANSFORM_MESSAGE }
                             : {})}
+                        {...(structure === undefined ? {} : { structure })}
                         active_direction={active_sort?.direction ?? null}
                         any_sorted={transform_state.sort.length > 0}
                         other_columns_sorted={transform_state.sort.some((key) =>
@@ -9967,9 +11206,15 @@ export function GridShell({
                             height: row_count,
                         }, true)}
                         on_hide={() => hide_source_column(source_column)}
-                        {...(editable_cells
-                            && edit_syntax === 'markdown'
-                            && sheet_meta.excelFirstRowHeader?.active === true
+                        {...(!source_rename_offered && editable_cells && column_structure_offered
+                            ? {
+                                // CSV and TSV rename only new columns.
+                                on_rename: () => {},
+                                rename_disabled: true,
+                                rename_disabled_reason: RENAME_ONLY_NEW_COLUMNS_MESSAGE,
+                            }
+                            : {})}
+                        {...(source_rename_offered
                             ? {
                                 rename_disabled: !header_column_can_be_renamed(
                                     sheet_meta,

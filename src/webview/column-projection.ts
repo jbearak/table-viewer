@@ -14,13 +14,27 @@ import {
     type ColumnLayout,
 } from '../worksheet-layout';
 
-export interface ColumnProjection {
+/** The display columns of a worksheet with no column layout: source columns only. */
+export interface SourceColumnProjection {
     /** Display-column index to canonical source-column index. */
     visible_to_source: number[];
     /** Canonical source-column index to display-column index; hidden columns
      *  deliberately have no reverse mapping. Kept sparse so hide-all is O(1). */
     source_to_visible: (number | undefined)[];
     hidden_count: number;
+}
+
+/**
+ * The display columns the grid shows. With a column layout a display column
+ * may be a Pending Column, which has no source column, so
+ * `visible_to_source` holds undefined there; `columns` names every display
+ * column's identity, Glide id key (`s:<n>` or `p:<id>`), and state.
+ */
+export interface ColumnProjection {
+    readonly visible_to_source: readonly (number | undefined)[];
+    readonly source_to_visible: readonly (number | undefined)[];
+    readonly hidden_count: number;
+    readonly columns?: readonly ProjectedColumn[];
 }
 
 /** Structural equality for projections recreated from an equivalent snapshot. */
@@ -36,7 +50,12 @@ export function column_projections_equal(
         && left.source_to_visible.length === right.source_to_visible.length
         && left.source_to_visible.every(
             (display, source) => display === right.source_to_visible[source],
-        );
+        )
+        && (left.columns?.length ?? 0) === (right.columns?.length ?? 0)
+        && (left.columns ?? []).every((column, display) => {
+            const other = right.columns?.[display];
+            return other !== undefined && other.key === column.key && other.state === column.state;
+        });
 }
 
 export function sanitize_column_visibility_state(
@@ -83,7 +102,7 @@ export function create_column_projection(
     column_count: number,
     value?: unknown,
     expected_schema?: string,
-): ColumnProjection {
+): SourceColumnProjection {
     const safe_column_count = Number.isInteger(column_count) && column_count > 0
         ? column_count
         : 0;
@@ -252,7 +271,7 @@ export interface ProjectedColumn {
     readonly state: ProjectedColumnState;
 }
 
-export interface ColumnLayoutProjection {
+export interface ColumnLayoutProjection extends ColumnProjection {
     /** Display columns in order. */
     readonly columns: readonly ProjectedColumn[];
     /** Source column to display column; hidden and absent columns have none. */
@@ -289,6 +308,7 @@ export function create_layout_column_projection(
     }
     const columns: ProjectedColumn[] = [];
     const source_to_visible: (number | undefined)[] = [];
+    const visible_to_source: (number | undefined)[] = [];
     const by_key = new Map<string, number>();
     for (const identity of index.display_identities()) {
         if (identity.kind === 'source' && hidden.has(identity.sourceColumn)) continue;
@@ -299,14 +319,56 @@ export function create_layout_column_projection(
                 : moved.has(identity.sourceColumn) ? 'moved' : 'source';
         const key = column_identity_key(identity);
         if (identity.kind === 'source') source_to_visible[identity.sourceColumn] = columns.length;
+        visible_to_source.push(identity.kind === 'source' ? identity.sourceColumn : undefined);
         by_key.set(key, columns.length);
         columns.push(Object.freeze({ identity, key, state }));
     }
     return Object.freeze({
         columns: Object.freeze(columns),
+        visible_to_source: Object.freeze(visible_to_source),
         source_to_visible,
         hidden_count: hidden.size,
         display_column_for_identity: (identity: ColumnIdentity) => by_key.get(column_identity_key(identity)),
         display_column_for_key: (key: string) => by_key.get(key),
     });
+}
+
+/**
+ * The grid's display columns for a worksheet: `base`, the visibility
+ * projection over source columns, with `layout` applied. Hidden columns are
+ * the source columns `base` hides.
+ */
+export function with_column_layout(
+    base: ColumnProjection,
+    column_count: number,
+    layout: ColumnLayout | undefined,
+): ColumnLayoutProjection {
+    if (layout === undefined) {
+        // No layout: the base projection's own order, every column a source column.
+        const columns: ProjectedColumn[] = base.visible_to_source.flatMap((source_column) => source_column === undefined
+            ? []
+            : [Object.freeze({
+                identity: Object.freeze({ kind: 'source' as const, sourceColumn: source_column }),
+                key: `s:${source_column}`,
+                state: 'source' as const,
+            })]);
+        const by_key = new Map<string, number>(columns.map((column, display) => [column.key, display]));
+        return Object.freeze({
+            columns: Object.freeze(columns),
+            visible_to_source: base.visible_to_source,
+            source_to_visible: base.source_to_visible,
+            hidden_count: base.hidden_count,
+            display_column_for_identity: (identity: ColumnIdentity) => by_key.get(column_identity_key(identity)),
+            display_column_for_key: (key: string) => by_key.get(key),
+        });
+    }
+    const hidden: number[] = [];
+    for (let source_column = 0; source_column < column_count; source_column++) {
+        if (base.source_to_visible[source_column] === undefined) hidden.push(source_column);
+    }
+    return create_layout_column_projection(
+        column_count,
+        layout,
+        hidden.length === 0 ? undefined : { hiddenColumns: hidden },
+    );
 }

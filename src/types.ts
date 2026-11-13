@@ -3378,6 +3378,11 @@ export function save_lifecycle_correlation(
 export type HostMessage =
     | { type: 'fontChanged'; fontFamily: string | null; fontSize: number | null }
     /**
+     * A message for the toolbar's polite live region, such as "Removed the
+     * sort on Price because the column was deleted." after a structural save.
+     */
+    | { type: 'toolbarAnnouncement'; message: string }
+    /**
      * How far the compare window's row alignment has got. Sent only in compare
      * mode, and only before the workbook snapshot: once the grid exists the
      * alignment is by definition finished.
@@ -3441,6 +3446,8 @@ export type HostMessage =
         sourceGeneration: number;
         granted: boolean;
         rowIds?: readonly string[];
+        /** The minted Pending Column IDs, for a column insert. */
+        columnIds?: readonly string[];
         formatTemplate?: PendingRowFormatTemplate;
         structuralBasis?: StructuralBasis;
         appendBasis?: PendingAppendBasis;
@@ -3667,9 +3674,9 @@ export type WebviewMessage =
     }
     | {
         /**
-         * Insert `count` blank Pending Inserted Rows (or, from step 8,
-         * Pending Columns) beside `anchor`. Admitted through the append
-         * ledger and its single reservation slot per worksheet.
+         * Insert `count` blank Pending Inserted Rows or Pending Columns
+         * beside `anchor`. Row IDs come from the append ledger, column IDs
+         * from its column twin; both share one reservation slot per worksheet.
          */
         type: 'requestStructuralInsert';
         requestId: string;
@@ -3728,6 +3735,8 @@ export type WebviewMessage =
             readonly appendHistoryIds: readonly string[];
             /** Unsaved temporary identities reachable from Undo/Redo history. */
             readonly pendingRowIds?: readonly string[];
+            /** Pending Column IDs reachable from Undo/Redo history. */
+            readonly pendingColumnIds?: readonly string[];
         })[];
     }
     // User-facing warning raised inside the webview (e.g. a clipped copy) that

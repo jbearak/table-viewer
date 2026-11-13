@@ -6,6 +6,54 @@ import {
 } from './context-menu';
 import type { SortDirection } from '../types';
 import type { SheetMeta } from '../data-source/interface';
+import type { StructureMenuAction } from './row-context-menu';
+
+/** Insert, Delete, Restore, and Move for a column selection, in Edit mode. */
+export interface ColumnStructureMenuActions {
+    readonly insert_left: StructureMenuAction;
+    readonly insert_right: StructureMenuAction;
+    readonly delete: StructureMenuAction;
+    /** Offered when the selection includes a Pending Column Removal. */
+    readonly restore?: StructureMenuAction;
+    readonly move_left: StructureMenuAction;
+    readonly move_right: StructureMenuAction;
+}
+
+function column_structure_item(label: string, action: StructureMenuAction): ActionMenuItem {
+    return {
+        label,
+        on_click: () => action.on_click?.(),
+        ...(action.on_click === undefined
+            ? {
+                disabled: true,
+                ...(action.disabled_reason === undefined ? {} : { disabled_reason: action.disabled_reason }),
+            }
+            : {}),
+    };
+}
+
+function counted(verb: string, count: number, side?: string): string {
+    const n = Math.max(1, count);
+    const columns = n === 1 ? `${verb} column` : `${verb} ${n} columns`;
+    return side === undefined ? columns : `${columns} ${side}`;
+}
+
+/** The structure items, in menu order: Insert, Delete, Restore, Move. */
+export function column_structure_menu_items(actions: ColumnStructureMenuActions): ActionMenuItem[] {
+    const items = [
+        column_structure_item(counted('Insert', actions.insert_left.count, 'left'), actions.insert_left),
+        column_structure_item(counted('Insert', actions.insert_right.count, 'right'), actions.insert_right),
+        column_structure_item(counted('Delete', actions.delete.count), actions.delete),
+    ];
+    if (actions.restore !== undefined) {
+        items.push(column_structure_item(counted('Restore', actions.restore.count), actions.restore));
+    }
+    items.push(
+        column_structure_item('Move columns left', actions.move_left),
+        column_structure_item('Move columns right', actions.move_right),
+    );
+    return items;
+}
 
 /** Merged children can inherit a displayed header but are not editable cells. */
 export function header_column_can_be_renamed(sheet: SheetMeta, column: number): boolean {
@@ -42,8 +90,14 @@ export interface ColumnContextMenuProps {
     any_filtered: boolean;
     on_copy: () => void;
     on_hide: () => void;
+    /** Why "Hide column" is disabled (a Pending Column cannot be hidden). */
+    hide_disabled_reason?: string;
     on_rename?: () => void;
     rename_disabled?: boolean;
+    /** Why "Rename column…" is disabled, shown as its description. */
+    rename_disabled_reason?: string;
+    /** Insert, Delete, Restore, and Move, in Edit mode with structural editing on. */
+    structure?: ColumnStructureMenuActions;
     on_sort: (direction: SortDirection, append: boolean) => void;
     on_clear_column_sort: () => void;
     on_clear_all_sorts: () => void;
@@ -59,13 +113,25 @@ export function column_context_menu_items(
 ): (ActionMenuItem | MenuSeparator)[] {
     const items: (ActionMenuItem | MenuSeparator)[] = [
         { label: 'Copy column', on_click: () => props.on_copy() },
-        { label: 'Hide column', on_click: () => props.on_hide() },
+        {
+            label: 'Hide column',
+            on_click: () => props.on_hide(),
+            ...(props.hide_disabled_reason === undefined
+                ? {}
+                : { disabled: true, disabled_reason: props.hide_disabled_reason }),
+        },
     ];
     if (props.on_rename) items.push({
         label: 'Rename column…',
         on_click: props.on_rename,
         disabled: props.rename_disabled,
+        ...(props.rename_disabled && props.rename_disabled_reason !== undefined
+            ? { disabled_reason: props.rename_disabled_reason }
+            : {}),
     });
+    if (props.structure !== undefined) {
+        items.push({ kind: 'separator' }, ...column_structure_menu_items(props.structure));
+    }
     if (!props.transform_sections) return items;
     items.push(
         { kind: 'separator' },
@@ -164,6 +230,10 @@ export interface MultiColumnContextMenuProps {
     transform_disabled_reason?: string;
     on_copy: () => void;
     on_hide: () => void;
+    /** Why "Hide N columns" is disabled (the selection holds a Pending Column). */
+    hide_disabled_reason?: string;
+    /** Insert, Delete, Restore, and Move, in Edit mode with structural editing on. */
+    structure?: ColumnStructureMenuActions;
     on_sort: (direction: SortDirection) => void;
     on_dismiss: () => void;
     restore_focus: () => void;
@@ -173,10 +243,16 @@ export function multi_column_context_menu_items(
     props: Omit<MultiColumnContextMenuProps, 'x' | 'y' | 'on_dismiss' | 'restore_focus'>,
 ): (ActionMenuItem | MenuSeparator)[] {
     const count = Math.max(2, props.column_count);
+    const hide = hide_columns_menu_item(count, props.on_hide);
     const items: (ActionMenuItem | MenuSeparator)[] = [
         { label: `Copy ${count} columns`, on_click: () => props.on_copy() },
-        hide_columns_menu_item(count, props.on_hide),
+        props.hide_disabled_reason === undefined
+            ? hide
+            : { ...hide, disabled: true, disabled_reason: props.hide_disabled_reason },
     ];
+    if (props.structure !== undefined) {
+        items.push({ kind: 'separator' }, ...column_structure_menu_items(props.structure));
+    }
     if (!props.transform_sections) return items;
     items.push(
         { kind: 'separator' },

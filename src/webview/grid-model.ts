@@ -81,3 +81,51 @@ export function build_grid_columns(
         };
     });
 }
+
+/** One display column of a worksheet layout, as `build_layout_grid_columns` reads it. */
+export interface LayoutGridColumnInput {
+    readonly key: string;
+    readonly identity:
+        | { readonly kind: 'source'; readonly sourceColumn: number }
+        | { readonly kind: 'pending'; readonly pendingColumnId: string };
+    readonly state: 'source' | 'inserted' | 'removed' | 'moved';
+}
+
+/**
+ * Glide columns for a worksheet layout's display columns. The id is the
+ * column identity key (`s:<n>`, `p:<id>`), so Glide state follows the column
+ * wherever it moves. Titles are prospective: a live column with no name
+ * shows the letter it will have after save (`prospective_column`, 0-based),
+ * a Pending Column Removal keeps its source name or letter, and a Pending
+ * Column shows its header. Source widths are keyed by source column; a
+ * Pending Column carries its own.
+ */
+export function build_layout_grid_columns(
+    columns: readonly LayoutGridColumnInput[],
+    widths: Record<number, number>,
+    names: readonly (string | undefined)[] | undefined,
+    pending: ReadonlyMap<string, { readonly header: string; readonly viewerWidth?: number }>,
+    prospective_column: (column: LayoutGridColumnInput) => number | undefined,
+): SizedGridColumn[] {
+    return columns.map((column) => {
+        if (column.identity.kind === 'pending') {
+            const entry = pending.get(column.identity.pendingColumnId);
+            const letter = column_letter(prospective_column(column) ?? 0);
+            return {
+                title: entry?.header ? entry.header : letter,
+                id: column.key,
+                width: clamp_column_width(entry?.viewerWidth ?? DEFAULT_COLUMN_WIDTH_PX),
+            };
+        }
+        const source_column = column.identity.sourceColumn;
+        const name = names?.[source_column];
+        const letter_index = column.state === 'removed'
+            ? source_column
+            : prospective_column(column) ?? source_column;
+        return {
+            title: name && name.length > 0 ? name : column_letter(letter_index),
+            id: column.key,
+            width: clamp_column_width(widths[source_column] ?? DEFAULT_COLUMN_WIDTH_PX),
+        };
+    });
+}

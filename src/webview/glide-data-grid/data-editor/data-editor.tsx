@@ -31,6 +31,7 @@ import {
     type CellActiviationBehavior,
 } from "../internal/data-grid/data-grid-types.js";
 import DataGridSearch, { type DataGridSearchProps } from "../internal/data-grid-search/data-grid-search.js";
+import type { RowMoveBlock } from "../internal/data-grid-dnd/data-grid-dnd.js";
 import { browserIsOSX } from "../common/browser-detect.js";
 import {
     getDataEditorTheme,
@@ -889,6 +890,8 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
         onRowMoved,
         canMoveRows,
         onRowProposeMove,
+        canMoveColumns,
+        getColumnAccessibilityLabel,
         overscrollX: overscrollXIn,
         overscrollY: overscrollYIn,
         preventDiagonalScrolling,
@@ -2666,16 +2669,44 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
         ]
     );
 
+    // Fork change: column moves report a block and the column it lands
+    // before, in data columns; the caller moves the selection with the block.
     const onColumnMovedImpl = whenDefined(
         onColumnMoved,
         React.useCallback(
-            (startIndex: number, endIndex: number) => {
-                onColumnMoved?.(startIndex - rowMarkerOffset, endIndex - rowMarkerOffset);
-                if (columnSelect !== "none") {
-                    setSelectedColumns(CompactSelection.fromSingleSelection(endIndex), undefined, true);
-                }
+            (block: RowMoveBlock, before: number) => {
+                onColumnMoved?.(
+                    { start: block.start - rowMarkerOffset, end: block.end - rowMarkerOffset },
+                    before - rowMarkerOffset
+                );
             },
-            [columnSelect, onColumnMoved, rowMarkerOffset, setSelectedColumns]
+            [onColumnMoved, rowMarkerOffset]
+        )
+    );
+    const canMoveColumnsImpl = whenDefined(
+        canMoveColumns,
+        React.useCallback(
+            (block: RowMoveBlock) =>
+                canMoveColumns?.({ start: block.start - rowMarkerOffset, end: block.end - rowMarkerOffset }) ?? true,
+            [canMoveColumns, rowMarkerOffset]
+        )
+    );
+    const onColumnProposeMoveImpl = whenDefined(
+        onColumnProposeMove,
+        React.useCallback(
+            (block: RowMoveBlock, before: number) =>
+                onColumnProposeMove?.(
+                    { start: block.start - rowMarkerOffset, end: block.end - rowMarkerOffset },
+                    before - rowMarkerOffset
+                ) ?? true,
+            [onColumnProposeMove, rowMarkerOffset]
+        )
+    );
+    const getColumnAccessibilityLabelImpl = whenDefined(
+        getColumnAccessibilityLabel,
+        React.useCallback(
+            (col: number) => getColumnAccessibilityLabel?.(col - rowMarkerOffset),
+            [getColumnAccessibilityLabel, rowMarkerOffset]
         )
     );
 
@@ -4508,11 +4539,13 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
                     cellYOffset={cellYOffset}
                     accessibilityHeight={visibleRegion.height}
                     getRowAccessibilityLabel={getRowAccessibilityLabel}
+                    getColumnAccessibilityLabel={getColumnAccessibilityLabelImpl}
                     onDragEnd={onDragEnd}
                     columns={mangledCols}
                     nonGrowWidth={nonGrowWidth}
                     drawHeader={drawHeader}
-                    onColumnProposeMove={onColumnProposeMove}
+                    onColumnProposeMove={onColumnProposeMoveImpl}
+                    canMoveColumns={canMoveColumnsImpl}
                     drawCell={drawCell}
                     disabledRows={disabledRows}
                     freezeColumns={mangledFreezeColumns}

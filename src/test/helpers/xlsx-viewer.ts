@@ -65,6 +65,13 @@ export interface OpenXlsx {
         structuralBasis?: StructuralBasis;
         appendBasis?: WorksheetPendingEdits['appendBasis'];
     }>;
+    /** Request a column insert beside a source column of sheet 0. */
+    insertColumns(request: { anchor: number; side: 'before' | 'after'; count?: number; requestId: string }): Promise<{
+        granted: boolean;
+        reason?: string;
+        columnIds?: string[];
+        structuralBasis?: StructuralBasis;
+    }>;
     append(request_id: string, count: number): Promise<{
         granted: boolean;
         rowIds?: string[];
@@ -148,6 +155,22 @@ export async function open_xlsx(
                 sourceGeneration: snapshot().sourceGeneration,
                 axis: 'rows',
                 anchor: { row: { kind: 'source', sourceRow: request.anchor } },
+                side: request.side,
+                count: request.count ?? 1,
+            });
+            await controller.drain();
+            return [...messages()].reverse().find((message) =>
+                message.type === 'structuralInsertResult' && message.requestId === request.requestId) as never;
+        },
+        async insertColumns(request) {
+            await panel.__receive({
+                type: 'requestStructuralInsert',
+                requestId: request.requestId,
+                editSessionId: session_id()!,
+                worksheet: { sheetIndex: 0, sheetName: sheet_name(0) },
+                sourceGeneration: snapshot().sourceGeneration,
+                axis: 'columns',
+                anchor: { column: { kind: 'source', sourceColumn: request.anchor } },
                 side: request.side,
                 count: request.count ?? 1,
             });

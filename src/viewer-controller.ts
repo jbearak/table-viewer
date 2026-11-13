@@ -48,6 +48,7 @@ import {
     assert_safe_file_size,
     FileSizeLimitExceededError,
     MAX_CSV_ROWS,
+    MAX_SHEET_COLUMNS,
     MAX_SHEET_ROWS,
     UNBOUNDED_SHEET_ROWS,
     MAX_WORKBOOK_FORMULAS,
@@ -206,6 +207,7 @@ import {
     assert_pending_user_changes_encoded_bound,
     EMPTY_PENDING_STRUCTURAL_CHANGES,
     MAX_PENDING_APPENDED_ROWS,
+    MAX_PENDING_COLUMNS,
     MAX_PENDING_ROW_ID_LENGTH,
     own_pending_structural_changes,
     appended_rows,
@@ -242,13 +244,19 @@ import {
     appended_row_source_row,
     has_live_column_layout_change,
     has_live_row_layout_change,
+    index_column_layout,
     index_row_layout,
+    insert_columns as insert_layout_columns,
     insert_rows as insert_rows_in_layout,
     insert_template_source_row,
+    MAX_COLUMN_LAYOUT_ENTRIES,
     MAX_ROW_LAYOUT_RUNS,
     source_column_layout,
     source_row_layout,
+    TOO_MANY_COLUMN_ENTRIES_MESSAGE,
+    TOO_MANY_LIVE_COLUMNS_MESSAGE,
     TOO_MANY_ROW_RUNS_MESSAGE,
+    type ColumnIdentity,
     type RowLayout,
 } from './worksheet-layout';
 import { content_digest } from './content-digest';
@@ -259,7 +267,9 @@ import {
 } from './xlsx-structural-observation';
 import type { StructuralAxis } from './xlsx-structural-support';
 import {
+    delimited_column_writer,
     delimited_records_of,
+    type DelimitedColumnWriter,
     is_delimited_prefix_growth,
     rebase_row_layout_on_growth,
     structural_bases_equal,
@@ -775,6 +785,25 @@ function sanitized_insert_anchor(anchor: unknown): RowIdentity | undefined {
         && row.pendingRowId.length > 0
         && row.pendingRowId.length <= MAX_PENDING_ROW_ID_LENGTH
     ) return { kind: 'pending', pendingRowId: row.pendingRowId };
+    return undefined;
+}
+
+/** The column anchor of a `requestStructuralInsert`, or undefined when malformed. */
+function sanitized_insert_column_anchor(anchor: unknown): ColumnIdentity | undefined {
+    if (!is_plain_record(anchor)) return undefined;
+    const column = anchor.column;
+    if (!is_plain_record(column)) return undefined;
+    if (
+        column.kind === 'source'
+        && Number.isSafeInteger(column.sourceColumn)
+        && (column.sourceColumn as number) >= 0
+    ) return { kind: 'source', sourceColumn: column.sourceColumn as number };
+    if (
+        column.kind === 'pending'
+        && typeof column.pendingColumnId === 'string'
+        && column.pendingColumnId.length > 0
+        && column.pendingColumnId.length <= MAX_PENDING_ROW_ID_LENGTH
+    ) return { kind: 'pending', pendingColumnId: column.pendingColumnId };
     return undefined;
 }
 
@@ -2507,7 +2536,9 @@ export function plan_csv_save(
             }
         }
         const rows = wants_bases ? rows_with_observed_bases() : rows_in;
-        const text = pending_prefix + serializer.serialize_rows(rows, first_row);
+        const text = pending_prefix + (column_writer === undefined
+            ? serializer.serialize_rows(rows, first_row)
+            : serialize_layout_rows(rows, first_row));
         pending_prefix = '';
         if (text.length > 0) chunks.push(encoder.encode(text));
     };
@@ -2544,10 +2575,41 @@ export function plan_csv_save(
     // differs from the source only by discarded tombstones, is byte-identical
     // to an unstructured save.
     const layout = has_live_layout_change(structural)
-        ? csv_save_layout(structural, sheet, edits, input.worksheets[0].dirty_edits)
+        ? csv_save_layout(
+            structural,
+            sheet,
+            edits,
+            input.worksheets[0].dirty_edits,
+            get_delimiter(input.file_path),
+        )
         : undefined;
     const delimiter = get_delimiter(input.file_path);
     const line_ending = src.lineEnding ?? '\n';
+    // A column layout with a live change rewrites the header from its raw
+    // fields and writes every record at the prospective width, ragged ones
+    // padded; otherwise records keep their own widths, as before.
+    const column_writer = layout?.columns;
+    if (column_writer !== undefined && src.headerLine !== undefined) {
+        pending_prefix = column_writer.header(src.headerLine) + line_ending;
+    }
+    function serialize_layout_rows(
+        rows: Iterable<readonly (RenderedCell | null)[]>,
+        first_row: number,
+    ): string {
+        let text = '';
+        let source_row = first_row;
+        for (const row of rows) {
+            const absolute_row = source_row;
+            text += serialize_delimited_values(column_writer!.record(`s:${absolute_row}`, (column) => {
+                const key = `${absolute_row}:${column}`;
+                return Object.prototype.hasOwnProperty.call(edits, key)
+                    ? edits[key]!
+                    : get_raw_cell_text(row[column]?.raw ?? null);
+            }), delimiter, line_ending);
+            source_row += 1;
+        }
+        return text;
+    }
     // A Pending Row is written at the worksheet's full width, blank cells
     // included, whether it was appended or inserted: one serialization.
     const emit_pending_row = (row: PendingAppendedRow): void => {
@@ -2563,7 +2625,9 @@ export function plan_csv_save(
             values[column] = cell.value;
         }
         chunks.push(encoder.encode(pending_prefix + serialize_delimited_values(
-            values,
+            column_writer === undefined
+                ? values
+                : column_writer.record(`p:${row.id}`, (column) => values[column] ?? ''),
             delimiter,
             line_ending,
         )));
@@ -2575,7 +2639,7 @@ export function plan_csv_save(
     } else {
         live_body_rows = 0;
         const inserted = new Map(inserted_rows(structural).map((row) => [row.id, row]));
-        for (const run of layout.runs) {
+        for (const run of layout.rows.runs) {
             if (run.kind === 'pending') {
                 // Live Pending Inserted Rows in layout order; a discarded
                 // tombstone has no row and writes nothing.
@@ -2590,7 +2654,7 @@ export function plan_csv_save(
             // Each run reads its own windows, so a run that a move placed out
             // of source order streams exactly like one that stayed in place.
             stream_source_rows(run.start, run.start + run.count, true, (rows, first_row) => {
-                for (const stretch of live_stretches(layout.removedSourceRows, first_row, first_row + rows.length)) {
+                for (const stretch of live_stretches(layout.rows.removedSourceRows, first_row, first_row + rows.length)) {
                     emit_rows(
                         rows.slice(stretch.start - first_row, stretch.start - first_row + stretch.count),
                         stretch.start,
@@ -2651,22 +2715,19 @@ export function plan_csv_save(
 }
 
 /**
- * The row layout a CSV/TSV structural save writes, after the checks the
- * planner owns: the layout validator against this exact source (a delimited
- * body starts at row 0, after the header line), the recorded Structural
- * Basis's dimensions, and no cell edit on a removed row or column. Column
- * changes are refused until their writer lands (delivery step 8); the host
- * never admits them before then.
+ * The row layout a CSV/TSV structural save writes, and its column writer
+ * when the column layout has a live change, after the checks the planner
+ * owns: the layout validator against this exact source (a delimited body
+ * starts at row 0, after the header line), the recorded Structural Basis's
+ * dimensions, and no cell edit on a removed row or column.
  */
 function csv_save_layout(
     structural: PendingStructuralChanges,
     sheet: SheetMeta,
     edits: Readonly<Record<string, string>>,
     dirty_edits: CsvDirtyMap | undefined,
-): RowLayout {
-    if (structural.columnLayout !== undefined && has_live_column_layout_change(structural.columnLayout)) {
-        throw new Error('Saving inserted, deleted, or moved columns is not available yet.');
-    }
+    delimiter: ',' | '\t',
+): { readonly rows: RowLayout; readonly columns?: DelimitedColumnWriter } {
     const basis = structural.structuralBasis;
     if (
         basis === undefined
@@ -2689,7 +2750,14 @@ function csv_save_layout(
         mintedAsInsert: () => true,
     });
     if (error !== undefined) throw new Error(`The row and column changes are inconsistent: ${error}`);
-    return structural.rowLayout ?? source_row_layout(0, sheet.sourceRowCount);
+    const rows = structural.rowLayout ?? source_row_layout(0, sheet.sourceRowCount);
+    if (structural.columnLayout === undefined || !has_live_column_layout_change(structural.columnLayout)) {
+        return { rows };
+    }
+    return {
+        rows,
+        columns: delimited_column_writer(structural.columnLayout, structural.pendingColumns ?? [], delimiter),
+    };
 }
 
 /**
@@ -3139,6 +3207,17 @@ export function attach_viewer(
         replayLeaseId?: string;
     }
     const row_admission_reservations = new Map<string, RowAdmissionReservation>();
+    /**
+     * Unsettled Pending Column admissions. A column insert shares its
+     * worksheet's one reservation slot with row admissions; once settled, its
+     * IDs stay in the ledger's `ownedColumnIds` (accepted) or leave it (released).
+     */
+    interface ColumnAdmissionReservation {
+        readonly editSessionId: string;
+        readonly ledgerKey: string;
+        readonly columnIds: readonly string[];
+    }
+    const column_admission_reservations = new Map<string, ColumnAdmissionReservation>();
     /** Request IDs stay live until their reservation is cancelled or published. */
     const row_admission_request_ids = new Set<string>();
     // The template budget is shared by every worksheet, so its authority
@@ -3189,6 +3268,15 @@ export function attach_viewer(
     const retained_pending_append_authorities = new RetainedPendingAppendAuthorityStore(
         MAX_SAVED_APPEND_AUTHORITY_BYTES,
     );
+    // The column half: Pending Column IDs history still names (the renderer's
+    // projection, which can only narrow), and the IDs a session's ledger
+    // actually owned when it ended and history still named. Undo after a
+    // Discard replays such a column against a new session's ledger, which
+    // takes the ID only when a publication or replay names it.
+    const retained_pending_column_keys = new Set<string>();
+    const retained_pending_column_ids = new Map<string, Set<string>>();
+    const retained_pending_column_owned = (target: WorksheetTarget, id: string): boolean =>
+        retained_pending_column_ids.get(worksheet_target_key(target))?.has(id) === true;
     interface SavedAppendAuthority {
         readonly worksheet: WorksheetTarget;
         readonly appendHistoryId: string;
@@ -3406,6 +3494,14 @@ export function attach_viewer(
             }
         }
         return undefined;
+    };
+    /** Whether the worksheet's one reservation slot holds an unsettled row or column admission. */
+    const admission_slot_busy = (ledger_key: string): boolean => {
+        if (unsettled_reservation_for_ledger(ledger_key) !== undefined) return true;
+        for (const reservation of column_admission_reservations.values()) {
+            if (reservation.ledgerKey === ledger_key) return true;
+        }
+        return false;
     };
     const reservations_for_ledger = (
         ledger_key: string,
@@ -3665,6 +3761,33 @@ export function attach_viewer(
     };
 
     /**
+     * Host-issued Pending Column IDs, for publication, replay, and Save alike:
+     * every live or tombstoned Pending Column is one this session's ledger
+     * owns, or one a Discard handed to history for this worksheet. A retained
+     * column re-enters the session's ledger when it is published, so it counts
+     * against the same 256 admissions a fresh insert does.
+     */
+    const pending_column_ownership_refusal = (
+        target: WorksheetTarget,
+        changes: Pick<PendingStructuralChanges, 'pendingColumns' | 'columnLayout'>,
+        ledger: AppendAdmissionLedger | undefined,
+    ): string | undefined => {
+        const column_ids = [
+            ...(changes.pendingColumns ?? []).map((column) => column.id),
+            ...(changes.columnLayout?.discardedPendingColumns ?? []).map((column) => column.id),
+        ];
+        if (column_ids.some((id) => ledger?.ownedColumnIds.has(id) !== true
+            && !retained_pending_column_owned(target, id))) {
+            return 'pending-column-not-owned-by-ledger';
+        }
+        const restored = new Set(column_ids.filter((id) => ledger?.ownedColumnIds.has(id) !== true));
+        if ((ledger?.ownedColumnIds.size ?? 0) + restored.size > MAX_PENDING_COLUMNS) {
+            return 'too-many-pending-columns';
+        }
+        return undefined;
+    };
+
+    /**
      * The layout rules a new-protocol publication must meet beyond the append
      * rules: the release gate, the ledger origin rule (origin `insert` only for
      * an ID an insert minted; origin `append` for any admitted ID), host-issued
@@ -3680,13 +3803,8 @@ export function attach_viewer(
         if (inserted_rows(changes).some((row) => !minted_as_insert(target, row.id, ledger))) {
             return 'insert-origin-not-minted-by-insert';
         }
-        const column_ids = [
-            ...(changes.pendingColumns ?? []).map((column) => column.id),
-            ...(changes.columnLayout?.discardedPendingColumns ?? []).map((column) => column.id),
-        ];
-        if (column_ids.some((id) => ledger?.ownedColumnIds.has(id) !== true)) {
-            return 'pending-column-not-owned-by-ledger';
-        }
+        const column_refusal = pending_column_ownership_refusal(target, changes, ledger);
+        if (column_refusal !== undefined) return column_refusal;
         if (
             changes.structuralBasis !== undefined
             && !structural_basis_authorized(target, changes.structuralBasis, ledger)
@@ -3773,6 +3891,24 @@ export function attach_viewer(
             target,
             pending_rows(changes),
         ));
+        // A Pending Column history retained across a Discard is owned again
+        // once a publication names it (the ownership check above passed).
+        for (const id of [
+            ...(changes.pendingColumns ?? []).map((column) => column.id),
+            ...(changes.columnLayout?.discardedPendingColumns ?? []).map((column) => column.id),
+        ]) {
+            if (next_ledger?.ownedColumnIds.has(id) === true) continue;
+            next_ledger ??= {
+                ownedRowIds: new Set<string>(),
+                insertMintedRowIds: new Set<string>(),
+                ownedColumnIds: new Set<string>(),
+                templateIdByRowId: new Map<string, string>(),
+                reservedRowIds: new Map<string, number>(),
+                unsettledRequestByRowId: new Map<string, string>(),
+                sourceGeneration: core?.source_generation ?? 0,
+            };
+            next_ledger.ownedColumnIds.add(id);
+        }
 
         const provisional_ledger_basis = accepted_append_basis_for_ledger(
             next_ledger,
@@ -4070,6 +4206,11 @@ export function attach_viewer(
     };
     const clear_append_admission_session = (session_id: string): void => {
         const prefix = `${session_id}\u0000`;
+        for (const [request_id, reservation] of column_admission_reservations) {
+            if (reservation.editSessionId !== session_id) continue;
+            column_admission_reservations.delete(request_id);
+            row_admission_request_ids.delete(request_id);
+        }
         for (const [request_id, reservation] of row_admission_reservations) {
             if (reservation.editSessionId === session_id) {
                 const ledger = append_admission_ledgers.get(reservation.ledgerKey);
@@ -4114,6 +4255,12 @@ export function attach_viewer(
         for (const [key, ledger] of append_admission_ledgers) {
             if (!key.startsWith(prefix)) continue;
             const target_key = key.slice(prefix.length);
+            for (const id of ledger.ownedColumnIds) {
+                if (!retained_pending_column_keys.has(pending_append_history_key(target_key, id))) continue;
+                const retained = retained_pending_column_ids.get(target_key) ?? new Set<string>();
+                retained.add(id);
+                retained_pending_column_ids.set(target_key, retained);
+            }
             const retained_ids = [...ledger.ownedRowIds].filter((id) =>
                 retained_pending_append_keys.has(pending_append_history_key(target_key, id)));
             if (retained_ids.length > 0) {
@@ -5440,8 +5587,17 @@ export function attach_viewer(
         };
     }
 
+    /**
+     * Sorts and filters a structural save dropped because their column was
+     * deleted: the toolbar's live region announces them, or, with no webview
+     * to receive them (recovery on load), the host warning does.
+     */
     function announce_structural_rekey(messages: readonly string[]): void {
-        if (messages.length > 0) show_owner_warning(messages.join(' '));
+        if (messages.length === 0) return;
+        const message = messages.join(' ');
+        void post_to_receiver({ type: 'toolbarAnnouncement', message }).then((delivered) => {
+            if (!delivered) show_owner_warning(message);
+        });
     }
 
     let unresolved_structural_sheet_names: ReadonlySet<string> = new Set();
@@ -5711,23 +5867,26 @@ export function attach_viewer(
                 if (structural_bases_equal(basis, current_basis)) {
                     if (others.length === changes.conflicts.length) continue;
                     replacement = { ...slot, conflicts: others };
-                } else if (
-                    changes.rowLayout !== undefined
-                    && is_delimited_prefix_growth(
-                        basis,
-                        bytes,
-                        get_delimiter(file_path),
-                        (prefix) => delimited_records_of(prefix, get_delimiter(file_path)),
-                    )
-                ) {
+                } else if (is_delimited_prefix_growth(
+                    basis,
+                    bytes,
+                    get_delimiter(file_path),
+                    (prefix) => delimited_records_of(prefix, get_delimiter(file_path)),
+                )) {
+                    // "External changes", step 2, for any layout change: the
+                    // appended rows join after the last source run. Without a
+                    // row layout (column changes only) the implicit source
+                    // layout already covers them, so only the basis advances.
                     replacement = {
                         ...slot,
-                        rowLayout: rebase_row_layout_on_growth(
-                            changes.rowLayout,
-                            0,
-                            basis.sourceRowCount,
-                            sheet.sourceRowCount,
-                        ),
+                        ...(changes.rowLayout === undefined ? {} : {
+                            rowLayout: rebase_row_layout_on_growth(
+                                changes.rowLayout,
+                                0,
+                                basis.sourceRowCount,
+                                sheet.sourceRowCount,
+                            ),
+                        }),
                         structuralBasis: current_basis,
                         conflicts: others,
                     };
@@ -9779,7 +9938,7 @@ export function attach_viewer(
             };
             append_admission_ledgers.set(ledger_key, ledger);
         }
-        if (unsettled_reservation_for_ledger(ledger_key) !== undefined) {
+        if (admission_slot_busy(ledger_key)) {
             await refuse('Another row append is still being installed. Try again.');
             return;
         }
@@ -10111,9 +10270,8 @@ export function attach_viewer(
             await refuse(axis_support?.supported === false ? axis_support.reason : STRUCTURE_NOT_AVAILABLE_YET);
             return;
         }
-        // Pending Columns arrive with delivery step 8.
         if (message.axis === 'columns') {
-            await refuse('Inserting columns is not available yet.');
+            await admit_column_insert(message, receiver_epoch, target, sheet, refuse, session_is_current);
             return;
         }
         if (sheet.columnCount <= 0) {
@@ -10175,7 +10333,7 @@ export function attach_viewer(
         }
         // One reservation slot per worksheet, shared by appends, inserts, and
         // restorations (and, from step 8, column inserts).
-        if (unsettled_reservation_for_ledger(ledger_key) !== undefined) {
+        if (admission_slot_busy(ledger_key)) {
             await refuse('Another row append is still being installed. Try again.');
             return;
         }
@@ -10418,6 +10576,189 @@ export function attach_viewer(
         }
     }
 
+    /**
+     * The column half of `admit_structural_insert`: mint `count` Pending
+     * Column IDs beside a live column. Column operations work under any row
+     * transform, so no transform is checked. IDs come from the worksheet's
+     * column ledger, bounded at `MAX_PENDING_COLUMNS` admissions per session,
+     * and the reservation shares the worksheet's one slot with row
+     * admissions: while either kind is unsettled the other is refused. The
+     * webview builds the blank columns itself, resolving an `.xlsx` column's
+     * format from its live neighbor (design "Formatting inheritance"; the
+     * writer reads that column's styles from the Structural Basis bytes), so
+     * the reply carries only the IDs and the Structural Basis.
+     */
+    async function admit_column_insert(
+        message: Extract<WebviewMessage, { type: 'requestStructuralInsert' }>,
+        receiver_epoch: number,
+        target: WorksheetTarget,
+        sheet: SheetMeta,
+        refuse: (reason: string) => Promise<boolean>,
+        session_is_current: () => boolean,
+    ): Promise<void> {
+        if (!Number.isSafeInteger(message.count) || message.count <= 0 || message.count > MAX_PENDING_COLUMNS) {
+            await refuse(`Insert at most ${MAX_PENDING_COLUMNS} columns at once.`);
+            return;
+        }
+        if (source?.truncationMessage) {
+            await refuse('Load the complete delimited file before inserting columns.');
+            return;
+        }
+        const anchor = sanitized_insert_column_anchor(message.anchor);
+        if (anchor === undefined || (anchor.kind === 'source' && anchor.sourceColumn >= sheet.columnCount)) {
+            await refuse('The insert names no column of this worksheet.');
+            return;
+        }
+        const state_snapshot = await read_file_state();
+        if (!session_is_current() || !source) {
+            await refuse('The source changed while the columns were being prepared.');
+            return;
+        }
+        if (structural_insert_gate_closed()) {
+            await refuse(STRUCTURAL_INSERT_GATE_MESSAGE);
+            return;
+        }
+        const state = (reconciled_against(state_snapshot, source).state) as PerFileState;
+        const durable = pending_changes_for_sheet(
+            reconcile_pending_edit_sheets(state.pendingEdits, source.meta().sheets),
+            target.sheetIndex,
+            sheet.name,
+            sheet.worksheetId,
+        );
+        const ledger_key = append_ledger_key(message.editSessionId, target);
+        let ledger = append_admission_ledgers.get(ledger_key);
+        if (!ledger) {
+            ledger = {
+                ownedRowIds: new Set(),
+                insertMintedRowIds: new Set<string>(),
+                ownedColumnIds: new Set<string>(),
+                templateIdByRowId: new Map(),
+                reservedRowIds: new Map(),
+                unsettledRequestByRowId: new Map(),
+                sourceGeneration: message.sourceGeneration,
+            };
+            append_admission_ledgers.set(ledger_key, ledger);
+        }
+        if (admission_slot_busy(ledger_key)) {
+            await refuse('Another row append is still being installed. Try again.');
+            return;
+        }
+        if ((durable?.tailRemovals?.length ?? 0) > 0) {
+            await refuse('Save or redo the row removal first.');
+            return;
+        }
+        const has_move = (cells: Readonly<Record<string, unknown>> | undefined): boolean =>
+            cells !== undefined && Object.values(cells).some((cell) =>
+                is_plain_record(cell) && cell.movedFrom !== undefined);
+        if (has_move(durable?.cells) || pending_rows(durable).some((row) => has_move(row.cells))) {
+            await refuse('Save or undo the moved cells first.');
+            return;
+        }
+        const structuralBasis = current_structural_basis(file_format.id, source_observation, sheet, target.sheetIndex);
+        if (structuralBasis === undefined) {
+            await refuse(STRUCTURE_NOT_AVAILABLE_YET);
+            return;
+        }
+        if (
+            durable?.conflicts?.some((conflict) => conflict.reason === 'structuralBasisChanged') === true
+            || (durable?.structuralBasis !== undefined
+                && !structural_bases_equal(durable.structuralBasis, structuralBasis))
+        ) {
+            await refuse(`${sheet.name} changed on disk after you inserted, deleted, or moved rows or columns. Review Changes before inserting more columns.`);
+            return;
+        }
+        // 256 Pending Column admissions per worksheet per session, discarded
+        // tombstones included.
+        if (ledger.ownedColumnIds.size + message.count > MAX_PENDING_COLUMNS) {
+            await refuse(`A worksheet may add at most ${MAX_PENDING_COLUMNS} columns before saving.`);
+            return;
+        }
+        const column_layout = durable?.columnLayout ?? source_column_layout(sheet.columnCount);
+        const column_index = index_column_layout(column_layout);
+        if (anchor.kind === 'pending' ? !column_index.is_live(anchor) : column_index.status_of(anchor) !== 'live') {
+            await refuse('Insert canceled because its column was removed.');
+            return;
+        }
+        if (column_index.liveCount + message.count > MAX_SHEET_COLUMNS) {
+            await refuse(TOO_MANY_LIVE_COLUMNS_MESSAGE);
+            return;
+        }
+        if (column_layout.columns.length + message.count > MAX_COLUMN_LAYOUT_ENTRIES) {
+            await refuse(TOO_MANY_COLUMN_ENTRIES_MESSAGE);
+            return;
+        }
+        const columnIds = Object.freeze(Array.from(
+            { length: message.count },
+            () => `insert-column:${randomUUID()}`,
+        ));
+        const tentative_layout = insert_layout_columns(column_layout, anchor, message.side, columnIds);
+        if (!tentative_layout.ok) {
+            await refuse(tentative_layout.refusal.message);
+            return;
+        }
+        // Aggregate size estimate over the durable changes with the new
+        // columns blank; the webview store's envelope bound catches the rest.
+        if (!own_wire_pending_changes({
+            ...target,
+            cells: durable?.cells ?? {},
+            formatTemplates: durable?.formatTemplates ?? [],
+            ...pending_layout_fields(durable),
+            columnLayout: tentative_layout.layout,
+            structuralBasis,
+            pendingColumns: [
+                ...(durable?.pendingColumns ?? []),
+                ...columnIds.map((id, index) => Object.freeze({
+                    id,
+                    header: 'New column 999',
+                    cells: Object.freeze({}),
+                    format: Object.freeze({ kind: 'none' as const }),
+                    createdOrder: Number.MAX_SAFE_INTEGER - columnIds.length + index + 1,
+                })),
+            ],
+            appendedRows: pending_rows(durable),
+            tailRemovals: [],
+            ...(durable?.appendBasis === undefined ? {} : { appendBasis: durable.appendBasis }),
+            conflicts: durable?.conflicts ?? [],
+        })) {
+            await refuse('Inserting these columns would exceed the pending-changes size limit.');
+            return;
+        }
+        if (!session_is_current()) {
+            row_admission_request_ids.delete(message.requestId);
+            return;
+        }
+        if (structural_insert_gate_closed()) {
+            await refuse(STRUCTURAL_INSERT_GATE_MESSAGE);
+            return;
+        }
+        if (admission_slot_busy(ledger_key)) {
+            await refuse('Another row append is still being installed. Try again.');
+            return;
+        }
+        for (const id of columnIds) ledger.ownedColumnIds.add(id);
+        column_admission_reservations.set(message.requestId, {
+            editSessionId: message.editSessionId,
+            ledgerKey: ledger_key,
+            columnIds,
+        });
+        const delivered = await post_to_receiver({
+            type: 'structuralInsertResult',
+            requestId: message.requestId,
+            sourceGeneration: message.sourceGeneration,
+            granted: true,
+            columnIds,
+            structuralBasis,
+        }, receiver_epoch);
+        if (!delivered) {
+            settle_row_admission({
+                type: 'settleRowAdmission',
+                requestId: message.requestId,
+                editSessionId: message.editSessionId,
+                accepted: false,
+            });
+        }
+    }
+
     async function validate_tail_removal_replay(
         message: Extract<WebviewMessage, { type: 'validateTailRemovalReplay' }>,
     ): Promise<void> {
@@ -10514,6 +10855,19 @@ export function attach_viewer(
         message: Extract<WebviewMessage, { type: 'settleRowAdmission' }>,
         replay_lease_id?: string,
     ): boolean {
+        const column_reservation = column_admission_reservations.get(message.requestId);
+        if (column_reservation !== undefined) {
+            if (column_reservation.editSessionId !== message.editSessionId) return false;
+            column_admission_reservations.delete(message.requestId);
+            row_admission_request_ids.delete(message.requestId);
+            // An installed column's ID stays owned for the session; a
+            // released one was never published, so it goes.
+            if (message.accepted !== true) {
+                const ledger = append_admission_ledgers.get(column_reservation.ledgerKey);
+                for (const id of column_reservation.columnIds) ledger?.ownedColumnIds.delete(id);
+            }
+            return true;
+        }
         const reservation = row_admission_reservations.get(message.requestId);
         if (reservation === undefined
             || reservation.editSessionId !== message.editSessionId
@@ -10665,7 +11019,7 @@ export function attach_viewer(
             sourceGeneration: message.sourceGeneration,
         };
         append_admission_ledgers.set(ledger_key, ledger);
-        if (unsettled_reservation_for_ledger(ledger_key) !== undefined) {
+        if (admission_slot_busy(ledger_key)) {
             await refuse('Another row restoration is still being installed. Try again.');
             return;
         }
@@ -10920,6 +11274,8 @@ export function attach_viewer(
             structural.formatTemplates,
             structural.appendBasis,
         )) return false;
+        // Pending Columns meet the publication's ownership rules at Save too.
+        if (pending_column_ownership_refusal(target, structural, live_ledger) !== undefined) return false;
         return accepted_row_admission_gestures_are_complete(
             ledger_key,
             pending_rows(structural),
@@ -11399,9 +11755,9 @@ export function attach_viewer(
         // buggy peer from bypassing that.
         const unsettled_worksheet = identity.worksheets.some((worksheet) => {
             const target = canonical_worksheet_target(worksheet);
-            return target !== undefined && unsettled_reservation_for_ledger(
+            return target !== undefined && admission_slot_busy(
                 append_ledger_key(identity.editSessionId, target),
-            ) !== undefined;
+            );
         });
         if (unsettled_worksheet) {
             const active = begin_save_lifecycle(identity);
@@ -12359,6 +12715,16 @@ export function attach_viewer(
                         accepted: false,
                     });
                 }
+                // An unsettled column grant was never installed by a renderer
+                // that can still settle it: release its IDs, as for rows.
+                for (const [requestId, reservation] of [...column_admission_reservations]) {
+                    settle_row_admission({
+                        type: 'settleRowAdmission',
+                        requestId,
+                        editSessionId: reservation.editSessionId,
+                        accepted: false,
+                    });
+                }
                 active_edit_session_request = undefined;
                 cancel_edit_claim(active_edit_claim);
                 // A reloaded renderer has no history — it is session-scoped and
@@ -13277,6 +13643,8 @@ export function attach_viewer(
                 const retained_pending = new Set<string>();
                 let retained_count = 0;
                 let retained_pending_count = 0;
+                const retained_columns = new Set<string>();
+                let retained_column_count = 0;
                 for (const raw of msg.authorities) {
                     if (!is_plain_record(raw) || !Array.isArray(raw.appendHistoryIds)) return;
                     const requested_target = sanitized_wire_worksheet_target(raw);
@@ -13300,6 +13668,22 @@ export function attach_viewer(
                     }
                     if (raw.pendingRowIds !== undefined && !Array.isArray(raw.pendingRowIds)) {
                         return;
+                    }
+                    if (raw.pendingColumnIds !== undefined && !Array.isArray(raw.pendingColumnIds)) {
+                        return;
+                    }
+                    for (const id of raw.pendingColumnIds ?? []) {
+                        retained_column_count += 1;
+                        if (
+                            retained_column_count > MAX_SAVED_APPEND_AUTHORITIES
+                            || typeof id !== 'string'
+                            || id.length === 0
+                            || id.length > MAX_PENDING_ROW_ID_LENGTH
+                        ) return;
+                        retained_columns.add(pending_append_history_key(
+                            worksheet_target_key(target),
+                            id,
+                        ));
                     }
                     for (const id of raw.pendingRowIds ?? []) {
                         retained_pending_count += 1;
@@ -13331,6 +13715,14 @@ export function attach_viewer(
                 }
                 retained_pending_append_keys.clear();
                 for (const key of retained_pending) retained_pending_append_keys.add(key);
+                retained_pending_column_keys.clear();
+                for (const key of retained_columns) retained_pending_column_keys.add(key);
+                for (const [target_key, ids] of [...retained_pending_column_ids]) {
+                    for (const id of [...ids]) {
+                        if (!retained_columns.has(pending_append_history_key(target_key, id))) ids.delete(id);
+                    }
+                    if (ids.size === 0) retained_pending_column_ids.delete(target_key);
+                }
                 for (const [target_key, authorities] of retained_pending_append_authorities.entries()) {
                     for (const id of [...authorities.keys()]) {
                         if (!retained_pending.has(pending_append_history_key(target_key, id))) {
@@ -13933,8 +14325,35 @@ export function attach_viewer(
                         && active_save_operation.identity.editSessionId === msg.editSessionId;
                     if (writing) return;
                     active_save_dialog_request = undefined;
-                    const operation = begin_edit_cleanup(msg.editSessionId);
-                    if (!operation) return;
+                    // As release and save do: fence new writes, let every write
+                    // that crossed first settle, which hands the ledgers' IDs
+                    // history still names to the retained stores (so Undo after
+                    // the Discard can replay them), then clean up under the fence.
+                    // Cleanup refuses beside any save operation; refuse before
+                    // fencing, so a refused discard leaves the session as it was.
+                    if (active_save_operation) return;
+                    const fence = fence_edit_session_writes(msg.editSessionId);
+                    if (!fence) return;
+                    try {
+                        await fence.admittedWrites;
+                    } catch (error) {
+                        log_sanitized_failure('Failed to settle admitted edits before discard', error);
+                    }
+                    const operation = begin_edit_cleanup(msg.editSessionId, undefined, fence.release);
+                    if (!operation) {
+                        // Something else took the session while its writes
+                        // settled: end the fenced session as release would.
+                        if (
+                            file_edit_state?.phase.type === 'releasing'
+                            && file_edit_state.phase.release === fence.release
+                            && active_edit_session_id === msg.editSessionId
+                        ) {
+                            active_edit_session_id = undefined;
+                            file_edit_state.phase = { type: 'free' };
+                            notify_edit_state();
+                        }
+                        return;
+                    }
                     notify_edit_state();
                     // Acknowledged either way, because a discard is undoable and
                     // undoing one has to acquire a NEW session: until cleanup

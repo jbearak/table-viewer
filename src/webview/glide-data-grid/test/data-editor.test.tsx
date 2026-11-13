@@ -4491,55 +4491,103 @@ a new line char ""more quotes"" plus a tab  ."	https://google.com`)
         expect(spy).toBeCalledTimes(1000);
     });
 
-    test("DND Columns", async () => {
+    // Fork change: a header drag moves the selected block of columns, and
+    // only when the press lands inside that selection.
+    const columnBlockSelection = (start: number, end: number): GridSelection => ({
+        columns: CompactSelection.fromSingleSelection([start, end + 1]),
+        rows: CompactSelection.empty(),
+        current: undefined,
+    });
+
+    function headerGesture(canvas: HTMLElement, fromX: number, toX: number) {
+        fireEvent.mouseDown(canvas, { clientX: fromX, clientY: 16 });
+        fireEvent.mouseMove(canvas, { clientX: (fromX + toX) / 2, clientY: 16, buttons: 1 });
+        fireEvent.mouseMove(canvas, { clientX: toX, clientY: 16, buttons: 1 });
+        fireEvent.mouseUp(canvas, { clientX: toX, clientY: 16 });
+        fireEvent.click(canvas, { clientX: toX, clientY: 16 });
+    }
+
+    test("DND Columns moves the selected block to the column it lands before", async () => {
         const spy = vi.fn();
         vi.useFakeTimers();
-        render(<EventedDataEditor {...basicProps} onColumnMoved={spy} />, {
-            wrapper: Context,
-        });
+        render(
+            <EventedDataEditor {...basicProps} gridSelection={columnBlockSelection(1, 1)} onColumnMoved={spy} />,
+            { wrapper: Context }
+        );
         prep();
-        const canvas = screen.getByTestId("data-grid-canvas");
+        // Column B's header, released over the left half of column A.
+        headerGesture(screen.getByTestId("data-grid-canvas"), 300, 50);
+        expect(spy).toHaveBeenCalledTimes(1);
+        expect(spy).toBeCalledWith({ start: 1, end: 1 }, 0);
+    });
 
-        fireEvent.mouseDown(canvas, {
-            clientX: 300, // Col B
-            clientY: 16, // Header
-        });
+    test("DND Columns lands after the column whose right half the pointer is over", async () => {
+        const spy = vi.fn();
+        vi.useFakeTimers();
+        render(
+            <EventedDataEditor {...basicProps} gridSelection={columnBlockSelection(0, 1)} onColumnMoved={spy} />,
+            { wrapper: Context }
+        );
+        prep();
+        // Columns A and B, released over the right half of column C (310..480).
+        headerGesture(screen.getByTestId("data-grid-canvas"), 100, 450);
+        expect(spy).toBeCalledWith({ start: 0, end: 1 }, 3);
+    });
 
-        fireEvent.mouseMove(canvas, {
-            clientX: 250,
-            clientY: 16,
-            buttons: 1,
-        });
+    test("DND Columns from an unselected header keeps drag-to-select and moves nothing", async () => {
+        const spy = vi.fn();
+        const selections = vi.fn();
+        vi.useFakeTimers();
+        render(
+            <EventedDataEditor
+                {...basicProps}
+                gridSelection={columnBlockSelection(2, 2)}
+                onGridSelectionChange={selections}
+                onColumnMoved={spy}
+            />,
+            { wrapper: Context }
+        );
+        prep();
+        headerGesture(screen.getByTestId("data-grid-canvas"), 300, 50);
+        expect(spy).not.toHaveBeenCalled();
+        expect(selections).toHaveBeenCalled();
+    });
 
-        fireEvent.mouseMove(canvas, {
-            clientX: 200,
-            clientY: 16,
-            buttons: 1,
-        });
+    test("DND Columns refused by onColumnProposeMove does not move", async () => {
+        const spy = vi.fn();
+        vi.useFakeTimers();
+        render(
+            <EventedDataEditor
+                {...basicProps}
+                gridSelection={columnBlockSelection(1, 1)}
+                onColumnMoved={spy}
+                onColumnProposeMove={() => false}
+            />,
+            { wrapper: Context }
+        );
+        prep();
+        headerGesture(screen.getByTestId("data-grid-canvas"), 300, 50);
+        expect(spy).not.toHaveBeenCalled();
+    });
 
-        fireEvent.mouseMove(canvas, {
-            clientX: 150,
-            clientY: 16,
-            buttons: 1,
-        });
-
-        fireEvent.mouseMove(canvas, {
-            clientX: 100,
-            clientY: 16,
-            buttons: 1,
-        });
-
-        fireEvent.mouseUp(canvas, {
-            clientX: 100, // Col A
-            clientY: 16, // Header
-        });
-
-        fireEvent.click(canvas, {
-            clientX: 100, // Col A
-            clientY: 16, // Header
-        });
-
-        expect(spy).toBeCalledWith(1, 0);
+    test("DND Columns does not arm when canMoveColumns refuses the block", async () => {
+        const spy = vi.fn();
+        const selections = vi.fn();
+        vi.useFakeTimers();
+        render(
+            <EventedDataEditor
+                {...basicProps}
+                gridSelection={columnBlockSelection(1, 1)}
+                onGridSelectionChange={selections}
+                onColumnMoved={spy}
+                canMoveColumns={() => false}
+            />,
+            { wrapper: Context }
+        );
+        prep();
+        headerGesture(screen.getByTestId("data-grid-canvas"), 300, 50);
+        expect(spy).not.toHaveBeenCalled();
+        expect(selections).toHaveBeenCalled();
     });
 
     test("Resize Column", async () => {

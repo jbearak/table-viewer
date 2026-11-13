@@ -8,7 +8,9 @@ import {
 import {
     delete_columns,
     delete_rows,
+    insert_columns,
     insert_rows,
+    move_columns,
     type StructureResult,
     type WorksheetStructureContext,
 } from '../webview/pending-row-store';
@@ -810,6 +812,26 @@ describe('layout history arms', () => {
         expect(replay(first_action, 'undo', refused(first.next))?.conflicts).toEqual([]);
     });
 
+    it.each([
+        {
+            reason: 'unsupportedStructure' as const,
+            pendingRowIds: [],
+            tailRemovalIds: [],
+            message: "Can't insert, delete, or move columns on this sheet: it contains an Excel table.",
+        },
+        { reason: 'structuralBasisChanged' as const, pendingRowIds: [], tailRemovalIds: [] },
+    ])('keeps a worksheet-level $reason while only a column layout change remains', (refusal) => {
+        const refused = (changes: PendingStructuralChanges) => ({ ...changes, conflicts: [refusal] });
+        const first = planned(move_columns(state([]), structure_context(), [{ kind: 'source', sourceColumn: 1 }], { kind: 'source', sourceColumn: 0 }));
+        const second = planned(delete_columns(first.next, structure_context(), [{ kind: 'source', sourceColumn: 0 }]));
+        const first_action = recorded({ label: 'Move column', changes: [first.change] });
+        const second_action = recorded({ label: 'Delete column', changes: [second.change] });
+        // The column move is still pending, so the refusal stands.
+        expect(replay(second_action, 'undo', refused(second.next))?.conflicts).toEqual([refusal]);
+        // Undoing the only layout change answers it.
+        expect(replay(first_action, 'undo', refused(first.next))?.conflicts).toEqual([]);
+    });
+
     it('undoes a column delete with the Pending Row cells it dropped and its cell deltas', () => {
         const start = state([row('x', 1, 'kept')]);
         const with_cells: PendingStructuralChanges = {
@@ -868,5 +890,21 @@ describe('layout history arms', () => {
         ]);
         expect(new Set(retained_pending_row_authorities(history)[0].pendingRowIds))
             .toEqual(new Set(['ins', 'kept']));
+    });
+
+    it('keeps admissions alive for Pending Columns a layout arm created, discarded, or tombstoned', () => {
+        const column = (id: string, order: number) =>
+            ({ id, header: id, cells: {}, format: { kind: 'none' as const }, createdOrder: order });
+        const inserted = planned(insert_columns(state([]), structure_context(), { kind: 'source', sourceColumn: 0 },
+            'after', [column('gone', 1), column('kept', 2)]));
+        const deleted = planned(delete_columns(inserted.next, structure_context({ isColumnReferenced: (id) => id === 'kept' }),
+            [{ kind: 'pending', pendingColumnId: 'gone' }, { kind: 'pending', pendingColumnId: 'kept' }]));
+        const history = record_actions([
+            { label: 'Insert 2 columns', changes: [inserted.change] },
+            { label: 'Delete 2 columns', changes: [deleted.change] },
+        ]);
+        const [retained] = retained_pending_row_authorities(history);
+        expect(new Set(retained!.pendingColumnIds)).toEqual(new Set(['gone', 'kept']));
+        expect(retained!.pendingRowIds).toEqual([]);
     });
 });

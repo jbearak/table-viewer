@@ -332,7 +332,8 @@ export function highlight_selection_from_grid(
 
     const source_columns = selected_display_columns
         .map((column) => column_projection.visible_to_source[column])
-        .filter((column): column is number => Number.isSafeInteger(column) && column >= 0)
+        // A Pending Column has no source column: host highlights skip it.
+        .filter((column): column is number => column !== undefined && Number.isSafeInteger(column) && column >= 0)
         .sort((a, b) => a - b)
         .filter((column, index, values) => index === 0 || column !== values[index - 1]);
     if (display_rows.length === 0 || source_columns.length === 0) return null;

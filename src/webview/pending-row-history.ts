@@ -58,6 +58,44 @@ function equal(left: unknown, right: unknown): boolean {
     return JSON.stringify(left) === JSON.stringify(right);
 }
 
+/**
+ * A Pending Column's width is view state, like a source column's: a resize
+ * records no history. Replay compares columns without it, and a column the
+ * replay keeps keeps the width it has now.
+ */
+function without_column_width(column: PendingColumn): PendingColumn {
+    if (column.viewerWidth === undefined) return column;
+    const { viewerWidth: _width, ...rest } = column;
+    return rest;
+}
+
+function with_current_width(column: PendingColumn, current: PendingColumn | undefined): PendingColumn {
+    // A column the replay brings back has no current width: it keeps its own.
+    if (current === undefined) return column;
+    const width = current.viewerWidth;
+    if (width === column.viewerWidth) return column;
+    const rest = without_column_width(column);
+    return width === undefined ? rest : { ...rest, viewerWidth: width };
+}
+
+function without_column_widths(changes: PendingStructuralChanges): PendingStructuralChanges {
+    if (!(changes.pendingColumns ?? []).some((column) => column.viewerWidth !== undefined)) return changes;
+    return { ...changes, pendingColumns: changes.pendingColumns!.map(without_column_width) };
+}
+
+/** `desired` with every Pending Column `current` also holds at its current width. */
+function with_current_widths(
+    desired: PendingStructuralChanges,
+    current: PendingStructuralChanges,
+): PendingStructuralChanges {
+    if (desired.pendingColumns === undefined) return desired;
+    const now = new Map((current.pendingColumns ?? []).map((column) => [column.id, column]));
+    return {
+        ...desired,
+        pendingColumns: desired.pendingColumns.map((column) => with_current_width(column, now.get(column.id))),
+    };
+}
+
 const structural = is_structural_history_change;
 
 function layout_json(layout: RowLayout | ColumnLayout | null | undefined, axis: 'rows' | 'columns'): string {
@@ -77,6 +115,10 @@ function swap_entries<T extends { readonly id: string; readonly createdOrder: nu
     current: readonly T[],
     transitions: readonly PendingEntryTransition<T>[],
     direction: HistoryDirection,
+    view: {
+        readonly comparable: (entry: T) => T;
+        readonly keep: (desired: T, now: T) => T;
+    } = { comparable: (entry) => entry, keep: (desired) => desired },
 ): T[] | undefined {
     const by_id = new Map(current.map((entry, index) => [entry.id, index]));
     const replaced = new Map<string, T | null>();
@@ -84,8 +126,12 @@ function swap_entries<T extends { readonly id: string; readonly createdOrder: nu
         const expected = direction === 'undo' ? transition.after : transition.before;
         const index = by_id.get(transition.id);
         const now = index === undefined ? null : current[index];
-        if (!equal(now, expected)) return undefined;
-        replaced.set(transition.id, direction === 'undo' ? transition.before : transition.after);
+        if (!equal(
+            now === null ? null : view.comparable(now),
+            expected === null ? null : view.comparable(expected),
+        )) return undefined;
+        const desired = direction === 'undo' ? transition.before : transition.after;
+        replaced.set(transition.id, desired === null || now === null ? desired : view.keep(desired, now));
     }
     const out: T[] = [];
     for (const entry of current) {
@@ -118,7 +164,10 @@ function with_layout_change(
     const current_layout = axis === 'rows' ? current.rowLayout : current.columnLayout;
     if (layout_json(current_layout, axis) !== layout_json(expected_layout, axis)) return undefined;
     const rows = swap_entries(pending_rows(current), delta.pendingRows, direction);
-    const columns = swap_entries<PendingColumn>(current.pendingColumns ?? [], delta.pendingColumns, direction);
+    const columns = swap_entries<PendingColumn>(current.pendingColumns ?? [], delta.pendingColumns, direction, {
+        comparable: without_column_width,
+        keep: with_current_width,
+    });
     if (rows === undefined || columns === undefined) return undefined;
     const basis = <T>(
         transition: { readonly before: T | null; readonly after: T | null } | undefined,
@@ -310,10 +359,10 @@ export function plan_pending_row_history_replay(
         if (change.kind === 'pendingRows') {
             const expected = direction === 'undo' ? change.delta.after : change.delta.before;
             const desired = direction === 'undo' ? change.delta.before : change.delta.after;
-            if (!equal(state.current, expected)) {
+            if (!equal(without_column_widths(state.current), without_column_widths(expected))) {
                 return { kind: 'refused', reason: 'conflict' };
             }
-            state.current = desired;
+            state.current = with_current_widths(desired, state.current);
             continue;
         }
         const expected = direction === 'undo' ? change.delta.after : change.delta.before;

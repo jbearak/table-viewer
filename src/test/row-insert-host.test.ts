@@ -336,7 +336,7 @@ describe('insert admission', () => {
         await viewer.dispose();
     });
 
-    it('refuses with the flag off, on .xlsx, for columns, and for malformed requests', async () => {
+    it('refuses with the flag off, on .xlsx, for a column outside the sheet, and for malformed requests', async () => {
         const off = await open_viewer({ structuralEditingEnabled: false });
         expect(await off.insert({ requestId: 'off' })).toMatchObject({ granted: false });
         await off.dispose();
@@ -351,8 +351,8 @@ describe('insert admission', () => {
         await xlsx.dispose();
 
         const viewer = await open_viewer();
-        expect(await viewer.insert({ requestId: 'cols', axis: 'columns', anchor: { column: { kind: 'source', sourceColumn: 0 } } }))
-            .toMatchObject({ granted: false, reason: 'Inserting columns is not available yet.' });
+        expect(await viewer.insert({ requestId: 'cols', axis: 'columns', anchor: { column: { kind: 'source', sourceColumn: 99 } } }))
+            .toMatchObject({ granted: false, reason: 'The insert names no column of this worksheet.' });
         expect(await viewer.insert({ requestId: 'zero', count: 0 })).toMatchObject({ granted: false });
         expect(await viewer.insert({ requestId: 'many', count: MAX_PENDING_APPENDED_ROWS + 1 }))
             .toMatchObject({ granted: false });
