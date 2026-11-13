@@ -330,6 +330,49 @@ describe('host-bridge', () => {
         )).toEqual(cleared);
     });
 
+    it('keeps structural publications superseded before acknowledgement until a later one is acknowledged', async () => {
+        const injected = { postMessage: vi.fn() };
+        (globalThis as { __tableViewerHostBridge?: unknown })
+            .__tableViewerHostBridge = injected;
+        const { pending_changes_durability } = await import('../webview/host-bridge');
+        const changes = (start: number) => ({
+            sheetIndex: 0,
+            sheetName: 'Sheet1',
+            cells: {},
+            formatTemplates: [],
+            appendedRows: [],
+            tailRemovals: [],
+            conflicts: [],
+            rowLayout: {
+                runs: [{ kind: 'source' as const, start, count: 1 }, { kind: 'source' as const, start: 1 - start, count: 1 }],
+                removedSourceRows: [],
+                discardedPendingRows: [],
+            },
+        });
+        const superseded = () => pending_changes_durability
+            .superseded_structural_payloads('session:echo', 0, 'Sheet1')
+            .map((payload) => {
+                const run = payload.rowLayout?.runs[0];
+                return run?.kind === 'source' ? run.start : undefined;
+            });
+        const first = pending_changes_durability.publish('session:echo', changes(1), 1);
+        expect(superseded()).toEqual([]);
+        const second = pending_changes_durability.publish('session:echo', changes(0), 1);
+        const third = pending_changes_durability.publish('session:echo', changes(1), 1);
+        expect(superseded()).toEqual([1, 0]);
+        // The first write landing proves nothing about the second.
+        pending_changes_durability.acknowledge('session:echo', first);
+        expect(superseded()).toEqual([0]);
+        pending_changes_durability.acknowledge('session:echo', third);
+        expect(superseded()).toEqual([]);
+        expect(second).toBe(first + 1);
+        // Bounded under a long run of unacknowledged gestures.
+        for (let gesture = 0; gesture < 200; gesture += 1) {
+            pending_changes_durability.publish('session:echo', changes(gesture % 2), 1);
+        }
+        expect(superseded().length).toBeLessThanOrEqual(64);
+    });
+
     it('prefers an injected global bridge over acquireVsCodeApi', async () => {
         const injected = { postMessage: vi.fn() };
         (globalThis as { __tableViewerHostBridge?: unknown })

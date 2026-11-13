@@ -17988,3 +17988,168 @@ describe('structural conflict notice counts and Review Changes notes', () => {
         expect(review?.textContent).toContain('Short rows will be padded to 3 columns.');
     });
 });
+
+describe('rapid structural gestures against refresh echoes', () => {
+    const basis = {
+        kind: 'delimited' as const, byteLength: 1, digest: 'x', sourceRowCount: 4, sourceColumnCount: 1,
+    };
+    // Source rows in display order, as canonical runs.
+    const layout = (...rows: number[]) => ({
+        runs: rows.reduce<{ kind: 'source'; start: number; count: number }[]>((runs, row) => {
+            const last = runs[runs.length - 1];
+            if (last !== undefined && last.start + last.count === row) last.count += 1;
+            else runs.push({ kind: 'source', start: row, count: 1 });
+            return runs;
+        }, []),
+        removedSourceRows: [],
+        discardedPendingRows: [],
+    });
+    const slot = (row_layout: ReturnType<typeof layout>) => ({
+        sheetName: 'Sheet1',
+        cells: {},
+        formatTemplates: [],
+        appendedRows: [],
+        tailRemovals: [],
+        conflicts: [],
+        rowLayout: row_layout,
+        structuralBasis: basis,
+    });
+
+    it('keeps the newest layout when a refresh echoes an older publication of its own', async () => {
+        const { post_message } = await render_app();
+        const meta = make_meta(['Sheet1'], false);
+        Object.assign(meta.sheets[0], { rowCount: 4, sourceRowCount: 4 });
+        const capabilities = {
+            csvEditable: true,
+            csvEditingSupported: true,
+            structuralEditing: { sheets: [{ rows: { supported: true as const }, columns: { supported: true as const } }] },
+        };
+        await dispatch_host_message(initial_snapshot_message(meta, { capabilities }));
+        await enter_edit_mode(post_message, 'echo-session');
+        const store = (grid_shell_mock.latest_props as unknown as GridShellProps).pending_row_store!;
+        const { pending_changes_durability } = await import('../webview/host-bridge');
+        const publications = () => post_message.mock.calls
+            .map(([message]) => message as WebviewMessage)
+            .filter((message): message is Extract<WebviewMessage, { type: 'pendingChangesChanged' }> =>
+                message.type === 'pendingChangesChanged');
+        const gesture = async (row_layout: ReturnType<typeof layout>) => {
+            await act(async () => {
+                const before = store.snapshot();
+                const staged = store.stage_replace('echo-session', before, {
+                    ...before, rowLayout: row_layout, structuralBasis: basis,
+                });
+                staged!.commit();
+                staged!.notify();
+                // GridShell's publication effect (the shell is mocked here).
+                pending_changes_durability.publish('echo-session', {
+                    sheetIndex: 0, sheetName: 'Sheet1', cells: {}, ...store.snapshot(),
+                }, 1);
+            });
+        };
+        // Two quick moves: the second publication leaves before the host has
+        // written the first.
+        const first = layout(1, 0, 2, 3);
+        const second = layout(1, 2, 0, 3);
+        await gesture(first);
+        await gesture(second);
+        await vi.waitUntil(() => publications().length >= 2);
+        const sent_before_echo = publications().length;
+        // The host's refresh after writing the first publication: it carries
+        // the first layout, and the second is still unacknowledged.
+        await dispatch_host_message(refresh_snapshot_message(meta, {
+            generation: 1,
+            sourceGeneration: 1,
+            reason: 'other',
+            capabilities: { ...capabilities, csvEditSessionId: 'echo-session' },
+            state: { pendingEdits: [slot(first)] },
+        }));
+        expect(store.snapshot().rowLayout).toEqual(second);
+        // No publication of the stale layout back to the host.
+        expect(publications().slice(sent_before_echo).map((message) => message.changes.rowLayout))
+            .not.toContainEqual(first);
+    });
+
+    const scenarios: readonly {
+        readonly name: string;
+        readonly steps: readonly { readonly rows: readonly number[]; readonly cell?: string }[];
+    }[] = [
+        { name: 'three moves', steps: [{ rows: [1, 0, 2, 3] }, { rows: [1, 2, 0, 3] }, { rows: [1, 2, 3, 0] }] },
+        {
+            name: 'five moves',
+            steps: [
+                { rows: [1, 0, 2, 3] }, { rows: [1, 2, 0, 3] }, { rows: [1, 2, 3, 0] },
+                { rows: [1, 2, 0, 3] }, { rows: [1, 0, 2, 3] },
+            ],
+        },
+        {
+            name: 'a move, a cell edit, and a move',
+            steps: [{ rows: [1, 0, 2, 3] }, { rows: [1, 0, 2, 3], cell: 'typed' }, { rows: [1, 2, 0, 3] }],
+        },
+    ];
+    for (const scenario of scenarios) it(`settles on the newest state after ${scenario.name}`, async () => {
+        const { post_message } = await render_app();
+        const meta = make_meta(['Sheet1'], false);
+        Object.assign(meta.sheets[0], { rowCount: 4, sourceRowCount: 4 });
+        const capabilities = {
+            csvEditable: true,
+            csvEditingSupported: true,
+            structuralEditing: { sheets: [{ rows: { supported: true as const }, columns: { supported: true as const } }] },
+        };
+        await dispatch_host_message(initial_snapshot_message(meta, { capabilities }));
+        await enter_edit_mode(post_message, 'settle-session');
+        const store = (grid_shell_mock.latest_props as unknown as GridShellProps).pending_row_store!;
+        const { pending_changes_durability } = await import('../webview/host-bridge');
+        let cells: Record<string, { value: string; base: string }> = {};
+        // GridShell's publication effect: the complete slot, deduped.
+        const shell_publish = () => pending_changes_durability.publish('settle-session', {
+            sheetIndex: 0, sheetName: 'Sheet1', cells, ...store.snapshot(),
+        }, 1);
+        const publications = () => post_message.mock.calls
+            .map(([message]) => message as WebviewMessage)
+            .filter((message): message is Extract<WebviewMessage, { type: 'pendingChangesChanged' }> =>
+                message.type === 'pendingChangesChanged');
+        for (const step of scenario.steps) {
+            await act(async () => {
+                if (step.cell !== undefined) cells = { '1:0': { value: step.cell, base: 'b' } };
+                const before = store.snapshot();
+                const staged = store.stage_replace('settle-session', before, {
+                    ...before, rowLayout: layout(...step.rows), structuralBasis: basis,
+                });
+                if (staged !== undefined) {
+                    staged.commit();
+                    staged.notify();
+                }
+                shell_publish();
+            });
+        }
+        await vi.waitUntil(() => publications().length >= 1);
+        // The host: write each publication in order, refresh every panel with
+        // what it wrote, then acknowledge (the acknowledgement is queued behind
+        // the refresh).
+        let written: Extract<WebviewMessage, { type: 'pendingChangesChanged' }>['changes'] | undefined;
+        let handled = 0;
+        while (handled < publications().length) {
+            expect(handled).toBeLessThan(40);
+            const publication = publications()[handled++]!;
+            written = publication.changes;
+            const { sheetIndex: _sheet_index, ...written_slot } = written;
+            await dispatch_host_message(refresh_snapshot_message(meta, {
+                generation: 1,
+                sourceGeneration: 1,
+                reason: 'other',
+                capabilities: { ...capabilities, csvEditSessionId: 'settle-session' },
+                state: { pendingEdits: [written_slot] },
+            }));
+            await act(async () => { shell_publish(); });
+            await dispatch_host_message({
+                type: 'pendingChangesAcknowledged',
+                editSessionId: 'settle-session',
+                sequence: publication.sequence,
+            });
+        }
+        const newest = scenario.steps[scenario.steps.length - 1]!;
+        expect(store.snapshot().rowLayout).toEqual(layout(...newest.rows));
+        expect(written?.rowLayout).toEqual(layout(...newest.rows));
+        expect(written?.cells).toEqual(cells);
+    });
+});

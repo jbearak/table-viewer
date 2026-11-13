@@ -681,6 +681,18 @@ interface SourceCellFocus {
     readonly sourceColumn: number;
 }
 
+/** JSON equality that ignores object key order (arrays keep theirs). */
+function same_json(left: unknown, right: unknown): boolean {
+    const canonical = (value: unknown): unknown => {
+        if (Array.isArray(value)) return value.map(canonical);
+        if (value === null || typeof value !== 'object') return value;
+        return Object.fromEntries(Object.keys(value).sort()
+            .filter((key) => (value as Record<string, unknown>)[key] !== undefined)
+            .map((key) => [key, canonical((value as Record<string, unknown>)[key])]));
+    };
+    return JSON.stringify(canonical(left)) === JSON.stringify(canonical(right));
+}
+
 export function App(): React.JSX.Element {
     const [meta, set_meta] = useState<WorkbookMeta | null>(null);
     const [generation, set_generation] = useState(0);
@@ -3853,39 +3865,50 @@ export function App(): React.JSX.Element {
                                     );
                                 const unchanged = <T,>(now: T, then: T): boolean =>
                                     JSON.stringify(now) === JSON.stringify(then);
+                                // Publications this renderer superseded before the
+                                // host acknowledged them. The host writes them in
+                                // order, so a refresh can carry one after a newer
+                                // gesture left: that is the host behind, not a
+                                // change the host made, and adopting it would revert
+                                // the newer gesture and republish the old layout,
+                                // which the next echo reverts again.
+                                const superseded = pending_changes_durability
+                                    .superseded_structural_payloads(
+                                        edit_session_id,
+                                        target.sheetIndex,
+                                        target.sheetName,
+                                        target.worksheetId,
+                                    );
+                                // Three-way, per field: keep a local change since the
+                                // latest publication; otherwise take the host's value,
+                                // unless it is an echo of a superseded publication.
+                                const take = <T,>(pick: (changes: WorksheetPendingChanges) => T): T => {
+                                    const now = pick(current);
+                                    const then = pick(published!);
+                                    const host = pick(authoritative);
+                                    if (!unchanged(now, then)) return now;
+                                    if (
+                                        !same_json(host, then)
+                                        && superseded.some((payload) => same_json(pick(payload), host))
+                                    ) return now;
+                                    return host;
+                                };
+                                const merged_append_basis = published === undefined
+                                    ? undefined
+                                    : take((changes) => changes.appendBasis);
                                 const merged: WorksheetPendingChanges = published === undefined
                                     ? current
                                     : {
                                         ...target,
-                                        cells: unchanged(current.cells, published.cells)
-                                            ? authoritative.cells : current.cells,
-                                        formatTemplates: unchanged(
-                                            current.formatTemplates,
-                                            published.formatTemplates,
-                                        ) ? authoritative.formatTemplates : current.formatTemplates,
-                                        appendedRows: unchanged(
-                                            pending_rows(current),
-                                            pending_rows(published),
-                                        ) ? pending_rows(authoritative) : pending_rows(current),
-                                        tailRemovals: unchanged(
-                                            current.tailRemovals,
-                                            published.tailRemovals,
-                                        ) ? authoritative.tailRemovals : current.tailRemovals,
-                                        ...(unchanged(current.appendBasis, published.appendBasis)
-                                            ? authoritative.appendBasis === undefined
-                                                ? {}
-                                                : { appendBasis: authoritative.appendBasis }
-                                            : current.appendBasis === undefined
-                                                ? {}
-                                                : { appendBasis: current.appendBasis }),
-                                        conflicts: unchanged(
-                                            current.conflicts,
-                                            published.conflicts,
-                                        ) ? authoritative.conflicts : current.conflicts,
-                                        ...pending_layout_fields(unchanged(
-                                            pending_layout_fields(current),
-                                            pending_layout_fields(published),
-                                        ) ? authoritative : current),
+                                        cells: take((changes) => changes.cells),
+                                        formatTemplates: take((changes) => changes.formatTemplates),
+                                        appendedRows: take(pending_rows),
+                                        tailRemovals: take((changes) => changes.tailRemovals),
+                                        ...(merged_append_basis === undefined
+                                            ? {}
+                                            : { appendBasis: merged_append_basis }),
+                                        conflicts: take((changes) => changes.conflicts),
+                                        ...take(pending_layout_fields),
                                     };
                                 const cell_store = cell_stores.get(worksheet_target_key(target));
                                 try {
