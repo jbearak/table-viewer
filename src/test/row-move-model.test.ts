@@ -194,6 +194,14 @@ describe('planning a move', () => {
         ]);
     });
 
+    it('plans a move of more rows than a call can take as arguments', () => {
+        const count = 150_000;
+        const ctx = context({ sourceRowCount: count + 1, structuralBasis: { ...BASIS, sourceRowCount: count + 1 } });
+        const plan = planned(plan_row_move(EMPTY, ctx, rows(count), 'end'));
+        expect(plan.label).toBe(`Move ${count} rows`);
+        expect(plan.direction).toBe('down');
+    });
+
     it('refuses a move that changes nothing, marked unchanged', () => {
         expect(plan_row_move(EMPTY, context(), [source(3)], source(4))).toMatchObject({ ok: false, unchanged: true });
     });

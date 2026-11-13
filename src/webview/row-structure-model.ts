@@ -598,7 +598,9 @@ export function plan_row_move(
     }
     const index = index_row_layout(row_layout_for(changes, context));
     const live = identities.filter((identity) => index.is_live(identity));
-    const first = Math.min(...live.map((identity) => index.position_of(identity)!));
+    // A loop, not `Math.min(...)`: a selection may exceed the argument limit.
+    let first = Infinity;
+    for (const identity of live) first = Math.min(first, index.position_of(identity)!);
     const direction = before === 'end' || (index.position_of(before) ?? Infinity) > first ? 'down' : 'up';
     return Object.freeze({
         ok: true,
