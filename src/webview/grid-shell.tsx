@@ -231,6 +231,7 @@ import {
     AppendComposer,
     EMPTY_APPEND_COMPOSER_DRAFT,
     type AppendComposerDraft,
+    type ComposerColumnKey,
 } from './append-composer';
 import { row_boundary_hit } from './row-resize-model';
 import { read_overlay_editor_value } from './live-editor';
@@ -600,6 +601,7 @@ import {
     column_identity_key,
     header_body_start,
     index_column_layout,
+    index_row_layout,
     row_identity_key,
     source_column_layout,
     type ColumnIdentity,
@@ -5893,6 +5895,11 @@ export function GridShell({
         (count: number): Promise<boolean> => append_and_focus_rows(count, 0),
         [append_and_focus_rows],
     );
+    /** `plan_pending_column_text`, defined below with the cell commit paths. */
+    const plan_pending_column_text_ref = useRef<(
+        edits: readonly { readonly pendingColumnId: string; readonly rowKey: string; readonly text: string }[],
+        before: PendingStructuralChanges,
+    ) => ReturnType<typeof plan_pending_column_cells> | 'refused'>(() => undefined);
     /**
      * The composer's staging path — quick add's sibling, with cell values.
      *
@@ -5918,6 +5925,26 @@ export function GridShell({
         // second payload outstanding.
         let gesture_order: number | undefined;
         let formula_refusal: string | undefined;
+        // Values for Pending Columns, by composed row: they are written into
+        // the Pending Column once the row has an identity.
+        const column_values = rows.map((values) => projected_columns.flatMap((column) => {
+            if (column.identity.kind !== 'pending') return [];
+            const pendingColumnId = column.identity.pendingColumnId;
+            const raw = values[`p:${pendingColumnId}`];
+            if (raw === undefined) return [];
+            const parsed = parse_cell_edit(raw, edit_syntax);
+            if (parsed.text === '' && parsed.rich === undefined) return [];
+            const formula_fields = commit_formula_fields(
+                parsed.text,
+                edit_syntax === 'markdown' && xlsx_edit_writes_formula(parsed.text, parsed.rich?.runs),
+                rows.length,
+            );
+            if (formula_fields.kind === 'refused') {
+                formula_refusal ??= formula_fields.reason;
+                return [];
+            }
+            return [{ pendingColumnId, text: raw }];
+        }));
         const seed_cells = rows.map((values) => {
             const cells: Record<number, PendingRowCell> = {};
             // Only the columns on screen: a draft keeps values for columns that
@@ -6003,11 +6030,54 @@ export function GridShell({
         // An envelope too large to hold the composed values now refuses the
         // whole gesture rather than staging blank rows beside a warning.
         if (appended === undefined) return false;
-        record_pending_row_gesture(
-            rows.length === 1 ? 'Compose row' : `Compose ${rows.length} rows`,
-            appended.before,
-            pending_store.snapshot(),
-        );
+        // Pending Column values join the same gesture, after the rows exist.
+        const column_edits = column_values.flatMap((values, index) => {
+            const row_id = appended.rowIds[index];
+            return row_id === undefined
+                ? []
+                : values.map((value) => ({ ...value, rowKey: `p:${row_id}` }));
+        });
+        let column_change: HistoryChange | undefined;
+        if (column_edits.length > 0) {
+            const roll_back = () => {
+                const rollback = pending_store.stage_replace(edit_session_id, pending_store.snapshot(), appended.before);
+                if (rollback?.valid()) {
+                    rollback.commit();
+                    rollback.notify();
+                }
+            };
+            const plan = plan_pending_column_text_ref.current(column_edits, pending_store.snapshot());
+            if (plan === 'refused') {
+                roll_back();
+                return false;
+            }
+            if (plan !== undefined) {
+                const staged = pending_store.stage_replace(edit_session_id, pending_store.snapshot(), plan.next);
+                if (staged === undefined || !staged.valid()) {
+                    roll_back();
+                    show_pending_size_warning();
+                    return false;
+                }
+                staged.commit();
+                staged.notify();
+                column_change = plan.change;
+            }
+        }
+        if (history_capture !== undefined) {
+            const changes = pending_row_history_changes(
+                history_capture.worksheet,
+                appended.before,
+                pending_store.snapshot(),
+                undefined,
+                column_change === undefined ? [] : [column_change],
+            );
+            if (changes.length > 0) {
+                commit_staged_transaction([history_capture.history.stage_record({
+                    label: rows.length === 1 ? 'Compose row' : `Compose ${rows.length} rows`,
+                    changes,
+                })]);
+            }
+        }
         const display_row = await pending_display_row(appended.rowIds[0]);
         if (display_row === undefined) return true;
         select_active_display_cell_ref.current([0, display_row]);
@@ -6024,10 +6094,11 @@ export function GridShell({
         refuse_formula,
         sheet_index,
         sheet_meta,
+        history_capture,
         pending_display_row,
         pending_store,
-        record_pending_row_gesture,
         projected_columns,
+        show_pending_size_warning,
     ]);
     const [local_composer_draft, set_local_composer_draft] = useState<AppendComposerDraft>(
         EMPTY_APPEND_COMPOSER_DRAFT,
@@ -6059,13 +6130,16 @@ export function GridShell({
      * Labels for the composer's fields — the same titles the grid header
      * paints, so a field is identifiable by the column the user can see.
      */
-    // The composer stages Pending Row cells, keyed by source column: it
-    // offers the live source columns only.
+    // The composer stages Pending Row cells, keyed by source column, and
+    // Pending Column cells, keyed by `p:<id>`: it offers every live column.
     const composer_columns = useMemo(
-        () => projected_columns.flatMap((column, display) =>
-            column.identity.kind === 'source' && column.state !== 'removed'
-                ? [{ source: column.identity.sourceColumn, title: columns[display]?.title ?? '' }]
-                : []),
+        () => projected_columns.flatMap((column, display): { source: ComposerColumnKey; title: string }[] => {
+            if (column.state === 'removed') return [];
+            const title = columns[display]?.title ?? '';
+            return column.identity.kind === 'source'
+                ? [{ source: column.identity.sourceColumn, title }]
+                : [{ source: `p:${column.identity.pendingColumnId}`, title }];
+        }),
         [columns, projected_columns],
     );
     const composer_column_labels = useMemo(
@@ -6083,10 +6157,13 @@ export function GridShell({
      * counting from one, so a legend names the row the values will actually
      * land on.
      */
-    const composer_first_row_number = sheet_meta.sourceRowCount
-        - pending_rows.tailRemovals.length
-        + stored_pending_rows(pending_rows).length
-        + 1;
+    // Under a row layout, removed rows leave and the band follows the layout's live rows.
+    const composer_first_row_number = pending_rows.rowLayout === undefined
+        ? sheet_meta.sourceRowCount
+            - pending_rows.tailRemovals.length
+            + stored_pending_rows(pending_rows).length
+            + 1
+        : body_start + index_row_layout(pending_rows.rowLayout).liveCount + appended_rows(pending_rows).length + 1;
     const may_append_rows_ref = useRef(may_append_rows);
     may_append_rows_ref.current = may_append_rows;
     const append_and_focus_ref = useRef(append_and_focus);
@@ -6496,6 +6573,7 @@ export function GridShell({
         refuse_formula,
         structure_context.worksheet,
     ]);
+    plan_pending_column_text_ref.current = plan_pending_column_text;
     const commit_pending_column_cells = useCallback((
         edits: readonly { readonly pendingColumnId: string; readonly rowKey: string; readonly text: string }[],
         label: string,

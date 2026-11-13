@@ -7392,6 +7392,44 @@ describe('GridShell append composer', () => {
             .toBe('false');
     });
 
+    it('offers a Pending Column and stages its value into the column, in the same history entry', async () => {
+        const history = create_history_store();
+        const pending = create_pending_row_store({ session_id: 'session-1' });
+        const before = pending.snapshot();
+        pending.stage_replace('session-1', before, {
+            ...before,
+            columnLayout: {
+                columns: [
+                    { kind: 'source', sourceColumn: 0 },
+                    { kind: 'pending', pendingColumnId: 'c1' },
+                    { kind: 'source', sourceColumn: 1 },
+                    { kind: 'source', sourceColumn: 2 },
+                ],
+                removedSourceColumns: [],
+                discardedPendingColumns: [],
+            },
+            pendingColumns: [{ id: 'c1', header: 'New column', cells: {}, format: { kind: 'none' }, createdOrder: 1 }],
+        })!.commit();
+        await render_grid(composer_props({ pending_row_store: pending, history_store: history }));
+        await open_composer();
+        expect(field_labels()).toEqual(['A name', 'New column', 'C name']);
+        await act(async () => set_input_value(field('append-composer-0-0') as HTMLInputElement, 'left'));
+        await act(async () => set_input_value(field('append-composer-0-1') as HTMLInputElement, 'typed'));
+        await act(async () => { button('Stage row').click(); });
+        await vi.waitUntil(() => pending.snapshot().appendedRows.length === 1);
+        const [row] = pending.snapshot().appendedRows;
+        expect(row.cells[0]?.value).toBe('left');
+        expect(pending.snapshot().pendingColumns?.[0]?.cells[`p:${row.id}`]?.value).toBe('typed');
+        const entries = history.snapshot().undoStack;
+        expect(entries.map((entry) => entry.action.label)).toEqual(['Compose row']);
+        expect(entries[0]!.action.changes.map((change) => change.kind)).toContain('columnLayout');
+        const undo = plan_pending_row_history_replay(entries[0]!.action, 'undo', () => pending.snapshot());
+        if (undo.kind !== 'plan') throw new Error(undo.kind);
+        const undone = undo.plans.at(-1)!.next;
+        expect(undone.appendedRows).toEqual([]);
+        expect(undone.pendingColumns?.[0]?.cells).toEqual({});
+    });
+
     it('stages a batch composed with Add another row as one gesture', async () => {
         const history = create_history_store();
         const pending = create_pending_row_store({ session_id: 'session-1' });
