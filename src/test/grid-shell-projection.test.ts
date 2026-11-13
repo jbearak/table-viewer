@@ -9989,6 +9989,57 @@ describe('columns: Insert, Delete, Restore, Move, rename, Pending Column cells, 
         expect(cell.data?.edit_value ?? (cell as { copyData?: string }).copyData).toBe('=1+1');
     });
 
+    it('auto-fits a Pending Column formula by its calculated result', async () => {
+        const canvas_context = vi.spyOn(HTMLCanvasElement.prototype, 'getContext')
+            .mockReturnValue({
+                font: '',
+                measureText: (text: string) => ({ width: text.length * 7 }),
+            } as unknown as CanvasRenderingContext2D);
+        onTestFinished(() => canvas_context.mockRestore());
+        const pending = with_pending_column({ 's:1': { value: '=REPT("x",60)' } }, xlsx_basis);
+        const sheet_meta = { ...props().sheet_meta, rowCount: 2, sourceRowCount: 2 };
+        const formula_anchor_workbook = webview_formula_workbook(true, [sheet_meta], () => pending.snapshot());
+        const pending_auto_fit_ref: { current: (() => Record<string, number>) | null } = { current: null };
+        const { rerender } = await render_columns({
+            pending_row_store: pending,
+            edit_syntax: 'markdown',
+            structural_support: { ...supported, basis: xlsx_basis },
+            formula_anchor_workbook,
+            formula_results: new Map(),
+            pending_auto_fit_ref,
+        });
+        // No result yet: the formula text is what there is to measure.
+        const before_result = pending_auto_fit_ref.current!()['c1']!;
+        await rerender({ formula_results: new Map([['1:1', 'x'.repeat(60)]]) });
+        const with_result = pending_auto_fit_ref.current!()['c1']!;
+        expect(with_result).toBeGreaterThan(before_result);
+        expect(with_result).toBeGreaterThanOrEqual(60 * 7);
+    });
+
+    it('goes to a Pending Column cell on a source row that has not loaded, loading it first', async () => {
+        // Source row 1's page is not resident until the load.
+        grid_mock.source_row_for_display = (display_row: number) => (display_row === 1 ? undefined : display_row);
+        grid_mock.ensure_rows_loaded.mockImplementation(async () => {
+            grid_mock.source_row_for_display = null;
+            return true;
+        });
+        const on_cell_focus_applied = vi.fn();
+        await render_columns({
+            pending_row_store: with_pending_column({}),
+            on_cell_focus_applied,
+            cell_focus: {
+                sequence: 1,
+                sheetIndex: 0,
+                row: { kind: 'source', sourceRow: 1 },
+                column: { kind: 'pending', pendingColumnId: 'c1' },
+            },
+        });
+        await vi.waitFor(() => expect(on_cell_focus_applied).toHaveBeenCalledWith(1, true));
+        expect(grid_mock.ensure_rows_loaded).toHaveBeenCalled();
+        expect((grid_mock.props!.gridSelection as { current?: { cell: [number, number] } }).current?.cell)
+            .toEqual([1, 1]);
+    });
+
     it('repaints a Pending Column formula when its result arrives', async () => {
         const pending = with_pending_column({ 's:1': { value: '=1+1' } }, xlsx_basis);
         const sheet_meta = { ...props().sheet_meta, rowCount: 2, sourceRowCount: 2 };

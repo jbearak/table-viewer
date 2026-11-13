@@ -4389,15 +4389,14 @@ export function GridShell({
         pending_projection,
         unloaded_display_row_for_source,
     ]);
-    const reveal_source_cell = useCallback(async (
+    /** Select `display_column` on a source row, loading the row's page first if it is not resident. */
+    const reveal_source_row_cell = useCallback(async (
         source_row: number,
-        source_column: number,
+        display_column: number,
         is_current?: () => boolean,
         restore_focus = true,
     ): Promise<boolean> => {
         if (is_current?.() === false) return false;
-        const display_column = display_column_for_source(source_column);
-        if (display_column === undefined) return false;
         let display_row = pending_projection.display_row_for_identity({
             kind: 'source',
             sourceRow: source_row,
@@ -4421,13 +4420,23 @@ export function GridShell({
         return true;
     }, [
         authoritative_display_row_for_source,
-        display_column_for_source,
         ensure_rows_loaded,
         focus_grid,
         pending_projection,
         select_active_display_cell,
         unloaded_display_row_for_source,
     ]);
+    const reveal_source_cell = useCallback(async (
+        source_row: number,
+        source_column: number,
+        is_current?: () => boolean,
+        restore_focus = true,
+    ): Promise<boolean> => {
+        if (is_current?.() === false) return false;
+        const display_column = display_column_for_source(source_column);
+        if (display_column === undefined) return false;
+        return reveal_source_row_cell(source_row, display_column, is_current, restore_focus);
+    }, [display_column_for_source, reveal_source_row_cell]);
     const applied_saved_row_focus_ref = useRef<number | null>(null);
     const saved_row_focus_attempt_ref = useRef<string | null>(null);
     const saved_row_focus_retries_ref = useRef({ sequence: -1, count: 0 });
@@ -4545,20 +4554,24 @@ export function GridShell({
         applied_cell_focus_ref.current = cell_focus.sequence;
         const sequence = cell_focus.sequence;
         const { row, column } = cell_focus;
-        // A source cell may be on a page not loaded yet: the source path loads
-        // it. A newer request, or the shell unmounting, retires this one, so a
-        // late load cannot move the caret off the newer cell.
-        if (row.kind === 'source' && column.kind === 'source') {
+        const display_column = projected_columns.findIndex((projected) =>
+            column_identities_equal(projected.identity, column));
+        // A source row may be on a page not loaded yet: the source path loads
+        // it, for a source or a Pending Column cell. A newer request, or the
+        // shell unmounting, retires this one, so a late load cannot move the
+        // caret off the newer cell.
+        if (row.kind === 'source' && (column.kind === 'source' || display_column >= 0)) {
             const is_current = () => cell_focus_mounted_ref.current
                 && applied_cell_focus_ref.current === sequence;
-            void reveal_source_cell(row.sourceRow, column.sourceColumn, is_current).then((visible) => {
+            const revealed = column.kind === 'source'
+                ? reveal_source_cell(row.sourceRow, column.sourceColumn, is_current)
+                : reveal_source_row_cell(row.sourceRow, display_column, is_current);
+            void revealed.then((visible) => {
                 if (is_current()) on_cell_focus_applied(sequence, visible);
             });
             return;
         }
         const display_row = pending_projection.display_row_for_identity(row);
-        const display_column = projected_columns.findIndex((projected) =>
-            column_identities_equal(projected.identity, column));
         if (display_row === undefined || display_column < 0) {
             focus_grid();
             on_cell_focus_applied(sequence, false);
@@ -4574,6 +4587,7 @@ export function GridShell({
         pending_projection,
         projected_columns,
         reveal_source_cell,
+        reveal_source_row_cell,
         select_active_display_cell,
         sheet_index,
     ]);
@@ -7710,20 +7724,40 @@ export function GridShell({
             if (projected.identity.kind !== 'pending') continue;
             const column = pending_columns_by_id.get(projected.identity.pendingColumnId);
             if (column === undefined) continue;
-            const cells: MeasurableCell[] = Object.values(column.cells).map((cell) => ({
-                text: pending_column_cell_text(cell),
-                bold: false,
-                italic: false,
-                ...(show_formatting && cell.valueRuns?.runs !== undefined && cell.valueRuns.runs.length > 0
-                    ? { runs: cell.valueRuns.runs }
-                    : {}),
-            }));
+            const worksheet = formula_anchor_workbook?.worksheets[sheet_index];
+            const cells: MeasurableCell[] = Object.entries(column.cells).map(([row_key, cell]) => {
+                // A formula shows its calculated result (or, unrenderable, its
+                // error), as `pending_column_cell_content` draws it; its text
+                // until a result arrives.
+                const is_formula = edit_syntax === 'markdown'
+                    && xlsx_edit_writes_formula(cell.value, cell.valueRuns?.runs);
+                if (is_formula) {
+                    const formula = formula_display_for(cell.value, cell.formulaAnchors, cell.valueEditOrder ?? 0);
+                    const result_key = pending_column_result_key(worksheet, column.id, row_key);
+                    const result = formula?.kind === 'unrenderable'
+                        ? formula.result
+                        : result_key === undefined ? undefined : formula_results_ref.current?.get(result_key);
+                    return { text: result ?? pending_column_cell_text(cell), bold: false, italic: false };
+                }
+                return {
+                    text: pending_column_cell_text(cell),
+                    bold: false,
+                    italic: false,
+                    ...(show_formatting && cell.valueRuns?.runs !== undefined && cell.valueRuns.runs.length > 0
+                        ? { runs: cell.valueRuns.runs }
+                        : {}),
+                };
+            });
             widths[column.id] = fit_column_width(cells, measure);
         }
         return widths;
     }, [
+        edit_syntax,
         font_family,
         font_size_px,
+        formula_anchor_workbook,
+        formula_display_for,
+        sheet_index,
         pending_column_cell_text,
         pending_columns_by_id,
         projected_columns,
