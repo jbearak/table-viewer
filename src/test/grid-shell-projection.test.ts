@@ -10,6 +10,8 @@ import type {
     GridFocusHandle,
     HighlightSelectionHandle,
     GridShellProps,
+    StructuralInsertAdmission,
+    StructuralInsertRequest,
 } from '../webview/grid-shell';
 import { matches_filter } from '../table-transform';
 import type { CsvSaveOperation, FilterEntry, SheetTransformState } from '../types';
@@ -8632,5 +8634,215 @@ describe('row Delete and Restore in the row-gutter menu', () => {
             { location: [0, 2], value: { kind: 'text', data: 'pasted' } },
         ], 'paste'));
         expect([...cells.snapshot().keys()]).toEqual(['2:0']);
+    });
+});
+
+describe('row Insert in the row-gutter menu', () => {
+    const basis = {
+        kind: 'delimited' as const,
+        byteLength: 10,
+        digest: 'digest',
+        sourceRowCount: 4,
+        sourceColumnCount: 3,
+    };
+    const supported = {
+        rows: { supported: true as const },
+        columns: { supported: true as const },
+        basis,
+    };
+    const template = { id: 'plain', format: { kind: 'none' as const } };
+    const append_basis = { sourceRowCount: 4, columnCount: 3, schemaFingerprint: 'sha256:x' };
+    const structure_props = (overrides: Partial<GridShellProps> = {}) => props({
+        sheet_meta: { ...props().sheet_meta, rowCount: 4, sourceRowCount: 4 },
+        row_count: 4,
+        edit_mode: true,
+        csv_editable: true,
+        edit_session_id: 'session',
+        transform_sections: true,
+        structural_support: supported,
+        ...overrides,
+    });
+    const open_row_menu = async (row: number) => {
+        const on_cell_context_menu = grid_mock.props!.onCellContextMenu as
+            (cell: [number, number], event: Record<string, unknown>) => void;
+        await act(async () => on_cell_context_menu([-1, row], {
+            preventDefault: vi.fn(),
+            bounds: { x: 0, y: 24 * (row + 1), width: 40, height: 24 },
+            localEventX: 10,
+            localEventY: 10,
+        }));
+    };
+    const menu_item = (label: string) => Array.from(document.querySelectorAll('button'))
+        .find((candidate) => candidate.textContent === label);
+    const caret = () => (grid_mock.props!.gridSelection as {
+        current?: { cell: [number, number] };
+    }).current?.cell;
+    /** An admission the test resolves when it chooses, recording how it settles. */
+    const admission = (row_ids: readonly string[]) => {
+        const settled: boolean[] = [];
+        let resolve!: (value: StructuralInsertAdmission | undefined) => void;
+        const promise = new Promise<StructuralInsertAdmission | undefined>((done) => { resolve = done; });
+        return {
+            settled,
+            on_insert_rows: vi.fn((_request: StructuralInsertRequest) => promise),
+            grant: () => resolve({
+                rowIds: row_ids,
+                formatTemplate: template,
+                structuralBasis: basis,
+                appendBasis: append_basis,
+                settle: (accepted) => { settled.push(accepted); },
+            }),
+        };
+    };
+
+    it('inserts a row below as one action, labelled, numbered, and focused', async () => {
+        const pending = create_pending_row_store({ session_id: 'session' });
+        const history = create_history_store();
+        const host = admission(['ins-a']);
+        await render_grid(structure_props({
+            edit_session: create_edit_session_store({ session_id: 'session' }),
+            pending_row_store: pending,
+            history_store: history,
+            on_insert_rows: host.on_insert_rows,
+        }));
+        await open_row_menu(1);
+        expect(menu_button_labels()).toEqual(expect.arrayContaining(['Insert row above', 'Insert row below']));
+        await act(async () => menu_item('Insert row below')!.click());
+        expect(host.on_insert_rows).toHaveBeenCalledWith({
+            anchor: { kind: 'source', sourceRow: 1 },
+            side: 'after',
+            count: 1,
+        });
+        await act(async () => host.grant());
+        await vi.waitFor(() => expect(host.settled).toEqual([true]));
+        expect(pending.snapshot().rowLayout?.runs).toEqual([
+            { kind: 'source', start: 0, count: 2 },
+            { kind: 'pending', ids: ['ins-a'] },
+            { kind: 'source', start: 2, count: 2 },
+        ]);
+        expect(pending.snapshot().structuralBasis).toEqual(basis);
+        const undo = peek_history(history.snapshot(), 'undo');
+        if (undo.kind !== 'available') throw new Error('nothing recorded');
+        expect(undo.entry.action.label).toBe('Insert row');
+        expect(undo.entry.action.changes.map((change) => change.kind)).toEqual(['rowLayout']);
+        const label = grid_mock.props!.getRowAccessibilityLabel as (row: number) => string | undefined;
+        expect(label(2)).toBe('Row 3, inserted');
+        const get_row_number = (grid_mock.props!.rowMarkers as {
+            getRowNumber(row: number): number | undefined;
+        }).getRowNumber;
+        expect([0, 1, 2, 3, 4].map(get_row_number)).toEqual([1, 2, 3, 4, 5]);
+        // Focus lands on the new row in the focused column, by polling.
+        await vi.waitFor(() => expect(caret()).toEqual([0, 2]));
+    });
+
+    it('cancels an insert whose anchor was removed while the request was out', async () => {
+        const pending = create_pending_row_store({ session_id: 'session' });
+        const host = admission(['ins-a']);
+        await render_grid(structure_props({
+            edit_session: create_edit_session_store({ session_id: 'session' }),
+            pending_row_store: pending,
+            on_insert_rows: host.on_insert_rows,
+        }));
+        await open_row_menu(1);
+        await act(async () => menu_item('Insert row above')!.click());
+        // Row 1 is deleted before the reply arrives.
+        await open_row_menu(1);
+        await act(async () => menu_item('Delete row')!.click());
+        expect(pending.snapshot().rowLayout?.removedSourceRows).toEqual([{ start: 1, count: 1 }]);
+        await act(async () => host.grant());
+        await vi.waitFor(() => expect(host.settled).toEqual([false]));
+        expect(pending.snapshot().appendedRows).toEqual([]);
+        expect(document.querySelector('[data-testid="structure-announcement"]')?.textContent)
+            .toContain('Insert canceled because its row was removed.');
+    });
+
+    it('releases a reply that arrives after the session changed', async () => {
+        const pending = create_pending_row_store({ session_id: 'session' });
+        const host = admission(['ins-a']);
+        await render_grid(structure_props({
+            edit_session: create_edit_session_store({ session_id: 'session' }),
+            pending_row_store: pending,
+            on_insert_rows: host.on_insert_rows,
+        }));
+        await open_row_menu(0);
+        await act(async () => menu_item('Insert row below')!.click());
+        // A discard or a new grant re-stamps the App-owned store.
+        await act(async () => pending.adopt_session('other'));
+        await act(async () => host.grant());
+        await vi.waitFor(() => expect(host.settled).toEqual([false]));
+        expect(pending.snapshot().appendedRows).toEqual([]);
+    });
+
+    it('disables Insert in a transformed view and for a split selection, with the reasons', async () => {
+        await render_grid(structure_props({
+            edit_session: create_edit_session_store({ session_id: 'session' }),
+            pending_row_store: create_pending_row_store({ session_id: 'session' }),
+            on_insert_rows: vi.fn(),
+            transform_state: { sort: [{ colIndex: 0, direction: 'asc' }], filters: [] },
+        }));
+        await open_row_menu(1);
+        expect(menu_item('Insert row above')?.getAttribute('aria-description'))
+            .toBe('Clear sorts, filters, and hidden rows to insert or move rows.');
+
+        await render_grid(structure_props({
+            edit_session: create_edit_session_store({ session_id: 'session' }),
+            pending_row_store: create_pending_row_store({ session_id: 'session' }),
+            on_insert_rows: vi.fn(),
+        }));
+        const on_selection_change = grid_mock.props!.onGridSelectionChange as (selection: unknown) => void;
+        await act(async () => on_selection_change({ columns: compact([]), rows: compact([0, 2]) }));
+        await open_row_menu(2);
+        expect(menu_item('Insert 2 rows below')?.getAttribute('aria-description'))
+            .toBe('Select adjacent rows to insert or move them.');
+    });
+
+    it('appends for "Insert row below" on the band’s last row', async () => {
+        const pending = create_pending_row_store({ session_id: 'session' });
+        pending.append_rows('session', ['band-a'], template, 1, append_basis);
+        const on_append_rows = vi.fn(async () => undefined);
+        await render_grid(structure_props({
+            edit_session: create_edit_session_store({ session_id: 'session' }),
+            pending_row_store: pending,
+            on_insert_rows: vi.fn(),
+            on_append_rows,
+        }));
+        await open_row_menu(4);
+        expect(menu_item('Insert row above')?.getAttribute('aria-description'))
+            .toBe('Appended rows stay at the end until you save.');
+        await act(async () => menu_item('Insert row below')!.click());
+        await vi.waitFor(() => expect(on_append_rows).toHaveBeenCalledWith(1));
+    });
+
+    it('disables sorting, filtering, and hiding rows while inserted rows exist', async () => {
+        const pending = create_pending_row_store({ session_id: 'session' });
+        const host = admission(['ins-a']);
+        const on_transform_change = vi.fn();
+        await render_grid(structure_props({
+            edit_session: create_edit_session_store({ session_id: 'session' }),
+            pending_row_store: pending,
+            on_insert_rows: host.on_insert_rows,
+            on_transform_change,
+        }));
+        await open_row_menu(0);
+        await act(async () => menu_item('Insert row below')!.click());
+        await act(async () => host.grant());
+        await vi.waitFor(() => expect(host.settled).toEqual([true]));
+        const reason = 'Save or discard inserted and moved rows to sort, filter, or hide rows.';
+        await open_row_menu(3);
+        expect(menu_item('Hide row')?.getAttribute('aria-description')).toBe(reason);
+        const on_header_context_menu = grid_mock.props!.onHeaderContextMenu as
+            (column: number, event: Record<string, unknown>) => void;
+        await act(async () => on_header_context_menu(0, {
+            preventDefault: vi.fn(),
+            bounds: { x: 100, y: 0, width: 100, height: 36 },
+            localEventX: 20,
+            localEventY: 10,
+        }));
+        const sort = Array.from(document.querySelectorAll('button'))
+            .find((button) => button.textContent?.includes('Sort ascending'))!;
+        expect(sort.getAttribute('aria-disabled')).toBe('true');
+        expect(sort.getAttribute('aria-description')).toBe(reason);
+        await act(async () => sort.click());
+        expect(on_transform_change).not.toHaveBeenCalled();
     });
 });

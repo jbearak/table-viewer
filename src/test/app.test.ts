@@ -5555,6 +5555,159 @@ describe('edit mode save exit', () => {
             button.textContent === 'Discard row and column changes on Sheet1')).toBe(true);
     });
 
+    it('requests a row insert, installs a granted reply, and releases a stale one', async () => {
+        const { post_message } = await render_app();
+        const meta = make_meta(['Sheet1'], false);
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        await enter_edit_mode(post_message, 'insert-session');
+        const request_insert = grid_shell_mock.latest_props!.on_insert_rows as
+            (request: unknown) => Promise<{ rowIds: readonly string[]; settle(accepted: boolean): void } | undefined>;
+        let admitted: Promise<{ rowIds: readonly string[]; settle(accepted: boolean): void } | undefined>;
+        await act(async () => {
+            admitted = request_insert({ anchor: { kind: 'source', sourceRow: 1 }, side: 'before', count: 2 });
+        });
+        const request = post_message.mock.calls.map(([message]) => message)
+            .find((message) => message?.type === 'requestStructuralInsert');
+        expect(request).toMatchObject({
+            editSessionId: 'insert-session',
+            worksheet: { sheetIndex: 0, sheetName: 'Sheet1' },
+            axis: 'rows',
+            anchor: { row: { kind: 'source', sourceRow: 1 } },
+            side: 'before',
+            count: 2,
+        });
+        // While the admission is out, every edit gesture waits, as for an append.
+        expect(grid_shell_mock.latest_props!.append_in_flight).toBe(true);
+        const basis = {
+            kind: 'delimited' as const, byteLength: 10, digest: 'abc',
+            sourceRowCount: meta.sheets[0].sourceRowCount, sourceColumnCount: meta.sheets[0].columnCount,
+        };
+        await dispatch_host_message({
+            type: 'structuralInsertResult',
+            requestId: request.requestId,
+            sourceGeneration: request.sourceGeneration,
+            granted: true,
+            rowIds: ['insert-row:a', 'insert-row:b'],
+            formatTemplate: { id: 'plain', format: { kind: 'none' } },
+            structuralBasis: basis,
+            appendBasis: { sourceRowCount: 1, columnCount: 1, schemaFingerprint: 'x' },
+        });
+        const reply = await admitted!;
+        expect(reply?.rowIds).toEqual(['insert-row:a', 'insert-row:b']);
+        expect(grid_shell_mock.latest_props!.append_in_flight).toBe(false);
+        post_message.mockClear();
+        reply!.settle(true);
+        reply!.settle(false);
+        expect(post_message.mock.calls.map(([message]) => message).filter((message) =>
+            message?.type === 'settleRowAdmission')).toEqual([{
+            type: 'settleRowAdmission',
+            requestId: request.requestId,
+            editSessionId: 'insert-session',
+            accepted: true,
+        }]);
+
+        // A reply from an older source generation is settled as released.
+        await act(async () => {
+            admitted = request_insert({ anchor: { kind: 'source', sourceRow: 0 }, side: 'after', count: 1 });
+        });
+        const stale = post_message.mock.calls.map(([message]) => message)
+            .find((message) => message?.type === 'requestStructuralInsert');
+        post_message.mockClear();
+        await dispatch_host_message({
+            type: 'structuralInsertResult',
+            requestId: stale.requestId,
+            sourceGeneration: stale.sourceGeneration - 1,
+            granted: true,
+            rowIds: ['insert-row:c'],
+            formatTemplate: { id: 'plain', format: { kind: 'none' } },
+            structuralBasis: basis,
+            appendBasis: { sourceRowCount: 1, columnCount: 1, schemaFingerprint: 'x' },
+        });
+        expect(await admitted!).toBeUndefined();
+        expect(post_message.mock.calls.map(([message]) => message)).toContainEqual({
+            type: 'settleRowAdmission',
+            requestId: stale.requestId,
+            editSessionId: 'insert-session',
+            accepted: false,
+        });
+        // A reply this window never asked for is released too.
+        post_message.mockClear();
+        await dispatch_host_message({
+            type: 'structuralInsertResult',
+            requestId: 'unknown',
+            sourceGeneration: stale.sourceGeneration,
+            granted: true,
+            rowIds: ['insert-row:d'],
+        });
+        expect(post_message.mock.calls.map(([message]) => message)).toContainEqual({
+            type: 'settleRowAdmission',
+            requestId: 'unknown',
+            editSessionId: 'insert-session',
+            accepted: false,
+        });
+    });
+
+    it('keeps new rows at the end from Review Changes', async () => {
+        const { post_message } = await render_app();
+        const meta = make_meta(['Sheet1'], false);
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        await click_button('Edit');
+        const rows = meta.sheets[0].sourceRowCount;
+        await dispatch_host_message({
+            type: 'editSessionResult',
+            granted: true,
+            editSessionId: 'keep-session',
+            sheetIndex: 0,
+            pendingChanges: {
+                sheetIndex: 0,
+                sheetName: 'Sheet1',
+                cells: {},
+                formatTemplates: [{ id: 'plain', format: { kind: 'none' } }],
+                appendedRows: [{
+                    id: 'insert-row:a',
+                    origin: 'insert',
+                    cells: { 0: { value: 'typed', valueEditOrder: 5 } },
+                    formatTemplateId: 'plain',
+                    createdOrder: 5,
+                }],
+                appendBasis: { sourceRowCount: rows, columnCount: meta.sheets[0].columnCount, schemaFingerprint: 'x' },
+                tailRemovals: [],
+                conflicts: [{ reason: 'structuralBasisChanged', pendingRowIds: [], tailRemovalIds: [] }],
+                rowLayout: {
+                    runs: [
+                        { kind: 'pending', ids: ['insert-row:a'] },
+                        { kind: 'source', start: 0, count: rows },
+                    ],
+                    removedSourceRows: [],
+                    discardedPendingRows: [],
+                },
+                structuralBasis: {
+                    kind: 'delimited',
+                    byteLength: 10,
+                    digest: 'abc',
+                    sourceRowCount: rows,
+                    sourceColumnCount: meta.sheets[0].columnCount,
+                },
+            },
+        });
+        const store = (grid_shell_mock.latest_props as unknown as GridShellProps).pending_row_store!;
+        expect(store.snapshot().rowLayout).toBeDefined();
+        await click_button('Keep new rows at the end');
+        const next = store.snapshot();
+        expect(next.rowLayout).toBeUndefined();
+        expect(next.structuralBasis).toBeUndefined();
+        expect(next.conflicts).toEqual([]);
+        expect(next.appendedRows).toEqual([expect.objectContaining({
+            id: 'insert-row:a',
+            cells: { 0: { value: 'typed', valueEditOrder: 5 } },
+        })]);
+        expect(next.appendedRows[0]?.origin ?? 'append').toBe('append');
+    });
+
     it('does not discard row and column changes while another gesture is admitted', async () => {
         const { post_message } = await render_app();
         const meta = make_meta(['Sheet1'], false);
