@@ -5,7 +5,12 @@ import {
     columnResizeEdgeScrollDistanceBeforeMax,
     columnResizeEdgeScrollSpeed,
     columnResizeWidthFromPointer,
+    rowMoveBlockForPress,
+    rowMoveDropBefore,
+    rowMoveIsNoOp,
+    rowMoveScrollDirection,
 } from "../internal/data-grid-dnd/data-grid-dnd.js";
+import { CompactSelection } from "../internal/data-grid/data-grid-types.js";
 
 describe("column resize edge scrolling", () => {
     test("ramps only inside the right-edge activation zone", () => {
@@ -36,5 +41,41 @@ describe("column resize edge scrolling", () => {
         expect(columnResizeWidthFromPointer(500, 300, 40, 40, 1)).toBe(200);
         expect(columnResizeWidthFromPointer(500, 300, 75, 40, 1)).toBe(235);
         expect(columnResizeWidthFromPointer(500, 300, 80, 40, 2)).toBe(140);
+    });
+});
+
+describe("row move", () => {
+    test("arms only for a press inside one contiguous row interval", () => {
+        const block = CompactSelection.fromSingleSelection([3, 7]);
+        expect(rowMoveBlockForPress(block, 3)).toEqual({ start: 3, end: 6 });
+        expect(rowMoveBlockForPress(block, 6)).toEqual({ start: 3, end: 6 });
+        expect(rowMoveBlockForPress(block, 7)).toBeUndefined();
+        expect(rowMoveBlockForPress(block, 2)).toBeUndefined();
+        expect(rowMoveBlockForPress(CompactSelection.empty(), 0)).toBeUndefined();
+        expect(rowMoveBlockForPress(block.add(9), 4)).toBeUndefined();
+    });
+
+    test("lands before the hovered row in its upper half and after it in its lower half", () => {
+        expect(rowMoveDropBefore(4, 100, 100, 30)).toBe(4);
+        expect(rowMoveDropBefore(4, 114, 100, 30)).toBe(4);
+        expect(rowMoveDropBefore(4, 115, 100, 30)).toBe(5);
+        expect(rowMoveDropBefore(4, 129, 100, 30)).toBe(5);
+    });
+
+    test("treats a drop inside or beside the block as no move", () => {
+        const rows = { start: 3, end: 5 };
+        expect(rowMoveIsNoOp(rows, 2)).toBe(false);
+        expect(rowMoveIsNoOp(rows, 3)).toBe(true);
+        expect(rowMoveIsNoOp(rows, 6)).toBe(true);
+        expect(rowMoveIsNoOp(rows, 7)).toBe(false);
+    });
+
+    test("scrolls within one row height of the top or bottom edge", () => {
+        expect(rowMoveScrollDirection(10, 36, 600, 32)).toBe(-1);
+        expect(rowMoveScrollDirection(67, 36, 600, 32)).toBe(-1);
+        expect(rowMoveScrollDirection(68, 36, 600, 32)).toBe(0);
+        expect(rowMoveScrollDirection(568, 36, 600, 32)).toBe(0);
+        expect(rowMoveScrollDirection(569, 36, 600, 32)).toBe(1);
+        expect(rowMoveScrollDirection(700, 36, 600, 32)).toBe(1);
     });
 });

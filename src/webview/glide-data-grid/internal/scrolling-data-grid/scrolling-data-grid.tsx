@@ -378,6 +378,8 @@ const GridScroller: React.FunctionComponent<ScrollingDataGridProps> = p => {
                 onMouseDown={p.onMouseDown}
                 onMouseUp={p.onMouseUp}
                 onRowMoved={p.onRowMoved}
+                canMoveRows={p.canMoveRows}
+                onRowProposeMove={p.onRowProposeMove}
                 smoothScrollX={p.smoothScrollX}
                 smoothScrollY={p.smoothScrollY}
             />

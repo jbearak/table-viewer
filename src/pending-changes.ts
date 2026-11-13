@@ -38,6 +38,7 @@ import {
     has_live_row_layout_change,
     is_source_column_layout,
     is_source_row_layout,
+    moved_source_rows,
     validate_column_layout,
     validate_row_layout,
     type ColumnIdentity,
@@ -627,6 +628,19 @@ export function appended_rows(changes: PendingRowsHolder): readonly PendingAppen
 export function inserted_rows(changes: PendingRowsHolder): readonly PendingAppendedRow[] {
     const rows = pending_rows(changes);
     return rows.length === 0 ? EMPTY_PENDING_ROWS : split_pending_rows(rows).inserted;
+}
+
+/**
+ * Whether a worksheet holds a live Pending Inserted Row or a Moved Row. While
+ * it does, the display order must stay the layout's, so sorting, filtering,
+ * and hiding rows on it wait for Save or Discard.
+ */
+export function has_inserted_or_moved_rows(
+    changes: { readonly appendedRows?: readonly PendingAppendedRow[]; readonly rowLayout?: RowLayout } | undefined,
+): boolean {
+    if (inserted_rows(changes).length > 0) return true;
+    const layout = changes?.rowLayout;
+    return layout !== undefined && moved_source_rows(layout).length > 0;
 }
 
 /** The layout fields a release without structural editing must refuse. */

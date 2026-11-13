@@ -2,8 +2,10 @@ import { describe, expect, test } from "vitest";
 import type { MappedGridColumn } from "../internal/data-grid/render/data-grid-lib.js";
 import {
     blitResizedCol,
+    computeCanBlit,
     type BlitData,
 } from "../internal/data-grid/render/data-grid-render.blit.js";
+import type { DrawGridArg } from "../internal/data-grid/render/draw-grid-arg.js";
 
 const LAST: BlitData = {
     cellXOffset: 0,
@@ -72,5 +74,14 @@ describe("column-resize blitting", () => {
             columns,
             1,
         )).toEqual([{ x: 1, y: 0, width: 199, height: 300 }]);
+    });
+});
+
+describe("blitting after a draw callback change", () => {
+    test("redraws rather than reusing pixels painted by another drawCell", () => {
+        const columns = [column(0)];
+        const base = { width: 500, height: 300, mappedColumns: columns, drawCellCallback: undefined } as unknown as DrawGridArg;
+        expect(computeCanBlit({ ...base }, base)).not.toBe(false);
+        expect(computeCanBlit({ ...base, drawCellCallback: () => undefined } as DrawGridArg, base)).toBe(false);
     });
 });

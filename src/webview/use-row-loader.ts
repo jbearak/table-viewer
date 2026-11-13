@@ -8,6 +8,8 @@ export { RowLoader };
 
 export interface UseRowLoader {
     ensure_rows(start_row: number, end_row: number): void;
+    /** The visible range as several source-display intervals; see RowLoader. */
+    ensure_row_intervals(intervals: readonly { readonly start: number; readonly end: number }[]): void;
     /**
      * Load every page covering the range. Resolves `true` once all are resident,
      * or `false` if the cache is cleared mid-load (sheet switch/reload) so the
@@ -117,6 +119,11 @@ export function use_row_loader(
     useEffect(() => () => loader.clear(), [loader]);
 
     const ensure_rows = useCallback((s: number, en: number) => loader.ensure_rows(s, en), [loader]);
+    const ensure_row_intervals = useCallback(
+        (intervals: readonly { readonly start: number; readonly end: number }[]) =>
+            loader.ensure_row_intervals(intervals),
+        [loader],
+    );
     const ensure_rows_loaded = useCallback(
         (s: number, en: number) => loader.ensure_rows_loaded(s, en),
         [loader],
@@ -156,6 +163,7 @@ export function use_row_loader(
 
     return {
         ensure_rows,
+        ensure_row_intervals,
         ensure_rows_loaded,
         trim_rows,
         pin_rows,

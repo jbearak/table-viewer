@@ -255,6 +255,9 @@ export function computeCanBlit(current: DrawGridArg, last: DrawGridArg | undefin
         current.prelightCells !== last.prelightCells ||
         current.touchMode !== last.touchMode ||
         current.maxScaleFactor !== last.maxScaleFactor ||
+        // Fork addition: a new cell draw callback paints differently (a row
+        // move's drop indicator), so the old pixels cannot be reused.
+        current.drawCellCallback !== last.drawCellCallback ||
         // Fork addition: identity-stable via deep-memo at the editor layer, so
         // this only breaks blitting when the merge set actually changes.
         current.mergedCells !== last.mergedCells

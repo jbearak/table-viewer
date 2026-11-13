@@ -887,6 +887,8 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
         isDraggable,
         onDragLeave,
         onRowMoved,
+        canMoveRows,
+        onRowProposeMove,
         overscrollX: overscrollXIn,
         overscrollY: overscrollYIn,
         preventDiagonalScrolling,
@@ -1420,7 +1422,9 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
                     row: getRowMarkerNumber === undefined
                         ? rowMarkerStartIndex + row
                         : getRowMarkerNumber(row),
-                    drawHandle: onRowMoved !== undefined,
+                    // Fork change: a row move starts from a press inside the
+                    // selected block, so markers keep their plain look.
+                    drawHandle: false,
                     cursor: rowMarkers === "clickable-number" ? "pointer" : undefined,
                 };
             } else if (isTrailing) {
@@ -1923,20 +1927,10 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
                         return;
                     }
 
-                    if (onRowMoved !== undefined) {
-                        const renderer = getCellRenderer(markerCell);
-                        assert(renderer?.kind === InnerGridCellKind.Marker);
-                        const postClick = renderer?.onClick?.({
-                            ...args,
-                            cell: markerCell,
-                            posX: args.localEventX,
-                            posY: args.localEventY,
-                            bounds: args.bounds,
-                            theme: themeForCell(markerCell, args.location),
-                            preventDefault: () => undefined,
-                        }) as MarkerCell | undefined;
-                        if (postClick === undefined || postClick.checked === markerCell.checked) return;
-                    }
+                    // Fork change: upstream made a marker select only through
+                    // its checkbox once rows could move; here a marker press
+                    // selects as it always has, and the drag layer arms a move
+                    // only for a press inside the selected block.
 
                     setOverlay(undefined);
                     focus();
@@ -4494,6 +4488,8 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
                     isDraggable={isDraggable}
                     onDragLeave={onDragLeave}
                     onRowMoved={onRowMoved}
+                    canMoveRows={canMoveRows}
+                    onRowProposeMove={onRowProposeMove}
                     overscrollX={overscrollX}
                     overscrollY={overscrollY}
                     preventDiagonalScrolling={preventDiagonalScrolling}

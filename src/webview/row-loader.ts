@@ -89,7 +89,11 @@ export class RowLoader {
     private sheet_index = 0;
     private row_count = 0;
     private req_seq = 0;
-    private viewport = { start: 0, end: 0 };
+    /**
+     * The inclusive source-display ranges the grid shows: usually one, more
+     * when moved rows put far-apart source rows on screen together.
+     */
+    private viewport: readonly { readonly start: number; readonly end: number }[] = [{ start: 0, end: 0 }];
     private viewport_set = false;
     private enabled = true;
     private page_size = PAGE_SIZE;
@@ -186,13 +190,22 @@ export class RowLoader {
             this.clear();
         }
         if (source_changed && this.viewport_set && enabled) {
-            this.ensure_rows(this.viewport.start, this.viewport.end);
+            this.ensure_row_intervals(this.viewport);
         }
     }
 
     /** Request any not-yet-resident pages covering the inclusive visible range. */
     ensure_rows(start_row: number, end_row: number): void {
-        this.viewport = { start: start_row, end: end_row };
+        this.ensure_row_intervals([{ start: start_row, end: end_row }]);
+    }
+
+    /**
+     * Like {@link ensure_rows} for a visible range whose source-display rows
+     * form several intervals: only their pages are requested and protected,
+     * not the rows between them.
+     */
+    ensure_row_intervals(intervals: readonly { readonly start: number; readonly end: number }[]): void {
+        this.viewport = intervals.map(({ start, end }) => ({ start, end }));
         this.viewport_set = true;
         if (!this.enabled || this.row_count <= 0) return;
         this.pump_requests();
@@ -238,7 +251,7 @@ export class RowLoader {
     private pump_requests(): void {
         if (!this.enabled || this.row_count <= 0) return;
         if (this.viewport_set) {
-            this.request_missing_pages(this.viewport.start, this.viewport.end);
+            for (const interval of this.viewport) this.request_missing_pages(interval.start, interval.end);
         }
         for (const waiter of this.load_waiters) {
             if (this.pending.size >= MAX_PENDING_PAGE_REQUESTS) return;
@@ -586,11 +599,8 @@ export class RowLoader {
                 : this.max_pages,
         );
         if (this.pages.size <= effective_max_pages) return;
-        const protect = new Set(
-            get_needed_page_starts(
-                this.viewport.start, this.viewport.end, this.page_size,
-            ),
-        );
+        const protect = new Set(this.viewport.flatMap((interval) =>
+            get_needed_page_starts(interval.start, interval.end, this.page_size)));
         // Each outstanding bulk copy load may hold far more than the cap
         // resident; never evict the pages any of them is still assembling.
         // Protecting per waiter (rather than one merged envelope) keeps the gap

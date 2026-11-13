@@ -5093,37 +5093,340 @@ a new line char ""more quotes"" plus a tab  ."	https://google.com`)
         cancelAnimationFrame.mockRestore();
     });
 
-    test("Drag reorder row", async () => {
-        const spy = vi.fn();
-        vi.useFakeTimers();
-        render(<EventedDataEditor {...basicProps} rowMarkers="number" onRowMoved={spy} />, {
-            wrapper: Context,
-        });
-        prep();
-        const canvas = screen.getByTestId("data-grid-canvas");
-
-        fireEvent.mouseDown(canvas, {
-            clientX: 10, // Col B Right Edge
-            clientY: 300, // Header
+    // Fork change: a marker drag moves rows only when the press lands inside
+    // the current contiguous row selection, and moves that whole block.
+    describe("row move", () => {
+        const blockSelection = (start: number, end: number): GridSelection => ({
+            columns: CompactSelection.empty(),
+            rows: CompactSelection.fromSingleSelection([start, end + 1]),
+            current: undefined,
         });
 
-        fireEvent.mouseMove(canvas, {
-            clientX: 10,
-            clientY: 400,
-            buttons: 1,
+        /** Press a row marker at `fromY`, move to `toY`, release, and click: one marker gesture. */
+        function markerGesture(canvas: HTMLElement, fromY: number, toY: number, press: Partial<MouseEventInit> = {}) {
+            fireEvent.mouseDown(canvas, { clientX: 10, clientY: fromY, ...press });
+            fireEvent.mouseMove(canvas, { clientX: 10, clientY: toY, buttons: 1, ...press });
+            fireEvent.mouseUp(canvas, { clientX: 10, clientY: toY, ...press });
+            fireEvent.click(canvas, { clientX: 10, clientY: toY, ...press });
+        }
+
+        /** Selection changes and clicks a gesture reports, with or without row moves wired. */
+        function recordGesture(
+            withRowMove: boolean,
+            selection: GridSelection | undefined,
+            fromY: number,
+            toY: number,
+            press: Partial<MouseEventInit> = {}
+        ) {
+            const selections = vi.fn();
+            const clicks = vi.fn();
+            const moved = vi.fn();
+            vi.useFakeTimers();
+            const view = render(
+                <EventedDataEditor
+                    {...basicProps}
+                    rowMarkers="clickable-number"
+                    gridSelection={selection}
+                    onGridSelectionChange={selections}
+                    onCellClicked={(cell: Item) => clicks(cell)}
+                    onRowMoved={withRowMove ? moved : undefined}
+                />,
+                { wrapper: Context }
+            );
+            prep();
+            markerGesture(screen.getByTestId("data-grid-canvas"), fromY, toY, press);
+            view.unmount();
+            return {
+                selections: selections.mock.calls.map(([s]) => [
+                    [...(s as GridSelection).rows],
+                    (s as GridSelection).current?.cell,
+                ]),
+                clicks: clicks.mock.calls,
+                moved: moved.mock.calls,
+            };
+        }
+
+        test("moves the whole selected block when the press is inside it", () => {
+            const moved = vi.fn();
+            vi.useFakeTimers();
+            render(
+                <EventedDataEditor
+                    {...basicProps}
+                    rowMarkers="clickable-number"
+                    gridSelection={blockSelection(5, 9)}
+                    onRowMoved={moved}
+                />,
+                { wrapper: Context }
+            );
+            prep();
+            // Row 8's marker, released in the upper half of row 11.
+            markerGesture(screen.getByTestId("data-grid-canvas"), 300, 400);
+            expect(moved).toHaveBeenCalledTimes(1);
+            expect(moved).toHaveBeenCalledWith({ start: 5, end: 9 }, 11);
         });
 
-        fireEvent.mouseUp(canvas, {
-            clientX: 10,
-            clientY: 400,
+        test("lands after the row whose lower half the pointer is over", () => {
+            const moved = vi.fn();
+            vi.useFakeTimers();
+            render(
+                <EventedDataEditor
+                    {...basicProps}
+                    rowMarkers="clickable-number"
+                    gridSelection={blockSelection(5, 9)}
+                    onRowMoved={moved}
+                />,
+                { wrapper: Context }
+            );
+            prep();
+            // Row 1 spans y 68..100; y 95 is its lower half, so the block lands before row 2.
+            markerGesture(screen.getByTestId("data-grid-canvas"), 300, 95);
+            expect(moved).toHaveBeenCalledWith({ start: 5, end: 9 }, 2);
         });
 
-        fireEvent.click(canvas, {
-            clientX: 10,
-            clientY: 400,
+        test("keeps drag-to-select from an unselected marker exactly as without row moves", () => {
+            const plain = recordGesture(false, blockSelection(5, 9), 500, 600);
+            const wired = recordGesture(true, blockSelection(5, 9), 500, 600);
+            expect(wired.moved).toEqual([]);
+            expect(wired.selections).toEqual(plain.selections);
+            expect(wired.clicks).toEqual(plain.clicks);
+            expect(plain.selections.length).toBeGreaterThan(0);
         });
 
-        expect(spy).toBeCalledWith(8, 11);
+        test("replays a press inside the block that never moves as an ordinary marker click", () => {
+            const plain = recordGesture(false, blockSelection(5, 9), 300, 305);
+            const wired = recordGesture(true, blockSelection(5, 9), 300, 305);
+            expect(wired.moved).toEqual([]);
+            expect(wired.selections).toEqual(plain.selections);
+            expect(wired.clicks).toEqual(plain.clicks);
+            expect(plain.selections).toEqual([[[8], undefined]]);
+        });
+
+        test("keeps a modified press inside the block an ordinary press", () => {
+            const plain = recordGesture(false, blockSelection(5, 9), 300, 400, { shiftKey: true });
+            const wired = recordGesture(true, blockSelection(5, 9), 300, 400, { shiftKey: true });
+            expect(wired.moved).toEqual([]);
+            expect(wired.selections).toEqual(plain.selections);
+        });
+
+        test("does not arm for a selection that is not one interval", () => {
+            const selection: GridSelection = {
+                columns: CompactSelection.empty(),
+                rows: CompactSelection.fromSingleSelection([5, 7]).add([8, 10]),
+                current: undefined,
+            };
+            const plain = recordGesture(false, selection, 300, 400);
+            const wired = recordGesture(true, selection, 300, 400);
+            expect(wired.moved).toEqual([]);
+            expect(wired.selections).toEqual(plain.selections);
+        });
+
+        test("does not arm when canMoveRows refuses the block", () => {
+            const moved = vi.fn();
+            const selections = vi.fn();
+            vi.useFakeTimers();
+            render(
+                <EventedDataEditor
+                    {...basicProps}
+                    rowMarkers="clickable-number"
+                    gridSelection={blockSelection(5, 9)}
+                    onGridSelectionChange={selections}
+                    canMoveRows={() => false}
+                    onRowMoved={moved}
+                />,
+                { wrapper: Context }
+            );
+            prep();
+            markerGesture(screen.getByTestId("data-grid-canvas"), 300, 400);
+            expect(moved).not.toHaveBeenCalled();
+            expect(selections).toHaveBeenCalled();
+        });
+
+        test("refuses a drop the proposal rejects, with the not-allowed cursor", async () => {
+            const moved = vi.fn();
+            const propose = vi.fn((_rows: { start: number; end: number }, before: number) => before !== 11);
+            vi.useFakeTimers();
+            render(
+                <EventedDataEditor
+                    {...basicProps}
+                    rowMarkers="clickable-number"
+                    gridSelection={blockSelection(5, 9)}
+                    onRowMoved={moved}
+                    onRowProposeMove={propose}
+                />,
+                { wrapper: Context }
+            );
+            prep();
+            const canvas = screen.getByTestId("data-grid-canvas");
+            fireEvent.mouseDown(canvas, { clientX: 10, clientY: 300 });
+            fireEvent.mouseMove(canvas, { clientX: 10, clientY: 400, buttons: 1 });
+            expect(propose).toHaveBeenCalledWith({ start: 5, end: 9 }, 11);
+            await vi.waitFor(() => expect(canvas.style.cursor).toBe("not-allowed"));
+            fireEvent.mouseMove(canvas, { clientX: 10, clientY: 470, buttons: 1 });
+            await vi.waitFor(() => expect(canvas.style.cursor).toBe("grabbing"));
+            fireEvent.mouseMove(canvas, { clientX: 10, clientY: 400, buttons: 1 });
+            fireEvent.mouseUp(canvas, { clientX: 10, clientY: 400 });
+            expect(moved).not.toHaveBeenCalled();
+        });
+
+        test("proposes -1 over the header", () => {
+            const propose = vi.fn(() => true);
+            const moved = vi.fn();
+            vi.useFakeTimers();
+            render(
+                <EventedDataEditor
+                    {...basicProps}
+                    rowMarkers="clickable-number"
+                    gridSelection={blockSelection(5, 9)}
+                    onRowMoved={moved}
+                    onRowProposeMove={propose}
+                />,
+                { wrapper: Context }
+            );
+            prep();
+            markerGesture(screen.getByTestId("data-grid-canvas"), 300, 20);
+            expect(propose).toHaveBeenLastCalledWith({ start: 5, end: 9 }, -1);
+            expect(moved).toHaveBeenCalledWith({ start: 5, end: 9 }, -1);
+        });
+
+        test("drops nothing for a move that leaves the block in place", () => {
+            const moved = vi.fn();
+            vi.useFakeTimers();
+            render(
+                <EventedDataEditor
+                    {...basicProps}
+                    rowMarkers="clickable-number"
+                    gridSelection={blockSelection(5, 9)}
+                    onRowMoved={moved}
+                />,
+                { wrapper: Context }
+            );
+            prep();
+            // Row 5's marker, released over row 9's upper half: still inside the block.
+            markerGesture(screen.getByTestId("data-grid-canvas"), 200, 330);
+            expect(moved).not.toHaveBeenCalled();
+        });
+
+        test("lands at the end, not on the trailing append row, when dropped over it", () => {
+            const moved = vi.fn();
+            vi.useFakeTimers();
+            render(
+                <EventedDataEditor
+                    {...basicProps}
+                    rows={12}
+                    rowMarkers="clickable-number"
+                    gridSelection={blockSelection(5, 9)}
+                    onRowMoved={moved}
+                />,
+                { wrapper: Context }
+            );
+            prep();
+            // Rows 0-11 end at y 420; the trailing append row follows them.
+            markerGesture(screen.getByTestId("data-grid-canvas"), 300, 440);
+            expect(moved).toHaveBeenCalledWith({ start: 5, end: 9 }, 12);
+        });
+
+        test("targets the visible bottom edge, not the worksheet end, while rows remain below", () => {
+            // 1,000 rows under a sticky append row (y 968-1000): row 29
+            // (y 964-996) is the bottom edge of the visible data rows.
+            for (const releaseY of [1100, 985]) {
+                const moved = vi.fn();
+                vi.useFakeTimers();
+                const view = render(
+                    <EventedDataEditor
+                        {...basicProps}
+                        rowMarkers="clickable-number"
+                        gridSelection={blockSelection(5, 9)}
+                        onRowMoved={moved}
+                    />,
+                    { wrapper: Context }
+                );
+                prep();
+                markerGesture(screen.getByTestId("data-grid-canvas"), 300, releaseY);
+                expect(moved).toHaveBeenCalledWith({ start: 5, end: 9 }, 29);
+                view.unmount();
+            }
+        });
+
+        test("lands at the end when the last row ends exactly at the visible bottom edge", () => {
+            // Header 40 + 31 rows of 30 end at y 970, the sticky append row's top.
+            const moved = vi.fn();
+            vi.useFakeTimers();
+            render(
+                <EventedDataEditor
+                    {...basicProps}
+                    rows={31}
+                    headerHeight={40}
+                    rowHeight={30}
+                    rowMarkers="clickable-number"
+                    gridSelection={blockSelection(5, 9)}
+                    onRowMoved={moved}
+                />,
+                { wrapper: Context }
+            );
+            prep();
+            markerGesture(screen.getByTestId("data-grid-canvas"), 300, 1100);
+            expect(moved).toHaveBeenCalledWith({ start: 5, end: 9 }, 31);
+        });
+
+        test("finds the bottom edge from the visible rows, not from a far-away target", async () => {
+            const moved = vi.fn();
+            const propose = vi.fn(() => true);
+            vi.useFakeTimers();
+            render(
+                <EventedDataEditor
+                    {...basicProps}
+                    rowMarkers="clickable-number"
+                    gridSelection={blockSelection(940, 944)}
+                    onRowMoved={moved}
+                    onRowProposeMove={propose}
+                />,
+                { wrapper: Context }
+            );
+            const scroller = prep();
+            // Scroll so row 937 is the first visible row (30,000 px down).
+            if (scroller !== null) {
+                vi.spyOn(scroller, "scrollHeight", "get").mockImplementation(() => 1000 * 32 + 36);
+                vi.spyOn(scroller, "scrollTop", "get").mockImplementation(() => 30_000);
+                fireEvent.scroll(scroller);
+            }
+            await drainEventLoop();
+            const canvas = screen.getByTestId("data-grid-canvas");
+            const measured = vi.spyOn(Element.prototype, "getBoundingClientRect");
+            // Row 942, then over the header (a -1 target), then below the grid.
+            fireEvent.mouseDown(canvas, { clientX: 10, clientY: 36 + 5 * 32 });
+            fireEvent.mouseMove(canvas, { clientX: 10, clientY: 20, buttons: 1 });
+            expect(propose).toHaveBeenLastCalledWith({ start: 940, end: 944 }, -1);
+            measured.mockClear();
+            fireEvent.mouseMove(canvas, { clientX: 10, clientY: 1100, buttons: 1 });
+            // One walk across the visible rows at most, not across the 937 above them.
+            expect(measured.mock.calls.length).toBeLessThan(100);
+            fireEvent.mouseUp(canvas, { clientX: 10, clientY: 1100 });
+            const before = moved.mock.calls[0]?.[1] as number;
+            expect(before).toBeGreaterThan(960);
+            expect(before).toBeLessThan(970);
+            measured.mockRestore();
+        });
+
+        test("Escape abandons an active move", () => {
+            const moved = vi.fn();
+            vi.useFakeTimers();
+            render(
+                <EventedDataEditor
+                    {...basicProps}
+                    rowMarkers="clickable-number"
+                    gridSelection={blockSelection(5, 9)}
+                    onRowMoved={moved}
+                />,
+                { wrapper: Context }
+            );
+            prep();
+            const canvas = screen.getByTestId("data-grid-canvas");
+            fireEvent.mouseDown(canvas, { clientX: 10, clientY: 300 });
+            fireEvent.mouseMove(canvas, { clientX: 10, clientY: 400, buttons: 1 });
+            fireEvent.keyDown(window, { key: "Escape" });
+            fireEvent.mouseUp(canvas, { clientX: 10, clientY: 400 });
+            expect(moved).not.toHaveBeenCalled();
+        });
     });
 
     test("Select range with mouse", async () => {

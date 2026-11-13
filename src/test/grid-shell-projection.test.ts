@@ -134,6 +134,7 @@ const grid_mock = vi.hoisted(() => ({
     // durable edit-key row space is non-vacuous.
     source_row_for_display: null as null | ((display_row: number) => number | undefined),
     ensure_rows: vi.fn(),
+    ensure_row_intervals: vi.fn(),
     ensure_rows_loaded: vi.fn(async (_start?: number, _end?: number) => true),
     trim_rows: vi.fn(),
     // Eviction holds. Recorded rather than simulated: what the loader does with a
@@ -223,6 +224,7 @@ vi.mock('../webview/use-row-loader', () => ({
         grid_mock.loader_enabled.push(enabled);
         return {
             ensure_rows: grid_mock.ensure_rows,
+            ensure_row_intervals: grid_mock.ensure_row_intervals,
             ensure_rows_loaded: grid_mock.ensure_rows_loaded,
             trim_rows: grid_mock.trim_rows,
             pin_rows: grid_mock.pin_rows,
@@ -413,6 +415,7 @@ afterEach(() => {
         x: 30, y: 10, width: 100, height: 36,
     }));
     grid_mock.ensure_rows.mockReset();
+    grid_mock.ensure_row_intervals.mockReset();
     grid_mock.ensure_rows_loaded.mockReset();
     grid_mock.ensure_rows_loaded.mockImplementation(async () => true);
     grid_mock.trim_rows.mockReset();
@@ -671,13 +674,13 @@ describe('GridShell cell wrapping', () => {
             row_heights: { 2: 48 },
         }));
 
-        grid_mock.ensure_rows.mockClear();
+        grid_mock.ensure_row_intervals.mockClear();
         const on_visible = grid_mock.props!.onVisibleRegionChanged as (
             range: { x: number; y: number; width: number; height: number },
         ) => void;
         act(() => on_visible({ x: 0, y: 1, width: 2, height: 2 }));
         // Compressed rows 1–2 are raw source-display rows 2–3, not 1–2.
-        expect(grid_mock.ensure_rows).toHaveBeenCalledWith(2, 3);
+        expect(grid_mock.ensure_row_intervals).toHaveBeenCalledWith([{ start: 2, end: 3 }]);
         const row_height = grid_mock.props!.rowHeight as (row: number) => number;
         expect(row_height(1)).toBe(48);
     });
@@ -4418,6 +4421,7 @@ describe('GridShell column projection', () => {
         expect(container!.querySelector('.data-editor-stub')).toBeNull();
         expect(grid_mock.loader_enabled.at(-1)).toBe(false);
         expect(grid_mock.ensure_rows).not.toHaveBeenCalled();
+        expect(grid_mock.ensure_row_intervals).not.toHaveBeenCalled();
     });
 
     it('renders a recoverable all-hidden status without grid overlays or row requests', async () => {
@@ -4440,6 +4444,7 @@ describe('GridShell column projection', () => {
         expect(container!.querySelector('.row-resize-overlay-stub')).toBeNull();
         expect(grid_mock.loader_enabled.at(-1)).toBe(false);
         expect(grid_mock.ensure_rows).not.toHaveBeenCalled();
+        expect(grid_mock.ensure_row_intervals).not.toHaveBeenCalled();
         expect(editing_ref.current?.has_uncommitted_changes()).toBe(true);
 
         await act(async () => {
@@ -4452,7 +4457,7 @@ describe('GridShell column projection', () => {
         });
         expect(container!.querySelector('.data-editor-stub')).not.toBeNull();
         expect(grid_mock.loader_enabled.at(-1)).toBe(true);
-        expect(grid_mock.ensure_rows).toHaveBeenCalledWith(0, 0);
+        expect(grid_mock.ensure_row_intervals).toHaveBeenCalledWith([{ start: 0, end: 0 }]);
         expect(editing_ref.current?.has_uncommitted_changes()).toBe(true);
     });
 });
@@ -9154,5 +9159,313 @@ describe('row Insert in the row-gutter menu', () => {
         expect(sort.getAttribute('aria-description')).toBe(reason);
         await act(async () => sort.click());
         expect(on_transform_change).not.toHaveBeenCalled();
+    });
+});
+
+describe('row Move by menu, shortcut, and drag', () => {
+    const basis = {
+        kind: 'delimited' as const,
+        byteLength: 10,
+        digest: 'digest',
+        sourceRowCount: 4,
+        sourceColumnCount: 3,
+    };
+    const supported = {
+        rows: { supported: true as const },
+        columns: { supported: true as const },
+        basis,
+    };
+    const structure_props = (overrides: Partial<GridShellProps> = {}) => props({
+        sheet_meta: { ...props().sheet_meta, rowCount: 4, sourceRowCount: 4 },
+        row_count: 4,
+        edit_mode: true,
+        csv_editable: true,
+        edit_session_id: 'session',
+        transform_sections: true,
+        structural_support: supported,
+        ...overrides,
+    });
+    const open_row_menu = async (row: number) => {
+        const on_cell_context_menu = grid_mock.props!.onCellContextMenu as
+            (cell: [number, number], event: Record<string, unknown>) => void;
+        await act(async () => on_cell_context_menu([-1, row], {
+            preventDefault: vi.fn(),
+            bounds: { x: 0, y: 24 * (row + 1), width: 40, height: 24 },
+            localEventX: 10,
+            localEventY: 10,
+        }));
+    };
+    const menu_item = (label: string) => Array.from(document.querySelectorAll('button'))
+        .find((candidate) => candidate.textContent === label);
+    const announcement = () =>
+        document.querySelector('[data-testid="structure-announcement"]')?.textContent?.trim();
+    const selected_rows = () => [...(grid_mock.props!.gridSelection as { rows: Iterable<number> }).rows];
+    const select_rows = async (rows: number[]) => {
+        const on_selection_change = grid_mock.props!.onGridSelectionChange as (selection: unknown) => void;
+        await act(async () => on_selection_change({ columns: compact([]), rows: compact(rows) }));
+    };
+    const key = (key: string, overrides: Record<string, unknown> = {}) => ({
+        key,
+        altKey: true,
+        shiftKey: true,
+        ctrlKey: false,
+        metaKey: false,
+        rawEvent: { code: key, target: document.createElement('canvas') },
+        cancel: vi.fn(),
+        preventDefault: vi.fn(),
+        ...overrides,
+    });
+    const render_moves = async (overrides: Partial<GridShellProps> = {}) => {
+        const pending = create_pending_row_store({ session_id: 'session' });
+        const history = create_history_store();
+        await render_grid(structure_props({
+            edit_session: create_edit_session_store({ session_id: 'session' }),
+            pending_row_store: pending,
+            history_store: history,
+            ...overrides,
+        }));
+        return { pending, history };
+    };
+
+    it('moves a row down from the menu: one action, tinted, labelled, announced, and followed', async () => {
+        const { pending, history } = await render_moves();
+        await open_row_menu(1);
+        expect(menu_button_labels()).toEqual(expect.arrayContaining(['Move rows up', 'Move rows down']));
+        await act(async () => menu_item('Move rows down')!.click());
+        expect(pending.snapshot().rowLayout?.runs).toEqual([
+            { kind: 'source', start: 0, count: 1 },
+            { kind: 'source', start: 2, count: 1 },
+            { kind: 'source', start: 1, count: 1 },
+            { kind: 'source', start: 3, count: 1 },
+        ]);
+        expect(pending.snapshot().structuralBasis).toEqual(basis);
+        const undo = peek_history(history.snapshot(), 'undo');
+        if (undo.kind !== 'available') throw new Error('nothing recorded');
+        expect(undo.entry.action.label).toBe('Move row');
+        expect(undo.entry.action.changes.map((change) => change.kind)).toEqual(['rowLayout']);
+        expect(announcement()).toBe('Moved 1 row down');
+        // The moved row carries the moved tint and names where it came from.
+        const label = grid_mock.props!.getRowAccessibilityLabel as (row: number) => string | undefined;
+        expect(label(2)).toBe('Row 3, moved from row 2');
+        expect(label(1)).toBeUndefined();
+        const get_cell_content = grid_mock.props!.getCellContent as (cell: [number, number]) => {
+            allowOverlay?: boolean;
+            themeOverride?: { bgCell?: string };
+        };
+        expect(get_cell_content([0, 2]).themeOverride?.bgCell).toBeDefined();
+        expect(get_cell_content([0, 2]).allowOverlay).toBe(true);
+        expect(get_cell_content([0, 1]).themeOverride?.bgCell).toBeUndefined();
+        const get_row_number = (grid_mock.props!.rowMarkers as {
+            getRowNumber(row: number): number | undefined;
+        }).getRowNumber;
+        expect([0, 1, 2, 3].map(get_row_number)).toEqual([1, 2, 3, 4]);
+        // The selection follows the moved row, by polling.
+        await vi.waitFor(() => expect(grid_mock.scroll_to).toHaveBeenLastCalledWith(0, 2, 'vertical'));
+        expect(selected_rows()).toEqual([2]);
+    });
+
+    it('shows Move disabled with the reason at the ends of the body', async () => {
+        await render_moves();
+        await open_row_menu(0);
+        const up = menu_item('Move rows up')!;
+        expect(up.getAttribute('aria-disabled')).toBe('true');
+        expect(up.getAttribute('aria-description')).toBe('The selected rows are already at the top.');
+        expect(menu_item('Move rows down')?.getAttribute('aria-disabled')).toBeNull();
+    });
+
+    it('disables sort, filter, and hide while moved rows exist', async () => {
+        await render_moves();
+        await open_row_menu(1);
+        await act(async () => menu_item('Move rows down')!.click());
+        await open_row_menu(0);
+        const hide = menu_item('Hide row')!;
+        expect(hide.getAttribute('aria-disabled')).toBe('true');
+        expect(hide.getAttribute('aria-description'))
+            .toBe('Save or discard inserted and moved rows to sort, filter, or hide rows.');
+    });
+
+    it('moves whole selected rows with Alt+Shift+Up and Down, and announces why it cannot', async () => {
+        const { pending, history } = await render_moves();
+        const on_key_down = grid_mock.props!.onKeyDown as (args: Record<string, unknown>) => void;
+        await select_rows([1, 2]);
+        const down = key('ArrowDown');
+        await act(async () => on_key_down(down));
+        expect(down.cancel).toHaveBeenCalled();
+        expect(down.preventDefault).toHaveBeenCalled();
+        expect(pending.snapshot().rowLayout?.runs).toEqual([
+            { kind: 'source', start: 0, count: 1 },
+            { kind: 'source', start: 3, count: 1 },
+            { kind: 'source', start: 1, count: 2 },
+        ]);
+        expect(announcement()).toBe('Moved 2 rows down');
+        const undo = peek_history(history.snapshot(), 'undo');
+        if (undo.kind !== 'available') throw new Error('nothing recorded');
+        expect(undo.entry.action.label).toBe('Move 2 rows');
+        await vi.waitFor(() => expect(selected_rows()).toEqual([2, 3]));
+        // At the bottom: nothing moves, and the live region says why.
+        const again = key('ArrowDown');
+        await act(async () => on_key_down(again));
+        expect(again.cancel).toHaveBeenCalled();
+        expect(announcement()).toBe('The selected rows are already at the bottom.');
+        const up = key('ArrowUp');
+        await act(async () => on_key_down(up));
+        expect(pending.snapshot().rowLayout).toBeUndefined();
+        expect(announcement()).toBe('Moved 2 rows up');
+    });
+
+    it('leaves Alt+Shift+arrows alone without a whole-row selection, in an editor, or outside Edit mode', async () => {
+        const { pending } = await render_moves();
+        const on_key_down = grid_mock.props!.onKeyDown as (args: Record<string, unknown>) => void;
+        const on_selection_change = grid_mock.props!.onGridSelectionChange as (selection: unknown) => void;
+        await act(async () => on_selection_change({
+            columns: compact([]),
+            rows: compact([]),
+            current: { cell: [0, 1], range: { x: 0, y: 1, width: 1, height: 1 }, rangeStack: [] },
+        }));
+        const cell = key('ArrowDown');
+        await act(async () => on_key_down(cell));
+        expect(cell.cancel).not.toHaveBeenCalled();
+        await select_rows([1]);
+        const typing = key('ArrowDown', { rawEvent: { code: 'ArrowDown', target: document.createElement('input') } });
+        await act(async () => on_key_down(typing));
+        expect(typing.cancel).not.toHaveBeenCalled();
+        const shift_only = key('ArrowDown', { altKey: false });
+        await act(async () => on_key_down(shift_only));
+        expect(pending.snapshot().rowLayout).toBeUndefined();
+    });
+
+    it('wires row drags only where structure items are offered', async () => {
+        await render_grid(structure_props({ structural_support: undefined }));
+        expect(grid_mock.props!.onRowMoved).toBeUndefined();
+        await render_grid(structure_props({ edit_mode: false }));
+        expect(grid_mock.props!.onRowMoved).toBeUndefined();
+    });
+
+    it('drags a selected block: arms, proposes each drop, and moves on release', async () => {
+        const pending = create_pending_row_store({ session_id: 'session' });
+        pending.append_rows('session', ['band-a'], { id: 'plain', format: { kind: 'none' } }, 1);
+        await render_grid(structure_props({
+            edit_session: create_edit_session_store({ session_id: 'session' }),
+            pending_row_store: pending,
+            history_store: create_history_store(),
+        }));
+        type Block = { start: number; end: number };
+        const can_move = grid_mock.props!.canMoveRows as (rows: Block) => boolean;
+        const propose = grid_mock.props!.onRowProposeMove as (rows: Block, before: number) => boolean;
+        expect(can_move({ start: 1, end: 2 })).toBe(true);
+        // Appended rows stay where Append put them.
+        expect(can_move({ start: 3, end: 4 })).toBe(false);
+        expect(can_move({ start: 4, end: 4 })).toBe(false);
+        // Over the column header, which is above every body row.
+        expect(propose({ start: 1, end: 2 }, -1)).toBe(false);
+        expect(propose({ start: 1, end: 2 }, 0)).toBe(true);
+        // Inside or after the band resolves to just before it.
+        expect(propose({ start: 1, end: 2 }, 5)).toBe(true);
+        const on_row_moved = grid_mock.props!.onRowMoved as (rows: Block, before: number) => void;
+        await act(async () => on_row_moved({ start: 1, end: 2 }, 5));
+        expect(pending.snapshot().rowLayout?.runs).toEqual([
+            { kind: 'source', start: 0, count: 1 },
+            { kind: 'source', start: 3, count: 1 },
+            { kind: 'source', start: 1, count: 2 },
+        ]);
+        expect(pending.snapshot().appendedRows.map((row) => row.id)).toEqual(['band-a']);
+        expect(announcement()).toBe('Moved 2 rows down');
+        await vi.waitFor(() => expect(selected_rows()).toEqual([2, 3]));
+        // Back to the top.
+        await act(async () => on_row_moved({ start: 2, end: 3 }, 0));
+        expect(pending.snapshot().rowLayout?.runs).toEqual([
+            { kind: 'source', start: 1, count: 2 },
+            { kind: 'source', start: 0, count: 1 },
+            { kind: 'source', start: 3, count: 1 },
+        ]);
+        expect(announcement()).toBe('Moved 2 rows up');
+        await vi.waitFor(() => expect(selected_rows()).toEqual([0, 1]));
+    });
+
+    describe('loading rows a move brought on screen', () => {
+        // Ten source rows; source row 9 is moved to the top, so display rows
+        // 0-2 show source-display rows 9, 0, and 1.
+        const render_moved = async (overrides: Partial<GridShellProps> = {}) => {
+            const pending = create_pending_row_store({ session_id: 'session' });
+            await render_grid(structure_props({
+                row_count: 10,
+                sheet_meta: { ...props().sheet_meta, rowCount: 10, sourceRowCount: 10 },
+                structural_support: { ...supported, basis: { ...basis, sourceRowCount: 10 } },
+                edit_session: create_edit_session_store({ session_id: 'session' }),
+                pending_row_store: pending,
+                ...overrides,
+            }));
+            const on_row_moved = grid_mock.props!.onRowMoved as (rows: { start: number; end: number }, before: number) => void;
+            await act(async () => on_row_moved({ start: 9, end: 9 }, 0));
+            expect(pending.snapshot().rowLayout?.runs).toEqual([
+                { kind: 'source', start: 9, count: 1 },
+                { kind: 'source', start: 0, count: 9 },
+            ]);
+        };
+
+        it('loads the source rows behind the visible rows, not the span between them', async () => {
+            await render_moved();
+            grid_mock.ensure_rows.mockClear();
+            grid_mock.ensure_row_intervals.mockClear();
+            const on_visible = grid_mock.props!.onVisibleRegionChanged as (range: Record<string, number>) => void;
+            await act(async () => on_visible({ x: 0, y: 0, width: 2, height: 3 }));
+            expect(grid_mock.ensure_row_intervals).toHaveBeenLastCalledWith([
+                { start: 0, end: 1 },
+                { start: 9, end: 9 },
+            ]);
+            expect(grid_mock.ensure_rows).not.toHaveBeenCalled();
+        });
+
+        it('loads and pins the source rows behind a capped whole-sheet copy', async () => {
+            const write_text = vi.fn(async (_text: string) => {});
+            Object.defineProperty(navigator, 'clipboard', {
+                configurable: true,
+                value: { writeText: write_text },
+            });
+            const grid_actions_ref = React.createRef<
+                import('../webview/grid-shell').GridActionsHandle | null
+            >() as React.MutableRefObject<import('../webview/grid-shell').GridActionsHandle | null>;
+            // A 3-row copy cap: 32 MiB of source bytes at 10 MiB a row.
+            await render_moved({
+                sheet_meta: {
+                    ...props().sheet_meta,
+                    rowCount: 10,
+                    sourceRowCount: 10,
+                    estimatedRowBytes: 10 * 1024 * 1024,
+                },
+                grid_actions_ref,
+            });
+            grid_mock.ensure_rows_loaded.mockClear();
+            grid_mock.pin_rows.mockClear();
+            await act(async () => { await grid_actions_ref.current!.copy_sheet(); });
+            const loaded = grid_mock.ensure_rows_loaded.mock.calls.map(([start, end]) => [start, end]);
+            expect(loaded).toEqual([[0, 1], [9, 9]]);
+            expect(grid_mock.pin_rows.mock.calls.map(([start, end]) => [start, end])).toEqual([[0, 1], [9, 9]]);
+            expect(grid_mock.unpin_rows).toHaveBeenCalledTimes(2);
+            expect(write_text).toHaveBeenCalledTimes(1);
+        });
+    });
+
+    it('refuses a drop at or above the Header Row', async () => {
+        const pending = create_pending_row_store({ session_id: 'session' });
+        // Source row 0 is the promoted Header Row: display rows 0-2 are source rows 1-3.
+        grid_mock.source_row_for_display = (display_row: number) => display_row + 1;
+        await render_grid(structure_props({
+            row_count: 3,
+            sheet_meta: {
+                ...props().sheet_meta,
+                rowCount: 3,
+                sourceRowCount: 4,
+                excelFirstRowHeader: { active: true, sourceRow: 0 },
+            } as GridShellProps['sheet_meta'],
+            edit_session: create_edit_session_store({ session_id: 'session' }),
+            pending_row_store: pending,
+        }));
+        type Block = { start: number; end: number };
+        const propose = grid_mock.props!.onRowProposeMove as (rows: Block, before: number) => boolean;
+        const can_move = grid_mock.props!.canMoveRows as (rows: Block) => boolean;
+        expect(can_move({ start: 1, end: 1 })).toBe(true);
+        expect(propose({ start: 1, end: 1 }, -1)).toBe(false);
+        expect(propose({ start: 1, end: 1 }, 0)).toBe(true);
     });
 });

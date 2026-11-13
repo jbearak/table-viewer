@@ -199,6 +199,7 @@ import {
     MAX_PENDING_ROW_ID_LENGTH,
     own_pending_structural_changes,
     appended_rows,
+    has_inserted_or_moved_rows,
     inserted_rows,
     pending_rows,
     has_live_layout_change,
@@ -705,7 +706,7 @@ export const STRUCTURAL_INSERT_GATE_MESSAGE =
 export const INSERT_TRANSFORMED_MESSAGE =
     'Clear sorts, filters, and hidden rows to insert or move rows.';
 
-/** Why a sort, filter, or hide-rows commit was refused while inserted rows exist. */
+/** Why a sort, filter, or hide-rows commit was refused while inserted or moved rows exist. */
 export const INSERTED_ROWS_TRANSFORM_MESSAGE =
     'Save or discard inserted and moved rows to sort, filter, or hide rows.';
 
@@ -4106,7 +4107,7 @@ export function attach_viewer(
      * commit boundary: a state that sorts, filters, or hides rows on a
      * worksheet may not commit while an insert admission on it is outstanding
      * (unsettled, or accepted and not yet published) or while its durable
-     * Pending Changes hold inserted rows.
+     * Pending Changes hold inserted or moved rows.
      */
     function insert_transform_refusal(
         sheet_index: number,
@@ -4134,7 +4135,7 @@ export function attach_viewer(
                 sheet.name,
                 sheet.worksheetId,
             );
-            if (inserted_rows(slot).length > 0) return INSERTED_ROWS_TRANSFORM_MESSAGE;
+            if (has_inserted_or_moved_rows(slot)) return INSERTED_ROWS_TRANSFORM_MESSAGE;
         }
         return undefined;
     }

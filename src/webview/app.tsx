@@ -234,7 +234,7 @@ import { run_discard_transaction } from './discard-transaction-model';
 import { highlight_history_source } from './highlight-capture-model';
 import { commit_staged_transaction, type StagedMutation } from './staged-mutation';
 import { discard_layout_changes, keep_inserted_rows_at_end } from './pending-row-store';
-import { has_inserted_rows, INSERTED_ROWS_TRANSFORM_MESSAGE } from './row-structure-model';
+import { has_inserted_or_moved_rows, INSERTED_ROWS_TRANSFORM_MESSAGE } from './row-structure-model';
 
 /**
  * Structural conflicts about a whole worksheet rather than a row or cell:
@@ -6394,7 +6394,7 @@ export function App(): React.JSX.Element {
      */
     const inserted_rows_refuse_transform = useCallback((sheet_index: number): boolean => {
         for (const [index, store] of edit_session_registry_ref.current?.pending_entries() ?? []) {
-            if (index !== sheet_index || !has_inserted_rows(store.snapshot())) continue;
+            if (index !== sheet_index || !has_inserted_or_moved_rows(store.snapshot())) continue;
             host_bridge.postMessage({ type: 'showWarning', message: INSERTED_ROWS_TRANSFORM_MESSAGE });
             return true;
         }

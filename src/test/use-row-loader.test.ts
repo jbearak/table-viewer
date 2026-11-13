@@ -112,6 +112,25 @@ describe('RowLoader', () => {
         ]);
     });
 
+    it('requests and protects only the pages of a viewport made of separate intervals', () => {
+        // A moved row puts a far source row on screen beside the top rows:
+        // the gap between them is neither requested nor protected.
+        const post = vi.fn();
+        const loader = new RowLoader(post, vi.fn(), 2); // cap = 2
+        loader.configure(0, 1_000_000, 1);
+        loader.ensure_row_intervals([{ start: 0, end: 39 }, { start: 999_999, end: 999_999 }]);
+        const far = Math.floor(999_999 / PAGE_SIZE) * PAGE_SIZE;
+        expect(post.mock.calls.map((call) => (call[0] as RequestRows).startRow)).toEqual([0, far]);
+        for (const start of [0, far]) loader.on_row_data(reply_for(post, 0, start, 1));
+        // A third page past the cap evicts neither viewport page.
+        loader.ensure_rows_loaded(5_000, 5_000);
+        loader.on_row_data(reply_for(post, 0, 5_000 - (5_000 % PAGE_SIZE), 1));
+        loader.ensure_row_intervals([{ start: 0, end: 39 }, { start: 999_999, end: 999_999 }]);
+        loader.trim();
+        expect(loader.get_row(0)).toBeDefined();
+        expect(loader.get_row(999_999)).toBeDefined();
+    });
+
     it('does not re-request a page that is already pending', () => {
         const post = vi.fn();
         const loader = new RowLoader(post, () => {});

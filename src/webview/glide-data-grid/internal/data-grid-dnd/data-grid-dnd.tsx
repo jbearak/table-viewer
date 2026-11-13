@@ -4,19 +4,43 @@ import * as React from "react";
 import DataGrid, { type DataGridProps, type DataGridRef } from "../data-grid/data-grid.js";
 import type { GridColumn, InnerGridColumn, Rectangle } from "../data-grid/data-grid-types.js";
 import type { GridMouseEventArgs } from "../data-grid/event-args.js";
+import { useAutoscroll } from "../../data-editor/use-autoscroll.js";
 
 type Props = Omit<
     DataGridProps,
-    "dragAndDropState" | "isResizing" | "isDragging" | "onMouseMoveRaw" | "allowResize" | "resizeColumn"
+    | "dragAndDropState"
+    | "isResizing"
+    | "isDragging"
+    | "isDragRefused"
+    | "onMouseMoveRaw"
+    | "allowResize"
+    | "resizeColumn"
 >;
+
+const nullScrollRef: React.MutableRefObject<HTMLDivElement | null> = { current: null };
 
 export interface DataGridDndProps extends Props {
     /**
-     * Called whenever a row re-order operation is completed. Setting the callback enables re-ordering by dragging the
-     * first column of a row.
+     * Fork change: called when the user drops a dragged block of rows. A drag arms only when a plain primary press
+     * lands on a row marker inside the current contiguous row selection (and `canMoveRows` allows that block); it
+     * then moves the whole block. `rows` is that block, inclusive; `before` is the row it lands before, `rows` for
+     * the end. Pressing any other marker keeps the ordinary marker press (drag-to-select, menus, touch).
      * @group Drag and Drop
      */
-    readonly onRowMoved?: (startIndex: number, endIndex: number) => void;
+    readonly onRowMoved?: (rows: RowMoveBlock, before: number) => void;
+    /**
+     * Fork addition: whether a press inside the selected block `rows` may start a row move. Returning false keeps
+     * the ordinary marker press.
+     * @group Drag and Drop
+     */
+    readonly canMoveRows?: (rows: RowMoveBlock) => boolean;
+    /**
+     * Fork addition: called when a row move's drop target changes. `before` is the row the block would land
+     * before, `rows` for the end, or -1 above the first row (over the header). Returning false refuses the drop:
+     * no drop indicator, the not-allowed cursor, and releasing does nothing.
+     * @group Drag and Drop
+     */
+    readonly onRowProposeMove?: (rows: RowMoveBlock, before: number) => boolean;
     /**
      * Called when the user finishes moving a column. `startIndex` is the index of the column that was moved, and
      * `endIndex` is the index at which it should end up. Note that you have to effect the move of the column, and pass
@@ -76,6 +100,61 @@ export interface DataGridDndProps extends Props {
     readonly maxColumnWidth: number;
     readonly minColumnWidth: number;
     readonly lockColumns: number;
+}
+
+/** A contiguous block of rows, inclusive at both ends. */
+export interface RowMoveBlock {
+    readonly start: number;
+    readonly end: number;
+}
+
+/** Fork addition: pointer travel, in CSS px, before an armed row press becomes a move (Glide's column threshold). */
+export const ROW_MOVE_THRESHOLD_PX = 20;
+/** Fork addition: thickness of the drop indicator drawn between rows. */
+export const ROW_MOVE_INDICATOR_PX = 2;
+
+/**
+ * Fork addition: the block a marker press on `row` would move: the current row selection when it is one contiguous
+ * interval containing `row`, else undefined (the press stays an ordinary marker press).
+ */
+export function rowMoveBlockForPress(
+    rows: { readonly length: number; first(): number | undefined; last(): number | undefined },
+    row: number
+): RowMoveBlock | undefined {
+    const first = rows.first();
+    const last = rows.last();
+    if (first === undefined || last === undefined) return undefined;
+    if (rows.length !== last - first + 1) return undefined;
+    if (row < first || row > last) return undefined;
+    return { start: first, end: last };
+}
+
+/** Fork addition: whether dropping `rows` before `before` leaves every row where it is. */
+export function rowMoveIsNoOp(rows: RowMoveBlock, before: number): boolean {
+    return before >= rows.start && before <= rows.end + 1;
+}
+
+/**
+ * Fork addition: the row a block would land before for a pointer at `pointerY` over `row`, whose top is `rowTop`
+ * and height `rowHeight`: the row itself in its upper half, the next row in its lower half.
+ */
+export function rowMoveDropBefore(row: number, pointerY: number, rowTop: number, rowHeight: number): number {
+    return pointerY < rowTop + rowHeight / 2 ? row : row + 1;
+}
+
+/**
+ * Fork addition: vertical auto-scroll while a row move's pointer is within one row height of the top (below the
+ * header, or over it) or bottom edge of the viewport.
+ */
+export function rowMoveScrollDirection(
+    pointerY: number,
+    headerBottom: number,
+    viewportBottom: number,
+    rowHeight: number
+): -1 | 0 | 1 {
+    if (pointerY < headerBottom + rowHeight) return -1;
+    if (pointerY > viewportBottom - rowHeight) return 1;
+    return 0;
 }
 
 // Dear Past Jason,
@@ -151,10 +230,27 @@ const DataGridDnd: React.FunctionComponent<DataGridDndProps> = p => {
     const [dragColActive, setDragColActive] = React.useState(false);
     const [dragStartX, setDragStartX] = React.useState<number>();
 
-    const [dragRow, setDragRow] = React.useState<number>();
-    const [dropRow, setDropRow] = React.useState<number>();
-    const [dragRowActive, setDragRowActive] = React.useState(false);
-    const [dragStartY, setDragStartY] = React.useState<number>();
+    // Fork change: a row move is armed by a press inside the selected block, held
+    // in a ref so mouse handlers read it synchronously, and mirrored into state
+    // for the indicator and cursor. The armed press itself is withheld from the
+    // data editor until release, so a press that never moves replays as today's.
+    const rowMoveRef = React.useRef<{
+        readonly rows: RowMoveBlock;
+        readonly startY: number;
+        readonly press: GridMouseEventArgs;
+        active: boolean;
+        before?: number;
+        allowed: boolean;
+        rowHeight: number;
+    }>();
+    const [rowMoveView, setRowMoveView] = React.useState<{
+        readonly rows: RowMoveBlock;
+        readonly before?: number;
+        readonly allowed: boolean;
+    }>();
+    const [rowMoveScroll, setRowMoveScroll] = React.useState<-1 | 0 | 1>(0);
+    const lastPointerYRef = React.useRef<number>();
+    const dragRowActive = rowMoveView !== undefined;
 
     const {
         onHeaderMenuClick,
@@ -167,6 +263,8 @@ const DataGridDnd: React.FunctionComponent<DataGridDndProps> = p => {
         maxColumnWidth,
         minColumnWidth,
         onRowMoved,
+        canMoveRows,
+        onRowProposeMove,
         lockColumns,
         onColumnProposeMove,
         onMouseDown,
@@ -316,19 +414,19 @@ const DataGridDnd: React.FunctionComponent<DataGridDndProps> = p => {
 
     const onItemHoveredImpl = React.useCallback(
         (args: GridMouseEventArgs) => {
-            const [col, row] = args.location;
+            const [col] = args.location;
             if (dragCol !== undefined && dropCol !== col && col >= lockColumns) {
                 setDragColActive(true);
                 setDropCol(col);
-            } else if (dragRow !== undefined && row !== undefined) {
-                setDragRowActive(true);
-                setDropRow(Math.max(0, row));
+            } else if (rowMoveRef.current !== undefined) {
+                // Fork change: an armed row move owns the pointer and hides it
+                // from drag-to-select; its drop target follows onMouseMove.
             // Don't emit onItemHovered if resizing or reordering a column or row.
             } else if (resizeCol === undefined && !dragColActive && !dragRowActive) {
                 onItemHovered?.(args);
             }
         },
-        [dragCol, dragRow, dropCol, onItemHovered, lockColumns, resizeCol, dragColActive, dragRowActive]
+        [dragCol, dropCol, onItemHovered, lockColumns, resizeCol, dragColActive, dragRowActive]
     );
 
     const canDragCol = onColumnMoved !== undefined;
@@ -379,10 +477,29 @@ const DataGridDnd: React.FunctionComponent<DataGridDndProps> = p => {
                     lockColumns > 0 &&
                     col === 0 &&
                     row !== undefined &&
-                    onRowMoved !== undefined
+                    onRowMoved !== undefined &&
+                    !args.isTouch &&
+                    !args.shiftKey &&
+                    !args.ctrlKey &&
+                    !args.metaKey
                 ) {
-                    setDragStartY(args.bounds.y);
-                    setDragRow(row);
+                    // Fork change: arm a move only for a press inside the
+                    // current contiguous row selection, and withhold the press
+                    // from the data editor, whose marker click would collapse
+                    // that selection. Release replays it if no move started.
+                    const rows = rowMoveBlockForPress(selection.rows, row);
+                    if (rows !== undefined && canMoveRows?.(rows) !== false) {
+                        lastPointerYRef.current = args.bounds.y + args.localEventY;
+                        rowMoveRef.current = {
+                            rows,
+                            startY: args.bounds.y + args.localEventY,
+                            press: args,
+                            active: false,
+                            allowed: false,
+                            rowHeight: args.bounds.height,
+                        };
+                        return;
+                    }
                 }
             }
             onMouseDown?.(args);
@@ -392,6 +509,8 @@ const DataGridDnd: React.FunctionComponent<DataGridDndProps> = p => {
             canResize,
             lockColumns,
             onRowMoved,
+            canMoveRows,
+            selection.rows,
             gridRef,
             columns,
             canDragCol,
@@ -415,10 +534,9 @@ const DataGridDnd: React.FunctionComponent<DataGridDndProps> = p => {
         resizeColRef.current = undefined;
         resizeColStartXRef.current = undefined;
         resizePointerXRef.current = undefined;
-        setDragRow(undefined);
-        setDropRow(undefined);
-        setDragStartY(undefined);
-        setDragRowActive(false);
+        rowMoveRef.current = undefined;
+        setRowMoveView(undefined);
+        setRowMoveScroll(0);
         setDragCol(undefined);
         setDropCol(undefined);
         setDragStartX(undefined);
@@ -461,23 +579,33 @@ const DataGridDnd: React.FunctionComponent<DataGridDndProps> = p => {
     const onMouseUpImpl = React.useCallback(
         (args: GridMouseEventArgs, isOutside: boolean) => {
             if (args.button === 0) {
+                const rowMove = rowMoveRef.current;
                 finishColumnResize();
                 clearAll();
                 if (dragCol !== undefined && dropCol !== undefined) {
                     onColumnMoved?.(dragCol, dropCol);
                 }
-                if (dragRow !== undefined && dropRow !== undefined) {
-                    onRowMoved?.(dragRow, dropRow);
+                if (rowMove?.active === true) {
+                    if (
+                        rowMove.before !== undefined &&
+                        rowMove.allowed &&
+                        !rowMoveIsNoOp(rowMove.rows, rowMove.before)
+                    ) {
+                        onRowMoved?.(rowMove.rows, rowMove.before);
+                    }
+                } else if (rowMove !== undefined) {
+                    // Fork change: a press that never became a move is the
+                    // ordinary marker press it would have been: replay it.
+                    onMouseDown?.(rowMove.press);
                 }
             }
             onMouseUp?.(args, isOutside);
         },
         [
             onMouseUp,
+            onMouseDown,
             dragCol,
             dropCol,
-            dragRow,
-            dropRow,
             onColumnMoved,
             onRowMoved,
             clearAll,
@@ -485,19 +613,32 @@ const DataGridDnd: React.FunctionComponent<DataGridDndProps> = p => {
         ]
     );
 
+    // Fork addition: Escape, blur, or a canceled pointer abandons a row move;
+    // the release that follows then does nothing.
+    const cancelRowMove = React.useCallback(() => {
+        if (rowMoveRef.current === undefined) return;
+        rowMoveRef.current = undefined;
+        setRowMoveView(undefined);
+        setRowMoveScroll(0);
+    }, []);
+
     React.useEffect(() => {
-        const finishResizeOnEscape = (event: KeyboardEvent) => {
-            if (event.key === "Escape") finishInterruptedResize();
+        const interrupt = () => {
+            finishInterruptedResize();
+            cancelRowMove();
         };
-        window.addEventListener("blur", finishInterruptedResize);
-        window.addEventListener("pointercancel", finishInterruptedResize);
+        const finishResizeOnEscape = (event: KeyboardEvent) => {
+            if (event.key === "Escape") interrupt();
+        };
+        window.addEventListener("blur", interrupt);
+        window.addEventListener("pointercancel", interrupt);
         window.addEventListener("keydown", finishResizeOnEscape);
         return () => {
-            window.removeEventListener("blur", finishInterruptedResize);
-            window.removeEventListener("pointercancel", finishInterruptedResize);
+            window.removeEventListener("blur", interrupt);
+            window.removeEventListener("pointercancel", interrupt);
             window.removeEventListener("keydown", finishResizeOnEscape);
         };
-    }, [finishInterruptedResize]);
+    }, [cancelRowMove, finishInterruptedResize]);
 
     const dragOffset = React.useMemo(() => {
         if (dragCol === undefined || dropCol === undefined) return undefined;
@@ -525,11 +666,9 @@ const DataGridDnd: React.FunctionComponent<DataGridDndProps> = p => {
                 if (diff > 20) {
                     setDragColActive(true);
                 }
-            } else if (dragRow !== undefined && dragStartY !== undefined) {
-                const diff = Math.abs(event.clientY - dragStartY);
-                if (diff > 20) {
-                    setDragRowActive(true);
-                }
+            } else if (rowMoveRef.current !== undefined) {
+                lastPointerYRef.current = event.clientY;
+                if ((event.buttons & 1) === 0) cancelRowMove();
             } else if (resizeCol !== undefined && canvas) {
                 resizePointerXRef.current = event.clientX;
                 applyColumnResizeAtPointer(event.clientX);
@@ -548,8 +687,7 @@ const DataGridDnd: React.FunctionComponent<DataGridDndProps> = p => {
         [
             dragCol,
             dragStartX,
-            dragRow,
-            dragStartY,
+            cancelRowMove,
             resizeCol,
             columns,
             canvasRef,
@@ -561,23 +699,185 @@ const DataGridDnd: React.FunctionComponent<DataGridDndProps> = p => {
         ]
     );
 
-    const getMangledCellContent = React.useCallback<typeof getCellContent>(
-        (cell, forceStrict) => {
-            if (dragRow === undefined || dropRow === undefined) return getCellContent(cell, forceStrict);
+    // Fork change: a row move shows a drop indicator instead of previewing the
+    // rows in their new order.
+    // The trailing append row, when shown, is not a row a block can land among.
+    const rows = p.hasAppendRow === true ? Math.max(0, p.rows - 1) : p.rows;
+    const indicatorBefore =
+        rowMoveView?.before !== undefined &&
+        rowMoveView.allowed &&
+        !rowMoveIsNoOp(rowMoveView.rows, rowMoveView.before)
+            ? rowMoveView.before
+            : undefined;
+    const rowMoveRefused =
+        rowMoveView?.before !== undefined &&
+        !rowMoveView.allowed &&
+        !rowMoveIsNoOp(rowMoveView.rows, rowMoveView.before);
+    const baseDrawCell = p.drawCell;
+    const drawCell = React.useMemo<DataGridProps["drawCell"]>(() => {
+        if (indicatorBefore === undefined) return baseDrawCell;
+        return (args, drawContent) => {
+            if (baseDrawCell === undefined) drawContent();
+            else baseDrawCell(args, drawContent);
+            const atTop = args.row === indicatorBefore;
+            const atBottom = indicatorBefore >= rows && args.row === rows - 1;
+            if (!atTop && !atBottom) return;
+            const { ctx, rect, theme } = args;
+            ctx.save();
+            ctx.fillStyle = theme.accentColor;
+            ctx.fillRect(
+                rect.x,
+                atTop ? rect.y : rect.y + rect.height - ROW_MOVE_INDICATOR_PX,
+                rect.width,
+                ROW_MOVE_INDICATOR_PX
+            );
+            ctx.restore();
+        };
+    }, [baseDrawCell, indicatorBefore, rows]);
 
-            // eslint-disable-next-line prefer-const
-            let [col, row] = cell;
-            if (row === dropRow) {
-                row = dragRow;
-            } else {
-                if (row > dropRow) row -= 1;
-                if (row >= dragRow) row += 1;
+    /** Fork addition: record a row move's drop target and ask whether it may land there. */
+    const setRowMoveDrop = React.useCallback(
+        (target: number) => {
+            const rowMove = rowMoveRef.current;
+            if (rowMove === undefined) return;
+            const before = Math.min(target, rows);
+            if (rowMove.before !== before) {
+                rowMove.before = before;
+                rowMove.allowed = rowMoveIsNoOp(rowMove.rows, before)
+                    ? true
+                    : onRowProposeMove?.(rowMove.rows, before) ?? before >= 0;
             }
-
-            return getCellContent([col, row], forceStrict);
+            if (rowMove.active) {
+                setRowMoveView(view =>
+                    view !== undefined &&
+                    view.before === rowMove.before &&
+                    view.allowed === rowMove.allowed &&
+                    view.rows === rowMove.rows
+                        ? view
+                        : { rows: rowMove.rows, before: rowMove.before, allowed: rowMove.allowed }
+                );
+            }
         },
-        [dragRow, dropRow, getCellContent]
+        [onRowProposeMove, rows]
     );
+
+    /**
+     * Fork addition: the row under a viewport Y, found by walking from the
+     * first visible row. Starting anywhere else (a -1 header target, or a row
+     * scrolled far away) would walk every row in between.
+     */
+    const firstVisibleRow = p.cellYOffset;
+    const rowAtPointer = React.useCallback(
+        (pointerY: number): { row: number; top: number; height: number } | undefined => {
+            const grid = gridRef?.current;
+            if (grid === null || grid === undefined || rows <= 0) return undefined;
+            let row = clamp(firstVisibleRow, 0, rows - 1);
+            let bounds = grid.getBounds(0, row);
+            for (let guard = 0; bounds !== undefined && guard < rows; guard++) {
+                if (pointerY < bounds.y && row > 0) row -= 1;
+                else if (pointerY >= bounds.y + bounds.height && row < rows - 1) row += 1;
+                else break;
+                bounds = grid.getBounds(0, row);
+            }
+            return bounds === undefined ? undefined : { row, top: bounds.y, height: bounds.height };
+        },
+        [firstVisibleRow, gridRef, rows]
+    );
+
+    /**
+     * Fork addition: the viewport Y where visible data rows end: the canvas
+     * bottom, or the top of a sticky append row drawn over it.
+     */
+    const visibleDataBottom = React.useCallback((): number | undefined => {
+        const canvas = canvasRef?.current;
+        if (canvas === null || canvas === undefined) return undefined;
+        let bottom = canvas.getBoundingClientRect().bottom;
+        if (p.hasAppendRow === true) {
+            const appendRow = gridRef?.current?.getBounds(0, rows);
+            if (appendRow !== undefined) bottom = Math.min(bottom, appendRow.y);
+        }
+        return bottom;
+    }, [canvasRef, gridRef, p.hasAppendRow, rows]);
+
+    /**
+     * Fork addition: the drop target for a pointer at or below the visible
+     * bottom edge: the end only once the last row is fully in view, else the
+     * row at that edge, so a release lands where the indicator shows.
+     */
+    const bottomEdgeTarget = React.useCallback(
+        (bottom: number): number => {
+            const hit = rowAtPointer(bottom - 1);
+            if (hit === undefined) return rows;
+            // Grid bounds include a 1 px border below the row: compare its real bottom.
+            return hit.row === rows - 1 && hit.top + hit.height - 1 <= bottom ? rows : hit.row;
+        },
+        [rowAtPointer, rows]
+    );
+
+    const headerBottom = p.headerHeight + p.groupHeaderHeight;
+    /** Fork addition: follow an armed row move's pointer: threshold, drop target, and edge scrolling. */
+    const onMouseMoveImpl = React.useCallback(
+        (args: GridMouseEventArgs) => {
+            const rowMove = rowMoveRef.current;
+            if (rowMove !== undefined) {
+                const pointerY = lastPointerYRef.current ?? rowMove.startY;
+                if (!rowMove.active && Math.abs(pointerY - rowMove.startY) > ROW_MOVE_THRESHOLD_PX) {
+                    rowMove.active = true;
+                }
+                const bottom = visibleDataBottom();
+                if (bottom !== undefined && pointerY >= bottom) {
+                    setRowMoveDrop(bottomEdgeTarget(bottom));
+                } else if (args.kind === "cell") {
+                    const [, row] = args.physicalLocation ?? args.location;
+                    const bounds = args.physicalBounds ?? args.bounds;
+                    rowMove.rowHeight = bounds.height;
+                    setRowMoveDrop(rowMoveDropBefore(row, pointerY, bounds.y, bounds.height));
+                } else if (args.kind === "header" || args.kind === "group-header") {
+                    setRowMoveDrop(-1);
+                } else if (args.kind === "out-of-bounds") {
+                    if (args.region[1] < 0) setRowMoveDrop(-1);
+                    // Below a short grid's last row, above the visible bottom edge.
+                    else if (args.region[1] > 0) setRowMoveDrop(rows);
+                    else if (rowMove.before === undefined) setRowMoveDrop(rowMove.rows.start);
+                    else setRowMoveDrop(rowMove.before);
+                }
+                const canvas = canvasRef?.current;
+                if (rowMove.active && canvas !== null && canvas !== undefined) {
+                    const rect = canvas.getBoundingClientRect();
+                    setRowMoveScroll(
+                        rowMoveScrollDirection(
+                            pointerY - rect.top,
+                            headerBottom,
+                            rect.height,
+                            rowMove.rowHeight
+                        )
+                    );
+                }
+            }
+            p.onMouseMove(args);
+        },
+        [bottomEdgeTarget, canvasRef, headerBottom, p.onMouseMove, rows, setRowMoveDrop, visibleDataBottom]
+    );
+
+    /** Fork addition: rows scroll under a still pointer while edge scrolling; keep the drop target under it. */
+    const onRowMoveScroll = React.useCallback(() => {
+        const rowMove = rowMoveRef.current;
+        const pointerY = lastPointerYRef.current;
+        if (rowMove === undefined || pointerY === undefined) return;
+        const canvas = canvasRef?.current;
+        if (canvas !== null && canvas !== undefined && pointerY < canvas.getBoundingClientRect().top + headerBottom) {
+            setRowMoveDrop(-1);
+            return;
+        }
+        const bottom = visibleDataBottom();
+        if (bottom !== undefined && pointerY >= bottom) {
+            setRowMoveDrop(bottomEdgeTarget(bottom));
+            return;
+        }
+        const hit = rowAtPointer(pointerY);
+        if (hit !== undefined) setRowMoveDrop(rowMoveDropBefore(hit.row, pointerY, hit.top, hit.height));
+    }, [bottomEdgeTarget, canvasRef, headerBottom, rowAtPointer, setRowMoveDrop, visibleDataBottom]);
+    useAutoscroll(rowMoveScroll === 0 ? undefined : [0, rowMoveScroll], eventTargetRef ?? nullScrollRef, onRowMoveScroll);
 
     const onDragStartImpl = React.useCallback<NonNullable<DataGridDndProps["onDragStart"]>>(
         args => {
@@ -599,7 +899,7 @@ const DataGridDnd: React.FunctionComponent<DataGridDndProps> = p => {
             disabledRows={p.disabledRows}
             drawFocusRing={p.drawFocusRing}
             drawHeader={p.drawHeader}
-            drawCell={p.drawCell}
+            drawCell={drawCell}
             enableGroups={p.enableGroups}
             eventTargetRef={p.eventTargetRef}
             experimental={p.experimental}
@@ -631,7 +931,7 @@ const DataGridDnd: React.FunctionComponent<DataGridDndProps> = p => {
             onDrop={p.onDrop}
             onKeyDown={p.onKeyDown}
             onKeyUp={p.onKeyUp}
-            onMouseMove={p.onMouseMove}
+            onMouseMove={onMouseMoveImpl}
             mergedCells={p.mergedCells}
             prelightCells={p.prelightCells}
             rowHeight={p.rowHeight}
@@ -646,10 +946,11 @@ const DataGridDnd: React.FunctionComponent<DataGridDndProps> = p => {
             translateY={p.translateY}
             verticalBorder={p.verticalBorder}
             width={p.width}
-            getCellContent={getMangledCellContent}
+            getCellContent={getCellContent}
             isResizing={resizeCol !== undefined}
             onHeaderMenuClick={onHeaderMenuClickMangled}
-            isDragging={dragColActive}
+            isDragging={dragColActive || dragRowActive}
+            isDragRefused={rowMoveRefused}
             onItemHovered={onItemHoveredImpl}
             onDragStart={onDragStartImpl}
             onMouseDown={onMouseDownImpl}

@@ -28,7 +28,7 @@ import {
     type WorksheetStructureContext,
 } from '../webview/pending-row-store';
 import {
-    has_inserted_rows,
+    has_inserted_or_moved_rows,
     INSERT_ABOVE_HEADER_MESSAGE,
     INSERT_ONLY_REMOVED_ROWS_MESSAGE,
     insert_anchor_is_live,
@@ -346,8 +346,8 @@ describe('projecting inserted rows', () => {
         expect(row?.kind === 'pending' ? row.intendedPhysicalRow + 1 : undefined).toBe(5);
         expect(projection.prospective_row(5)).toBe(5);
         expect(projection.display_row_for_identity(pending('a'))).toBe(3);
-        expect(has_inserted_rows(changes)).toBe(true);
-        expect(has_inserted_rows(EMPTY)).toBe(false);
+        expect(has_inserted_or_moved_rows(changes)).toBe(true);
+        expect(has_inserted_or_moved_rows(EMPTY)).toBe(false);
     });
 
     it('lists the inline inserted rows in a display range, which the band scans miss', () => {
