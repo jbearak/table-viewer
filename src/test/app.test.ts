@@ -18026,6 +18026,14 @@ describe('structural conflict notice counts and Review Changes notes', () => {
         expect(request!.discard.layouts[0]!.rowLayout).toBeUndefined();
         // Keep is offered only for a Structural Basis change.
         expect(request!.keep !== undefined).toBe(reason === 'structuralBasisChanged');
+        // Until the counts arrive, the actions they describe wait.
+        const notice_before = document.querySelector('[aria-label="Row and column changes that need review"]')!;
+        expect(notice_before.textContent).toContain('Checking formulas…');
+        const action = (label: string) => [...notice_before.querySelectorAll('button')]
+            .find((button) => button.textContent === label) as HTMLButtonElement | undefined;
+        expect(action('Discard row and column changes on Sales')?.disabled).toBe(true);
+        if (reason === 'structuralBasisChanged') expect(action('Keep new rows at the end')?.disabled).toBe(true);
+        expect(action('Dismiss notice')?.disabled).toBe(false);
         await dispatch_host_message({
             type: 'formulaImpact',
             requestId: request!.requestId,
@@ -18035,6 +18043,9 @@ describe('structural conflict notice counts and Review Changes notes', () => {
                 discard: { ref: 4, moved: 12 },
             },
         });
+        expect(action('Discard row and column changes on Sales')?.disabled).toBe(false);
+        if (reason === 'structuralBasisChanged') expect(action('Keep new rows at the end')?.disabled).toBe(false);
+        expect(notice_before.textContent).not.toContain('Checking formulas…');
         const notice = document.querySelector('[aria-label="Row and column changes that need review"]');
         if (reason === 'structuralBasisChanged') {
             expect(notice?.textContent).toContain('Keep new rows at the end: 12 formulas will point at different rows or columns.');
@@ -18055,6 +18066,58 @@ describe('structural conflict notice counts and Review Changes notes', () => {
         });
         expect(document.querySelector('[aria-label="Row and column changes that need review"]')?.textContent)
             .not.toContain('4 formulas will show #REF!');
+    });
+
+    it('says when the host cannot count formula impact, and still offers the actions', async () => {
+        const { post_message } = await render_app();
+        const meta = make_meta(['Sales'], false);
+        Object.assign(meta.sheets[0], { columnCount: 2, sourceRowCount: 4, rowCount: 4, formulaCells: [0, 1] });
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: {
+                csvEditable: true,
+                csvEditingSupported: true,
+                editSyntax: 'markdown',
+                structuralEditing: { sheets: [{ rows: { supported: true }, columns: { supported: true } }] },
+            },
+        }));
+        await click_button('Edit');
+        await dispatch_host_message({
+            type: 'editSessionResult',
+            granted: true,
+            editSessionId: 'unavailable-session',
+            sheetIndex: 0,
+            pendingChanges: {
+                sheetIndex: 0,
+                sheetName: 'Sales',
+                cells: {},
+                formatTemplates: [],
+                appendedRows: [],
+                tailRemovals: [],
+                conflicts: [{ reason: 'structuralBasisChanged', pendingRowIds: [], tailRemovalIds: [] }],
+                rowLayout: {
+                    runs: [{ kind: 'source', start: 0, count: 4 }],
+                    removedSourceRows: [{ start: 2, count: 1 }],
+                    discardedPendingRows: [],
+                },
+                structuralBasis: {
+                    kind: 'xlsx', worksheetPartDigest: 'w', sharedStringsDigest: null, stylesDigest: null,
+                    workbookDigest: 'b', sourceRowCount: 4, sourceColumnCount: 2,
+                },
+            },
+        });
+        const request = post_message.mock.calls.map(([message]) => message as WebviewMessage)
+            .find((message): message is Extract<WebviewMessage, { type: 'requestFormulaImpact' }> =>
+                message.type === 'requestFormulaImpact')!;
+        await dispatch_host_message({
+            type: 'formulaImpact',
+            requestId: request.requestId,
+            sourceGeneration: request.sourceGeneration,
+            impacts: null,
+        });
+        const notice = document.querySelector('[aria-label="Row and column changes that need review"]')!;
+        expect(notice.textContent).toContain('Formula impact unavailable.');
+        expect(notice.textContent).not.toContain('Checking formulas…');
+        for (const button of notice.querySelectorAll('button')) expect((button as HTMLButtonElement).disabled).toBe(false);
     });
 
     it('notes that a column change pads short rows', async () => {

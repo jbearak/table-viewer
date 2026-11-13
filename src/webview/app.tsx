@@ -9080,6 +9080,14 @@ export function App(): React.JSX.Element {
         && formula_impacts?.states === formula_impact_states
         ? formula_impacts.impacts
         : undefined;
+    // The counts describe what each salvage action does, so the actions wait
+    // for the answer to the current request. A host that cannot count
+    // answers null, and the actions go ahead without counts.
+    const formula_impact_pending = formula_impact_states !== undefined
+        && formula_impacts?.states !== formula_impact_states;
+    const formula_impact_unavailable = formula_impact_states !== undefined
+        && formula_impacts?.states === formula_impact_states
+        && formula_impacts.impacts === null;
     const keep_impact_text = current_formula_impacts?.keep === undefined
         ? undefined
         : formula_impact_text(current_formula_impacts.keep);
@@ -9772,6 +9780,8 @@ export function App(): React.JSX.Element {
                             {`Values typed in ${active_column_values_lost} new ${active_column_values_lost === 1 ? 'column' : 'columns'} will be discarded.`}
                         </p>
                     )}
+                    {formula_impact_pending && <p role="status">Checking formulas…</p>}
+                    {formula_impact_unavailable && <p>Formula impact unavailable.</p>}
                     {basis_changed && keep_impact_text !== undefined && (
                         <p>{`Keep new rows at the end: ${keep_impact_text}`}</p>
                     )}
@@ -9780,11 +9790,11 @@ export function App(): React.JSX.Element {
                     )}
                     <div className="external-change-item-actions">
                         {basis_changed && (
-                            <button onClick={keep_active_inserted_rows_at_end}>
+                            <button onClick={keep_active_inserted_rows_at_end} disabled={formula_impact_pending}>
                                 Keep new rows at the end
                             </button>
                         )}
-                        <button onClick={discard_active_layout_changes}>
+                        <button onClick={discard_active_layout_changes} disabled={formula_impact_pending}>
                             {`Discard row and column changes on ${current_sheet.name}`}
                         </button>
                         <button
