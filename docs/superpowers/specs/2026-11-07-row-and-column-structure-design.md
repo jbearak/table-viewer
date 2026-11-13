@@ -3,7 +3,8 @@
 ## Status
 
 Accepted design, revision 9. Reviewed to approval by Claude Sonnet and GPT
-Terra over eight rounds; ready to plan and implement.
+Terra over eight rounds. Implemented in delivery steps 2 through 10, and
+`STRUCTURAL_EDITING_ENABLED` is on.
 
 Table Viewer will let Edit mode insert, delete, and move rows and columns in
 `.xlsx`, CSV, and TSV worksheets. The three formats ship together behind one

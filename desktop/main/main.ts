@@ -321,19 +321,6 @@ function create_update_window_presenter(): AppUpdateWindowPresenter {
     });
 }
 
-/** Real-Electron smoke seam for structural editing, which ships behind
- *  `STRUCTURAL_EDITING_ENABLED`. Like the update preview below, it is honored
- *  only by an unpackaged app on an explicit isolated user-data directory, so a
- *  shipped build or an ordinary developer launch never sees it. */
-function structural_editing_smoke_override(): boolean | undefined {
-    if (app.isPackaged
-        || !custom_user_data
-        || process.env.TABLE_VIEWER_TEST_STRUCTURAL_EDITING !== '1') {
-        return undefined;
-    }
-    return true;
-}
-
 /** Real-Electron smoke seam. It is available only to an unpackaged app using an
  *  explicit isolated user-data directory, so it cannot affect a shipped build
  *  or an ordinary developer launch. The smoke test advances the download by
@@ -1905,7 +1892,6 @@ if (!got_lock) {
             (window) => {
                 if (window.isFocused()) build_menu();
             },
-            structural_editing_smoke_override(),
         );
         // After the window manager exists, and before the argv files below: the
         // flush releases whatever `open-file` / `second-instance` / `activate`

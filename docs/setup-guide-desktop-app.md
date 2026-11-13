@@ -92,7 +92,7 @@ You can repeat the replacement while keeping the file open—handy when a script
 
 ## 5. A few useful details
 
-- Modern `.xlsx` workbooks, `.csv` files, and `.tsv` files can be edited in place: double-click a cell or start typing, then **Save**. Legacy `.xls` workbooks, `.dta` datasets, and `.parquet` files are read-only. Editing changes only the contents of cells, and only once you save. The app never writes your sorts, filters, widths, hidden columns, or highlights into any format.
+- Modern `.xlsx` workbooks, `.csv` files, and `.tsv` files can be edited in place: double-click a cell or start typing, then **Save**. Legacy `.xls` workbooks, `.dta` datasets, and `.parquet` files are read-only. Editing changes the contents of cells, and the rows and columns if you insert, delete, or move them, and only once you save. The app never writes your sorts, filters, widths, hidden columns, or highlights into any format.
 - Unsaved edits also double as annotations that outlive a new version of the file. Until you save them, your changes stay as pending edits in Table Viewer's database, so they come back with the file the same way your highlights and layout do.
 - View choices are remembered per file and worksheet in the app's local storage. The desktop app and VS Code extension do not currently share saved views.
 - Each open file gets its own window. Opening a file that is already open focuses its existing window.

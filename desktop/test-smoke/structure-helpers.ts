@@ -1,9 +1,8 @@
 // Shared helpers for the structural-editing smoke specs (row and column
 // structure design, "Integration and desktop smoke").
 //
-// Structural editing ships behind `STRUCTURAL_EDITING_ENABLED`. These specs turn
-// it on through `TABLE_VIEWER_TEST_STRUCTURAL_EDITING`, which main.ts honors only
-// for an unpackaged app on an isolated user-data directory.
+// The specs launch the app as shipped: structural editing is on by default
+// (`STRUCTURAL_EDITING_ENABLED`), with no test switch.
 //
 // The grid is a canvas, so the helpers aim at row markers and column headers by
 // coordinate, then confirm the target through something the grid reports in the
@@ -16,8 +15,6 @@ import type { ElectronApplication, Locator, Page } from '@playwright/test';
 import { CHANNEL_WEBVIEW_MESSAGE } from '../shared/ipc';
 import { history_menu_item, type HistoryMenuState } from '../main/history-menu-model';
 import { launch_app } from './smoke-helpers';
-
-export const STRUCTURAL_EDITING_ENV = { TABLE_VIEWER_TEST_STRUCTURAL_EDITING: '1' };
 
 const VIEWER_URL_PREFIX = 'tv-app://viewer';
 const GRID_CANVAS = '[data-testid="data-grid-canvas"]';
@@ -38,12 +35,12 @@ export async function save_screenshot(page: Page, name: string): Promise<void> {
     await page.screenshot({ path: path.join(SCREENSHOT_DIR, `${name}.png`) });
 }
 
-/** Launch with structural editing on and return the app and its one viewer. */
+/** Launch the app on `file` and return it with its one viewer. */
 export async function launch_structural_viewer(
     user_data_dir: string,
     file: string,
 ): Promise<{ app: ElectronApplication; page: Page }> {
-    const app = await launch_app(user_data_dir, [file], STRUCTURAL_EDITING_ENV);
+    const app = await launch_app(user_data_dir, [file]);
     try {
         const pages = () => app.windows().filter((page) => page.url().startsWith(VIEWER_URL_PREFIX));
         await expect.poll(() => pages().length, { timeout: 30_000 }).toBe(1);

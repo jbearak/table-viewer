@@ -349,7 +349,7 @@ describe('saves that would drop a stored layout', () => {
 
 describe('peer compatibility rule 3: the release gate', () => {
     it('refuses a publication that carries layout fields while the flag is off', async () => {
-        const viewer = await open_viewer();
+        const viewer = await open_viewer({ structuralEditingEnabled: false });
         expect(await viewer.publish({ rowLayout: REMOVAL_LAYOUT, structuralBasis: BASIS })).toBe(false);
         expect(viewer.durable()).toBeUndefined();
         // Layout-free publications are unaffected.
@@ -639,7 +639,10 @@ describe('history replay commit', () => {
     });
 
     it('refuses a replayed layout while structural editing is disabled', async () => {
-        const viewer = await open_viewer({ initial: slot({ cells: { '0:0': { value: 'x', base: 'a' } } }) });
+        const viewer = await open_viewer({
+            initial: slot({ cells: { '0:0': { value: 'x', base: 'a' } } }),
+            structuralEditingEnabled: false,
+        });
         expect(viewer.session).toMatchObject({ granted: true });
         expect(await replay(viewer, 'layout', {
             structures: [{
@@ -684,8 +687,16 @@ describe('the structural editing capability', () => {
         }).snapshot.capabilities;
 
     it('is absent while structural editing is off', async () => {
-        const viewer = await open_viewer();
+        const viewer = await open_viewer({ structuralEditingEnabled: false });
         expect(capabilities(viewer)).not.toHaveProperty('structuralEditing');
+        await viewer.dispose();
+    });
+
+    it('is present by default, because structural editing ships enabled', async () => {
+        const viewer = await open_viewer();
+        expect(capabilities(viewer).structuralEditing).toMatchObject({
+            sheets: [{ rows: { supported: true }, columns: { supported: true } }],
+        });
         await viewer.dispose();
     });
 
