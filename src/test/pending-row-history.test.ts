@@ -8,6 +8,7 @@ import {
 import {
     delete_columns,
     delete_rows,
+    insert_columns,
     insert_rows,
     move_columns,
     type StructureResult,
@@ -889,5 +890,21 @@ describe('layout history arms', () => {
         ]);
         expect(new Set(retained_pending_row_authorities(history)[0].pendingRowIds))
             .toEqual(new Set(['ins', 'kept']));
+    });
+
+    it('keeps admissions alive for Pending Columns a layout arm created, discarded, or tombstoned', () => {
+        const column = (id: string, order: number) =>
+            ({ id, header: id, cells: {}, format: { kind: 'none' as const }, createdOrder: order });
+        const inserted = planned(insert_columns(state([]), structure_context(), { kind: 'source', sourceColumn: 0 },
+            'after', [column('gone', 1), column('kept', 2)]));
+        const deleted = planned(delete_columns(inserted.next, structure_context({ isColumnReferenced: (id) => id === 'kept' }),
+            [{ kind: 'pending', pendingColumnId: 'gone' }, { kind: 'pending', pendingColumnId: 'kept' }]));
+        const history = record_actions([
+            { label: 'Insert 2 columns', changes: [inserted.change] },
+            { label: 'Delete 2 columns', changes: [deleted.change] },
+        ]);
+        const [retained] = retained_pending_row_authorities(history);
+        expect(new Set(retained!.pendingColumnIds)).toEqual(new Set(['gone', 'kept']));
+        expect(retained!.pendingRowIds).toEqual([]);
     });
 });

@@ -5424,11 +5424,13 @@ export function App(): React.JSX.Element {
             worksheet: WorksheetTarget;
             ids: Set<string>;
             pendingIds: Set<string>;
+            columnIds: Set<string>;
         }>(retained_saved_append_authorities(store.snapshot()).map(
             (entry) => [worksheet_target_key(entry), {
                 worksheet: entry,
                 ids: new Set(entry.appendHistoryIds),
                 pendingIds: new Set(),
+                columnIds: new Set(),
             }],
         ));
         for (const entry of retained_pending_row_authorities(store.snapshot())) {
@@ -5437,8 +5439,10 @@ export function App(): React.JSX.Element {
                 worksheet: entry,
                 ids: new Set<string>(),
                 pendingIds: new Set<string>(),
+                columnIds: new Set<string>(),
             };
             for (const id of entry.pendingRowIds) group.pendingIds.add(id);
+            for (const id of entry.pendingColumnIds) group.columnIds.add(id);
             grouped.set(key, group);
         }
         const sheets = meta_ref.current?.sheets ?? [];
@@ -5455,6 +5459,7 @@ export function App(): React.JSX.Element {
                 worksheet,
                 ids: new Set<string>(),
                 pendingIds: new Set<string>(),
+                columnIds: new Set<string>(),
             };
             for (const removal of pending.snapshot().tailRemovals) {
                 group.ids.add(removal.appendHistoryId);
@@ -5464,14 +5469,18 @@ export function App(): React.JSX.Element {
             for (const row of pending.snapshot().rowLayout?.discardedPendingRows ?? []) {
                 group.pendingIds.add(row.id);
             }
+            for (const column of pending.snapshot().columnLayout?.discardedPendingColumns ?? []) {
+                group.columnIds.add(column.id);
+            }
             grouped.set(key, group);
         }
         host_bridge.postMessage({
             type: 'retainedSavedAppendAuthoritiesChanged',
-            authorities: [...grouped.values()].map(({ worksheet, ids, pendingIds }) => ({
+            authorities: [...grouped.values()].map(({ worksheet, ids, pendingIds, columnIds }) => ({
                 ...worksheet,
                 appendHistoryIds: [...ids],
                 pendingRowIds: [...pendingIds],
+                ...(columnIds.size === 0 ? {} : { pendingColumnIds: [...columnIds] }),
             })),
         });
     }, []);

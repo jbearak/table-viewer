@@ -614,6 +614,7 @@ import {
     formula_display,
     formula_result_key,
     formula_workbook_with_appended_rows,
+    pending_column_result_key,
     type CommittedFormulaFields,
     type FormulaDisplay,
 } from './formula-anchor-model';
@@ -954,6 +955,13 @@ export function pending_row_history_changes(
     before: PendingStructuralChanges,
     after: PendingStructuralChanges,
     changed_rows?: readonly { readonly id: string; readonly index: number }[],
+    /**
+     * Arms of the same gesture that replay after its row and removal arms and
+     * before its metadata arm, such as a Pending Column cell change. The
+     * metadata arm's snapshots are the post-gesture state, which these arms
+     * have reached on redo and not yet left on undo.
+     */
+    before_metadata: readonly HistoryChange[] = [],
 ): HistoryChange[] {
     const templates = new Map([
         ...before.formatTemplates,
@@ -1104,7 +1112,7 @@ export function pending_row_history_changes(
             after,
         },
     }];
-    return [...row_changes, ...removal_changes, ...metadata_change];
+    return [...row_changes, ...removal_changes, ...before_metadata, ...metadata_change];
 }
 
 /**
@@ -2147,9 +2155,12 @@ export function GridShell({
         pending_rows,
         tail_removal_projection_key,
     );
+    // Column identity keys, not source indexes: every Pending Column has no
+    // source index, so two of them trading places must still change the key.
+    const column_topology_key = projected_columns.map((column) => column.key).join(',');
     const paste_topology_key = [
         mapping_generation,
-        column_projection.visible_to_source.join(','),
+        column_topology_key,
         pending_topology_key,
     ].join(':');
     const pending_selection_topology_key = [
@@ -2836,6 +2847,42 @@ export function GridShell({
         },
         [body_start, get_source_row, is_removed_source_row, pending_projection],
     );
+    /** The Pending Column cell at a display cell: its column and live row key. */
+    const pending_column_overlay_target = useCallback(
+        (display_column: number, display_row: number):
+        { readonly pendingColumnId: string; readonly rowKey: string } | undefined => {
+            const identity = projected_columns[display_column]?.identity;
+            if (identity?.kind !== 'pending') return undefined;
+            const target = pending_column_row_target(display_row);
+            return target === undefined || !target.live
+                ? undefined
+                : { pendingColumnId: identity.pendingColumnId, rowKey: target.key };
+        },
+        [pending_column_row_target, projected_columns],
+    );
+    const pending_column_overlay_target_ref = useRef(pending_column_overlay_target);
+    pending_column_overlay_target_ref.current = pending_column_overlay_target;
+    /**
+     * A Pending Column cell's text as the grid shows and copies it: an `.xlsx`
+     * formula rendered through its anchors, anything else as stored.
+     */
+    const pending_column_cell_text = useCallback((cell: PendingRowCell | undefined): string => {
+        if (cell === undefined) return '';
+        return edit_syntax === 'markdown' && xlsx_edit_writes_formula(cell.value, cell.valueRuns?.runs)
+            ? formula_text_for(cell.value, cell.formulaAnchors, cell.valueEditOrder ?? 0)
+            : cell.value;
+    }, [edit_syntax, formula_text_for]);
+    /**
+     * The text a Pending Column cell's editor opens with: the rendered formula,
+     * or the value in edit syntax, so a styled cell reopens with its markup
+     * and an untouched commit keeps its runs.
+     */
+    const pending_column_cell_edit_text = useCallback((cell: PendingRowCell | undefined): string => {
+        if (cell === undefined) return '';
+        return edit_syntax === 'markdown' && xlsx_edit_writes_formula(cell.value, cell.valueRuns?.runs)
+            ? pending_column_cell_text(cell)
+            : dirty_value_edit_text(cell, edit_syntax);
+    }, [edit_syntax, pending_column_cell_text]);
     const columns = useMemo<GridColumn[]>(
         () => {
             const built = build_layout_grid_columns(
@@ -3692,10 +3739,42 @@ export function GridShell({
         find_epoch_ref.current += 1;
     }, []);
     const find_in_flight_ref = useRef<Promise<unknown>>(Promise.resolve());
+    /**
+     * The text a Pending Column cell paints: a formula's calculated result
+     * once known (its rendered text until then), or the value.
+     */
+    const pending_column_painted_text = useCallback((display_column: number, row: number): string => {
+        const identity = projected_columns[display_column]?.identity;
+        if (identity?.kind !== 'pending') return '';
+        const target = pending_column_row_target(row);
+        const cell = target === undefined
+            ? undefined
+            : pending_columns_by_id.get(identity.pendingColumnId)?.cells[target.key];
+        if (cell === undefined || target === undefined) return '';
+        const text = pending_column_cell_text(cell);
+        if (edit_syntax !== 'markdown' || !xlsx_edit_writes_formula(cell.value, cell.valueRuns?.runs)) return text;
+        const display = formula_display_for(cell.value, cell.formulaAnchors, cell.valueEditOrder ?? 0);
+        if (display.kind === 'unrenderable') return display.result;
+        const key = pending_column_result_key(
+            formula_anchor_workbook?.worksheets[sheet_index],
+            identity.pendingColumnId,
+            target.key,
+        );
+        return (key === undefined ? undefined : formula_results_ref.current?.get(key)) ?? text;
+    }, [
+        edit_syntax,
+        formula_anchor_workbook,
+        formula_display_for,
+        pending_column_cell_text,
+        pending_column_row_target,
+        pending_columns_by_id,
+        projected_columns,
+        sheet_index,
+    ]);
     /** The text a cell paints, from the same inputs `get_cell_content` uses. */
     const find_text_at = useCallback((position: FindPosition): string => {
         const source_column = visible_source_columns[position.column];
-        if (source_column === undefined) return '';
+        if (source_column === undefined) return pending_column_painted_text(position.column, position.row);
         const projected_row = pending_projection_ref.current.row_at(position.row);
         if (projected_row !== undefined && projected_row.kind !== 'source') {
             const rendered_cell = projected_row.kind === 'removal'
@@ -3755,6 +3834,7 @@ export function GridShell({
         formula_display_for,
         get_row,
         get_source_row,
+        pending_column_painted_text,
         pending_formula_result_key_for,
         pending_rendered_rows,
         removal_rendered_rows,
@@ -5597,7 +5677,7 @@ export function GridShell({
         );
         const admitted_topology_key = [
             mapping_generation,
-            column_projection.visible_to_source.join(','),
+            column_topology_key,
             admitted_pending_topology_key,
         ].join(':');
         return new Promise((resolve) => {
@@ -5658,7 +5738,7 @@ export function GridShell({
         });
     }, [
         admit_pending_rows,
-        column_projection.visible_to_source,
+        column_topology_key,
         edit_session_id,
         mapping_generation,
         pending_store,
@@ -5996,8 +6076,11 @@ export function GridShell({
     // unreadable.
     const open_overlay_row_ref = useRef<{
         display_cell: Item;
-        source_row: number;
-        source_column: number;
+        /** Undefined for a Pending Column cell, which `pending_column` names instead. */
+        source_row: number | undefined;
+        source_column: number | undefined;
+        /** A Pending Column cell's identity, pinned until the editor closes. */
+        pending_column?: { readonly pendingColumnId: string; readonly rowKey: string };
         edit_session_id: string | undefined;
         pin: symbol;
         opened_value?: string;
@@ -6047,10 +6130,26 @@ export function GridShell({
             ? projected.sourceDisplayRow
             : display_row;
         const source_column = source_column_for_display_ref.current(loc[0]);
+        if (source_column === undefined) {
+            // A Pending Column cell: keep the identity the editor opened on, so
+            // its commit does not depend on the row's page staying resident.
+            const pending_column = pending_column_overlay_target_ref.current(loc[0], display_row);
+            if (pending_column === undefined) return;
+            overlay_admission_revoked_ref.current = false;
+            open_overlay_row_ref.current = {
+                display_cell: [loc[0], display_row],
+                source_row,
+                source_column: undefined,
+                pending_column,
+                edit_session_id: edit_session_id_ref.current,
+                pin: pin_rows_ref.current(loader_row, loader_row),
+            };
+            return;
+        }
         // Unresolved identity: nothing to remember and nothing worth pinning. The
         // overlay-open gate means this is unreachable for a real editor mount, and
         // leaving the ref null keeps the commit guards' early return intact.
-        if (source_row === undefined || source_column === undefined) return;
+        if (source_row === undefined) return;
         overlay_admission_revoked_ref.current = false;
         open_overlay_row_ref.current = {
             display_cell: [loc[0], display_row],
@@ -6137,19 +6236,17 @@ export function GridShell({
             ? captured.source_column
             : source_column_for_display(display_column);
         if (source_column === undefined) {
-            const identity = projected_columns[display_column]?.identity;
-            const target = pending_column_row_target(row);
-            if (identity?.kind !== 'pending' || target === undefined) return null;
-            const stored = pending_columns_by_id.get(identity.pendingColumnId)?.cells[target.key];
-            const original = stored === undefined
-                ? ''
-                : edit_syntax === 'markdown' && xlsx_edit_writes_formula(stored.value, stored.valueRuns?.runs)
-                    ? formula_text_for(stored.value, stored.formulaAnchors, stored.valueEditOrder ?? 0)
-                    : stored.value;
+            const target = captured_matches && captured.pending_column !== undefined
+                ? captured.pending_column
+                : pending_column_overlay_target_ref.current(display_column, row);
+            if (target === undefined) return null;
+            const original = pending_column_cell_edit_text(
+                pending_columns_by_id.get(target.pendingColumnId)?.cells[target.rowKey],
+            );
             return {
                 kind: 'pendingColumn',
-                pendingColumnId: identity.pendingColumnId,
-                rowKey: target.key,
+                pendingColumnId: target.pendingColumnId,
+                rowKey: target.rowKey,
                 value,
                 original,
             };
@@ -6220,9 +6317,8 @@ export function GridShell({
         get_cell_raw,
         pending_projection,
         pending_rendered_rows,
-        pending_column_row_target,
+        pending_column_cell_edit_text,
         pending_columns_by_id,
-        projected_columns,
         sheet_index,
         source_column_for_display,
         store,
@@ -7372,23 +7468,55 @@ export function GridShell({
             const value_cell = target === undefined ? undefined : column.cells[target.key];
             const highlight = target === undefined ? undefined : column.highlights?.[target.key];
             const editable = editable_cells && target !== undefined && target.live;
-            const value = value_cell?.value ?? '';
-            const shown = value_cell !== undefined
+            const shown = pending_column_cell_text(value_cell);
+            // An `.xlsx` formula shows its calculated result, as a Pending Row
+            // cell's does, and its rendered text in the editor; one that cannot
+            // render for the current layouts shows its error and is read-only.
+            const is_formula = value_cell !== undefined
                 && edit_syntax === 'markdown'
-                && xlsx_edit_writes_formula(value_cell.value, value_cell.valueRuns?.runs)
-                ? formula_text_for(value_cell.value, value_cell.formulaAnchors, value_cell.valueEditOrder ?? 0)
-                : value;
+                && xlsx_edit_writes_formula(value_cell.value, value_cell.valueRuns?.runs);
+            const formula = is_formula
+                ? formula_display_for(value_cell.value, value_cell.formulaAnchors, value_cell.valueEditOrder ?? 0)
+                : undefined;
+            const unrenderable = formula?.kind === 'unrenderable' ? formula : undefined;
+            const result_key = !is_formula || target === undefined
+                ? undefined
+                : pending_column_result_key(
+                    formula_anchor_workbook?.worksheets[sheet_index],
+                    identity.pendingColumnId,
+                    target.key,
+                );
+            const formula_result = !is_formula
+                ? undefined
+                : unrenderable?.result
+                    ?? (result_key === undefined ? undefined : formula_results_ref.current?.get(result_key));
+            const cell_editable = editable && unrenderable === undefined;
             const overlay: CellEditOverlay = {
-                editable,
-                refused: editable_cells && !editable,
+                editable: cell_editable,
+                refused: editable_cells && !cell_editable,
                 bg: highlight !== undefined
                     ? highlight_rgba(highlight, high_contrast)
                     : target?.live === false ? compare_row_bgs.deleted : compare_row_bgs.added,
-                ...(editable && edit_syntax === 'markdown' ? { edit_value: shown } : {}),
+                ...(cell_editable && edit_syntax === 'markdown'
+                    ? { edit_value: pending_column_cell_edit_text(value_cell) }
+                    : {}),
+                ...(!is_formula
+                    ? {}
+                    : formula_result === undefined
+                        ? { formula_result_pending: true as const }
+                        : { formula_result }),
             };
+            const runs = !is_formula && edit_syntax === 'markdown' ? value_cell?.valueRuns : undefined;
             return build_grid_cell(
                 0,
-                [{ raw: shown === '' ? null : shown, formatted: shown, bold: false, italic: false }],
+                [{
+                    raw: shown === '' ? null : shown,
+                    formatted: shown,
+                    bold: false,
+                    italic: false,
+                    ...(is_formula ? { formula: shown } : {}),
+                    ...(runs === undefined ? {} : { richText: runs }),
+                }],
                 show_formatting,
                 overlay,
                 font_size_px,
@@ -7409,8 +7537,13 @@ export function GridShell({
             get_cell_height,
             high_contrast,
             link_modifier_held,
+            formula_anchor_workbook,
+            formula_display_for,
+            pending_column_cell_edit_text,
+            pending_column_cell_text,
             pending_column_row_target,
             pending_columns_by_id,
+            sheet_index,
             projected_columns,
             show_formatting,
         ],
@@ -7891,12 +8024,21 @@ export function GridShell({
                     rest.push(item);
                     continue;
                 }
-                const target = pending_column_row_target(item.location[1]);
-                if (target === undefined || !target.live) continue;
+                // An overlay commit lands on the identity its editor opened
+                // on, never on whatever row now occupies its display cell.
+                const captured = source === 'edit'
+                    && open_overlay?.pending_column !== undefined
+                    && open_overlay.display_cell[0] === item.location[0]
+                    && open_overlay.display_cell[1] === item.location[1]
+                    ? open_overlay.pending_column
+                    : undefined;
+                const target = captured
+                    ?? pending_column_overlay_target(item.location[0], item.location[1]);
+                if (target === undefined) continue;
                 const value = item.value;
                 column_edits.push({
-                    pendingColumnId: identity.pendingColumnId,
-                    rowKey: target.key,
+                    pendingColumnId: target.pendingColumnId,
+                    rowKey: target.rowKey,
                     text: value.kind === GridCellKind.Text
                         ? value.data ?? ''
                         : value.kind === GridCellKind.Custom && is_rich_text_cell(value)
@@ -7904,7 +8046,9 @@ export function GridShell({
                             : '',
                 });
             }
-            if (column_edits.length > 0 && rest.length === 0) {
+            // A paste that admitted rows below the sheet records them in the
+            // same action, so it takes the combined path below.
+            if (column_edits.length > 0 && rest.length === 0 && pending_paste_history_ref.current === null) {
                 return commit_pending_column_cells(
                     column_edits,
                     edit_history_label(source, column_edits.length),
@@ -8124,7 +8268,7 @@ export function GridShell({
                 // captured row as well as the captured column. Other gestures use
                 // current residency, with the capture only as an eviction fallback.
                 const source_row = captured_matches
-                    ? captured.source_row
+                    ? captured.source_row ?? null
                     : targetRowIdentity?.kind === 'source'
                         ? targetRowIdentity.sourceRow
                         : resolve_source_row(target_display_row);
@@ -8383,7 +8527,8 @@ export function GridShell({
                 deferred_paste?.before ?? pending_before,
                 pending_after,
                 pending_history_rows,
-            ).concat(column_change === undefined ? [] : [column_change]);
+                column_change === undefined ? [] : [column_change],
+            );
             const source_result = edits.length > 0
                 ? commit_edits_result(
                     edits,
@@ -8506,7 +8651,7 @@ export function GridShell({
             source_column_for_display,
             commit_source_row,
             commit_pending_column_cells,
-            pending_column_row_target,
+            pending_column_overlay_target,
             plan_pending_column_text,
             projected_columns,
             save_in_flight_ref,
@@ -9042,7 +9187,8 @@ export function GridShell({
             if (cells === undefined || virtual_columns.length === 0 || row_key === undefined) return cells;
             const displayed = [...cells];
             for (const { column, pending } of virtual_columns) {
-                const value = pending.cells[row_key]?.value;
+                const cell = pending.cells[row_key];
+                const value = cell === undefined ? undefined : pending_column_cell_text(cell);
                 displayed[column] = value === undefined ? null : {
                     raw: value,
                     formatted: value,
@@ -9057,15 +9203,8 @@ export function GridShell({
             row_index: number,
         ): (RenderedCell | null)[] | undefined => {
             const projected = pending_projection.row_at(row_index);
-            const row_key = projected === undefined
-                ? undefined
-                : projected.kind === 'source'
-                    ? (projected.identity?.sourceRow ?? get_source_row(projected.sourceDisplayRow)) === undefined
-                        ? undefined
-                        : `s:${projected.identity?.sourceRow ?? get_source_row(projected.sourceDisplayRow)}`
-                    : projected.kind === 'removal'
-                        ? undefined
-                        : `p:${projected.row.id}`;
+            // The key the cell was edited under: `f:` above a promoted Header Row.
+            const row_key = pending_column_row_target(row_index)?.key;
             return with_pending_columns(get_displayed_source_row(row_index, projected), row_key);
         };
         const get_displayed_source_row = (
@@ -9168,6 +9307,8 @@ export function GridShell({
         formula_text_for,
         get_source_row,
         merge_index,
+        pending_column_cell_text,
+        pending_column_row_target,
         pending_projection,
         pending_rendered_rows,
         read_live_edit,
@@ -10178,13 +10319,16 @@ export function GridShell({
             }
             prev_pending_formula_impact_ref.current = pending_formula_impact;
         }
+        let pending_column_results_changed = false;
         if (prev_formula_results_ref.current !== formula_results) {
+            const before_size = changed.size;
             for (const [key, value] of prev_formula_results_ref.current) {
                 if (formula_results?.get(key) !== value) changed.add(key);
             }
             for (const [key, value] of formula_results ?? []) {
                 if (prev_formula_results_ref.current.get(key) !== value) changed.add(key);
             }
+            pending_column_results_changed = changed.size !== before_size;
             prev_formula_results_ref.current = formula_results ?? new Map();
         }
         if (prev_source_formula_results_ref.current !== source_formula_results) {
@@ -10202,6 +10346,19 @@ export function GridShell({
         prev_conflicted_keys_ref.current = conflicted_keys;
         const grid = grid_ref.current;
         if (!grid || changed.size === 0) return;
+        // Result keys are prospective addresses, which no source key names for
+        // a Pending Column: repaint its visible cells when any result moved.
+        const pending_column_cells: { cell: Item }[] = [];
+        if (pending_column_results_changed) {
+            const visible = visible_ref.current;
+            projected_columns.forEach((column, display_column) => {
+                if (column.identity.kind !== 'pending') return;
+                if (display_column < visible.x || display_column >= visible.x + visible.width) return;
+                for (let row = visible.y; row < visible.y + visible.height; row++) {
+                    pending_column_cells.push({ cell: [display_column, row] });
+                }
+            });
+        }
         // Dirty keys are source-keyed, so a changed key's row is a source row and
         // cannot be used as a display coordinate. source_key_damage maps source →
         // display over the visible range (handling one source row appearing at
@@ -10223,11 +10380,13 @@ export function GridShell({
                 cells.push({ cell: [display_column, display_row] });
             }
         }
+        cells.push(...pending_column_cells);
         if (cells.length > 0) grid.updateCells(cells);
     }, [
         dirty_cells,
         conflicted_keys,
         pending_formula_impact,
+        projected_columns,
         formula_results,
         source_formula_results,
         display_column_for_source,

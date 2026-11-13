@@ -156,7 +156,8 @@ export function columnMoveDropBefore(col: number, pointerX: number, colLeft: num
 
 /**
  * Fork addition: horizontal auto-scroll while a column move's pointer is within one column width of the left edge
- * (after any frozen columns) or the right edge of the viewport.
+ * (after any frozen columns) or the right edge of the viewport. Each zone is at most half the scrollable width, so a
+ * column wider than that cannot make the two overlap and reverse the drag.
  */
 export function columnMoveScrollDirection(
     pointerX: number,
@@ -164,8 +165,9 @@ export function columnMoveScrollDirection(
     viewportRight: number,
     colWidth: number
 ): -1 | 0 | 1 {
-    if (pointerX < frozenRight + colWidth) return -1;
-    if (pointerX > viewportRight - colWidth) return 1;
+    const zone = Math.min(colWidth, Math.max(0, viewportRight - frozenRight) / 2);
+    if (pointerX < frozenRight + zone) return -1;
+    if (pointerX > viewportRight - zone) return 1;
     return 0;
 }
 
@@ -179,8 +181,10 @@ export function rowMoveScrollDirection(
     viewportBottom: number,
     rowHeight: number
 ): -1 | 0 | 1 {
-    if (pointerY < headerBottom + rowHeight) return -1;
-    if (pointerY > viewportBottom - rowHeight) return 1;
+    // As for columns: each zone is at most half the body, so a tall row cannot reverse the drag.
+    const zone = Math.min(rowHeight, Math.max(0, viewportBottom - headerBottom) / 2);
+    if (pointerY < headerBottom + zone) return -1;
+    if (pointerY > viewportBottom - zone) return 1;
     return 0;
 }
 

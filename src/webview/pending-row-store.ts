@@ -1546,11 +1546,14 @@ export function discard_layout_changes(
     changes: PendingStructuralChanges,
     context: WorksheetStructureContext,
 ): StructureResult {
+    // The row arm drops the inserted rows' Pending Column cells with them, so
+    // its own transition restores them on Undo before the column arm runs.
+    const discarded = new Set(inserted_rows(changes).map((row) => `p:${row.id}`));
     const result = rows_then_columns(changes, context, {
         rowLayout: source_row_layout(context.bodyStart, body_row_count(context)),
         columnLayout: column_layout_of(changes, context),
         rows: appended_rows(changes),
-        columns: changes.pendingColumns ?? [],
+        columns: columns_without_cells(changes.pendingColumns ?? [], (key) => discarded.has(key)),
         discardedRows: inserted_rows(changes),
     });
     return without_basis_conflict(result);

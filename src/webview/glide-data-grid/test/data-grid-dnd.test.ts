@@ -4,6 +4,7 @@ import {
     columnResizeEdgeScrollDistance,
     columnResizeEdgeScrollDistanceBeforeMax,
     columnResizeEdgeScrollSpeed,
+    columnMoveScrollDirection,
     columnResizeWidthFromPointer,
     rowMoveBlockForPress,
     rowMoveDropBefore,
@@ -77,5 +78,30 @@ describe("row move", () => {
         expect(rowMoveScrollDirection(568, 36, 600, 32)).toBe(0);
         expect(rowMoveScrollDirection(569, 36, 600, 32)).toBe(1);
         expect(rowMoveScrollDirection(700, 36, 600, 32)).toBe(1);
+    });
+
+    test("never reverses a drag when a row is taller than half the viewport", () => {
+        // A 900 px row over a 564 px body: each zone is capped at half of it.
+        expect(rowMoveScrollDirection(599, 36, 600, 900)).toBe(1);
+        expect(rowMoveScrollDirection(37, 36, 600, 900)).toBe(-1);
+        expect(rowMoveScrollDirection(318, 36, 600, 900)).toBe(0);
+    });
+});
+
+describe("column move auto-scroll", () => {
+    test("scrolls within one column width of the left or right edge", () => {
+        expect(columnMoveScrollDirection(40, 32, 800, 100)).toBe(-1);
+        expect(columnMoveScrollDirection(131, 32, 800, 100)).toBe(-1);
+        expect(columnMoveScrollDirection(132, 32, 800, 100)).toBe(0);
+        expect(columnMoveScrollDirection(700, 32, 800, 100)).toBe(0);
+        expect(columnMoveScrollDirection(701, 32, 800, 100)).toBe(1);
+    });
+
+    test("never reverses a drag when a column is wider than half the viewport", () => {
+        // frozenRight 32, viewportRight 800, a 900 px column: the pointer at
+        // the right edge scrolls right, at the left edge left.
+        expect(columnMoveScrollDirection(799, 32, 800, 900)).toBe(1);
+        expect(columnMoveScrollDirection(33, 32, 800, 900)).toBe(-1);
+        expect(columnMoveScrollDirection(416, 32, 800, 900)).toBe(0);
     });
 });

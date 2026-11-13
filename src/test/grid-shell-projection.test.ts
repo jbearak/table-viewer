@@ -23,7 +23,7 @@ import {
 import { create_history_store, type HistoryStore } from '../webview/history-store';
 import { peek_history } from '../webview/history-stack-model';
 import { webview_formula_workbook } from '../webview/formula-anchor-model';
-import { EMPTY_PENDING_STRUCTURAL_CHANGES, inserted_rows } from '../pending-changes';
+import { EMPTY_PENDING_STRUCTURAL_CHANGES, inserted_rows, own_pending_structural_changes, type PendingRowCell, type StructuralBasis } from '../pending-changes';
 import { plan_pending_row_history_replay } from '../webview/pending-row-history';
 import { create_pending_row_store, keep_inserted_rows_at_end } from '../webview/pending-row-store';
 import {
@@ -9526,7 +9526,7 @@ describe('columns: Insert, Delete, Restore, Move, rename, Pending Column cells, 
             structuralBasis: basis,
             settle,
         }));
-        await render_grid(props({
+        const initial = props({
             sheet_meta: { ...props().sheet_meta, rowCount: 2, sourceRowCount: 2 },
             row_count: 2,
             column_projection: all_columns,
@@ -9540,8 +9540,14 @@ describe('columns: Insert, Delete, Restore, Move, rename, Pending Column cells, 
             history_store: history,
             on_insert_columns,
             ...overrides,
-        }));
-        return { pending, history, settle, on_insert_columns };
+        });
+        const GridShell = await render_grid(initial);
+        const rerender = async (next: Partial<GridShellProps>) => {
+            await act(async () => {
+                root!.render(React.createElement(GridShell, { ...initial, ...next }));
+            });
+        };
+        return { pending, history, settle, on_insert_columns, rerender };
     };
     const insert_right_of_first = async () => {
         await open_header_menu(0);
@@ -9627,6 +9633,313 @@ describe('columns: Insert, Delete, Restore, Move, rename, Pending Column cells, 
         const undo = plan_pending_row_history_replay(action, 'undo', () => pending.snapshot());
         if (undo.kind !== 'plan') throw new Error(undo.kind);
         expect(undo.plans[0]!.next.pendingColumns?.[0]?.cells).toEqual({});
+    });
+
+    it('records rows a Pending Column paste admitted below the sheet in the same action', async () => {
+        const on_append_rows = vi.fn(async () => ({
+            rowIds: ['host-row-1'],
+            formatTemplate: { id: 'plain', format: { kind: 'none' as const } },
+            appendBasis: { sourceRowCount: 2, provisionalStartRow: 2, columnCount: 3, schemaFingerprint: 'schema' },
+            settle: vi.fn(),
+        }));
+        const { pending, history } = await render_columns({ on_append_rows });
+        await insert_right_of_first();
+        const admit_for_paste = grid_mock.props!.onPasteRowsNeeded as (
+            count: number,
+            topology_key: unknown,
+        ) => Promise<unknown>;
+        let admitted: unknown;
+        void admit_for_paste(1, grid_mock.props!.pasteTopologyKey).then((result) => { admitted = result; });
+        // The admission polls for the grid to project its rows; let React render.
+        await vi.waitFor(async () => {
+            await act(async () => {});
+            expect(admitted).toBeDefined();
+        });
+        expect(admitted).not.toBe(false);
+        const paste = grid_mock.props!.onCellsEdited as (
+            items: readonly { location: [number, number]; value: { kind: string; data: string } }[],
+            source: string,
+        ) => unknown;
+        await act(async () => paste([
+            { location: [1, 1], value: { kind: 'text', data: 'second' } },
+            { location: [1, 2], value: { kind: 'text', data: 'below' } },
+        ], 'paste'));
+        expect(pending.snapshot().pendingColumns?.[0]?.cells).toMatchObject({
+            's:1': { value: 'second' },
+            'p:host-row-1': { value: 'below' },
+        });
+        const action = last_action(history);
+        expect(action.label).toBe('Paste');
+        // The admitted row, its column cell, then the append basis it advanced.
+        expect(action.changes.map((change) => change.kind)).toEqual(['rowAppend', 'columnLayout', 'pendingRows']);
+        const undo = plan_pending_row_history_replay(action, 'undo', () => pending.snapshot());
+        if (undo.kind !== 'plan') throw new Error(undo.kind);
+        expect(undo.plans[0]!.next.appendedRows).toEqual([]);
+        expect(undo.plans[0]!.next.pendingColumns?.[0]?.cells).toEqual({});
+        const redo = plan_pending_row_history_replay(action, 'redo', () => undo.plans[0]!.next);
+        if (redo.kind !== 'plan') throw new Error(redo.kind);
+        expect(redo.plans[0]!.next).toEqual(pending.snapshot());
+        // The paste consumed its admission: the next edit records only itself.
+        await act(async () => edit_one(grid_mock.props!.onCellsEdited)([1, 0], { kind: 'text', data: 'later' }));
+        expect(last_action(history).changes.map((change) => change.kind)).toEqual(['columnLayout']);
+    });
+
+    it('undoes and redoes a paste that clears a source formula conflict and fills a Pending Column', async () => {
+        const pending = create_pending_row_store({ session_id: 'session' });
+        expect(pending.install({ session_id: 'session' }, {
+            formatTemplates: [],
+            appendedRows: [],
+            tailRemovals: [],
+            conflicts: [{
+                reason: 'ambiguousPendingFormula',
+                pendingRowIds: [],
+                tailRemovalIds: [],
+                formulaCells: [{ rowIdentity: { kind: 'source', sourceRow: 0 }, sourceColumn: 0 }],
+            }],
+        })).toBe(true);
+        const { history } = await render_columns({ pending_row_store: pending });
+        await insert_right_of_first();
+        const paste = grid_mock.props!.onCellsEdited as (
+            items: readonly { location: [number, number]; value: { kind: string; data: string } }[],
+            source: string,
+        ) => unknown;
+        await act(async () => paste([
+            { location: [0, 0], value: { kind: 'text', data: 'resolved' } },
+            { location: [1, 0], value: { kind: 'text', data: 'new' } },
+        ], 'paste'));
+        expect(pending.snapshot().conflicts).toEqual([]);
+        const action = last_action(history);
+        expect(action.changes.map((change) => change.kind).sort()).toEqual(['cell', 'columnLayout', 'pendingRows']);
+        const undo = plan_pending_row_history_replay(action, 'undo', () => pending.snapshot());
+        if (undo.kind !== 'plan') throw new Error(undo.kind);
+        expect(undo.plans[0]!.next.conflicts).toHaveLength(1);
+        expect(undo.plans[0]!.next.pendingColumns?.[0]?.cells).toEqual({});
+        const redo = plan_pending_row_history_replay(action, 'redo', () => undo.plans[0]!.next);
+        if (redo.kind !== 'plan') throw new Error(redo.kind);
+        expect(redo.plans[0]!.next).toEqual(pending.snapshot());
+    });
+
+    const copy_pending_column = async (write_text: ReturnType<typeof vi.fn>) => {
+        Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: write_text } });
+        await open_header_menu(1);
+        await act(async () => menu_item('Copy column')!.click());
+    };
+    const xlsx_basis = {
+        kind: 'xlsx' as const,
+        worksheetPartDigest: 'w',
+        sharedStringsDigest: null,
+        stylesDigest: null,
+        workbookDigest: 'b',
+        sourceRowCount: 2,
+        sourceColumnCount: 3,
+    };
+    const with_pending_column = (cells: Record<string, PendingRowCell>, structural_basis: StructuralBasis = basis) => {
+        const pending = create_pending_row_store({ session_id: 'session' });
+        expect(pending.install({ session_id: 'session' }, {
+            formatTemplates: [],
+            appendedRows: [],
+            tailRemovals: [],
+            conflicts: [],
+            columnLayout: {
+                columns: [{ kind: 'source', sourceColumn: 0 }, { kind: 'pending', pendingColumnId: 'c1' }, { kind: 'source', sourceColumn: 1 }, { kind: 'source', sourceColumn: 2 }],
+                removedSourceColumns: [],
+                discardedPendingColumns: [],
+            },
+            pendingColumns: [{ id: 'c1', header: 'New', cells, format: { kind: 'default' }, createdOrder: 1 }],
+            structuralBasis: structural_basis,
+        })).toBe(true);
+        return pending;
+    };
+
+    it('copies a Pending Column formula as its anchors render, as the grid shows it', async () => {
+        // `=A1` committed against source column 1 (then B); the new column
+        // has since put it at C.
+        const pending = with_pending_column({ 's:1': {
+            value: '=A1',
+            formulaAnchors: { references: [{
+                start: 1,
+                end: 3,
+                corners: [{
+                    row: { kind: 'identity', row: { kind: 'source', sourceRow: 0 } },
+                    column: { kind: 'identity', column: { kind: 'source', sourceColumn: 1 } },
+                }],
+            }] },
+        } }, xlsx_basis);
+        await render_columns({
+            pending_row_store: pending,
+            edit_syntax: 'markdown',
+            structural_support: { ...supported, basis: xlsx_basis },
+            formula_anchor_workbook: webview_formula_workbook(true, [props().sheet_meta], () => pending.snapshot()),
+        });
+        const get_cell_content = grid_mock.props!.getCellContent as (cell: [number, number]) => { data?: unknown };
+        expect(JSON.stringify(get_cell_content([1, 1]))).toContain('=C1');
+        const write_text = vi.fn(async (_text: string) => {});
+        await copy_pending_column(write_text);
+        expect(write_text).toHaveBeenCalledWith('New\n\n=C1');
+    });
+
+    it('reopens a styled Pending Column cell with its markup, so an untouched commit keeps the runs', async () => {
+        const pending = with_pending_column({ 's:1': {
+            value: 'bold',
+            valueRuns: { runs: [{ text: 'bold', style: { bold: true } }] },
+        } }, xlsx_basis);
+        await render_columns({
+            pending_row_store: pending,
+            edit_syntax: 'markdown',
+            structural_support: { ...supported, basis: xlsx_basis },
+        });
+        const get_cell_content = grid_mock.props!.getCellContent as (cell: [number, number]) => {
+            data?: string | { edit_value?: string };
+            displayData?: string;
+        };
+        // The editor opens with the markup; the cell shows the plain text.
+        const opened = get_cell_content([1, 1]);
+        expect(typeof opened.data === 'string' ? opened.data : opened.data?.edit_value).toBe('**bold**');
+        const close_overlay = await open_tracking_overlay([1, 1], '**bold**');
+        try {
+            await act(async () => edit_one(grid_mock.props!.onCellsEdited)([1, 1], { kind: 'text', data: '**bold**' }));
+        } finally {
+            await close_overlay();
+        }
+        expect(pending.snapshot().pendingColumns?.[0]?.cells['s:1']).toMatchObject({
+            value: 'bold',
+            valueRuns: { runs: [{ text: 'bold', style: { bold: true } }] },
+        });
+    });
+
+    it('shows a Pending Column formula\'s calculated result, and the formula in its editor', async () => {
+        const pending = with_pending_column({ 's:1': { value: '=1+1' } }, xlsx_basis);
+        const sheet_meta = { ...props().sheet_meta, rowCount: 2, sourceRowCount: 2 };
+        const formula_anchor_workbook = webview_formula_workbook(true, [sheet_meta], () => pending.snapshot());
+        await render_columns({
+            pending_row_store: pending,
+            edit_syntax: 'markdown',
+            structural_support: { ...supported, basis: xlsx_basis },
+            formula_anchor_workbook,
+            formula_results: new Map([['1:1', '2']]),
+        });
+        const get_cell_content = grid_mock.props!.getCellContent as (cell: [number, number]) => {
+            displayData?: string;
+            data?: { edit_value?: string; display_data?: string };
+        };
+        const cell = get_cell_content([1, 1]);
+        expect(JSON.stringify(cell)).toContain('"2"');
+        expect(cell.data?.edit_value ?? (cell as { copyData?: string }).copyData).toBe('=1+1');
+    });
+
+    it('repaints a Pending Column formula when its result arrives', async () => {
+        const pending = with_pending_column({ 's:1': { value: '=1+1' } }, xlsx_basis);
+        const sheet_meta = { ...props().sheet_meta, rowCount: 2, sourceRowCount: 2 };
+        const { rerender } = await render_columns({
+            pending_row_store: pending,
+            edit_syntax: 'markdown',
+            structural_support: { ...supported, basis: xlsx_basis },
+            formula_anchor_workbook: webview_formula_workbook(true, [sheet_meta], () => pending.snapshot()),
+            formula_results: new Map(),
+        });
+        const on_visible_region_changed = grid_mock.props!.onVisibleRegionChanged as
+            (region: { x: number; y: number; width: number; height: number }) => void;
+        act(() => on_visible_region_changed({ x: 0, y: 0, width: 4, height: 2 }));
+        grid_mock.update_cells.mockClear();
+        await rerender({ formula_results: new Map([['1:1', '2']]) });
+        const damaged = grid_mock.update_cells.mock.calls.flatMap(([cells]) =>
+            (cells as { cell: [number, number] }[]).map(({ cell }) => cell.join(',')));
+        expect(damaged).toContain('1,1');
+        const get_cell_content = grid_mock.props!.getCellContent as (cell: [number, number]) => unknown;
+        expect(JSON.stringify(get_cell_content([1, 1]))).toContain('"2"');
+    });
+
+    it('finds text in a Pending Column cell', async () => {
+        const pending = with_pending_column({ 's:1': { value: 'Spain' } });
+        type GridActionsHandle = import('../webview/grid-shell').GridActionsHandle;
+        const grid_actions_ref = React.createRef<GridActionsHandle | null>() as
+            React.MutableRefObject<GridActionsHandle | null>;
+        await render_columns({ pending_row_store: pending, grid_actions_ref });
+        let result: Awaited<ReturnType<GridActionsHandle['find']>> | undefined;
+        await act(async () => {
+            result = await grid_actions_ref.current!.find('spain', 1, true);
+        });
+        expect(result).toMatchObject({ kind: 'match', position: { column: 1, row: 1 } });
+    });
+
+    it('copies a Pending Column cell on a row above a promoted Header Row by its fixed-row key', async () => {
+        // Header Row is source row 1: display row 0 is source row 0, above it.
+        grid_mock.source_row_for_display = (row) => (row === 0 ? 0 : row + 1);
+        try {
+            const pending = with_pending_column({ 'f:0': { value: 'above' }, 's:2': { value: 'body' } });
+            await render_columns({
+                pending_row_store: pending,
+                sheet_meta: {
+                    ...props().sheet_meta,
+                    rowCount: 2,
+                    sourceRowCount: 3,
+                    excelFirstRowHeader: { mode: 'on', detected: false, active: true, available: true, sourceRow: 1 },
+                },
+            });
+            const get_cell_content = grid_mock.props!.getCellContent as (cell: [number, number]) => { data?: unknown };
+            expect(JSON.stringify(get_cell_content([1, 0]))).toContain('above');
+            const write_text = vi.fn(async (_text: string) => {});
+            await copy_pending_column(write_text);
+            expect(write_text).toHaveBeenCalledWith('New\nabove\nbody');
+        } finally {
+            grid_mock.source_row_for_display = null;
+        }
+    });
+
+    it('changes the paste topology key when Pending Columns trade places', async () => {
+        const pending = create_pending_row_store({ session_id: 'session' });
+        const layout = (ids: readonly string[]) => ({
+            columns: [
+                { kind: 'source' as const, sourceColumn: 0 },
+                ...ids.map((pendingColumnId) => ({ kind: 'pending' as const, pendingColumnId })),
+                { kind: 'source' as const, sourceColumn: 1 },
+                { kind: 'source' as const, sourceColumn: 2 },
+            ],
+            removedSourceColumns: [],
+            discardedPendingColumns: [],
+        });
+        const state = (ids: readonly string[]) => ({
+            formatTemplates: [],
+            appendedRows: [],
+            tailRemovals: [],
+            conflicts: [],
+            columnLayout: layout(ids),
+            pendingColumns: ['c1', 'c2'].map((id, index) => ({
+                id, header: id, cells: {}, format: { kind: 'none' as const }, createdOrder: index + 1,
+            })),
+            structuralBasis: basis,
+        });
+        expect(pending.install({ session_id: 'session' }, state(['c1', 'c2']))).toBe(true);
+        await render_columns({ pending_row_store: pending });
+        const before = grid_mock.props!.pasteTopologyKey;
+        await act(async () => {
+            const staged = pending.stage_replace('session', pending.snapshot(), own_pending_structural_changes(state(['c2', 'c1'])));
+            staged!.commit();
+            staged!.notify();
+        });
+        expect(grid_mock.props!.pasteTopologyKey).not.toBe(before);
+    });
+
+    it('commits a Pending Column editor to the row it opened on, even after that row\'s page leaves', async () => {
+        const { pending } = await render_columns();
+        await insert_right_of_first();
+        grid_mock.pin_rows.mockClear();
+        const close_overlay = await open_tracking_overlay([1, 1], '');
+        // The editor pins the row's page for its lifetime.
+        expect(grid_mock.pin_rows).toHaveBeenCalledWith(1, 1);
+        // The page is evicted anyway: the current projection can no longer
+        // name the row.
+        grid_mock.source_row_for_display = (row) => (row === 1 ? undefined : row);
+        try {
+            await act(async () => edit_one(grid_mock.props!.onCellsEdited)([1, 1], { kind: 'text', data: 'kept' }));
+            expect(pending.snapshot().pendingColumns?.[0]?.cells).toEqual({
+                's:1': { value: 'kept', valueEditOrder: expect.any(Number) },
+            });
+        } finally {
+            grid_mock.source_row_for_display = null;
+            await close_overlay();
+        }
+        expect(grid_mock.unpin_rows).toHaveBeenCalled();
     });
 
     it('refuses the whole paste when a source cell it covers is unavailable', async () => {

@@ -3268,6 +3268,15 @@ export function attach_viewer(
     const retained_pending_append_authorities = new RetainedPendingAppendAuthorityStore(
         MAX_SAVED_APPEND_AUTHORITY_BYTES,
     );
+    // The column half: Pending Column IDs history still names (the renderer's
+    // projection, which can only narrow), and the IDs a session's ledger
+    // actually owned when it ended and history still named. Undo after a
+    // Discard replays such a column against a new session's ledger, which
+    // takes the ID only when a publication or replay names it.
+    const retained_pending_column_keys = new Set<string>();
+    const retained_pending_column_ids = new Map<string, Set<string>>();
+    const retained_pending_column_owned = (target: WorksheetTarget, id: string): boolean =>
+        retained_pending_column_ids.get(worksheet_target_key(target))?.has(id) === true;
     interface SavedAppendAuthority {
         readonly worksheet: WorksheetTarget;
         readonly appendHistoryId: string;
@@ -3771,7 +3780,8 @@ export function attach_viewer(
             ...(changes.pendingColumns ?? []).map((column) => column.id),
             ...(changes.columnLayout?.discardedPendingColumns ?? []).map((column) => column.id),
         ];
-        if (column_ids.some((id) => ledger?.ownedColumnIds.has(id) !== true)) {
+        if (column_ids.some((id) => ledger?.ownedColumnIds.has(id) !== true
+            && !retained_pending_column_owned(target, id))) {
             return 'pending-column-not-owned-by-ledger';
         }
         if (
@@ -3860,6 +3870,24 @@ export function attach_viewer(
             target,
             pending_rows(changes),
         ));
+        // A Pending Column history retained across a Discard is owned again
+        // once a publication names it (the ownership check above passed).
+        for (const id of [
+            ...(changes.pendingColumns ?? []).map((column) => column.id),
+            ...(changes.columnLayout?.discardedPendingColumns ?? []).map((column) => column.id),
+        ]) {
+            if (next_ledger?.ownedColumnIds.has(id) === true) continue;
+            next_ledger ??= {
+                ownedRowIds: new Set<string>(),
+                insertMintedRowIds: new Set<string>(),
+                ownedColumnIds: new Set<string>(),
+                templateIdByRowId: new Map<string, string>(),
+                reservedRowIds: new Map<string, number>(),
+                unsettledRequestByRowId: new Map<string, string>(),
+                sourceGeneration: core?.source_generation ?? 0,
+            };
+            next_ledger.ownedColumnIds.add(id);
+        }
 
         const provisional_ledger_basis = accepted_append_basis_for_ledger(
             next_ledger,
@@ -4206,6 +4234,12 @@ export function attach_viewer(
         for (const [key, ledger] of append_admission_ledgers) {
             if (!key.startsWith(prefix)) continue;
             const target_key = key.slice(prefix.length);
+            for (const id of ledger.ownedColumnIds) {
+                if (!retained_pending_column_keys.has(pending_append_history_key(target_key, id))) continue;
+                const retained = retained_pending_column_ids.get(target_key) ?? new Set<string>();
+                retained.add(id);
+                retained_pending_column_ids.set(target_key, retained);
+            }
             const retained_ids = [...ledger.ownedRowIds].filter((id) =>
                 retained_pending_append_keys.has(pending_append_history_key(target_key, id)));
             if (retained_ids.length > 0) {
@@ -12655,6 +12689,16 @@ export function attach_viewer(
                         accepted: false,
                     });
                 }
+                // An unsettled column grant was never installed by a renderer
+                // that can still settle it: release its IDs, as for rows.
+                for (const [requestId, reservation] of [...column_admission_reservations]) {
+                    settle_row_admission({
+                        type: 'settleRowAdmission',
+                        requestId,
+                        editSessionId: reservation.editSessionId,
+                        accepted: false,
+                    });
+                }
                 active_edit_session_request = undefined;
                 cancel_edit_claim(active_edit_claim);
                 // A reloaded renderer has no history — it is session-scoped and
@@ -13573,6 +13617,8 @@ export function attach_viewer(
                 const retained_pending = new Set<string>();
                 let retained_count = 0;
                 let retained_pending_count = 0;
+                const retained_columns = new Set<string>();
+                let retained_column_count = 0;
                 for (const raw of msg.authorities) {
                     if (!is_plain_record(raw) || !Array.isArray(raw.appendHistoryIds)) return;
                     const requested_target = sanitized_wire_worksheet_target(raw);
@@ -13596,6 +13642,22 @@ export function attach_viewer(
                     }
                     if (raw.pendingRowIds !== undefined && !Array.isArray(raw.pendingRowIds)) {
                         return;
+                    }
+                    if (raw.pendingColumnIds !== undefined && !Array.isArray(raw.pendingColumnIds)) {
+                        return;
+                    }
+                    for (const id of raw.pendingColumnIds ?? []) {
+                        retained_column_count += 1;
+                        if (
+                            retained_column_count > MAX_SAVED_APPEND_AUTHORITIES
+                            || typeof id !== 'string'
+                            || id.length === 0
+                            || id.length > MAX_PENDING_ROW_ID_LENGTH
+                        ) return;
+                        retained_columns.add(pending_append_history_key(
+                            worksheet_target_key(target),
+                            id,
+                        ));
                     }
                     for (const id of raw.pendingRowIds ?? []) {
                         retained_pending_count += 1;
@@ -13627,6 +13689,14 @@ export function attach_viewer(
                 }
                 retained_pending_append_keys.clear();
                 for (const key of retained_pending) retained_pending_append_keys.add(key);
+                retained_pending_column_keys.clear();
+                for (const key of retained_columns) retained_pending_column_keys.add(key);
+                for (const [target_key, ids] of [...retained_pending_column_ids]) {
+                    for (const id of [...ids]) {
+                        if (!retained_columns.has(pending_append_history_key(target_key, id))) ids.delete(id);
+                    }
+                    if (ids.size === 0) retained_pending_column_ids.delete(target_key);
+                }
                 for (const [target_key, authorities] of retained_pending_append_authorities.entries()) {
                     for (const id of [...authorities.keys()]) {
                         if (!retained_pending.has(pending_append_history_key(target_key, id))) {

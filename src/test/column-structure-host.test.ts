@@ -277,6 +277,27 @@ describe('column insert admission', () => {
         await viewer.dispose();
     });
 
+    it('releases an unsettled column reservation when the renderer reloads, so the slot and Save are free', async () => {
+        const viewer = await open_viewer();
+        const reply = await viewer.insert({ requestId: 'cols' });
+        expect(reply.granted).toBe(true);
+        // The renderer reloads before it settles the grant.
+        await viewer.panel.__receive({ type: 'ready', structuralLayout: 1 });
+        await viewer.panel.__receive({ type: 'requestEditSession', requestId: 'edit-2' });
+        await viewer.controller.drain();
+        const rows = await viewer.insert({ requestId: 'rows', axis: 'rows', anchor: { row: { kind: 'source', sourceRow: 0 } } });
+        expect(rows.reason).toBeUndefined();
+        expect(rows.granted).toBe(true);
+        await viewer.settle('rows', false);
+        expect(await viewer.insert({ requestId: 'cols-2' })).toMatchObject({ granted: true });
+        await viewer.settle('cols-2', false);
+        // The released IDs were never installed, so they stay unpublishable.
+        expect(await viewer.publish(inserted_changes(reply.columnIds!))).toBe(false);
+        expect(await viewer.save({})).toMatchObject({ success: true });
+        expect(viewer.warning).not.toHaveBeenCalledWith(UNSETTLED_ADMISSION_SAVE_MESSAGE);
+        await viewer.dispose();
+    });
+
     it('refuses a save while a column admission is unsettled', async () => {
         const viewer = await open_viewer();
         const reply = await viewer.insert({ requestId: 'cols' });
@@ -326,6 +347,92 @@ describe('column insert admission', () => {
         expect((await stale.insert({ requestId: 'stale' })).reason)
             .toMatch(/changed on disk after you inserted, deleted, or moved rows or columns/);
         await stale.dispose();
+    });
+});
+
+describe('Pending Columns reachable only from history', () => {
+    const retain = (viewer: Awaited<ReturnType<typeof open_viewer>>, pendingColumnIds: readonly string[]) =>
+        viewer.panel.__receive({
+            type: 'retainedSavedAppendAuthoritiesChanged',
+            authorities: [{ sheetIndex: 0, sheetName: 'Sheet1', appendHistoryIds: [], pendingRowIds: [], pendingColumnIds }],
+        });
+
+    async function prepare_replay(viewer: Awaited<ReturnType<typeof open_viewer>>, id: string, desired: Partial<WorksheetPendingEdits>) {
+        const empty = { formatTemplates: [], appendedRows: [], tailRemovals: [], conflicts: [] };
+        await viewer.panel.__receive({
+            type: 'prepareHistoryReplay',
+            request: {
+                requestId: `${id}-prepare`,
+                replayId: id,
+                cells: [],
+                highlights: [],
+                structures: [{
+                    ordinal: 0,
+                    worksheet: { sheetIndex: 0, sheetName: 'Sheet1' },
+                    expected: empty,
+                    desired: { ...empty, ...desired },
+                }],
+                focus: {
+                    worksheet: { sheetIndex: 0, sheetName: 'Sheet1' },
+                    sourceRowStart: 0,
+                    sourceRowEnd: 0,
+                    sourceColumnStart: 0,
+                    sourceColumnEnd: 0,
+                },
+            },
+        });
+        await viewer.controller.drain();
+        await vi.waitFor(() => expect(viewer.messages().some((message) =>
+            (message.type === 'historyReplayPrepared' || message.type === 'historyReplayPrepareRefused')
+            && JSON.stringify(message).includes(id))).toBe(true));
+        return viewer.messages().some((message) =>
+            message.type === 'historyReplayPrepared' && JSON.stringify(message).includes(id));
+    }
+
+    async function new_session(viewer: Awaited<ReturnType<typeof open_viewer>>, request_id: string) {
+        await viewer.panel.__receive({ type: 'releaseEditSession', editSessionId: viewer.last<{ editSessionId: string }>('editSessionResult').editSessionId });
+        await viewer.controller.drain();
+        await viewer.panel.__receive({ type: 'requestEditSession', requestId: request_id });
+        await viewer.controller.drain();
+        expect(viewer.last<{ granted: boolean }>('editSessionResult').granted).toBe(true);
+    }
+
+    it('replays a discarded Pending Column into a new session while history retains it', async () => {
+        const viewer = await open_viewer();
+        const reply = await viewer.insert({ requestId: 'cols' });
+        await viewer.settle('cols', true);
+        const changes = inserted_changes(reply.columnIds!);
+        expect(await viewer.publish(changes)).toBe(true);
+        await retain(viewer, reply.columnIds!);
+        // Discard: the durable changes go, and the session ends.
+        expect(await viewer.publish({})).toBe(true);
+        await new_session(viewer, 'again');
+        // Undo brings the column back against the new session's ledger.
+        expect(await prepare_replay(viewer, 'undo-discard', changes)).toBe(true);
+        expect(await viewer.publish(changes)).toBe(true);
+        expect(viewer.durable().pendingEdits?.[0]?.pendingColumns?.map((column) => column.id)).toEqual(reply.columnIds);
+        await viewer.dispose();
+    });
+
+    it('does not widen ownership: an ID history names but no session owned, or one history let go, stays refused', async () => {
+        const viewer = await open_viewer();
+        const reply = await viewer.insert({ requestId: 'cols' });
+        await viewer.settle('cols', true);
+        const changes = inserted_changes(reply.columnIds!);
+        expect(await viewer.publish(changes)).toBe(true);
+        // History names a foreign ID alongside the real one.
+        await retain(viewer, [...reply.columnIds!, 'insert-column:forged']);
+        expect(await viewer.publish({})).toBe(true);
+        await new_session(viewer, 'again');
+        const forged = inserted_changes(['insert-column:forged']);
+        expect(await prepare_replay(viewer, 'forged', forged)).toBe(false);
+        expect(await viewer.publish(forged)).toBe(false);
+        // History drops the column (its actions fell off the stack): the
+        // retained authority goes with it.
+        await retain(viewer, []);
+        expect(await prepare_replay(viewer, 'dropped', changes)).toBe(false);
+        expect(await viewer.publish(changes)).toBe(false);
+        await viewer.dispose();
     });
 });
 

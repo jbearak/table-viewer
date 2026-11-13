@@ -3735,6 +3735,8 @@ export type WebviewMessage =
             readonly appendHistoryIds: readonly string[];
             /** Unsaved temporary identities reachable from Undo/Redo history. */
             readonly pendingRowIds?: readonly string[];
+            /** Pending Column IDs reachable from Undo/Redo history. */
+            readonly pendingColumnIds?: readonly string[];
         })[];
     }
     // User-facing warning raised inside the webview (e.g. a clipped copy) that

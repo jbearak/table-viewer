@@ -607,15 +607,24 @@ export function plan_pending_column_cells(
     const columns = [...(changes.pendingColumns ?? [])];
     const index_of = new Map(columns.map((column, index) => [column.id, index]));
     const before_by_id = new Map<string, PendingColumn>();
+    // Each column's cell map is copied once per batch, not once per edit: a
+    // large paste into one column stays linear.
+    const cells_by_index = new Map<number, Record<string, PendingRowCell>>();
     for (const edit of edits) {
         const index = index_of.get(edit.pendingColumnId);
         if (index === undefined) continue;
         const column = columns[index]!;
         if (!before_by_id.has(column.id)) before_by_id.set(column.id, column);
-        const cells: Record<string, PendingRowCell> = { ...column.cells };
+        let cells = cells_by_index.get(index);
+        if (cells === undefined) {
+            cells = { ...column.cells };
+            cells_by_index.set(index, cells);
+        }
         if (edit.cell === undefined) delete cells[edit.rowKey];
         else cells[edit.rowKey] = edit.cell;
-        columns[index] = { ...column, cells };
+    }
+    for (const [index, cells] of cells_by_index) {
+        columns[index] = { ...columns[index]!, cells };
     }
     const transitions = [...before_by_id].flatMap(([id, before]) => {
         const after = columns[index_of.get(id)!]!;

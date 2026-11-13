@@ -480,6 +480,22 @@ export function prospective_formula_targets(
  * `row:column` in a prospective request, or `undefined` when it has none (a
  * removed row or column); its source `row:column` otherwise.
  */
+/**
+ * The key a Pending Column cell's calculation result is stored under: its
+ * prospective row and column, as `prospective_formula_request` targets it.
+ * Undefined when the cell has no prospective place (its row was removed).
+ */
+export function pending_column_result_key(
+    worksheet: AnchorWorksheet | undefined,
+    pending_column_id: string,
+    row_key: string,
+): string | undefined {
+    if (worksheet === undefined) return undefined;
+    const row = prospective_row_of_key(worksheet, row_key);
+    const column = prospective_column_of(worksheet, { kind: 'pending', pendingColumnId: pending_column_id });
+    return row === undefined || column === undefined ? undefined : `${row}:${column}`;
+}
+
 export function formula_result_key(
     worksheet: AnchorWorksheet | undefined,
     prospective: boolean,

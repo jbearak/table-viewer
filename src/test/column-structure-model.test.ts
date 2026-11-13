@@ -365,6 +365,8 @@ describe('Pending Column content', () => {
             { pendingColumnId: 'missing', rowKey: 's:0', cell: { value: 'ignored' } },
         ])!;
         expect(plan.next.pendingColumns?.[0]?.cells).toEqual({ 's:0': { value: 'Spain' }, 's:1': { value: 'second' } });
+        // One copy per column per batch, and never the input's own map.
+        expect(before.pendingColumns?.[0]?.cells).toEqual({});
         expect(plan.change.kind).toBe('columnLayout');
         round_trip(before, own_pending_structural_changes(plan.next), 'Edit cell', [plan.change]);
         const cleared = plan_pending_column_cells(plan.next, worksheet, [
@@ -534,6 +536,28 @@ describe('Discard row and column changes, and Keep new rows at the end, with col
         expect(result.outcome.next.rowLayout).toBeUndefined();
         expect(result.outcome.next.columnLayout).toBeUndefined();
         expect(result.outcome.next.structuralBasis).toBeUndefined();
+        round_trip(rows, result.outcome.next, 'Discard row and column changes on data', changes);
+    });
+
+    it('discards inserted rows that hold Pending Column cells, and Undo brings the cells back', () => {
+        const columns = inserted();
+        const rows = own_pending_structural_changes({
+            ...columns,
+            formatTemplates: [{ id: 'plain', format: { kind: 'none' } }],
+            appendedRows: [{ id: 'ins', origin: 'insert', cells: { 0: { value: 'row' } }, formatTemplateId: 'plain', createdOrder: 1 }],
+            rowLayout: {
+                runs: [{ kind: 'source', start: 0, count: 1 }, { kind: 'pending', ids: ['ins'] }, { kind: 'source', start: 1, count: 3 }],
+                removedSourceRows: [],
+                discardedPendingRows: [],
+            },
+            pendingColumns: [{ ...columns.pendingColumns![0]!, cells: { 'p:ins': { value: 'typed' }, 's:0': { value: 'kept' } } }],
+        });
+        const result = discard_layout_changes(rows, context());
+        if (!result.ok) throw new Error(result.refusal.message);
+        const changes = [result.outcome.change, ...(result.outcome.additionalChanges ?? [])];
+        expect(changes.map((change) => change.kind)).toEqual(['rowLayout', 'columnLayout']);
+        expect(result.outcome.next.appendedRows).toEqual([]);
+        expect(result.outcome.next.pendingColumns).toBeUndefined();
         round_trip(rows, result.outcome.next, 'Discard row and column changes on data', changes);
     });
 

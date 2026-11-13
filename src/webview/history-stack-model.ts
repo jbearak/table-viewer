@@ -2631,18 +2631,36 @@ export interface RetainedSavedAppendAuthority extends WorksheetTarget {
 
 export interface RetainedPendingRowAuthority extends WorksheetTarget {
     readonly pendingRowIds: readonly string[];
+    readonly pendingColumnIds: readonly string[];
 }
 
-/** Temporary row identities still reachable from either history stack. */
+/** Temporary row and Pending Column identities still reachable from either history stack. */
 export function retained_pending_row_authorities(
     state: HistoryStackState,
 ): readonly RetainedPendingRowAuthority[] {
-    const groups = new Map<string, { worksheet: WorksheetTarget; ids: Set<string> }>();
-    const retain = (worksheet: WorksheetTarget, id: string): void => {
+    const groups = new Map<string, { worksheet: WorksheetTarget; ids: Set<string>; columns: Set<string> }>();
+    const group_of = (worksheet: WorksheetTarget) => {
         const key = worksheet_target_key(worksheet);
-        const group = groups.get(key) ?? { worksheet, ids: new Set<string>() };
-        group.ids.add(id);
+        const group = groups.get(key) ?? { worksheet, ids: new Set<string>(), columns: new Set<string>() };
         groups.set(key, group);
+        return group;
+    };
+    const retain = (worksheet: WorksheetTarget, id: string): void => {
+        group_of(worksheet).ids.add(id);
+    };
+    // Undo can bring back any Pending Column a gesture created, edited, or
+    // discarded, and a discarded column's tombstone still names its ID.
+    const retain_columns = (
+        worksheet: WorksheetTarget,
+        columns: readonly { readonly id: string }[] | undefined,
+        layout: ColumnLayout | null | undefined,
+    ): void => {
+        const group = group_of(worksheet);
+        for (const column of columns ?? []) group.columns.add(column.id);
+        for (const entry of layout?.columns ?? []) {
+            if (entry.kind === 'pending') group.columns.add(entry.pendingColumnId);
+        }
+        for (const column of layout?.discardedPendingColumns ?? []) group.columns.add(column.id);
     };
     for (const entry of [...state.undoStack, ...state.redoStack]) {
         for (const change of entry.action.changes) {
@@ -2659,12 +2677,20 @@ export function retained_pending_row_authorities(
                         retain(change.delta.worksheet, row.id);
                     }
                 }
+                for (const side of [change.delta.before, change.delta.after]) {
+                    retain_columns(change.delta.worksheet, side.pendingColumns, side.columnLayout);
+                }
             } else if (change.kind === 'rowLayout' || change.kind === 'columnLayout') {
                 // Undo can bring back any row the gesture created or discarded,
                 // and a discarded Pending Inserted Row's tombstone still names
                 // its ID, so each keeps its admission alive.
                 for (const transition of change.delta.pendingRows) {
                     retain(change.delta.worksheet, transition.id);
+                }
+                retain_columns(change.delta.worksheet, change.delta.pendingColumns, undefined);
+                if (change.kind === 'columnLayout') {
+                    retain_columns(change.delta.worksheet, undefined, change.delta.before);
+                    retain_columns(change.delta.worksheet, undefined, change.delta.after);
                 }
                 if (change.kind === 'rowLayout') {
                     for (const layout of [change.delta.before, change.delta.after]) {
@@ -2676,9 +2702,10 @@ export function retained_pending_row_authorities(
             }
         }
     }
-    return Object.freeze([...groups.values()].map(({ worksheet, ids }) => Object.freeze({
+    return Object.freeze([...groups.values()].map(({ worksheet, ids, columns }) => Object.freeze({
         ...worksheet,
         pendingRowIds: Object.freeze([...ids]),
+        pendingColumnIds: Object.freeze([...columns]),
     })));
 }
 
