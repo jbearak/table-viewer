@@ -296,6 +296,15 @@ const SAVE_WINDOW = 10_000;
  */
 const IN_FLIGHT_STRUCTURAL_SAVES = new Set<string>();
 
+/**
+ * Test seam: forget every in-flight structural save, as a process that died
+ * mid-save would. Tests that simulate a stop after each step use it before
+ * reopening the file in a new controller.
+ */
+export function forget_in_flight_structural_saves_for_tests(): void {
+    IN_FLIGHT_STRUCTURAL_SAVES.clear();
+}
+
 const UNRESOLVED_STRUCTURAL_SAVE_EDIT_MESSAGE =
     "Choose whether your last save finished before editing this file.";
 
