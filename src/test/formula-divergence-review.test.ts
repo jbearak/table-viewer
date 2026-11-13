@@ -6,11 +6,16 @@ import { describe, expect, it } from 'vitest';
 import type { ColumnWindow, DataSource, RenderedCell, WorkbookMeta } from '../data-source/interface';
 import { EMPTY_PENDING_STRUCTURAL_CHANGES, type PendingStructuralChanges } from '../pending-changes';
 import { delete_rows, move_rows, type WorksheetStructureContext } from '../webview/pending-row-store';
-import type { FormulaCalculationLayout } from '../formula-calculation';
+import { formula_calculation_workbook, type FormulaCalculationLayout } from '../formula-calculation';
+import { formula_anchor_context } from '../formula-anchor-layout';
+import { anchor_formula } from '../formula-anchors';
+import { insert_rows as insert_layout_rows, source_row_layout } from '../worksheet-layout';
 import {
     MAX_FORMULA_DIVERGENCE_ITEMS,
     formula_divergence_class,
     review_formula_divergence,
+    review_formula_impact,
+    review_formula_impact_cooperatively,
 } from '../formula-divergence-review';
 
 function value(raw: string): RenderedCell {
@@ -166,5 +171,67 @@ describe('review_formula_divergence', () => {
         expect(formula_divergence_class('tombstoneCorner')).toBe('refilled');
         expect(formula_divergence_class('discardedCorner')).toBe('discarded');
         expect(formula_divergence_class('unadjustable')).toBe('unadjustable');
+    });
+});
+
+describe('review_formula_impact', () => {
+    it('counts formulas a discard turns to #REF! and those it points at different rows', () => {
+        // Data: a Pending Inserted Row `p1` after worksheet row 2.
+        const inserted = insert_layout_rows(source_row_layout(1, 6), { kind: 'source', sourceRow: 1 }, 'after', ['p1']);
+        if (!inserted.ok) throw new Error(inserted.refusal.message);
+        const before_layouts: FormulaCalculationLayout[] = [
+            { bodyStart: 1, rowLayout: inserted.layout, band: [] },
+            layout_of(undefined, 0),
+        ];
+        const source = workbook();
+        // Summary!A3 now names the inserted row, Data!A3, by its identity.
+        const anchored = anchor_formula(
+            '=Data!A3',
+            formula_anchor_context(formula_calculation_workbook(source.meta().sheets, before_layouts), 1),
+        );
+        if (anchored.kind !== 'anchored') throw new Error('not anchored');
+        const edit = {
+            sheetIndex: 1,
+            row: 2,
+            column: 0,
+            value: '=Data!A3',
+            writesFormula: true,
+            ...(anchored.anchors === undefined ? {} : { formulaAnchors: anchored.anchors }),
+        };
+        const impact = review_formula_impact(
+            source,
+            { edits: [edit], layouts: before_layouts },
+            { edits: [edit], layouts: [layout_of(undefined, 1), layout_of(undefined, 0)] },
+        );
+        // Summary!A3 shows #REF!; Data!C2, Data!C7, Summary!A1, and Summary!A2
+        // lose the inserted row and render one row up.
+        expect(impact).toEqual({ ref: 1, moved: 4 });
+        // Nothing changes when the layouts do not.
+        expect(review_formula_impact(
+            source,
+            { edits: [edit], layouts: before_layouts },
+            { edits: [edit], layouts: before_layouts },
+        )).toEqual({ ref: 0, moved: 0 });
+    });
+
+    it('yields between slices and stops once cancelled', async () => {
+        const source = workbook(2_500);
+        const before = { edits: [], layouts: [layout_of(moved(), 1), layout_of(undefined, 0)] };
+        const after = { edits: [], layouts: [layout_of(undefined, 1), layout_of(undefined, 0)] };
+        let yields = 0;
+        const impact = await review_formula_impact_cooperatively(source, before, after, {
+            isCancelled: () => false,
+            workSliceMs: 0,
+            yieldControl: async () => { yields += 1; },
+        });
+        expect(impact).toEqual(review_formula_impact(source, before, after));
+        expect(impact!.moved).toBeGreaterThan(2_500);
+        expect(yields).toBeGreaterThan(0);
+        let cancelled = false;
+        expect(await review_formula_impact_cooperatively(source, before, after, {
+            isCancelled: () => cancelled,
+            workSliceMs: 0,
+            yieldControl: async () => { cancelled = true; },
+        })).toBeUndefined();
     });
 });

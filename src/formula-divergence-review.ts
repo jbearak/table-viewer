@@ -17,6 +17,7 @@ import {
 } from './formula-calculation';
 import {
     formula_anchor_context,
+    prospective_cell_at,
     prospective_column_of,
     prospective_row_of,
 } from './formula-anchor-layout';
@@ -194,7 +195,10 @@ export function review_formula_divergence(
     edits: readonly FormulaCalculationEdit[],
     layouts: readonly FormulaCalculationLayout[],
 ): FormulaDivergenceReview {
-    const steps = review_steps(source, edits, layouts);
+    return run_to_end(review_steps(source, edits, layouts));
+}
+
+function run_to_end<T>(steps: Generator<void, T, void>): T {
     let step = steps.next();
     while (!step.done) step = steps.next();
     return step.value;
@@ -207,7 +211,13 @@ export async function review_formula_divergence_cooperatively(
     layouts: readonly FormulaCalculationLayout[],
     schedule: FormulaCalculationSchedule,
 ): Promise<FormulaDivergenceReview | undefined> {
-    const steps = review_steps(source, edits, layouts);
+    return run_cooperatively(review_steps(source, edits, layouts), schedule);
+}
+
+async function run_cooperatively<T>(
+    steps: Generator<void, T, void>,
+    schedule: FormulaCalculationSchedule,
+): Promise<T | undefined> {
     const work_slice_ms = Math.max(0, schedule.workSliceMs ?? 8);
     const yield_control = schedule.yieldControl ?? (() => new Promise<void>((resolve) => {
         globalThis.setTimeout(resolve, 0);
@@ -225,4 +235,129 @@ export async function review_formula_divergence_cooperatively(
         step = steps.next();
     }
     return schedule.isCancelled() ? undefined : step.value;
+}
+
+// --- Action impact ------------------------------------------------------------
+
+/** One workbook state: the calculator's prospective edits and layouts. */
+export interface FormulaImpactState {
+    readonly edits: readonly FormulaCalculationEdit[];
+    readonly layouts: readonly FormulaCalculationLayout[];
+}
+
+/** What an action would do to the workbook's formulas. */
+export interface FormulaImpact {
+    /** Formulas that render `#REF!` after the action and did not before. */
+    readonly ref: number;
+    /** Other formulas whose rendered text changes: they point at different rows or columns. */
+    readonly moved: number;
+}
+
+/**
+ * Compare every formula of the workbook as it renders in `before` and in
+ * `after`, matched by the row and column identities of its cell, so a cell a
+ * layout renumbers is still the same cell. Formulas only one state holds
+ * (on a row or column the action drops) are not counted. "4 formulas will
+ * show #REF! and 12 will point at different rows."
+ */
+function* impact_steps(
+    source: DataSource,
+    before: FormulaImpactState,
+    after: FormulaImpactState,
+): Generator<void, FormulaImpact, void> {
+    const sheets = source.meta().sheets;
+    function* rendered(state: FormulaImpactState): Generator<void, Map<string, string>, void> {
+        const workbook = formula_calculation_workbook(sheets, state.layouts);
+        const out = new Map<string, string>();
+        const key_at = (sheet_index: number, row: number, column: number): string | undefined => {
+            const cell = prospective_cell_at(workbook.worksheets[sheet_index]!, row, column);
+            if (cell === undefined) return undefined;
+            const row_key = cell.row.kind === 'fixed'
+                ? `s:${cell.row.sourceRow}`
+                : cell.row.kind === 'source' ? `s:${cell.row.sourceRow}` : `p:${cell.row.pendingRowId}`;
+            const column_key = cell.column.kind === 'source'
+                ? `s:${cell.column.sourceColumn}`
+                : `p:${cell.column.pendingColumnId}`;
+            return `${sheet_index}|${row_key}|${column_key}`;
+        };
+        const render = (sheet_index: number, text: string, anchors: FormulaCalculationEdit['formulaAnchors']) => {
+            try {
+                const result = render_formula(text, anchors, formula_anchor_context(workbook, sheet_index));
+                return result.kind === 'rendered' ? result.text : text;
+            } catch {
+                return text;
+            }
+        };
+        const edited = new Set<string>();
+        for (const edit of state.edits) {
+            const key = key_at(edit.sheetIndex, edit.row, edit.column);
+            if (key === undefined) continue;
+            edited.add(key);
+            if (edit.writesFormula) out.set(key, render(edit.sheetIndex, edit.value, edit.formulaAnchors));
+        }
+        let since_yield = 0;
+        for (let sheet_index = 0; sheet_index < sheets.length; sheet_index += 1) {
+            const cells = sheets[sheet_index]!.formulaCells ?? [];
+            const worksheet = workbook.worksheets[sheet_index]!;
+            for (let offset = 0; offset + 1 < cells.length;) {
+                const source_row = cells[offset]!;
+                const columns: number[] = [];
+                while (offset + 1 < cells.length && cells[offset] === source_row) {
+                    columns.push(cells[offset + 1]!);
+                    offset += 2;
+                }
+                if (prospective_row_of(worksheet, { kind: 'source', sourceRow: source_row }) === undefined) continue;
+                const live = columns.filter((column) => {
+                    const key = `${sheet_index}|s:${source_row}|s:${column}`;
+                    return !edited.has(key)
+                        && prospective_column_of(worksheet, { kind: 'source', sourceColumn: column }) !== undefined;
+                });
+                if (live.length === 0) continue;
+                const read = source.read_canonical_columns?.(sheet_index, source_row, 1, live)
+                    ?? read_source_columns(source, sheet_index, source_row, 1, live);
+                live.forEach((column, index) => {
+                    const text = read.rows[0]?.[index]?.formula;
+                    if (text !== undefined) {
+                        out.set(`${sheet_index}|s:${source_row}|s:${column}`, render(sheet_index, text, undefined));
+                    }
+                });
+                since_yield += live.length;
+                if (since_yield >= FORMULAS_PER_STEP) {
+                    since_yield = 0;
+                    yield;
+                }
+            }
+        }
+        return out;
+    }
+    const was = yield* rendered(before);
+    const will = yield* rendered(after);
+    let ref = 0;
+    let moved = 0;
+    for (const [key, text] of will) {
+        const previous = was.get(key);
+        if (previous === undefined || previous === text) continue;
+        if (text.includes('#REF!') && !previous.includes('#REF!')) ref += 1;
+        else moved += 1;
+    }
+    return Object.freeze({ ref, moved });
+}
+
+/** Synchronous form, for tests. */
+export function review_formula_impact(
+    source: DataSource,
+    before: FormulaImpactState,
+    after: FormulaImpactState,
+): FormulaImpact {
+    return run_to_end(impact_steps(source, before, after));
+}
+
+/** The impact, yielding between slices like the review; `undefined` once cancelled. */
+export function review_formula_impact_cooperatively(
+    source: DataSource,
+    before: FormulaImpactState,
+    after: FormulaImpactState,
+    schedule: FormulaCalculationSchedule,
+): Promise<FormulaImpact | undefined> {
+    return run_cooperatively(impact_steps(source, before, after), schedule);
 }

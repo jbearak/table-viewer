@@ -390,3 +390,10 @@ describe('CsvDataSource', () => {
         });
     });
 });
+
+describe('CsvDataSource.shortestRecordWidth', () => {
+    it('is the field count of the shortest record, the header line included', () => {
+        expect(new CsvDataSource(enc('a,b,c\n1,2\n3,4,5\n'), ',', 100).shortestRecordWidth).toBe(2);
+        expect(new CsvDataSource(enc('a,b,c\n1,2,3\n'), ',', 100).shortestRecordWidth).toBe(3);
+    });
+});

@@ -11,6 +11,7 @@ import {
     type PendingStructuralChanges,
 } from '../pending-changes';
 import {
+    has_live_column_layout_change,
     index_column_layout,
     moved_source_columns,
     moved_source_rows,
@@ -20,6 +21,7 @@ import {
     FORMULA_DIVERGENCE_CLASSES,
     type FormulaDivergenceClass,
     type FormulaDivergenceItem,
+    type FormulaImpact,
 } from '../formula-divergence-review';
 
 export interface WorksheetStructureCounts {
@@ -178,4 +180,37 @@ export function divergence_cell_label(sheet_name: string, row: number, column: n
         ? sheet_name
         : `'${sheet_name.replace(/'/g, "''")}'`;
     return `${quoted}!${letters}${row + 1}`;
+}
+
+/**
+ * The structural conflict notice's count for one action, before the user
+ * chooses: "4 formulas will show #REF! and 12 will point at different rows."
+ * Undefined when the action changes no formula.
+ */
+export function formula_impact_text(impact: FormulaImpact): string | undefined {
+    const formulas = (count: number) => `${count.toLocaleString('en-US')} ${count === 1 ? 'formula' : 'formulas'}`;
+    if (impact.ref > 0 && impact.moved > 0) {
+        return `${formulas(impact.ref)} will show #REF! and ${impact.moved.toLocaleString('en-US')} will point at different rows.`;
+    }
+    if (impact.ref > 0) return `${formulas(impact.ref)} will show #REF!.`;
+    if (impact.moved > 0) return `${formulas(impact.moved)} will point at different rows.`;
+    return undefined;
+}
+
+/**
+ * Review Changes' padding note for a CSV or TSV worksheet (design "CSV and
+ * TSV"): a column change writes every record at the prospective width, so a
+ * record shorter than it is padded. Undefined without a live column change,
+ * or when no record is shorter.
+ */
+export function short_rows_note(
+    changes: Pick<PendingStructuralChanges, 'columnLayout'>,
+    shortest_row_width: number | undefined,
+): string | undefined {
+    const layout = changes.columnLayout;
+    if (layout === undefined || shortest_row_width === undefined || !has_live_column_layout_change(layout)) {
+        return undefined;
+    }
+    const width = index_column_layout(layout).liveCount;
+    return shortest_row_width < width ? `Short rows will be padded to ${width} columns.` : undefined;
 }

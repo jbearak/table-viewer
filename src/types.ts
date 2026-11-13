@@ -83,7 +83,11 @@ import type {
     FormulaCalculationLayout,
     FormulaCalculationResult,
 } from './formula-calculation';
-import type { FormulaDivergenceReview } from './formula-divergence-review';
+import type {
+    FormulaDivergenceReview,
+    FormulaImpact,
+    FormulaImpactState,
+} from './formula-divergence-review';
 
 export interface WorkbookData {
     sheets: SheetData[];
@@ -3444,6 +3448,13 @@ export type HostMessage =
     | { type: 'formulaCalculation'; requestId: string; sourceGeneration: number; results: readonly FormulaCalculationResult[] }
     /** Review Changes' divergence list; `null` when the request was refused. */
     | { type: 'formulaDivergence'; requestId: string; sourceGeneration: number; review: FormulaDivergenceReview | null }
+    /** Per salvage action, how many formulas it would turn to `#REF!` or point elsewhere; `null` when refused. */
+    | {
+        type: 'formulaImpact';
+        requestId: string;
+        sourceGeneration: number;
+        impacts: { readonly keep?: FormulaImpact; readonly discard?: FormulaImpact } | null;
+    }
     /** Git compare mode: sparse positional diff for the same page a rowData
      *  answered. `rowStatus[i]` describes row `startRow + i`; `changedCells`
      *  carries original raw (`base`) and formatted text for differing cells. */
@@ -3673,6 +3684,18 @@ export type WebviewMessage =
      * Review Changes asks which formulas might render differently from Excel
      * for these layouts. `edits` are the calculator's prospective edits.
      */
+    /**
+     * The structural conflict notice asks what each salvage action would do
+     * to the workbook's formulas: `before` is now, each action its result.
+     */
+    | {
+        type: 'requestFormulaImpact';
+        requestId: string;
+        sourceGeneration: number;
+        before: FormulaImpactState;
+        keep?: FormulaImpactState;
+        discard: FormulaImpactState;
+    }
     | {
         type: 'requestFormulaDivergence';
         requestId: string;

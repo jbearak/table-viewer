@@ -696,6 +696,7 @@ describe('the structural editing capability', () => {
                 rows: { supported: true },
                 columns: { supported: true },
                 basis: current_basis,
+                shortestRowWidth: 1,
             }],
         });
         await viewer.dispose();

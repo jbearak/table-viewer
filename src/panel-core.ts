@@ -44,7 +44,12 @@ import {
     type FormulaCalculationRequest,
     type FormulaCalculationResult,
 } from './formula-calculation';
-import { review_formula_divergence_cooperatively } from './formula-divergence-review';
+import {
+    review_formula_divergence_cooperatively,
+    review_formula_impact_cooperatively,
+    type FormulaImpact,
+    type FormulaImpactState,
+} from './formula-divergence-review';
 import { MAX_SHEET_ROWS, MAX_WORKBOOK_FORMULAS } from './spreadsheet-safety';
 import { MAX_PENDING_APPENDED_ROWS } from './pending-changes';
 
@@ -420,6 +425,7 @@ export class ViewerPanelCore {
     private formula_calculation_operation = 0;
     /** Bumped by each divergence review request, so only the latest answers. */
     private formula_divergence_operation = 0;
+    private formula_impact_operation = 0;
     private active_formula_calculation?: {
         readonly requestId: string;
         readonly sourceGeneration: number;
@@ -902,6 +908,8 @@ export class ViewerPanelCore {
             this.cancel_formula_calculation(msg);
         } else if (msg.type === 'requestFormulaDivergence') {
             await this.handle_formula_divergence(msg);
+        } else if (msg.type === 'requestFormulaImpact') {
+            await this.handle_formula_impact(msg);
         }
     }
 
@@ -1020,6 +1028,69 @@ export class ViewerPanelCore {
         }, receiver_epoch);
     }
 
+    /** An impact state from the wire, owned and checked against the workbook; undefined when malformed. */
+    private own_impact_state(value: unknown): FormulaImpactState | undefined {
+        if (typeof value !== 'object' || value === null) return undefined;
+        const state = value as { edits?: unknown; layouts?: unknown };
+        const sheets = this.source.meta().sheets;
+        const layouts = own_formula_calculation_layouts(state.layouts, sheets);
+        if (layouts === undefined || !this.formula_review_edits_valid(state.edits)) return undefined;
+        return { edits: state.edits as FormulaImpactState['edits'], layouts };
+    }
+
+    private formula_review_edits_valid(edits: unknown): boolean {
+        const sheets = this.source.meta().sheets;
+        return Array.isArray(edits)
+            && edits.length <= MAX_WORKBOOK_FORMULAS
+            && edits.every((edit) => Number.isSafeInteger(edit?.sheetIndex)
+                && edit.sheetIndex >= 0
+                && edit.sheetIndex < sheets.length
+                && Number.isSafeInteger(edit.row) && edit.row >= 0
+                && Number.isSafeInteger(edit.column) && edit.column >= 0
+                && typeof edit.value === 'string'
+                && typeof edit.writesFormula === 'boolean')
+            && formula_calculation_edit_anchors_valid(edits as FormulaCalculationEdit[]);
+    }
+
+    private async handle_formula_impact(
+        msg: Extract<WebviewMessage, { type: 'requestFormulaImpact' }>,
+    ): Promise<void> {
+        const receiver_epoch = this.receiver_epoch;
+        if (msg.sourceGeneration !== this._source_generation) return;
+        this.formula_impact_operation += 1;
+        const operation = this.formula_impact_operation;
+        const cancelled = () => this.disposed
+            || operation !== this.formula_impact_operation
+            || receiver_epoch !== this.receiver_epoch
+            || msg.sourceGeneration !== this._source_generation;
+        const before = this.own_impact_state(msg.before);
+        const discard = this.own_impact_state(msg.discard);
+        const keep = msg.keep === undefined ? undefined : this.own_impact_state(msg.keep);
+        let impacts: { keep?: FormulaImpact; discard?: FormulaImpact } | null = null;
+        if (before !== undefined && discard !== undefined && (msg.keep === undefined || keep !== undefined)) {
+            try {
+                const schedule = { isCancelled: cancelled };
+                const discard_impact = await review_formula_impact_cooperatively(this.source, before, discard, schedule);
+                if (discard_impact === undefined) return;
+                let keep_impact: FormulaImpact | undefined;
+                if (keep !== undefined) {
+                    keep_impact = await review_formula_impact_cooperatively(this.source, before, keep, schedule);
+                    if (keep_impact === undefined) return;
+                }
+                impacts = { discard: discard_impact, ...(keep_impact === undefined ? {} : { keep: keep_impact }) };
+            } catch {
+                impacts = null;
+            }
+        }
+        if (cancelled()) return;
+        await this.post({
+            type: 'formulaImpact',
+            requestId: msg.requestId,
+            sourceGeneration: msg.sourceGeneration,
+            impacts,
+        }, receiver_epoch);
+    }
+
     private async handle_formula_divergence(
         msg: Extract<WebviewMessage, { type: 'requestFormulaDivergence' }>,
     ): Promise<void> {
@@ -1029,16 +1100,7 @@ export class ViewerPanelCore {
         const operation = this.formula_divergence_operation;
         const sheets = this.source.meta().sheets;
         const layouts = own_formula_calculation_layouts(msg.layouts, sheets);
-        const edits_valid = Array.isArray(msg.edits)
-            && msg.edits.length <= MAX_WORKBOOK_FORMULAS
-            && msg.edits.every((edit) => Number.isSafeInteger(edit?.sheetIndex)
-                && edit.sheetIndex >= 0
-                && edit.sheetIndex < sheets.length
-                && Number.isSafeInteger(edit.row) && edit.row >= 0
-                && Number.isSafeInteger(edit.column) && edit.column >= 0
-                && typeof edit.value === 'string'
-                && typeof edit.writesFormula === 'boolean')
-            && formula_calculation_edit_anchors_valid(msg.edits);
+        const edits_valid = this.formula_review_edits_valid(msg.edits);
         let review = null;
         if (layouts !== undefined && edits_valid) {
             try {

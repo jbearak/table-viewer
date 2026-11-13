@@ -5562,9 +5562,20 @@ describe('edit mode save exit', () => {
             basesValidated: true,
         });
         expect(post_message.mock.calls.some(([message]) => message?.type === 'showWarning')).toBe(false);
-        expect(document.querySelector('[aria-label="Pending rows that need review"]')).not.toBeNull();
-        expect([...document.querySelectorAll('button')].some((button) =>
-            button.textContent === 'Discard row and column changes on Sheet1')).toBe(true);
+        const notice = document.querySelector('[aria-label="Row and column changes that need review"]');
+        expect(notice).not.toBeNull();
+        // The design's two lines and three actions, not the pending-row notice.
+        expect([...notice!.querySelectorAll('p')].map((line) => line.textContent)).toEqual([
+            'Sheet1 changed on disk after you inserted, deleted, or moved rows or columns.',
+            "Table Viewer can't tell where those changes belong in the new version.",
+        ]);
+        expect([...notice!.querySelectorAll('button')].map((button) => button.textContent)).toEqual([
+            'Keep new rows at the end',
+            'Discard row and column changes on Sheet1',
+            'Dismiss notice',
+        ]);
+        expect(document.querySelector('[aria-label="Pending rows that need review"]')).toBeNull();
+        expect(document.body.textContent).not.toContain('Pending rows need review');
     });
 
     it('shows an unsupportedStructure save refusal with its reason, naming the worksheet, with its discard', async () => {
@@ -5599,12 +5610,17 @@ describe('edit mode save exit', () => {
             basesValidated: true,
         });
         expect(post_message.mock.calls.some(([sent]) => sent?.type === 'showWarning')).toBe(false);
-        const review = document.querySelector('[aria-label="Pending rows that need review"]');
+        const review = document.querySelector('[aria-label="Row and column changes that need review"]');
         expect(review?.textContent).toContain(`Sheet1: ${message}`);
         expect([...document.querySelectorAll('button')].some((button) =>
             button.textContent === 'Discard row and column changes on Sheet1')).toBe(true);
         expect([...document.querySelectorAll('button')].some((button) =>
             button.textContent === 'Keep new rows at the end')).toBe(false);
+        expect([...review!.querySelectorAll('button')].map((button) => button.textContent)).toEqual([
+            'Discard row and column changes on Sheet1',
+            'Dismiss notice',
+        ]);
+        expect(document.body.textContent).not.toContain('Pending rows need review');
     });
 
     for (const reason of ['unsupportedStructure', 'structuralBasisChanged'] as const) {
@@ -5679,7 +5695,7 @@ describe('edit mode save exit', () => {
                     },
                     basesValidated: true,
                 });
-                expect(document.querySelector('[aria-label="Pending rows that need review"]')?.textContent)
+                expect(document.querySelector('[aria-label="Row and column changes that need review"]')?.textContent)
                     .toContain("Sheet1: Can't save these row and column changes: no.");
             }
             const store = (grid_shell_mock.latest_props as unknown as GridShellProps).pending_row_store!;
@@ -5691,7 +5707,7 @@ describe('edit mode save exit', () => {
             expect(next.rowLayout).toBeUndefined();
             expect(next.structuralBasis).toBeUndefined();
             expect(next.conflicts).toEqual([]);
-            expect(document.querySelector('[aria-label="Pending rows that need review"]')).toBeNull();
+            expect(document.querySelector('[aria-label="Row and column changes that need review"]')).toBeNull();
         });
     }
 
@@ -17852,5 +17868,109 @@ describe('cursor after a structural save', () => {
             sourceRow: 2,
             sourceColumn: 0,
         });
+    });
+});
+
+describe('structural conflict notice counts and Review Changes notes', () => {
+    it('asks the host what each salvage action does to formulas and shows the counts', async () => {
+        const { post_message } = await render_app();
+        const meta = make_meta(['Sales'], false);
+        Object.assign(meta.sheets[0], { columnCount: 2, sourceRowCount: 4, rowCount: 4, formulaCells: [0, 1] });
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: {
+                csvEditable: true,
+                csvEditingSupported: true,
+                editSyntax: 'markdown',
+                structuralEditing: { sheets: [{ rows: { supported: true }, columns: { supported: true } }] },
+            },
+        }));
+        await click_button('Edit');
+        await dispatch_host_message({
+            type: 'editSessionResult',
+            granted: true,
+            editSessionId: 'impact-session',
+            sheetIndex: 0,
+            pendingChanges: {
+                sheetIndex: 0,
+                sheetName: 'Sales',
+                cells: {},
+                formatTemplates: [],
+                appendedRows: [],
+                tailRemovals: [],
+                conflicts: [{ reason: 'structuralBasisChanged', pendingRowIds: [], tailRemovalIds: [] }],
+                rowLayout: {
+                    runs: [{ kind: 'source', start: 0, count: 4 }],
+                    removedSourceRows: [{ start: 2, count: 1 }],
+                    discardedPendingRows: [],
+                },
+                structuralBasis: {
+                    kind: 'xlsx',
+                    worksheetPartDigest: 'w',
+                    sharedStringsDigest: null,
+                    stylesDigest: null,
+                    workbookDigest: 'b',
+                    sourceRowCount: 4,
+                    sourceColumnCount: 2,
+                },
+            },
+        });
+        const request = post_message.mock.calls.map(([message]) => message as WebviewMessage)
+            .find((message): message is Extract<WebviewMessage, { type: 'requestFormulaImpact' }> =>
+                message.type === 'requestFormulaImpact');
+        expect(request).toBeDefined();
+        // Discard drops the removal; the layout afterwards is the source layout.
+        expect(request!.before.layouts[0]!.rowLayout?.removedSourceRows).toEqual([{ start: 2, count: 1 }]);
+        expect(request!.discard.layouts[0]!.rowLayout).toBeUndefined();
+        await dispatch_host_message({
+            type: 'formulaImpact',
+            requestId: request!.requestId,
+            sourceGeneration: request!.sourceGeneration,
+            impacts: { keep: { ref: 0, moved: 12 }, discard: { ref: 4, moved: 12 } },
+        });
+        const notice = document.querySelector('[aria-label="Row and column changes that need review"]');
+        expect(notice?.textContent).toContain('Keep new rows at the end: 12 formulas will point at different rows.');
+        expect(notice?.textContent).toContain(
+            'Discard row and column changes on Sales: 4 formulas will show #REF! and 12 will point at different rows.');
+    });
+
+    it('notes that a column change pads short rows', async () => {
+        const { post_message } = await render_app();
+        const meta = make_meta(['Sheet1'], false);
+        Object.assign(meta.sheets[0], { columnCount: 3, sourceRowCount: 2, rowCount: 2 });
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: {
+                csvEditable: true,
+                csvEditingSupported: true,
+                structuralEditing: {
+                    sheets: [{ rows: { supported: true }, columns: { supported: true }, shortestRowWidth: 2 }],
+                },
+            },
+        }));
+        await enter_edit_mode(post_message, 'padding-session');
+        const store = (grid_shell_mock.latest_props as unknown as GridShellProps).pending_row_store!;
+        const before = store.snapshot();
+        await act(async () => {
+            const staged = store.stage_replace('padding-session', before, {
+                ...before,
+                columnLayout: {
+                    columns: [
+                        { kind: 'source', sourceColumn: 0 },
+                        { kind: 'source', sourceColumn: 2 },
+                        { kind: 'source', sourceColumn: 1 },
+                    ],
+                    removedSourceColumns: [],
+                    discardedPendingColumns: [],
+                },
+                structuralBasis: {
+                    kind: 'delimited', byteLength: 1, digest: 'x', sourceRowCount: 2, sourceColumnCount: 3,
+                },
+            });
+            staged!.commit();
+            staged!.notify();
+        });
+        await click_button('Review changes');
+        const review = document.querySelector('[aria-label="Row and column changes"]');
+        expect(review?.textContent).toContain('1 column moved.');
+        expect(review?.textContent).toContain('Short rows will be padded to 3 columns.');
     });
 });

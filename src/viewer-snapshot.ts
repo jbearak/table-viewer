@@ -233,6 +233,12 @@ export interface WorksheetStructuralSupport {
     readonly autoFilter?: { readonly ref: string; readonly filteredColumns: readonly number[] };
     /** `.xlsx`: every conditional-formatting element and data-validation rule. */
     readonly relativeRules?: readonly WorksheetRelativeRule[];
+    /**
+     * CSV and TSV: fields in the shortest record, the header line included.
+     * A column change writes every record at the prospective width, so a
+     * shorter record is padded, which Review Changes notes.
+     */
+    readonly shortestRowWidth?: number;
 }
 
 export interface StructuralEditingCapability {

@@ -111,12 +111,14 @@ import {
     divergence_cell_label,
     divergence_groups,
     divergence_summary_text,
+    formula_impact_text,
+    short_rows_note,
     renamed_source_columns,
     structure_counts_text,
     worksheet_needs_structure_review,
     worksheet_structure_counts,
 } from './structural-review-model';
-import type { FormulaDivergenceReview } from '../formula-divergence-review';
+import type { FormulaDivergenceReview, FormulaImpact, FormulaImpactState } from '../formula-divergence-review';
 import {
     layout_affected_formula_cells,
     needs_prospective_formula_request,
@@ -1122,6 +1124,23 @@ export function App(): React.JSX.Element {
      * active worksheet's layout, as one history action, after the file changed
      * under it. Cell edits and appended rows stay and reconcile as usual.
      */
+    /** The active-sheet context the salvage actions and their formula count run against. */
+    const salvage_context = (sheet_index: number) => {
+        const sheet = meta_ref.current?.sheets[sheet_index];
+        if (sheet === undefined) return undefined;
+        const header = sheet.excelFirstRowHeader;
+        return {
+            worksheet: {
+                sheetIndex: sheet_index,
+                sheetName: sheet.name,
+                ...(sheet.worksheetId === undefined ? {} : { worksheetId: sheet.worksheetId }),
+            },
+            bodyStart: header?.active === true && header.sourceRow !== undefined ? header.sourceRow + 1 : 0,
+            sourceRowCount: sheet.sourceRowCount,
+            sourceColumnCount: sheet.columnCount,
+            bodyViewTransformed: false,
+        };
+    };
     const discard_active_layout_changes = useCallback(() => {
         const sheet_index = active_sheet_index;
         const sheet = meta_ref.current?.sheets[sheet_index];
@@ -1959,11 +1978,17 @@ export function App(): React.JSX.Element {
                     return entry === undefined ? undefined : committed_column_name(entry.value);
                 })
                 : 0;
-            return { sheetIndex, name, text: structure_counts_text(worksheet_structure_counts(changes, renamed)) };
+            return {
+                sheetIndex,
+                name,
+                text: structure_counts_text(worksheet_structure_counts(changes, renamed)),
+                padding: short_rows_note(changes, structural_editing?.sheets[sheetIndex]?.shortestRowWidth),
+            };
         });
     },
         // eslint-disable-next-line react-hooks/exhaustive-deps
-        [structure_review_open, structure_review_sheets, meta, formula_roots_projection.calculationRevision],
+        [structure_review_open, structure_review_sheets, meta, formula_roots_projection.calculationRevision,
+            structural_editing],
     );
     const [formula_divergence, set_formula_divergence] = useState<{
         readonly key: string;
@@ -8509,6 +8534,86 @@ export function App(): React.JSX.Element {
         return entries.length === 0 ? undefined : Object.fromEntries(entries);
     }, [live_rejected_keys, save_rejection]);
 
+    // Whether the active worksheet has a Structural Basis conflict, whose
+    // notice counts what each salvage action does to formulas.
+    const impact_basis_changed = edit_mode_on_active_sheet
+        && active_pending_conflicts.some((conflict) => conflict.reason === 'structuralBasisChanged');
+    // What each salvage action would do to the workbook's formulas, counted
+    // by the host before the user chooses.
+    const formula_impact_states = useMemo((): {
+        readonly before: FormulaImpactState;
+        readonly keep?: FormulaImpactState;
+        readonly discard: FormulaImpactState;
+    } | undefined => {
+        if (!impact_basis_changed || !meta || edit_syntax !== 'markdown'
+            || formula_anchor_workbook === undefined) return undefined;
+        const sheet = meta.sheets[active_sheet_index];
+        if (sheet === undefined) return undefined;
+        const pending_by_sheet = new Map(edit_session_registry_ref.current!.pending_entries());
+        const changes_for = (sheet_index: number) => pending_by_sheet.get(sheet_index)?.snapshot();
+        const current = changes_for(active_sheet_index) ?? EMPTY_PENDING_STRUCTURAL_CHANGES;
+        const context = salvage_context(active_sheet_index);
+        if (context === undefined) return undefined;
+        const state_for = (override?: PendingStructuralChanges): FormulaImpactState => {
+            const changes_with = override === undefined
+                ? changes_for
+                : (sheet_index: number) => sheet_index === active_sheet_index ? override : changes_for(sheet_index);
+            const workbook = override === undefined
+                ? formula_anchor_workbook
+                : webview_formula_workbook(true, meta.sheets, changes_with);
+            const request = prospective_formula_request({
+                workbook,
+                changes_for: changes_with,
+                edits: source_formula_edits,
+                pending_edits: formula_roots_projection.pendingEdits,
+            });
+            return { edits: request.edits, layouts: request.layouts };
+        };
+        try {
+            const discard = discard_layout_changes(current, context);
+            if (!discard.ok) return undefined;
+            const keep = keep_inserted_rows_at_end(current, context, Date.now() * 1_000);
+            return {
+                before: state_for(),
+                discard: state_for(discard.outcome.next),
+                ...(keep.ok ? { keep: state_for(keep.outcome.next) } : {}),
+            };
+        } catch {
+            return undefined;
+        }
+    },
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+        [impact_basis_changed, formula_calculation_edit_signature, active_sheet_index, meta,
+            edit_syntax, formula_anchor_workbook],
+    );
+    const [formula_impacts, set_formula_impacts] = useState<{
+        readonly requestId: string;
+        readonly impacts: { readonly keep?: FormulaImpact; readonly discard?: FormulaImpact } | null;
+    }>();
+    const formula_impact_request_ref = useRef<string>();
+    useEffect(() => {
+        if (formula_impact_states === undefined) {
+            formula_impact_request_ref.current = undefined;
+            return;
+        }
+        const requestId = `formula-impact:${load_epoch}:${++formula_divergence_sequence_ref.current}`;
+        formula_impact_request_ref.current = requestId;
+        host_bridge.postMessage({
+            type: 'requestFormulaImpact',
+            requestId,
+            sourceGeneration: source_generation_ref.current,
+            ...formula_impact_states,
+        });
+    }, [formula_impact_states, load_epoch]);
+    useEffect(() => {
+        const on_message = (event: MessageEvent) => {
+            const msg = event.data as HostMessage;
+            if (msg.type !== 'formulaImpact' || msg.requestId !== formula_impact_request_ref.current) return;
+            set_formula_impacts({ requestId: msg.requestId, impacts: msg.impacts });
+        };
+        window.addEventListener('message', on_message);
+        return () => window.removeEventListener('message', on_message);
+    }, []);
     if (!meta) {
         return compare_progress
             ? (
@@ -8888,6 +8993,25 @@ export function App(): React.JSX.Element {
     ]);
     const show_structural_conflicts = structural_conflicts.length > 0
         && dismissed_structural_conflict_signature !== structural_conflict_signature;
+    // Worksheet-level conflicts on a Worksheet Layout get the design's own
+    // notice ("External changes"); the append conflicts keep theirs.
+    const layout_conflicts = structural_conflicts.filter((conflict) =>
+        conflict.reason === 'structuralBasisChanged' || conflict.reason === 'unsupportedStructure');
+    const append_conflicts = structural_conflicts.filter((conflict) => !layout_conflicts.includes(conflict));
+    const show_layout_conflicts = show_structural_conflicts && layout_conflicts.length > 0;
+    const show_append_conflicts = show_structural_conflicts && append_conflicts.length > 0;
+    const basis_changed = layout_conflicts.some((conflict) => conflict.reason === 'structuralBasisChanged');
+    const current_formula_impacts = formula_impact_states !== undefined
+        && formula_impacts !== undefined
+        && formula_impacts.requestId === formula_impact_request_ref.current
+        ? formula_impacts.impacts
+        : undefined;
+    const keep_impact_text = current_formula_impacts?.keep === undefined
+        ? undefined
+        : formula_impact_text(current_formula_impacts.keep);
+    const discard_impact_text = current_formula_impacts?.discard === undefined
+        ? undefined
+        : formula_impact_text(current_formula_impacts.discard);
     const previous_external_change = external_change_occurrences_ref.current.get(
         external_change_worksheet_key,
     ) ?? {
@@ -9481,7 +9605,7 @@ export function App(): React.JSX.Element {
                     {structure_review_open && (
                         <div id="structure-review-details">
                             <ul className="external-change-list">
-                                {structure_review_counts.map(({ sheetIndex, name, text }) => {
+                                {structure_review_counts.map(({ sheetIndex, name, text, padding }) => {
                                     const groups = current_formula_divergence
                                         ? divergence_groups(current_formula_divergence.items, sheetIndex)
                                         : [];
@@ -9493,6 +9617,7 @@ export function App(): React.JSX.Element {
                                         <li key={sheetIndex}>
                                             <h3>{name}</h3>
                                             <p>{text}</p>
+                                            {padding !== undefined && <p>{padding}</p>}
                                             {formula_divergence_key !== undefined
                                                 && current_formula_divergence === undefined && (
                                                 <p role="status">Checking formulas…</p>
@@ -9547,7 +9672,61 @@ export function App(): React.JSX.Element {
                     )}
                 </section>
             )}
-            {show_structural_conflicts && (
+            {show_layout_conflicts && (
+                // The design's notice for a worksheet-level conflict on a
+                // Worksheet Layout ("External changes"): its two lines, the
+                // counts the user needs before choosing, and three actions.
+                <section
+                    className="external-change-review structural-conflict-review"
+                    role="alert"
+                    aria-label="Row and column changes that need review"
+                >
+                    {basis_changed && (
+                        <>
+                            <p>{`${current_sheet.name} changed on disk after you inserted, deleted, or moved rows or columns.`}</p>
+                            <p>Table Viewer can&apos;t tell where those changes belong in the new version.</p>
+                        </>
+                    )}
+                    {layout_conflicts.filter((conflict) => conflict.reason === 'unsupportedStructure')
+                        .map((conflict, index) => (
+                            <p key={`unsupported:${index}`}>
+                                {`${current_sheet.name}: ${conflict.message ?? "Can't save these row and column changes: the worksheet has a structure Table Viewer can't shift."}`}
+                            </p>
+                        ))}
+                    {basis_changed && active_column_values_lost > 0 && (
+                        <p>
+                            {`Values typed in ${active_column_values_lost} new ${active_column_values_lost === 1 ? 'column' : 'columns'} will be discarded.`}
+                        </p>
+                    )}
+                    {basis_changed && keep_impact_text !== undefined && (
+                        <p>{`Keep new rows at the end: ${keep_impact_text}`}</p>
+                    )}
+                    {discard_impact_text !== undefined && (
+                        <p>{`Discard row and column changes on ${current_sheet.name}: ${discard_impact_text}`}</p>
+                    )}
+                    <div className="external-change-item-actions">
+                        {basis_changed && (
+                            <button onClick={keep_active_inserted_rows_at_end}>
+                                Keep new rows at the end
+                            </button>
+                        )}
+                        <button onClick={discard_active_layout_changes}>
+                            {`Discard row and column changes on ${current_sheet.name}`}
+                        </button>
+                        <button
+                            onClick={() => {
+                                set_dismissed_structural_conflict_signature(
+                                    structural_conflict_signature,
+                                );
+                                queueMicrotask(() => grid_focus_ref.current?.focus());
+                            }}
+                        >
+                            Dismiss notice
+                        </button>
+                    </div>
+                </section>
+            )}
+            {show_append_conflicts && (
                 <section
                     className="external-change-review structural-conflict-review"
                     role="alert"
@@ -9561,7 +9740,7 @@ export function App(): React.JSX.Element {
                         saved until you edit or remove pending rows, or cancel affected removals.
                     </p>
                     <ul className="external-change-list">
-                        {structural_conflicts.map((conflict, index) => (
+                        {append_conflicts.map((conflict, index) => (
                             <li key={`${conflict.reason}:${index}`}>
                                 {conflict.reason === 'ambiguousColumns'
                                     ? 'Column identities no longer match.'
@@ -9581,12 +9760,6 @@ export function App(): React.JSX.Element {
                             </li>
                         ))}
                     </ul>
-                    {active_column_values_lost > 0 && structural_conflicts.some((conflict) =>
-                        conflict.reason === 'structuralBasisChanged') && (
-                        <p>
-                            {`Values typed in ${active_column_values_lost} new ${active_column_values_lost === 1 ? 'column' : 'columns'} will be discarded.`}
-                        </p>
-                    )}
                     <div className="external-change-item-actions">
                         <button
                             disabled={structurally_conflicted_pending_row_ids.length === 0
@@ -9630,25 +9803,6 @@ export function App(): React.JSX.Element {
                                 }}
                             >
                                 Cancel affected row removals
-                            </button>
-                        )}
-                        {structural_conflicts.some((conflict) =>
-                            conflict.reason === 'structuralBasisChanged') && (
-                            <>
-                                <button onClick={keep_active_inserted_rows_at_end}>
-                                    Keep new rows at the end
-                                </button>
-                                <button onClick={discard_active_layout_changes}>
-                                    {`Discard row and column changes on ${current_sheet.name}`}
-                                </button>
-                            </>
-                        )}
-                        {!structural_conflicts.some((conflict) =>
-                                conflict.reason === 'structuralBasisChanged')
-                            && structural_conflicts.some((conflict) =>
-                                conflict.reason === 'unsupportedStructure') && (
-                            <button onClick={discard_active_layout_changes}>
-                                {`Discard row and column changes on ${current_sheet.name}`}
                             </button>
                         )}
                         <button

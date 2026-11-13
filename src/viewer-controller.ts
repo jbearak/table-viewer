@@ -3018,6 +3018,9 @@ export function attach_viewer(
                     file_format.id,
                     observation,
                     projected_source.meta().sheets,
+                    projected_source instanceof CsvDataSource
+                        ? [projected_source.shortestRecordWidth]
+                        : undefined,
                 ),
             }
             : {}
