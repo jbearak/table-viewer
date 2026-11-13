@@ -172,7 +172,8 @@ describe('row structure menu model', () => {
         const model = row_structure_menu_model({
             support: supported, ready: true, selection: selection({ count: 1 }), changes: EMPTY, context: context(),
         });
-        expect(model).toEqual({ delete: { count: 1, enabled: true } });
+        expect(model.delete).toEqual({ count: 1, enabled: true });
+        expect(model.restore).toBeUndefined();
     });
 
     it('reports an unsupported worksheet with the host reason', () => {
@@ -275,6 +276,9 @@ describe('resolving a row selection', () => {
             removedSourceRows: [3],
             fixedRows: true,
             tailRemovals: false,
+            contiguous: false,
+            bandRows: 1,
+            endsAtBandEnd: true,
         });
     });
 

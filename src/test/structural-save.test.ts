@@ -212,16 +212,115 @@ describe('plan_csv_save with a row layout', () => {
         }, basis_of(bytes, 2, 1)))).rejects.toThrow('inconsistent');
     });
 
-    it('refuses inserted rows until inserting can be saved', async () => {
-        await expect(plan('h\na\n', '/tmp/s.csv', (bytes) => changes({
+    for (const [label, newline] of [['LF', '\n'], ['CRLF', '\r\n'], ['CR', '\r']] as const) {
+        for (const [format, delimiter, path] of [['CSV', ',', '/tmp/s.csv'], ['TSV', '\t', '/tmp/s.tsv']] as const) {
+            it(`writes inserted rows at the start, middle, and end of a ${format} file with ${label} newlines, beside deletes and appends`, async () => {
+                const text = ['h1', 'a1', 'b1', 'c1']
+                    .map((cell) => `${cell}${delimiter}${cell.replace('1', '2')}`)
+                    .join(newline) + newline;
+                const row = (id: string, createdOrder: number, cells: Record<number, string> = {}) => ({
+                    id,
+                    origin: 'insert' as const,
+                    cells: Object.fromEntries(Object.entries(cells).map(([column, value]) =>
+                        [column, { value, valueEditOrder: createdOrder }])),
+                    formatTemplateId: 'plain',
+                    createdOrder,
+                });
+                const { output, result } = await plan(text, path, (bytes) => changes({
+                    runs: [
+                        { kind: 'pending', ids: ['ins0'] },
+                        { kind: 'source', start: 0, count: 1 },
+                        { kind: 'pending', ids: ['ins1', 'ins2', 'gone'] },
+                        { kind: 'source', start: 1, count: 2 },
+                        { kind: 'pending', ids: ['ins3'] },
+                    ],
+                    removedSourceRows: [{ start: 1, count: 1 }],
+                    discardedPendingRows: [{ id: 'gone', createdOrder: 9 }],
+                }, basis_of(bytes, 3, 2), {
+                    formatTemplates: [APPEND_TEMPLATE],
+                    appendBasis: append_basis(2, ['h1', 'h2'], 3),
+                    appendedRows: [
+                        row('ins0', 1),
+                        row('ins1', 2, { 0: 'x,y' }),
+                        row('ins2', 3),
+                        row('ins3', 4, { 1: 'z' }),
+                        { id: 'app', cells: { 0: { value: 'p', valueEditOrder: 5 } }, formatTemplateId: 'plain', createdOrder: 5 },
+                    ],
+                }));
+                const quoted = delimiter === ',' ? '"x,y"' : 'x,y';
+                expect(output).toBe([
+                    `h1${delimiter}h2`,
+                    delimiter,
+                    `a1${delimiter}a2`,
+                    `${quoted}${delimiter}`,
+                    delimiter,
+                    `c1${delimiter}c2`,
+                    `${delimiter}z`,
+                    `p${delimiter}`,
+                ].join(newline) + newline);
+                expect(result.receipt?.structure).toEqual([{
+                    sheetIndex: 0,
+                    sheetName: expect.any(String),
+                    rowRuns: [{ from: 0, count: 1, to: 1 }, { from: 2, count: 1, to: 4 }],
+                    removedRows: [{ start: 1, count: 1 }],
+                    columnMap: [0, 1],
+                    insertedRows: [
+                        { pendingRowId: 'ins0', sourceRow: 0 },
+                        { pendingRowId: 'ins1', sourceRow: 2 },
+                        { pendingRowId: 'ins2', sourceRow: 3 },
+                        { pendingRowId: 'ins3', sourceRow: 5 },
+                    ],
+                    insertedColumns: [],
+                }]);
+                // Inserted rows are placed by the structure entry; only the
+                // appended row is an append assignment, at `H + N + i`.
+                expect(result.receipt?.appendedRows.map((assignment) =>
+                    [assignment.pendingRowId, assignment.sourceRow])).toEqual([['app', 6]]);
+            });
+        }
+    }
+
+    it('writes an insert after the last record of a file without a final newline', async () => {
+        const { output } = await plan('h\na', '/tmp/s.csv', (bytes) => changes({
             runs: [{ kind: 'source', start: 0, count: 1 }, { kind: 'pending', ids: ['ins'] }],
             removedSourceRows: [],
             discardedPendingRows: [],
         }, basis_of(bytes, 1, 1), {
             formatTemplates: [APPEND_TEMPLATE],
             appendBasis: append_basis(1, ['h'], 1),
+            appendedRows: [{
+                id: 'ins',
+                origin: 'insert',
+                cells: { 0: { value: 'new', valueEditOrder: 1 } },
+                formatTemplateId: 'plain',
+                createdOrder: 1,
+            }],
+        }));
+        expect(output).toBe('h\na\nnew\n');
+    });
+
+    it('writes an inserted row in place of every deleted row', async () => {
+        const { output } = await plan('h\na\n', '/tmp/s.csv', (bytes) => changes({
+            runs: [{ kind: 'pending', ids: ['ins'] }, { kind: 'source', start: 0, count: 1 }],
+            removedSourceRows: [{ start: 0, count: 1 }],
+            discardedPendingRows: [],
+        }, basis_of(bytes, 1, 1), {
+            formatTemplates: [APPEND_TEMPLATE],
+            appendBasis: append_basis(1, ['h'], 1),
             appendedRows: [{ id: 'ins', origin: 'insert', cells: {}, formatTemplateId: 'plain', createdOrder: 1 }],
-        }))).rejects.toThrow('Saving inserted rows is not available yet.');
+        }));
+        expect(output).toBe('h\n\n');
+    });
+
+    it('refuses inserted rows without an append basis, as it refuses appends', async () => {
+        await expect(plan('h\na\n', '/tmp/s.csv', (bytes) => changes({
+            runs: [{ kind: 'source', start: 0, count: 1 }, { kind: 'pending', ids: ['ins'] }],
+            removedSourceRows: [],
+            discardedPendingRows: [],
+        }, basis_of(bytes, 1, 1), {
+            formatTemplates: [APPEND_TEMPLATE],
+            appendedRows: [{ id: 'ins', origin: 'insert', cells: {}, formatTemplateId: 'plain', createdOrder: 1 }],
+        }))).rejects.toThrow('no verified worksheet basis');
     });
 
     it('writes a layout whose every body row is removed as the header alone', async () => {

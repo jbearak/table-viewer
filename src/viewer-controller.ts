@@ -9113,6 +9113,21 @@ export function attach_viewer(
             await refuse('Pending rows need review because the worksheet columns changed.');
             return;
         }
+        // Appending on a worksheet with a layout checks the Structural Basis
+        // as insert admission does: the band follows a layout authored
+        // against one file, so it may not grow once that file changed.
+        if (durable !== undefined && has_live_layout_change(durable)) {
+            const current_basis = current_structural_basis(file_format.id, source_observation, sheet);
+            if (
+                durable.conflicts?.some((conflict) => conflict.reason === 'structuralBasisChanged') === true
+                || durable.structuralBasis === undefined
+                || current_basis === undefined
+                || !structural_bases_equal(durable.structuralBasis, current_basis)
+            ) {
+                await refuse(`${sheet.name} changed on disk after you inserted, deleted, or moved rows or columns. Review Changes before appending rows.`);
+                return;
+            }
+        }
 
         let format: PendingRowFormatTemplate['format'];
         if (file_format.id === 'xlsx') {
