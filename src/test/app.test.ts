@@ -18355,10 +18355,14 @@ describe('rapid structural gestures against refresh echoes', () => {
         await enter_edit_mode(post_message, 'settle-session');
         const store = (grid_shell_mock.latest_props as unknown as GridShellProps).pending_row_store!;
         const { pending_changes_durability } = await import('../webview/host-bridge');
-        let cells: Record<string, { value: string; base: string }> = {};
-        // GridShell's publication effect: the complete slot, deduped.
+        const cell_store = (grid_shell_mock.latest_props as unknown as GridShellProps).edit_session!;
+        // GridShell's publication effect: the complete slot, its cells read
+        // from the cell store App reconciles, deduped.
         const shell_publish = () => pending_changes_durability.publish('settle-session', {
-            sheetIndex: 0, sheetName: 'Sheet1', cells, ...store.snapshot(),
+            sheetIndex: 0,
+            sheetName: 'Sheet1',
+            cells: Object.fromEntries(cell_store.snapshot()),
+            ...store.snapshot(),
         }, 1);
         const publications = () => post_message.mock.calls
             .map(([message]) => message as WebviewMessage)
@@ -18366,7 +18370,7 @@ describe('rapid structural gestures against refresh echoes', () => {
                 message.type === 'pendingChangesChanged');
         for (const step of scenario.steps) {
             await act(async () => {
-                if (step.cell !== undefined) cells = { '1:0': { value: step.cell, base: 'b' } };
+                if (step.cell !== undefined) cell_store.commit('settle-session', '1:0', { value: step.cell, base: 'b' });
                 const before = store.snapshot();
                 const staged = store.stage_replace('settle-session', before, {
                     ...before, rowLayout: layout(...step.rows), structuralBasis: basis,
@@ -18406,6 +18410,10 @@ describe('rapid structural gestures against refresh echoes', () => {
         const newest = scenario.steps[scenario.steps.length - 1]!;
         expect(store.snapshot().rowLayout).toEqual(layout(...newest.rows));
         expect(written?.rowLayout).toEqual(layout(...newest.rows));
-        expect(written?.cells).toEqual(cells);
+        // The typed value survives in the renderer and reaches the host.
+        const typed = [...scenario.steps].reverse().find((step) => step.cell !== undefined)?.cell;
+        const expected_cells = typed === undefined ? {} : { '1:0': { value: typed, base: 'b' } };
+        expect(Object.fromEntries(cell_store.snapshot())).toEqual(expected_cells);
+        expect(written?.cells).toEqual(expected_cells);
     });
 });
