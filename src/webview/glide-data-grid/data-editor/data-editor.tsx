@@ -654,6 +654,7 @@ export interface DataEditorProps extends Props, Pick<DataGridSearchProps, "image
      * Fork addition: asked before a paste into the focused grid reads its target.
      * The paste waits for the returned promise, then runs against the props of
      * the render committed by then, so a host can make the grid editable first.
+     * A promise that resolves `false` drops the paste.
      */
     readonly onPasteAdmission?: () => Promise<unknown> | undefined;
     /**
@@ -4097,7 +4098,9 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
             .catch(() => undefined)
             .then(() => admission)
             .catch(() => undefined)
-            .then(() => {
+            .then(granted => {
+                // Refused: the grid did not become editable, so there is nothing to paste into.
+                if (granted === false) return;
                 const execution = pasteExecutionRef.current;
                 return execution.perform(e, captured, execution.topologyKey);
             });

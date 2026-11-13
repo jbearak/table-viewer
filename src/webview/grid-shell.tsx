@@ -10623,9 +10623,12 @@ export function GridShell({
     // user asked for a menu, and a refusal only leaves the items unavailable.
     const menu_open = context_menu !== null;
     const menu_offers_edits = structural_support !== undefined || edit_syntax === 'markdown';
+    // Asked again when a sort or filter settles: one in flight is refused.
     useEffect(() => {
-        if (menu_open && edit_armed && menu_offers_edits) void ensure_edit_session(true);
-    }, [edit_armed, ensure_edit_session, menu_offers_edits, menu_open]);
+        if (menu_open && edit_armed && menu_offers_edits && !transform_pending) {
+            void ensure_edit_session(true);
+        }
+    }, [edit_armed, ensure_edit_session, menu_offers_edits, menu_open, transform_pending]);
 
     // Surfaces that hold the session open with nothing unsaved behind them.
     // When the last one closes, App is told the session may be empty.
@@ -11689,18 +11692,16 @@ export function GridShell({
                             ...(inserted_rows_lock
                                 ? { hide_rows_disabled_reason: INSERTED_ROWS_TRANSFORM_MESSAGE }
                                 : {}),
-                            // Left as it was, `!edit_mode` included. The sort/filter
-                            // restriction is about row order — promoting a row hides
-                            // the rows above it, which only means anything in
-                            // natural order — and README documents the action as
-                            // available only when nothing is reordering the view.
-                            // With transform_state no longer emptied in edit mode
-                            // that restriction now *also* sees an edit-mode sort, so
-                            // the two terms agree rather than one masking the other.
+                            // The sort/filter restriction is about row order —
+                            // promoting a row hides the rows above it, which only
+                            // means anything in natural order — and README
+                            // documents the action as available only when nothing
+                            // is reordering the view. Whether a held session
+                            // locks the header row is App's to say: this menu
+                            // holds one itself while it is open.
                             can_promote_row_to_header: can_promote_row_to_header
                                 && transform_sections
                                 && !transform_pending
-                                && !edit_mode
                                 && !preview_mode
                                 && transform_state.sort.length === 0
                                 && !transform_state.filters.some((filter) => filter.enabled),

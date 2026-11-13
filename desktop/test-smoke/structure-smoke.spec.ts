@@ -158,6 +158,8 @@ test('a row drag and a column drag are the first edits to a file', async () => {
     await page.mouse.down();
     await page.mouse.move(from.x, from.y - 10, { steps: 5 });
     await page.mouse.move(to.x, to.y - 8, { steps: 5 });
+    // A drop is judged against the session, which a scripted drag can outrun.
+    await expect(page.getByRole('button', { name: 'Diff' })).toBeVisible();
     await page.mouse.up();
     await expect_undo_label('Move row');
     await save_changes(page);
@@ -171,6 +173,7 @@ test('a row drag and a column drag are the first edits to a file', async () => {
     await page.mouse.down();
     await page.mouse.move(header_from.x - 10, header_from.y, { steps: 5 });
     await page.mouse.move(header_to.x - 40, header_to.y, { steps: 5 });
+    await expect(page.getByRole('button', { name: 'Diff' })).toBeVisible();
     await page.mouse.up();
     await expect_undo_label('Move column');
     await save_changes(page);
@@ -328,6 +331,26 @@ test('an external change conflicts, and both salvage actions resolve it', async 
     await save_screenshot(page, '06-discarded-layout');
     expect(fs.readFileSync(file, 'utf8'))
         .toBe('name,qty\napple,11\nbanana,2\ncherry,3\ndate,4\nkiwi,\n');
+});
+
+test('the row menu of an .xlsx with nothing unsaved still makes a row the header', async () => {
+    const book = Buffer.from(build_fixture_xlsx({
+        sheets: [{
+            name: 'Data',
+            body: `<sheetData>${[[1, 2], ['name', 'qty'], [5, 6], [7, 8]].map((cells, index) =>
+                row(index + 1, cells.map((value, column) => cell(`${'AB'[column]}${index + 1}`, value))))
+                .join('')}</sheetData>`,
+        }],
+    }));
+    const { page } = await open_file('late-header.xlsx', book);
+    await wait_for_grid(page);
+
+    // The menu holds an editing session for its insert and delete items; with
+    // nothing unsaved that must not take the header item away.
+    await choose(await open_row_menu(page, 1), 'Use row as header');
+    await expect.poll(async () => (await grid_headers(page)).map((header) => header.split('|')[1]))
+        .toEqual(['name', 'qty']);
+    await expect(save_button(page)).toBeDisabled();
 });
 
 test('an external edit that turns on an .xlsx Header Row conflicts, and Keep new rows at the end saves', async () => {

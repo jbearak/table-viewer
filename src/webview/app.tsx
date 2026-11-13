@@ -6276,6 +6276,9 @@ export function App(): React.JSX.Element {
         // The sheet whose grid should regain focus after an authoritative remount.
         // Undefined for grid- and state-strip-originated header commands.
         grid_focus_sheet_index?: number,
+        // The held session has nothing unsaved and no open editor, so nothing
+        // of it can reach the host ahead of this command.
+        session_is_empty = false,
     ) => {
         const sheet = meta?.sheets[target_sheet_index];
         const header = sheet?.excelFirstRowHeader;
@@ -6287,8 +6290,7 @@ export function App(): React.JSX.Element {
         // visible affordance, so a stale callback or a queue cannot bypass it.
         if (!sheet || !header) return 'skip';
         if (
-            edit_mode
-            || edit_mode_ref.current
+            (!session_is_empty && (edit_mode || edit_mode_ref.current))
             || (
                 header_row !== undefined
                 && (preview_mode || preview_mode_ref.current)
@@ -6404,7 +6406,13 @@ export function App(): React.JSX.Element {
     }, [active_sheet_index, header_waits_for_transform, meta]);
 
     const handle_promote_row_to_header = useCallback((display_row: number) => {
-        request_excel_header(true, false, display_row);
+        // The row menu acquires the session for its editing items, so one is
+        // held here even when nothing was edited. Empty, it locks nothing: the
+        // request goes ahead of the release the closing menu causes.
+        const session_is_empty = edit_mode_ref.current
+            && !edit_session_registry_ref.current!.has_dirty_entries()
+            && editing_ref.current?.has_uncommitted_changes() === false;
+        request_excel_header(true, false, display_row, undefined, undefined, session_is_empty);
     }, [active_sheet_index, request_excel_header]);
 
     /**
@@ -8745,6 +8753,15 @@ export function App(): React.JSX.Element {
         || any_transform_pending
         || excel_header_pending
     );
+    // Promotion is offered from the row menu, which holds a session of its own
+    // while open: only a session with unsaved work locks the header row there.
+    const promote_row_blocked = !!excel_header && (
+        (edit_mode_on_active_sheet
+            && (edit_session_registry_ref.current!.has_dirty_entries()
+                || editing_status?.has_live_uncommitted === true))
+        || any_transform_pending
+        || excel_header_pending
+    );
     const excel_header_disabled_reason = !excel_header_candidate_available
         && !excel_header?.active
         ? 'This sheet has no first row to use as column names.'
@@ -9276,7 +9293,7 @@ export function App(): React.JSX.Element {
             on_hide_columns={handle_hide_columns}
             on_hide_rows={handle_hide_rows}
             can_promote_row_to_header={
-                excel_header !== undefined && !excel_header_disabled && !preview_mode
+                excel_header !== undefined && !promote_row_blocked && !preview_mode
                     && !header_waits_for_transform(active_sheet_index, true)
             }
             on_promote_row_to_header={handle_promote_row_to_header}

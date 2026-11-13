@@ -13403,7 +13403,11 @@ export function attach_viewer(
                 // reason about timing rather than about the document.
                 const own_release = active_edit_release;
                 if (own_release !== undefined) {
+                    const receiver_epoch = session.current_receiver_epoch;
                     await own_release.completion.catch(() => undefined);
+                    // The renderer that asked was replaced while this waited:
+                    // a grant now would go to one that never asked for it.
+                    if (session.current_receiver_epoch !== receiver_epoch) return;
                     if (edit_admission_closed) {
                         void post_to_receiver({
                             type: 'editSessionResult',

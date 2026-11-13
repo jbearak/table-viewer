@@ -2535,6 +2535,8 @@ describe('Excel first-row header toggle', () => {
         expect(unhide.disabled).toBe(true);
         await click_button('Unhide all');
 
+        // An empty session yields to row promotion; one holding an edit does not.
+        await report_grid_editing(false, true);
         expect(grid_shell_mock.latest_props?.can_promote_row_to_header).toBe(false);
         await act(async () => {
             const promote = grid_shell_mock.latest_props?.on_promote_row_to_header as
@@ -2545,6 +2547,36 @@ describe('Excel first-row header toggle', () => {
         expect(post_message.mock.calls
             .map((call) => call[0] as WebviewMessage)
             .some((message) => message.type === 'setExcelFirstRowHeader')).toBe(false);
+    });
+
+    it('promotes a row under the empty session its menu acquired', async () => {
+        const { post_message } = await render_app();
+        const meta = excel_meta(false, 'off');
+        meta.sheets[0].sourceRowCount = 4;
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        // The row menu acquires the session as it opens.
+        const { granted } = await request_edit_session();
+        await dispatch_host_message({
+            type: 'editSessionResult',
+            granted: true,
+            editSessionId: 'menu-session',
+        });
+        expect(await granted).toBe(true);
+        post_message.mockClear();
+
+        expect(grid_shell_mock.latest_props?.can_promote_row_to_header).toBe(true);
+        await act(async () => {
+            (grid_shell_mock.latest_props?.on_promote_row_to_header as (row: number) => void)(2);
+        });
+
+        const sent = post_message.mock.calls
+            .map((call) => (call[0] as WebviewMessage).type)
+            .filter((type) => type === 'releaseEditSession' || type === 'setExcelFirstRowHeader');
+        // Sent under the session, ahead of the release the closing menu causes:
+        // the host refuses a header request that follows an unacknowledged refresh.
+        expect(sent).toEqual(['setExcelFirstRowHeader']);
     });
 
     it('requests row promotion from the row-header context action', async () => {

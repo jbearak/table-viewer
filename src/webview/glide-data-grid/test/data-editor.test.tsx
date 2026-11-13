@@ -3262,6 +3262,36 @@ a new line char ""more quotes"" plus a tab  ."	https://google.com`)
         expect(navigator.clipboard.readText).toHaveBeenCalledTimes(1);
     });
 
+    test("a paste whose admission is refused is dropped", async () => {
+        vi.useFakeTimers();
+        Object.assign(navigator, {
+            clipboard: { read: undefined, readText: vi.fn(async () => "pasted") },
+        });
+        const admission = vi.fn(async () => false);
+        const editSpy = vi.fn(() => true);
+        render(
+            <EventedDataEditor
+                {...basicProps}
+                onPaste={true}
+                onPasteAdmission={admission}
+                onCellsEdited={editSpy}
+            />,
+            { wrapper: Context }
+        );
+        prep(false);
+        vi.useRealTimers();
+        const canvas = screen.getByTestId("data-grid-canvas");
+        vi.spyOn(document, "activeElement", "get").mockImplementation(() => canvas);
+        sendClick(canvas, { clientX: 140, clientY: 36 + 32 * 2 + 16 });
+
+        fireEvent.paste(window);
+        await vi.waitFor(() => expect(admission).toHaveBeenCalledTimes(1));
+        await drainEventLoop();
+
+        expect(navigator.clipboard.readText).not.toHaveBeenCalled();
+        expect(editSpy).not.toHaveBeenCalled();
+    });
+
     test("a paste aimed elsewhere asks for no admission", async () => {
         vi.useFakeTimers();
         const admission = vi.fn(() => Promise.resolve());

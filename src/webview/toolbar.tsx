@@ -85,7 +85,7 @@ export interface ToolbarProps {
     auto_fit_scope_menu?: ToolbarScopeMenu;
     /** The file can be edited: Save is offered, and Diff and Discard with it. */
     editable: boolean;
-    /** Unsaved changes are being held; Diff has something to compare. */
+    /** An editing session is held: an edit is open or unsaved, so Diff is offered. */
     editing: boolean;
     diff_mode: boolean;
     on_toggle_diff_mode: () => void;
@@ -123,8 +123,9 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
     //
     // Save is there whenever the file can be edited, and disabled until there
     // is something to save: there is no mode to enter, so its presence is what
-    // says cells can be changed and its tooltip says how. Diff and Discard only
-    // mean anything beside unsaved changes, so they come and go with them.
+    // says cells can be changed and its tooltip says how. Discard only means
+    // anything beside unsaved changes, and Diff while an edit is being made, an
+    // open editor included, so they come and go with those.
     const edit_actions = [
         props.editable && props.editing && (
             <ToolbarButton
