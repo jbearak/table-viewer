@@ -251,6 +251,21 @@ describe('review_formula_impact', () => {
         expect(yields).toBeGreaterThan(2);
     });
 
+    it('yields while comparing, counting unchanged formulas in each batch', async () => {
+        const source = workbook(3_000);
+        const state = { edits: [], layouts: [layout_of(undefined, 1), layout_of(undefined, 0)] };
+        let yields = 0;
+        // Nothing changes, so every comparison is of an unchanged formula.
+        const impact = await review_formula_impact_cooperatively(source, state, state, {
+            isCancelled: () => false,
+            workSliceMs: 0,
+            yieldControl: async () => { yields += 1; },
+        });
+        expect(impact).toEqual({ ref: 0, moved: 0 });
+        // Rendering yields every 256 formulas in each state; comparing does too.
+        expect(yields).toBeGreaterThanOrEqual(3 * Math.floor(3_000 / 256));
+    });
+
     it('yields between slices and stops once cancelled', async () => {
         const source = workbook(2_500);
         const before = { edits: [], layouts: [layout_of(moved(), 1), layout_of(undefined, 0)] };

@@ -340,7 +340,10 @@ function* impact_steps(
     const will = yield* rendered(after);
     let ref = 0;
     let moved = 0;
+    let compared = 0;
     for (const [key, text] of will) {
+        // Every visited formula counts toward the batch, unchanged ones too.
+        if (++compared % FORMULAS_PER_STEP === 0) yield;
         const previous = was.get(key);
         if (previous === undefined || previous === text) continue;
         if (formula_ref_error_count(text) > formula_ref_error_count(previous)) ref += 1;
