@@ -11217,7 +11217,9 @@ export function GridShell({
         if (selection === undefined || structural_support === undefined) return undefined;
         const model = row_structure_menu_model({
             support: structural_support.rows,
-            ready: editable_cells,
+            // As for columns: from this render's own answer, and closed with
+            // the same admission every row gesture checks before it acts.
+            ready: editable_cells && structure_admission_open(),
             selection,
             changes: pending_rows,
             context: structure_context,

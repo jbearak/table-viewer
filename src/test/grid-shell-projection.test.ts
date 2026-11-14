@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import React, { act } from 'react';
-import { ROWS_NOT_LOADED_MESSAGE } from '../webview/row-structure-model';
+import { ROWS_NOT_LOADED_MESSAGE, STRUCTURE_BUSY_MESSAGE } from '../webview/row-structure-model';
 import { createRoot, type Root } from 'react-dom/client';
 import { readFileSync } from 'node:fs';
 import { afterEach, describe, expect, it, onTestFinished, vi } from 'vitest';
@@ -8710,6 +8710,32 @@ describe('row Delete and Restore in the row-gutter menu', () => {
         expect(item.getAttribute('aria-disabled')).toBe('true');
         expect(item.getAttribute('aria-description')).toBe('Not available yet');
         expect(item.title).toBe('Not available yet');
+    });
+
+    it('shows the structure items disabled while another change holds structural admission', async () => {
+        // An undo replay, a highlight or append round trip, or a full structural
+        // backlog closes admission without making the cells read-only. The
+        // gestures refuse then, so the menu must say so instead of offering a
+        // click that does nothing.
+        const pending = create_pending_row_store({ session_id: 'session' });
+        let admitted = false;
+        await render_grid(structure_props({
+            structural_support: supported,
+            pending_row_store: pending,
+            gestures_admitted: () => admitted,
+        }));
+        await open_row_menu(1);
+        for (const label of ['Insert row above', 'Insert row below', 'Delete row', 'Move rows up', 'Move rows down']) {
+            const item = menu_item(label)!;
+            expect(item.getAttribute('aria-disabled'), label).toBe('true');
+            expect(item.getAttribute('aria-description'), label).toBe(STRUCTURE_BUSY_MESSAGE);
+        }
+        await act(async () => menu_item('Delete row')!.click());
+        expect(pending.snapshot().rowLayout).toBeUndefined();
+
+        admitted = true;
+        await open_row_menu(1);
+        expect(menu_item('Delete row')!.getAttribute('aria-disabled')).not.toBe('true');
     });
 
     it.each([
