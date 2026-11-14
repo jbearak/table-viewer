@@ -1,3 +1,4 @@
+import * as crypto from 'crypto';
 import { EventEmitter } from 'events';
 import * as fs from 'fs';
 import * as os from 'os';
@@ -64,6 +65,14 @@ function watch(file_path: string) {
     return events;
 }
 
+/** Fills libuv's thread pool for a few hundred milliseconds. */
+function occupy_thread_pool(): Promise<unknown> {
+    const threads = Number(process.env.UV_THREADPOOL_SIZE) || 4;
+    return Promise.all(Array.from({ length: threads * 2 }, () => new Promise((resolve) => {
+        crypto.pbkdf2('password', 'salt', 200_000, 64, 'sha512', resolve);
+    })));
+}
+
 function fire_native(event_type: 'change' | 'rename', file_path: string): void {
     for (const listener of [...native.listeners]) {
         listener(event_type, path.basename(file_path));
@@ -78,6 +87,24 @@ describe('Node file refresh watcher when the native watcher loses events', () =>
         expect(native.listeners).toHaveLength(1);
 
         fs.writeFileSync(target, 'reset by git');
+
+        await vi.waitFor(() => expect(events).toEqual(['change']), WAIT);
+    });
+
+    it('notices a change made the moment watching starts, before the poll first looks', async () => {
+        const target = path.join(temp_dir, 'book.xlsx');
+        fs.writeFileSync(target, 'saved by Table Viewer');
+        // The change lands in the same tick the watcher starts, so a poll that
+        // takes its own first sample afterwards would sample the changed file
+        // and never see a difference. The watcher's stamp from when it started
+        // is the baseline.
+        // A busy machine delays the poll's first sample: libuv's thread pool,
+        // which runs every async stat, is full of other work, as it is when
+        // many test files share one CI runner.
+        const pool_busy = occupy_thread_pool();
+        const events = watch(target);
+        fs.writeFileSync(target, 'changed by another program at once');
+        await pool_busy;
 
         await vi.waitFor(() => expect(events).toEqual(['change']), WAIT);
     });
