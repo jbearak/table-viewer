@@ -50,7 +50,7 @@ import {
     type StructureOutcome,
     type WorksheetStructureContext,
 } from './pending-row-store';
-import { STRUCTURE_BUSY_MESSAGE } from './row-structure-model';
+import { structure_readiness_refusal } from './row-structure-model';
 
 export const SELECT_ADJACENT_COLUMNS_MESSAGE = 'Select adjacent columns to insert or move them.';
 export const INSERT_ONLY_REMOVED_COLUMNS_MESSAGE =
@@ -76,17 +76,12 @@ export function removed_column_name_message(name: string): string {
     return `A deleted column on this sheet is named ${name}. Restore it or choose another name.`;
 }
 
-/** "Delete column", "Delete 3 columns", "Move column", ...: undo labels and menu items. */
+/** "Delete column", "Delete 3 columns", "Move column", ...: undo labels and menu item counts. */
 export function column_structure_label(
     verb: 'Delete' | 'Restore' | 'Insert' | 'Move',
     count: number,
 ): string {
     return count === 1 ? `${verb} column` : `${verb} ${count} columns`;
-}
-
-/** "Insert column left", "Insert 3 columns right": the Insert menu items. */
-export function column_insert_label(side: 'left' | 'right', count: number): string {
-    return `${column_structure_label('Insert', Math.max(1, count))} ${side}`;
 }
 
 /** The live region's report of a move: "Moved 3 columns right", "Moved 1 column left". */
@@ -177,12 +172,6 @@ function item(count: number, reason: string | undefined): ColumnStructureItemMod
         : { count, enabled: false, reason });
 }
 
-function shared_reason(input: Pick<ColumnStructureMenuInput, 'support' | 'ready'>): string | undefined {
-    return !input.support.supported
-        ? input.support.reason
-        : !input.ready ? STRUCTURE_BUSY_MESSAGE : undefined;
-}
-
 export function column_layout_for(
     changes: PendingStructuralChanges,
     context: Pick<WorksheetStructureContext, 'sourceColumnCount'>,
@@ -198,7 +187,7 @@ export function column_layout_for(
 export function column_structure_menu_model(input: ColumnStructureMenuInput): ColumnStructureMenuModel {
     const { selection, changes, context } = input;
     const count = selection.count;
-    const shared = shared_reason(input);
+    const shared = structure_readiness_refusal(input);
     const delete_reason = shared
         ?? refusal_message(plan_column_delete(changes, context, selection.identities, new Map()));
     const insertLeft = insert_item(input, shared, 'before');
@@ -264,7 +253,8 @@ export function column_move_block_refusal(
     input: Pick<ColumnStructureMenuInput, 'support' | 'ready' | 'selection' | 'changes' | 'context'>,
 ): string | undefined {
     const { selection, changes, context } = input;
-    const reason = shared_reason(input)
+    // An `.xlsx` sheet the host can't restructure says so in Move's words, as for rows.
+    const reason = structure_readiness_refusal(input, 'move')
         ?? (!selection.contiguous ? SELECT_ADJACENT_COLUMNS_MESSAGE : undefined)
         ?? structure_exclusivity_message(changes, context);
     if (reason !== undefined) return reason;

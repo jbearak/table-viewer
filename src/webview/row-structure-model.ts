@@ -89,7 +89,7 @@ export const MOVE_AT_BOTTOM_MESSAGE = 'The selected rows are already at the bott
 
 /**
  * "Delete row", "Delete 3 rows", "Restore row", "Insert 2 rows", "Move 3
- * rows", ...: undo labels, and menu items for Delete and Restore.
+ * rows", ...: undo labels, and the counts in the structure menu items.
  */
 export function row_structure_label(verb: 'Delete' | 'Restore' | 'Insert' | 'Move', count: number): string {
     return count === 1 ? `${verb} row` : `${verb} ${count} rows`;
@@ -98,11 +98,6 @@ export function row_structure_label(verb: 'Delete' | 'Restore' | 'Insert' | 'Mov
 /** The live region's report of a move: "Moved 3 rows down", "Moved 1 row up". */
 export function row_move_announcement(count: number, direction: 'up' | 'down'): string {
     return `Moved ${count} ${count === 1 ? 'row' : 'rows'} ${direction}`;
-}
-
-/** "Insert row above", "Insert 3 rows below": the Insert menu items. */
-export function row_insert_label(side: 'above' | 'below', count: number): string {
-    return `${row_structure_label('Insert', Math.max(1, count))} ${side}`;
 }
 
 /**
@@ -509,11 +504,7 @@ function item(count: number, reason: string | undefined): StructureItemModel {
 export function row_structure_menu_model(input: RowStructureMenuInput): RowStructureMenuModel {
     const { selection, changes, context } = input;
     const count = selection.count;
-    const shared_reason = !input.support.supported
-        ? input.support.reason
-        : !input.ready
-            ? STRUCTURE_BUSY_MESSAGE
-            : undefined;
+    const shared_reason = structure_readiness_refusal(input);
     const delete_reason = shared_reason
         ?? (selection.fixedRows ? FIXED_ROWS_MESSAGE : undefined)
         ?? (selection.tailRemovals ? STRUCTURE_TAIL_REMOVAL_MESSAGE : undefined)
@@ -541,12 +532,20 @@ export function row_structure_menu_model(input: RowStructureMenuInput): RowStruc
     });
 }
 
-function shared_structure_reason(input: Pick<RowStructureMenuInput, 'support' | 'ready'>): string | undefined {
-    return !input.support.supported
-        ? input.support.reason
-        : !input.ready
-            ? STRUCTURE_BUSY_MESSAGE
-            : undefined;
+/**
+ * Why no structure gesture on either axis can run now, or undefined: the
+ * host's refusal for the worksheet's axis, in Move's words for a move, else
+ * a grid that isn't ready. Every structure item, shortcut, and drag on both
+ * axes asks this before its own reasons.
+ */
+export function structure_readiness_refusal(
+    input: { readonly support: StructuralAxisSupport; readonly ready: boolean },
+    gesture: 'edit' | 'move' = 'edit',
+): string | undefined {
+    if (!input.support.supported) {
+        return gesture === 'move' ? input.support.moveReason ?? input.support.reason : input.support.reason;
+    }
+    return input.ready ? undefined : STRUCTURE_BUSY_MESSAGE;
 }
 
 /**
@@ -559,8 +558,7 @@ export function row_move_block_refusal(
 ): string | undefined {
     const { selection, changes, context } = input;
     // An `.xlsx` sheet the host can't restructure says so in Move's words.
-    const reason = (input.support.supported ? undefined : input.support.moveReason)
-        ?? shared_structure_reason(input)
+    const reason = structure_readiness_refusal(input, 'move')
         ?? (selection.fixedRows ? MOVE_FIXED_ROWS_MESSAGE : undefined)
         ?? (selection.tailRemovals ? STRUCTURE_TAIL_REMOVAL_MESSAGE : undefined)
         ?? (selection.runs === undefined ? ROWS_NOT_LOADED_MESSAGE : undefined)

@@ -11005,6 +11005,37 @@ describe('structure items across the cell, row, and column menus', () => {
         }],
     ] as const;
 
+    it.each(['cell', 'header'] as const)(
+        'focuses the live column after the first deleted one, from the %s menu',
+        async (route) => {
+            const four = { ...basis, sourceColumnCount: 4 };
+            await render_structure({
+                sheet_meta: {
+                    ...props().sheet_meta,
+                    rowCount: 4,
+                    sourceRowCount: 4,
+                    columnCount: 4,
+                    columnNames: ['A name', 'B name', 'C name', 'D name'],
+                },
+                column_projection: { visible_to_source: [0, 1, 2, 3], source_to_visible: [0, 1, 2, 3], hidden_count: 0 },
+                structural_support: { ...supported, basis: four },
+            });
+            // A and C selected, the menu opened on C: focus lands on B, which
+            // followed the first deleted column, as a row Delete's does.
+            await select({ columns: compact([0, 2]) });
+            if (route === 'cell') {
+                await open_cell_menu(2, 1);
+                await click('Delete');
+            } else {
+                await open_header_menu(2);
+            }
+            await click('Delete 2 columns');
+            await vi.waitFor(() => expect((grid_mock.props!.gridSelection as {
+                current?: { cell: [number, number] };
+            }).current?.cell[0]).toBe(1));
+        },
+    );
+
     it('CSV with nothing pending', async () => {
         await render_structure();
         await expect(await capture_all(source_menus))

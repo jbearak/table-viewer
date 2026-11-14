@@ -141,8 +141,8 @@ Rename column…  [disabled: Only new columns can be renamed on this sheet.]
 Insert column left  [disabled: Can't insert or delete columns on this sheet: it contains an Excel table.]
 Insert column right  [disabled: Can't insert or delete columns on this sheet: it contains an Excel table.]
 Delete column  [disabled: Can't insert or delete columns on this sheet: it contains an Excel table.]
-Move columns left  [disabled: Can't insert or delete columns on this sheet: it contains an Excel table.]
-Move columns right  [disabled: Can't insert or delete columns on this sheet: it contains an Excel table.]
+Move columns left  [disabled: Can't move columns on this sheet: it contains an Excel table.]
+Move columns right  [disabled: Can't move columns on this sheet: it contains an Excel table.]
 ---
 Sort ascending
 Sort descending
@@ -157,8 +157,8 @@ Rename column…  [disabled: Only new columns can be renamed on this sheet.]
 Insert column left  [disabled: Can't insert or delete columns on this sheet: it contains an Excel table.]
 Insert column right  [disabled: Can't insert or delete columns on this sheet: it contains an Excel table.]
 Delete column  [disabled: Can't insert or delete columns on this sheet: it contains an Excel table.]
-Move columns left  [disabled: Can't insert or delete columns on this sheet: it contains an Excel table.]
-Move columns right  [disabled: Can't insert or delete columns on this sheet: it contains an Excel table.]
+Move columns left  [disabled: Can't move columns on this sheet: it contains an Excel table.]
+Move columns right  [disabled: Can't move columns on this sheet: it contains an Excel table.]
 ---
 Sort ascending
 Sort descending
@@ -172,8 +172,8 @@ Hide 2 columns
 Insert 2 columns left  [disabled: Can't insert or delete columns on this sheet: it contains an Excel table.]
 Insert 2 columns right  [disabled: Can't insert or delete columns on this sheet: it contains an Excel table.]
 Delete 2 columns  [disabled: Can't insert or delete columns on this sheet: it contains an Excel table.]
-Move columns left  [disabled: Can't insert or delete columns on this sheet: it contains an Excel table.]
-Move columns right  [disabled: Can't insert or delete columns on this sheet: it contains an Excel table.]
+Move columns left  [disabled: Can't move columns on this sheet: it contains an Excel table.]
+Move columns right  [disabled: Can't move columns on this sheet: it contains an Excel table.]
 ---
 Sort ascending
 Sort descending
@@ -185,8 +185,8 @@ Hide 2 columns
 Insert 2 columns left  [disabled: Can't insert or delete columns on this sheet: it contains an Excel table.]
 Insert 2 columns right  [disabled: Can't insert or delete columns on this sheet: it contains an Excel table.]
 Delete 2 columns  [disabled: Can't insert or delete columns on this sheet: it contains an Excel table.]
-Move columns left  [disabled: Can't insert or delete columns on this sheet: it contains an Excel table.]
-Move columns right  [disabled: Can't insert or delete columns on this sheet: it contains an Excel table.]
+Move columns left  [disabled: Can't move columns on this sheet: it contains an Excel table.]
+Move columns right  [disabled: Can't move columns on this sheet: it contains an Excel table.]
 ---
 Sort ascending
 Sort descending

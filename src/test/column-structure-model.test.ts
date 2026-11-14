@@ -1,6 +1,6 @@
 // Columns in the webview model (row and column structure design, delivery
-// step 8): resolving a header selection, the structure items of the column
-// menus and every reason they are disabled, Move past one displayed column
+// step 8): resolving a header selection (the menus' structure items and their
+// reasons are in structure-menu.test.ts), Move past one displayed column
 // (skipping hidden ones), planning one history action per gesture with undo
 // and redo through the `columnLayout` arm, Pending Column cells, rename, and
 // width, the drop target of a drag, default names, the column projection the
@@ -21,24 +21,16 @@ import { plan_pending_row_history_replay } from '../webview/pending-row-history'
 import {
     discard_layout_changes,
     keep_inserted_rows_at_end,
-    LAST_LIVE_COLUMN_MESSAGE,
-    STRUCTURE_TAIL_REMOVAL_MESSAGE,
     type WorksheetStructureContext,
 } from '../webview/pending-row-store';
-import { STRUCTURE_BUSY_MESSAGE } from '../webview/row-structure-model';
 import {
     column_insert_anchor_is_live,
     column_insert_created_order,
-    column_insert_label,
     column_move_announcement,
     column_move_block_refusal,
     column_step_target,
     column_structure_label,
-    column_structure_menu_model,
     default_pending_column_names,
-    INSERT_ONLY_REMOVED_COLUMNS_MESSAGE,
-    MOVE_AT_LEFT_MESSAGE,
-    MOVE_AT_RIGHT_MESSAGE,
     MOVE_ONLY_REMOVED_COLUMNS_MESSAGE,
     moved_block_display_columns,
     nearest_live_column,
@@ -53,7 +45,6 @@ import {
     removed_column_name_refusal,
     resolve_column_move_drop,
     resolve_column_structure_selection,
-    RESTORE_ONLY_REMOVED_COLUMNS_MESSAGE,
     SELECT_ADJACENT_COLUMNS_MESSAGE,
     type ColumnMovePlanResult,
     type ColumnStructurePlanResult,
@@ -66,13 +57,10 @@ import {
     type ProjectedColumn,
 } from '../webview/column-projection';
 import { build_layout_grid_columns } from '../webview/grid-model';
-import { column_context_menu_items, multi_column_context_menu_items } from '../webview/column-context-menu';
 import { column_rename_error } from '../webview/rename-column-dialog';
-import type { ActionMenuItem } from '../webview/context-menu';
 import {
     index_column_layout,
     source_column_layout,
-    TOO_WIDE_TO_RESTRUCTURE_MESSAGE,
     type ColumnIdentity,
     type ColumnLayout,
 } from '../worksheet-layout';
@@ -138,8 +126,6 @@ describe('labels and announcements', () => {
     it('names counts as the history and menus do', () => {
         expect(column_structure_label('Insert', 1)).toBe('Insert column');
         expect(column_structure_label('Delete', 3)).toBe('Delete 3 columns');
-        expect(column_insert_label('left', 1)).toBe('Insert column left');
-        expect(column_insert_label('right', 2)).toBe('Insert 2 columns right');
         expect(column_move_announcement(1, 'left')).toBe('Moved 1 column left');
         expect(column_move_announcement(3, 'right')).toBe('Moved 3 columns right');
     });
@@ -158,147 +144,13 @@ describe('header selections', () => {
     });
 });
 
-describe('the column menus', () => {
-    const menu = (changes: PendingStructuralChanges, display: readonly number[], overrides: {
-        ready?: boolean;
-        support?: { supported: false; reason: string };
-        ctx?: WorksheetStructureContext;
-        hidden?: readonly number[];
-    } = {}) => {
-        const columns = columns_of(changes, overrides.hidden);
-        return column_structure_menu_model({
-            support: overrides.support ?? supported,
-            ready: overrides.ready ?? true,
-            selection: resolve_column_structure_selection(columns, display),
-            changes,
-            context: overrides.ctx ?? context(),
-            columns,
-        });
-    };
-
-    it('offers Insert on both sides, Delete, and Move for a live column', () => {
-        const model = menu(EMPTY, [1]);
-        expect(model.insertLeft).toMatchObject({ enabled: true, anchor: src(1) });
-        expect(model.insertRight).toMatchObject({ enabled: true, anchor: src(1) });
-        expect(model.delete.enabled).toBe(true);
-        expect(model.restore).toBeUndefined();
-        expect(model.moveLeft).toMatchObject({ enabled: true, before: src(0) });
-        expect(model.moveRight).toMatchObject({ enabled: true, before: src(3) });
-    });
-
-    it('disables every item with the shared reasons', () => {
-        const busy = menu(EMPTY, [1], { ready: false });
-        for (const item of [busy.insertLeft, busy.insertRight, busy.delete, busy.moveLeft, busy.moveRight]) {
-            expect(item.reason).toBe(STRUCTURE_BUSY_MESSAGE);
-        }
-        const wide = menu(EMPTY, [1], { support: { supported: false, reason: TOO_WIDE_TO_RESTRUCTURE_MESSAGE } });
-        expect(wide.delete.reason).toBe(TOO_WIDE_TO_RESTRUCTURE_MESSAGE);
-        expect(wide.insertLeft.reason).toBe(TOO_WIDE_TO_RESTRUCTURE_MESSAGE);
-        const tail = own_pending_structural_changes({
-            ...EMPTY,
-            tailRemovals: [{ appendHistoryId: 'h', sourceRow: 3, savedFingerprint: 'f', savedRow: {
-                cells: {}, format: { kind: 'none' },
-            } }],
-        });
-        expect(menu(tail, [1]).insertLeft.reason).toBe(STRUCTURE_TAIL_REMOVAL_MESSAGE);
-        expect(menu(tail, [1]).moveRight.reason).toBe(STRUCTURE_TAIL_REMOVAL_MESSAGE);
-    });
-
-    it('needs adjacent columns for Insert and Move, but deletes any selection', () => {
-        const model = menu(EMPTY, [0, 2]);
-        expect(model.insertLeft.reason).toBe(SELECT_ADJACENT_COLUMNS_MESSAGE);
-        expect(model.moveRight.reason).toBe(SELECT_ADJACENT_COLUMNS_MESSAGE);
-        expect(model.delete.enabled).toBe(true);
-    });
-
-    it('keeps one live column', () => {
-        expect(menu(EMPTY, [0, 1, 2, 3]).delete.reason).toBe(LAST_LIVE_COLUMN_MESSAGE);
-    });
-
-    it('offers Restore for removals only, and anchors nothing on a removal alone', () => {
-        const removed = planned(plan_column_delete(EMPTY, context(), [src(2)], new Map())).outcome.next;
-        const only = menu(removed, [2]);
-        expect(only.restore).toMatchObject({ enabled: true, count: 1 });
-        expect(only.insertLeft.reason).toBe(INSERT_ONLY_REMOVED_COLUMNS_MESSAGE);
-        expect(only.moveLeft.reason).toBe(MOVE_ONLY_REMOVED_COLUMNS_MESSAGE);
-        const mixed = menu(removed, [1, 2]);
-        expect(mixed.restore?.reason).toBe(RESTORE_ONLY_REMOVED_COLUMNS_MESSAGE);
-    });
-
-    it('stops Move at the edges', () => {
-        expect(menu(EMPTY, [0]).moveLeft.reason).toBe(MOVE_AT_LEFT_MESSAGE);
-        expect(menu(EMPTY, [3]).moveRight.reason).toBe(MOVE_AT_RIGHT_MESSAGE);
-        expect(menu(EMPTY, [2]).moveRight).toMatchObject({ enabled: true, before: 'end' });
-    });
-
-    it('steps past one displayed column, leaving hidden columns where they are', () => {
-        // Column 1 is hidden: moving 2 left passes 0, not the hidden column.
-        const model = menu(EMPTY, [1], { hidden: [1] });
-        expect(model.moveLeft).toMatchObject({ enabled: true, before: src(0) });
+describe('a column Move step', () => {
+    it('passes one displayed column, leaving hidden columns where they are', () => {
         const plan = planned(plan_column_move(EMPTY, context(), [src(2)], src(0)));
         expect(plan.outcome.next.columnLayout?.columns).toEqual([src(2), src(0), src(1), src(3)]);
         // Moving 0 right past displayed column 2 (hidden 1 between) lands before 3.
         expect(column_step_target(columns_of(EMPTY, [1]), index_column_layout(source_column_layout(4)), [src(0)], 'forward'))
             .toEqual(src(3));
-    });
-
-    it('builds menu items that show disabled reasons', () => {
-        const items = column_context_menu_items({
-            column_name: 'Price',
-            transform_sections: false,
-            transform_disabled: false,
-            active_direction: null,
-            any_sorted: false,
-            other_columns_sorted: false,
-            has_filter: false,
-            any_filtered: false,
-            on_copy: () => {},
-            on_hide: () => {},
-            hide_disabled_reason: 'Save the new column to hide it.',
-            structure: {
-                insert_left: { count: 1, on_click: () => {} },
-                insert_right: { count: 2, on_click: () => {} },
-                delete: { count: 1, disabled_reason: LAST_LIVE_COLUMN_MESSAGE },
-                restore: { count: 1, on_click: () => {} },
-                move_left: { count: 1, disabled_reason: MOVE_AT_LEFT_MESSAGE },
-                move_right: { count: 1, on_click: () => {} },
-            },
-            on_sort: () => {},
-            on_clear_column_sort: () => {},
-            on_clear_all_sorts: () => {},
-            on_edit_filter: () => {},
-            on_clear_column_filter: () => {},
-            on_clear_all_filters: () => {},
-        }).filter((item): item is ActionMenuItem => !('kind' in item));
-        expect(items.map((item) => item.label)).toEqual([
-            'Copy column',
-            'Hide column',
-            'Insert column left',
-            'Insert 2 columns right',
-            'Delete column',
-            'Restore column',
-            'Move columns left',
-            'Move columns right',
-        ]);
-        expect(items[1]).toMatchObject({ disabled: true, disabled_reason: 'Save the new column to hide it.' });
-        expect(items[4]).toMatchObject({ disabled: true, disabled_reason: LAST_LIVE_COLUMN_MESSAGE });
-        const multi = multi_column_context_menu_items({
-            column_count: 3,
-            transform_sections: false,
-            transform_disabled: false,
-            on_copy: () => {},
-            on_hide: () => {},
-            structure: {
-                insert_left: { count: 3, on_click: () => {} },
-                insert_right: { count: 3, on_click: () => {} },
-                delete: { count: 3, on_click: () => {} },
-                move_left: { count: 3, on_click: () => {} },
-                move_right: { count: 3, on_click: () => {} },
-            },
-            on_sort: () => {},
-        }).filter((item): item is ActionMenuItem => !('kind' in item));
-        expect(multi.map((item) => item.label)).toContain('Insert 3 columns left');
-        expect(multi.map((item) => item.label)).toContain('Delete 3 columns');
     });
 });
 

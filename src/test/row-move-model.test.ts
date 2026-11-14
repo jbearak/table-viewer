@@ -1,6 +1,6 @@
 // Row move in the webview model (row and column structure design, delivery
-// step 7): the Move items of the row-gutter menu and every reason they are
-// disabled, one step past a live row and its glued tombstones, planning one
+// step 7): one step past a live row and its glued tombstones (the Move items
+// and their reasons are in structure-menu.test.ts), planning one
 // history action per gesture with undo and redo, resolving a drag's drop row,
 // the block focus follows, the announcement, and the moved tint and labels.
 import { describe, expect, it } from 'vitest';
@@ -19,38 +19,25 @@ import { plan_pending_row_history_replay } from '../webview/pending-row-history'
 import { create_pending_row_projection } from '../webview/pending-row-projection';
 import {
     APPENDED_BAND_MESSAGE,
-    MERGE_SPLIT_MESSAGE,
-    merge_destination_message,
-    STRUCTURE_CELL_MOVE_MESSAGE,
-    STRUCTURE_TAIL_REMOVAL_MESSAGE,
-    STRUCTURE_TRANSFORMED_MESSAGE,
     type WorksheetStructureContext,
 } from '../webview/pending-row-store';
 import {
     moved_block_display_rows,
     MOVE_ABOVE_HEADER_MESSAGE,
-    MOVE_AT_BOTTOM_MESSAGE,
-    MOVE_AT_TOP_MESSAGE,
     MOVE_FIXED_ROWS_MESSAGE,
-    MOVE_ONLY_REMOVED_ROWS_MESSAGE,
     plan_row_delete,
     plan_row_insert,
     plan_row_move,
     resolve_row_move_drop,
     row_move_announcement,
     row_move_block_refusal,
-    row_structure_menu_model,
+    row_move_item_model,
     ROWS_NOT_LOADED_MESSAGE,
-    SELECT_ADJACENT_ROWS_MESSAGE,
-    STRUCTURE_BUSY_MESSAGE,
     type RowMovePlanResult,
     type RowStructurePlanResult,
     type RowStructureSelection,
     row_structure_selection,
 } from '../webview/row-structure-model';
-import { row_context_menu_items } from '../webview/row-context-menu';
-import type { ActionMenuItem } from '../webview/context-menu';
-import { TOO_MANY_ROW_RUNS_MESSAGE, type RowLayout } from '../worksheet-layout';
 
 const worksheet: WorksheetTarget = { sheetIndex: 0, sheetName: 'data' };
 const template = { id: 'plain', format: { kind: 'none' as const } };
@@ -106,18 +93,10 @@ function selection(overrides: Partial<RowStructureSelection>): RowStructureSelec
     } as Parameters<typeof row_structure_selection>[0]);
 }
 
-function menu(
-    changes: PendingStructuralChanges,
-    overrides: Partial<RowStructureSelection>,
-    options: { ready?: boolean; ctx?: WorksheetStructureContext } = {},
-) {
-    return row_structure_menu_model({
-        support: supported,
-        ready: options.ready ?? true,
-        selection: selection(overrides),
-        changes,
-        context: options.ctx ?? context(),
-    });
+/** The step each Move item, and the `Alt+Shift+↑`/`↓` shortcuts, would take. */
+function steps(changes: PendingStructuralChanges, overrides: Partial<RowStructureSelection>) {
+    const input = { support: supported, ready: true, selection: selection(overrides), changes, context: context() };
+    return { moveUp: row_move_item_model(input, 'backward'), moveDown: row_move_item_model(input, 'forward') };
 }
 
 function rows(count: number, start = 0): RowIdentity[] {
@@ -126,7 +105,7 @@ function rows(count: number, start = 0): RowIdentity[] {
 
 describe('planning a move', () => {
     it('moves the block past one neighbor as one action labelled "Move N rows"', () => {
-        const model = menu(EMPTY, { count: 3, identities: rows(3, 2) });
+        const model = steps(EMPTY, { count: 3, identities: rows(3, 2) });
         expect(model.moveDown).toEqual({ count: 3, enabled: true, before: source(6) });
         expect(model.moveUp).toEqual({ count: 3, enabled: true, before: source(1) });
         const down = planned(plan_row_move(EMPTY, context(), rows(3, 2), model.moveDown.before!));
@@ -151,7 +130,7 @@ describe('planning a move', () => {
     it('passes a live row together with its glued tombstones in one step', () => {
         // Row 6 deleted: it glues to row 5.
         const changes = deleted(EMPTY, [6]);
-        const down = menu(changes, { count: 2, identities: rows(2, 3) }).moveDown;
+        const down = steps(changes, { count: 2, identities: rows(2, 3) }).moveDown;
         expect(down.before).toEqual(source(7));
         expect(planned(plan_row_move(changes, context(), rows(2, 3), down.before!)).outcome.next.rowLayout?.runs)
             .toEqual([
@@ -160,7 +139,7 @@ describe('planning a move', () => {
                 { kind: 'source', start: 3, count: 2 },
                 { kind: 'source', start: 7, count: 3 },
             ]);
-        const up = menu(changes, { identities: [source(7)] }).moveUp;
+        const up = steps(changes, { identities: [source(7)] }).moveUp;
         expect(up.before).toEqual(source(5));
         expect(planned(plan_row_move(changes, context(), [source(7)], up.before!)).outcome.next.rowLayout?.runs)
             .toEqual([
@@ -230,96 +209,7 @@ describe('planning a move', () => {
     });
 });
 
-describe('the Move items', () => {
-    const reasons = (
-        changes: PendingStructuralChanges,
-        overrides: Partial<RowStructureSelection>,
-        options: { ready?: boolean; ctx?: WorksheetStructureContext } = {},
-    ) => {
-        const model = menu(changes, overrides, options);
-        return [model.moveUp.reason, model.moveDown.reason];
-    };
-    const both = (reason: string) => [reason, reason];
-
-    it('disables both with the shared reasons', () => {
-        expect(row_structure_menu_model({
-            support: { supported: false, reason: 'Not available yet' },
-            ready: true,
-            selection: selection({}),
-            changes: EMPTY,
-            context: context(),
-        }).moveUp.reason).toBe('Not available yet');
-        expect(reasons(EMPTY, {}, { ready: false })).toEqual(both(STRUCTURE_BUSY_MESSAGE));
-        expect(reasons(EMPTY, { fixedRows: true })).toEqual(both(MOVE_FIXED_ROWS_MESSAGE));
-        expect(reasons(EMPTY, { tailRemovals: true })).toEqual(both(STRUCTURE_TAIL_REMOVAL_MESSAGE));
-        expect(reasons(EMPTY, { identities: undefined })).toEqual(both(ROWS_NOT_LOADED_MESSAGE));
-        expect(reasons(EMPTY, { count: 2, contiguous: false, identities: [source(1), source(5)] }))
-            .toEqual(both(SELECT_ADJACENT_ROWS_MESSAGE));
-        expect(reasons(EMPTY, {}, { ctx: context({ bodyViewTransformed: true }) }))
-            .toEqual(both(STRUCTURE_TRANSFORMED_MESSAGE));
-    });
-
-    it('keeps appended rows at the end: a selection in or reaching into the band does not move', () => {
-        const band = { ...EMPTY, formatTemplates: [template], appendedRows: [appended('x', 1), appended('y', 2)] };
-        expect(reasons(band, { identities: [pending('x')], bandRows: 1 })).toEqual(both(APPENDED_BAND_MESSAGE));
-        expect(reasons(band, { count: 2, identities: [source(9), pending('x')], bandRows: 1 }))
-            .toEqual(both(APPENDED_BAND_MESSAGE));
-        // The last body row cannot move down into the band.
-        expect(menu(band, { identities: [source(9)] }).moveDown.reason).toBe(APPENDED_BAND_MESSAGE);
-    });
-
-    it('refuses a selection of only deleted rows', () => {
-        const changes = deleted(EMPTY, [2, 3]);
-        expect(reasons(changes, { count: 2, identities: rows(2, 2), removedSourceRows: [2, 3] }))
-            .toEqual(both(MOVE_ONLY_REMOVED_ROWS_MESSAGE));
-    });
-
-    it('stops at the Header Row and at the ends of the body', () => {
-        expect(menu(EMPTY, { identities: [source(1)] }, { ctx: context({ bodyStart: 1 }) }).moveUp.reason)
-            .toBe(MOVE_ABOVE_HEADER_MESSAGE);
-        expect(menu(EMPTY, { identities: [source(0)] }).moveUp.reason).toBe(MOVE_AT_TOP_MESSAGE);
-        expect(menu(EMPTY, { identities: [source(9)] }).moveDown.reason).toBe(MOVE_AT_BOTTOM_MESSAGE);
-        // A deleted row at the top does not count as a row to pass.
-        expect(menu(deleted(EMPTY, [0]), { identities: [source(1)] }).moveUp.reason).toBe(MOVE_AT_TOP_MESSAGE);
-    });
-
-    it('disables both under the cut-move and tail-removal exclusivity rules', () => {
-        expect(reasons(EMPTY, {}, { ctx: context({ hasPendingCellMove: () => true }) }))
-            .toEqual(both(STRUCTURE_CELL_MOVE_MESSAGE));
-        const tail = {
-            ...EMPTY,
-            tailRemovals: [{ appendHistoryId: 'h', sourceRow: 9, savedFingerprint: 'f' }],
-        } as unknown as PendingStructuralChanges;
-        expect(reasons(tail, {})).toEqual(both(STRUCTURE_TAIL_REMOVAL_MESSAGE));
-    });
-
-    it('refuses to split a merge or land inside one', () => {
-        const merges = [{ startRow: 2, endRow: 3, startCol: 0, endCol: 1 }, { startRow: 6, endRow: 7, startCol: 0, endCol: 0 }];
-        const ctx = context({ merges });
-        expect(reasons(EMPTY, { identities: [source(2)] }, { ctx })).toEqual(both(MERGE_SPLIT_MESSAGE));
-        // Rows 4-5 passing row 6 would land between the merge's rows 6 and 7.
-        expect(menu(EMPTY, { count: 2, identities: rows(2, 4) }, { ctx }).moveDown.reason)
-            .toBe(merge_destination_message('rows'));
-        // The whole merge moves as a unit.
-        expect(menu(EMPTY, { count: 2, identities: rows(2, 2) }, { ctx }).moveUp.enabled).toBe(true);
-    });
-
-    it('refuses a move past the row-run limit', () => {
-        // 9,998 single-row runs in swapped pairs and one tail run: 9,999 runs.
-        const runs: RowLayout['runs'][number][] = [];
-        for (let row = 0; row < 9_998; row += 2) {
-            runs.push({ kind: 'source', start: row + 1, count: 1 }, { kind: 'source', start: row, count: 1 });
-        }
-        runs.push({ kind: 'source', start: 9_998, count: 4 });
-        const changes: PendingStructuralChanges = {
-            ...EMPTY,
-            rowLayout: { runs, removedSourceRows: [], discardedPendingRows: [] },
-            structuralBasis: { ...BASIS, sourceRowCount: 10_002 },
-        };
-        const ctx = context({ sourceRowCount: 10_002, structuralBasis: { ...BASIS, sourceRowCount: 10_002 } });
-        expect(menu(changes, { identities: [source(9_999)] }, { ctx }).moveUp.reason).toBe(TOO_MANY_ROW_RUNS_MESSAGE);
-    });
-
+describe('the block a drag moves', () => {
     it('arms a drag only when the block could move at all', () => {
         const input = (overrides: Partial<RowStructureSelection>) => ({
             support: supported,
@@ -331,26 +221,6 @@ describe('the Move items', () => {
         expect(row_move_block_refusal(input({ identities: [source(0)] }))).toBeUndefined();
         expect(row_move_block_refusal(input({ bandRows: 1 }))).toBe(APPENDED_BAND_MESSAGE);
         expect(row_move_block_refusal(input({ fixedRows: true }))).toBe(MOVE_FIXED_ROWS_MESSAGE);
-    });
-
-    it('labels the items "Move rows up" and "Move rows down", after Delete and Restore', () => {
-        const items = row_context_menu_items({
-            selected_row_count: 2,
-            can_hide_rows: false,
-            can_promote_row_to_header: false,
-            on_hide_rows: () => {},
-            on_promote_row_to_header: () => {},
-            on_copy_rows: () => {},
-            delete_rows: { count: 2, on_click: () => {} },
-            restore_rows: { count: 1, on_click: () => {} },
-            move_rows_up: { count: 2, disabled_reason: MOVE_AT_TOP_MESSAGE },
-            move_rows_down: { count: 2, on_click: () => {} },
-        }) as ActionMenuItem[];
-        expect(items.map((item) => item.label)).toEqual([
-            'Delete 2 rows', 'Restore row', 'Move rows up', 'Move rows down', 'Copy 2 rows',
-        ]);
-        expect(items[2]).toMatchObject({ disabled: true, disabled_reason: MOVE_AT_TOP_MESSAGE });
-        expect(items[3]?.disabled).toBeUndefined();
     });
 });
 

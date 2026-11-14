@@ -19,24 +19,16 @@ import { history_menu_projection } from '../webview/history-menu-projection';
 import { plan_pending_row_history_replay } from '../webview/pending-row-history';
 import { create_pending_row_projection } from '../webview/pending-row-projection';
 import {
-    STRUCTURE_CELL_MOVE_MESSAGE,
-    STRUCTURE_TAIL_REMOVAL_MESSAGE,
     type WorksheetStructureContext,
 } from '../webview/pending-row-store';
 import {
-    FIXED_ROWS_MESSAGE,
     nearest_live_row,
     plan_row_delete,
     plan_row_restore,
     removed_source_row_test,
     resolve_row_structure_selection,
-    RESTORE_ONLY_REMOVALS_MESSAGE,
-    ROWS_NOT_LOADED_MESSAGE,
     row_structure_menu_model,
-    STRUCTURE_BUSY_MESSAGE,
     type RowStructurePlan,
-    type RowStructureSelection,
-    row_structure_selection,
     plan_row_delete_runs,
     plan_row_restore_runs,
 } from '../webview/row-structure-model';
@@ -74,20 +66,6 @@ function planned(result: ReturnType<typeof plan_row_delete>): RowStructurePlan {
 
 function source(sourceRow: number): RowIdentity {
     return { kind: 'source', sourceRow };
-}
-
-function selection(overrides: Partial<RowStructureSelection>): RowStructureSelection {
-    return row_structure_selection({
-        count: 1,
-        identities: [source(2)],
-        removedSourceRows: [],
-        fixedRows: false,
-        tailRemovals: false,
-        contiguous: true,
-        bandRows: 0,
-        endsAtBandEnd: false,
-        ...overrides,
-    } as Parameters<typeof row_structure_selection>[0]);
 }
 
 describe('row Delete and Restore planning', () => {
@@ -165,91 +143,6 @@ describe('row Delete and Restore planning', () => {
         // Restoring every removal leaves the source layout, which is stored as absence.
         expect(both.outcome.next.rowLayout).toBeUndefined();
         expect(both.outcome.next.structuralBasis).toBeUndefined();
-    });
-});
-
-describe('row structure menu model', () => {
-    const supported = { supported: true as const };
-
-    it('enables Delete for live rows and offers no Restore without removals', () => {
-        const model = row_structure_menu_model({
-            support: supported, ready: true, selection: selection({ count: 1 }), changes: EMPTY, context: context(),
-        });
-        expect(model.delete).toEqual({ count: 1, enabled: true });
-        expect(model.restore).toBeUndefined();
-    });
-
-    it('reports an unsupported worksheet with the host reason', () => {
-        const model = row_structure_menu_model({
-            support: { supported: false, reason: 'Not available yet' },
-            ready: true,
-            selection: selection({}),
-            changes: EMPTY,
-            context: context(),
-        });
-        expect(model.delete).toEqual({ count: 1, enabled: false, reason: 'Not available yet' });
-    });
-
-    it('disables Delete for header rows, tail removals, unloaded rows, and a busy grid', () => {
-        const menu = (overrides: Partial<RowStructureSelection>, ready = true) => row_structure_menu_model({
-            support: supported, ready, selection: selection(overrides), changes: EMPTY, context: context(),
-        }).delete.reason;
-        expect(menu({ fixedRows: true })).toBe(FIXED_ROWS_MESSAGE);
-        expect(menu({ tailRemovals: true })).toBe(STRUCTURE_TAIL_REMOVAL_MESSAGE);
-        expect(menu({ identities: undefined })).toBe(ROWS_NOT_LOADED_MESSAGE);
-        expect(menu({}, false)).toBe(STRUCTURE_BUSY_MESSAGE);
-    });
-
-    it('takes the store refusal as the reason: pending cell moves, tail removals', () => {
-        const moved = row_structure_menu_model({
-            support: supported,
-            ready: true,
-            selection: selection({}),
-            changes: EMPTY,
-            context: context({ hasPendingCellMove: () => true }),
-        });
-        expect(moved.delete).toEqual({ count: 1, enabled: false, reason: STRUCTURE_CELL_MOVE_MESSAGE });
-    });
-
-    it('enables Restore only for a selection made only of removals', () => {
-        const deleted = planned(plan_row_delete(EMPTY, context(), [source(2), source(3)], new Map()));
-        const only = row_structure_menu_model({
-            support: supported,
-            ready: true,
-            selection: selection({ count: 2, identities: [source(2), source(3)], removedSourceRows: [2, 3] }),
-            changes: deleted.outcome.next,
-            context: context(),
-        });
-        expect(only.restore).toEqual({ count: 2, enabled: true });
-        // Every selected row is already deleted, so Delete has nothing to do.
-        expect(only.delete.enabled).toBe(false);
-        const mixed = row_structure_menu_model({
-            support: supported,
-            ready: true,
-            selection: selection({ count: 2, identities: [source(2), source(5)], removedSourceRows: [2] }),
-            changes: deleted.outcome.next,
-            context: context(),
-        });
-        expect(mixed.delete.enabled).toBe(true);
-        expect(mixed.restore).toEqual({ count: 1, enabled: false, reason: RESTORE_ONLY_REMOVALS_MESSAGE });
-    });
-
-    it('lets Delete remove Pending Appended Rows even beside a tail removal', () => {
-        const start: PendingStructuralChanges = {
-            ...with_rows([appended('a', 1)]),
-            tailRemovals: [{
-                appendHistoryId: 'h', sourceRow: 9, savedFingerprint: 'f',
-                savedRow: { cells: {}, format: { kind: 'none' } },
-            }],
-        };
-        const model = row_structure_menu_model({
-            support: supported,
-            ready: true,
-            selection: selection({ identities: [{ kind: 'pending', pendingRowId: 'a' }] }),
-            changes: start,
-            context: context(),
-        });
-        expect(model.delete.enabled).toBe(true);
     });
 });
 
