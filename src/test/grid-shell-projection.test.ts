@@ -11081,21 +11081,26 @@ describe('structure items across the cell, row, and column menus', () => {
         const pending = create_pending_row_store({ session_id: 'session' });
         pending.append_rows('session', ['band-a', 'band-b'], template, 1, append_basis);
         await render_structure({ pending_row_store: pending });
-        // Insert a row below row 1, a column right of A, then delete row 4 and column C.
-        await open_row_menu(0);
-        await click('Insert row below');
-        await vi.waitFor(() => expect(inserted_rows(pending.snapshot())).toHaveLength(1));
-        await open_header_menu(0);
-        await click('Insert column right');
-        await vi.waitFor(() => expect(pending.snapshot().pendingColumns).toHaveLength(1));
-        await select({});
-        await open_row_menu(4);
-        await click('Delete row');
-        await vi.waitFor(() => expect(pending.snapshot().rowLayout?.removedSourceRows).toHaveLength(1));
-        await select({});
-        await open_header_menu(3);
-        await click('Delete column');
-        await vi.waitFor(() => expect(pending.snapshot().columnLayout?.removedSourceColumns).toHaveLength(1));
+        // Insert a row below row 1, a column right of A, then delete row 4 and
+        // column C. Each gesture moves the caret when the grid shows its
+        // result; wait for that, so it can't land on a selection made later.
+        const caret = () => (grid_mock.props!.gridSelection as {
+            current?: { cell: [number, number] };
+        }).current?.cell;
+        const gesture = async (open: () => Promise<void>, label: string, focused: [number, number]) => {
+            await select({});
+            await open();
+            await click(label);
+            await vi.waitFor(() => expect(caret()).toEqual(focused));
+        };
+        await gesture(() => open_row_menu(0), 'Insert row below', [0, 1]);
+        await gesture(() => open_header_menu(0), 'Insert column right', [1, 0]);
+        await gesture(() => open_row_menu(4), 'Delete row', [0, 5]);
+        await gesture(() => open_header_menu(3), 'Delete column', [2, 0]);
+        expect(inserted_rows(pending.snapshot())).toHaveLength(1);
+        expect(pending.snapshot().pendingColumns).toHaveLength(1);
+        expect(pending.snapshot().rowLayout?.removedSourceRows).toHaveLength(1);
+        expect(pending.snapshot().columnLayout?.removedSourceColumns).toHaveLength(1);
         // Display rows: 0 source, 1 inserted, 2-3 source, 4 removed, 5-6 appended.
         // Display columns: 0 A, 1 Pending Column, 2 B, 3 C (removed).
         await expect(await capture_all([
