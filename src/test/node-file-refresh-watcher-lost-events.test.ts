@@ -12,6 +12,10 @@ import { NodeFileRefreshWatcherFactory } from '../node-file-refresh-watcher';
  * skips the "events were dropped" notice instead of passing it on. These tests
  * stand in a native watcher that reports only what each test fires by hand, so
  * a dropped event is deterministic rather than a matter of machine load.
+ *
+ * Writes a test counts events after are synchronous. An async write truncates
+ * the file before it writes, and a poll landing between the two would report a
+ * change of its own.
  */
 type NativeListener = (event_type: string, filename: string | null) => void;
 
@@ -73,7 +77,7 @@ describe('Node file refresh watcher when the native watcher loses events', () =>
         const events = watch(target);
         expect(native.listeners).toHaveLength(1);
 
-        await fs.promises.writeFile(target, 'reset by git');
+        fs.writeFileSync(target, 'reset by git');
 
         await vi.waitFor(() => expect(events).toEqual(['change']), WAIT);
     });
@@ -98,10 +102,10 @@ describe('Node file refresh watcher when the native watcher loses events', () =>
         // The only native event lands while the writer is mid-file, so a reload
         // it triggers reads a truncated workbook. The rest of the write must
         // still raise an event, or the view keeps the unreadable read's result.
-        await fs.promises.writeFile(target, 'PK');
+        fs.writeFileSync(target, 'PK');
         fire_native('change', target);
         expect(events).toEqual(['change']);
-        await fs.promises.appendFile(target, ' and the rest of the archive');
+        fs.appendFileSync(target, ' and the rest of the archive');
 
         await vi.waitFor(() => expect(events).toEqual(['change', 'change']), WAIT);
     });
@@ -111,12 +115,12 @@ describe('Node file refresh watcher when the native watcher loses events', () =>
         await fs.promises.writeFile(target, 'saved by Table Viewer');
         const events = watch(target);
 
-        await fs.promises.writeFile(target, 'first external change');
+        fs.writeFileSync(target, 'first external change');
         fire_native('change', target);
         expect(events).toEqual(['change']);
         // A second, unreported change is the observable end point: once it
         // arrives, every poll that could have repeated the first has run.
-        await fs.promises.writeFile(target, 'second external change, unreported');
+        fs.writeFileSync(target, 'second external change, unreported');
 
         await vi.waitFor(() => expect(events).toHaveLength(2), WAIT);
         expect(events).toEqual(['change', 'change']);
@@ -134,7 +138,7 @@ describe('Node file refresh watcher when the native watcher loses events', () =>
         // has seen the change, the disposed one has had the same polls to miss.
         const live_events = watch(target);
 
-        await fs.promises.writeFile(target, 'changed after dispose');
+        fs.writeFileSync(target, 'changed after dispose');
 
         await vi.waitFor(() => expect(live_events).toEqual(['change']), WAIT);
         expect(disposed_events).toEqual([]);
