@@ -16,7 +16,7 @@ import { expect, test } from '@playwright/test';
 import type { ElectronApplication, Page } from '@playwright/test';
 import { parse_xlsx } from '../../src/parse-xlsx';
 import { build_fixture_xlsx, cell, row } from '../../src/test/helpers/xlsx-structure-fixture';
-import { isolated_user_data, repo_dir, state_database_path } from './smoke-helpers';
+import { isolated_user_data, read_workbook, repo_dir, state_database_path } from './smoke-helpers';
 import {
     cell_point,
     choose,
@@ -392,17 +392,15 @@ test('XLSX rows and columns: insert, delete, move, then save', async () => {
     await save_screenshot(page, '03-xlsx-before-save');
 
     await save_changes(page);
-    const saved = async () => {
-        const parsed = await parse_xlsx(new Uint8Array(fs.readFileSync(file)));
-        return parsed.data.sheets[0].rows.map((row) => row.map((cell) => cell?.formatted ?? ''));
-    };
-    await expect.poll(async () => (await saved()).map((row) => row.slice(0, 3))).toEqual([
+    const saved = async () => (await read_workbook(file))?.data.sheets[0].rows
+        .map((row) => row.map((cell) => cell?.formatted ?? ''));
+    await expect.poll(async () => (await saved())?.map((row) => row.slice(0, 3))).toEqual([
         ['New column', 'Name', 'Age'],
         ['', 'Alice', '30'],
         ['', 'Bob', '25'],
         ['', 'Cara', ''],
     ]);
-    expect((await saved())[0]).toHaveLength(4);
+    expect((await saved())?.[0]).toHaveLength(4);
 });
 
 test('an .xlsx formula recalculated before Save shows General digits, as it does after Save', async () => {
@@ -889,10 +887,8 @@ test('an external edit that turns on an .xlsx Header Row conflicts, and Keep new
     await expect.poll(async () => (await grid_rows(page)).map((line) => line.split('|').slice(1).join('|')))
         .toEqual(['3|4', '5|6', '7|8', '9|typed-under-conflict']);
     await save_changes(page);
-    const saved = async () => {
-        const parsed = await parse_xlsx(new Uint8Array(fs.readFileSync(file)));
-        return parsed.data.sheets[0].rows.map((cells) => cells.map((value) => value?.formatted ?? ''));
-    };
+    const saved = async () => (await read_workbook(file))?.data.sheets[0].rows
+        .map((cells) => cells.map((value) => value?.formatted ?? ''));
     await expect.poll(saved)
         .toEqual([['x', 'y'], ['3', '4'], ['5', '6'], ['7', '8'], ['9', 'typed-under-conflict']]);
 });

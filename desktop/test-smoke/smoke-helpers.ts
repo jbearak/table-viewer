@@ -4,6 +4,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { expect, _electron as electron } from '@playwright/test';
 import type { ElectronApplication, Page } from '@playwright/test';
+import { parse_xlsx } from '../../src/parse-xlsx';
 
 export const repo_dir = path.resolve(__dirname, '..', '..');
 export const main_js = path.join(repo_dir, 'dist', 'desktop', 'main.js');
@@ -31,6 +32,25 @@ export function launch_app(
         cwd: repo_dir,
         env: { ...process.env, ...env, TABLE_VIEWER_USER_DATA_DIR: user_data_dir },
     });
+}
+
+export type ParsedWorkbook = Awaited<ReturnType<typeof parse_xlsx>>;
+
+/**
+ * The workbook at `file` as it is on disk, or undefined while the app or Git is
+ * partway through writing it.
+ *
+ * The app saves in place, truncating the file and then writing it, so a read
+ * can land in between and fail to parse. `expect.poll` stops at the first
+ * thrown error instead of trying again, so a spec that polls a saved workbook
+ * polls this, which reads a half-written file as "not yet".
+ */
+export async function read_workbook(file: string): Promise<ParsedWorkbook | undefined> {
+    try {
+        return await parse_xlsx(new Uint8Array(fs.readFileSync(file)));
+    } catch {
+        return undefined;
+    }
 }
 
 /** The desktop's SQLite file-state database inside `user_data_dir`. */
