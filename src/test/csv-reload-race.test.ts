@@ -12,6 +12,7 @@ import { dispose_csv_preview, show_csv_preview } from '../csv-preview';
 import { CsvDataSource } from '../data-source/csv-source';
 import type { DataSource } from '../data-source/interface';
 import { acquire_file_coordinator } from '../file-coordinator';
+import { FILE_SETTLE_LIMIT_MS } from '../file-settle';
 import type { AuthorityFileStateStore } from '../state';
 import { versioned_state_store } from './helpers/versioned-state-store';
 import * as vscode_mock from './mocks/vscode';
@@ -1401,7 +1402,11 @@ describe('CSV reload races', () => {
         vi.useFakeTimers();
         let mtime = 0;
         vscode_mock.__setStatImplementation(async () => ({ size: 100, mtime: ++mtime }));
-        vscode_mock.__setReadFileImplementation(async () => enc.encode('h\na\n'));
+        let reads = 0;
+        vscode_mock.__setReadFileImplementation(async () => {
+            reads += 1;
+            return enc.encode('h\na\n');
+        });
         const close_spy = vi.spyOn(CsvDataSource.prototype, 'close');
         const error_dismissed = deferred<undefined>();
         const error_spy = vi.spyOn(vscode_mock.window, 'showErrorMessage')
@@ -1411,10 +1416,14 @@ describe('CSV reload races', () => {
         const panel_close = vi.spyOn(panel, 'dispose');
 
         await panel.__receive({ type: 'ready' });
+        // A file whose stat changes on every look is still being written, so
+        // the load waits for it to settle, up to the limit, before reporting.
+        await vi.advanceTimersByTimeAsync(FILE_SETTLE_LIMIT_MS);
         await vi.waitFor(() => expect(error_spy).toHaveBeenCalledOnce());
 
         expect(initial_snapshots(panel)).toHaveLength(0);
-        expect(close_spy).toHaveBeenCalledTimes(4);
+        // Every candidate built along the way was closed.
+        expect(close_spy).toHaveBeenCalledTimes(reads);
         expect(error_spy).toHaveBeenCalledWith(
             'The file changed while it was being refreshed.',
         );
@@ -1441,6 +1450,7 @@ describe('CSV reload races', () => {
         const panel_close = vi.spyOn(panel, 'dispose');
 
         await panel.__receive({ type: 'ready' });
+        await vi.advanceTimersByTimeAsync(FILE_SETTLE_LIMIT_MS);
         await vi.waitFor(() => expect(error_spy).toHaveBeenCalledOnce());
         unstable = false;
         await panel.__receive({ type: 'ready' });
@@ -1467,8 +1477,10 @@ describe('CSV reload races', () => {
         const panel_close = vi.spyOn(panel, 'dispose');
 
         await panel.__receive({ type: 'ready' });
+        await vi.advanceTimersByTimeAsync(FILE_SETTLE_LIMIT_MS);
         await vi.waitFor(() => expect(error_spy).toHaveBeenCalledOnce());
         const watcher_refresh = vscode_mock.__getWatchers()[0].__fireChange();
+        await vi.advanceTimersByTimeAsync(FILE_SETTLE_LIMIT_MS);
         await vi.waitFor(() => expect(error_spy).toHaveBeenCalledTimes(2));
 
         initial_error_dismissed.resolve(undefined);
@@ -1521,13 +1533,14 @@ describe('CSV reload races', () => {
         vi.useRealTimers();
     });
 
-    it('shares one retry budget across locked and unstable reload failures', async () => {
+    it('bounds a reload through locked and unstable failures', async () => {
         vi.useFakeTimers();
         vscode_mock.__setStatImplementation(async () => ({ size: 100, mtime: 1 }));
         vscode_mock.__setReadFileImplementation(async () => enc.encode('h\na\n'));
         open_csv_table(uri('/tmp/mixed-retry.csv'));
         const panel = vscode_mock.__getPanels()[0];
         await panel.__receive({ type: 'ready' });
+        const error_spy = vi.spyOn(vscode_mock.window, 'showErrorMessage');
 
         let stat_calls = 0;
         vscode_mock.__setStatImplementation(async () => {
@@ -1542,9 +1555,19 @@ describe('CSV reload races', () => {
         });
 
         await vscode_mock.__getWatchers()[0].__fireChange();
+        // A stat that changes on every look is a file still being written:
+        // the reload waits for it rather than reporting it after three tries.
         await vi.advanceTimersByTimeAsync(500);
-
-        expect(stat_calls).toBe(6);
+        expect(error_spy).not.toHaveBeenCalled();
+        // But not forever.
+        await vi.advanceTimersByTimeAsync(FILE_SETTLE_LIMIT_MS);
+        expect(error_spy).toHaveBeenCalledOnce();
+        expect(error_spy).toHaveBeenCalledWith(
+            'Failed to reload: The file changed while it was being refreshed.',
+        );
+        const calls_at_report = stat_calls;
+        await vi.advanceTimersByTimeAsync(FILE_SETTLE_LIMIT_MS);
+        expect(stat_calls).toBe(calls_at_report);
         expect(refresh_snapshots(panel)).toHaveLength(0);
         vi.useRealTimers();
     });
@@ -1614,12 +1637,14 @@ describe('CSV reload races', () => {
             mtime: ++mtime,
         }));
         await vscode_mock.__getWatchers()[0].__fireChange();
-        await vi.advanceTimersByTimeAsync(200);
+        await vi.advanceTimersByTimeAsync(FILE_SETTLE_LIMIT_MS + 1_000);
+        const reads_at_limit = reads;
+        await vi.advanceTimersByTimeAsync(FILE_SETTLE_LIMIT_MS);
         vi.useRealTimers();
 
-        // Initial parse+verification, then four bounded watcher attempts that
-        // are rejected by the first validation stat before another read.
-        expect(reads).toBe(6);
+        // The reload waits for the file to settle, a retry at a time, until
+        // the limit; then it stops reading.
+        expect(reads).toBe(reads_at_limit);
         expect(refresh_snapshots(panel)).toHaveLength(0);
     });
 
