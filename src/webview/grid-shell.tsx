@@ -11486,7 +11486,8 @@ export function GridShell({
                     copy_source_selection({
                         y: 0,
                         height: row_count,
-                        source_columns: selected_column_sources,
+                        source_columns: selected_column_displays
+                            .map((display) => copy_columns[display]!),
                     }, true);
                 } else if (has_explicit_row_selection) {
                     if (selected_rows) copy_display_rows(selected_rows);

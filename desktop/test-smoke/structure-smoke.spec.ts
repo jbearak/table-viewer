@@ -17,6 +17,7 @@ import { parse_xlsx } from '../../src/parse-xlsx';
 import { build_fixture_xlsx, cell, row } from '../../src/test/helpers/xlsx-structure-fixture';
 import { isolated_user_data, repo_dir, state_database_path } from './smoke-helpers';
 import {
+    cell_point,
     choose,
     choose_from_submenu,
     open_cell_menu,
@@ -70,8 +71,10 @@ async function expect_undo_label(label: string): Promise<void> {
     await expect.poll(() => undo_menu_label(app!), { timeout: 15_000 }).toBe(`Undo ${label}`);
 }
 
-async function close_menu(page: Page): Promise<void> {
-    await page.keyboard.press('Escape');
+/** Close a cell menu by clicking its cell: a press outside the menu closes it, with no focus needed. */
+async function close_cell_menu(page: Page, column: number, row: number): Promise<void> {
+    const point = await cell_point(page, column, row);
+    await page.mouse.click(point.x, point.y);
     await expect(page.locator('[role="menu"]')).toHaveCount(0);
 }
 
@@ -212,6 +215,16 @@ test('a cell in a Pending Column, a Pending Row, or a Pending Appended Row has a
     ]);
     await save_screenshot(page, 'pending-cell-menu-0-column-inserted');
 
+    // With the Pending Column selected, its cell's Copy selection copies it.
+    await select_column(page, 1);
+    const point = await cell_point(page, 1, 0);
+    await page.mouse.click(point.x, point.y, { button: 'right' });
+    await choose(page.locator('[role="menu"]').first(), 'Copy selection');
+    await expect.poll(() => app!.evaluate(({ clipboard }) => clipboard.readText()))
+        .toMatch(/^New column\r?\n/);
+    await page.mouse.click(point.x, point.y);
+    await expect(page.locator('th[aria-colindex="2"]')).not.toHaveAttribute('aria-selected', 'true');
+
     // A cell in the Pending Column has the cell menu. The column can't be
     // hidden until it is saved, and the cell inserts a row beside itself.
     const pending_column_menu = await open_cell_menu(page, 1, 0);
@@ -230,10 +243,10 @@ test('a cell in a Pending Column, a Pending Row, or a Pending Appended Row has a
     // A cell in the Pending Row, in a source column and in the Pending Column.
     await open_cell_menu(page, 0, 1);
     await save_screenshot(page, 'pending-cell-menu-2-pending-row');
-    await close_menu(page);
+    await close_cell_menu(page, 0, 1);
     await open_cell_menu(page, 1, 1);
     await save_screenshot(page, 'pending-cell-menu-3-pending-row-and-column');
-    await close_menu(page);
+    await close_cell_menu(page, 1, 1);
 
     // A cell in a Pending Appended Row, in the Pending Column, deletes the column.
     await page.getByRole('button', { name: 'Add rows' }).click();
