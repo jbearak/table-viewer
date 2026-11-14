@@ -1,0 +1,198 @@
+## row menu, source row 2 (Row actions for row 2)
+Insert row above  [disabled: Clear sorts, filters, and hidden rows to insert or move rows.]
+Insert row below  [disabled: Clear sorts, filters, and hidden rows to insert or move rows.]
+Delete row
+Move rows up  [disabled: Clear sorts, filters, and hidden rows to insert or move rows.]
+Move rows down  [disabled: Clear sorts, filters, and hidden rows to insert or move rows.]
+Hide row
+Copy row
+
+## row menu, first row (Row actions for row 1)
+Insert row above  [disabled: Clear sorts, filters, and hidden rows to insert or move rows.]
+Insert row below  [disabled: Clear sorts, filters, and hidden rows to insert or move rows.]
+Delete row
+Move rows up  [disabled: Clear sorts, filters, and hidden rows to insert or move rows.]
+Move rows down  [disabled: Clear sorts, filters, and hidden rows to insert or move rows.]
+Hide row
+Copy row
+
+## row menu, rows 1-2 selected (Row actions for 2 selected rows)
+Insert 2 rows above  [disabled: Clear sorts, filters, and hidden rows to insert or move rows.]
+Insert 2 rows below  [disabled: Clear sorts, filters, and hidden rows to insert or move rows.]
+Delete 2 rows
+Move rows up  [disabled: Clear sorts, filters, and hidden rows to insert or move rows.]
+Move rows down  [disabled: Clear sorts, filters, and hidden rows to insert or move rows.]
+Hide 2 rows
+Copy 2 rows
+
+## row menu, rows 1 and 3 selected (Row actions for 2 selected rows)
+Insert 2 rows above  [disabled: Select adjacent rows to insert or move them.]
+Insert 2 rows below  [disabled: Select adjacent rows to insert or move them.]
+Delete 2 rows
+Move rows up  [disabled: Select adjacent rows to insert or move them.]
+Move rows down  [disabled: Select adjacent rows to insert or move them.]
+Hide 2 rows
+Copy 2 rows
+
+## cell menu, cell B2 (Context menu)
+Highlight yellow
+Highlight green
+Highlight blue
+Highlight pink
+---
+Copy cell
+---
+Insert >
+    Insert row above  [disabled: Clear sorts, filters, and hidden rows to insert or move rows.]
+    Insert row below  [disabled: Clear sorts, filters, and hidden rows to insert or move rows.]
+    Insert column left
+    Insert column right
+Delete >
+    Delete row
+    Delete column
+---
+Select >
+    Select row
+    Select column
+    Select all
+Hide >
+    Hide row
+    Hide column
+
+## cell menu, range A1:B2 (Context menu)
+Highlight yellow
+Highlight green
+Highlight blue
+Highlight pink
+---
+Copy selection
+---
+Insert >
+    Insert 2 rows above  [disabled: Clear sorts, filters, and hidden rows to insert or move rows.]
+    Insert 2 rows below  [disabled: Clear sorts, filters, and hidden rows to insert or move rows.]
+    Insert 2 columns left
+    Insert 2 columns right
+Delete >
+    Delete 2 rows
+    Delete 2 columns
+---
+Select >
+    Select row
+    Select column
+    Select all
+Hide >
+    Hide 2 rows
+    Hide 2 columns
+
+## cell menu, columns A-B selected (Context menu)
+Highlight yellow
+Highlight green
+Highlight blue
+Highlight pink
+---
+Copy selection
+---
+Insert >
+    Insert row above  [disabled: Clear sorts, filters, and hidden rows to insert or move rows.]
+    Insert row below  [disabled: Clear sorts, filters, and hidden rows to insert or move rows.]
+    Insert 2 columns left
+    Insert 2 columns right
+Delete >
+    Delete row
+    Delete 2 columns
+---
+Select >
+    Select row
+    Select column
+    Select all
+Hide >
+    Hide 2 columns
+
+## cell menu, rows 1-2 selected (Context menu)
+Highlight yellow
+Highlight green
+Highlight blue
+Highlight pink
+---
+Copy selection
+---
+Insert >
+    Insert 2 rows above  [disabled: Clear sorts, filters, and hidden rows to insert or move rows.]
+    Insert 2 rows below  [disabled: Clear sorts, filters, and hidden rows to insert or move rows.]
+    Insert column left
+    Insert column right
+Delete >
+    Delete 2 rows
+    Delete column
+---
+Select >
+    Select row
+    Select column
+    Select all
+Hide >
+    Hide 2 rows
+    Hide column
+
+## header menu, column B (Column actions for B name)
+Copy column
+Hide column
+Rename column…  [disabled: Only new columns can be renamed on this sheet.]
+---
+Insert column left
+Insert column right
+Delete column
+Move columns left
+Move columns right
+---
+Sort ascending
+Sort descending
+---
+Add ascending to sort
+Add descending to sort
+Clear all sorts
+---
+Filter…
+
+## header menu, first column (Column actions for A name)
+Copy column
+Hide column
+Rename column…  [disabled: Only new columns can be renamed on this sheet.]
+---
+Insert column left
+Insert column right
+Delete column
+Move columns left  [disabled: The selected columns are already at the left edge.]
+Move columns right
+---
+Sort ascending
+Sort descending
+Clear sort on this column
+Clear all sorts
+---
+Filter…
+
+## header menu, columns A-B selected (Column actions for 2 selected columns)
+Copy 2 columns
+Hide 2 columns
+---
+Insert 2 columns left
+Insert 2 columns right
+Delete 2 columns
+Move columns left  [disabled: The selected columns are already at the left edge.]
+Move columns right
+---
+Sort ascending
+Sort descending
+
+## header menu, columns A and C selected (Column actions for 2 selected columns)
+Copy 2 columns
+Hide 2 columns
+---
+Insert 2 columns left  [disabled: Select adjacent columns to insert or move them.]
+Insert 2 columns right  [disabled: Select adjacent columns to insert or move them.]
+Delete 2 columns
+Move columns left  [disabled: Select adjacent columns to insert or move them.]
+Move columns right  [disabled: Select adjacent columns to insert or move them.]
+---
+Sort ascending
+Sort descending
