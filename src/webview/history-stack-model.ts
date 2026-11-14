@@ -26,6 +26,7 @@ import type { FormulaAnchors } from '../formula-anchors';
 import { append_source_rows_to_layout, type ColumnLayout, type RowLayout } from '../worksheet-layout';
 import {
     worksheet_target_key,
+    worksheet_target_matches,
     type CellHighlightColor,
     type WorksheetTarget,
 } from '../types';
@@ -37,12 +38,14 @@ import {
     history_value,
     history_values_equal,
     hyperlink_only_overlay,
+    rebase_saved_cell_delta,
     value_only_overlay,
     type HistoryActionOwner,
     type CellHistoryDelta,
     type CellOverlayState,
     type HistoryDirection,
     type HistoryValue,
+    type SavedCellContent,
 } from './history-cell-state-model';
 
 /**
@@ -1694,6 +1697,92 @@ export function rekey_saved_appended_row_history(
     if (redoStack === undefined) {
         return refused(state, 'Save appended rows', bounds.hardMaxBytes).state;
     }
+    return bound_rekeyed_history({ ...state, undoStack, redoStack }, bounds);
+}
+
+/** One source cell a save wrote, and the content it left there. */
+export interface SavedHistoryCell extends SavedCellContent {
+    readonly worksheet: WorksheetTarget;
+    readonly sourceRow: number;
+    readonly sourceColumn: number;
+}
+
+/**
+ * Re-express both history stacks over the cells a successful save wrote.
+ *
+ * A save is not a boundary for undo, but it does change what every recorded
+ * overlay state is a difference FROM. See `rebase_saved_cell_delta` for the
+ * rewrite; this applies it to each recorded delta on a saved cell and leaves
+ * every other change, and every entry that names no saved cell, exactly as it
+ * was. Entry identity and move counts remain intact, as they do when saved
+ * rows are rekeyed.
+ */
+export function rebase_saved_cell_history(
+    state: HistoryStackState,
+    saved: readonly SavedHistoryCell[],
+    bounds: HistoryBounds = DEFAULT_HISTORY_BOUNDS,
+): HistoryStackState {
+    if (saved.length === 0) return state;
+    const by_cell = new Map<string, SavedHistoryCell[]>();
+    for (const cell of saved) {
+        const key = `${cell.sourceRow}:${cell.sourceColumn}`;
+        const cells = by_cell.get(key);
+        if (cells === undefined) by_cell.set(key, [cell]);
+        else cells.push(cell);
+    }
+    // The recorded target is the first argument: a delta names its worksheet by
+    // the strongest identity it captured, which is how a replay resolves it too.
+    const saved_for = (delta: CellHistoryDelta): SavedHistoryCell | undefined =>
+        by_cell.get(`${delta.sourceRow}:${delta.sourceColumn}`)
+            ?.find((cell) => worksheet_target_matches(delta.worksheet, cell.worksheet));
+
+    let changed = false;
+    const rebase_stack = (
+        entries: readonly HistoryEntry[],
+    ): readonly HistoryEntry[] | undefined => {
+        const rebased: HistoryEntry[] = [];
+        for (const entry of entries) {
+            let entry_changed = false;
+            const changes: HistoryChange[] = [];
+            for (const change of entry.action.changes) {
+                const cell = change.kind === 'cell' ? saved_for(change.delta) : undefined;
+                if (change.kind !== 'cell' || cell === undefined) {
+                    changes.push(change);
+                    continue;
+                }
+                const delta = rebase_saved_cell_delta(change.delta, cell);
+                if (delta === change.delta) {
+                    changes.push(change);
+                    continue;
+                }
+                entry_changed = true;
+                if (delta !== undefined) changes.push({ kind: 'cell', delta });
+            }
+            if (!entry_changed) {
+                rebased.push(entry);
+                continue;
+            }
+            changed = true;
+            if (changes.length === 0) continue;
+            const measured = own_and_measure(
+                { label: entry.action.label, changes },
+                bounds.hardMaxBytes,
+            );
+            if (measured === undefined) return undefined;
+            rebased.push({
+                ...measured,
+                id: entry.id,
+                moves: entry.moves,
+                epoch: entry.epoch,
+            });
+        }
+        return rebased;
+    };
+    const undoStack = rebase_stack(state.undoStack);
+    if (undoStack === undefined) return refused(state, 'Save', bounds.hardMaxBytes).state;
+    const redoStack = rebase_stack(state.redoStack);
+    if (redoStack === undefined) return refused(state, 'Save', bounds.hardMaxBytes).state;
+    if (!changed) return state;
     return bound_rekeyed_history({ ...state, undoStack, redoStack }, bounds);
 }
 

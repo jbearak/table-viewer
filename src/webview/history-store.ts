@@ -25,6 +25,7 @@ import {
     DEFAULT_HISTORY_BOUNDS,
     empty_history_stack,
     record_history_action,
+    rebase_saved_cell_history,
     rekey_saved_appended_row_history,
     rekey_committed_tail_removal_history,
     install_structural_save_barrier,
@@ -35,6 +36,7 @@ import {
     type HistoryEntry,
     type HistoryStackState,
     type RecordOutcome,
+    type SavedHistoryCell,
     type SavedHistoryRowAssignment,
     type SavedTailRemovalCommit,
 } from './history-stack-model';
@@ -126,6 +128,15 @@ export interface HistoryStore {
         bounds?: HistoryBounds,
     ): HistoryRekeyOutcome;
     /**
+     * Re-express recorded cell states over the content a successful save wrote,
+     * so undo and redo keep working across it. The rewrite can enlarge an entry,
+     * which is bounded and reported the same way as a row rekey.
+     */
+    rebase_saved_cells(
+        cells: readonly SavedHistoryCell[],
+        bounds?: HistoryBounds,
+    ): HistoryRekeyOutcome;
+    /**
      * Turn tail removals written by Save into host-admitted row restorations,
      * reporting when the rebuilt history cannot be retained within the bounds.
      */
@@ -201,6 +212,21 @@ export function create_history_store(initial?: HistoryStackState): HistoryStore 
         rekey_saved_rows: (rows, bounds = DEFAULT_HISTORY_BOUNDS) => {
             const previous = state;
             const next = rekey_saved_appended_row_history(previous, rows, bounds);
+            if (next === previous) return { kind: 'rekeyed', changed: false };
+            state = next;
+            notify();
+            return next.epoch !== previous.epoch
+                ? {
+                    kind: 'unrecordable',
+                    reason: 'action-too-large',
+                    hardMaxBytes: bounds.hardMaxBytes,
+                }
+                : { kind: 'rekeyed', changed: true };
+        },
+
+        rebase_saved_cells: (cells, bounds = DEFAULT_HISTORY_BOUNDS) => {
+            const previous = state;
+            const next = rebase_saved_cell_history(previous, cells, bounds);
             if (next === previous) return { kind: 'rekeyed', changed: false };
             state = next;
             notify();

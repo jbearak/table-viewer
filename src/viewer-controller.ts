@@ -13774,8 +13774,16 @@ export function attach_viewer(
                     // identity returns, the next projection can retire it or
                     // keep it. The map remains subject to its hard count/byte
                     // limits while a permanently removed sheet stays absent.
+                    //
+                    // Nor can it speak for a row it still names as pending. A
+                    // saved row keeps its Pending Row ID as its append history
+                    // ID, so that projection was built before the renderer
+                    // applied the save's receipt: its history has not learned
+                    // the row was saved, and retiring the capability on its
+                    // word would refuse every later undo of the saved row.
                     if (
                         !retained.has(key)
+                        && !retained_pending.has(key)
                         && worksheet_target_index(current_sheets, authority.worksheet)
                             !== undefined
                     ) forget_saved_append_authority(key);

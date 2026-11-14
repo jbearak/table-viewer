@@ -18,6 +18,7 @@ import type { WorkbookMeta } from '../data-source/interface';
 import type { WorkbookSnapshot } from '../viewer-snapshot';
 import type { EditSessionStore } from '../webview/edit-session-store';
 import type { AppendRowsAdmission, GridShellProps } from '../webview/grid-shell';
+import type { HistoryStore } from '../webview/history-store';
 import { find_button } from './helpers/dom-interaction';
 import { sheet_edits } from './pending-edits-helper';
 import {
@@ -16555,6 +16556,143 @@ describe('undo and redo, from the keyboard and the desktop menu', () => {
         expect(grid_stub().getAttribute('data-gestures-admitted')).toBe('true');
         expect(sent(post_message, 'prepareHistoryReplay')).toBeUndefined();
         expect(sent(post_message, 'showWarning')).toBeUndefined();
+    });
+
+    /** Record one typed edit of A1, the way the grid records a committed cell. */
+    function record_cell_edit(history: HistoryStore, text: string, base: string) {
+        const delta = build_cell_history_delta({
+            worksheet: { sheetIndex: 0, sheetName: 'Sheet1' },
+            sourceRow: 0,
+            sourceColumn: 0,
+            before: absent_overlay(),
+            after: value_only_overlay(history_value(text), history_value(base)),
+            persistedValue: history_value(base),
+            persistedHyperlink: null,
+        });
+        const record = history.stage_record({
+            label: 'Edit cell',
+            changes: [{ kind: 'cell' as const, delta: delta! }],
+        });
+        expect(record.commit()).toBe(true);
+        record.notify();
+    }
+
+    /**
+     * Grant the session an undo asked for, the way the host does: the result,
+     * and a snapshot of the workbook under the new session alongside it.
+     */
+    async function grant_replay_session(meta: WorkbookMeta, edit_session_id: string) {
+        await dispatch_host_message({
+            type: 'editSessionResult',
+            granted: true,
+            editSessionId: edit_session_id,
+        });
+        await dispatch_host_message(workbook_snapshot_message(meta, {
+            presentation: 'refresh',
+            reason: 'other',
+            capabilities: {
+                csvEditable: true,
+                csvEditingSupported: true,
+                csvEditSessionId: edit_session_id,
+            },
+        }));
+    }
+
+    it('undoes a saved edit on the first press, as an edit over the saved file', async () => {
+        const { post_message } = await render_app();
+        const meta = make_meta(['Sheet1'], false);
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        await enter_edit_mode(post_message, 'saved-edit-session');
+        const props = grid_shell_mock.latest_props as unknown as GridShellProps;
+        props.edit_session!.commit('saved-edit-session', '0:0', { value: 'edited', base: 'Alice' });
+        record_cell_edit(props.history_store!, 'edited', 'Alice');
+
+        // Save writes the edit and ends the session that held it.
+        const operation: CsvSaveOperation = {
+            editSessionId: 'saved-edit-session',
+            saveRequestId: 'save-1',
+            worksheets: [{
+                sheetIndex: 0,
+                sheetName: 'Sheet1',
+                edits: { '0:0': 'edited' },
+                dirtyEdits: { '0:0': { value: 'edited', base: 'Alice' } },
+            }],
+        };
+        await dispatch_host_message({
+            type: 'saveOperationStarted',
+            lifecycle: { revision: 1, state: 'active', operation },
+        });
+        await dispatch_host_message({
+            type: 'saveResult',
+            success: true,
+            lifecycle: { revision: 2, state: 'succeeded', operation },
+        });
+        expect(props.edit_session!.size()).toBe(0);
+        post_message.mockClear();
+
+        await undo_via_menu();
+        await vi.waitUntil(() => sent(post_message, 'requestEditSession') !== undefined);
+        await grant_replay_session(meta, 'undo-session');
+        await vi.waitUntil(() => sent(post_message, 'prepareHistoryReplay') !== undefined);
+        const prepare = sent(post_message, 'prepareHistoryReplay');
+        await dispatch_host_message({
+            type: 'historyReplayPrepared',
+            prepared: {
+                requestId: prepare.request.requestId,
+                replayId: prepare.request.replayId,
+                leaseId: 'lease-1',
+                focusSheetIndex: 0,
+                focus: prepare.request.focus,
+                cells: [{
+                    ordinal: 0,
+                    worksheet: { sheetIndex: 0, sheetName: 'Sheet1' },
+                    resolvedSheetIndex: 0,
+                    sourceRow: 0,
+                    sourceColumn: 0,
+                    overlay: { kind: 'absent' },
+                    persisted: { text: 'edited' },
+                    persistedHyperlink: null,
+                }],
+            },
+        });
+
+        // The cell goes back to what it held, as an unsaved change against what
+        // the save wrote, and nothing is refused on the way.
+        const commit = sent(post_message, 'commitHistoryReplay');
+        expect(commit?.request.cells).toEqual([
+            { ordinal: 0, entry: expect.objectContaining({ value: 'Alice', base: 'edited' }) },
+        ]);
+        expect(sent(post_message, 'showWarning')).toBeUndefined();
+    });
+
+    it('reports a refusal on the press that had to acquire a session', async () => {
+        // Acquiring a session delivers a snapshot. That is not the document
+        // leaving, and the refusal it precedes still has to be reported: a first
+        // press that says nothing followed by a second that warns reads as broken.
+        const { post_message } = await render_app();
+        const meta = make_meta(['Sheet1'], false);
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        await enter_edit_mode(post_message, 'released-session');
+        const props = grid_shell_mock.latest_props as unknown as GridShellProps;
+        record_cell_edit(props.history_store!, 'edited', 'Alice');
+        await release_idle_edit_session();
+        post_message.mockClear();
+
+        await undo_via_menu();
+        await vi.waitUntil(() => sent(post_message, 'requestEditSession') !== undefined);
+        await grant_replay_session(meta, 'undo-session');
+        await vi.waitUntil(() => sent(post_message, 'prepareHistoryReplay') !== undefined);
+        await refuse_prepare(post_message, 'conflict');
+
+        await vi.waitUntil(() => sent(post_message, 'showWarning') !== undefined);
+        expect(sent(post_message, 'showWarning')).toEqual({
+            type: 'showWarning',
+            message: 'Undo could not be completed because the workbook changed. No changes were applied.',
+        });
     });
 
     it('routes structural-only undo and redo through the host transaction', async () => {

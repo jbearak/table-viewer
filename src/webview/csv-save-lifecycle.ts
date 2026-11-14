@@ -32,6 +32,9 @@ import {
 
 export { save_lifecycle_correlation } from '../types';
 import { is_plain_record } from '../plain-record';
+import { parse_cell_key } from '../cell-key';
+import { history_value } from './history-cell-state-model';
+import type { SavedHistoryCell } from './history-stack-model';
 
 export interface CsvSaveProjection {
     readonly authoritative: CsvSaveLifecycle;
@@ -430,6 +433,42 @@ export function remove_operation_owned_pending_edits(
     }
     if (!retained) return pending_edits;
     return remaining > 0 ? retained : undefined;
+}
+
+/**
+ * The source cells a successful save wrote and no longer holds an overlay for,
+ * as history needs them to re-express its recorded states over the saved file.
+ *
+ * `retained` is the worksheet's overlay AFTER the tombstone. A cell still in it
+ * holds an edit newer than the one the save wrote, and its history describes
+ * that edit rather than the saved one, so it is left out.
+ *
+ * Which dimensions were written follows the save itself: text only for a key
+ * the operation sent in `edits`, a link only for an entry carrying one.
+ */
+export function saved_history_cells(
+    worksheet: CsvSaveWorksheetOperation,
+    target: WorksheetTarget,
+    retained: SheetPendingEditCells | undefined,
+): SavedHistoryCell[] {
+    if (!is_plain_record(worksheet.dirtyEdits)) return [];
+    const cells: SavedHistoryCell[] = [];
+    for (const [key, owned] of Object.entries(worksheet.dirtyEdits)) {
+        if (retained !== undefined && Object.prototype.hasOwnProperty.call(retained, key)) continue;
+        const coordinates = parse_cell_key(key);
+        if (coordinates === undefined || !is_strict_wire_dirty_entry(owned)) continue;
+        const wrote_value = Object.prototype.hasOwnProperty.call(worksheet.edits, key);
+        if (!wrote_value && owned.link === undefined) continue;
+        cells.push({
+            worksheet: target,
+            ...coordinates,
+            ...(wrote_value ? { value: history_value(owned.value, owned.valueRuns) } : {}),
+            ...(owned.link === undefined
+                ? {}
+                : { hyperlink: { value: owned.link, base: owned.baseLink ?? null } }),
+        });
+    }
+    return cells;
 }
 
 export function remove_operation_owned_pending_structural_changes(

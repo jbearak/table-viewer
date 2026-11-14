@@ -435,6 +435,11 @@ function hyperlink_dimensions_equal(
  * historical persisted content would instead manufacture a fresh dirty edit
  * against whatever is on disk now — after an intervening save that content is
  * stale, and the redo would write it back over the saved value.
+ *
+ * That is about a file that moved for a reason history did not see. A save this
+ * window made is handled before any replay: `rebase_saved_cell_delta` rewrites
+ * the recorded states over what the save wrote, so by then the destination is
+ * an explicit state showing the earlier content, not an absence.
  */
 export type CellHistoryTransitionMode = 'semantic' | 'membership';
 
@@ -703,6 +708,182 @@ function effective_hyperlink_side(
         return { content: persisted, overlay: 'absent' };
     }
     return { content: state.hyperlink.value, overlay: 'present' };
+}
+
+// --- Rebasing over a save ---
+
+/**
+ * What a save wrote into one cell, one field per dimension it actually wrote.
+ *
+ * A dimension the save left alone is absent here, and history leaves it alone
+ * too: a link-only entry writes no text, so the cell's recorded value states
+ * still describe the file exactly as they did.
+ */
+export interface SavedCellContent {
+    /** The content now in the file, when the save wrote the value dimension. */
+    readonly value?: HistoryValue;
+    /**
+     * The link now in the file and the one it replaced, when the save wrote the
+     * link dimension. `base` answers for a recorded state that never touched
+     * the link: what it showed was the link the file held before this save.
+     */
+    readonly hyperlink?: {
+        readonly value: CellHyperlink | null;
+        readonly base: CellHyperlink | null;
+    };
+}
+
+/**
+ * Re-express one cell's delta over the content a save just wrote.
+ *
+ * A recorded overlay state says what a cell showed as a difference from the
+ * file. A save changes the file and removes the overlay, so every state
+ * recorded before it describes a file that no longer exists: the state the save
+ * wrote reads `{value: B, base: A}` while the cell now holds no overlay at all,
+ * and the replay's compare-and-swap would refuse to undo it forever.
+ *
+ * So each state keeps what it SHOWED and is rewritten as the overlay that shows
+ * it over the saved file. Content equal to the saved content leaves the overlay;
+ * anything else becomes an ordinary edit against the saved content. Undo past
+ * the save then restores the earlier content as an unsaved change, which is
+ * what the user asked for, and the swap stays exact.
+ *
+ * This is the same rewrite a saved Pending Row's cells get, for the same reason.
+ *
+ * Returns the delta unchanged when it cannot be rewritten faithfully: a state
+ * carrying a cut's provenance, a formula's pending-row or layout references, or
+ * a base that was never observed describes more than content, and a replay of
+ * it across a save stays refused rather than guessed at. Returns `undefined`
+ * when the rewritten sides no longer differ, so the change records nothing.
+ */
+export function rebase_saved_cell_delta(
+    delta: CellHistoryDelta,
+    saved: SavedCellContent,
+): CellHistoryDelta | undefined {
+    if (saved.value === undefined && saved.hyperlink === undefined) return delta;
+    const before = delta.beforeOverlay;
+    const after = delta.afterOverlay;
+    if (!overlay_is_plain_content(before) || !overlay_is_plain_content(after)) return delta;
+
+    const before_value = recorded_value_content(delta, 'undo');
+    const after_value = recorded_value_content(delta, 'redo');
+    const before_link = recorded_link_content(delta, 'undo', saved);
+    const after_link = recorded_link_content(delta, 'redo', saved);
+
+    return build_cell_history_delta({
+        worksheet: delta.worksheet,
+        sourceRow: delta.sourceRow,
+        sourceColumn: delta.sourceColumn,
+        before: overlay_over_saved(before, before_value, before_link, saved),
+        after: overlay_over_saved(after, after_value, after_link, saved),
+        // What a side with a dimension out of the overlay shows. A written
+        // dimension shows the saved content; an unwritten one shows what it
+        // always did, which both sides agree on whenever both are out.
+        persistedValue: saved.value
+            ?? (value_in_overlay(before) ? after_value : before_value),
+        persistedHyperlink: saved.hyperlink !== undefined
+            ? saved.hyperlink.value
+            : link_in_overlay(before) ? after_link : before_link,
+    });
+}
+
+function value_in_overlay(state: CellOverlayState): boolean {
+    return state.kind === 'present' && state.value.kind === 'present';
+}
+
+function link_in_overlay(state: CellOverlayState): boolean {
+    return state.kind === 'present' && state.hyperlink.kind === 'present';
+}
+
+/** Whether a state is fully described by the content it shows. */
+function overlay_is_plain_content(state: CellOverlayState): boolean {
+    if (state.kind === 'absent' || state.value.kind === 'untouched') return true;
+    const value = state.value;
+    return !value.basePending
+        && value.movedFrom === undefined
+        && value.formulaReferenceBases === undefined
+        && value.formulaAnchors === undefined;
+}
+
+/** The value a recorded side showed, whether or not it was in the overlay. */
+function recorded_value_content(
+    delta: CellHistoryDelta,
+    direction: HistoryDirection,
+): HistoryValue {
+    const state = overlay_for_direction(delta, direction);
+    if (state.kind === 'present') {
+        return state.value.kind === 'present' ? state.value.value : state.value.anchor;
+    }
+    if (delta.value !== undefined) return transition_side(delta.value, direction).content;
+    // A link-only delta never moved the value, so the other side shows the
+    // same text. That side has an overlay, or there would be no delta.
+    const other = overlay_for_direction(delta, direction === 'undo' ? 'redo' : 'undo');
+    if (other.kind === 'absent') return history_value('');
+    return other.value.kind === 'present' ? other.value.value : other.value.anchor;
+}
+
+/** The link a recorded side showed, whether or not it was in the overlay. */
+function recorded_link_content(
+    delta: CellHistoryDelta,
+    direction: HistoryDirection,
+    saved: SavedCellContent,
+): CellHyperlink | null {
+    const state = overlay_for_direction(delta, direction);
+    if (state.kind === 'present' && state.hyperlink.kind === 'present') {
+        return state.hyperlink.value;
+    }
+    if (delta.hyperlink !== undefined) return transition_side(delta.hyperlink, direction).content;
+    // The delta never touched the link, so this side showed the file's own.
+    return saved.hyperlink?.base ?? null;
+}
+
+/** The overlay that shows `value` and `link` over what the save wrote. */
+function overlay_over_saved(
+    state: CellOverlayState,
+    value: HistoryValue,
+    link: CellHyperlink | null,
+    saved: SavedCellContent,
+): CellOverlayState {
+    const recorded = state.kind === 'present' && state.value.kind === 'present'
+        ? state.value
+        : undefined;
+    // A dimension the save did not write keeps its recorded membership.
+    const value_present = saved.value === undefined
+        ? recorded !== undefined
+        : !history_values_equal(value, saved.value);
+    const link_present = saved.hyperlink === undefined
+        ? link_in_overlay(state)
+        : !hyperlinks_equal(link, saved.hyperlink.value);
+    const link_base = saved.hyperlink !== undefined
+        ? saved.hyperlink.value
+        : state.kind === 'present' && state.hyperlink.kind === 'present'
+            ? state.hyperlink.base
+            : null;
+
+    if (!value_present) {
+        return link_present
+            ? hyperlink_only_overlay(saved.value ?? value, link, link_base)
+            : absent_overlay();
+    }
+    // Rewritten over the saved content, the value is an ordinary edit: the
+    // flags that disambiguate a value equal to its base no longer apply, and
+    // formatting was observed on both sides. An unwritten dimension keeps
+    // every field it recorded.
+    const base = saved.value ?? recorded!.base;
+    const write_value = saved.value === undefined ? recorded?.writeValue : undefined;
+    const retain_value = saved.value === undefined ? recorded?.retainValue : undefined;
+    const formatting_known = saved.value === undefined ? recorded?.formattingKnown : true;
+    return link_present
+        ? combined_overlay(
+            value, base, link, link_base, false,
+            write_value, retain_value, formatting_known,
+            undefined, recorded?.valueEditOrder,
+        )
+        : value_only_overlay(
+            value, base, false,
+            write_value, retain_value, formatting_known,
+            undefined, recorded?.valueEditOrder,
+        );
 }
 
 /**
