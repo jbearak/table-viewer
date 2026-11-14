@@ -1,5 +1,6 @@
 /* eslint-disable sonarjs/no-duplicate-string */
 import * as React from "react";
+import { flushSync } from "react-dom";
 import { assert, assertNever, maybe } from "../common/support.js";
 import { clamp, uniq, flatten, range, debounce } from "../common/collection-utils.js";
 import {
@@ -90,9 +91,11 @@ import {
 import { type Keybinds, useKeybindingsWithDefaults } from "./data-editor-keybindings.js";
 import type { Highlight } from "../internal/data-grid/render/data-grid-render.cells.js";
 
-const DataGridOverlayEditor = React.lazy(
-    async () => await import("../internal/data-grid-overlay-editor/data-grid-overlay-editor.js")
-);
+// Fork change: imported, not React.lazy. The webview is one bundle, so lazy
+// loading saved nothing, and the first editor opened suspended for a task while
+// the import settled. Keys typed in that gap reached the grid and reopened the
+// editor with only the last of them.
+import DataGridOverlayEditor from "../internal/data-grid-overlay-editor/data-grid-overlay-editor.js";
 
 // There must be a better way
 let idCounter = 0;
@@ -762,6 +765,11 @@ export interface DataEditorRef {
      * or double click would, without consulting `onOverlayOpenRequest`. Returns
      * false, having done nothing, when `cell` is not the selected cell, is
      * scrolled out of view, or does not allow an overlay.
+     *
+     * The editor is mounted before this returns. A host calls it from outside
+     * any input event, where React would otherwise defer the render, and a key
+     * pressed in that gap would reach the grid and open the editor again with
+     * only that key.
      */
     openOverlay: (cell: Item, initialValue?: string) => boolean;
     /**
@@ -4392,7 +4400,7 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
                 if (bounds === undefined) return false;
                 const content = getMangledCellContent([selected[0], row]);
                 if (content.kind === GridCellKind.Boolean || !content.allowOverlay) return false;
-                reselect(bounds, true, initialValue, true);
+                flushSync(() => reselect(bounds, true, initialValue, true));
                 return true;
             },
             emit: async e => {

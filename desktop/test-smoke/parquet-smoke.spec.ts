@@ -12,7 +12,8 @@
 // header is hovered through the page's input events, which reach the window
 // whether or not it has focus, and the tooltip's text is polled.
 //
-// CI runs only the relaunch spec from this directory; run this one locally:
+// Not in CI: it uses the application menu, which needs the app frontmost
+// (see desktop/README.md). Run it locally:
 //   npm run desktop:prepackage
 //   npx playwright test --config=desktop/test-smoke/playwright.config.ts \
 //     desktop/test-smoke/parquet-smoke.spec.ts

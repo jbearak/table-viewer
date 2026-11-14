@@ -6,7 +6,8 @@
 // Every check polls the grid's accessibility table (`aria-selected`) or the
 // bar's DOM; nothing waits a fixed delay.
 //
-// CI runs only the relaunch spec from this directory; run this one locally:
+// Not in CI: it uses the application menu, which needs the app frontmost
+// (see desktop/README.md). Run it locally:
 //   npm run desktop:prepackage
 //   npx playwright test --config=desktop/test-smoke/playwright.config.ts \
 //     desktop/test-smoke/find-smoke.spec.ts

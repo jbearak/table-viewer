@@ -3,10 +3,10 @@ import { execFileSync } from 'child_process';
 import * as path from 'path';
 import { expect, test } from '@playwright/test';
 import type { ElectronApplication, Page } from '@playwright/test';
-import { parse_xlsx } from '../../src/parse-xlsx';
 import {
     isolated_user_data,
     launch_app,
+    read_workbook,
     repo_dir,
 } from './smoke-helpers';
 
@@ -42,25 +42,12 @@ function run_git(args: readonly string[]): void {
     });
 }
 
-/**
- * The workbook as it is on disk, or undefined while the app or Git is partway
- * through writing it. `expect.poll` stops at the first thrown error, so a read
- * that lands mid-write has to read as "not yet" for the poll to try again.
- */
-async function read_workbook(): Promise<Awaited<ReturnType<typeof parse_xlsx>> | undefined> {
-    try {
-        return await parse_xlsx(new Uint8Array(fs.readFileSync(workbook_path)));
-    } catch {
-        return undefined;
-    }
-}
-
 async function workbook_row_count(): Promise<number> {
-    return (await read_workbook())?.data.sheets[SHEET_INDEX]?.rowCount ?? -1;
+    return (await read_workbook(workbook_path))?.data.sheets[SHEET_INDEX]?.rowCount ?? -1;
 }
 
 async function workbook_cell(row: number, column: number): Promise<string | undefined> {
-    return (await read_workbook())?.data.sheets[SHEET_INDEX]?.rows[row]?.[column]?.formatted;
+    return (await read_workbook(workbook_path))?.data.sheets[SHEET_INDEX]?.rows[row]?.[column]?.formatted;
 }
 
 async function install_dialog_capture(): Promise<void> {

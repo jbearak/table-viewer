@@ -174,10 +174,17 @@ export async function save_changes(page: Page): Promise<void> {
     await expect(save_button(page)).not.toHaveClass(/has-unsaved/, { timeout: 30_000 });
 }
 
+/**
+ * The grid canvas's box. A save that changes the rows (a move, a delete)
+ * remounts the grid, so the canvas can be briefly absent; wait for the new one.
+ */
 async function canvas_box(page: Page): Promise<{ x: number; y: number }> {
-    const box = await page.locator(GRID_CANVAS).first().boundingBox();
-    if (!box) throw new Error('the grid canvas has no box');
-    return box;
+    let box: { x: number; y: number } | null = null;
+    await expect.poll(async () => {
+        box = await page.locator(GRID_CANVAS).first().boundingBox();
+        return box !== null;
+    }, { message: 'the grid canvas has no box' }).toBe(true);
+    return box!;
 }
 
 /** The centre of a display row's marker, in page coordinates. */

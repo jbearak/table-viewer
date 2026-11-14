@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 
 import React, { act } from 'react';
+import { flushSync } from 'react-dom';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type {
@@ -1855,6 +1856,41 @@ describe('GridShell editing with no session held yet', () => {
         expect(grid_mock.props!.onOverlayOpenRequest).toBeUndefined();
         // Still in use until the editor it asked for has mounted or been refused.
         expect(editing_ref.current!.session_busy()).toBe(true);
+    });
+
+    it('lets the session go once an editor that mounted inside openOverlay is cancelled', async () => {
+        const { request, grant } = session_request();
+        const { rerender, editing_ref } = await render_grid(undefined, {
+            ...no_session,
+            on_request_edit_session: request,
+        });
+        // Glide's openOverlay mounts the editor before it returns.
+        const editor_root = createRoot(document.createElement('div'));
+        grid_mock.open_overlay.mockImplementationOnce((cell) => {
+            const props = grid_mock.props as unknown as {
+                provideEditor: (content: unknown) => { editor: React.ComponentType<Record<string, unknown>> };
+            };
+            const value = grid_mock.props!.getCellContent!(cell);
+            const { editor } = props.provideEditor(value);
+            flushSync(() => editor_root.render(React.createElement(editor, {
+                value,
+                onChange: vi.fn(),
+                onFinishedEditing: vi.fn(),
+            })));
+            return true;
+        });
+
+        grid_mock.props!.onOverlayOpenRequest!([0, 0], undefined);
+        grant();
+        await flush();
+        await rerender({ editing_session_held: true, edit_session_id: 'session-1', on_request_edit_session: undefined });
+        await flush();
+        expect(grid_mock.open_overlay).toHaveBeenCalledTimes(1);
+        expect(editing_ref.current!.session_busy()).toBe(true);
+
+        // Escape closes it with nothing changed.
+        await act(async () => { editor_root.unmount(); });
+        expect(editing_ref.current!.session_busy()).toBe(false);
     });
 
     it('drops the editor request when the host refuses, and says the session is not in use', async () => {

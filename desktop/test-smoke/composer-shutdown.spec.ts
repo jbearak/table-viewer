@@ -2,10 +2,10 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { expect, test } from '@playwright/test';
 import type { ElectronApplication, Page } from '@playwright/test';
-import { parse_xlsx } from '../../src/parse-xlsx';
 import {
     isolated_user_data,
     launch_app,
+    read_workbook,
     reader_tokens,
     repo_dir,
 } from './smoke-helpers';
@@ -94,10 +94,12 @@ const lifecycle_file_variants: readonly LifecycleFileVariant[] = [
     },
 ];
 
+/** The file as it is on disk, or undefined while the app is partway through
+ *  writing a workbook (see `read_workbook`). */
 async function read_lifecycle_file(
     file_path: string,
     variant: LifecycleFileVariant,
-): Promise<LifecycleFileState> {
+): Promise<LifecycleFileState | undefined> {
     if (variant.format === 'csv') {
         const rows = fs.readFileSync(file_path, 'utf8').trimEnd().split(/\r?\n/u);
         return {
@@ -106,7 +108,8 @@ async function read_lifecycle_file(
             worksheetCount: 1,
         };
     }
-    const parsed = await parse_xlsx(new Uint8Array(fs.readFileSync(file_path)));
+    const parsed = await read_workbook(file_path);
+    if (parsed === undefined) return undefined;
     const worksheet = parsed.data.sheets[variant.worksheetIndex];
     if (!worksheet) throw new Error(`missing worksheet ${variant.worksheetIndex}`);
     const values = new Set<string>();
@@ -141,6 +144,7 @@ async function launch_lifecycle_app(
         fs.copyFileSync(variant.fixturePath, file_path);
     }
     const initial_state = await read_lifecycle_file(file_path, variant);
+    if (initial_state === undefined) throw new Error(`${variant.name} fixture does not parse`);
     if (initial_state.worksheetCount !== variant.worksheetCount) {
         throw new Error(
             `${variant.name} has ${initial_state.worksheetCount} worksheets, expected ${variant.worksheetCount}`,
@@ -465,11 +469,12 @@ async function save_pending_change(
             `${detail}\nCaptured shutdown dialogs: ${JSON.stringify(state.dialogs)}`,
         );
     }
-    await expect.poll(async () => (
-        await read_lifecycle_file(launched.filePath, launched.fileVariant)
-    ).rowCount).toBe(launched.initialRowCount + scenario.appendedRows);
-    const saved = await read_lifecycle_file(launched.filePath, launched.fileVariant);
-    for (const marker of scenario.savedMarkers) expect(saved.values).toContain(marker);
+    let saved: LifecycleFileState | undefined;
+    await expect.poll(async () => {
+        saved = await read_lifecycle_file(launched.filePath, launched.fileVariant);
+        return saved?.rowCount;
+    }).toBe(launched.initialRowCount + scenario.appendedRows);
+    for (const marker of scenario.savedMarkers) expect(saved?.values).toContain(marker);
     await expect(launched.page.getByRole('button', { name: 'Discard' })).toHaveCount(0);
     const state = await shutdown_state(launched.app);
     expect(state.viewerCount).toBe(1);

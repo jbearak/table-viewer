@@ -103,12 +103,11 @@ jobs:
   # gate, connection, drain, journal replay — survives a restart, and no headless
   # substitute exercises it.
   #
-  # Separate from the smoke suite proper, which is deliberately not in CI: the
-  # focus-dependent specs there drive menu commands that only reach the grid while
-  # the app is frontmost, so they fail on any machine whose desktop is being used
-  # (documented in desktop/README.md). The relaunch specs use no menu commands and
-  # no focus assertions, which is what makes them CI-safe when their siblings are
-  # not. Keep that property when editing them, or this job becomes flaky.
+  # The relaunch specs use no menu commands and no focus assertions, which is
+  # what makes them CI-safe: they read everything back through the grid's
+  # accessibility cells, the state database, and the file on disk, none of which
+  # needs the app frontmost. Keep that property when editing them, or this job
+  # becomes flaky. The other CI-safe specs run in `desktop-smoke` below.
   desktop-relaunch:
     runs-on: macos-latest
 
@@ -148,6 +147,53 @@ jobs:
       # relaunching, and save.
       - name: Packaged desktop relaunch gates
         run: npm run test:desktop-smoke:relaunch
+
+  # The smoke specs that need no OS focus: structural editing (insert, delete,
+  # restore, and move rows and columns, and the conflict notices), editing with
+  # no edit mode, appended rows across save, external reload, and a forced quit,
+  # closing or quitting with pending changes, and the update window. Like the relaunch specs they
+  # drive the page only through its own input events and read results from the
+  # page, the file, and the state database; the Undo label comes from the
+  # history state the renderer posts, not the native menu.
+  #
+  # The rest of the smoke suite stays out of CI: those specs invoke application
+  # menu commands, which Electron routes to the focused window, so they only
+  # pass while the app is frontmost (documented in desktop/README.md). Keep a
+  # menu command or focus assertion out of every spec this job runs.
+  #
+  # A job of its own rather than more steps in `desktop-relaunch`: it takes
+  # several minutes, so it runs beside that job instead of after it, and a
+  # failure names which kind of check broke.
+  desktop-smoke:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6
+        with:
+          node-version: '26.5.1'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Restore Electron download cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/Library/Caches/electron
+          key: electron-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('package-lock.json') }}
+          restore-keys: electron-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Install Electron (retry transient downloads)
+        run: npm run desktop:ensure-electron
+
+      - name: Desktop smoke specs that need no focus
+        run: npm run test:desktop-smoke:unfocused
 
   # Exercise the real electron-builder Windows path before a release tag exists.
   # Unit fixtures cannot establish which targets electron-builder includes in
