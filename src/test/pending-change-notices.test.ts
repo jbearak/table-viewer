@@ -3,6 +3,7 @@
 import { describe, expect, it } from 'vitest';
 import type {
     FormulaDeletedItem,
+    FormulaDependentItem,
     FormulaDivergenceItem,
     FormulaDivergenceReview,
 } from '../formula-divergence-review';
@@ -41,10 +42,13 @@ function review(parts: Partial<FormulaDivergenceReview>): FormulaDivergenceRevie
         counts: [],
         deleted: [],
         deletedCounts: [],
+        dependents: [],
         totals: {
             deleted: cells(parts.deleted ?? []),
             changedRanges: cells(items.filter((item) => item.classes.some((name) => name !== 'unadjustable'))),
             unadjustable: cells(items.filter((item) => item.classes.includes('unadjustable'))),
+            refDependents: (parts.dependents ?? []).filter((item) => item.result === 'ref').length,
+            uncheckedDependents: (parts.dependents ?? []).filter((item) => item.result === 'unchecked').length,
         },
         ...parts,
     };
@@ -60,6 +64,18 @@ function deleted(row: number, column: number, parts: Partial<FormulaDeletedItem>
         written: '=C2*B2',
         rows: [],
         columns: [{ kind: 'source', sourceColumn: 2 }],
+        ...parts,
+    };
+}
+
+function dependent(row: number, parts: Partial<FormulaDependentItem> = {}): FormulaDependentItem {
+    return {
+        sheetIndex: 0,
+        row,
+        column: 3,
+        formula: '=SUM(D2:D5)',
+        written: '=SUM(D2:D5)',
+        result: 'ref',
         ...parts,
     };
 }
@@ -196,7 +212,7 @@ describe('pending_change_notices', () => {
         const [notice] = pending_change_notices(with_review(review({
             deleted: many,
             deletedCounts: [{ targetSheetIndex: 0, formulas: 700 }],
-            totals: { deleted: 700, changedRanges: 0, unadjustable: 0 },
+            totals: { deleted: 700, changedRanges: 0, unadjustable: 0, refDependents: 0, uncheckedDependents: 0 },
         })));
         expect(notice!.formulas).toMatchObject({
             total: 700,
@@ -225,7 +241,7 @@ describe('pending_change_notices', () => {
                     counts: [{ targetSheetIndex: 0, formulas: 300 }, { targetSheetIndex: 1, formulas: 300 }],
                     deleted: Array.from({ length: 250 }, (_, row) => two_sheets(row)).flat(),
                     deletedCounts: [{ targetSheetIndex: 0, formulas: 300 }, { targetSheetIndex: 1, formulas: 300 }],
-                    totals: { deleted: 300, changedRanges: 300, unadjustable: 0 },
+                    totals: { deleted: 300, changedRanges: 300, unadjustable: 0, refDependents: 0, uncheckedDependents: 0 },
                 }),
             },
         });
@@ -242,7 +258,7 @@ describe('pending_change_notices', () => {
         const ranged_first = pending_change_notices(with_review(review({
             items: Array.from({ length: 500 }, (_, row) => flagged(row)),
             counts: [{ targetSheetIndex: 0, formulas: 501 }],
-            totals: { deleted: 0, changedRanges: 500, unadjustable: 1 },
+            totals: { deleted: 0, changedRanges: 500, unadjustable: 1, refDependents: 0, uncheckedDependents: 0 },
         })));
         expect(kinds(ranged_first)).toEqual(['saveRefusal', 'changedRanges']);
         expect(ranged_first[0]!.sentences).toEqual([
@@ -255,7 +271,7 @@ describe('pending_change_notices', () => {
         const unadjustable_first = pending_change_notices(with_review(review({
             items: Array.from({ length: 500 }, (_, row) => flagged(row, { classes: ['unadjustable'] })),
             counts: [{ targetSheetIndex: 0, formulas: 502 }],
-            totals: { deleted: 0, changedRanges: 2, unadjustable: 500 },
+            totals: { deleted: 0, changedRanges: 2, unadjustable: 500, refDependents: 0, uncheckedDependents: 0 },
         })));
         expect(kinds(unadjustable_first)).toEqual(['saveRefusal', 'changedRanges']);
         expect(unadjustable_first[0]!.formulas!.total).toBe(500);
@@ -372,6 +388,97 @@ describe('pending_change_notices', () => {
         expect(notices[0]!.sentences).toEqual([
             "Table Viewer couldn't check what these row and column changes do to formulas.",
         ]);
+    });
+
+    describe('formulas that use the broken ones', () => {
+        // Total D2:D5 is `=B*C`; Price (C) deleted. The All row D6 sums them,
+        // and Summary uses D6.
+        const totals = [2, 3, 4, 5].map((row) => deleted(row - 1, 3, {
+            formula: `=B${row}*#REF!`,
+            written: `=B${row}*C${row}`,
+        }));
+        const sheets: PendingChangeNoticeInput = { ...workbook, worksheets: [...workbook.worksheets, { name: 'Summary' }] };
+        const notice_for = (dependents: readonly FormulaDependentItem[], parts: Partial<FormulaDivergenceReview> = {}) =>
+            pending_change_notices({
+                ...sheets,
+                formulaReview: {
+                    current: true,
+                    review: review({ deleted: totals, deletedCounts: [{ targetSheetIndex: 0, formulas: 4 }], dependents, ...parts }),
+                },
+            })[0]!;
+
+        it('counts them in a second sentence and lists them after, marked', () => {
+            const notice = notice_for([
+                dependent(5),
+                dependent(0, { sheetIndex: 1, column: 0, formula: '=Data!D6*2', written: '=Data!D6*2' }),
+            ]);
+            expect(notice.sentences).toEqual([
+                '4 formulas use column Price, which you deleted. After you save, they will show #REF!.',
+                '2 more formulas use their results and will show #REF! too.',
+                'Restore the column, or undo, to keep them working.',
+            ]);
+            expect(notice.formulas!.items.map((item) => [item.location, item.formula, item.note])).toEqual([
+                ['Data!D2', '=B2*#REF!', undefined],
+                ['Data!D3', '=B3*#REF!', undefined],
+                ['Data!D4', '=B4*#REF!', undefined],
+                ['Data!D5', '=B5*#REF!', undefined],
+                ['Data!D6', '=SUM(D2:D5)', 'Uses a #REF! result'],
+                ['Summary!A1', '=Data!D6*2', 'Uses a #REF! result'],
+            ]);
+            expect(notice.formulas).toMatchObject({ total: 6, disclosureLabel: 'Show 6 formulas' });
+            expect(notice.formulas!.items[5]!.goTo.intent).toEqual({ kind: 'goToCell', sheetIndex: 1, row: 0, column: 0 });
+        });
+
+        it('says which ones might show an error, since Table Viewer cannot calculate them', () => {
+            const notice = notice_for([
+                dependent(5),
+                dependent(1, { sheetIndex: 1, column: 0, formula: '=ROUND(Data!D6,2)', written: '=ROUND(Data!D6,2)', result: 'unchecked' }),
+            ]);
+            expect(notice.sentences.slice(1)).toEqual([
+                '1 more formula uses their results and will show #REF! too.',
+                "Table Viewer can't calculate 1 more formula that uses their results, so it might show an error too.",
+                'Restore the column, or undo, to keep them working.',
+            ]);
+            expect(notice.formulas!.items.at(-1)!.note).toBe('Might show an error');
+            const several = notice_for([], {
+                totals: { deleted: 4, changedRanges: 0, unadjustable: 0, refDependents: 0, uncheckedDependents: 3 },
+            });
+            expect(several.sentences[1]).toBe(
+                "Table Viewer can't calculate 3 more formulas that use their results, so they might show errors too.");
+        });
+
+        it('speaks of one broken formula as it, and counts dependents past the cap', () => {
+            const [notice] = pending_change_notices(with_review(review({
+                deleted: [deleted(1, 3)],
+                deletedCounts: [{ targetSheetIndex: 0, formulas: 1 }],
+                dependents: [dependent(5)],
+                totals: { deleted: 1, changedRanges: 0, unadjustable: 0, refDependents: 900, uncheckedDependents: 0 },
+            })));
+            expect(notice!.sentences).toEqual([
+                '1 formula uses column Price, which you deleted. After you save, it will show #REF!.',
+                '900 more formulas use its result and will show #REF! too.',
+                'Restore the column, or undo, to keep them working.',
+            ]);
+            expect(notice!.formulas).toMatchObject({ total: 901, truncatedNote: 'Showing the first 2.' });
+        });
+
+        it('brings a dismissed warning back when more formulas come to use the broken ones', () => {
+            const notice = notice_for([dependent(5)]);
+            const dismissed = new Set([notice.dismissKey!]);
+            const input = (dependents: readonly FormulaDependentItem[]): PendingChangeNoticeInput => ({
+                ...sheets,
+                dismissed,
+                formulaReview: {
+                    current: true,
+                    review: review({ deleted: totals, deletedCounts: [{ targetSheetIndex: 0, formulas: 4 }], dependents }),
+                },
+            });
+            expect(pending_change_notices(input([dependent(5)]))).toEqual([]);
+            expect(kinds(pending_change_notices(input([dependent(5), dependent(6)])))).toEqual(['deletedReferences']);
+            // The same cell, now one Table Viewer can't calculate.
+            expect(kinds(pending_change_notices(input([dependent(5, { result: 'unchecked' })]))))
+                .toEqual(['deletedReferences']);
+        });
     });
 
     it('drops a dismissed warning until its content changes', () => {

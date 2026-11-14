@@ -48,6 +48,7 @@ import { is_plain_record } from './plain-record';
 const MAX_RANGE_CELLS_PER_READ = 8_192;
 const MAX_RANGE_COLUMNS_PER_READ = 256;
 const PARSER_WORK_PER_CHECKPOINT = 1_024;
+const EDITS_PER_CHECKPOINT = 8_192;
 // Excel's documented formula-text limit, plus the editor's leading '='.
 const MAX_CALCULATED_FORMULA_LENGTH = 8_193;
 // A save runs on the extension host. Keep its cache-refresh fallback below one
@@ -435,8 +436,11 @@ export function formula_calculation_workbook(
  * cross-sheet lookup, range streaming, memoization, and error containment stay
  * behind this seam. Memory is O(targets + edits + one 8K-cell range chunk),
  * not O(the workbook or the request's point-reference count).
+ *
+ * Yields between bounded pieces of work, so a caller that is itself a
+ * generator (the Save warnings' review) can run it in the same slices.
  */
-function* calculate_workbook_formula_steps(
+export function* calculate_workbook_formula_steps(
     source: DataSource,
     request: FormulaCalculationRequest,
     max_work?: number,
@@ -483,7 +487,13 @@ function* calculate_workbook_formula_steps(
     ));
     const sheet_names = sheets.map((sheet) => sheet.name);
     const sheet_lookup = new Map(sheet_names.map((name, index) => [name.toUpperCase(), index]));
-    const edits = new Map(request.edits.map((edit) => [address_key(edit), edit]));
+    const edits = new Map<string, FormulaCalculationEdit>();
+    // A request can carry a hundred thousand edits: index them in slices.
+    for (let index = 0; index < request.edits.length; index += 1) {
+        const edit = request.edits[index];
+        edits.set(address_key(edit), edit);
+        if ((index + 1) % EDITS_PER_CHECKPOINT === 0) yield;
+    }
     const pending_header_names = new Map<string, string>();
     const header_name_counts = sheets.map((_sheet, sheet_index) => {
         const counts = new Map<string, number>();

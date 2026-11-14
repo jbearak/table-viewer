@@ -5,7 +5,10 @@
 //
 //   esbuild benchmarks/formulas/save-warnings-bench.ts --bundle --platform=node \
 //     --packages=external --outfile=test-results/save-warnings-bench.js
-//   node test-results/save-warnings-bench.js [rows]
+//   node test-results/save-warnings-bench.js [rows] [dependents]
+//
+// With `dependents`, every row also has `E = D*1.1` and the All row sums E,
+// so deleting Price breaks a formula on every row and one that uses it.
 //
 // Prints one JSON line per gesture: the review's total CPU time, its longest
 // uninterrupted slice when run cooperatively (8 ms slices, as the host runs
@@ -28,16 +31,22 @@ import {
 
 async function main(): Promise<void> {
     const rows = Number(process.argv[2] ?? 50_000);
-    const body: string[] = [row(1, ['Item', 'Qty', 'Price', 'Total'].map((v, c) => cell(`${'ABCD'[c]}1`, v)))];
+    const dependents = process.argv[3] === 'dependents';
+    const body: string[] = [row(1, ['Item', 'Qty', 'Price', 'Total', 'Tax'].map((v, c) => cell(`${'ABCDE'[c]}1`, v)))];
     for (let n = 2; n <= rows + 1; n += 1) {
         body.push(row(n, [
             cell(`A${n}`, `item ${n}`),
             cell(`B${n}`, n % 17),
             cell(`C${n}`, (n % 13) / 4),
             cell(`D${n}`, { f: `B${n}*C${n}` }),
+            ...(dependents ? [cell(`E${n}`, { f: `D${n}*1.1` })] : []),
         ]));
     }
-    body.push(row(rows + 2, [cell(`B${rows + 2}`, { f: `SUM(B2:B${rows + 1})` }), cell(`D${rows + 2}`, { f: `SUM(D2:D${rows + 1})` })]));
+    body.push(row(rows + 2, [
+        cell(`B${rows + 2}`, { f: `SUM(B2:B${rows + 1})` }),
+        cell(`D${rows + 2}`, { f: `SUM(D2:D${rows + 1})` }),
+        ...(dependents ? [cell(`E${rows + 2}`, { f: `SUM(E2:E${rows + 1})` })] : []),
+    ]));
     const bytes = build_fixture_xlsx({ sheets: [{ name: 'Data', body: `<sheetData>${body.join('')}</sheetData>` }] });
     const opened = performance.now();
     const source = await build_source_from_buffer(bytes, 'bench.xlsx');
@@ -62,7 +71,11 @@ async function main(): Promise<void> {
         'move the first body row down': unwrap(move_rows(EMPTY_PENDING_STRUCTURAL_CHANGES, context,
             [{ kind: 'source', sourceRow: 1 }], { kind: 'source', sourceRow: 3 })),
     };
-    console.log(JSON.stringify({ rows, formulas: rows + 2, open_ms: Math.round(open_ms) }));
+    console.log(JSON.stringify({
+        rows,
+        formulas: dependents ? 2 * rows + 3 : rows + 2,
+        open_ms: Math.round(open_ms),
+    }));
     for (const [gesture, changes] of Object.entries(gestures)) {
         const layouts: FormulaCalculationLayout[] = [{
             bodyStart: 1,
@@ -97,6 +110,8 @@ async function main(): Promise<void> {
             longest_slice_ms: Math.round(longest * 10) / 10,
             yields,
             ref_formulas: review.deletedCounts.reduce((sum, entry) => sum + entry.formulas, 0),
+            ref_dependents: review.totals.refDependents,
+            unchecked_dependents: review.totals.uncheckedDependents,
             range_formulas: review.counts.reduce((sum, entry) => sum + entry.formulas, 0),
         }));
     }

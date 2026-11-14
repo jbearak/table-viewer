@@ -46,7 +46,15 @@ export interface WorkbookFormulaImpact {
 
 export interface WorkbookFormulaGraph {
     invalidatedBy(changed: Iterable<WorkbookCellAddress>): WorkbookFormulaImpact;
+    /**
+     * `invalidatedBy`, yielding every few thousand cells, for a caller that
+     * runs in slices (the host's Save warnings review).
+     */
+    invalidatedBySteps(changed: Iterable<WorkbookCellAddress>): Generator<void, WorkbookFormulaImpact, void>;
 }
+
+/** Cells visited between the yields of `invalidatedBySteps`. */
+const CELLS_PER_INVALIDATION_STEP = 2_048;
 
 export interface WorkbookFormulaEdit extends WorkbookCellAddress {
     readonly value: string;
@@ -772,143 +780,160 @@ export function compile_workbook_formula_graph(
     exact_by_sheet.length = 0;
     ranges_by_sheet.length = 0;
 
+    function* invalidated_steps(changed: Iterable<WorkbookCellAddress>): Generator<void, WorkbookFormulaImpact, void> {
+        let since_yield = 0;
+        const queued_by_sheet = new Map<number, Set<number>>();
+        const queue: WorkbookCellAddress[] = [];
+        const enqueue_cell = (cell: WorkbookCellAddress): boolean => {
+            if (
+                !Number.isSafeInteger(cell.sheetIndex)
+                || cell.sheetIndex < 0
+                || cell.sheetIndex >= sources.length
+                || !valid_coordinate(cell.row, cell.column)
+            ) return false;
+            const number = cell_number(cell.row, cell.column);
+            const queued = queued_by_sheet.get(cell.sheetIndex) ?? new Set<number>();
+            if (queued.has(number)) return false;
+            queued.add(number);
+            queued_by_sheet.set(cell.sheetIndex, queued);
+            queue.push(cell);
+            return true;
+        };
+        for (const cell of changed) enqueue_cell(cell);
+
+        const visited = new Uint8Array(formula_sheets_array.length);
+        const consumed_ranges = sources.map(
+            (source) => new Uint8Array(source.ranges.length / RANGE_STRIDE),
+        );
+        const range_index_states: Array<ReadonlyMap<number, Int32Array> | undefined>
+            = new Array(sources.length);
+        const affected_by_sheet = new Map<number, Set<number>>();
+        let affected_size = 0;
+        const enqueue_formula = (ordinal: number): void => {
+            if (visited[ordinal]) return;
+            visited[ordinal] = 1;
+            affected_size += 1;
+            const sheet = formula_sheets_array[ordinal];
+            const row = formula_rows_array[ordinal];
+            const column = formula_columns_array[ordinal];
+            const affected = affected_by_sheet.get(sheet) ?? new Set<number>();
+            affected.add(cell_number(row, column));
+            affected_by_sheet.set(sheet, affected);
+            enqueue_cell({ sheetIndex: sheet, row, column });
+        };
+        const visit_range = (source: CompiledSourceSheet, range_id: number): void => {
+            const offset = range_id * RANGE_STRIDE;
+            enqueue_formula(source.ranges[offset + 4]);
+        };
+        const visit_exact = (source: CompiledSourceSheet, cell: WorkbookCellAddress): void => {
+            let low = 0;
+            let high = source.exact.length / EXACT_STRIDE;
+            while (low < high) {
+                const middle = (low + high) >>> 1;
+                const offset = middle * EXACT_STRIDE;
+                const before = source.exact[offset] < cell.row
+                    || (source.exact[offset] === cell.row
+                        && source.exact[offset + 1] < cell.column);
+                if (before) low = middle + 1;
+                else high = middle;
+            }
+            for (let record = low; record < source.exact.length / EXACT_STRIDE; record += 1) {
+                const offset = record * EXACT_STRIDE;
+                if (
+                    source.exact[offset] !== cell.row
+                    || source.exact[offset + 1] !== cell.column
+                ) break;
+                enqueue_formula(source.exact[offset + 2]);
+            }
+        };
+        let wave_start = 0;
+        while (wave_start < queue.length) {
+            // Close exact edges before touching ranges. Deep exact chains
+            // then become one point wave instead of repeating the spatial
+            // query once per link.
+            const points_by_sheet = new Map<number, WorkbookCellAddress[]>();
+            let exact_cursor = wave_start;
+            while (exact_cursor < queue.length) {
+                if (++since_yield >= CELLS_PER_INVALIDATION_STEP) {
+                    since_yield = 0;
+                    yield;
+                }
+                const cell = queue[exact_cursor];
+                visit_exact(sources[cell.sheetIndex], cell);
+                const points = points_by_sheet.get(cell.sheetIndex) ?? [];
+                points.push(cell);
+                points_by_sheet.set(cell.sheetIndex, points);
+                exact_cursor += 1;
+            }
+            const wave_end = queue.length;
+            for (const [sheet_index, points] of points_by_sheet) {
+                const source = sources[sheet_index];
+                if (source.ranges.length === 0) continue;
+                const range_index_state = range_index_states[sheet_index]
+                    ?? source.rangeIndex.createState();
+                range_index_states[sheet_index] = range_index_state;
+                for (const cell of points) {
+                    if (++since_yield >= CELLS_PER_INVALIDATION_STEP) {
+                        since_yield = 0;
+                        yield;
+                    }
+                    source.rangeIndex.visit(
+                        cell.row,
+                        cell.column,
+                        consumed_ranges[sheet_index],
+                        range_index_state,
+                        (id) => visit_range(source, id),
+                    );
+                }
+            }
+            wave_start = wave_end;
+        }
+
+        const empty: FormulaSheetImpact = {
+            size: 0,
+            has: () => false,
+            *keys() {},
+            *cells() {},
+        };
+        const projections = new Map<number, FormulaSheetImpact>();
+        return {
+            size: affected_size,
+            forSheet(sheetIndex) {
+                const projected = projections.get(sheetIndex);
+                if (projected) return projected;
+                const affected = affected_by_sheet.get(sheetIndex);
+                if (!affected) return empty;
+                const created: FormulaSheetImpact = {
+                    size: affected.size,
+                    has: (row, column) => affected.has(cell_number(row, column)),
+                    *keys() {
+                        for (const number of affected) {
+                            yield `${Math.floor(number / MAX_COLUMN)}:${number % MAX_COLUMN}`;
+                        }
+                    },
+                    *cells() {
+                        for (const number of affected) {
+                            yield {
+                                row: Math.floor(number / MAX_COLUMN),
+                                column: number % MAX_COLUMN,
+                            };
+                        }
+                    },
+                };
+                projections.set(sheetIndex, created);
+                return created;
+            },
+        };
+    }
+
     return {
         invalidatedBy(changed) {
-            const queued_by_sheet = new Map<number, Set<number>>();
-            const queue: WorkbookCellAddress[] = [];
-            const enqueue_cell = (cell: WorkbookCellAddress): boolean => {
-                if (
-                    !Number.isSafeInteger(cell.sheetIndex)
-                    || cell.sheetIndex < 0
-                    || cell.sheetIndex >= sources.length
-                    || !valid_coordinate(cell.row, cell.column)
-                ) return false;
-                const number = cell_number(cell.row, cell.column);
-                const queued = queued_by_sheet.get(cell.sheetIndex) ?? new Set<number>();
-                if (queued.has(number)) return false;
-                queued.add(number);
-                queued_by_sheet.set(cell.sheetIndex, queued);
-                queue.push(cell);
-                return true;
-            };
-            for (const cell of changed) enqueue_cell(cell);
-
-            const visited = new Uint8Array(formula_sheets_array.length);
-            const consumed_ranges = sources.map(
-                (source) => new Uint8Array(source.ranges.length / RANGE_STRIDE),
-            );
-            const range_index_states: Array<ReadonlyMap<number, Int32Array> | undefined>
-                = new Array(sources.length);
-            const affected_by_sheet = new Map<number, Set<number>>();
-            let affected_size = 0;
-            const enqueue_formula = (ordinal: number): void => {
-                if (visited[ordinal]) return;
-                visited[ordinal] = 1;
-                affected_size += 1;
-                const sheet = formula_sheets_array[ordinal];
-                const row = formula_rows_array[ordinal];
-                const column = formula_columns_array[ordinal];
-                const affected = affected_by_sheet.get(sheet) ?? new Set<number>();
-                affected.add(cell_number(row, column));
-                affected_by_sheet.set(sheet, affected);
-                enqueue_cell({ sheetIndex: sheet, row, column });
-            };
-            const visit_range = (source: CompiledSourceSheet, range_id: number): void => {
-                const offset = range_id * RANGE_STRIDE;
-                enqueue_formula(source.ranges[offset + 4]);
-            };
-            const visit_exact = (source: CompiledSourceSheet, cell: WorkbookCellAddress): void => {
-                let low = 0;
-                let high = source.exact.length / EXACT_STRIDE;
-                while (low < high) {
-                    const middle = (low + high) >>> 1;
-                    const offset = middle * EXACT_STRIDE;
-                    const before = source.exact[offset] < cell.row
-                        || (source.exact[offset] === cell.row
-                            && source.exact[offset + 1] < cell.column);
-                    if (before) low = middle + 1;
-                    else high = middle;
-                }
-                for (let record = low; record < source.exact.length / EXACT_STRIDE; record += 1) {
-                    const offset = record * EXACT_STRIDE;
-                    if (
-                        source.exact[offset] !== cell.row
-                        || source.exact[offset + 1] !== cell.column
-                    ) break;
-                    enqueue_formula(source.exact[offset + 2]);
-                }
-            };
-            let wave_start = 0;
-            while (wave_start < queue.length) {
-                // Close exact edges before touching ranges. Deep exact chains
-                // then become one point wave instead of repeating the spatial
-                // query once per link.
-                const points_by_sheet = new Map<number, WorkbookCellAddress[]>();
-                let exact_cursor = wave_start;
-                while (exact_cursor < queue.length) {
-                    const cell = queue[exact_cursor];
-                    visit_exact(sources[cell.sheetIndex], cell);
-                    const points = points_by_sheet.get(cell.sheetIndex) ?? [];
-                    points.push(cell);
-                    points_by_sheet.set(cell.sheetIndex, points);
-                    exact_cursor += 1;
-                }
-                const wave_end = queue.length;
-                for (const [sheet_index, points] of points_by_sheet) {
-                    const source = sources[sheet_index];
-                    if (source.ranges.length === 0) continue;
-                    const range_index_state = range_index_states[sheet_index]
-                        ?? source.rangeIndex.createState();
-                    range_index_states[sheet_index] = range_index_state;
-                    for (const cell of points) {
-                        source.rangeIndex.visit(
-                            cell.row,
-                            cell.column,
-                            consumed_ranges[sheet_index],
-                            range_index_state,
-                            (id) => visit_range(source, id),
-                        );
-                    }
-                }
-                wave_start = wave_end;
-            }
-
-            const empty: FormulaSheetImpact = {
-                size: 0,
-                has: () => false,
-                *keys() {},
-                *cells() {},
-            };
-            const projections = new Map<number, FormulaSheetImpact>();
-            return {
-                size: affected_size,
-                forSheet(sheetIndex) {
-                    const projected = projections.get(sheetIndex);
-                    if (projected) return projected;
-                    const affected = affected_by_sheet.get(sheetIndex);
-                    if (!affected) return empty;
-                    const created: FormulaSheetImpact = {
-                        size: affected.size,
-                        has: (row, column) => affected.has(cell_number(row, column)),
-                        *keys() {
-                            for (const number of affected) {
-                                yield `${Math.floor(number / MAX_COLUMN)}:${number % MAX_COLUMN}`;
-                            }
-                        },
-                        *cells() {
-                            for (const number of affected) {
-                                yield {
-                                    row: Math.floor(number / MAX_COLUMN),
-                                    column: number % MAX_COLUMN,
-                                };
-                            }
-                        },
-                    };
-                    projections.set(sheetIndex, created);
-                    return created;
-                },
-            };
+            const steps = invalidated_steps(changed);
+            let step = steps.next();
+            while (!step.done) step = steps.next();
+            return step.value;
         },
+        invalidatedBySteps: invalidated_steps,
     };
 }
 

@@ -448,9 +448,10 @@ test('an .xlsx formula recalculated before Save shows General digits, as it does
 
 /**
  * Data: Item / Qty / Price / Total, with Total `=B*C` on rows 2-5, and an All
- * row summing Qty and Total.
+ * row summing Qty and Total. With `summary`, a Summary worksheet holding those
+ * formulas in A1, A2, and so on.
  */
-function totals_workbook(): Buffer {
+function totals_workbook(summary: readonly string[] = []): Buffer {
     const fruit: readonly (readonly [string, number, number])[] = [
         ['Apple', 3, 0.5], ['Banana', 5, 0.25], ['Cherry', 7, 2], ['Date', 9, 1.5],
     ];
@@ -471,8 +472,12 @@ function totals_workbook(): Buffer {
             cell('D6', { f: 'SUM(D2:D5)', v: 30.25 }),
         ]),
     ];
+    const summary_rows = summary.map((formula, index) => row(index + 1, [cell(`A${index + 1}`, { f: formula, v: 0 })]));
     return Buffer.from(build_fixture_xlsx({
-        sheets: [{ name: 'Data', body: `<sheetData>${rows.join('')}</sheetData>` }],
+        sheets: [
+            { name: 'Data', body: `<sheetData>${rows.join('')}</sheetData>` },
+            ...(summary.length === 0 ? [] : [{ name: 'Summary', body: `<sheetData>${summary_rows.join('')}</sheetData>` }]),
+        ],
     }));
 }
 
@@ -505,12 +510,17 @@ test('an .xlsx warns before Save only about formulas a change breaks, under the 
     );
     await expect(broken).toContainText('Restore the column, or undo, to keep them working.');
     expect(await canvas_top(page)).toBe(top);
-    await broken.getByRole('button', { name: 'Show 4 formulas' }).click();
+    await broken.getByRole('button', { name: /^Show \d+ formulas$/ }).click();
     // Labelled the way the grid shows the cell: by its column's name and row number.
     await expect(broken.locator('li').first()).toContainText('Total, row 2');
     await expect(broken.locator('li').first()).toContainText('=B2*#REF!');
     await expect(broken.locator('li').first()).toContainText('was =B2*C2');
     await save_screenshot(page, '12-xlsx-ref-notice');
+    // The All row sums those Totals, so it breaks too: counted, and listed last.
+    await expect(broken).toContainText('1 more formula uses their results and will show #REF! too.');
+    await expect(broken.locator('li')).toHaveCount(5);
+    await expect(broken.locator('li').last()).toContainText('Total, row 7');
+    await expect(broken.locator('li').last()).toContainText('Uses a #REF! result');
 
     await save_button(page).hover();
     await expect(page.getByRole('tooltip')).toHaveText('Save: 1 row inserted, 1 column deleted.');
@@ -520,6 +530,41 @@ test('an .xlsx warns before Save only about formulas a change breaks, under the 
     await choose(await open_column_menu(page, 2), 'Restore column');
     await expect(notices).toHaveCount(0, { timeout: 30_000 });
     expect(await canvas_top(page)).toBe(top);
+});
+
+test('an .xlsx counts the formulas that use a broken one, on other worksheets too', async () => {
+    const { page } = await open_file('totals.xlsx', totals_workbook(['Data!D6*2', 'ROUND(Data!D6,2)', 'IFERROR(Data!D6,0)']));
+    await wait_for_grid(page);
+    await choose(await open_column_menu(page, 2), 'Delete column');
+    const broken = page.getByRole('status', { name: 'Formulas that will show #REF!' });
+    await expect(broken).toContainText(
+        '4 formulas use column Price, which you deleted. After you save, they will show #REF!.',
+        { timeout: 30_000 },
+    );
+    await broken.getByRole('button', { name: /^Show \d+ formulas$/ }).click();
+    await save_screenshot(page, '15-xlsx-ref-dependents');
+    // The All row and Summary!A1 evaluate to #REF!. ROUND is outside what Table
+    // Viewer calculates, so A2 might show an error; IFERROR catches it.
+    await expect(broken).toContainText('2 more formulas use their results and will show #REF! too.');
+    await expect(broken).toContainText(
+        "Table Viewer can't calculate 1 more formula that uses their results, so it might show an error too.");
+    const items = broken.locator('li');
+    await expect(items).toHaveCount(7);
+    await expect(items.nth(4)).toContainText('Total, row 6 on Data');
+    await expect(items.nth(4)).toContainText('Uses a #REF! result');
+    await expect(items.nth(5)).toContainText('Summary!A1');
+    await expect(items.nth(5)).toContainText('=Data!C6*2');
+    await expect(items.nth(6)).toContainText('Summary!A2');
+    await expect(items.nth(6)).toContainText('Might show an error');
+    await expect(broken).not.toContainText('IFERROR');
+
+    // Summary shows the pending results; the notice stays, now naming Data.
+    const summary = page.getByRole('button', { name: 'Summary', exact: true });
+    await summary.click();
+    await expect(summary).toHaveClass(/active/);
+    await expect.poll(async () => (await grid_rows(page)).length).toBe(3);
+    await expect(broken).toContainText('4 formulas use column Price on Data, which you deleted.');
+    await save_screenshot(page, '16-summary-pending-results');
 });
 
 test('a move that changes a summed range says so before Save', async () => {
