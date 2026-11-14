@@ -13,6 +13,8 @@ After an edit, Table Viewer recalculates affected formulas when it can. Its buil
 - Header Row column references, described below
 - `SUM` and `AVERAGE`
 
+A recalculated result uses the cell's number format, or Excel's General format if the cell has none, so it looks the same before and after Save. For example, `=19/9` displays `2.111111111` both times.
+
 A formula that contains `#REF!`, which is what a reference becomes when its row, column, or worksheet is deleted, displays `?? (invalid reference)`.
 
 If a formula uses another function, has a cycle, cannot be parsed safely, or exceeds the calculation limits, Table Viewer removes its stale cached result instead of displaying a result it cannot trust. The cell displays `??` until Excel or another spreadsheet engine recalculates the workbook.

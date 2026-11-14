@@ -19,6 +19,7 @@ import { isolated_user_data, repo_dir, state_database_path } from './smoke-helpe
 import {
     cell_point,
     choose,
+    cell_point,
     choose_from_submenu,
     open_cell_menu,
     save_button,
@@ -388,6 +389,48 @@ test('XLSX rows and columns: insert, delete, move, then save', async () => {
         ['', 'Cara', ''],
     ]);
     expect((await saved())[0]).toHaveLength(4);
+});
+
+test('an .xlsx formula recalculated before Save shows General digits, as it does after Save', async () => {
+    // B1 = (A1+A2)/9 with no number format, cached at 17/9.
+    const book = Buffer.from(build_fixture_xlsx({
+        sheets: [{
+            name: 'Data',
+            body: `<sheetData>${[
+                row(1, [cell('A1', 15), cell('B1', { f: 'SUM(A1:A2)/9', v: 17 / 9 })]),
+                row(2, [cell('A2', 2)]),
+            ].join('')}</sheetData>`,
+        }],
+    }));
+    const { file, page } = await open_file('ninths.xlsx', book);
+    await wait_for_grid(page);
+    // A before and after doesn't fit the cell, so hovering shows the painted text.
+    const hovered_formula = async () => {
+        const formula_cell = await cell_point(page, 1, 0);
+        await page.mouse.move(0, 0);
+        await page.mouse.move(formula_cell.x, formula_cell.y);
+        return page.getByRole('tooltip');
+    };
+
+    // A value edit: B1 becomes 19/9.
+    await type_into_cell(page, 1, 0, '17');
+    await expect(await hovered_formula()).toContainText('1.888888889 → ');
+    await save_screenshot(page, '11-xlsx-recalculated-before-save');
+    await expect(await hovered_formula()).toHaveText('1.888888889 → 2.111111111');
+
+    // Save writes the result, and the file's cached value displays the same way.
+    await save_changes(page);
+    await save_screenshot(page, '12-xlsx-recalculated-after-save');
+    const parsed = await parse_xlsx(new Uint8Array(fs.readFileSync(file)));
+    expect(parsed.data.sheets[0].rows[0][1]?.formatted).toBe('2.111111111');
+
+    // A row inserted inside the SUM and typed into: B1 becomes 21/9.
+    await choose_from_submenu(await open_cell_menu(page, 0, 1), 'Insert', 'Insert row above');
+    await expect.poll(async () => (await grid_rows(page))[1]).toMatch(/^Row 2, inserted\|/);
+    await type_into_cell(page, 1, 1, '2');
+    await expect(await hovered_formula()).toContainText(' → ');
+    await save_screenshot(page, '13-xlsx-row-change-recalculated');
+    await expect(await hovered_formula()).toHaveText('2.111111111 → 2.333333333');
 });
 
 test('an external change conflicts, and both salvage actions resolve it', async () => {
