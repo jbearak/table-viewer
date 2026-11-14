@@ -70,6 +70,11 @@ async function expect_undo_label(label: string): Promise<void> {
     await expect.poll(() => undo_menu_label(app!), { timeout: 15_000 }).toBe(`Undo ${label}`);
 }
 
+async function close_menu(page: Page): Promise<void> {
+    await page.keyboard.press('Escape');
+    await expect(page.locator('[role="menu"]')).toHaveCount(0);
+}
+
 test('CSV rows: insert, delete, restore, move by keyboard and drag, then save', async () => {
     const { file, page } = await open_file(
         'fruit.csv',
@@ -193,6 +198,52 @@ test('the cell menu inserts, deletes, and restores rows and columns', async () =
     await save_changes(page);
     await expect.poll(() => fs.readFileSync(file, 'utf8'))
         .toBe('name,New column,price\napple,,0.5\n,,\nbanana,,0.25\n');
+});
+
+test('a cell in a Pending Column, a Pending Row, or a Pending Appended Row has a menu', async () => {
+    const { page } = await open_file('fruit.csv', 'name,qty\napple,1\nbanana,2\n');
+    await wait_for_grid(page);
+
+    await choose(await open_column_menu(page, 0), 'Insert column right');
+    await expect.poll(() => grid_headers(page)).toEqual([
+        '|name',
+        'Column B, inserted|New column',
+        '|qty',
+    ]);
+    await save_screenshot(page, 'pending-cell-menu-0-column-inserted');
+
+    // A cell in the Pending Column has the cell menu. The column can't be
+    // hidden until it is saved, and the cell inserts a row beside itself.
+    const pending_column_menu = await open_cell_menu(page, 1, 0);
+    await pending_column_menu.getByRole('menuitem', { name: 'Hide', exact: true }).click();
+    await expect(page.getByRole('menuitem', { name: 'Hide column', exact: true }))
+        .toHaveAttribute('aria-disabled', 'true');
+    await save_screenshot(page, 'pending-cell-menu-1-pending-column');
+    await choose_from_submenu(pending_column_menu, 'Insert', 'Insert row below');
+    await expect.poll(() => grid_rows(page)).toEqual([
+        '|apple||1',
+        'Row 2, inserted|||',
+        '|banana||2',
+    ]);
+    await expect_undo_label('Insert row');
+
+    // A cell in the Pending Row, in a source column and in the Pending Column.
+    await open_cell_menu(page, 0, 1);
+    await save_screenshot(page, 'pending-cell-menu-2-pending-row');
+    await close_menu(page);
+    await open_cell_menu(page, 1, 1);
+    await save_screenshot(page, 'pending-cell-menu-3-pending-row-and-column');
+    await close_menu(page);
+
+    // A cell in a Pending Appended Row, in the Pending Column, deletes the column.
+    await page.getByRole('button', { name: 'Add rows' }).click();
+    await page.getByRole('button', { name: 'Add row', exact: true }).click();
+    await expect.poll(() => grid_rows(page)).toHaveLength(4);
+    const appended_menu = await open_cell_menu(page, 1, 3);
+    await save_screenshot(page, 'pending-cell-menu-4-appended-row-and-column');
+    await choose_from_submenu(appended_menu, 'Delete', 'Delete column');
+    await expect.poll(() => grid_headers(page)).toEqual(['|name', '|qty']);
+    await expect_undo_label('Delete column');
 });
 
 test('a row drag and a column drag are the first edits to a file', async () => {
