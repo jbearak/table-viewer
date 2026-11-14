@@ -236,7 +236,17 @@ function by_cell(left: FormulaCalculationAddress, right: FormulaCalculationAddre
 /** A formula Save writes `#REF!` into, with its source cell when it is a source formula. */
 interface DirectFormula extends FormulaCalculationAddress {
     readonly source: WorkbookCellAddress | undefined;
+    /** Every `#REF!` Save writes into it is caught (`catchesErrors`). */
+    readonly caught: boolean;
 }
+
+/**
+ * A formula the calculator can't evaluate. A formula that catches every
+ * `#REF!` Save writes into it but reads some other cell outside IFERROR or
+ * an IS function, such as `=IFERROR(#REF!,D6)`, stands in as this for the
+ * formulas that use it: if D6 breaks, so does it, so they might show an error.
+ */
+const CANNOT_CALCULATE = '=IFERROR(0,0)';
 
 interface DependentReview {
     readonly items: readonly FormulaDependentItem[];
@@ -307,7 +317,7 @@ function* dependent_steps(
             sheetIndex: formula.sheetIndex,
             row: formula.row,
             column: formula.column,
-            value: '=#REF!',
+            value: formula.caught ? CANNOT_CALCULATE : '=#REF!',
             writesFormula: true,
         });
         if (++since_yield >= FORMULAS_PER_STEP * 8) {
@@ -530,17 +540,15 @@ function* review_steps(
             deleted_by_target.set(deletion.worksheet, entry);
         }
         // Caught only when every #REF! is: `=IFERROR(A1,0)+#REF!` shows #REF!.
-        const catches_errors = deleted_by_target.size > 0 && formula_error_catching(rendered).catchesRefErrors;
-        if (deleted_by_target.size > 0) {
-            if (catches_errors) {
-                totals.deletedCaught += 1;
-                untargeted.add(key);
-            } else {
-                totals.deleted += 1;
-                // It shows #REF! after Save, so it passes it on.
-                if (!shows_ref) untargeted.delete(key);
-            }
-            direct.set(key, { sheetIndex: sheet_index, row, column, source: source_cell });
+        const after_save = deleted_by_target.size > 0 ? formula_error_catching(rendered) : undefined;
+        const catches_errors = after_save?.catchesRefErrors === true;
+        if (after_save !== undefined) {
+            if (catches_errors) totals.deletedCaught += 1;
+            else totals.deleted += 1;
+            // It passes nothing on only if no error in a cell it reads reaches its result.
+            if (shows_ref || after_save.catchesReadErrors) untargeted.add(key);
+            else untargeted.delete(key);
+            direct.set(key, { sheetIndex: sheet_index, row, column, source: source_cell, caught: catches_errors });
         }
         for (const [target, entry] of [...deleted_by_target].sort(([left], [right]) => left - right)) {
             deleted_counts.set(target, (deleted_counts.get(target) ?? 0) + 1);

@@ -195,6 +195,16 @@ describe('formulas that use a #REF! formula', () => {
         ]);
     });
 
+    it('says a formula that uses one that catches its #REF! but reads a broken cell outside IFERROR might show an error', async () => {
+        // A1 catches the #REF! Save writes for Data!C2, but its fallback is
+        // the All total, which breaks too. A3 catches every error it reads.
+        const source = await prices(['=IFERROR(Data!C2,Data!D6)', '=A1*2', '=IFERROR(Data!C3*Data!D6,0)', '=A3*2']);
+        const review = review_formula_divergence(source, [], price_deleted(source));
+        expect(review.deleted.filter((item) => item.sheetIndex === 1).map((item) => item.catchesErrors)).toEqual([true, true]);
+        // The calculator can't tell what A1 shows, so A2 might show an error.
+        expect(listed(review)).toEqual(['0!5:2 =SUM(C2:C5) ref', '1!1:0 =A1*2 unchecked']);
+    });
+
     it('passes the error on through a pending formula that catches it in only some of the cells it reads', async () => {
         const source = await prices(['=1', '=A1*2']);
         const review = review_formula_divergence(source, [
