@@ -228,7 +228,10 @@ export function formula_result_matches_persisted(
     if (result === persisted_displayed_text(c, show_formatting)) return true;
     // An unformatted number displays fewer digits than the file stores, and
     // the calculator reports 15 significant digits where the file may hold 17.
-    return c.rawType === 'number' && c.raw !== null && same_number(c.raw, result);
+    // A result painted through a number format is display text, not a value.
+    const result_is_value = !show_formatting || c.numberFormat === undefined;
+    return result_is_value && c.rawType === 'number' && c.raw !== null
+        && same_number(c.raw, result);
 }
 
 function same_number(left: string, right: string): boolean {

@@ -414,6 +414,14 @@ describe('formula_result_matches_persisted', () => {
         )).toBe(false);
     });
 
+    it('does not read a formatted result as a value', () => {
+        // Under `0,` a cached 1000 shows as "1" and a new 1000000 as "1000".
+        const scaled: RenderedCell = { ...formula('1000', '1'), numberFormat: { code: '0,' } };
+        expect(formula_result_matches_persisted(scaled, true, '1000')).toBe(false);
+        expect(formula_result_matches_persisted(scaled, true, '1')).toBe(true);
+        expect(formula_result_matches_persisted(scaled, false, '1000')).toBe(true);
+    });
+
     it('compares text results as text', () => {
         // `=A1` cached as the text "001": a result of "1" is a change.
         const text: RenderedCell = { ...formula('001', '001'), rawType: 'string' };
