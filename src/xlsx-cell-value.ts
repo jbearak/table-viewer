@@ -45,6 +45,7 @@ export function iso_to_serial(text: string, datemode: DateMode): number | null {
  * account numbers keep the spelling the user typed.
  */
 const NUMBER_RE = /^[+-]?((0|[1-9]\d*)(\.\d*)?|\.\d+)([eE][+-]?\d+)?$/;
+/** Excel keeps 15 significant digits of a number and zeroes the rest. */
 const MAX_EXACT_DIGITS = 15;
 
 /** Exact value/runs rule used when an XLSX edit chooses formula storage. */
@@ -56,9 +57,14 @@ export function xlsx_edit_writes_formula(
     return !force_text && runs === undefined && is_xlsx_formula_text(value);
 }
 
-function significant_digits(text: string): number {
-    const mantissa = text.replace(/[eE][+-]?\d+$/, '').replace(/[+-]/, '').replace('.', '');
-    return mantissa.replace(/^0+/, '').length;
+/**
+ * Whether a numeric literal survives Excel's 15 significant digits unchanged.
+ * Zeros before the first nonzero digit or after the last one are not
+ * significant, so 1000000000000000 (1E+15) fits and 1234567890123456 does not.
+ */
+export function fits_excel_number_precision(text: string): boolean {
+    const digits = text.replace(/[eE][+-]?\d+$/, '').replace(/[^0-9]/g, '');
+    return digits.replace(/^0+/, '').replace(/0+$/, '').length <= MAX_EXACT_DIGITS;
 }
 
 function boolean_literal(value: string): '1' | '0' | null {
@@ -116,7 +122,7 @@ export function classify_xlsx_cell_value(
     if (NUMBER_RE.test(trimmed)) {
         const n = Number(trimmed);
         const underflowed = n === 0 && /[1-9]/.test(trimmed.replace(/[eE][+-]?\d+$/, ''));
-        if (Number.isFinite(n) && !underflowed && significant_digits(trimmed) <= MAX_EXACT_DIGITS) {
+        if (Number.isFinite(n) && !underflowed && fits_excel_number_precision(trimmed)) {
             return { kind: 'number', text: trimmed };
         }
     }

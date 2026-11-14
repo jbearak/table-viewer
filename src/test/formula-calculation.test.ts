@@ -392,6 +392,29 @@ describe('calculate_workbook_formulas', () => {
         ]);
     });
 
+    it('counts a typed 16-digit integer as the number Save writes', () => {
+        // 1000000000000000 has one significant digit, so Save writes a number
+        // and SUM counts it. 1234567890123456 would lose a digit, so Save keeps
+        // it as text and SUM skips it.
+        const source = workbook([{ name: 'Sheet1', rows: [[
+            cell('', { rawType: 'string' }),
+            cell('', { rawType: 'string' }),
+            cell('0', { formula: '=SUM(A1)' }),
+            cell('0', { formula: '=SUM(B1)' }),
+        ]] }]);
+
+        expect(calculate_workbook_formulas(source, {
+            edits: [
+                { ...target(0, 0, 0), value: '1000000000000000', writesFormula: false },
+                { ...target(0, 0, 1), value: '1234567890123456', writesFormula: false },
+            ],
+            targets: [target(0, 0, 2), target(0, 0, 3)],
+        })).toEqual([
+            { ...target(0, 0, 2), value: '1000000000000000' },
+            { ...target(0, 0, 3), value: '0' },
+        ]);
+    });
+
     it('treats a rich numeric edit as text when the writer will use inlineStr', () => {
         const source = workbook([{ name: 'Sheet1', rows: [[
             cell('12', { rawType: 'number' }),

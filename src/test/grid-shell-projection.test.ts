@@ -136,6 +136,8 @@ const grid_mock = vi.hoisted(() => ({
     source_row_for_display: null as null | ((display_row: number) => number | undefined),
     // Source rows whose cells read as not loaded, though a display row claims them.
     unloaded_source_rows: new Set<number>(),
+    // How many display rows, from 0, auto-fit samples as resident.
+    sampled_row_count: 0,
     ensure_rows: vi.fn(),
     ensure_row_intervals: vi.fn(),
     ensure_rows_loaded: vi.fn(async (_start?: number, _end?: number) => true),
@@ -257,7 +259,13 @@ vi.mock('../webview/use-row-loader', () => ({
             get_compare_status: (row: number) => grid_mock.compare_status[row],
             get_compare_base: (row: number, col: number) =>
                 grid_mock.compare_base[`${row}:${col}`],
-            sample_loaded_rows: () => [],
+            sample_loaded_rows: (max: number) => Array.from(
+                { length: Math.min(max, grid_mock.sampled_row_count) },
+                (_, display_row) => ({
+                    cells: grid_mock.get_row(display_row),
+                    source_row: mock_get_source_row(display_row),
+                }),
+            ),
             get_page_size: () => 100,
             version: grid_mock.loader_version,
         };
@@ -409,6 +417,7 @@ afterEach(() => {
     // row every later test's edits land on.
     grid_mock.source_row_for_display = null;
     additionally_loaded_source_rows.clear();
+    grid_mock.sampled_row_count = 0;
     grid_mock.row_resize_props = null;
     grid_mock.row_resize_set_target.mockReset();
     grid_mock.update_cells.mockReset();
@@ -5228,6 +5237,114 @@ describe('GridShell link-only edits', () => {
             root!.render(React.createElement(GridShell, { ...shown, show_formatting: false }));
         });
         expect(painted(1)).toBe('1.8888888888888888 → 2.11111111111111');
+    });
+
+    it('paints a 16-digit integer result and edit through General, as they read once saved', async () => {
+        // 1000000000000000 has one significant digit, so Excel stores it as a
+        // number and General shows 1E+15; the calculator's 1234567890123460 is
+        // 15 digits and shows 1.23457E+15. A typed 1.50 shows 1.5.
+        const general = (raw: string, formatted: string, formula?: string) => ({
+            raw, formatted, bold: false, italic: false, rawType: 'number' as const,
+            ...(formula === undefined ? {} : { formula }),
+        });
+        grid_mock.get_row.mockImplementation(() => [
+            general('1', '1', '=C1*1'),
+            general('1', '1', '=C1+6'),
+            general('1', '1'),
+        ] as any);
+        const formula_results = new Map([
+            ['0:0', '1000000000000000'],
+            ['0:1', '1234567890123460'],
+        ]);
+        const sheet_meta = { ...props().sheet_meta, columnCount: 3 };
+        const column_projection = {
+            visible_to_source: [0, 1, 2],
+            source_to_visible: [0, 1, 2],
+            hidden_count: 0,
+        };
+        const shown = props({
+            show_formatting: true,
+            editing_session_held: true,
+            csv_editable: true,
+            edit_syntax: 'markdown',
+            sheet_meta,
+            column_projection,
+            formula_results,
+            initial_edits: { '0:2': { value: '1000000000000000', base: '1' } },
+        });
+        const GridShell = await render_grid(shown);
+        const painted = (column: number) => {
+            const content = (grid_mock.props!.getCellContent as (cell: [number, number]) => {
+                displayData?: string;
+                data?: string | { lines: Array<Array<{ text: string }>> };
+            })([column, 0]);
+            return typeof content.data === 'object'
+                ? content.data.lines.flat().map((part) => part.text).join('')
+                : content.displayData;
+        };
+        expect(painted(0)).toBe('1 → 1E+15');
+        expect(painted(1)).toBe('1 → 1.23457E+15');
+        expect(painted(2)).toBe('1E+15');
+
+        await act(async () => {
+            root!.render(React.createElement(GridShell, {
+                ...shown,
+                initial_edits: { '0:2': { value: '1.50', base: '1' } },
+                key: 'retyped',
+            }));
+        });
+        expect(painted(2)).toBe('1.5');
+
+        // Formatting off shows values.
+        await act(async () => {
+            root!.render(React.createElement(GridShell, { ...shown, show_formatting: false }));
+        });
+        expect(painted(0)).toBe('1 → 1000000000000000');
+        expect(painted(2)).toBe('1000000000000000');
+    });
+
+    it('auto-fits a source column by the edits and recalculated results it paints', async () => {
+        const canvas_context = vi.spyOn(HTMLCanvasElement.prototype, 'getContext')
+            .mockReturnValue({
+                font: '',
+                measureText: (text: string) => ({ width: text.length * 7 }),
+            } as unknown as CanvasRenderingContext2D);
+        onTestFinished(() => canvas_context.mockRestore());
+        grid_mock.get_row.mockImplementation(() => [
+            { raw: '1', formatted: '1', bold: false, italic: false, rawType: 'number', formula: '=C1/9' },
+            { raw: '1', formatted: '1', bold: false, italic: false, rawType: 'number' },
+        ] as any);
+        grid_mock.sampled_row_count = 1;
+        const auto_fit_ref: { current: (() => Record<number, number> | null) | null } = { current: null };
+        const sheet_meta = { ...props().sheet_meta, columnCount: 2 };
+        const column_projection = { visible_to_source: [0, 1], source_to_visible: [0, 1], hidden_count: 0 };
+        const shown = props({
+            show_formatting: true,
+            editing_session_held: true,
+            csv_editable: true,
+            edit_syntax: 'markdown',
+            sheet_meta,
+            column_projection,
+            auto_fit_ref,
+            formula_results: new Map([['0:0', '2.11111111111111']]),
+            initial_edits: { '0:1': { value: '0.123456789012345', base: '1' } },
+        });
+        await render_grid(shown);
+        const painted = (column: number) => {
+            const content = (grid_mock.props!.getCellContent as (cell: [number, number]) => {
+                displayData?: string;
+                data?: string | { lines: Array<Array<{ text: string }>> };
+            })([column, 0]);
+            return typeof content.data === 'object'
+                ? content.data.lines.flat().map((part) => part.text).join('')
+                : content.displayData;
+        };
+        // The loaded text is 1; the cells paint 1 → 2.111111111 and 0.123456789.
+        expect(painted(0)).toBe('1 → 2.111111111');
+        expect(painted(1)).toBe('0.123456789');
+        const widths = auto_fit_ref.current!()!;
+        expect(widths[0]).toBe('1 → 2.111111111'.length * 7 + 16);
+        expect(widths[1]).toBe('0.123456789'.length * 7 + 16);
     });
 
     it('does not invalidate formulas for a hyperlink-only edit', async () => {
@@ -10249,6 +10366,56 @@ describe('columns: Insert, Delete, Restore, Move, rename, Pending Column cells, 
         const with_result = pending_auto_fit_ref.current!()['c1']!;
         expect(with_result).toBeGreaterThan(before_result);
         expect(with_result).toBeGreaterThanOrEqual(60 * 7);
+    });
+
+    it('auto-fits a Pending Column by the text its cells paint, not the raw result', async () => {
+        const canvas_context = vi.spyOn(HTMLCanvasElement.prototype, 'getContext')
+            .mockReturnValue({
+                font: '',
+                measureText: (text: string) => ({ width: text.length * 7 }),
+            } as unknown as CanvasRenderingContext2D);
+        onTestFinished(() => canvas_context.mockRestore());
+        // Row 1's A has 0%, which the Pending Column copies; row 0's has none.
+        grid_mock.get_row.mockImplementation((row?: number) => [
+            {
+                raw: '1', formatted: row === 1 ? '100%' : '1', bold: false, italic: false, rawType: 'number',
+                ...(row === 1 ? { numberFormat: { code: '0%' } } : {}),
+            },
+            { raw: 'b', formatted: 'b', bold: false, italic: false },
+            { raw: 'c', formatted: 'c', bold: false, italic: false },
+        ] as any);
+        const pending = with_pending_column(
+            { 's:0': { value: '=19/9' }, 's:1': { value: '=19/9' } },
+            xlsx_basis,
+            { kind: 'source', sourceColumn: 0 },
+        );
+        const sheet_meta = { ...props().sheet_meta, rowCount: 2, sourceRowCount: 2 };
+        const pending_auto_fit_ref: { current: (() => Record<string, number>) | null } = { current: null };
+        const shown = {
+            pending_row_store: pending,
+            edit_syntax: 'markdown' as const,
+            show_formatting: true,
+            structural_support: { ...supported, basis: xlsx_basis },
+            formula_anchor_workbook: webview_formula_workbook(true, [sheet_meta], () => pending.snapshot()),
+            formula_results: new Map([['0:1', '2.11111111111111'], ['1:1', '2.11111111111111']]),
+            pending_auto_fit_ref,
+        };
+        const { rerender } = await render_columns(shown);
+        // Painted 2.111111111 and 211%; the raw result is 2.11111111111111.
+        expect(pending_auto_fit_ref.current!()['c1']).toBe('2.111111111'.length * 7 + 16);
+
+        // A typed number fits as it paints too: 1E+15, not 1000000000000000.
+        await act(async () => {
+            const before = pending.snapshot();
+            const staged = pending.stage_replace('session', before, {
+                ...before,
+                pendingColumns: [{ ...before.pendingColumns![0]!, cells: { 's:0': { value: '1000000000000000' } } }],
+            });
+            staged!.commit();
+            staged!.notify();
+        });
+        await rerender({ ...shown, formula_results: new Map() });
+        expect(pending_auto_fit_ref.current!()['c1']).toBe('1E+15'.length * 7 + 16);
     });
 
     it('goes to a Pending Column cell on a source row that has not loaded, loading it first', async () => {

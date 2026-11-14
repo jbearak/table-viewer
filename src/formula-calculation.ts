@@ -13,6 +13,7 @@ import {
 import { number_format_is_date } from './spreadsheet-format';
 import {
     classify_xlsx_cell_value,
+    fits_excel_number_precision,
     iso_to_serial,
     xlsx_runs_require_inline_string,
 } from './xlsx-cell-value';
@@ -286,11 +287,9 @@ function numeric_text(value: string): number | undefined {
         return undefined;
     }
     const number = Number(trimmed);
-    const mantissa = trimmed.replace(/[eE][+-]?\d+$/, '').replace(/[+-]/, '').replace('.', '');
-    const significant_digits = mantissa.replace(/^0+/, '').length;
     const underflowed = number === 0
         && /[1-9]/.test(trimmed.replace(/[eE][+-]?\d+$/, ''));
-    return Number.isFinite(number) && !underflowed && significant_digits <= 15
+    return Number.isFinite(number) && !underflowed && fits_excel_number_precision(trimmed)
         ? number
         : undefined;
 }

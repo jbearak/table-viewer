@@ -358,6 +358,11 @@ interface DirtyPresentation {
 const dirty_presentation_cache
     = new WeakMap<DirtyEntry, WeakMap<RenderedCell, DirtyPresentation>>();
 
+/** What a loaded number with no number format displays through. */
+const GENERAL_NUMBER_FORMAT: XlsxNumberFormat = Object.freeze({ code: 'General' });
+/** An `.xlsx` cell with no value and no style, for an edit of a cell that has neither. */
+const BLANK_XLSX_CELL: RenderedCell = Object.freeze({ raw: null, formatted: '', bold: false, italic: false });
+
 function dirty_requires_rich_text(
     dirty: DirtyEntry,
     cell: RenderedCell | null | undefined,
@@ -369,9 +374,15 @@ function dirty_requires_rich_text(
     );
 }
 
+/**
+ * An edit as it displays once saved. In an `.xlsx` cell with no number format
+ * a number goes through General, as the saved cell's value does: 1.50 shows
+ * 1.5 and 1000000000000000 shows 1E+15.
+ */
 function cached_dirty_presentation(
     dirty: DirtyEntry,
     cell: RenderedCell,
+    xlsx_editing: boolean,
 ): DirtyPresentation {
     let by_cell = dirty_presentation_cache.get(dirty);
     if (!by_cell) {
@@ -381,8 +392,9 @@ function cached_dirty_presentation(
     const cached = by_cell.get(cell);
     if (cached) return cached;
     const requires_rich = dirty_requires_rich_text(dirty, cell);
-    const display = cell.numberFormat
-        ? format_xlsx_edit_preview(dirty.value, cell.numberFormat, {
+    const number_format = cell.numberFormat ?? (xlsx_editing ? GENERAL_NUMBER_FORMAT : undefined);
+    const display = number_format
+        ? format_xlsx_edit_preview(dirty.value, number_format, {
             was_boolean: cell.rawType === 'boolean',
             was_iso_date: cell.xlsxIsoDate,
             force_text: requires_rich,
@@ -423,9 +435,6 @@ function cached_markdown_edit_text(
     return text;
 }
 
-/** What a loaded number with no number format displays through. */
-const GENERAL_NUMBER_FORMAT: XlsxNumberFormat = Object.freeze({ code: 'General' });
-
 function calculated_formula_display(
     result: string | undefined,
     show_formatting: boolean,
@@ -448,16 +457,19 @@ function calculated_formula_display(
 
 /**
  * A typed Pending Column value as it displays once saved: through the number
- * format the cell will have, as a source cell's edit is. Styled text stays text.
+ * format the cell will have, or General in an `.xlsx` cell with none, as a
+ * source cell's edit is. Styled text stays text.
  */
 function pending_column_value_display(
     cell: PendingRowCell,
     shown: string,
     number_format: XlsxNumberFormat | undefined,
+    xlsx_editing: boolean,
 ): string {
-    return number_format === undefined || cell.valueRuns !== undefined
+    const format = number_format ?? (xlsx_editing ? GENERAL_NUMBER_FORMAT : undefined);
+    return format === undefined || cell.valueRuns !== undefined
         ? shown
-        : format_xlsx_edit_preview(cell.value, number_format);
+        : format_xlsx_edit_preview(cell.value, format);
 }
 
 /**
@@ -488,9 +500,10 @@ function dirty_value_overlay_fields(
     const formula_edit = xlsx_editing
         && xlsx_edit_writes_formula(dirty.value, retained_runs);
     const formula_result_pending = formula_edit && calculated_formula_result === undefined;
-    const presentation = !formula_edit && show_formatting && !diff_mode && cell
-        && (cell.numberFormat || (xlsx_editing && dirty.valueRuns))
-        ? cached_dirty_presentation(dirty, cell)
+    const presentation_cell = cell ?? (xlsx_editing ? BLANK_XLSX_CELL : undefined);
+    const presentation = !formula_edit && show_formatting && !diff_mode && presentation_cell
+        && (presentation_cell.numberFormat || xlsx_editing)
+        ? cached_dirty_presentation(dirty, presentation_cell, xlsx_editing)
         : undefined;
     const requires_rich = !formula_edit
         && show_formatting && !diff_mode && xlsx_editing && dirty.valueRuns
@@ -541,10 +554,11 @@ function pending_rendered_cell(
         : undefined;
     return {
         raw: formula === undefined ? raw : '',
+        // A number with no number format displays through General once saved.
         formatted: formula === undefined
-            ? number_format === undefined
+            ? format.kind !== 'xlsx' || (number_format === undefined && cell?.valueRuns !== undefined)
                 ? raw
-                : format_xlsx_edit_preview(raw, number_format)
+                : format_xlsx_edit_preview(raw, number_format ?? GENERAL_NUMBER_FORMAT)
             : UNKNOWN_XLSX_FORMULA_RESULT,
         ...(formula === undefined ? {} : { formula, formulaResultPending: true as const }),
         ...(cell?.valueRuns === undefined ? {} : { richText: cell.valueRuns }),
@@ -2980,16 +2994,18 @@ export function GridShell({
      * default column, or a row with no styled cell there, has none.
      */
     const pending_column_number_format = useCallback(
-        (column: PendingColumn, display_row: number): XlsxNumberFormat | undefined => {
+        (column: PendingColumn, row_key: string): XlsxNumberFormat | undefined => {
             if (column.format.kind !== 'source') return undefined;
             const { sourceColumn } = column.format;
-            const projected = pending_projection.row_at(display_row);
-            if (projected?.kind === 'source') return get_row(projected.sourceDisplayRow)?.[sourceColumn]?.numberFormat;
-            if (projected?.kind !== 'pending' && projected?.kind !== 'replacement') return undefined;
-            const format = pending_template_formats.get(projected.row.formatTemplateId);
+            // `s:<row>` and `f:<row>` name a source row, `p:<id>` a Pending Row.
+            if (row_key.startsWith('s:') || row_key.startsWith('f:')) {
+                return get_cell_for_source_ref.current(Number(row_key.slice(2)), sourceColumn)?.numberFormat;
+            }
+            const row = row_key.startsWith('p:') ? live_pending_row_by_id(row_key.slice(2)) : undefined;
+            const format = row === undefined ? undefined : pending_template_formats.get(row.formatTemplateId);
             return format?.kind === 'xlsx' ? format.cellNumberFormats?.[sourceColumn] ?? undefined : undefined;
         },
-        [get_row, pending_projection, pending_template_formats],
+        [live_pending_row_by_id, pending_template_formats],
     );
     /** The Pending Column cell at a display cell: its column and live row key. */
     const pending_column_overlay_target = useCallback(
@@ -4085,27 +4101,25 @@ export function GridShell({
     }, []);
     const find_in_flight_ref = useRef<Promise<unknown>>(Promise.resolve());
     /**
-     * The text a Pending Column cell paints: a formula's calculated result
-     * once known (its rendered text until then), or the value.
+     * The text a Pending Column cell paints, by its row key: a formula's
+     * calculated result once known (its rendered text until then), or the
+     * value, each through the number format the cell has once saved. Find and
+     * auto-fit both read it, so neither can disagree with the paint.
      */
-    const pending_column_painted_text = useCallback((display_column: number, row: number): string => {
-        const identity = projected_columns[display_column]?.identity;
-        if (identity?.kind !== 'pending') return '';
-        const column = pending_columns_by_id.get(identity.pendingColumnId);
-        const target = pending_column_row_target(row);
-        const cell = target === undefined ? undefined : column?.cells[target.key];
-        if (column === undefined || cell === undefined || target === undefined) return '';
+    const pending_column_cell_painted_text = useCallback((column: PendingColumn, row_key: string): string => {
+        const cell = column.cells[row_key];
+        if (cell === undefined) return '';
         const text = pending_column_cell_text(cell);
-        const number_format = show_formatting ? pending_column_number_format(column, row) : undefined;
+        const number_format = show_formatting ? pending_column_number_format(column, row_key) : undefined;
         if (edit_syntax !== 'markdown' || !xlsx_edit_writes_formula(cell.value, cell.valueRuns?.runs)) {
-            return pending_column_value_display(cell, text, number_format);
+            return pending_column_value_display(cell, text, number_format, show_formatting && edit_syntax === 'markdown');
         }
         const display = formula_display_for(cell.value, cell.formulaAnchors, cell.valueEditOrder ?? 0);
         if (display.kind === 'unrenderable') return display.result;
         const key = pending_column_result_key(
             formula_anchor_workbook?.worksheets[sheet_index],
-            identity.pendingColumnId,
-            target.key,
+            column.id,
+            row_key,
         );
         return calculated_formula_display(
             key === undefined ? undefined : formula_results_ref.current?.get(key),
@@ -4118,11 +4132,21 @@ export function GridShell({
         formula_display_for,
         pending_column_cell_text,
         pending_column_number_format,
+        sheet_index,
+        show_formatting,
+    ]);
+    /** The text a Pending Column cell paints, by its display position. */
+    const pending_column_painted_text = useCallback((display_column: number, row: number): string => {
+        const identity = projected_columns[display_column]?.identity;
+        if (identity?.kind !== 'pending') return '';
+        const column = pending_columns_by_id.get(identity.pendingColumnId);
+        const target = pending_column_row_target(row);
+        return column === undefined || target === undefined ? '' : pending_column_cell_painted_text(column, target.key);
+    }, [
+        pending_column_cell_painted_text,
         pending_column_row_target,
         pending_columns_by_id,
         projected_columns,
-        sheet_index,
-        show_formatting,
     ]);
     /** The text a cell paints, from the same inputs `get_cell_content` uses. */
     const find_text_at = useCallback((position: FindPosition): string => {
@@ -7993,13 +8017,28 @@ export function GridShell({
         const fit_columns = visible_source_columns.filter(
             (column): column is number => column !== undefined,
         );
-        const cells = sample.map((row) => {
+        const has_edits = store.size() > 0;
+        const cells = sample.map(({ cells: row, source_row }) => {
             const visible_cells: Partial<Record<number, MeasurableCell | null>> = {};
             for (const source_column of fit_columns) {
-                visible_cells[source_column] = measurable_from_rendered(
-                    row[source_column] ?? null,
-                    show_formatting,
-                );
+                const loaded = row[source_column] ?? null;
+                const measurable = measurable_from_rendered(loaded, show_formatting);
+                visible_cells[source_column] = measurable;
+                // Only an edit or a formula paints other than the loaded text.
+                if (source_row === undefined || (loaded?.formula === undefined && !has_edits)) continue;
+                const key = cell_key(source_row, source_column);
+                const dirty = has_edits ? store.get(key) : undefined;
+                if (loaded?.formula === undefined && dirty === undefined) continue;
+                const overlay = value_overlay_for_cell(source_row, source_column, key, loaded, dirty);
+                if (overlay === undefined) continue;
+                // What the cell paints: an edit through its number format, or
+                // a recalculated result after the value it replaces.
+                visible_cells[source_column] = {
+                    text: displayed_text(loaded, show_formatting, { editable: false, ...overlay }),
+                    bold: measurable?.bold ?? false,
+                    italic: measurable?.italic ?? false,
+                    ...(show_formatting && overlay.dirty_rich !== undefined ? { runs: overlay.dirty_rich.runs } : {}),
+                };
             }
             return visible_cells;
         });
@@ -8018,13 +8057,15 @@ export function GridShell({
         show_formatting,
         font_family,
         font_size_px,
+        store,
+        value_overlay_for_cell,
         visible_source_columns,
     ]);
 
     /**
      * Fitted widths for the visible Pending Columns. A Pending Column's cells
      * are all in the Pending Changes, not on loaded pages, so every stored
-     * cell is measured, as the grid shows it.
+     * cell is measured, as the grid paints it.
      */
     const compute_pending_auto_fit = useCallback((): Record<string, number> => {
         const widths: Record<string, number> = {};
@@ -8041,28 +8082,17 @@ export function GridShell({
             if (projected.identity.kind !== 'pending') continue;
             const column = pending_columns_by_id.get(projected.identity.pendingColumnId);
             if (column === undefined) continue;
-            const worksheet = formula_anchor_workbook?.worksheets[sheet_index];
             const cells: MeasurableCell[] = Object.entries(column.cells).map(([row_key, cell]) => {
-                // A formula shows its calculated result (or, unrenderable, its
-                // error), as `pending_column_cell_content` draws it; its text
-                // until a result arrives.
-                const is_formula = edit_syntax === 'markdown'
-                    && xlsx_edit_writes_formula(cell.value, cell.valueRuns?.runs);
-                if (is_formula) {
-                    const formula = formula_display_for(cell.value, cell.formulaAnchors, cell.valueEditOrder ?? 0);
-                    const result_key = pending_column_result_key(worksheet, column.id, row_key);
-                    const result = formula?.kind === 'unrenderable'
-                        ? formula.result
-                        : result_key === undefined ? undefined : formula_results_ref.current?.get(result_key);
-                    return { text: result ?? pending_column_cell_text(cell), bold: false, italic: false };
-                }
+                const runs = show_formatting
+                    && !(edit_syntax === 'markdown' && xlsx_edit_writes_formula(cell.value, cell.valueRuns?.runs))
+                    && cell.valueRuns?.runs !== undefined && cell.valueRuns.runs.length > 0
+                    ? cell.valueRuns.runs
+                    : undefined;
                 return {
-                    text: pending_column_cell_text(cell),
+                    text: pending_column_cell_painted_text(column, row_key),
                     bold: false,
                     italic: false,
-                    ...(show_formatting && cell.valueRuns?.runs !== undefined && cell.valueRuns.runs.length > 0
-                        ? { runs: cell.valueRuns.runs }
-                        : {}),
+                    ...(runs === undefined ? {} : { runs }),
                 };
             });
             widths[column.id] = fit_column_width(cells, measure);
@@ -8072,10 +8102,7 @@ export function GridShell({
         edit_syntax,
         font_family,
         font_size_px,
-        formula_anchor_workbook,
-        formula_display_for,
-        sheet_index,
-        pending_column_cell_text,
+        pending_column_cell_painted_text,
         pending_columns_by_id,
         projected_columns,
         show_formatting,
@@ -8145,7 +8172,7 @@ export function GridShell({
                 );
             // Both a result and a typed value show through the number format
             // the cell has once saved, as a source cell's do.
-            const number_format = pending_column_number_format(column, row);
+            const number_format = target === undefined ? undefined : pending_column_number_format(column, target.key);
             const formula_result = !is_formula
                 ? undefined
                 : unrenderable?.result ?? calculated_formula_display(
@@ -8172,7 +8199,7 @@ export function GridShell({
             const runs = !is_formula && edit_syntax === 'markdown' ? value_cell?.valueRuns : undefined;
             const formatted = value_cell === undefined || is_formula
                 ? shown
-                : pending_column_value_display(value_cell, shown, number_format);
+                : pending_column_value_display(value_cell, shown, number_format, edit_syntax === 'markdown');
             return build_grid_cell(
                 0,
                 [{

@@ -623,6 +623,67 @@ test('a number in a Pending Column shows the format and digits it has after Save
     expect(second[3]?.formatted).toBe('13%');
 });
 
+test('a 16-digit integer shows as General shows it, and auto-fit measures what cells show', async () => {
+    // A holds plain numbers and B text, neither with a number format.
+    const book = Buffer.from(build_fixture_xlsx({
+        sheets: [{
+            name: 'Data',
+            body: `<sheetData>${[
+                row(1, [cell('A1', 1), cell('B1', 'x')]),
+                row(2, [cell('A2', 12), cell('B2', 'y')]),
+            ].join('')}</sheetData>`,
+        }],
+    }));
+    const { file, page } = await open_file('large-integers.xlsx', book);
+    await wait_for_grid(page);
+    await choose(await open_column_menu(page, 0), 'Insert column right');
+    await expect.poll(async () => (await grid_headers(page)).length).toBe(3);
+    // 1E+15 and 12 * 102880657510288 = 1234567890123456, 1.23457E+15 to 15 digits.
+    await type_into_cell(page, 2, 0, '=A1*1000000000000000');
+    await type_into_cell(page, 2, 1, '=A2*102880657510288');
+    // 2e15 is a number; 1234567890123456 would lose its last digit, so it stays text.
+    await type_into_cell(page, 3, 0, '2e15');
+    await type_into_cell(page, 3, 1, '1234567890123456');
+
+    const find_input = page.locator('input[aria-label="Find"]');
+    // Find searches once per query, and a Pending Column's results are briefly
+    // pending again after its width changes, so search again until it matches.
+    const painted = async (text: string, column: number, row: number) => {
+        if (await find_input.count() === 0) await page.keyboard.press('ControlOrMeta+F');
+        await expect(async () => {
+            await find_input.fill('');
+            await find_input.fill(text);
+            await expect(page.locator(`#glide-cell-${column}-${row}`))
+                .toHaveAttribute('aria-selected', 'true', { timeout: 2_000 });
+        }).toPass({ timeout: 30_000 });
+    };
+    const not_painted = async (text: string) => {
+        await find_input.fill(text);
+        await expect(page.locator('.find-bar-status')).toHaveText('No matches');
+    };
+    // The painted checks come first, so the absent ones run on settled results.
+    const expect_painted = async () => {
+        await painted('1E+15', 2, 0);
+        await painted('1.23457E+15', 2, 1);
+        await painted('2E+15', 3, 0);
+        await painted('1234567890123456', 3, 1);
+        await not_painted('1000000000000000');
+        await not_painted('1234567890123460');
+    };
+    await expect_painted();
+    // Fitted to 1.23457E+15 and 1234567890123456, as painted; see the screenshots.
+    await page.getByRole('button', { name: 'Auto-fit Columns' }).click();
+    await expect_painted();
+    await save_screenshot(page, '17-xlsx-large-integers-fitted-before-save');
+
+    await save_changes(page);
+    await expect_painted();
+    await save_screenshot(page, '18-xlsx-large-integers-after-save');
+    const [first, second] = (await parse_xlsx(new Uint8Array(fs.readFileSync(file)))).data.sheets[0].rows;
+    expect([first[2]?.raw, first[2]?.formatted]).toEqual([2e15, '2E+15']);
+    expect(second[2]?.raw).toBe('1234567890123456');
+});
+
 test('an external change conflicts, and both salvage actions resolve it', async () => {
     const { file, page } = await open_file(
         'fruit.csv',
