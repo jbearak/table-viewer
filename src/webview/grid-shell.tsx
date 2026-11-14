@@ -9591,6 +9591,11 @@ export function GridShell({
         unrenderable_formula_for_cell,
     ]);
 
+    // The edits held for a session are opened by a callback made before it
+    // was granted, when on_cell_activated still refused every cell.
+    const on_cell_activated_ref = useRef(on_cell_activated);
+    on_cell_activated_ref.current = on_cell_activated;
+
     const provide_editor = useCallback<ProvideEditorCallback<GridCell>>(
         (cell) => {
             if (
@@ -9624,7 +9629,7 @@ export function GridShell({
             // Set before asking: openOverlay mounts the editor before it
             // returns, and the mount is what clears this.
             // Space and Enter on the grid activate the cell as they open it.
-            if (index > 0 && edit.initial === undefined) on_cell_activated(at);
+            if (index > 0 && edit.initial === undefined) on_cell_activated_ref.current(at);
             overlay_opening_ref.current = true;
             opening_editor_keys_ref.current = edit.keys;
             let opened = false;
@@ -9659,7 +9664,7 @@ export function GridShell({
             at = [next[0], next[1]];
         }
         return true;
-    }, [on_cell_activated]);
+    }, []);
 
     /**
      * Glide asks before it opens an editor. Under a session it simply opens.

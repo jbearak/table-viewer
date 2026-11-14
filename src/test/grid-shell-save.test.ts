@@ -13,6 +13,8 @@ import type {
 } from '../types';
 import { decode_stored_per_file_state } from '../types';
 import { CompactSelection } from '../webview/glide-data-grid';
+import { webview_formula_workbook } from '../webview/formula-anchor-model';
+import { EMPTY_PENDING_STRUCTURAL_CHANGES } from '../pending-changes';
 import type { EditingHandle, GridFocusHandle } from '../webview/grid-shell';
 import {
     create_edit_session_store,
@@ -92,6 +94,7 @@ vi.mock('../webview/glide-data-grid', () => {
             empty: () => empty_selection,
             fromSingleSelection: () => empty_selection,
         },
+        direction: () => 'ltr',
         DataEditor: React.forwardRef((props: unknown, ref: React.ForwardedRef<unknown>) => {
             grid_mock.props = props as typeof grid_mock.props;
             React.useImperativeHandle(ref, () => ({
@@ -266,6 +269,7 @@ async function render_grid(
         on_edit_session_idle?: () => void;
         row_heights?: Record<number, number>;
         grid_focus_ref?: React.MutableRefObject<GridFocusHandle | null>;
+        formula_anchor_workbook?: ReturnType<typeof webview_formula_workbook>;
     } = {},
 ) {
     vi.resetModules();
@@ -2094,6 +2098,56 @@ describe('GridShell editing with no session held yet', () => {
         expect(overlay.finished).toEqual(['a', '<middle']);
         expect(selected_cell()).toEqual([2, 0]);
         expect(overlay.input()!.value).toBe('c');
+        await overlay.unmount();
+    });
+
+    it('refuses a formula it cannot edit when a Space after a held Tab opens it, as the grid does', async () => {
+        // A formula that cannot be rendered while a row is being inserted, in
+        // the cell the Tab moves to.
+        const formula_anchor_workbook = webview_formula_workbook(true, [{
+            name: 'Sheet1',
+            sourceRowCount: 1,
+            columnCount: 3,
+        }], () => ({
+            ...EMPTY_PENDING_STRUCTURAL_CHANGES,
+            appendedRows: [{ id: 'i1', origin: 'insert', cells: {}, formatTemplateId: 't', createdOrder: 1 }],
+            rowLayout: {
+                runs: [{ kind: 'pending', ids: ['i1'] }, { kind: 'source', start: 0, count: 1 }],
+                removedSourceRows: [],
+                discardedPendingRows: [],
+            },
+        }));
+        const unrenderable = {
+            edit_syntax: 'markdown' as const,
+            formula_anchor_workbook,
+            initial_edits: { '0:1': { value: '=SUM(INDEX(A:A,MATCH("x",A:A,0)):B5)+C3', base: '' } },
+        };
+        const refusal = {
+            type: 'showWarning',
+            message: expect.stringMatching(/can't be edited/),
+        };
+        // Under a session, Space on that cell activates it, and the grid refuses.
+        const open = await render_grid(three_columns, unrenderable);
+        await act(async () => { (grid_mock.props as any).onCellActivated([1, 0]); });
+        expect(open.post_message).toHaveBeenCalledWith(refusal);
+        await act(async () => root!.unmount());
+        container?.remove();
+
+        const { request, grant } = session_request();
+        const overlay = open_editors_as_glide_does();
+        const { rerender, post_message } = await render_grid(three_columns, {
+            ...no_session,
+            ...unrenderable,
+            on_request_edit_session: request,
+        });
+        await select_cell([0, 0]);
+
+        grid_mock.props!.onOverlayOpenRequest!([0, 0], 'x');
+        grid_key('Tab');
+        grid_key(' ');
+
+        await grant_session(grant, rerender);
+        expect(post_message).toHaveBeenCalledWith(refusal);
         await overlay.unmount();
     });
 
