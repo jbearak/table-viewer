@@ -4161,43 +4161,74 @@ export function GridShell({
         pending_columns_by_id,
         projected_columns,
     ]);
+    /**
+     * A formula in a Pending Row cell, or a tail removal's, as painted: its
+     * text for the current layouts and its calculated result once known (an
+     * unrenderable formula's error). Undefined for a cell with no formula.
+     */
+    const pending_row_formula = useCallback((
+        rendered_cell: RenderedCell | null | undefined,
+        pending_cell: PendingRowCell | undefined,
+        prospective_row: number,
+        source_column: number,
+    ): { readonly display: FormulaDisplay; readonly result: string | undefined } | undefined => {
+        if (rendered_cell?.formula === undefined) return undefined;
+        const display = formula_display_for(
+            rendered_cell.formula,
+            pending_cell?.formulaAnchors,
+            pending_cell?.valueEditOrder ?? 0,
+        );
+        if (display.kind === 'unrenderable') return { display, result: display.result };
+        const key = pending_formula_result_key_for(prospective_row, source_column);
+        return {
+            display,
+            result: calculated_formula_display(
+                key === undefined ? undefined : formula_results_ref.current?.get(key),
+                show_formatting,
+                rendered_cell,
+            ),
+        };
+    }, [formula_display_for, pending_formula_result_key_for, show_formatting]);
+    /**
+     * The text a Pending Row cell, or a tail removal's, paints. Find and
+     * auto-fit both read it, so neither can disagree with the paint.
+     */
+    const pending_row_painted_text = useCallback((
+        rendered_cell: RenderedCell | null | undefined,
+        pending_cell: PendingRowCell | undefined,
+        prospective_row: number,
+        source_column: number,
+    ): string => {
+        const formula = pending_row_formula(rendered_cell, pending_cell, prospective_row, source_column);
+        return displayed_text(
+            rendered_cell,
+            show_formatting,
+            formula === undefined
+                ? undefined
+                : formula.result === undefined
+                    ? { editable: false, formula_result_pending: true }
+                    : { editable: false, formula_result: formula.result },
+        );
+    }, [pending_row_formula, show_formatting]);
     /** The text a cell paints, from the same inputs `get_cell_content` uses. */
     const find_text_at = useCallback((position: FindPosition): string => {
         const source_column = visible_source_columns[position.column];
         if (source_column === undefined) return pending_column_painted_text(position.column, position.row);
         const projected_row = pending_projection_ref.current.row_at(position.row);
         if (projected_row !== undefined && projected_row.kind !== 'source') {
-            const rendered_cell = projected_row.kind === 'removal'
-                ? removal_rendered_rows.get(projected_row.removal.sourceRow)?.[source_column]
-                : pending_rendered_rows.get(projected_row.row.id)?.[source_column];
-            const pending_cell = projected_row.kind === 'removal'
-                ? undefined
-                : projected_row.row.cells[source_column];
-            const unrenderable = rendered_cell?.formula === undefined
-                ? undefined
-                : formula_display_for(rendered_cell.formula, pending_cell?.formulaAnchors);
-            const result_key = pending_formula_result_key_for(
-                projected_row.intendedPhysicalRow,
-                source_column,
-            );
-            const formula_result = rendered_cell?.formula === undefined
-                ? undefined
-                : unrenderable?.kind === 'unrenderable'
-                    ? unrenderable.result
-                    : calculated_formula_display(
-                        result_key === undefined ? undefined : formula_results_ref.current?.get(result_key),
-                        show_formatting,
-                        rendered_cell,
-                    );
-            return displayed_text(
-                rendered_cell,
-                show_formatting,
-                rendered_cell?.formula === undefined
-                    ? undefined
-                    : formula_result === undefined
-                        ? { editable: false, formula_result_pending: true }
-                        : { editable: false, formula_result },
-            );
+            return projected_row.kind === 'removal'
+                ? pending_row_painted_text(
+                    removal_rendered_rows.get(projected_row.removal.sourceRow)?.[source_column],
+                    undefined,
+                    projected_row.intendedPhysicalRow,
+                    source_column,
+                )
+                : pending_row_painted_text(
+                    pending_rendered_rows.get(projected_row.row.id)?.[source_column],
+                    projected_row.row.cells[source_column],
+                    projected_row.intendedPhysicalRow,
+                    source_column,
+                );
         }
         const source_display_row = projected_row?.kind === 'source'
             ? projected_row.sourceDisplayRow
@@ -4221,12 +4252,11 @@ export function GridShell({
             overlay === undefined ? undefined : { editable: false, ...overlay },
         );
     }, [
-        formula_display_for,
         get_row,
         get_source_row,
         pending_column_painted_text,
-        pending_formula_result_key_for,
         pending_rendered_rows,
+        pending_row_painted_text,
         removal_rendered_rows,
         show_formatting,
         store,
@@ -7981,7 +8011,9 @@ export function GridShell({
         const ctx = measure_ctx_ref.current;
         if (!ctx) return null;
         const sample = sample_loaded_rows_ref.current(AUTO_FIT_SAMPLE_ROWS);
-        if (sample.length === 0) return null;
+        // Pending Rows, inserted and appended, are never on a loaded page.
+        const pending_display_rows = [...pending_display_row_by_physical.values()];
+        if (sample.length === 0 && pending_display_rows.length === 0) return null;
         // Widths are keyed by source column; a Pending Column keeps its own.
         const fit_columns = visible_source_columns.filter(
             (column): column is number => column !== undefined,
@@ -8011,6 +8043,33 @@ export function GridShell({
             }
             return visible_cells;
         });
+        // Their cells are in the Pending Changes, so each is measured as it
+        // paints. A sheet with more Pending Rows than the loaded-row cap
+        // measures every k-th, so neither band is skipped wholesale.
+        const stride = Math.ceil(pending_display_rows.length / AUTO_FIT_SAMPLE_ROWS);
+        for (let index = 0; index < pending_display_rows.length; index += stride) {
+            const projected = pending_projection.row_at(pending_display_rows[index]);
+            if (projected?.kind !== 'pending' && projected?.kind !== 'replacement') continue;
+            const rendered = pending_rendered_rows.get(projected.row.id);
+            if (rendered === undefined) continue;
+            const visible_cells: Partial<Record<number, MeasurableCell | null>> = {};
+            for (const source_column of fit_columns) {
+                const rendered_cell = rendered[source_column];
+                if (rendered_cell === undefined || rendered_cell === null) continue;
+                const { runs, ...plain } = measurable_from_rendered(rendered_cell, show_formatting)!;
+                const text = pending_row_painted_text(
+                    rendered_cell,
+                    projected.row.cells[source_column],
+                    projected.intendedPhysicalRow,
+                    source_column,
+                );
+                // A formula paints its result in the cell's font, without runs.
+                visible_cells[source_column] = rendered_cell.formula === undefined && runs !== undefined
+                    ? { ...plain, text, runs }
+                    : { ...plain, text };
+            }
+            cells.push(visible_cells);
+        }
         const measure = (cell: MeasurableCell): number => {
             ctx.font = canvas_font(
                 cell.bold,
@@ -8026,6 +8085,10 @@ export function GridShell({
         show_formatting,
         font_family,
         font_size_px,
+        pending_display_row_by_physical,
+        pending_projection,
+        pending_rendered_rows,
+        pending_row_painted_text,
         store,
         value_overlay_for_cell,
         visible_source_columns,
@@ -8255,30 +8318,17 @@ export function GridShell({
                     || projected_row.kind === 'replacement'
                     ? projected_row.row.cells[source_column]
                     : undefined;
-                const pending_formula_display = rendered_cell?.formula === undefined
-                    ? undefined
-                    : formula_display_for(
-                        rendered_cell.formula,
-                        pending_value_cell?.formulaAnchors,
-                        pending_value_cell?.valueEditOrder ?? 0,
-                    );
-                const pending_formula = pending_formula_display?.text;
-                const pending_unrenderable = pending_formula_display?.kind === 'unrenderable'
-                    ? pending_formula_display
-                    : undefined;
-                const pending_result_key = pending_formula_result_key_for(
+                const pending_formula_cell = pending_row_formula(
+                    rendered_cell,
+                    pending_value_cell,
                     projected_row.intendedPhysicalRow,
                     source_column,
                 );
-                const pending_formula_result = rendered_cell?.formula === undefined
-                    ? undefined
-                    : pending_unrenderable?.result ?? calculated_formula_display(
-                        pending_result_key === undefined
-                            ? undefined
-                            : formula_results_ref.current?.get(pending_result_key),
-                        show_formatting,
-                        rendered_cell,
-                    );
+                const pending_formula = pending_formula_cell?.display.text;
+                const pending_unrenderable = pending_formula_cell?.display.kind === 'unrenderable'
+                    ? pending_formula_cell.display
+                    : undefined;
+                const pending_formula_result = pending_formula_cell?.result;
                 // A formula that cannot render for the current layouts cannot be edited.
                 const pending_editable = editable && pending_unrenderable === undefined;
                 const overlay: CellEditOverlay = {
@@ -8601,9 +8651,8 @@ export function GridShell({
             value_overlay_for_cell,
             clipboard_source,
             mapping_generation,
-            formula_display_for,
             formula_text_for,
-            pending_formula_result_key_for,
+            pending_row_formula,
             unrenderable_formula_for_cell,
             sheet_index,
             projected_columns,

@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { create_edit_session_registry } from '../webview/edit-session-registry';
+import { EMPTY_PENDING_STRUCTURAL_CHANGES, type PendingStructuralChanges } from '../pending-changes';
+import { with_pending_column_widths } from '../webview/column-structure-model';
 
 // Stands in for App's session id ref: one mutable authoritative value the
 // registry reads through the injected getter, exactly as production does.
@@ -415,6 +417,57 @@ describe('edit session registry', () => {
             value: '=A1',
             writesFormula: true,
         }]);
+    });
+
+    it('keeps formula results current when only a Pending Column width changes, and through the refresh after it', () => {
+        const { registry } = make_session_ref('session');
+        const pending = registry.pending_rows_for_sheet(0);
+        expect(pending.install({ session_id: 'session' }, {
+            ...EMPTY_PENDING_STRUCTURAL_CHANGES,
+            columnLayout: {
+                columns: [{ kind: 'source', sourceColumn: 0 }, { kind: 'pending', pendingColumnId: 'c1' }],
+                removedSourceColumns: [],
+                discardedPendingColumns: [],
+            },
+            pendingColumns: [{
+                id: 'c1', header: 'New', cells: { 's:0': { value: '=A1/9' } }, format: { kind: 'default' }, createdOrder: 1,
+            }],
+        })).toBe(true);
+        const replace = (next: (before: PendingStructuralChanges) => PendingStructuralChanges) => {
+            const before = pending.snapshot();
+            const staged = pending.stage_replace('session', before, next(before))!;
+            staged.commit();
+            staged.notify();
+        };
+        const first = registry.formula_projection();
+        const revision = registry.revision();
+
+        // An auto-fit or a drag stores the width; the results are still current.
+        replace((before) => with_pending_column_widths(before, { c1: 180 })!);
+        expect(registry.revision()).toBeGreaterThan(revision);
+        expect(registry.formula_projection().structuralRevision).toBe(first.structuralRevision);
+
+        // The refresh the host sends after it stores the width leaves every
+        // worksheet's Pending Changes where they were.
+        const sheets = [{ name: 'Data', worksheetId: '1' }, { name: 'Other', worksheetId: '2' }];
+        registry.pending_rows_for_sheet(1);
+        registry.reconcile_sheets(sheets, sheets, () => true);
+        expect(registry.formula_projection().structuralRevision).toBe(first.structuralRevision);
+        // A reorder moves them, and their formulas' addresses with them.
+        registry.reconcile_sheets(sheets, [...sheets].reverse(), () => true);
+        expect(registry.pending_rows_for_sheet(1)).toBe(pending);
+        const reordered = registry.formula_projection().structuralRevision;
+        expect(reordered).toBeGreaterThan(first.structuralRevision);
+
+        // A width and a cell together are a change a formula can read.
+        replace((before) => {
+            const resized = with_pending_column_widths(before, { c1: 90 })!;
+            return {
+                ...resized,
+                pendingColumns: [{ ...resized.pendingColumns![0]!, cells: { 's:0': { value: '=A1/3' } } }],
+            };
+        });
+        expect(registry.formula_projection().structuralRevision).toBeGreaterThan(reordered);
     });
 
     it('reindexes cached pending formula inputs after a structural removal', () => {

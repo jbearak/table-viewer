@@ -734,8 +734,8 @@ test('a 16-digit integer shows as General shows it, and auto-fit measures what c
     await type_into_cell(page, 3, 1, '1234567890123456');
 
     const find_input = page.locator('input[aria-label="Find"]');
-    // Find searches once per query, and a Pending Column's results are briefly
-    // pending again after its width changes, so search again until it matches.
+    // Find searches once per query, and a result arrives some time after the
+    // edit that asks for it, so search again until it matches.
     const painted = async (text: string, column: number, row: number) => {
         if (await find_input.count() === 0) await page.keyboard.press('ControlOrMeta+F');
         await expect(async () => {
@@ -770,6 +770,78 @@ test('a 16-digit integer shows as General shows it, and auto-fit measures what c
     const [first, second] = (await parse_xlsx(new Uint8Array(fs.readFileSync(file)))).data.sheets[0].rows;
     expect([first[2]?.raw, first[2]?.formatted]).toEqual([2e15, '2E+15']);
     expect(second[2]?.raw).toBe('1234567890123456');
+});
+
+test('auto-fit makes room for a long value in an inserted row and an appended row, before and after Save', async () => {
+    const { file, page } = await open_file(
+        'fruit.csv',
+        'name,qty,note,x,y,z\napple,1,a,1,1,1\nbanana,2,b,2,2,2\n',
+    );
+    await wait_for_grid(page);
+    const auto_fit = page.getByRole('button', { name: 'Auto-fit Columns' });
+    /** Fit again: the button restores the widths while a fit is on. */
+    const fit = async () => {
+        if (await auto_fit.getAttribute('aria-pressed') === 'true') {
+            await auto_fit.click();
+            await expect(auto_fit).toHaveAttribute('aria-pressed', 'false');
+        }
+        await auto_fit.click();
+        await expect(auto_fit).toHaveAttribute('aria-pressed', 'true');
+    };
+    /**
+     * Whether column A (name) is at least `width` px wide: a click that far
+     * into apple's row lands in its name cell. A click on banana's name first
+     * moves the selection off it, so a click past the grid's last column
+     * can't leave it there. While Save remounts the grid there is no canvas
+     * to click, which reads as "not yet" so the caller's poll tries again.
+     */
+    const name_reaches = async (width: number, banana_row: number): Promise<boolean> => {
+        const apple = await cell_point(page, 0, 0).catch(() => undefined);
+        const banana = await cell_point(page, 0, banana_row).catch(() => undefined);
+        if (apple === undefined || banana === undefined) return false;
+        await page.mouse.click(banana.x - 50, banana.y);
+        const moved_off = await expect(page.locator(`#glide-cell-1-${banana_row}`))
+            .toHaveAttribute('aria-selected', 'true', { timeout: 2_000 }).then(() => true, () => false);
+        if (!moved_off) return false;
+        await page.mouse.click(apple.x - 60 + width, apple.y);
+        return expect.poll(() => page.locator('#glide-cell-1-0').getAttribute('aria-selected'), { timeout: 2_000 })
+            .toBe('true').then(() => true, () => false);
+    };
+
+    // The probe's click leaves a tooltip under the pointer; move it aside first.
+    const screenshot = async (name: string) => {
+        await page.mouse.move(1, 1);
+        await save_screenshot(page, name);
+    };
+
+    // About 300 px of text in an inserted row, under banana's 6 characters.
+    await choose(await open_row_menu(page, 1), 'Insert row above');
+    await expect.poll(async () => (await grid_rows(page))[1]).toBe('Row 2, inserted||||||');
+    const inserted = 'a long value typed into an inserted row, not cut off';
+    await type_into_cell(page, 1, 1, inserted);
+    await fit();
+    await expect.poll(() => name_reaches(220, 2), { timeout: 15_000 }).toBe(true);
+    await screenshot('19-inserted-row-fitted');
+
+    // About 550 px in an appended row, wider than the inserted row's value.
+    await page.getByRole('button', { name: 'Add rows' }).click();
+    await page.getByRole('button', { name: 'Add row', exact: true }).click();
+    await expect.poll(() => grid_rows(page)).toHaveLength(4);
+    const appended = 'a much longer value typed into an appended row, which auto-fit has to make room for too';
+    await type_into_cell(page, 1, 3, appended);
+    await fit();
+    await expect.poll(() => name_reaches(420, 2), { timeout: 15_000 }).toBe(true);
+    await screenshot('20-appended-row-fitted');
+
+    // Saved, the rows are source rows: the fit made before Save still holds,
+    // and fitting again makes room for both.
+    await save_changes(page);
+    await expect.poll(() => fs.readFileSync(file, 'utf8')).toContain(appended);
+    await expect.poll(() => name_reaches(420, 2), { timeout: 15_000 }).toBe(true);
+    await screenshot('21-inserted-and-appended-after-save');
+    await fit();
+    await expect.poll(() => name_reaches(420, 2), { timeout: 15_000 }).toBe(true);
+    await screenshot('22-inserted-and-appended-fitted-after-save');
 });
 
 test('an external change conflicts, and both salvage actions resolve it', async () => {

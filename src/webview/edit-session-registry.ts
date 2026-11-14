@@ -271,6 +271,26 @@ export function target_for_sheet(
     };
 }
 
+/**
+ * Whether two snapshots differ only in Pending Column widths. A width is how
+ * the column is viewed; no formula reads it, so a resize or an auto-fit must
+ * not send the worksheet's results back to pending.
+ */
+function only_pending_column_widths_differ(
+    before: PendingStructuralChanges,
+    after: PendingStructuralChanges,
+): boolean {
+    const prior = before.pendingColumns ?? [];
+    const next = after.pendingColumns ?? [];
+    if (prior.length !== next.length) return false;
+    if (prior.every((column, index) => column.viewerWidth === next[index]!.viewerWidth)) return false;
+    const without_widths = (changes: PendingStructuralChanges) => JSON.stringify({
+        ...changes,
+        pendingColumns: changes.pendingColumns!.map(({ viewerWidth: _width, ...column }) => column),
+    });
+    return without_widths(before) === without_widths(after);
+}
+
 export function create_edit_session_registry(
     current_session_id: () => string | undefined,
 ): EditSessionRegistry {
@@ -866,7 +886,14 @@ export function create_edit_session_registry(
     };
     const watch_pending = (store: PendingRowStore) => {
         if (pending_subscriptions.has(store)) return;
+        let last_snapshot = store.snapshot();
         pending_subscriptions.set(store, store.subscribe((change) => {
+            const previous_snapshot = last_snapshot;
+            last_snapshot = store.snapshot();
+            if (change.kind === 'reset' && only_pending_column_widths_differ(previous_snapshot, last_snapshot)) {
+                publish();
+                return;
+            }
             structural_formula_revision += 1;
             let changed_sheet_index: number | undefined;
             for (const [sheetIndex, candidate] of pending_stores) {
@@ -1047,6 +1074,7 @@ export function create_edit_session_registry(
                 retry_publications.push(entry);
             }
             stores = moved;
+            const parked_pending_before = new Set(pending_parked.keys());
             const moved_pending = new Map<number, PendingRowStore>();
             const retry_structural_publications: Array<{
                 target: WorksheetTarget;
@@ -1093,8 +1121,15 @@ export function create_edit_session_registry(
                 pending_parked.set(store, entry);
                 retry_structural_publications.push(entry);
             }
+            // A refresh that leaves every worksheet's Pending Changes where
+            // they were, such as the one a column width change brings, changes
+            // nothing a formula reads from them.
+            const pending_moved = moved_pending.size !== pending_stores.size
+                || [...moved_pending].some(([index, store]) => pending_stores.get(index) !== store)
+                || pending_parked.size !== parked_pending_before.size
+                || [...pending_parked.keys()].some((store) => !parked_pending_before.has(store));
             pending_stores = moved_pending;
-            structural_formula_revision += 1;
+            if (pending_moved) structural_formula_revision += 1;
             unwatch_detached();
             unwatch_detached_pending();
             rebuild_formula_projection();
