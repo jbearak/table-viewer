@@ -453,8 +453,23 @@ function formula_list(
     };
 }
 
-function signature(kind: string, total: number, entries: readonly PendingChangeNoticeFormula[]): string {
-    return `${kind}:${JSON.stringify([total, entries.map((entry) => [entry.location, entry.formula])])}`;
+/**
+ * A warning's dismissal key: everything it says, so a dismissed warning comes
+ * back once its content changes, even when the same formulas are listed for a
+ * different reason. `cause` adds what the words can't tell apart, such as which
+ * rows or columns were deleted.
+ */
+function signature(
+    kind: string,
+    sentences: readonly string[],
+    entries: readonly PendingChangeNoticeFormula[],
+    cause: readonly string[] = [],
+): string {
+    return `${kind}:${JSON.stringify([
+        sentences,
+        cause,
+        entries.map((entry) => [entry.location, entry.formula, entry.written ?? null, entry.note ?? null]),
+    ])}`;
 }
 
 /** What the person deleted that a formula uses, in words. */
@@ -514,19 +529,25 @@ function deleted_references_notice(input: PendingChangeNoticeInput): PendingChan
         ? 'rows and columns'
         : columns > 0 ? (columns === 1 ? 'column' : 'columns') : (rows === 1 ? 'row' : 'rows');
     const pronoun = total === 1 ? 'it' : 'them';
+    const sentences = [
+        `${count(total, 'formula uses', 'formulas use')} ${deleted_thing_words(input, review.deleted)}. `
+            + `After you save, ${total === 1 ? 'it' : 'they'} will show #REF!.`,
+        `Restore the ${restore}, or undo, to keep ${pronoun} working.`,
+    ];
+    const deleted = [...new Set(review.deleted.flatMap((item) => [
+        ...item.rows.map((identity) => `${item.targetSheetIndex}:row:${JSON.stringify(identity)}`),
+        ...item.columns.map((identity) => `${item.targetSheetIndex}:column:${JSON.stringify(identity)}`),
+    ]))].sort();
+    const dismissKey = signature('deleted', sentences, entries, deleted);
     return {
         kind: 'deletedReferences',
         role: 'status',
         severity: 'warning',
         label: 'Formulas that will show #REF!',
-        sentences: [
-            `${count(total, 'formula uses', 'formulas use')} ${deleted_thing_words(input, review.deleted)}. `
-                + `After you save, ${total === 1 ? 'it' : 'they'} will show #REF!.`,
-            `Restore the ${restore}, or undo, to keep ${pronoun} working.`,
-        ],
+        sentences,
         formulas: formula_list(entries, total),
-        actions: [{ label: 'Dismiss', intent: { kind: 'dismiss', key: signature('deleted', total, entries) } }],
-        dismissKey: signature('deleted', total, entries),
+        actions: [{ label: 'Dismiss', intent: { kind: 'dismiss', key: dismissKey } }],
+        dismissKey,
     };
 }
 
@@ -584,19 +605,21 @@ function changed_ranges_notice(input: PendingChangeNoticeInput): PendingChangeNo
             ? 'Removing appended rows'
             : `Your ${axis_words(axes, false)} changes`;
     const pronoun = total === 1 ? 'it' : 'them';
+    const sentences = [
+        `${cause} changed the range in ${count(total, 'formula', 'formulas')}.`,
+        ...(mixed ? [] : [range_reason(classes[0]!, main_axis(axes), total !== 1)]),
+        `Excel might adjust ${pronoun} differently, so check ${pronoun} before you save.`,
+    ];
+    const dismissKey = signature('ranges', sentences, entries);
     return {
         kind: 'changedRanges',
         role: 'status',
         severity: 'warning',
         label: 'Formulas whose ranges changed',
-        sentences: [
-            `${cause} changed the range in ${count(total, 'formula', 'formulas')}.`,
-            ...(mixed ? [] : [range_reason(classes[0]!, main_axis(axes), total !== 1)]),
-            `Excel might adjust ${pronoun} differently, so check ${pronoun} before you save.`,
-        ],
+        sentences,
         formulas: formula_list(entries, total),
-        actions: [{ label: 'Dismiss', intent: { kind: 'dismiss', key: signature('ranges', total, entries) } }],
-        dismissKey: signature('ranges', total, entries),
+        actions: [{ label: 'Dismiss', intent: { kind: 'dismiss', key: dismissKey } }],
+        dismissKey,
     };
 }
 

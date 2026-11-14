@@ -313,6 +313,38 @@ describe('pending_change_notices', () => {
         }));
         expect(kinds(pending_change_notices({ ...changed, dismissed }))).toEqual(['deletedReferences']);
     });
+
+    it('brings a dismissed warning back when the same formula breaks for another reason', () => {
+        // Summary!A1 = SUM(Data!A2:A3): delete Data's column A and dismiss,
+        // undo, then delete rows 2-3. Same cell, same rendering, same count.
+        const sheets = {
+            ...workbook,
+            worksheets: [{ name: 'Summary', columnNames: ['Total'] }, { name: 'Data', columnNames: ['Amount'] }],
+        };
+        const breaks = (parts: Partial<FormulaDeletedItem>): PendingChangeNoticeInput => ({
+            ...sheets,
+            formulaReview: {
+                current: true,
+                review: review({
+                    deleted: [deleted(0, 0, { targetSheetIndex: 1, formula: '=SUM(#REF!)', written: '=SUM(Data!A2:A3)', ...parts })],
+                    deletedCounts: [{ targetSheetIndex: 1, formulas: 1 }],
+                }),
+            },
+        });
+        const column = breaks({ rows: [], columns: [{ kind: 'source', sourceColumn: 0 }] });
+        const [notice] = pending_change_notices(column);
+        const dismissed = new Set([notice!.dismissKey!]);
+        expect(pending_change_notices({ ...column, dismissed })).toEqual([]);
+        const rows = breaks({ columns: [], rows: [{ kind: 'source', sourceRow: 1 }, { kind: 'source', sourceRow: 2 }] });
+        expect(kinds(pending_change_notices({ ...rows, dismissed }))).toEqual(['deletedReferences']);
+        // Only which row was deleted differs: the words match, the warning still returns.
+        const one_row = breaks({ columns: [], rows: [{ kind: 'source', sourceRow: 1 }] });
+        const other_row = breaks({ columns: [], rows: [{ kind: 'source', sourceRow: 2 }] });
+        const [first] = pending_change_notices(one_row);
+        expect(pending_change_notices(other_row)[0]!.sentences).toEqual(first!.sentences);
+        expect(kinds(pending_change_notices({ ...other_row, dismissed: new Set([first!.dismissKey!]) })))
+            .toEqual(['deletedReferences']);
+    });
 });
 
 describe('conflict notices', () => {
