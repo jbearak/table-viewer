@@ -77,6 +77,16 @@ describe('CsvCellEditor', () => {
         expect(on_change).toHaveBeenCalledWith(expect.objectContaining({ data: 'acb' }));
     });
 
+    it('opens on a character typed on any layout, with the held ones after it', async () => {
+        const on_change = vi.fn();
+        await render_editor('a', on_change, vi.fn(), vi.fn(), 'ж', value('a'), [key('é'), key('𝔸')]);
+
+        const input = container!.querySelector('input')!;
+        expect(input.value).toBe('жé𝔸');
+        expect(input.selectionStart).toBe('жé𝔸'.length);
+        expect(on_change).toHaveBeenCalledWith(expect.objectContaining({ data: 'жé𝔸' }));
+    });
+
     it('applies held keys to a value it opens with selected', async () => {
         const on_change = vi.fn();
         await render_editor('London', on_change, vi.fn(), vi.fn(), undefined, value('London'), [

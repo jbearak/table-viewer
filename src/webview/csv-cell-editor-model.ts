@@ -217,6 +217,16 @@ const MODIFIER_KEYS = new Set([
     'Shift', 'Control', 'Alt', 'AltGraph', 'Meta', 'OS', 'CapsLock', 'Fn', 'FnLock', 'NumLock', 'ScrollLock',
 ]);
 
+/**
+ * Whether `key` is one character a key types, as on the grid it starts an
+ * edit: é, ж, or ü on a layout that has them, as well as ASCII. Mirrors the
+ * rule in the Glide fork's DataEditor onKeyDown.
+ */
+function is_typed_character(key: string): boolean {
+    const code = key.codePointAt(0) ?? 0;
+    return Array.from(key).length === 1 && code >= 0x20 && code !== 0x7f;
+}
+
 function key_of(e: EditorKeyEvent): EditorKeyEvent {
     return { key: e.key, shiftKey: e.shiftKey, altKey: e.altKey, metaKey: e.metaKey, ctrlKey: e.ctrlKey };
 }
@@ -233,7 +243,7 @@ function with_last(typing: HeldTyping, edit: HeldEdit): HeldTyping {
  * While the last edit is open the key goes to it: Enter, Tab, or Shift+Tab
  * commit it, and any other key is kept for the editor to apply. After a
  * commit, a key does what it would do on the grid once the editor had
- * closed: a printable ASCII key starts an edit with that character, Space or
+ * closed: a key that types a character starts an edit with it, Space or
  * Enter starts one on the cell's own value, and any other key sets `dropping`.
  */
 export function hold_key(typing: HeldTyping, e: EditorKeyEvent): HeldTyping | undefined {
@@ -253,11 +263,11 @@ export function hold_key(typing: HeldTyping, e: EditorKeyEvent): HeldTyping | un
     // A modifier pressed on its own, as before a capital letter, does nothing.
     if (MODIFIER_KEYS.has(e.key)) return typing;
     // The grid opens an editor on the cell's value for Space and Enter, and
-    // one with the character for a printable ASCII key.
+    // one with the character for any other printable key, on any layout.
     const plain = !e.shiftKey && !e.altKey;
     let initial: string | undefined | null = null;
     if (plain && (e.key === ' ' || e.key === 'Enter')) initial = undefined;
-    else if (!e.altKey && /^[!-~]$/.test(e.key)) initial = e.key;
+    else if (!e.altKey && e.key !== ' ' && is_typed_character(e.key)) initial = e.key;
     if (initial === null) return { ...typing, dropping: true };
     return { ...typing, edits: [...typing.edits, { initial, keys: [] }] };
 }

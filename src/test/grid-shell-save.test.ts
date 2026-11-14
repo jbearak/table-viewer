@@ -2081,6 +2081,27 @@ describe('GridShell editing with no session held yet', () => {
         await overlay.unmount();
     });
 
+    it('starts the next edit with a character typed on any layout after a held commit', async () => {
+        const { request, grant } = session_request();
+        const overlay = open_editors_as_glide_does();
+        const { rerender } = await render_grid(three_columns, {
+            ...no_session,
+            on_request_edit_session: request,
+        });
+        await select_cell([0, 0]);
+
+        // The grid starts an edit for ж as it does for an ASCII letter.
+        grid_mock.props!.onOverlayOpenRequest!([0, 0], 'ж');
+        for (const key of ['é', 'Tab', 'ü', 'ß']) expect(grid_key(key).cancel).toHaveBeenCalled();
+
+        await grant_session(grant, rerender, { column_projection: three_columns });
+        expect(overlay.finished).toEqual(['жé']);
+        expect(grid_mock.open_overlay.mock.calls).toEqual([[[0, 0], 'ж'], [[1, 0], 'ü']]);
+        expect(selected_cell()).toEqual([1, 0]);
+        expect(overlay.input()!.value).toBe('üß');
+        await overlay.unmount();
+    });
+
     it('replays every edit a run of Tabs and Spaces leads to before the grant', async () => {
         const { request, grant } = session_request();
         const overlay = open_editors_as_glide_does();

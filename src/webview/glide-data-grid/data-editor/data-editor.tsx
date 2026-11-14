@@ -170,6 +170,19 @@ type Props = Partial<
 
 type EmitEvents = "copy" | "paste" | "delete" | "fill-right" | "fill-down";
 
+/**
+ * Fork change: whether a key types one character, so that it starts an edit.
+ * Upstream takes printable ASCII only, which ignores é, ж, or ü typed on a
+ * layout that has them. A non-ASCII character with Alt is left out: on macOS
+ * that is Option, whose characters double as shortcuts (Option+Shift+A types
+ * Å and sorts).
+ */
+function isTypedCharacter(key: string, altKey: boolean): boolean {
+    const code = key.codePointAt(0) ?? 0;
+    if (Array.from(key).length !== 1 || code < 0x20 || code === 0x7f) return false;
+    return code < 0x7f || !altKey;
+}
+
 function getSpanStops(cells: readonly (readonly GridCell[])[]): number[] {
     return uniq(
         flatten(
@@ -3626,8 +3639,7 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
                 !event.metaKey &&
                 !event.ctrlKey &&
                 gridSelection.current !== undefined &&
-                event.key.length === 1 &&
-                /[ -~]/g.test(event.key) &&
+                isTypedCharacter(event.key, event.altKey) &&
                 event.bounds !== undefined &&
                 isReadWriteCell(getCellContent([col - rowMarkerOffset, Math.max(0, Math.min(row, rows - 1))]))
             ) {
