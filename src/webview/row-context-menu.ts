@@ -16,7 +16,26 @@ export interface StructureMenuAction {
     readonly disabled_reason?: string;
 }
 
-export interface RowContextMenuModelProps {
+/** Insert, Delete, Restore, and Move for a row selection, in an editable file. */
+export interface RowStructureMenuActions {
+    /**
+     * Delete row(s), offered in an editable file when structural editing is on. It
+     * replaces "Remove pending row(s)", whose props are then ignored.
+     */
+    delete_rows: StructureMenuAction;
+    /** Restore row(s), offered when the selection includes Pending Row Removals. */
+    restore_rows?: StructureMenuAction;
+    /** "Insert row above" / "Insert N rows above", offered beside Delete. */
+    insert_rows_above: StructureMenuAction;
+    /** "Insert row below" / "Insert N rows below"; below the band's last row it appends. */
+    insert_rows_below: StructureMenuAction;
+    /** "Move rows up": the block passes one neighboring displayed row. */
+    move_rows_up: StructureMenuAction;
+    /** "Move rows down". */
+    move_rows_down: StructureMenuAction;
+}
+
+export interface RowContextMenuModelProps extends Partial<RowStructureMenuActions> {
     selected_row_count: number;
     can_hide_rows: boolean;
     show_disabled_hide_rows?: boolean;
@@ -30,24 +49,10 @@ export interface RowContextMenuModelProps {
     on_remove_pending_rows?: () => void;
     show_disabled_remove_pending_rows?: boolean;
     on_cancel_row_removals?: () => void;
-    /**
-     * Delete row(s), offered in an editable file when structural editing is on. It
-     * replaces "Remove pending row(s)", whose props are then ignored.
-     */
-    delete_rows?: StructureMenuAction;
-    /** Restore row(s), offered when the selection includes Pending Row Removals. */
-    restore_rows?: StructureMenuAction;
-    /** "Insert row above" / "Insert N rows above", offered beside Delete. */
-    insert_rows_above?: StructureMenuAction;
-    /** "Insert row below" / "Insert N rows below"; below the band's last row it appends. */
-    insert_rows_below?: StructureMenuAction;
-    /** "Move rows up": the block passes one neighboring displayed row. */
-    move_rows_up?: StructureMenuAction;
-    /** "Move rows down". */
-    move_rows_down?: StructureMenuAction;
 }
 
-function structure_item(
+/** One row structure item, labeled for its count: "Insert 3 rows above". */
+export function row_structure_menu_item(
     verb: 'Delete' | 'Restore' | 'Insert above' | 'Insert below' | 'Move up' | 'Move down',
     action: StructureMenuAction,
 ): MenuItem {
@@ -95,18 +100,18 @@ export function row_context_menu_items(props: RowContextMenuModelProps): MenuIte
         });
     }
     if (props.insert_rows_above !== undefined) {
-        items.push(structure_item('Insert above', props.insert_rows_above));
+        items.push(row_structure_menu_item('Insert above', props.insert_rows_above));
     }
     if (props.insert_rows_below !== undefined) {
-        items.push(structure_item('Insert below', props.insert_rows_below));
+        items.push(row_structure_menu_item('Insert below', props.insert_rows_below));
     }
     if (props.delete_rows !== undefined) {
-        items.push(structure_item('Delete', props.delete_rows));
+        items.push(row_structure_menu_item('Delete', props.delete_rows));
         if (props.restore_rows !== undefined) {
-            items.push(structure_item('Restore', props.restore_rows));
+            items.push(row_structure_menu_item('Restore', props.restore_rows));
         }
-        if (props.move_rows_up !== undefined) items.push(structure_item('Move up', props.move_rows_up));
-        if (props.move_rows_down !== undefined) items.push(structure_item('Move down', props.move_rows_down));
+        if (props.move_rows_up !== undefined) items.push(row_structure_menu_item('Move up', props.move_rows_up));
+        if (props.move_rows_down !== undefined) items.push(row_structure_menu_item('Move down', props.move_rows_down));
     } else if (props.on_remove_pending_rows || props.show_disabled_remove_pending_rows) {
         const pending_row_count = Math.max(
             1,

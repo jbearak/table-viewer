@@ -220,6 +220,33 @@ export async function open_column_menu(page: Page, column: number): Promise<Loca
     return menu;
 }
 
+/** The centre of a body cell, assuming default column widths and row heights. */
+export async function cell_point(page: Page, column: number, row: number): Promise<{ x: number; y: number }> {
+    const box = await canvas_box(page);
+    return {
+        x: box.x + ROW_MARKER_WIDTH_PX + column * COLUMN_WIDTH_PX + COLUMN_WIDTH_PX / 2,
+        y: box.y + HEADER_HEIGHT_PX + row * ROW_HEIGHT_PX + ROW_HEIGHT_PX / 2,
+    };
+}
+
+/** Right-click a body cell and wait for the cell menu. */
+export async function open_cell_menu(page: Page, column: number, row: number): Promise<Locator> {
+    const point = await cell_point(page, column, row);
+    await page.mouse.click(point.x, point.y, { button: 'right' });
+    const menu = context_menu(page);
+    await expect(menu.getByRole('menuitem', { name: 'Copy cell', exact: true })).toBeVisible();
+    return menu;
+}
+
+/** Open `submenu` in a menu and choose `item` from it. */
+export async function choose_from_submenu(menu: Locator, submenu: string, item: string): Promise<void> {
+    await menu.getByRole('menuitem', { name: submenu, exact: true }).click();
+    const entry = menu.page().getByRole('menuitem', { name: item, exact: true });
+    await expect(entry).not.toHaveAttribute('aria-disabled', 'true');
+    await entry.click();
+    await expect(menu).toHaveCount(0);
+}
+
 export async function choose(menu: Locator, item: string): Promise<void> {
     const entry = menu.getByRole('menuitem', { name: item, exact: true });
     await expect(entry).not.toHaveAttribute('aria-disabled', 'true');

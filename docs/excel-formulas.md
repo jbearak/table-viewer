@@ -13,6 +13,8 @@ After an edit, Table Viewer recalculates affected formulas when it can. Its buil
 - Header Row column references, described below
 - `SUM` and `AVERAGE`
 
+A formula that contains `#REF!`, which is what a reference becomes when its row, column, or worksheet is deleted, displays `?? (invalid reference)`.
+
 If a formula uses another function, has a cycle, cannot be parsed safely, or exceeds the calculation limits, Table Viewer removes its stale cached result instead of displaying a result it cannot trust. The cell displays `??` until Excel or another spreadsheet engine recalculates the workbook.
 
 Editing a cell that belongs to an array formula, shared formula, or what-if data table may be refused when changing that cell alone could damage the formula group. Replace the grouped formula in Excel first, or edit its input cells instead.

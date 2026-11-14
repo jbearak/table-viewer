@@ -214,6 +214,34 @@ function persisted_displayed_text(
     return show_formatting ? c?.formatted ?? '' : c?.raw ?? '';
 }
 
+/**
+ * Whether a recalculated result is the value the cell already shows. A row or
+ * column change recalculates every formula, and most land where they were:
+ * painting those as `1.5 → 1.5` would bury the results that did change.
+ */
+export function formula_result_matches_persisted(
+    c: RenderedCell | null | undefined,
+    show_formatting: boolean,
+    result: string,
+): boolean {
+    if (!c || c.formulaResultPending) return false;
+    if (result === persisted_displayed_text(c, show_formatting)) return true;
+    // An unformatted number displays fewer digits than the file stores, and
+    // the calculator reports 15 significant digits where the file may hold 17.
+    // A result painted through a number format is display text, not a value.
+    const result_is_value = !show_formatting || c.numberFormat === undefined;
+    return result_is_value && c.rawType === 'number' && c.raw !== null
+        && same_number(c.raw, result);
+}
+
+function same_number(left: string, right: string): boolean {
+    if (left.trim() === '' || right.trim() === '') return false;
+    const a = Number(left);
+    const b = Number(right);
+    return Number.isFinite(a) && Number.isFinite(b)
+        && Number(a.toPrecision(15)) === Number(b.toPrecision(15));
+}
+
 /** Visual lines for a compare-deleted cell: the whole text struck through in
  *  the deletion color, split on hard breaks like every other rich cell. */
 function deleted_lines(text: string, colors: DiffColors): RichTextLine[] {

@@ -116,7 +116,11 @@ import {
     selected_source_columns,
     type HeaderDragState,
 } from './column-selection-model';
-import { row_context_menu_items, type StructureMenuAction } from './row-context-menu';
+import {
+    row_context_menu_items,
+    type RowStructureMenuActions,
+    type StructureMenuAction,
+} from './row-context-menu';
 import { use_row_marker_selection } from './use-row-marker-selection';
 import { draw_sort_glyphs, header_sort_metadata } from './header-sort-glyph';
 import {
@@ -143,6 +147,7 @@ import {
     build_grid_cell,
     cell_allows_wrapping,
     displayed_text,
+    formula_result_matches_persisted,
     rich_cell_display_data,
     type CellEditOverlay,
 } from './cell-renderer';
@@ -3125,6 +3130,11 @@ export function GridShell({
         if (
             cell?.formula === undefined
             || (!formula_is_affected && calculated_formula_result === undefined)
+        ) return undefined;
+        // Recalculated to what it already shows: not a change to display.
+        if (
+            calculated_formula_result !== undefined
+            && formula_result_matches_persisted(cell, show_formatting, calculated_formula_result)
         ) return undefined;
         return calculated_formula_result === undefined
             ? { formula_result_pending: true }
@@ -11193,6 +11203,82 @@ export function GridShell({
         [edit_session_id, pending_store, projected_columns],
     );
 
+    /**
+     * The row structure items for a selection, with their actions. Built
+     * while rendering, for the row menu and the cell menu alike.
+     */
+    const row_structure_actions = (
+        selection: RowStructureSelection | undefined,
+        from_row: number,
+    ): RowStructureMenuActions | undefined => {
+        if (selection === undefined || structural_support === undefined) return undefined;
+        const model = row_structure_menu_model({
+            support: structural_support.rows,
+            ready: editable_cells,
+            selection,
+            changes: pending_rows,
+            context: structure_context,
+            ...(may_append_rows ? {} : {
+                appendRefusal: !can_request_append_rows
+                    ? 'Rows can\'t be appended to this sheet right now.'
+                    : stored_pending_rows(pending_rows).length >= MAX_PENDING_APPENDED_ROWS
+                        ? TOO_MANY_PENDING_ROWS_MESSAGE
+                        : 'Appending another row would exceed the worksheet row limit.',
+            }),
+        });
+        return {
+            insert_rows_above: insert_menu_action(model.insertAbove, 'before'),
+            insert_rows_below: insert_menu_action(model.insertBelow, 'after'),
+            delete_rows: {
+                count: model.delete.count,
+                ...(model.delete.enabled
+                    ? { on_click: () => { delete_rows_gesture(selection.runs ?? [], from_row); } }
+                    : { disabled_reason: model.delete.reason }),
+            },
+            move_rows_up: move_menu_action(model.moveUp, selection.identities ?? []),
+            move_rows_down: move_menu_action(model.moveDown, selection.identities ?? []),
+            ...(model.restore === undefined ? {} : {
+                restore_rows: {
+                    count: model.restore.count,
+                    ...(model.restore.enabled
+                        ? { on_click: () => { restore_rows_gesture(selection.removedSourceRuns); } }
+                        : { disabled_reason: model.restore.reason }),
+                },
+            }),
+        };
+    };
+    // The rows and columns the cell menu's Insert and Delete items act on:
+    // those the selection spans, or the clicked cell's own row beside a
+    // column selection and its own column beside a row selection.
+    const cell_menu_structure = useMemo(() => {
+        if (context_menu?.kind !== 'cell' || !structure_items_offered) return undefined;
+        const rows = grid_selection.columns.length > 0
+            ? null
+            : selected_display_row_intervals(grid_selection, row_count);
+        const columns = grid_selection.rows.length > 0
+            ? []
+            : selected_display_columns(grid_selection, projected_columns.length);
+        return {
+            rows: resolve_row_structure_selection(
+                pending_projection,
+                rows ?? [{ start: context_menu.row, end: context_menu.row }],
+                row_structure_selection_options,
+            ),
+            columns: resolve_column_structure_selection(
+                projected_columns,
+                columns.length > 0 ? columns : [context_menu.display_col],
+            ),
+        };
+    }, [
+        context_menu,
+        grid_selection,
+        pending_projection,
+        projected_columns,
+        row_count,
+        row_structure_selection_options,
+        structure_items_offered,
+    ]);
+
     // Snapshot the cell menu's effective selection while rendering so every model
     // callback targets the same rows and range that supplied its labels.
     let cell_menu_items = null;
@@ -11202,6 +11288,10 @@ export function GridShell({
         const has_explicit_column_selection = grid_selection.columns.length > 0;
         const has_explicit_row_selection = grid_selection.rows.length > 0;
         const selected_rows = selected_display_row_intervals(grid_selection, row_count);
+        const row_structure = row_structure_actions(cell_menu_structure?.rows, row);
+        const column_structure = cell_menu_structure === undefined
+            ? undefined
+            : column_structure_actions(cell_menu_structure.columns, display_col);
         // Columns the selection spans; hide targets all of them (falls back to
         // the clicked column when the selection maps to nothing usable).
         const selected_column_sources = selected_display_columns(
@@ -11408,6 +11498,8 @@ export function GridShell({
             on_select_row: () => select_row(row),
             on_select_column: () => select_column(display_col),
             on_select_all: select_all,
+            ...(row_structure === undefined ? {} : { row_structure }),
+            ...(column_structure === undefined ? {} : { column_structure }),
         });
     }
 
@@ -11653,24 +11745,7 @@ export function GridShell({
                 const only_removals = selected_removal_rows.size === selected_row_count;
                 const has_structural_rows = selected_pending_ids.size > 0
                     || selected_removal_rows.size > 0;
-                const structure_menu = row_menu.structure === undefined
-                    || structural_support === undefined
-                    ? undefined
-                    : row_structure_menu_model({
-                        support: structural_support.rows,
-                        ready: editable_cells,
-                        selection: row_menu.structure,
-                        changes: pending_rows,
-                        context: structure_context,
-                        ...(may_append_rows ? {} : {
-                            appendRefusal: !can_request_append_rows
-                                ? 'Rows can\'t be appended to this sheet right now.'
-                                : stored_pending_rows(pending_rows).length >= MAX_PENDING_APPENDED_ROWS
-                                    ? TOO_MANY_PENDING_ROWS_MESSAGE
-                                    : 'Appending another row would exceed the worksheet row limit.',
-                        }),
-                    });
-                const structure_selection = row_menu.structure;
+                const structure = row_structure_actions(row_menu.structure, row_menu.row);
                 return (
                     <ContextMenu
                         x={row_menu.x}
@@ -11715,51 +11790,7 @@ export function GridShell({
                                 pending_row_count: selected_pending_ids.size,
                                 show_disabled_remove_pending_rows: true,
                             } : {}),
-                            ...(structure_menu === undefined || structure_selection === undefined ? {} : {
-                                insert_rows_above: insert_menu_action(
-                                    structure_menu.insertAbove,
-                                    'before',
-                                ),
-                                insert_rows_below: insert_menu_action(
-                                    structure_menu.insertBelow,
-                                    'after',
-                                ),
-                                delete_rows: {
-                                    count: structure_menu.delete.count,
-                                    ...(structure_menu.delete.enabled
-                                        ? {
-                                            on_click: () => {
-                                                delete_rows_gesture(
-                                                    structure_selection.runs ?? [],
-                                                    row_menu.row,
-                                                );
-                                            },
-                                        }
-                                        : { disabled_reason: structure_menu.delete.reason }),
-                                },
-                                move_rows_up: move_menu_action(
-                                    structure_menu.moveUp,
-                                    structure_selection.identities ?? [],
-                                ),
-                                move_rows_down: move_menu_action(
-                                    structure_menu.moveDown,
-                                    structure_selection.identities ?? [],
-                                ),
-                                ...(structure_menu.restore === undefined ? {} : {
-                                    restore_rows: {
-                                        count: structure_menu.restore.count,
-                                        ...(structure_menu.restore.enabled
-                                            ? {
-                                                on_click: () => {
-                                                    restore_rows_gesture(
-                                                        structure_selection.removedSourceRuns,
-                                                    );
-                                                },
-                                            }
-                                            : { disabled_reason: structure_menu.restore.reason }),
-                                    },
-                                }),
-                            }),
+                            ...structure,
                             ...(only_removals ? {
                                 on_cancel_row_removals: () => {
                                     const before = pending_store.snapshot();
