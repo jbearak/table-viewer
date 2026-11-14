@@ -1,0 +1,192 @@
+## row menu, source row 2 (Row actions for row 2)
+Insert row above  [disabled: Wait for the current change to finish.]
+Insert row below  [disabled: Wait for the current change to finish.]
+Delete row  [disabled: Wait for the current change to finish.]
+Move rows up  [disabled: Wait for the current change to finish.]
+Move rows down  [disabled: Wait for the current change to finish.]
+Hide row
+Copy row
+
+## row menu, first row (Row actions for row 1)
+Insert row above  [disabled: Wait for the current change to finish.]
+Insert row below  [disabled: Wait for the current change to finish.]
+Delete row  [disabled: Wait for the current change to finish.]
+Move rows up  [disabled: Wait for the current change to finish.]
+Move rows down  [disabled: Wait for the current change to finish.]
+Hide row
+Copy row
+
+## row menu, rows 1-2 selected (Row actions for 2 selected rows)
+Insert 2 rows above  [disabled: Wait for the current change to finish.]
+Insert 2 rows below  [disabled: Wait for the current change to finish.]
+Delete 2 rows  [disabled: Wait for the current change to finish.]
+Move rows up  [disabled: Wait for the current change to finish.]
+Move rows down  [disabled: Wait for the current change to finish.]
+Hide 2 rows
+Copy 2 rows
+
+## row menu, rows 1 and 3 selected (Row actions for 2 selected rows)
+Insert 2 rows above  [disabled: Wait for the current change to finish.]
+Insert 2 rows below  [disabled: Wait for the current change to finish.]
+Delete 2 rows  [disabled: Wait for the current change to finish.]
+Move rows up  [disabled: Wait for the current change to finish.]
+Move rows down  [disabled: Wait for the current change to finish.]
+Hide 2 rows
+Copy 2 rows
+
+## cell menu, cell B2 (Context menu)
+Highlight yellow
+Highlight green
+Highlight blue
+Highlight pink
+---
+Copy cell
+---
+Insert >
+    Insert row above  [disabled: Wait for the current change to finish.]
+    Insert row below  [disabled: Wait for the current change to finish.]
+    Insert column left  [disabled: Wait for the current change to finish.]
+    Insert column right  [disabled: Wait for the current change to finish.]
+Delete >
+    Delete row  [disabled: Wait for the current change to finish.]
+    Delete column  [disabled: Wait for the current change to finish.]
+---
+Select >
+    Select row
+    Select column
+    Select all
+Hide >
+    Hide row
+    Hide column
+
+## cell menu, range A1:B2 (Context menu)
+Highlight yellow
+Highlight green
+Highlight blue
+Highlight pink
+---
+Copy selection
+---
+Insert >
+    Insert 2 rows above  [disabled: Wait for the current change to finish.]
+    Insert 2 rows below  [disabled: Wait for the current change to finish.]
+    Insert 2 columns left  [disabled: Wait for the current change to finish.]
+    Insert 2 columns right  [disabled: Wait for the current change to finish.]
+Delete >
+    Delete 2 rows  [disabled: Wait for the current change to finish.]
+    Delete 2 columns  [disabled: Wait for the current change to finish.]
+---
+Select >
+    Select row
+    Select column
+    Select all
+Hide >
+    Hide 2 rows
+    Hide 2 columns
+
+## cell menu, columns A-B selected (Context menu)
+Highlight yellow
+Highlight green
+Highlight blue
+Highlight pink
+---
+Copy selection
+---
+Insert >
+    Insert row above  [disabled: Wait for the current change to finish.]
+    Insert row below  [disabled: Wait for the current change to finish.]
+    Insert 2 columns left  [disabled: Wait for the current change to finish.]
+    Insert 2 columns right  [disabled: Wait for the current change to finish.]
+Delete >
+    Delete row  [disabled: Wait for the current change to finish.]
+    Delete 2 columns  [disabled: Wait for the current change to finish.]
+---
+Select >
+    Select row
+    Select column
+    Select all
+Hide >
+    Hide 2 columns
+
+## cell menu, rows 1-2 selected (Context menu)
+Highlight yellow
+Highlight green
+Highlight blue
+Highlight pink
+---
+Copy selection
+---
+Insert >
+    Insert 2 rows above  [disabled: Wait for the current change to finish.]
+    Insert 2 rows below  [disabled: Wait for the current change to finish.]
+    Insert column left  [disabled: Wait for the current change to finish.]
+    Insert column right  [disabled: Wait for the current change to finish.]
+Delete >
+    Delete 2 rows  [disabled: Wait for the current change to finish.]
+    Delete column  [disabled: Wait for the current change to finish.]
+---
+Select >
+    Select row
+    Select column
+    Select all
+Hide >
+    Hide 2 rows
+    Hide column
+
+## header menu, column B (Column actions for B name)
+Copy column
+Hide column
+Rename column…  [disabled: Only new columns can be renamed on this sheet.]
+---
+Insert column left  [disabled: Wait for the current change to finish.]
+Insert column right  [disabled: Wait for the current change to finish.]
+Delete column  [disabled: Wait for the current change to finish.]
+Move columns left  [disabled: Wait for the current change to finish.]
+Move columns right  [disabled: Wait for the current change to finish.]
+---
+Sort ascending
+Sort descending
+---
+Filter…
+
+## header menu, first column (Column actions for A name)
+Copy column
+Hide column
+Rename column…  [disabled: Only new columns can be renamed on this sheet.]
+---
+Insert column left  [disabled: Wait for the current change to finish.]
+Insert column right  [disabled: Wait for the current change to finish.]
+Delete column  [disabled: Wait for the current change to finish.]
+Move columns left  [disabled: Wait for the current change to finish.]
+Move columns right  [disabled: Wait for the current change to finish.]
+---
+Sort ascending
+Sort descending
+---
+Filter…
+
+## header menu, columns A-B selected (Column actions for 2 selected columns)
+Copy 2 columns
+Hide 2 columns
+---
+Insert 2 columns left  [disabled: Wait for the current change to finish.]
+Insert 2 columns right  [disabled: Wait for the current change to finish.]
+Delete 2 columns  [disabled: Wait for the current change to finish.]
+Move columns left  [disabled: Wait for the current change to finish.]
+Move columns right  [disabled: Wait for the current change to finish.]
+---
+Sort ascending
+Sort descending
+
+## header menu, columns A and C selected (Column actions for 2 selected columns)
+Copy 2 columns
+Hide 2 columns
+---
+Insert 2 columns left  [disabled: Wait for the current change to finish.]
+Insert 2 columns right  [disabled: Wait for the current change to finish.]
+Delete 2 columns  [disabled: Wait for the current change to finish.]
+Move columns left  [disabled: Wait for the current change to finish.]
+Move columns right  [disabled: Wait for the current change to finish.]
+---
+Sort ascending
+Sort descending

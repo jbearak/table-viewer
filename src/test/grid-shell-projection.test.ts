@@ -10835,3 +10835,308 @@ describe('columns: Insert, Delete, Restore, Move, rename, Pending Column cells, 
         expect(menu_button_labels()).not.toContain('Insert column left');
     });
 });
+
+/**
+ * Every item of the cell, row, and column menus, with its enabled state and
+ * disabled reason, across the states structure editing can be in. The file
+ * snapshots are the menus as the grid builds them, so a change to what one
+ * menu offers, or why it refuses, shows up beside the others.
+ */
+describe('structure items across the cell, row, and column menus', () => {
+    const basis = {
+        kind: 'delimited' as const,
+        byteLength: 10,
+        digest: 'digest',
+        sourceRowCount: 4,
+        sourceColumnCount: 3,
+    };
+    const supported = {
+        rows: { supported: true as const },
+        columns: { supported: true as const },
+        basis,
+    };
+    const template = { id: 'plain', format: { kind: 'none' as const } };
+    const append_basis = { sourceRowCount: 4, columnCount: 3, schemaFingerprint: 'sha256:x' };
+    const all_columns = {
+        visible_to_source: [0, 1, 2],
+        source_to_visible: [0, 1, 2],
+        hidden_count: 0,
+    };
+    const render_structure = async (overrides: Partial<GridShellProps> = {}) => {
+        const pending = overrides.pending_row_store ?? create_pending_row_store({ session_id: 'session' });
+        let next_row = 0;
+        let next_column = 0;
+        await render_grid(props({
+            sheet_meta: { ...props().sheet_meta, rowCount: 4, sourceRowCount: 4 },
+            row_count: 4,
+            column_projection: all_columns,
+            editing_session_held: true,
+            csv_editable: true,
+            edit_session_id: 'session',
+            transform_sections: true,
+            structural_support: supported,
+            edit_session: create_edit_session_store({ session_id: 'session' }),
+            pending_row_store: pending,
+            history_store: create_history_store(),
+            on_append_rows: vi.fn(async () => undefined),
+            on_insert_rows: vi.fn(async (request: StructuralInsertRequest) => ({
+                rowIds: Array.from({ length: request.count }, () => `inserted-${++next_row}`),
+                formatTemplate: template,
+                structuralBasis: basis,
+                appendBasis: append_basis,
+                settle: () => {},
+            })),
+            on_insert_columns: vi.fn(async (request: { count: number }) => ({
+                columnIds: Array.from({ length: request.count }, () => `c${++next_column}`),
+                structuralBasis: basis,
+                settle: () => {},
+            })),
+            ...overrides,
+        }));
+        return pending;
+    };
+    const context_event = (x: number, y: number) => ({
+        preventDefault: vi.fn(),
+        bounds: { x, y, width: 100, height: 24 },
+        localEventX: 10,
+        localEventY: 10,
+    });
+    const select = async (selection: Record<string, unknown>) => {
+        const on_selection_change = grid_mock.props!.onGridSelectionChange as (selection: unknown) => void;
+        await act(async () => on_selection_change({ columns: compact([]), rows: compact([]), ...selection }));
+    };
+    const open_row_menu = async (row: number) => {
+        const on_cell_context_menu = grid_mock.props!.onCellContextMenu as
+            (cell: [number, number], event: Record<string, unknown>) => void;
+        await act(async () => on_cell_context_menu([-1, row], context_event(0, 24 * (row + 1))));
+    };
+    const open_cell_menu = async (column: number, row: number) => {
+        const on_cell_context_menu = grid_mock.props!.onCellContextMenu as
+            (cell: [number, number], event: Record<string, unknown>) => void;
+        await act(async () => on_cell_context_menu([column, row], context_event(40 + 100 * column, 24 * (row + 1))));
+    };
+    const open_header_menu = async (column: number) => {
+        const on_header_context_menu = grid_mock.props!.onHeaderContextMenu as
+            (column: number, event: Record<string, unknown>) => void;
+        await act(async () => on_header_context_menu(column, context_event(40 + 100 * column, 0)));
+    };
+    const click = async (label: string) => {
+        const item = Array.from(document.querySelectorAll('button'))
+            .find((candidate) => candidate.querySelector('.context-menu-label')?.textContent === label);
+        if (item === undefined) throw new Error(`no item ${label}`);
+        await act(async () => item.click());
+    };
+    /** The open menu, one line per item, submenus opened and indented. */
+    const capture = async (title: string): Promise<string> => {
+        const menu = document.querySelector('.context-menu-root .context-menu');
+        if (menu === null) throw new Error(`no menu for ${title}`);
+        const lines = [`## ${title} (${menu.getAttribute('aria-label') ?? 'cell'})`];
+        const walk = async (level: Element, indent: string) => {
+            for (const child of Array.from(level.children)) {
+                if (child.getAttribute('role') === 'separator') {
+                    lines.push(`${indent}---`);
+                    continue;
+                }
+                if (!(child instanceof HTMLButtonElement)) continue;
+                const label = child.querySelector('.context-menu-label')?.textContent ?? '';
+                if (child.getAttribute('aria-haspopup') === 'menu') {
+                    lines.push(`${indent}${label} >`);
+                    await act(async () => child.click());
+                    const sub = level.querySelector(
+                        `[data-parent-menu-index="${child.dataset.menuIndex}"] > .context-menu`,
+                    );
+                    if (sub !== null) await walk(sub, `${indent}    `);
+                    continue;
+                }
+                const reason = child.getAttribute('aria-description');
+                lines.push(child.getAttribute('aria-disabled') === 'true'
+                    ? `${indent}${label}  [disabled${reason === null ? '' : `: ${reason}`}]`
+                    : `${indent}${label}`);
+            }
+        };
+        await walk(menu, '');
+        return lines.join('\n');
+    };
+    /** Open each menu in turn and capture it. */
+    const capture_all = async (
+        menus: readonly (readonly [string, () => Promise<void>])[],
+    ): Promise<string> => {
+        const sections: string[] = [];
+        for (const [title, open] of menus) {
+            await open();
+            sections.push(await capture(title));
+        }
+        return `${sections.join('\n\n')}\n`;
+    };
+    /** The menus a source row and column offer, by every route. */
+    const source_menus = [
+        ['row menu, source row 2', async () => { await select({}); await open_row_menu(1); }],
+        ['row menu, first row', async () => { await select({}); await open_row_menu(0); }],
+        ['row menu, rows 1-2 selected', async () => {
+            await select({ rows: compact([0, 1]) });
+            await open_row_menu(1);
+        }],
+        ['row menu, rows 1 and 3 selected', async () => {
+            await select({ rows: compact([0, 2]) });
+            await open_row_menu(2);
+        }],
+        ['cell menu, cell B2', async () => { await select({}); await open_cell_menu(1, 1); }],
+        ['cell menu, range A1:B2', async () => {
+            await select({ current: { cell: [1, 1], range: { x: 0, y: 0, width: 2, height: 2 }, rangeStack: [] } });
+            await open_cell_menu(1, 1);
+        }],
+        ['cell menu, columns A-B selected', async () => {
+            await select({ columns: compact([0, 1]) });
+            await open_cell_menu(1, 1);
+        }],
+        ['cell menu, rows 1-2 selected', async () => {
+            await select({ rows: compact([0, 1]) });
+            await open_cell_menu(1, 1);
+        }],
+        ['header menu, column B', async () => { await select({}); await open_header_menu(1); }],
+        ['header menu, first column', async () => { await select({}); await open_header_menu(0); }],
+        ['header menu, columns A-B selected', async () => {
+            await select({ columns: compact([0, 1]) });
+            await open_header_menu(1);
+        }],
+        ['header menu, columns A and C selected', async () => {
+            await select({ columns: compact([0, 2]) });
+            await open_header_menu(2);
+        }],
+    ] as const;
+
+    it.each(['cell', 'header'] as const)(
+        'focuses the live column after the first deleted one, from the %s menu',
+        async (route) => {
+            const four = { ...basis, sourceColumnCount: 4 };
+            await render_structure({
+                sheet_meta: {
+                    ...props().sheet_meta,
+                    rowCount: 4,
+                    sourceRowCount: 4,
+                    columnCount: 4,
+                    columnNames: ['A name', 'B name', 'C name', 'D name'],
+                },
+                column_projection: { visible_to_source: [0, 1, 2, 3], source_to_visible: [0, 1, 2, 3], hidden_count: 0 },
+                structural_support: { ...supported, basis: four },
+            });
+            // A and C selected, the menu opened on C: focus lands on B, which
+            // followed the first deleted column, as a row Delete's does.
+            await select({ columns: compact([0, 2]) });
+            if (route === 'cell') {
+                await open_cell_menu(2, 1);
+                await click('Delete');
+            } else {
+                await open_header_menu(2);
+            }
+            await click('Delete 2 columns');
+            await vi.waitFor(() => expect((grid_mock.props!.gridSelection as {
+                current?: { cell: [number, number] };
+            }).current?.cell[0]).toBe(1));
+        },
+    );
+
+    it('CSV with nothing pending', async () => {
+        await render_structure();
+        await expect(await capture_all(source_menus))
+            .toMatchFileSnapshot('./__snapshots__/structure-menus/csv-source.txt');
+    });
+
+    it('while another change is still being applied', async () => {
+        await render_structure({ gestures_admitted: () => false });
+        await expect(await capture_all(source_menus))
+            .toMatchFileSnapshot('./__snapshots__/structure-menus/change-in-flight.txt');
+    });
+
+    it('before the editing session arrives', async () => {
+        await render_structure({
+            editing_session_held: false,
+            edit_session_id: undefined,
+            on_request_edit_session: vi.fn(() => new Promise<boolean>(() => {})),
+        });
+        await expect(await capture_all(source_menus))
+            .toMatchFileSnapshot('./__snapshots__/structure-menus/before-session.txt');
+    });
+
+    it('on an .xlsx sheet that cannot be restructured', async () => {
+        const axis = (noun: string) => ({
+            supported: false as const,
+            reason: `Can't insert or delete ${noun} on this sheet: it contains an Excel table.`,
+            moveReason: `Can't move ${noun} on this sheet: it contains an Excel table.`,
+        });
+        await render_structure({
+            structural_support: { rows: axis('rows'), columns: axis('columns'), basis },
+        });
+        await expect(await capture_all(source_menus))
+            .toMatchFileSnapshot('./__snapshots__/structure-menus/xlsx-unsupported.txt');
+    });
+
+    it('in a sorted view', async () => {
+        await render_structure({ transform_state: { sort: [{ colIndex: 0, direction: 'asc' }], filters: [] } });
+        await expect(await capture_all(source_menus))
+            .toMatchFileSnapshot('./__snapshots__/structure-menus/sorted.txt');
+    });
+
+    it('with a Pending Inserted Row, an appended row, a Pending Column, and deletions', async () => {
+        const pending = create_pending_row_store({ session_id: 'session' });
+        pending.append_rows('session', ['band-a', 'band-b'], template, 1, append_basis);
+        await render_structure({ pending_row_store: pending });
+        // Insert a row below row 1, a column right of A, then delete row 4 and
+        // column C. Each gesture moves the caret when the grid shows its
+        // result; wait for that, so it can't land on a selection made later.
+        const caret = () => (grid_mock.props!.gridSelection as {
+            current?: { cell: [number, number] };
+        }).current?.cell;
+        const gesture = async (open: () => Promise<void>, label: string, focused: [number, number]) => {
+            await select({});
+            await open();
+            await click(label);
+            await vi.waitFor(() => expect(caret()).toEqual(focused));
+        };
+        await gesture(() => open_row_menu(0), 'Insert row below', [0, 1]);
+        await gesture(() => open_header_menu(0), 'Insert column right', [1, 0]);
+        await gesture(() => open_row_menu(4), 'Delete row', [0, 5]);
+        await gesture(() => open_header_menu(3), 'Delete column', [2, 0]);
+        expect(inserted_rows(pending.snapshot())).toHaveLength(1);
+        expect(pending.snapshot().pendingColumns).toHaveLength(1);
+        expect(pending.snapshot().rowLayout?.removedSourceRows).toHaveLength(1);
+        expect(pending.snapshot().columnLayout?.removedSourceColumns).toHaveLength(1);
+        // Display rows: 0 source, 1 inserted, 2-3 source, 4 removed, 5-6 appended.
+        // Display columns: 0 A, 1 Pending Column, 2 B, 3 C (removed).
+        await expect(await capture_all([
+            ['row menu, Pending Inserted Row', async () => { await select({}); await open_row_menu(1); }],
+            ['row menu, source row below it', async () => { await select({}); await open_row_menu(2); }],
+            ['row menu, deleted row', async () => { await select({}); await open_row_menu(4); }],
+            ['row menu, deleted and live rows', async () => {
+                await select({ rows: compact([3, 4]) });
+                await open_row_menu(4);
+            }],
+            ['row menu, first appended row', async () => { await select({}); await open_row_menu(5); }],
+            ['row menu, last appended row', async () => { await select({}); await open_row_menu(6); }],
+            ['row menu, both appended rows', async () => {
+                await select({ rows: compact([5, 6]) });
+                await open_row_menu(6);
+            }],
+            ['row menu, source and appended rows', async () => {
+                await select({ rows: compact([3, 4, 5]) });
+                await open_row_menu(5);
+            }],
+            ['cell menu, Pending Inserted Row', async () => { await select({}); await open_cell_menu(0, 1); }],
+            ['cell menu, Pending Column cell', async () => { await select({}); await open_cell_menu(1, 2); }],
+            ['cell menu, deleted row', async () => { await select({}); await open_cell_menu(0, 4); }],
+            ['cell menu, deleted column', async () => { await select({}); await open_cell_menu(3, 2); }],
+            ['cell menu, last appended row', async () => { await select({}); await open_cell_menu(0, 6); }],
+            ['header menu, Pending Column', async () => { await select({}); await open_header_menu(1); }],
+            ['header menu, deleted column', async () => { await select({}); await open_header_menu(3); }],
+            ['header menu, source column beside them', async () => { await select({}); await open_header_menu(2); }],
+            ['header menu, Pending Column and A selected', async () => {
+                await select({ columns: compact([0, 1]) });
+                await open_header_menu(1);
+            }],
+            ['header menu, B and deleted C selected', async () => {
+                await select({ columns: compact([2, 3]) });
+                await open_header_menu(3);
+            }],
+        ])).toMatchFileSnapshot('./__snapshots__/structure-menus/pending-changes.txt');
+    });
+});

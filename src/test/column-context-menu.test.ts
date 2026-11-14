@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import {
     column_context_menu_items,
     header_column_can_be_renamed,
+    multi_column_context_menu_items,
 } from '../webview/column-context-menu';
 import { column_rename_error } from '../webview/rename-column-dialog';
 import { committed_column_name } from '../column-name';
@@ -146,5 +147,38 @@ describe('column context menu model', () => {
         expect(actionable.slice(2).every((item) => item.disabled)).toBe(true);
         expect(labels(items)).toContain('Edit filter…');
         expect(labels(items)).toContain('Clear filter on this column');
+    });
+});
+
+describe('column structure items', () => {
+    const item = (label: string) => ({ label, on_click: vi.fn() });
+    const structure = {
+        insert: [item('Insert 2 columns left'), item('Insert 2 columns right')],
+        delete: [item('Delete 2 columns'), item('Restore column')],
+        move: [item('Move columns left'), item('Move columns right')],
+    };
+
+    it('places Insert, Delete, Restore, and Move after Copy and Hide, in both header menus', () => {
+        const single = column_context_menu_items({
+            ...base(),
+            transform_sections: false,
+            hide_disabled_reason: 'Save the new column to hide it.',
+            structure,
+        });
+        expect(single.map((entry) => entry.kind === 'separator' ? '|' : entry.label)).toEqual([
+            'Copy column', 'Hide column', '|', 'Insert 2 columns left', 'Insert 2 columns right',
+            'Delete 2 columns', 'Restore column', 'Move columns left', 'Move columns right',
+        ]);
+        expect(single[1]).toMatchObject({ disabled: true, disabled_reason: 'Save the new column to hide it.' });
+        const multi = multi_column_context_menu_items({
+            column_count: 2,
+            transform_sections: false,
+            transform_disabled: false,
+            on_copy: vi.fn(),
+            on_hide: vi.fn(),
+            structure,
+            on_sort: vi.fn(),
+        });
+        expect(multi.slice(3)).toEqual([...structure.insert, ...structure.delete, ...structure.move]);
     });
 });

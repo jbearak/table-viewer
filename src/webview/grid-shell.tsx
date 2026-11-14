@@ -56,7 +56,6 @@ import {
     column_move_announcement,
     column_move_block_refusal,
     column_move_item_model,
-    column_structure_menu_model,
     default_pending_column_names,
     INSERT_COLUMN_CANCELED_MESSAGE,
     moved_block_display_columns,
@@ -76,8 +75,6 @@ import {
     plan_pending_column_update,
     resolve_column_move_drop,
     resolve_column_structure_selection,
-    type ColumnInsertItemModel,
-    type ColumnMoveItemModel,
     type ColumnStructureSelection,
     type PendingColumnCellEdit,
     type PendingColumnHighlightEdit,
@@ -106,7 +103,6 @@ import {
     ColumnContextMenu,
     header_column_can_be_renamed,
     MultiColumnContextMenu,
-    type ColumnStructureMenuActions,
 } from './column-context-menu';
 import {
     grid_selection_contains_column,
@@ -116,11 +112,14 @@ import {
     selected_source_columns,
     type HeaderDragState,
 } from './column-selection-model';
+import { row_context_menu_items } from './row-context-menu';
 import {
-    row_context_menu_items,
-    type RowStructureMenuActions,
-    type StructureMenuAction,
-} from './row-context-menu';
+    structure_menu_items,
+    type StructureGestures,
+    type StructureMenuItems,
+    type StructureMenuState,
+    type StructureMenuTarget,
+} from './structure-menu';
 import { use_row_marker_selection } from './use-row-marker-selection';
 import { draw_sort_glyphs, header_sort_metadata } from './header-sort-glyph';
 import {
@@ -608,11 +607,8 @@ import {
     row_move_block_refusal,
     row_move_item_model,
     row_structure_label,
-    row_structure_menu_model,
     merge_ranges_of,
     structure_auto_filter,
-    type InsertItemModel,
-    type MoveItemModel,
     type RowStructurePlan,
     type RowStructureSelection,
     type RowStructureSelectionOptions,
@@ -4529,13 +4525,16 @@ export function GridShell({
     const structure_gesture_admitted = useCallback((): boolean => (
         editable_cells_ref.current && structure_admission_open()
     ), [structure_admission_open]);
-    const delete_rows_gesture = useCallback((
-        runs: readonly RowSelectionRun[],
-        from_row: number,
-    ): boolean => {
+    const delete_rows_gesture = useCallback((runs: readonly RowSelectionRun[]): boolean => {
         if (!structure_gesture_admitted()) return false;
         const display_column = grid_selection_ref.current.current?.cell[0] ?? 0;
         const before = pending_store.snapshot();
+        // Where the first deleted row was, for focus once a deleted Pending
+        // Row has left the grid: the row after the deleted block lands there.
+        const first = runs[0];
+        const from_row = (first === undefined ? undefined : pending_projection_ref.current.display_row_for_identity(
+            first.kind === 'source' ? { kind: 'source', sourceRow: first.start } : first.identity,
+        )) ?? 0;
         // Pending Appended Rows alone leave the layout as it is: the existing
         // removal, under the Delete item's name.
         if (only_appended_runs(before, runs)) {
@@ -5464,26 +5463,6 @@ export function GridShell({
         void focus_new_row(appended.rowIds[0]!, display_column);
         return true;
     }, [admit_pending_rows, focus_new_row, structure_gesture_admitted]);
-    /** An Insert item's menu action: insert beside its anchor, or append below the band. */
-    const insert_menu_action = useCallback((
-        model: InsertItemModel,
-        side: 'before' | 'after',
-    ): StructureMenuAction => {
-        if (!model.enabled) {
-            return {
-                count: model.count,
-                ...(model.reason === undefined ? {} : { disabled_reason: model.reason }),
-            };
-        }
-        const anchor = model.anchor;
-        return {
-            count: model.count,
-            on_click: () => {
-                if (model.action === 'append') void append_rows_gesture(model.count);
-                else if (anchor !== undefined) void insert_rows_gesture(anchor, side, model.count);
-            },
-        };
-    }, [append_rows_gesture, insert_rows_gesture]);
     /**
      * After a Move, select the moved block where it now is, scroll its
      * leading row into view, and focus the grid. Polls the projection the grid
@@ -5554,19 +5533,6 @@ export function GridShell({
         pending_store,
         structure_gesture_admitted,
     ]);
-    const move_menu_action = useCallback((
-        model: MoveItemModel,
-        identities: readonly RowIdentity[],
-    ): StructureMenuAction => {
-        const before = model.before;
-        if (!model.enabled || before === undefined) {
-            return {
-                count: model.count,
-                ...(model.reason === undefined ? {} : { disabled_reason: model.reason }),
-            };
-        }
-        return { count: model.count, on_click: () => { move_rows_gesture(identities, before); } };
-    }, [move_rows_gesture]);
     /** Row moves are offered (by menu, shortcut, and drag) only where Insert and Delete are. */
     const row_moves_offered = structure_items_offered && structural_support !== undefined;
     /** A drag's block, resolved once per block rather than once per drop target. */
@@ -5838,11 +5804,11 @@ export function GridShell({
         structure_gesture_admitted,
         when_columns_show,
     ]);
-    /** Delete columns: one history action; focus moves to the nearest live column. */
-    const delete_columns_gesture = useCallback((
-        identities: readonly ColumnIdentity[],
-        from_display_column: number,
-    ): boolean => {
+    /**
+     * Delete columns: one history action. Focus moves to the nearest live
+     * column at or after the first deleted one, as a row Delete's does.
+     */
+    const delete_columns_gesture = useCallback((identities: readonly ColumnIdentity[]): boolean => {
         if (!structure_gesture_admitted()) return false;
         const plan = plan_column_delete(
             pending_store.snapshot(),
@@ -5856,6 +5822,8 @@ export function GridShell({
         }
         const focused_row = grid_selection_ref.current.current?.cell[1];
         const before_columns = projected_columns_ref.current;
+        const deleted_keys = new Set(identities.map(column_identity_key));
+        const from_display_column = Math.max(0, before_columns.findIndex((column) => deleted_keys.has(column.key)));
         if (!commit_row_structure_plan(plan)) return false;
         when_columns_show(
             (columns) => columns !== before_columns,
@@ -5926,59 +5894,6 @@ export function GridShell({
         structure_gesture_admitted,
         when_columns_show,
         write_grid_selection,
-    ]);
-    /** The structure items' actions for a header selection captured when its menu opened. */
-    const column_structure_actions = useCallback((
-        selection: ColumnStructureSelection,
-        from_display_column: number,
-    ): ColumnStructureMenuActions | undefined => {
-        if (!column_structure_offered || structural_support === undefined) return undefined;
-        const model = column_structure_menu_model({
-            support: structural_support.columns,
-            // Built while rendering, so from this render's own answer: the ref
-            // still holds the last commit's, and a menu opened as the session
-            // arrived would stay disabled.
-            ready: editable_cells && structure_admission_open(),
-            selection,
-            changes: pending_rows_ref.current,
-            context: structure_context,
-            columns: projected_columns,
-        });
-        const disabled = (count: number, reason: string | undefined): StructureMenuAction =>
-            ({ count, ...(reason === undefined ? {} : { disabled_reason: reason }) });
-        const insert = (item: ColumnInsertItemModel, side: 'before' | 'after'): StructureMenuAction =>
-            item.enabled && item.anchor !== undefined
-                ? { count: item.count, on_click: () => { void insert_columns_gesture(item.anchor!, side, Math.max(1, item.count)); } }
-                : disabled(item.count, item.reason);
-        const move = (item: ColumnMoveItemModel): StructureMenuAction =>
-            item.enabled && item.before !== undefined
-                ? { count: item.count, on_click: () => { move_columns_gesture(selection.identities, item.before!); } }
-                : disabled(item.count, item.reason);
-        return {
-            insert_left: insert(model.insertLeft, 'before'),
-            insert_right: insert(model.insertRight, 'after'),
-            delete: model.delete.enabled
-                ? { count: model.delete.count, on_click: () => { delete_columns_gesture(selection.identities, from_display_column); } }
-                : disabled(model.delete.count, model.delete.reason),
-            ...(model.restore === undefined ? {} : {
-                restore: model.restore.enabled
-                    ? { count: model.restore.count, on_click: () => { restore_columns_gesture(selection.removedSourceColumns); } }
-                    : disabled(model.restore.count, model.restore.reason),
-            }),
-            move_left: move(model.moveLeft),
-            move_right: move(model.moveRight),
-        };
-    }, [
-        column_structure_offered,
-        delete_columns_gesture,
-        editable_cells,
-        insert_columns_gesture,
-        move_columns_gesture,
-        projected_columns,
-        restore_columns_gesture,
-        structural_support,
-        structure_context,
-        structure_admission_open,
     ]);
     /** `Alt+Shift+←`/`→`: move the selected whole columns one step, or announce why not. */
     const move_columns_by_keyboard_ref = useRef<(direction: 'backward' | 'forward') => boolean>(() => false);
@@ -11286,51 +11201,56 @@ export function GridShell({
     );
 
     /**
-     * The row structure items for a selection, with their actions. Built
-     * while rendering, for the row menu and the cell menu alike.
+     * The worksheet's state for the open menu's structure items, read while
+     * rendering: from this render's own admission answer, since the ref still
+     * holds the last commit's and a menu opened as the session arrived would
+     * stay disabled. Undefined with no menu open, or where the menus offer no
+     * structure items.
      */
-    const row_structure_actions = (
-        selection: RowStructureSelection | undefined,
-        from_row: number,
-    ): RowStructureMenuActions | undefined => {
-        if (selection === undefined || structural_support === undefined) return undefined;
-        const model = row_structure_menu_model({
-            support: structural_support.rows,
-            // As for columns: from this render's own answer, and closed with
-            // the same admission every row gesture checks before it acts.
+    const structure_menu_state: StructureMenuState | undefined = context_menu !== null
+        && structure_items_offered
+        && structural_support !== undefined
+        ? {
+            support: structural_support,
             ready: editable_cells && structure_admission_open(),
-            selection,
             changes: pending_rows,
             context: structure_context,
+            columns: projected_columns,
             ...(may_append_rows ? {} : {
-                appendRefusal: !can_request_append_rows
+                append_refusal: !can_request_append_rows
                     ? 'Rows can\'t be appended to this sheet right now.'
                     : stored_pending_rows(pending_rows).length >= MAX_PENDING_APPENDED_ROWS
                         ? TOO_MANY_PENDING_ROWS_MESSAGE
                         : 'Appending another row would exceed the worksheet row limit.',
             }),
-        });
-        return {
-            insert_rows_above: insert_menu_action(model.insertAbove, 'before'),
-            insert_rows_below: insert_menu_action(model.insertBelow, 'after'),
-            delete_rows: {
-                count: model.delete.count,
-                ...(model.delete.enabled
-                    ? { on_click: () => { delete_rows_gesture(selection.runs ?? [], from_row); } }
-                    : { disabled_reason: model.delete.reason }),
-            },
-            move_rows_up: move_menu_action(model.moveUp, selection.identities ?? []),
-            move_rows_down: move_menu_action(model.moveDown, selection.identities ?? []),
-            ...(model.restore === undefined ? {} : {
-                restore_rows: {
-                    count: model.restore.count,
-                    ...(model.restore.enabled
-                        ? { on_click: () => { restore_rows_gesture(selection.removedSourceRuns); } }
-                        : { disabled_reason: model.restore.reason }),
-                },
-            }),
-        };
-    };
+        }
+        : undefined;
+    const structure_gestures = useMemo((): StructureGestures => ({
+        insert_rows: insert_rows_gesture,
+        append_rows: append_rows_gesture,
+        delete_rows: delete_rows_gesture,
+        restore_rows: restore_rows_gesture,
+        move_rows: move_rows_gesture,
+        insert_columns: insert_columns_gesture,
+        delete_columns: delete_columns_gesture,
+        restore_columns: restore_columns_gesture,
+        move_columns: move_columns_gesture,
+    }), [
+        append_rows_gesture,
+        delete_columns_gesture,
+        delete_rows_gesture,
+        insert_columns_gesture,
+        insert_rows_gesture,
+        move_columns_gesture,
+        move_rows_gesture,
+        restore_columns_gesture,
+        restore_rows_gesture,
+    ]);
+    /** The structure items for a selection captured when its menu opened. */
+    const structure_items = (target: StructureMenuTarget | undefined): StructureMenuItems | undefined =>
+        target === undefined || structure_menu_state === undefined
+            ? undefined
+            : structure_menu_items(target, structure_menu_state, structure_gestures);
     // The rows and columns the cell menu's Insert and Delete items act on:
     // those the selection spans, or the clicked cell's own row beside a
     // column selection and its own column beside a row selection.
@@ -11372,10 +11292,10 @@ export function GridShell({
         const has_explicit_column_selection = grid_selection.columns.length > 0;
         const has_explicit_row_selection = grid_selection.rows.length > 0;
         const selected_rows = selected_display_row_intervals(grid_selection, row_count);
-        const row_structure = row_structure_actions(cell_menu_structure?.rows, row);
-        const column_structure = cell_menu_structure === undefined
-            ? undefined
-            : column_structure_actions(cell_menu_structure.columns, display_col);
+        const row_structure = structure_items(cell_menu_structure
+            && { axis: 'rows', selection: cell_menu_structure.rows });
+        const column_structure = structure_items(cell_menu_structure
+            && { axis: 'columns', selection: cell_menu_structure.columns });
         // Columns the selection spans; hide targets all of them (falls back to
         // the clicked column when the selection maps to nothing usable). A
         // Pending Column has no source column to hide until it is saved.
@@ -11597,8 +11517,9 @@ export function GridShell({
             on_select_row: () => select_row(row),
             on_select_column: () => select_column(display_col),
             on_select_all: select_all,
-            ...(row_structure === undefined ? {} : { row_structure }),
-            ...(column_structure === undefined ? {} : { column_structure }),
+            ...(row_structure === undefined || column_structure === undefined
+                ? {}
+                : { structure: { rows: row_structure, columns: column_structure } }),
         });
     }
 
@@ -11844,7 +11765,8 @@ export function GridShell({
                 const only_removals = selected_removal_rows.size === selected_row_count;
                 const has_structural_rows = selected_pending_ids.size > 0
                     || selected_removal_rows.size > 0;
-                const structure = row_structure_actions(row_menu.structure, row_menu.row);
+                const structure = structure_items(row_menu.structure
+                    && { axis: 'rows', selection: row_menu.structure });
                 return (
                     <ContextMenu
                         x={row_menu.x}
@@ -11889,7 +11811,7 @@ export function GridShell({
                                 pending_row_count: selected_pending_ids.size,
                                 show_disabled_remove_pending_rows: true,
                             } : {}),
-                            ...structure,
+                            ...(structure === undefined ? {} : { structure }),
                             ...(only_removals ? {
                                 on_cancel_row_removals: () => {
                                     const before = pending_store.snapshot();
@@ -11944,10 +11866,7 @@ export function GridShell({
             })()}
             {context_menu?.kind === 'multi-column' && (() => {
                 const has_pending = context_menu.source_cols.length < context_menu.display_cols.length;
-                const structure = column_structure_actions(
-                    context_menu.structure,
-                    context_menu.display_cols[0] ?? 0,
-                );
+                const structure = structure_items({ axis: 'columns', selection: context_menu.structure });
                 return (
                 <MultiColumnContextMenu
                     x={context_menu.x}
@@ -11981,7 +11900,7 @@ export function GridShell({
             })()}
             {context_menu?.kind === 'header' && context_menu.source_col === undefined && (() => {
                 // A Pending Column: no source column to sort, filter, or hide by.
-                const pending_structure = column_structure_actions(context_menu.structure, context_menu.display_col);
+                const pending_structure = structure_items({ axis: 'columns', selection: context_menu.structure });
                 return (
                     <ColumnContextMenu
                         x={context_menu.x}
@@ -12033,7 +11952,7 @@ export function GridShell({
                     key.colIndex === source_column);
                 const existing_filter = transform_state.filters.find((entry) =>
                     entry.colIndex === source_column);
-                const structure = column_structure_actions(context_menu.structure, context_menu.display_col);
+                const structure = structure_items({ axis: 'columns', selection: context_menu.structure });
                 // A column with a structure change other than a removal renames
                 // only as a Pending Column does; renaming a source column's
                 // header stays the `.xlsx` header edit it was.

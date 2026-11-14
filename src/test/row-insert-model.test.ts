@@ -1,6 +1,6 @@
 // Row insert in the webview model (row and column structure design, delivery
-// step 6): the Insert items of the row-gutter menu and their gating, planning
-// one history action per gesture with undo and redo, the anchor check a host
+// step 6): planning one history action per gesture with undo and redo (the
+// Insert items and their gating are in structure-menu.test.ts), the anchor check a host
 // reply meets, the projection of inserted rows, and "Keep new rows at the end"
 // with its undo.
 import { describe, expect, it } from 'vitest';
@@ -19,41 +19,26 @@ import { history_menu_projection } from '../webview/history-menu-projection';
 import { plan_pending_row_history_replay } from '../webview/pending-row-history';
 import { create_pending_row_projection } from '../webview/pending-row-projection';
 import {
-    APPENDED_BAND_MESSAGE,
     keep_inserted_rows_at_end,
     STRUCTURE_CELL_MOVE_MESSAGE,
-    STRUCTURE_TAIL_REMOVAL_MESSAGE,
     STRUCTURE_TRANSFORMED_MESSAGE,
-    TOO_MANY_PENDING_ROWS_MESSAGE,
     type WorksheetStructureContext,
 } from '../webview/pending-row-store';
 import {
     has_inserted_or_moved_rows,
-    INSERT_ABOVE_HEADER_MESSAGE,
-    INSERT_ONLY_REMOVED_ROWS_MESSAGE,
     insert_anchor_is_live,
     insert_created_order,
     plan_row_delete,
     plan_row_insert,
     resolve_row_structure_selection,
-    row_insert_label,
-    row_structure_menu_model,
-    ROWS_NOT_LOADED_MESSAGE,
-    SELECT_ADJACENT_ROWS_MESSAGE,
-    STRUCTURE_BUSY_MESSAGE,
     type RowStructurePlanResult,
-    type RowStructureSelection,
-    row_structure_selection,
 } from '../webview/row-structure-model';
-import { row_context_menu_items } from '../webview/row-context-menu';
-import type { ActionMenuItem } from '../webview/context-menu';
 
 const worksheet: WorksheetTarget = { sheetIndex: 0, sheetName: 'data' };
 const template = { id: 'plain', format: { kind: 'none' as const } };
 const EMPTY: PendingStructuralChanges = { formatTemplates: [], appendedRows: [], tailRemovals: [], conflicts: [] };
 const BASIS = { kind: 'delimited' as const, byteLength: 40, digest: 'abc', sourceRowCount: 10, sourceColumnCount: 2 };
 const APPEND_BASIS = { sourceRowCount: 10, columnCount: 2, schemaFingerprint: 'sha256:x' };
-const supported = { supported: true as const };
 
 function context(overrides: Partial<WorksheetStructureContext> = {}): WorksheetStructureContext {
     return {
@@ -93,35 +78,6 @@ function insert(
 
 function appended(id: string, createdOrder: number): PendingAppendedRow {
     return { id, cells: {}, formatTemplateId: 'plain', createdOrder };
-}
-
-function selection(overrides: Partial<RowStructureSelection>): RowStructureSelection {
-    return row_structure_selection({
-        count: 1,
-        identities: [source(2)],
-        removedSourceRows: [],
-        fixedRows: false,
-        tailRemovals: false,
-        contiguous: true,
-        bandRows: 0,
-        endsAtBandEnd: false,
-        ...overrides,
-    } as Parameters<typeof row_structure_selection>[0]);
-}
-
-function menu(
-    changes: PendingStructuralChanges,
-    overrides: Partial<RowStructureSelection>,
-    options: { ready?: boolean; ctx?: WorksheetStructureContext; appendRefusal?: string } = {},
-) {
-    return row_structure_menu_model({
-        support: supported,
-        ready: options.ready ?? true,
-        selection: selection(overrides),
-        changes,
-        context: options.ctx ?? context(),
-        ...(options.appendRefusal === undefined ? {} : { appendRefusal: options.appendRefusal }),
-    });
 }
 
 describe('planning an insert', () => {
@@ -210,88 +166,6 @@ describe('the anchor check a host reply meets', () => {
         expect(insert_anchor_is_live(inserted, context(), pending('a'))).toBe(true);
         const gone = planned(plan_row_delete(inserted, context(), [pending('a')], new Map())).outcome.next;
         expect(insert_anchor_is_live(gone, context(), pending('a'))).toBe(false);
-    });
-});
-
-describe('the Insert items', () => {
-    it('offers Insert above and below for contiguous body rows, anchored on the selection’s ends', () => {
-        const model = menu(EMPTY, { count: 3, identities: [source(2), source(3), source(4)] });
-        expect(model.insertAbove).toEqual({ count: 3, enabled: true, action: 'insert', anchor: source(2) });
-        expect(model.insertBelow).toEqual({ count: 3, enabled: true, action: 'insert', anchor: source(4) });
-    });
-
-    it('disables both with the spec’s reasons', () => {
-        const reason = (overrides: Partial<RowStructureSelection>, options = {}) =>
-            menu(EMPTY, overrides, options).insertAbove.reason;
-        expect(reason({ contiguous: false, count: 2, identities: [source(1), source(5)] }))
-            .toBe(SELECT_ADJACENT_ROWS_MESSAGE);
-        expect(reason({}, { ctx: context({ bodyViewTransformed: true }) })).toBe(STRUCTURE_TRANSFORMED_MESSAGE);
-        expect(reason({ fixedRows: true })).toBe(INSERT_ABOVE_HEADER_MESSAGE);
-        expect(reason({ tailRemovals: true })).toBe(STRUCTURE_TAIL_REMOVAL_MESSAGE);
-        expect(reason({ identities: undefined })).toBe(ROWS_NOT_LOADED_MESSAGE);
-        expect(reason({}, { ready: false })).toBe(STRUCTURE_BUSY_MESSAGE);
-        expect(reason({}, { ctx: context({ hasPendingCellMove: () => true }) })).toBe(STRUCTURE_CELL_MOVE_MESSAGE);
-        expect(row_structure_menu_model({
-            support: { supported: false, reason: 'Not available yet' },
-            ready: true,
-            selection: selection({}),
-            changes: EMPTY,
-            context: context(),
-        }).insertBelow.reason).toBe('Not available yet');
-        // A selection of only deleted rows has nothing live to anchor on.
-        const deleted = planned(plan_row_delete(EMPTY, context(), [source(2)], new Map())).outcome.next;
-        expect(menu(deleted, { removedSourceRows: [2] }).insertBelow.reason).toBe(INSERT_ONLY_REMOVED_ROWS_MESSAGE);
-    });
-
-    it('keeps the append band at the end: Insert below its last row appends', () => {
-        const band = { ...EMPTY, formatTemplates: [template], appendedRows: [appended('x', 1), appended('y', 2)] };
-        const last = { identities: [pending('y')], bandRows: 1, endsAtBandEnd: true };
-        expect(menu(band, last).insertBelow).toEqual({ count: 1, enabled: true, action: 'append' });
-        expect(menu(band, last).insertAbove.reason).toBe(APPENDED_BAND_MESSAGE);
-        expect(menu(band, last, { appendRefusal: 'full' }).insertBelow)
-            .toEqual({ count: 1, enabled: false, reason: 'full', action: 'append' });
-        // Not the band's last row, or a selection spanning body and band.
-        expect(menu(band, { identities: [pending('x')], bandRows: 1 }).insertBelow.reason)
-            .toBe(APPENDED_BAND_MESSAGE);
-        expect(menu(band, {
-            count: 2,
-            identities: [source(9), pending('x')],
-            bandRows: 1,
-        }).insertBelow.reason).toBe(APPENDED_BAND_MESSAGE);
-    });
-
-    it('refuses an over-limit selection before building any probe IDs', () => {
-        // Larger than any array can be: allocating one probe ID per row would throw.
-        const huge = 2 ** 32;
-        const model = menu(EMPTY, { count: huge, identities: [source(2), source(3)] });
-        expect(model.insertAbove).toEqual({
-            count: huge,
-            enabled: false,
-            reason: TOO_MANY_PENDING_ROWS_MESSAGE,
-            action: 'insert',
-        });
-        expect(model.insertBelow.reason).toBe(TOO_MANY_PENDING_ROWS_MESSAGE);
-    });
-
-    it('labels the items "Insert row above" and "Insert N rows below", with their reasons', () => {
-        expect(row_insert_label('above', 1)).toBe('Insert row above');
-        expect(row_insert_label('below', 3)).toBe('Insert 3 rows below');
-        const items = row_context_menu_items({
-            selected_row_count: 2,
-            can_hide_rows: false,
-            can_promote_row_to_header: false,
-            on_hide_rows: () => {},
-            on_promote_row_to_header: () => {},
-            on_copy_rows: () => {},
-            insert_rows_above: { count: 2, on_click: () => {} },
-            insert_rows_below: { count: 2, disabled_reason: SELECT_ADJACENT_ROWS_MESSAGE },
-            delete_rows: { count: 2, on_click: () => {} },
-        }) as ActionMenuItem[];
-        expect(items.map((item) => item.label)).toEqual([
-            'Insert 2 rows above', 'Insert 2 rows below', 'Delete 2 rows', 'Copy 2 rows',
-        ]);
-        expect(items[1]).toMatchObject({ disabled: true, disabled_reason: SELECT_ADJACENT_ROWS_MESSAGE });
-        expect(items[0]?.disabled).toBeUndefined();
     });
 });
 

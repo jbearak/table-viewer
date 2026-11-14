@@ -1,5 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
+import type { ActionMenuItem } from '../webview/context-menu';
 import { row_context_menu_items } from '../webview/row-context-menu';
+import type { StructureMenuItems } from '../webview/structure-menu';
 
 function labels(
     selected_row_count: number,
@@ -127,49 +129,30 @@ describe('row structure items', () => {
         on_promote_row_to_header: vi.fn(),
         on_copy_rows: vi.fn(),
     };
-    const shown = (items: ReturnType<typeof row_context_menu_items>) =>
-        items.flatMap((item) => item.kind === 'separator' || item.kind === 'submenu' ? [] : [{
-            label: item.label,
-            disabled: item.disabled === true,
-            reason: item.disabled_reason,
-        }]);
+    const item = (label: string): ActionMenuItem => ({ label, on_click: vi.fn() });
+    const structure: StructureMenuItems = {
+        insert: [item('Insert 2 rows above'), item('Insert 2 rows below')],
+        delete: [item('Delete 2 rows'), { ...item('Restore row'), disabled: true, disabled_reason: 'Not yet' }],
+        move: [item('Move rows up'), item('Move rows down')],
+    };
+    const labels_of = (items: ReturnType<typeof row_context_menu_items>) =>
+        items.flatMap((entry) => entry.kind === 'separator' || entry.kind === 'submenu' ? [] : [entry.label]);
 
-    it('replaces Remove pending rows with Delete, and adds Restore', () => {
-        const on_delete = vi.fn();
-        const items = row_context_menu_items({
-            ...base,
-            on_remove_pending_rows: vi.fn(),
-            delete_rows: { count: 2, on_click: on_delete },
-            restore_rows: { count: 2, on_click: vi.fn() },
-        });
-        expect(shown(items)).toEqual([
-            { label: 'Delete 2 rows', disabled: false, reason: undefined },
-            { label: 'Restore 2 rows', disabled: false, reason: undefined },
-            { label: 'Hide 2 rows', disabled: false, reason: undefined },
-            { label: 'Copy 2 rows', disabled: false, reason: undefined },
+    it('places Insert, Delete, Restore, and Move as given, replacing Remove pending rows', () => {
+        const items = row_context_menu_items({ ...base, on_remove_pending_rows: vi.fn(), structure });
+        expect(labels_of(items)).toEqual([
+            'Insert 2 rows above', 'Insert 2 rows below', 'Delete 2 rows', 'Restore row',
+            'Move rows up', 'Move rows down', 'Hide 2 rows', 'Copy 2 rows',
         ]);
-        const remove = items[0];
-        if (remove.kind === 'separator' || remove.kind === 'submenu') throw new Error('not an item');
-        remove.on_click({} as never);
-        expect(on_delete).toHaveBeenCalledOnce();
+        expect(items[3]).toBe(structure.delete[1]);
     });
 
-    it('keeps a disabled structure item with its reason', () => {
-        expect(shown(row_context_menu_items({
+    it('keeps Cancel row removal for tail removals beside the structure items', () => {
+        expect(labels_of(row_context_menu_items({
             ...base,
             selected_row_count: 1,
-            delete_rows: { count: 1, disabled_reason: 'Not available yet' },
-        }))[0]).toEqual({ label: 'Delete row', disabled: true, reason: 'Not available yet' });
-    });
-
-    it('keeps Cancel row removal for tail removals beside Delete', () => {
-        expect(shown(row_context_menu_items({
-            ...base,
-            selected_row_count: 1,
-            delete_rows: { count: 1, disabled_reason: 'Save or redo the row removal first.' },
             on_cancel_row_removals: vi.fn(),
-        })).map((item) => item.label)).toEqual([
-            'Delete row', 'Cancel row removal', 'Hide row', 'Copy row',
-        ]);
+            structure: { insert: [], delete: [item('Delete row')], move: [] },
+        }))).toEqual(['Delete row', 'Cancel row removal', 'Hide row', 'Copy row']);
     });
 });

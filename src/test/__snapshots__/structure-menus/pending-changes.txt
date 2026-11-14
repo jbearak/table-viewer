@@ -1,0 +1,277 @@
+## row menu, Pending Inserted Row (Row actions for row 2)
+Insert row above
+Insert row below
+Delete row
+Move rows up
+Move rows down
+Hide row  [disabled: Save or discard inserted and moved rows to sort, filter, or hide rows.]
+Copy row
+
+## row menu, source row below it (Row actions for row 3)
+Insert row above
+Insert row below
+Delete row
+Move rows up
+Move rows down
+Hide row  [disabled: Save or discard inserted and moved rows to sort, filter, or hide rows.]
+Copy row
+
+## row menu, deleted row (Row actions for row 5)
+Insert row above  [disabled: Select a row that isn't deleted to insert rows beside it.]
+Insert row below  [disabled: Select a row that isn't deleted to insert rows beside it.]
+Delete row  [disabled: Select at least one row that isn't deleted.]
+Restore row
+Move rows up  [disabled: Select a row that isn't deleted to move it.]
+Move rows down  [disabled: Select a row that isn't deleted to move it.]
+Hide row  [disabled: Save or discard inserted and moved rows to sort, filter, or hide rows.]
+Copy row
+
+## row menu, deleted and live rows (Row actions for 2 selected rows)
+Insert 2 rows above
+Insert 2 rows below
+Delete 2 rows
+Restore row  [disabled: Select only deleted rows to restore them.]
+Move rows up
+Move rows down  [disabled: Appended rows stay at the end until you save.]
+Hide 2 rows  [disabled: Save or discard inserted and moved rows to sort, filter, or hide rows.]
+Copy 2 rows
+
+## row menu, first appended row (Row actions for row 5)
+Insert row above  [disabled: Appended rows stay at the end until you save.]
+Insert row below  [disabled: Appended rows stay at the end until you save.]
+Delete row
+Move rows up  [disabled: Appended rows stay at the end until you save.]
+Move rows down  [disabled: Appended rows stay at the end until you save.]
+Hide row  [disabled: Save or discard inserted and moved rows to sort, filter, or hide rows.]
+Copy row
+
+## row menu, last appended row (Row actions for row 6)
+Insert row above  [disabled: Appended rows stay at the end until you save.]
+Insert row below
+Delete row
+Move rows up  [disabled: Appended rows stay at the end until you save.]
+Move rows down  [disabled: Appended rows stay at the end until you save.]
+Hide row  [disabled: Save or discard inserted and moved rows to sort, filter, or hide rows.]
+Copy row
+
+## row menu, both appended rows (Row actions for 2 selected rows)
+Insert 2 rows above  [disabled: Appended rows stay at the end until you save.]
+Insert 2 rows below
+Delete 2 rows
+Move rows up  [disabled: Appended rows stay at the end until you save.]
+Move rows down  [disabled: Appended rows stay at the end until you save.]
+Hide 2 rows  [disabled: Save or discard inserted and moved rows to sort, filter, or hide rows.]
+Copy 2 rows
+
+## row menu, source and appended rows (Row actions for 3 selected rows)
+Insert 3 rows above  [disabled: Appended rows stay at the end until you save.]
+Insert 3 rows below  [disabled: Appended rows stay at the end until you save.]
+Delete 3 rows
+Restore row  [disabled: Select only deleted rows to restore them.]
+Move rows up  [disabled: Appended rows stay at the end until you save.]
+Move rows down  [disabled: Appended rows stay at the end until you save.]
+Hide 3 rows  [disabled: Save or discard inserted and moved rows to sort, filter, or hide rows.]
+Copy 3 rows
+
+## cell menu, Pending Inserted Row (Context menu)
+Highlight yellow
+Highlight green
+Highlight blue
+Highlight pink
+---
+Copy cell
+---
+Insert >
+    Insert row above
+    Insert row below
+    Insert column left
+    Insert column right
+Delete >
+    Delete row
+    Delete column
+---
+Select >
+    Select row
+    Select column
+    Select all
+Hide >
+    Hide row  [disabled: Save or discard inserted and moved rows to sort, filter, or hide rows.]
+    Hide column
+
+## cell menu, Pending Column cell (Context menu)
+Highlight yellow
+Highlight green
+Highlight blue
+Highlight pink
+---
+Copy cell
+---
+Insert >
+    Insert row above
+    Insert row below
+    Insert column left
+    Insert column right
+Delete >
+    Delete row
+    Delete column
+---
+Select >
+    Select row
+    Select column
+    Select all
+Hide >
+    Hide row  [disabled: Save or discard inserted and moved rows to sort, filter, or hide rows.]
+    Hide column  [disabled: Save the new column to hide it.]
+
+## cell menu, deleted row (Context menu)
+Highlight yellow
+Highlight green
+Highlight blue
+Highlight pink
+---
+Copy cell
+---
+Insert >
+    Insert row above  [disabled: Select a row that isn't deleted to insert rows beside it.]
+    Insert row below  [disabled: Select a row that isn't deleted to insert rows beside it.]
+    Insert column left
+    Insert column right
+Delete >
+    Delete row  [disabled: Select at least one row that isn't deleted.]
+    Restore row
+    Delete column
+---
+Select >
+    Select row
+    Select column
+    Select all
+Hide >
+    Hide row  [disabled: Save or discard inserted and moved rows to sort, filter, or hide rows.]
+    Hide column
+
+## cell menu, deleted column (Context menu)
+Highlight yellow
+Highlight green
+Highlight blue
+Highlight pink
+---
+Copy cell
+---
+Insert >
+    Insert row above
+    Insert row below
+    Insert column left  [disabled: Select a column that isn't deleted to insert columns beside it.]
+    Insert column right  [disabled: Select a column that isn't deleted to insert columns beside it.]
+Delete >
+    Delete row
+    Delete column  [disabled: Select at least one column that isn't deleted.]
+    Restore column
+---
+Select >
+    Select row
+    Select column
+    Select all
+Hide >
+    Hide row  [disabled: Save or discard inserted and moved rows to sort, filter, or hide rows.]
+    Hide column
+
+## cell menu, last appended row (Context menu)
+Highlight yellow
+Highlight green
+Highlight blue
+Highlight pink
+---
+Copy cell
+---
+Insert >
+    Insert row above  [disabled: Appended rows stay at the end until you save.]
+    Insert row below
+    Insert column left
+    Insert column right
+Delete >
+    Delete row
+    Delete column
+---
+Select >
+    Select row
+    Select column
+    Select all
+Hide >
+    Hide row  [disabled: Save or discard inserted and moved rows to sort, filter, or hide rows.]
+    Hide column
+
+## header menu, Pending Column (Column actions for New column)
+Copy column
+Hide column  [disabled: Save the new column to hide it.]
+Rename column…
+---
+Insert column left
+Insert column right
+Delete column
+Move columns left
+Move columns right
+---
+Sort ascending  [disabled: Save the new column to sort or filter by it.]
+Sort descending  [disabled: Save the new column to sort or filter by it.]
+---
+Filter…  [disabled: Save the new column to sort or filter by it.]
+
+## header menu, deleted column (Column actions for C name)
+Copy column
+Hide column
+Rename column…  [disabled: Only new columns can be renamed on this sheet.]
+---
+Insert column left  [disabled: Select a column that isn't deleted to insert columns beside it.]
+Insert column right  [disabled: Select a column that isn't deleted to insert columns beside it.]
+Delete column  [disabled: Select at least one column that isn't deleted.]
+Restore column
+Move columns left  [disabled: Select a column that isn't deleted to move it.]
+Move columns right  [disabled: Select a column that isn't deleted to move it.]
+---
+Sort ascending  [disabled: Save or discard inserted and moved rows to sort, filter, or hide rows.]
+Sort descending  [disabled: Save or discard inserted and moved rows to sort, filter, or hide rows.]
+---
+Filter…  [disabled: Save or discard inserted and moved rows to sort, filter, or hide rows.]
+
+## header menu, source column beside them (Column actions for B name)
+Copy column
+Hide column
+Rename column…  [disabled: Only new columns can be renamed on this sheet.]
+---
+Insert column left
+Insert column right
+Delete column
+Move columns left
+Move columns right  [disabled: The selected columns are already at the right edge.]
+---
+Sort ascending  [disabled: Save or discard inserted and moved rows to sort, filter, or hide rows.]
+Sort descending  [disabled: Save or discard inserted and moved rows to sort, filter, or hide rows.]
+---
+Filter…  [disabled: Save or discard inserted and moved rows to sort, filter, or hide rows.]
+
+## header menu, Pending Column and A selected (Column actions for 2 selected columns)
+Copy 2 columns
+Hide 2 columns  [disabled: Save the new column to hide it.]
+---
+Insert 2 columns left
+Insert 2 columns right
+Delete 2 columns
+Move columns left  [disabled: The selected columns are already at the left edge.]
+Move columns right
+---
+Sort ascending  [disabled: Save or discard inserted and moved rows to sort, filter, or hide rows.]
+Sort descending  [disabled: Save or discard inserted and moved rows to sort, filter, or hide rows.]
+
+## header menu, B and deleted C selected (Column actions for 2 selected columns)
+Copy 2 columns
+Hide 2 columns
+---
+Insert 2 columns left
+Insert 2 columns right
+Delete 2 columns
+Restore column  [disabled: Select only deleted columns to restore them.]
+Move columns left
+Move columns right  [disabled: The selected columns are already at the right edge.]
+---
+Sort ascending  [disabled: Save or discard inserted and moved rows to sort, filter, or hide rows.]
+Sort descending  [disabled: Save or discard inserted and moved rows to sort, filter, or hide rows.]
