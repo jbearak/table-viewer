@@ -9582,9 +9582,9 @@ export function GridShell({
                 overlay_opening_ref.current = true;
                 opened = grid_ref.current?.openOverlay(intent.cell, intent.initial) === true;
                 if (!opened) overlay_opening_ref.current = false;
-                // An Enter or Tab typed while waiting. Synchronous for the same
-                // reason openOverlay is: the next key must find the editor
-                // closed and the selection moved.
+                // An Enter or Tab typed while waiting. Commit synchronously, as
+                // openOverlay opens, so the next key finds the editor closed
+                // and the selection moved.
                 const commit = open_editor_commit_ref.current;
                 const navigation = intent.commit;
                 if (opened && navigation !== undefined && commit) {
@@ -10762,9 +10762,9 @@ export function GridShell({
     // shortcuts) stay native to Glide, which steps past merges itself.
     const on_key_down = useCallback(
         (args: GridKeyEventArgs) => {
-            // An editor is waiting for the session to open. A key typed now is
-            // the editor's, not the grid's: Space must not activate the cell,
-            // Shift+Space select the row, Backspace clear it, or Tab move away
+            // An editor is waiting for the session to open, so a key typed now
+            // belongs to it. Left to the grid, Space would activate the cell,
+            // Shift+Space select the row, Backspace clear it, and Tab move away
             // from the edit.
             const waiting = overlay_intent_ref.current;
             if (waiting !== null && !is_editable_target(args.rawEvent?.target ?? null)) {

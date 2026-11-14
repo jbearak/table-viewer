@@ -102,8 +102,8 @@ export function held_editor_key(
         case 'default':
             break;
     }
-    // The caret sits at the end of typed text, so Delete removes nothing there;
-    // both keys remove a selected value.
+    // The caret sits at the end of typed text, so Delete removes nothing there.
+    // Either key removes a selected value.
     if (e.key === 'Backspace') return { kind: 'text', text: Array.from(text ?? '').slice(0, -1).join('') };
     if (e.key === 'Delete') return text === undefined ? { kind: 'text', text: '' } : { kind: 'hold' };
     // 'Dead' and 'Process' belong to a character still being composed.
