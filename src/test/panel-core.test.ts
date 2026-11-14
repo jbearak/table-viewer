@@ -3169,6 +3169,7 @@ describe('formula questions', () => {
             [1, 1, '=#REF!*2', '=B2*2'],
         ]);
         expect(answer.review.deletedCounts).toEqual([{ targetSheetIndex: 0, formulas: 2 }]);
+        expect(answer.review.totals).toEqual({ deleted: 2, changedRanges: 0, unadjustable: 0 });
     });
 
     it('answers null to layouts it cannot read, and nothing to an older source generation', async () => {
