@@ -21,6 +21,10 @@ export interface NodeFileRefreshWatcherOptions {
 type FileStamp = string;
 const ABSENT: FileStamp = 'absent';
 
+function stamp_of(stat: fs.BigIntStats): FileStamp {
+    return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
+}
+
 /**
  * Node `fs.watch`-based implementation of `FileRefreshWatcher`, mirroring
  * `vscode-file-refresh-watcher.ts`: it watches the containing directory and
@@ -30,11 +34,14 @@ const ABSENT: FileStamp = 'absent';
  * `fs.watch` alone is not enough. On macOS it rides on FSEvents, which can
  * report a change seconds late or never. Under load the kernel drops events,
  * and libuv skips the notice that it did. A missed event would leave the view
- * on stale data for good, so an `fs.watchFile` stat poll runs alongside it.
- * Both sides compare the target's stamp with the last one either of them
- * reported. A change the native watcher caught is not reported a second time,
- * and any change after the last report always is, even the rest of a write the
- * native watcher reported only partway through.
+ * on stale data for good, so a stat poll runs alongside it. Both sides
+ * compare the target's stamp with the last one either of them reported, and
+ * the first is the stamp taken when watching starts. (`fs.watchFile` would
+ * compare against its own first sample instead, which a busy thread pool can
+ * take after a change, and then that change is never reported.) A change
+ * the native watcher caught is not reported a second time, and any change
+ * after the last report always is, even the rest of a write the native
+ * watcher reported only partway through.
  *
  * When directory watching is unavailable (missing directory, platform limits),
  * the poll is the only signal.
@@ -45,7 +52,7 @@ class NodeFileRefreshWatcher implements FileRefreshWatcher {
     private readonly target_key: string;
     private readonly poll_interval_ms: number;
     private fs_watcher: fs.FSWatcher | undefined;
-    private poll_listener: (() => void) | undefined;
+    private poll_timer: ReturnType<typeof setTimeout> | undefined;
     private last_stamp: FileStamp;
     private disposed = false;
 
@@ -71,8 +78,7 @@ class NodeFileRefreshWatcher implements FileRefreshWatcher {
 
     private stamp(): FileStamp {
         try {
-            const stat = fs.statSync(this.identity.filePath, { bigint: true });
-            return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
+            return stamp_of(fs.statSync(this.identity.filePath, { bigint: true }));
         } catch {
             return ABSENT;
         }
@@ -115,7 +121,7 @@ class NodeFileRefreshWatcher implements FileRefreshWatcher {
         this.fs_watcher = undefined;
     }
 
-    /** Called by `fs.watchFile` whenever two of its samples differ. It
+    /** Called when a poll's sample differs from the last reported stamp. It
      *  re-stats rather than trusting the sample, which may predate a stamp the
      *  native watcher has recorded since. */
     private reconcile(): void {
@@ -129,14 +135,23 @@ class NodeFileRefreshWatcher implements FileRefreshWatcher {
         else this.emit('change');
     }
 
+    /** Samples off the main thread, so a slow disk never blocks it; only a
+     *  sample that differs pays for `reconcile`'s synchronous stat. */
     private start_polling(): void {
-        if (this.disposed || this.poll_listener) return;
-        this.poll_listener = () => this.reconcile();
-        fs.watchFile(
-            this.identity.filePath,
-            { interval: this.poll_interval_ms },
-            this.poll_listener,
-        );
+        if (this.disposed || this.poll_timer !== undefined) return;
+        const poll = () => {
+            fs.promises.stat(this.identity.filePath, { bigint: true }).then(
+                stamp_of,
+                () => ABSENT,
+            ).then((sample) => {
+                if (this.disposed) return;
+                if (sample !== this.last_stamp) this.reconcile();
+                this.poll_timer = setTimeout(poll, this.poll_interval_ms);
+                this.poll_timer.unref?.();
+            });
+        };
+        this.poll_timer = setTimeout(poll, this.poll_interval_ms);
+        this.poll_timer.unref?.();
     }
 
     private emit(kind: FileRefreshWatcherEventKind): void {
@@ -168,9 +183,9 @@ class NodeFileRefreshWatcher implements FileRefreshWatcher {
             }
             this.fs_watcher = undefined;
         }
-        if (this.poll_listener) {
-            fs.unwatchFile(this.identity.filePath, this.poll_listener);
-            this.poll_listener = undefined;
+        if (this.poll_timer !== undefined) {
+            clearTimeout(this.poll_timer);
+            this.poll_timer = undefined;
         }
     }
 }
