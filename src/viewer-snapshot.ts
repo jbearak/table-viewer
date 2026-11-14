@@ -236,7 +236,7 @@ export interface WorksheetStructuralSupport {
     /**
      * CSV and TSV: fields in the shortest record, the header line included.
      * A column change writes every record at the prospective width, so a
-     * shorter record is padded, which Review Changes notes.
+     * shorter record is padded, which the Save button's description notes.
      */
     readonly shortestRowWidth?: number;
 }

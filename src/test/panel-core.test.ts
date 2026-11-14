@@ -3102,3 +3102,113 @@ describe('ViewerPanelCore', () => {
     });
 
 });
+
+// The two formula questions the webview asks about Pending Changes (the Save
+// warnings' review and the conflict notice's impact count) share one
+// cancellation path: only the latest question of each kind answers, and never
+// across a reload.
+describe('formula questions', () => {
+    /** `rows` rows; column C holds `=B{n}*2` on every row, so every formula names column B. */
+    function formula_source(rows: number): DataSource {
+        const cell = (row: number, column: number): RenderedCell => column === 2
+            ? { raw: '', formatted: '', rawType: 'number', formula: `=B${row + 1}*2`, bold: false, italic: false }
+            : { raw: String(row), formatted: String(row), rawType: 'number', bold: false, italic: false };
+        return {
+            meta: () => ({
+                hasFormatting: false,
+                sheets: [{
+                    name: 'Sheet1',
+                    rowCount: rows,
+                    sourceRowCount: rows,
+                    columnCount: 3,
+                    merges: [],
+                    hasFormatting: false,
+                    formulaCells: Array.from({ length: rows }, (_, row) => [row, 2]).flat(),
+                }],
+            }),
+            read_rows: (_sheet, start, count) => ({
+                startRow: start,
+                rows: Array.from({ length: Math.min(count, rows - start) }, (_, offset) =>
+                    [0, 1, 2].map((column) => cell(start + offset, column))),
+            }),
+            read_columns: (_sheet, start, count, columns) => ({
+                startRow: start,
+                rows: Array.from({ length: Math.min(count, rows - start) }, (_, offset) =>
+                    columns.map((column) => cell(start + offset, column))),
+            }),
+            close: () => {},
+        };
+    }
+    const column_b_deleted = [{
+        bodyStart: 0,
+        columnLayout: {
+            columns: [0, 1, 2].map((sourceColumn) => ({ kind: 'source' as const, sourceColumn })),
+            removedSourceColumns: [1],
+            discardedPendingColumns: [],
+        },
+        band: [],
+    }];
+    const divergence = (core: ViewerPanelCore, requestId: string, layouts: unknown = column_b_deleted) =>
+        core.handle_message({
+            type: 'requestFormulaDivergence',
+            requestId,
+            sourceGeneration: core.source_generation,
+            edits: [],
+            layouts,
+        } as WebviewMessage);
+
+    it('lists the formulas a deleted column breaks, as saved and as written', async () => {
+        const { panel, posted } = make_panel();
+        const core = new ViewerPanelCore(panel, formula_source(2));
+        await divergence(core, 'review-1');
+        const answer = posted.find((message) => message.type === 'formulaDivergence');
+        expect(answer).toMatchObject({ requestId: 'review-1', sourceGeneration: core.source_generation });
+        expect(answer.review.deleted.map((item: { row: number; column: number; formula: string; written: string }) =>
+            [item.row, item.column, item.formula, item.written])).toEqual([
+            [0, 1, '=#REF!*2', '=B1*2'],
+            [1, 1, '=#REF!*2', '=B2*2'],
+        ]);
+        expect(answer.review.deletedCounts).toEqual([{ targetSheetIndex: 0, formulas: 2 }]);
+    });
+
+    it('answers null to layouts it cannot read, and nothing to an older source generation', async () => {
+        const { panel, posted } = make_panel();
+        const core = new ViewerPanelCore(panel, formula_source(2));
+        await divergence(core, 'malformed', [{ bodyStart: 'x' }]);
+        expect(posted.find((message) => message.type === 'formulaDivergence'))
+            .toEqual({ type: 'formulaDivergence', requestId: 'malformed', sourceGeneration: core.source_generation, review: null });
+        posted.length = 0;
+        await core.handle_message({
+            type: 'requestFormulaDivergence',
+            requestId: 'stale',
+            sourceGeneration: core.source_generation - 1,
+            edits: [],
+            layouts: column_b_deleted,
+        } as WebviewMessage);
+        expect(posted.filter((message) => message.type === 'formulaDivergence')).toEqual([]);
+    });
+
+    it('lets a newer question of one kind supersede an older one, but not one of the other kind', async () => {
+        const { panel, posted } = make_panel();
+        const core = new ViewerPanelCore(panel, formula_source(20_000));
+        const state = { edits: [], layouts: column_b_deleted };
+        const first = divergence(core, 'review-old');
+        const impact = core.handle_message({
+            type: 'requestFormulaImpact',
+            requestId: 'impact-1',
+            sourceGeneration: core.source_generation,
+            before: state,
+            discard: { edits: [], layouts: [{ bodyStart: 0, band: [] }] },
+        } as WebviewMessage);
+        const second = divergence(core, 'review-new');
+        await Promise.all([first, impact, second]);
+        const answered = posted
+            .filter((message) => message.type === 'formulaDivergence' || message.type === 'formulaImpact')
+            .map((message) => message.requestId);
+        expect(answered).not.toContain('review-old');
+        expect(answered).toEqual(expect.arrayContaining(['review-new', 'impact-1']));
+        // Discarding the deletion restores every formula that would have shown #REF!.
+        expect(posted.find((message) => message.type === 'formulaImpact')?.impacts)
+            .toEqual({ discard: { ref: 0, moved: 20_000 } });
+    });
+});

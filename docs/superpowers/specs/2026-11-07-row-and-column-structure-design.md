@@ -324,11 +324,21 @@ their styles, merges, and formulas.
 
 ### Saving and discarding
 
-Save writes the prospective layout. Review Changes lists, per worksheet, the
-counts of inserted, deleted, and moved rows and columns, so the user can see
-what Save will remove before it becomes permanent. Exiting Edit mode with
-structural changes offers Save, Discard, and Cancel, as with any Pending
-Change. Discard restores the source layout.
+Save writes the prospective layout. The grid's tints are the record of what
+Save will insert, delete, and move, and the Save button's tooltip and
+accessible description count it per worksheet ("Save: 1 row inserted, 1
+column deleted."), naming a worksheet only in a workbook, and only when more
+than one has changes or the changed one isn't showing (ADR 0006). Discard
+restores the source layout.
+
+A pending-change notice appears under the grid, without a click, only for
+what the grid can't show: a refused Save, formulas that will show `#REF!`
+because a row or column they use was deleted ("2 formulas use column Price,
+which you deleted. After you save, they will show #REF!."), and the
+formulas "Where this differs from Excel" flags. The host answers both formula
+lists in one cooperative pass, asked about 150 ms after the layouts or edits
+last changed and cancelled by a newer question; `src/webview/pending-change-notices.ts`
+decides which notices show and what they say.
 
 ### External changes
 
@@ -371,7 +381,7 @@ Tail Removals is reconciled this way:
    this step catches. The Header Row toggle is disabled in Edit mode in the
    webview today; the host's `setExcelFirstRowHeader` handler now also refuses
    while any worksheet of the file has a layout change, so a stale message
-   cannot change it. Review Changes shows:
+   cannot change it. A pending-change notice shows:
 
 ```text
 Sales changed on disk after you inserted, deleted, or moved rows or columns.
@@ -722,7 +732,7 @@ bases exist to detect.
 ### Rendering formulas
 
 Rendering turns stored text and anchors into text for the current layouts. It
-is used by the editor, the calculator, the Review Changes list, and the save
+is used by the editor, the calculator, the Save warnings, and the save
 planner, so all four always agree.
 
 For each axis of each anchored reference, place every corner in the target
@@ -779,10 +789,11 @@ from the final state, so it cannot follow Excel in three narrow classes:
    reference renders `#REF!`, where Excel would shrink the range.
 
 The design accepts these differences rather than refusing the gestures, which
-would block ordinary edits whenever a row happens to be a range corner. Review
-Changes lists every formula that might be in any of these classes — "3 formulas have a
-range whose first or last row was moved or deleted; check them before
-saving." — with Go to cell.
+would block ordinary edits whenever a row happens to be a range corner. A
+pending-change notice lists every formula that might be in any of these
+classes, as Save writes it and as written, with Go to cell: "Moving rows
+changed the range in 1 formula. A row you moved was the first or last row of
+its range. Excel might adjust it differently, so check it before you save."
 
 The flag is a deliberate superset, decided per range reference and per axis:
 
@@ -1152,7 +1163,7 @@ If one rule would split into more than 64 rules, Save is refused with an
 `unsupportedStructure` conflict naming the worksheet and the rule's range. The
 structural support ships each rule's `sqref` and formulas with relative
 references, so the webview computes the split count as layout changes happen
-and Review Changes warns before Save: "Moving these rows would split the
+and a pending-change notice warns before Save: "Moving these rows would split the
 conditional formatting on B2:B500 into 70 rules. Save will refuse it."
 
 **Merges** keep these additional rules, all checked at action time:
@@ -1267,9 +1278,9 @@ verbatim and ragged records keep their width, as today. Otherwise the header
 line is parsed into raw fields with the CSV parser, not taken from the
 normalized `columnNames`, and those raw fields are permuted, with removed
 fields dropped and Pending Column headers inserted; then every record is
-written at the prospective width, so ragged rows are padded. Review Changes
-notes "Short rows will be padded to N columns" when a column change pads any
-row.
+written at the prospective width, so ragged rows are padded. The Save button's
+description adds "Short rows will be padded to N columns." when a column
+change pads any row.
 
 ## Webview
 
@@ -1462,7 +1473,7 @@ planning bytes, the host checks:
 - that no cell edit addresses a removed row or column.
 
 A failure is a structural rejection naming the worksheet and reason, shown in
-Review Changes.
+the layout-conflict notice.
 
 ### Receipt
 
@@ -1631,6 +1642,8 @@ unresolved intent.
 | History arms and replay | `history-stack-model.ts`, `pending-row-history.ts` |
 | Admission, publication, conflicts, receipts, rekey intent | `src/viewer-controller.ts` |
 | XLSX support scan | new `src/xlsx-structural-support.ts` |
+| Pending-change notices and the Save description | `src/webview/pending-change-notices.ts` |
+| Formula review for the notices (`#REF!` and flagged ranges) | `src/formula-divergence-review.ts` |
 | XLSX structural write | new `src/ooxml-surgery/worksheet-structure.ts`, `xlsx-package.ts` |
 | CSV/TSV write | `plan_csv_save`, `src/serialize-csv.ts` |
 

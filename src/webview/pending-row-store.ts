@@ -1567,7 +1567,7 @@ function rows_then_columns(
 }
 
 /**
- * Review Changes' "Discard row and column changes on <sheet>", offered when
+ * The layout-conflict notice's "Discard row and column changes on <sheet>", offered when
  * the file changed under a live layout change (`structuralBasisChanged`):
  * drop Pending Inserted Rows, Pending Columns, removals, moves, and
  * tombstones, leaving the source layout of the file as it is now and no
@@ -1608,7 +1608,7 @@ function without_basis_conflict(result: StructureResult): StructureResult {
 }
 
 /**
- * Review Changes' "Keep new rows at the end", offered beside the discard when
+ * The layout-conflict notice's "Keep new rows at the end", offered beside the discard when
  * the file changed under a live layout change: every live Pending Inserted
  * Row becomes a Pending Appended Row, in layout order, with `origin` set to
  * `append` and fresh `createdOrder`s after every Pending Row's (so after the

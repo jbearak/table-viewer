@@ -1,11 +1,11 @@
-// Review Changes' divergence list (design "Where this differs from Excel"):
+// The Save warnings' divergence list (design "Where this differs from Excel"):
 // every formula of the workbook whose range references the divergence flags
 // mark for the current layouts, source and pending, on the formula's own
 // worksheet and on others, at its prospective cell with its rendered text.
 import { describe, expect, it } from 'vitest';
 import type { ColumnWindow, DataSource, RenderedCell, WorkbookMeta } from '../data-source/interface';
 import { EMPTY_PENDING_STRUCTURAL_CHANGES, type PendingStructuralChanges } from '../pending-changes';
-import { delete_rows, move_rows, type WorksheetStructureContext } from '../webview/pending-row-store';
+import { delete_columns, delete_rows, move_rows, type WorksheetStructureContext } from '../webview/pending-row-store';
 import { formula_calculation_workbook, type FormulaCalculationLayout } from '../formula-calculation';
 import { formula_anchor_context } from '../formula-anchor-layout';
 import { anchor_formula, formula_divergence_flags, render_formula } from '../formula-anchors';
@@ -127,6 +127,7 @@ describe('review_formula_divergence', () => {
                 row: 4,
                 column: 2,
                 formula: '=SUM(A4:A5)',
+                written: '=SUM(A2:A5)',
                 classes: ['moved'],
                 axes: ['row'],
             },
@@ -136,12 +137,59 @@ describe('review_formula_divergence', () => {
                 row: 0,
                 column: 0,
                 formula: '=SUM(Data!A3:A5)',
+                written: '=SUM(Data!A2:A4)',
                 classes: ['moved'],
                 axes: ['row'],
             },
         ]);
         // A single-cell reference and a formula naming only an unchanged sheet are never flagged.
         expect(review.counts).toEqual([{ targetSheetIndex: 0, formulas: 2 }]);
+        // A move deletes nothing, so no formula will show #REF!.
+        expect(review.deleted).toEqual([]);
+        expect(review.deletedCounts).toEqual([]);
+    });
+
+    it('lists the formulas Save writes #REF! into, with the deleted rows and columns they name', () => {
+        // Worksheet row 3 (source row 2) deleted: Data!C7 `=A3` and Summary!A2
+        // `=Data!A3` lose their only cell. The ranges around it shrink instead.
+        const row_deleted = (() => {
+            const result = delete_rows(EMPTY_PENDING_STRUCTURAL_CHANGES, context, [{ kind: 'source', sourceRow: 2 }]);
+            if (!result.ok) throw new Error(result.refusal.message);
+            return result.outcome.next;
+        })();
+        const rows = review_formula_divergence(workbook(), [], [layout_of(row_deleted, 1), layout_of(undefined, 0)]);
+        expect(rows.deleted.map((item) => [item.sheetIndex, item.row, item.column, item.formula, item.written]))
+            .toEqual([
+                [0, 5, 2, '=#REF!', '=A3'],
+                [1, 1, 0, '=Data!#REF!', '=Data!A3'],
+            ]);
+        expect(rows.deleted.every((item) =>
+            item.targetSheetIndex === 0
+            && JSON.stringify(item.rows) === JSON.stringify([{ kind: 'source', sourceRow: 2 }])
+            && item.columns.length === 0)).toBe(true);
+        expect(rows.deletedCounts).toEqual([{ targetSheetIndex: 0, formulas: 2 }]);
+
+        // Column A deleted: every formula on the workbook names it.
+        const column_deleted = (() => {
+            const result = delete_columns(EMPTY_PENDING_STRUCTURAL_CHANGES, context, [{ kind: 'source', sourceColumn: 0 }]);
+            if (!result.ok) throw new Error(result.refusal.message);
+            return result.outcome.next;
+        })();
+        const columns = review_formula_divergence(workbook(), [], [
+            { ...layout_of(undefined, 1), columnLayout: column_deleted.columnLayout! },
+            layout_of(undefined, 0),
+        ]);
+        expect(columns.deleted.map((item) => `${item.sheetIndex}!${item.row}:${item.column} ${item.formula}`))
+            .toEqual([
+                '0!1:1 =SUM(#REF!)',
+                '0!6:1 =#REF!',
+                '1!0:0 =SUM(Data!#REF!)',
+                '1!1:0 =Data!#REF!',
+            ]);
+        expect(columns.deleted.every((item) =>
+            JSON.stringify(item.columns) === JSON.stringify([{ kind: 'source', sourceColumn: 0 }]))).toBe(true);
+        // Summary!A3 `=SUM(A1:A2)` names Summary only, which lost nothing.
+        expect(columns.deletedCounts).toEqual([{ targetSheetIndex: 0, formulas: 4 }]);
     });
 
     it('skips source formulas an edit replaces and formulas on deleted rows, and checks pending formulas', () => {

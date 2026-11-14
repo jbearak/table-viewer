@@ -2715,7 +2715,7 @@ export interface CsvStructuralSaveRejection {
     readonly pendingRowIds: readonly string[];
     readonly tailRemovalIds: readonly string[];
     readonly formulaCells?: PendingStructuralConflict['formulaCells'];
-    /** An `unsupportedStructure` refusal's reason, for Review Changes. */
+    /** An `unsupportedStructure` refusal's reason, for the layout-conflict notice. */
     readonly message?: string;
 }
 
@@ -3446,7 +3446,7 @@ export type HostMessage =
         mappingGeneration: number;
     }
     | { type: 'formulaCalculation'; requestId: string; sourceGeneration: number; results: readonly FormulaCalculationResult[] }
-    /** Review Changes' divergence list; `null` when the request was refused. */
+    /** The Save warnings' formula review: flagged ranges and `#REF!` formulas; `null` when refused. */
     | { type: 'formulaDivergence'; requestId: string; sourceGeneration: number; review: FormulaDivergenceReview | null }
     /** Per salvage action, how many formulas it would turn to `#REF!` or point elsewhere; `null` when refused. */
     | {
@@ -3680,7 +3680,7 @@ export type WebviewMessage =
     }
     | { type: 'cancelFormulaCalculation'; requestId: string; sourceGeneration: number }
     /**
-     * Review Changes asks which formulas might render differently from Excel
+     * The Save warnings ask which formulas might render differently from Excel
      * for these layouts. `edits` are the calculator's prospective edits.
      */
     /**

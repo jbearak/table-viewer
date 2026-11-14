@@ -1,4 +1,4 @@
-// The webview's `.xlsx` action-time checks and Review Changes warning
+// The webview's `.xlsx` action-time checks and the Save-refusal warning
 // (delivery step 9c): the store's merge rules over the merges the host's
 // support scan ships, the filtered-column move rule over the shipped
 // AutoFilter, and the warning before Save for a rule the layouts would split
@@ -144,7 +144,7 @@ describe('the shipped AutoFilter', () => {
     });
 });
 
-describe('the Review Changes split warning', () => {
+describe('the Save-refusal split warning', () => {
     const rules = [{ kind: 'conditionalFormatting' as const, sqref: 'A2:A201', formulas: ['Other!$B2>0'] }];
 
     function inputs(changes?: PendingStructuralChanges): AnchorWorksheetInput[] {
