@@ -1979,6 +1979,28 @@ a new line char ""more quotes"" plus a tab  ."	https://google.com`)
         expect(document.body.contains(screen.getByDisplayValue("jk"))).toBe(true);
     });
 
+    test("openOverlay has the editor mounted when it returns, called outside any event", async () => {
+        vi.useFakeTimers();
+        const ref = React.createRef<DataEditorRef>();
+        render(<DataEditor {...basicProps} ref={ref} onOverlayOpenRequest={() => true} />, {
+            wrapper: Context,
+        });
+        prep();
+
+        const canvas = screen.getByTestId("data-grid-canvas");
+        sendClick(canvas, {
+            clientX: 300, // Col B
+            clientY: 36 + 32 + 16, // Row 1 (0 indexed)
+        });
+        fireEvent.keyDown(canvas, { keyCode: 74, key: "j" });
+        fireEvent.keyUp(canvas, { keyCode: 74, key: "j" });
+
+        // Not wrapped in act: the host opens it when a session grant arrives,
+        // and the next key may already be waiting behind that task.
+        expect(ref.current?.openOverlay([1, 1], "jk")).toBe(true);
+        expect(document.body.contains(screen.getByDisplayValue("jk"))).toBe(true);
+    });
+
     test("openOverlay does nothing for a cell that is not the selected one", async () => {
         vi.useFakeTimers();
         const ref = React.createRef<DataEditorRef>();

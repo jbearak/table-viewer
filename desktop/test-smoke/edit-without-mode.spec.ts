@@ -79,14 +79,16 @@ test('an editable file opens ready to edit, with Save waiting and no Edit button
 
 test('typing starts an edit and keeps every key; Save writes it', async () => {
     await select_cell(1, 0);
-    // No pause between keys: the ones typed while the session is being
-    // acquired belong to the edit the first one started.
-    await page.keyboard.type('Hello', { delay: 0 });
+    // One key at a time, and long enough that the session is granted partway
+    // through: the keys typed while it is being acquired, and those typed while
+    // the editor opens on the grant, belong to the edit the first one started.
+    const typed = 'HelloTypedOneKeyAtATime';
+    await page.keyboard.type(typed, { delay: 3 });
     await expect(editor()).toBeVisible();
-    await expect(editor()).toHaveValue('Hello');
+    await expect(editor()).toHaveValue(typed);
     await page.keyboard.press('Enter');
     await expect(editor()).toBeHidden();
-    await expect(cell(1, 0)).toHaveText('Hello');
+    await expect(cell(1, 0)).toHaveText(typed);
 
     await expect(save()).toHaveClass(/has-unsaved/);
     await expect(save()).not.toHaveAttribute('aria-disabled', 'true');
@@ -97,7 +99,7 @@ test('typing starts an edit and keeps every key; Save writes it', async () => {
 
     await save().click();
     await expect.poll(() => fs.readFileSync(csv, 'utf8'))
-        .toBe('Name,Age,City\nHello,30,New York\nBob,25,London\nCharlie,35,Paris\n');
+        .toBe(`Name,Age,City\n${typed},30,New York\nBob,25,London\nCharlie,35,Paris\n`);
     await expect_nothing_unsaved();
 });
 
