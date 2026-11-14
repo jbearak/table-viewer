@@ -19,7 +19,6 @@ import { isolated_user_data, repo_dir, state_database_path } from './smoke-helpe
 import {
     cell_point,
     choose,
-    cell_point,
     choose_from_submenu,
     open_cell_menu,
     save_button,
