@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
     editor_key_intent,
+    held_editor_key,
     insert_newline,
     type EditorKeyEvent,
 } from '../webview/csv-cell-editor-model';
@@ -69,5 +70,49 @@ describe('insert_newline', () => {
         const out = insert_newline('hi', 2, 2);
         expect(out.value).toBe('hi\n');
         expect(out.cursor).toBe(3);
+    });
+});
+
+describe('held_editor_key', () => {
+    it('adds a printable key to the text, Space and Shift+Space included', () => {
+        expect(held_editor_key('New', ev(' '))).toEqual({ kind: 'text', text: 'New ' });
+        expect(held_editor_key('NEW', ev(' ', { shiftKey: true }))).toEqual({ kind: 'text', text: 'NEW ' });
+        expect(held_editor_key('caf', ev('é', { altKey: true }))).toEqual({ kind: 'text', text: 'café' });
+    });
+
+    it('replaces a value the editor would open with selected', () => {
+        expect(held_editor_key(undefined, ev('a'))).toEqual({ kind: 'text', text: 'a' });
+        expect(held_editor_key(undefined, ev('Backspace'))).toEqual({ kind: 'text', text: '' });
+        expect(held_editor_key(undefined, ev('Delete'))).toEqual({ kind: 'text', text: '' });
+    });
+
+    it('removes the last character on Backspace, and nothing on Delete after the caret', () => {
+        expect(held_editor_key('Nwe', ev('Backspace'))).toEqual({ kind: 'text', text: 'Nw' });
+        expect(held_editor_key('a😀', ev('Backspace'))).toEqual({ kind: 'text', text: 'a' });
+        expect(held_editor_key('Nwe', ev('Delete'))).toEqual({ kind: 'hold' });
+    });
+
+    it('adds a newline on Shift+Enter or Alt+Enter', () => {
+        expect(held_editor_key('a', ev('Enter', { shiftKey: true }))).toEqual({ kind: 'text', text: 'a\n' });
+        expect(held_editor_key('a', ev('Enter', { altKey: true }))).toEqual({ kind: 'text', text: 'a\n' });
+    });
+
+    it('commits on Enter, Tab, and Shift+Tab', () => {
+        expect(held_editor_key('a', ev('Enter'))).toEqual({ kind: 'commit', navigation: 'below' });
+        expect(held_editor_key('a', ev('Tab'))).toEqual({ kind: 'commit', navigation: 'next' });
+        expect(held_editor_key('a', ev('Tab', { shiftKey: true }))).toEqual({ kind: 'commit', navigation: 'previous' });
+    });
+
+    it('leaves Escape, shortcuts, and composition to the grid', () => {
+        expect(held_editor_key('a', ev('Escape'))).toEqual({ kind: 'pass' });
+        expect(held_editor_key('a', ev('s', { metaKey: true }))).toEqual({ kind: 'pass' });
+        expect(held_editor_key('a', ev('z', { ctrlKey: true }))).toEqual({ kind: 'pass' });
+        expect(held_editor_key('a', ev('Dead', { altKey: true }))).toEqual({ kind: 'pass' });
+    });
+
+    it('holds keys the editor keeps to itself', () => {
+        for (const key of ['ArrowLeft', 'ArrowDown', 'Home', 'PageDown', 'F2', 'Shift', '\t']) {
+            expect(held_editor_key('a', ev(key))).toEqual({ kind: 'hold' });
+        }
     });
 });

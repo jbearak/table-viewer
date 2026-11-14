@@ -21,6 +21,12 @@ export interface CsvCellEditorProps {
     onFinishedEditing: (newValue?: GridCell, movement?: Movement) => boolean | void;
     onCommitNavigation?: (navigation: EditorCommitNavigation) => void;
     initialValue?: string;
+    /**
+     * Set while the editor is mounted to commit it as Enter, Tab, or Shift+Tab
+     * would. The grid uses it for one of those keys typed before the editor
+     * could open.
+     */
+    commitRef?: React.MutableRefObject<((navigation: EditorCommitNavigation) => void) | null>;
 }
 
 function cell_text(cell: GridCell): string {
@@ -56,6 +62,7 @@ export function CsvCellEditor({
     onFinishedEditing,
     onCommitNavigation,
     initialValue,
+    commitRef,
 }: CsvCellEditorProps): React.JSX.Element {
     // Glide rewrites built-in Text cells with the type-to-edit seed before it
     // opens the overlay, but Custom cells are passed through unchanged. Rich
@@ -99,6 +106,16 @@ export function CsvCellEditor({
         if (onFinishedEditing(with_text(value, live), [0, 0]) === false) return;
         onCommitNavigation?.(navigation);
     };
+    const commit_latest_ref = useRef(commit);
+    commit_latest_ref.current = commit;
+    useEffect(() => {
+        if (!commitRef) return undefined;
+        const handle = (navigation: EditorCommitNavigation) => commit_latest_ref.current(navigation);
+        commitRef.current = handle;
+        return () => {
+            if (commitRef.current === handle) commitRef.current = null;
+        };
+    }, [commitRef]);
 
     const handle_key_down = (
         e: React.KeyboardEvent<HTMLInputElement | HTMLTextAreaElement>,
