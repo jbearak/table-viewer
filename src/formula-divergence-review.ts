@@ -16,7 +16,7 @@
  * drops a run a newer question supersedes.
  */
 import { read_source_columns, type DataSource } from './data-source/interface';
-import { formula_ref_error_count, workbook_a1_formula_references } from './xlsx-formula';
+import { formula_error_catching, formula_ref_error_count, workbook_a1_formula_references } from './xlsx-formula';
 import {
     calculate_workbook_formula_steps,
     formula_calculation_workbook,
@@ -112,9 +112,10 @@ export interface FormulaDeletedItem {
     readonly rows: readonly RowIdentity[];
     readonly columns: readonly ColumnIdentity[];
     /**
-     * The formula catches errors (IFERROR, ISERROR, …; `CATCHES_ERRORS`), so
-     * it shows its fallback value after Save rather than `#REF!`, though Save
-     * still writes `#REF!` into its text.
+     * Every `#REF!` Save writes into the formula sits where it is caught,
+     * such as in IFERROR's first argument or inside ISERROR
+     * (`formula_error_catching`), so it shows its fallback value after Save
+     * rather than `#REF!`.
      */
     readonly catchesErrors?: true;
 }
@@ -125,8 +126,10 @@ export interface FormulaDeletedItem {
  * - `ref`: the calculator evaluates it to `#REF!`, as Excel will;
  * - `unchecked`: it uses one through something the calculator doesn't
  *   evaluate (a function other than SUM or AVERAGE, text, a comparison), so
- *   it might show an error and might not. A formula that catches errors
- *   (IFERROR, ISERROR, ISREF, …) is neither.
+ *   it might show an error and might not, as does one that catches some
+ *   errors but not every one it reads, such as `=IFERROR(A1,0)+B2` or
+ *   `=IFNA(B2,0)`. A formula that reads every cell inside IFERROR's first
+ *   argument or an IS function (`formula_error_catching`) is neither.
  */
 export type FormulaDependentResult = 'ref' | 'unchecked';
 
@@ -201,15 +204,6 @@ type ReviewSteps<T> = Generator<void, T, void>;
 const FORMULAS_PER_STEP = 256;
 
 /**
- * Functions that catch an error or test for one instead of passing it on.
- * A formula calling one is not claimed to show `#REF!`, even when Save writes
- * `#REF!` into it, whether in the Save warning or in a conflict notice's
- * counts, and its result does not carry `#REF!` on to the formulas that use
- * it. Matched in the text, since the calculator doesn't evaluate them.
- */
-const CATCHES_ERRORS = /(?:^|[^A-Za-z0-9_.])(?:_xlfn\.)?(?:IFERROR|IFNA|ERROR\.TYPE|AGGREGATE|IS(?:ERROR|ERR|NA|REF|BLANK|NUMBER|TEXT|NONTEXT|LOGICAL|FORMULA))\s*\(/i;
-
-/**
  * What the calculator returns for a formula it can't evaluate: one that
  * uses a `#REF!` result this way might show an error after Save.
  */
@@ -259,9 +253,11 @@ interface DependentReview {
  * pending formulas are checked by evaluation, and one found to break adds its
  * own dependents. What each shows comes from the calculator, run on the same
  * edits and layouts as the grid's prospective results: `#REF!` only when the
- * calculator gets `#REF!`. Formulas that catch errors, and formulas whose own
- * text already held `#REF!`, are left out of the calculation (`untargeted`),
- * so they keep their stored results and pass nothing on.
+ * calculator gets `#REF!`. Formulas that catch an error in every cell they
+ * read, and formulas whose own text already showed `#REF!`, are left out of
+ * the calculation (`untargeted`), so they keep their stored results and pass
+ * nothing on. Any other formula the calculator can't evaluate, IFERROR
+ * included, might show an error.
  */
 function* dependent_steps(
     source: DataSource,
@@ -455,7 +451,8 @@ function* review_steps(
         uncheckedDependents: 0,
     };
     // Formulas Save writes #REF! into, and formulas whose results don't carry
-    // #REF! on: those that catch errors, and those whose text already held it.
+    // #REF! on: those that catch an error in every cell they read, and those
+    // whose text already showed it.
     const direct = new Map<string, DirectFormula>();
     const untargeted = new Set<string>();
     const overridden = new Set(edits.map((edit) => `${edit.sheetIndex}:${edit.row}:${edit.column}`));
@@ -470,10 +467,12 @@ function* review_steps(
         source_cell?: WorkbookCellAddress,
     ): void => {
         checked += 1;
-        const catches_errors = CATCHES_ERRORS.test(text);
-        if (catches_errors || (text.includes('#REF!') && formula_ref_error_count(text) > 0)) {
-            untargeted.add(`${sheet_index}:${row}:${column}`);
-        }
+        const key = `${sheet_index}:${row}:${column}`;
+        const catching = formula_error_catching(text);
+        // Its text already holds a #REF! it shows, or no error in a cell it
+        // reads reaches its result.
+        const shows_ref = text.includes('#REF!') && formula_ref_error_count(text) > 0 && !catching.catchesRefErrors;
+        if (shows_ref || catching.catchesReadErrors) untargeted.add(key);
         const context = formula_anchor_context(workbook, sheet_index);
         let flags;
         let deletions;
@@ -530,10 +529,18 @@ function* review_steps(
             for (const identity of deletion.columns) entry.columns.set(JSON.stringify(identity), identity);
             deleted_by_target.set(deletion.worksheet, entry);
         }
+        // Caught only when every #REF! is: `=IFERROR(A1,0)+#REF!` shows #REF!.
+        const catches_errors = deleted_by_target.size > 0 && formula_error_catching(rendered).catchesRefErrors;
         if (deleted_by_target.size > 0) {
-            if (catches_errors) totals.deletedCaught += 1;
-            else totals.deleted += 1;
-            direct.set(`${sheet_index}:${row}:${column}`, { sheetIndex: sheet_index, row, column, source: source_cell });
+            if (catches_errors) {
+                totals.deletedCaught += 1;
+                untargeted.add(key);
+            } else {
+                totals.deleted += 1;
+                // It shows #REF! after Save, so it passes it on.
+                if (!shows_ref) untargeted.delete(key);
+            }
+            direct.set(key, { sheetIndex: sheet_index, row, column, source: source_cell });
         }
         for (const [target, entry] of [...deleted_by_target].sort(([left], [right]) => left - right)) {
             deleted_counts.set(target, (deleted_counts.get(target) ?? 0) + 1);
@@ -679,9 +686,9 @@ export interface FormulaImpact {
      */
     readonly ref: number;
     /**
-     * Formulas whose rendered text gains a `#REF!` error token but that catch
-     * errors (`CATCHES_ERRORS`, the Save warning's rule), so they show their
-     * fallback values.
+     * Formulas whose rendered text gains a `#REF!` error token but catches
+     * every one (`formula_error_catching`, the Save warning's rule), so they
+     * show their fallback values.
      */
     readonly caught: number;
     /** Other formulas whose rendered text changes: they point at different rows or columns. */
@@ -784,7 +791,7 @@ function* impact_steps(
         const previous = was.get(key);
         if (previous === undefined || previous === text) continue;
         if (formula_ref_error_count(text) <= formula_ref_error_count(previous)) moved += 1;
-        else if (CATCHES_ERRORS.test(text)) caught += 1;
+        else if (formula_error_catching(text).catchesRefErrors) caught += 1;
         else ref += 1;
     }
     return Object.freeze({ ref, caught, moved });

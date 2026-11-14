@@ -553,14 +553,18 @@ describe('review_formula_impact', () => {
     it('counts a formula that catches the #REF! it gains apart from those that show it', () => {
         // The same rule as the Save warning: Save writes #REF! into
         // `=IFERROR(Data!C2*2,0)` and `=ISERROR(Data!C3)`, but they show
-        // their fallback values. `=ROUND(Data!C2,0)` passes the error on.
+        // their fallback values. The rest show #REF!: `ROUND` passes the
+        // error on, `IFNA` catches only #N/A, and IFERROR doesn't cover
+        // `+Data!C2` outside its call.
         const source = source_of([
             { name: 'Data', rows: [[value('1'), value('2'), value('3')], [value('1'), value('2'), value('3')]] },
             {
                 name: 'Summary',
                 rows: [
                     [formula('=IFERROR(Data!C2*2,0)')],
-                    [formula('=_xlfn.IFNA(Data!C1,0)+ISERROR(Data!C2)')],
+                    [formula('=ISERROR(Data!C3)')],
+                    [formula('=_xlfn.IFNA(Data!C1,0)')],
+                    [formula('=IFERROR(Data!A1,0)+Data!C2')],
                     [formula('=ROUND(Data!C2,0)')],
                 ],
             },
@@ -574,7 +578,7 @@ describe('review_formula_impact', () => {
                 edits: [],
                 layouts: [{ bodyStart: 0, columnLayout: deleted.layout, band: [] }, layout_of(undefined, 0)],
             },
-        )).toEqual({ ref: 1, caught: 2, moved: 0 });
+        )).toEqual({ ref: 3, caught: 2, moved: 0 });
     });
 
     it('yields while rendering formula edits, not only source formulas', async () => {

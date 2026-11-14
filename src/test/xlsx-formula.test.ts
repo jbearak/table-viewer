@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
     a1_formula_references,
+    formula_error_catching,
     formula_reference_tokens,
     is_xlsx_formula_text,
     local_a1_formula_references,
@@ -524,5 +525,84 @@ describe('formula reference tokenizer', () => {
                 };
             })).toEqual(a1_formula_references(formula));
         }
+    });
+});
+
+describe('which errors a formula catches', () => {
+    const ref = (formula: string) => formula_error_catching(formula).catchesRefErrors;
+    const reads = (formula: string) => formula_error_catching(formula).catchesReadErrors;
+
+    it('covers IFERROR\'s first argument only', () => {
+        expect(ref('=IFERROR(#REF!,0)')).toBe(true);
+        expect(ref('=IFERROR(#REF!*2,0)')).toBe(true);
+        expect(ref('=IFERROR(1,#REF!)')).toBe(false);
+        // IFERROR protects nothing outside its call.
+        expect(ref('=IFERROR(Data!A1,0)+#REF!')).toBe(false);
+        expect(ref('=IFERROR(#REF!,0)+#REF!')).toBe(false);
+        // An unrelated reference outside it doesn't stop it catching the #REF!.
+        expect(ref('=IFERROR(#REF!,0)+A1')).toBe(true);
+        expect(reads('=IFERROR(#REF!,0)+A1')).toBe(false);
+    });
+
+    it('covers every #REF! under an IFERROR, at any depth', () => {
+        expect(ref('=IFERROR(SUM(IFERROR(#REF!,1),#REF!),0)')).toBe(true);
+        expect(ref('=SUM(IFERROR(#REF!,1),#REF!)')).toBe(false);
+        // The inner SUM's comma doesn't move IFERROR to its second argument.
+        expect(ref('=IFERROR(SUM(1,#REF!),0)')).toBe(true);
+        expect(ref('=IFERROR({1,2}+#REF!,0)')).toBe(true);
+        expect(ref('=IFERROR((A1,#REF!),0)')).toBe(true);
+    });
+
+    it('covers every argument of a function that never returns an error', () => {
+        for (const name of ['ISERROR', 'ISERR', 'ISREF', 'ISNA', 'ISBLANK', 'ISNUMBER', 'ISTEXT', 'ISNONTEXT', 'ISLOGICAL', 'ERROR.TYPE']) {
+            expect(ref(`=${name}(#REF!)`), name).toBe(true);
+            expect(reads(`=${name}(Data!C2)`), name).toBe(true);
+        }
+        expect(ref('=IF(ISERROR(#REF!),0,1)')).toBe(true);
+        // The third argument of IF is outside ISERROR.
+        expect(ref('=IF(ISERROR(#REF!),0,#REF!)')).toBe(false);
+        expect(reads('=IF(ISERROR(B2),0,B2)')).toBe(false);
+    });
+
+    it('does not count IFNA, AGGREGATE, ISFORMULA, or ISEVEN as catching #REF!', () => {
+        expect(ref('=IFNA(#REF!,0)')).toBe(false);
+        expect(ref('=_xlfn.IFNA(#REF!,0)')).toBe(false);
+        expect(ref('=_xlfn.AGGREGATE(9,6,#REF!)')).toBe(false);
+        expect(ref('=_xlfn.ISFORMULA(#REF!)')).toBe(false);
+        expect(ref('=ISEVEN(#REF!)')).toBe(false);
+    });
+
+    it('reads IFERROR( and #REF! inside strings and quoted sheet names as text', () => {
+        expect(ref('="IFERROR("&#REF!')).toBe(false);
+        expect(ref('=IFERROR(A1,"#REF!")+#REF!')).toBe(false);
+        // A string holding a comma or parenthesis doesn't move the argument.
+        expect(ref('=IFERROR(IF(A1="a,b)",1,#REF!),0)')).toBe(true);
+        expect(ref("=IFERROR('IFERROR(,#REF!'!A1,0)+#REF!")).toBe(false);
+        expect(ref("=IFERROR('Sales, (Q1)'!#REF!,0)")).toBe(true);
+        // The only #REF! is text, so there is none to catch.
+        expect(ref('=IFERROR("#REF!",0)')).toBe(false);
+    });
+
+    it('ignores case, _xlfn. prefixes, and spaces around arguments', () => {
+        expect(ref('=iferror(#ref!,0)')).toBe(true);
+        expect(ref('=_xlfn.IFERROR(#REF!,0)')).toBe(true);
+        expect(ref('=_xlfn._xlws.ISERROR(#REF!)')).toBe(true);
+        expect(ref('=IFERROR( #REF! * 2 , 0 )')).toBe(true);
+        expect(ref('=IFERROR( 1 , #REF! )')).toBe(false);
+        // A name that only ends in IFERROR is a different function.
+        expect(ref('=MYIFERROR(#REF!,0)')).toBe(false);
+    });
+
+    it('counts every reference-like operand as reading cells', () => {
+        expect(reads('=IFERROR(Data!C2*2,0)')).toBe(true);
+        expect(reads("=IFERROR('Sales Q1'!C2,0)")).toBe(true);
+        expect(reads('=IFERROR(VLOOKUP(B2,Sheet2!A:C,2,FALSE),"")')).toBe(true);
+        expect(reads('=IFERROR(B2,0)+Total')).toBe(false);
+        expect(reads('=IFERROR(B2,0)+[@Price]')).toBe(false);
+        expect(reads('=IFERROR(B2,0)+SUM(1:3)')).toBe(false);
+        expect(reads('=IFERROR(B2,0)+1.5E+3+TRUE')).toBe(true);
+        // A formula that reads nothing has nothing to catch.
+        expect(reads('=IFERROR(1,0)')).toBe(false);
+        expect(reads('=Data!C2')).toBe(false);
     });
 });

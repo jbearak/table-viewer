@@ -712,6 +712,157 @@ export function formula_ref_error_count(formula: string): number {
 }
 
 /**
+ * Functions whose result is never an error, whatever error their arguments
+ * hold: the IS functions that return TRUE or FALSE for any value, and
+ * ERROR.TYPE, which returns 4 for `#REF!`. Not IFNA, which catches only
+ * `#N/A`; AGGREGATE, which skips errors only for some options; ISFORMULA,
+ * which returns `#VALUE!` for an argument that isn't a reference; or ISEVEN
+ * and ISODD, which return an error for one that isn't a number.
+ */
+const ERROR_PROOF_FUNCTIONS: ReadonlySet<string> = new Set([
+    'ISBLANK', 'ISERR', 'ISERROR', 'ISLOGICAL', 'ISNA', 'ISNONTEXT', 'ISNUMBER', 'ISREF', 'ISTEXT', 'ERROR.TYPE',
+]);
+
+/** A call that could catch an error: matches whenever {@link formula_error_catching} could find one. */
+const ERROR_CATCHING_CALL = /(?:IFERROR|IS[A-Z]+|ERROR\.TYPE)\(/i;
+
+const ERROR_LITERAL = /#(?:NULL!|DIV\/0!|VALUE!|REF!|NAME\?|NUM!|N\/A|GETTING_DATA|SPILL!|CALC!|FIELD!|BLOCKED!|CONNECT!|BUSY!|UNKNOWN!|EXTERNAL!|PYTHON!)/iy;
+
+const NUMBER_WORD = /^(?:\d+\.?\d*|\.\d+)E?$/i;
+
+function word_character(char: string | undefined): boolean {
+    if (char === undefined) return false;
+    const code = char.charCodeAt(0);
+    // ASCII letters, digits, `_`, `.`, `$`, and `\` without the regex.
+    if (code < 128) {
+        return (code >= 97 && code <= 122) || (code >= 65 && code <= 90) || (code >= 48 && code <= 57)
+            || code === 95 || code === 46 || code === 36 || code === 92;
+    }
+    return identifier_character(char);
+}
+
+/** Whether an error in the cells a formula reads reaches its result. */
+export interface FormulaErrorCatching {
+    /**
+     * The formula has a `#REF!` error token, and every one sits where an
+     * enclosing function turns an error into a value: in IFERROR's first
+     * argument, or in any argument of ISERROR, ISBLANK, ERROR.TYPE, or
+     * another function that never returns an error. Such a formula shows a
+     * value, not `#REF!`.
+     */
+    readonly catchesRefErrors: boolean;
+    /**
+     * The formula reads at least one cell, and every operand that might
+     * (a reference, a defined name, a structured reference, a quoted sheet
+     * name, a `#REF!`) sits in such a position, so no error in a cell it
+     * reads reaches its result.
+     */
+    readonly catchesReadErrors: boolean;
+}
+
+const CATCHES_NOTHING: FormulaErrorCatching = Object.freeze({ catchesRefErrors: false, catchesReadErrors: false });
+
+/**
+ * Which errors a formula catches, by where each operand sits: inside
+ * IFERROR's first argument or an argument of a function in
+ * {@link ERROR_PROOF_FUNCTIONS}, at any depth. IFERROR's second argument and
+ * everything outside the call are not covered, so
+ * `=IFERROR(A1,0)+#REF!` shows `#REF!`. Strings, quoted sheet names, and
+ * bracketed spans are read as {@link formula_ref_error_count} reads them; a
+ * function name counts only when `(` follows it directly, and `_xlfn.` and
+ * `_xlws.` prefixes are ignored.
+ *
+ * Every word that isn't a function name, a number, TRUE, or FALSE counts as
+ * reading cells, defined names and LET variables included, so a formula is
+ * never said to catch an error it might pass on.
+ */
+export function formula_error_catching(formula: string): FormulaErrorCatching {
+    if (!ERROR_CATCHING_CALL.test(formula)) return CATCHES_NOTHING;
+    /** One open `(` or `{`: whether it catches errors, and which argument the scan is in. */
+    const frames: { catches: 'every' | 'first' | 'none'; argument: number; array: boolean }[] = [];
+    const guarding = (frame: (typeof frames)[number]) =>
+        frame.catches === 'every' || (frame.catches === 'first' && frame.argument === 0);
+    /** Open frames that catch errors at the scan position. */
+    let guards = 0;
+    let ref_errors = 0;
+    let reads = 0;
+    // Operands outside every catching position.
+    let loose_ref_errors = 0;
+    let loose_reads = 0;
+    const operand = (ref_error: boolean) => {
+        if (ref_error) {
+            ref_errors += 1;
+            if (guards === 0) loose_ref_errors += 1;
+        } else {
+            reads += 1;
+            if (guards === 0) loose_reads += 1;
+        }
+    };
+    let index = formula.startsWith('=') ? 1 : 0;
+    while (index < formula.length) {
+        const char = formula[index]!;
+        const span_end = opaque_span_end_at(formula, index);
+        if (span_end !== undefined) {
+            // A quoted sheet name or a bracketed span names cells; a string doesn't.
+            if (char !== '"') operand(false);
+            index = span_end;
+            continue;
+        }
+        if (char === '#') {
+            ERROR_LITERAL.lastIndex = index;
+            const literal = ERROR_LITERAL.exec(formula)?.[0];
+            if (literal?.toUpperCase() === '#REF!') operand(true);
+            index += literal?.length ?? 1;
+            continue;
+        }
+        if (word_character(char)) {
+            let end = index + 1;
+            while (end < formula.length && word_character(formula[end])) end += 1;
+            const word = formula.slice(index, end);
+            if (formula[end] === '(') {
+                const name = word.toUpperCase().replace(/^(?:_XLFN\.|_XLWS\.)+/, '');
+                const frame = {
+                    catches: ERROR_PROOF_FUNCTIONS.has(name) ? 'every' as const
+                        : name === 'IFERROR' ? 'first' as const : 'none' as const,
+                    argument: 0,
+                    array: false,
+                };
+                frames.push(frame);
+                if (guarding(frame)) guards += 1;
+                index = end + 1;
+                continue;
+            }
+            const upper = word.toUpperCase();
+            // `1:3` is a range of rows, not two numbers.
+            const constant = upper === 'TRUE' || upper === 'FALSE'
+                || (NUMBER_WORD.test(word) && formula[end] !== ':' && formula[index - 1] !== ':');
+            if (!constant) operand(false);
+            index = end;
+            continue;
+        }
+        if (char === '(' || char === '{') {
+            frames.push({ catches: 'none', argument: 0, array: char === '{' });
+        } else if (char === ')' || char === '}') {
+            const frame = frames.pop();
+            if (frame !== undefined && guarding(frame)) guards -= 1;
+        } else if (char === ',') {
+            // A comma in an array constant separates its items, not arguments.
+            const frame = frames[frames.length - 1];
+            if (frame !== undefined && !frame.array) {
+                const was = guarding(frame);
+                frame.argument += 1;
+                if (was && !guarding(frame)) guards -= 1;
+            }
+        }
+        index += 1;
+    }
+    return Object.freeze({
+        catchesRefErrors: ref_errors > 0 && loose_ref_errors === 0,
+        catchesReadErrors: ref_errors + reads > 0 && loose_ref_errors + loose_reads === 0,
+    });
+}
+
+/**
  * Start of each opaque span, keyed by its end, from one forward pass of
  * {@link opaque_span_end_at}. Backward scans use it to step over a span
  * whole.

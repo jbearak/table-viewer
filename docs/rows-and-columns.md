@@ -102,7 +102,7 @@ An insert, delete, or move needs no notice: the tints show it. A notice appears 
   Restore the column, or undo, to keep them working.
   ```
 
-  Table Viewer calculates only arithmetic, `SUM`, and `AVERAGE`. A formula that uses a broken result through another function, such as `ROUND`, is counted separately: it might show an error and might not. A formula that uses a broken result inside a function that catches errors, such as `IFERROR` or `ISERROR`, isn't counted.
+  Table Viewer calculates only arithmetic, `SUM`, and `AVERAGE`. A formula that uses a broken result through another function, such as `ROUND`, is counted separately: it might show an error and might not. A formula that reads every cell inside a function that catches errors isn't counted. Those functions are `IFERROR`, in its first argument only, `ERROR.TYPE`, and the IS functions that return TRUE or FALSE: `ISBLANK`, `ISERR`, `ISERROR`, `ISLOGICAL`, `ISNA`, `ISNONTEXT`, `ISNUMBER`, `ISREF`, and `ISTEXT`. `IFNA` isn't one of them, since it catches only `#N/A`. If `D6` is a broken total, `=IFNA(D6,0)` and `=IFERROR(B2,0)+D6` are counted as formulas that might show an error.
 
   A formula that uses the deleted row or column inside such a function, like `=IFERROR(C2*2,0)` after you delete column C, won't show `#REF!`. Excel shows its fallback value instead. Save still writes `#REF!` into it, so the notice lists it and counts it on its own:
 
@@ -111,6 +111,8 @@ An insert, delete, or move needs no notice: the tints show it. A notice appears 
   1 more formula uses the deleted column but catches the error, so it will show its fallback value instead.
   Restore the column, or undo, to keep them working.
   ```
+
+  That holds only when every `#REF!` Save writes into the formula sits inside such a function. `=IFERROR(A2,0)+C2` will show `#REF!`, and the notice counts it with the others.
 
 - A move or delete changed a formula's range in a way Excel might not. Table Viewer adjusts a range from the final arrangement of rows and columns, while Excel adjusts it one change at a time, so moving the first or last row of a range, or inserting next to a deleted one, can give a different range:
 
