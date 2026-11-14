@@ -2992,6 +2992,143 @@
       ]
     },
     {
+      "name": "move a range's last row up inside it",
+      "sheets": [
+        "Sheet1"
+      ],
+      "headerRow": 0,
+      "gestures": [
+        {
+          "op": "moveRows",
+          "sheet": "Sheet1",
+          "first": 6,
+          "count": 1,
+          "before": 4
+        }
+      ],
+      "formulas": [
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B3:B6)",
+          "libreoffice": "=SUM(B3:B6)",
+          "expect": {
+            "kind": "flagged",
+            "note": "LibreOffice's move is insert + cut-paste + delete, and cut-paste moves only references wholly inside the moved block, so a range whose corner moves keeps its old bounds. The spec carries each corner with its row (\"Where this differs from Excel\": corner-crossing and displaced corners), so the range is in the flagged superset."
+          }
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM($B$3:$B$6)",
+          "libreoffice": "=SUM($B$3:$B$6)",
+          "expect": {
+            "kind": "flagged",
+            "note": "LibreOffice's move is insert + cut-paste + delete, and cut-paste moves only references wholly inside the moved block, so a range whose corner moves keeps its old bounds. The spec carries each corner with its row (\"Where this differs from Excel\": corner-crossing and displaced corners), so the range is in the flagged superset."
+          }
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=B6",
+          "libreoffice": "=B4"
+        }
+      ]
+    },
+    {
+      "name": "move a range's first row down inside it",
+      "sheets": [
+        "Sheet1"
+      ],
+      "headerRow": 0,
+      "gestures": [
+        {
+          "op": "moveRows",
+          "sheet": "Sheet1",
+          "first": 3,
+          "count": 1,
+          "before": 6
+        }
+      ],
+      "formulas": [
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B3:B6)",
+          "libreoffice": "=SUM(B3:B6)",
+          "expect": {
+            "kind": "flagged",
+            "note": "LibreOffice's move is insert + cut-paste + delete, and cut-paste moves only references wholly inside the moved block, so a range whose corner moves keeps its old bounds. The spec carries each corner with its row (\"Where this differs from Excel\": corner-crossing and displaced corners), so the range is in the flagged superset."
+          }
+        },
+        {
+          "sheet": "Sheet1",
+          "text": "=B3",
+          "libreoffice": "=B5"
+        }
+      ]
+    },
+    {
+      "name": "move a range's last row up inside it under a Header Row",
+      "sheets": [
+        "Sheet1"
+      ],
+      "headerRow": 1,
+      "gestures": [
+        {
+          "op": "moveRows",
+          "sheet": "Sheet1",
+          "first": 5,
+          "count": 1,
+          "before": 3
+        }
+      ],
+      "formulas": [
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM(B2:B5)",
+          "libreoffice": "=SUM(B2:B5)",
+          "expect": {
+            "kind": "flagged",
+            "note": "LibreOffice's move is insert + cut-paste + delete, and cut-paste moves only references wholly inside the moved block, so a range whose corner moves keeps its old bounds. The spec carries each corner with its row (\"Where this differs from Excel\": corner-crossing and displaced corners), so the range is in the flagged superset."
+          }
+        }
+      ]
+    },
+    {
+      "name": "move a range's last row up inside it on a referenced sheet",
+      "sheets": [
+        "Sheet1",
+        "My Data"
+      ],
+      "headerRow": 0,
+      "gestures": [
+        {
+          "op": "moveRows",
+          "sheet": "My Data",
+          "first": 6,
+          "count": 1,
+          "before": 4
+        }
+      ],
+      "formulas": [
+        {
+          "sheet": "Sheet1",
+          "text": "=SUM('My Data'!B3:B6)",
+          "libreoffice": "=SUM('My Data'!B3:B6)",
+          "expect": {
+            "kind": "flagged",
+            "note": "LibreOffice's move is insert + cut-paste + delete, and cut-paste moves only references wholly inside the moved block, so a range whose corner moves keeps its old bounds. The spec carries each corner with its row (\"Where this differs from Excel\": corner-crossing and displaced corners), so the range is in the flagged superset."
+          }
+        },
+        {
+          "sheet": "My Data",
+          "text": "=SUM(B3:B6)",
+          "libreoffice": "=SUM(B3:B6)",
+          "expect": {
+            "kind": "flagged",
+            "note": "LibreOffice's move is insert + cut-paste + delete, and cut-paste moves only references wholly inside the moved block, so a range whose corner moves keeps its old bounds. The spec carries each corner with its row (\"Where this differs from Excel\": corner-crossing and displaced corners), so the range is in the flagged superset."
+          }
+        }
+      ]
+    },
+    {
       "name": "move a range's first column past its last",
       "sheets": [
         "Sheet1"

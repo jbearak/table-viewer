@@ -793,9 +793,13 @@ The flag is a deliberate superset, decided per range reference and per axis:
   or any run out of ascending source order;
 - a range renders `#REF!` because a corner named a discarded Pending Appended
   Row;
-- a corner lies in a source run that is out of ascending source order with
-  the nearest source run on either side, skipping pending runs, which covers
-  every row a move carried, whether or not the moved tint marks it.
+- a corner lies in a source run that is out of source order with any other
+  source run (one before it starts later in the source, or one after it
+  starts earlier; pending runs are ignored), which covers every row a move
+  carried, whether or not the moved tint marks it. Comparing only the nearest
+  source runs is not enough: moving row 5 above row 4 and then row 8 above
+  row 4 gives the order 2-3, 5, 8, 4, 6-7, where 5 is in order with both
+  neighbors, and `SUM(B2:B5)` renders `SUM(B2:B4)`.
 
 Step 2 may narrow these rules only with oracle evidence that a narrowed case
 matches Excel.
@@ -813,7 +817,15 @@ LibreOffice 26.8 the only differences were spelling (LibreOffice drops the
 sheet qualifier on `#REF!` and writes `C8:C8` as `C8`) and moved or refilled
 range corners, all flagged. LibreOffice has no cut-insert, so moves are
 checked as insert, cut-paste, and delete, which agrees with the spec wherever
-no range corner moves.
+no range corner moves. Where a corner moves, the two engines disagree:
+LibreOffice's cut-paste moves a range reference only when the whole range is
+inside the cut block, so moving `SUM(B3:B6)`'s last row above row 4 keeps
+`SUM(B3:B6)`, and its own Cut with Paste Special "shift cells down" does the
+same. Excel's cut-paste moves the end of a range whose cell was cut (Microsoft
+Tech Community reports, answered "That's by design!"), so its
+cut-insert presumably carries the corner as this spec does and gives
+`SUM(B3:B4)`. With no Excel to check, that is inferred, not verified, which is
+one more reason these ranges are flagged rather than narrowed.
 
 Because rendering is a function of the anchors and the full layouts, two
 operation sequences that produce the same full layouts produce the same text.

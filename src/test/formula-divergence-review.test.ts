@@ -8,8 +8,15 @@ import { EMPTY_PENDING_STRUCTURAL_CHANGES, type PendingStructuralChanges } from 
 import { delete_rows, move_rows, type WorksheetStructureContext } from '../webview/pending-row-store';
 import { formula_calculation_workbook, type FormulaCalculationLayout } from '../formula-calculation';
 import { formula_anchor_context } from '../formula-anchor-layout';
-import { anchor_formula } from '../formula-anchors';
-import { insert_rows as insert_layout_rows, source_row_layout } from '../worksheet-layout';
+import { anchor_formula, formula_divergence_flags, render_formula } from '../formula-anchors';
+import {
+    delete_columns as delete_layout_columns,
+    insert_rows as insert_layout_rows,
+    move_rows as move_layout_rows,
+    source_column_layout,
+    source_row_layout,
+    type RowLayout,
+} from '../worksheet-layout';
 import {
     MAX_FORMULA_DIVERGENCE_ITEMS,
     formula_divergence_class,
@@ -174,6 +181,169 @@ describe('review_formula_divergence', () => {
     });
 });
 
+/** A DataSource over in-memory sheets; `header` marks sheets whose row 1 is an active Header Row. */
+function source_of(sheets: readonly { name: string; rows: (RenderedCell | null)[][]; header?: boolean }[]): DataSource {
+    const packed = (rows: (RenderedCell | null)[][]) => rows.flatMap((row, index) =>
+        row.flatMap((cell, column) => cell?.formula === undefined ? [] : [index, column]));
+    const meta: WorkbookMeta = {
+        hasFormatting: false,
+        sheets: sheets.map(({ name, rows, header }) => ({
+            name,
+            rowCount: rows.length,
+            sourceRowCount: rows.length,
+            columnCount: Math.max(...rows.map((row) => row.length)),
+            merges: [],
+            hasFormatting: false,
+            formulaCells: packed(rows),
+            ...(header ? {
+                excelFirstRowHeader: { mode: 'on' as const, detected: false, active: true, available: true, sourceRow: 0 },
+            } : {}),
+        })),
+    };
+    return {
+        meta: () => meta,
+        read_rows: (sheet, start, count) => ({ startRow: start, rows: sheets[sheet]!.rows.slice(start, start + count) }),
+        read_columns: (sheet, start, count, columns): ColumnWindow => ({
+            startRow: start,
+            rows: sheets[sheet]!.rows.slice(start, start + count)
+                .map((row) => columns.map((column) => row[column] ?? null)),
+        }),
+        close: () => {},
+    };
+}
+
+describe('a range whose last row was moved up', () => {
+    // The report: Header Row 1, amounts in B2:B5, B7 `=SUM(B2:B5)`, a note in
+    // row 8, and Summary!A1 `=SUM(Data!B2:B5)`.
+    const budget = () => source_of([
+        {
+            name: 'Data',
+            header: true,
+            rows: [
+                [value('Name'), value('Amount')],
+                [value('a'), value('3')],
+                [value('b'), value('5')],
+                [value('c'), value('9')],
+                [value('d'), value('7')],
+                [null, null],
+                [value('Total'), formula('=SUM(B2:B5)')],
+                [value('Note'), null],
+            ],
+        },
+        { name: 'Summary', rows: [[formula('=SUM(Data!B2:B5)')]] },
+    ]);
+    const budget_context: WorksheetStructureContext = {
+        worksheet: { sheetIndex: 0, sheetName: 'Data' },
+        bodyStart: 1,
+        sourceRowCount: 8,
+        sourceColumnCount: 2,
+        bodyViewTransformed: false,
+    };
+    /** Move worksheet rows, named by source row, before another source row's row. */
+    const move = (changes: PendingStructuralChanges, source_row: number, before: number) => {
+        const result = move_rows(changes, budget_context, [{ kind: 'source', sourceRow: source_row }], {
+            kind: 'source',
+            sourceRow: before,
+        });
+        if (!result.ok) throw new Error(result.refusal.message);
+        return result.outcome.next;
+    };
+    const review_of = (changes: PendingStructuralChanges) =>
+        review_formula_divergence(budget(), [], [layout_of(changes, 1), layout_of(undefined, 0)]);
+
+    it('flags the formula and its cross-sheet dependent when one move carries the corner', () => {
+        // Row 5 (`d`) above row 3: the range's last corner now sits on row 3.
+        const review = review_of(move(EMPTY_PENDING_STRUCTURAL_CHANGES, 4, 2));
+        expect(review.items.map((item) => `${item.sheetIndex}:${item.row}:${item.column} ${item.formula} ${item.classes}`))
+            .toEqual(['0:6:1 =SUM(B2:B3) moved', '1:0:0 =SUM(Data!B2:B3) moved']);
+        expect(review.counts).toEqual([{ targetSheetIndex: 0, formulas: 2 }]);
+    });
+
+    it('still flags them after a later move leaves the carried corner in order with its neighbors', () => {
+        // Row 5 (`d`) above row 4 (`c`), then the note row above `c`: rows
+        // 2, 3, 5, 8, 4, 6, 7. `d`'s run is in order with the runs beside it,
+        // but `c`, after it, came before it in the source.
+        const changes = move(move(EMPTY_PENDING_STRUCTURAL_CHANGES, 4, 3), 7, 3);
+        const review = review_of(changes);
+        expect(review.items.map((item) => `${item.sheetIndex}:${item.row}:${item.column} ${item.formula} ${item.classes} ${item.axes}`))
+            .toEqual(['0:7:1 =SUM(B2:B4) moved row', '1:0:0 =SUM(Data!B2:B4) moved row']);
+        expect(review.counts).toEqual([{ targetSheetIndex: 0, formulas: 2 }]);
+    });
+});
+
+describe('divergence flags over every short move sequence', () => {
+    // Data: Header Row 1, body rows 2-7 (source rows 1-6). Each range is on
+    // Summary, so no move carries the formula itself.
+    const BODY = 6;
+    const sheets = [
+        { name: 'Data', sourceRowCount: BODY + 1, columnCount: 2 },
+        { name: 'Summary', sourceRowCount: 1, columnCount: 1 },
+    ];
+    type State = { readonly layout: RowLayout; readonly order: readonly number[] };
+    /** Every move of one or two adjacent body rows to every other place. */
+    function* moves(state: State): Generator<State> {
+        const { order } = state;
+        for (let count = 1; count <= 2; count += 1) {
+            for (let first = 0; first + count <= order.length; first += 1) {
+                for (let before = 0; before <= order.length; before += 1) {
+                    if (before >= first && before <= first + count) continue;
+                    const block = order.slice(first, first + count);
+                    const result = move_layout_rows(
+                        state.layout,
+                        block.map((sourceRow) => ({ kind: 'source' as const, sourceRow })),
+                        before === order.length ? 'end' : { kind: 'source', sourceRow: order[before]! },
+                    );
+                    if (!result.ok) throw new Error(result.refusal.reason);
+                    const rest = order.filter((row) => !block.includes(row));
+                    const at = before === order.length ? rest.length : rest.indexOf(order[before]!);
+                    yield { layout: result.layout, order: [...rest.slice(0, at), ...block, ...rest.slice(at)] };
+                }
+            }
+        }
+    }
+
+    it('flags every range that no longer sums the rows it summed', () => {
+        const start: State = {
+            layout: source_row_layout(1, BODY),
+            order: Array.from({ length: BODY }, (_, index) => index + 1),
+        };
+        let checked = 0;
+        let flagged_count = 0;
+        const check = (state: State) => {
+            const workbook = formula_calculation_workbook(sheets, [
+                { bodyStart: 1, rowLayout: state.layout, band: [] },
+                { bodyStart: 0, band: [] },
+            ]);
+            const context = formula_anchor_context(workbook, 1);
+            for (let first = 2; first <= BODY + 1; first += 1) {
+                for (let last = first + 1; last <= BODY + 1; last += 1) {
+                    const text = `=SUM(Data!B${first}:B${last})`;
+                    checked += 1;
+                    if (formula_divergence_flags(text, undefined, context).length > 0) {
+                        flagged_count += 1;
+                        continue;
+                    }
+                    const rendered = render_formula(text, undefined, context);
+                    const match = rendered.kind === 'rendered'
+                        ? /^=SUM\(Data!B(\d+):B(\d+)\)$/.exec(rendered.text)
+                        : null;
+                    expect(match, text).not.toBeNull();
+                    // Worksheet row r holds source row order[r - 2].
+                    const summed = state.order.slice(Number(match![1]) - 2, Number(match![2]) - 1).sort((a, b) => a - b);
+                    const before = Array.from({ length: last - first + 1 }, (_, index) => first - 1 + index);
+                    expect(summed, `${text} after ${state.order.join(',')}`).toEqual(before);
+                }
+            }
+        };
+        for (const once of moves(start)) {
+            check(once);
+            for (const twice of moves(once)) check(twice);
+        }
+        expect(checked).toBeGreaterThan(30_000);
+        expect(flagged_count).toBeGreaterThan(0);
+    });
+});
+
 describe('review_formula_impact', () => {
     it('counts formulas a discard turns to #REF! and those it points at different rows', () => {
         // Data: a Pending Inserted Row `p1` after worksheet row 2.
@@ -228,6 +398,54 @@ describe('review_formula_impact', () => {
             { edits: [edit], layouts: before_layouts },
             { edits: [edit], layouts: before_layouts },
         )).toEqual({ ref: 0, moved: 0 });
+    });
+
+    it('counts what a plain column delete does, with no conflict: #REF! for every reference wholly in it', () => {
+        // Data (no Header Row): values in A-D, formulas in E and one in C4,
+        // the column the action deletes.
+        const source = source_of([
+            {
+                name: 'Data',
+                rows: [
+                    [value('1'), value('2'), value('3'), value('4'), formula('=C1')],
+                    [value('1'), value('2'), value('3'), value('4'), formula('=SUM(B2:D2)')],
+                    [value('1'), value('2'), value('3'), value('4'), formula('=SUM(C1:C3)')],
+                    [value('1'), value('2'), formula('=B4'), value('4'), formula('=A4+#REF!')],
+                    [value('1'), value('2'), value('3'), value('4'), formula('=A5')],
+                ],
+            },
+            {
+                name: 'Summary',
+                rows: [
+                    [formula('=Data!C2')],
+                    [formula('=SUM(Data!C:C)')],
+                    [formula('=SUM(Data!B:D)')],
+                    [formula('=Data!D1')],
+                    [formula('="#REF!"&Data!A1')],
+                    [formula('=Data!E2+Data!C2')],
+                ],
+            },
+        ]);
+        const deleted = delete_layout_columns(
+            source_column_layout(5),
+            [{ kind: 'source', sourceColumn: 2 }],
+            () => 0,
+        );
+        if (!deleted.ok) throw new Error(deleted.refusal.reason);
+        const impact = review_formula_impact(
+            source,
+            { edits: [], layouts: [layout_of(undefined, 0), layout_of(undefined, 0)] },
+            {
+                edits: [],
+                layouts: [{ bodyStart: 0, columnLayout: deleted.layout, band: [] }, layout_of(undefined, 0)],
+            },
+        );
+        // #REF!: E1 `=C1`, E3 `=SUM(C1:C3)`, Summary `=Data!C2`, `=SUM(Data!C:C)`,
+        // and `=Data!E2+Data!C2`, which gains one. Moved: E2 to `=SUM(B2:C2)`,
+        // `=SUM(Data!B:C)`, and `=Data!C1`. Not counted: C4, on the deleted
+        // column; `=A4+#REF!` and `=A5`, unchanged though their cells move left;
+        // and the `#REF!` inside a string.
+        expect(impact).toEqual({ ref: 5, moved: 3 });
     });
 
     it('yields while rendering formula edits, not only source formulas', async () => {

@@ -192,8 +192,8 @@ class ArrayAnchorAxis<Identity> implements AnchorAxisView<Identity> {
         const index = this.runs.findIndex((run) => run.members.includes(member));
         if (index < 0) return false;
         const run = this.runs[index];
-        return (index > 0 && this.runs[index - 1].start > run.start)
-            || (index + 1 < this.runs.length && this.runs[index + 1].start < run.start);
+        return this.runs.some((other, position) => (position < index && other.start > run.start)
+            || (position > index && other.start < run.start));
     }
 }
 

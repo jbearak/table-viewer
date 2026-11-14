@@ -170,9 +170,10 @@ export interface AxisLayoutIndex<I> {
     /** Displayed identities in order: removed source entries in place, discarded ones skipped. */
     display_identities(): IterableIterator<I>;
     /**
-     * Whether a source identity lies in a source run that is out of ascending
-     * source order with the nearest source run on either side, skipping
-     * pending runs. Always false for pending identities.
+     * Whether a source identity lies in a source run that is out of source
+     * order with any other source run: one before it starts later in the
+     * source, or one after it starts earlier. Pending runs are ignored.
+     * Always false for pending identities.
      */
     in_displaced_source_run(identity: I): boolean;
 }
@@ -536,18 +537,29 @@ function build_segments(model: AxisModel): LayoutSegment[] {
     return segments;
 }
 
-/** Per run: out of ascending order with the nearest source run on either side. */
+/**
+ * Per run: whether it is a source run out of source order with any other
+ * source run, so a move may have carried it: a source run before it starts
+ * later in the source, or one after it starts earlier. Comparing only the
+ * nearest source runs is not enough: move row 5 above row 4, then row 8 above
+ * row 4, and the order 2-3, 5, 8, 4, 6-7 leaves 5 in order with both
+ * neighbors though a move carried it.
+ */
 function displaced_runs(runs: readonly AxisRun[]): boolean[] {
     const displaced = runs.map(() => false);
-    let previous: { start: number; index: number } | undefined;
+    let latest_before = -1;
     runs.forEach((run, index) => {
         if (run.kind !== 'source') return;
-        if (previous !== undefined && previous.start > run.start) {
-            displaced[index] = true;
-            displaced[previous.index] = true;
-        }
-        previous = { start: run.start, index };
+        if (latest_before > run.start) displaced[index] = true;
+        latest_before = Math.max(latest_before, run.start);
     });
+    let earliest_after = Number.POSITIVE_INFINITY;
+    for (let index = runs.length - 1; index >= 0; index -= 1) {
+        const run = runs[index]!;
+        if (run.kind !== 'source') continue;
+        if (earliest_after < run.start) displaced[index] = true;
+        earliest_after = Math.min(earliest_after, run.start);
+    }
     return displaced;
 }
 

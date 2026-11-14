@@ -1024,10 +1024,9 @@ function check_axis_index<I>(
     const source_runs = runs.filter((run) => run.source);
     expect(index.hasOutOfOrderRun).toBe(source_runs.some((run, i) => i > 0 && source_runs[i - 1]!.start > run.start));
     const displaced = new Set<number>();
+    // Out of source order with any other source run, not only its neighbors.
     source_runs.forEach((run, i) => {
-        const previous = source_runs[i - 1];
-        const next = source_runs[i + 1];
-        if ((previous !== undefined && previous.start > run.start) || (next !== undefined && next.start < run.start)) {
+        if (source_runs.some((other, j) => (j < i && other.start > run.start) || (j > i && other.start < run.start))) {
             for (const member of run.members) displaced.add(member);
         }
     });

@@ -109,9 +109,9 @@ export interface AnchorAxisView<Identity> {
     /** Identity at a prospective 1-based number in `(H, H + N + bandCount]`, else `undefined`. */
     identity_at(number: number): Identity | undefined;
     /**
-     * Whether the identity lies in a source run that is out of ascending
-     * source order with the nearest source run on either side, skipping
-     * pending runs.
+     * Whether the identity lies in a source run that is out of source order
+     * with any other source run: one before it starts later in the source, or
+     * one after it starts earlier. Pending runs are ignored.
      */
     in_displaced_run(identity: Identity): boolean;
 }
@@ -769,8 +769,8 @@ export function render_formula(
  * - `discardedCorner`: the range renders `#REF!` because a corner names an
  *   identity the layout no longer holds, such as a discarded Pending Appended
  *   Row;
- * - `displacedCorner`: a corner lies in a source run out of ascending source
- *   order with its nearest source neighbors, so a move carried it;
+ * - `displacedCorner`: a corner lies in a source run out of source order with
+ *   some other source run, so a move may have carried it;
  * - `unadjustable`: a construct no layout change can adjust, such as
  *   `INDEX(A:A,1):B5`, touches a worksheet with a live layout change on this
  *   axis, so the formula is `unrenderable`.
