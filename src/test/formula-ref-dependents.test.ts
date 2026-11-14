@@ -149,6 +149,73 @@ describe('formulas that use a #REF! formula', () => {
         expect(listed(review)).toEqual(['0!5:2 =SUM(C2:C5) ref']);
     });
 
+    it('says a formula catches the error only when every #REF! Save writes into it is caught', async () => {
+        const source = await prices([
+            '=IFERROR(Data!C2*2,0)',
+            // IFERROR covers only Data!B2: the #REF! after it shows.
+            '=IFERROR(Data!B2,0)+Data!C3',
+            // IFNA catches only #N/A.
+            '=_xlfn.IFNA(Data!C4,0)',
+            '=ISERROR(Data!C5)',
+        ]);
+        const review = review_formula_divergence(source, [], price_deleted(source));
+        const summary = review.deleted.filter((item) => item.sheetIndex === 1)
+            .map((item) => `${item.row}:${item.column} ${item.formula} ${item.catchesErrors === true ? 'caught' : 'ref'}`);
+        expect(summary).toEqual([
+            '0:0 =IFERROR(Data!#REF!*2,0) caught',
+            '1:0 =IFERROR(Data!B2,0)+Data!#REF! ref',
+            '2:0 =_xlfn.IFNA(Data!#REF!,0) ref',
+            '3:0 =ISERROR(Data!#REF!) caught',
+        ]);
+        // The four Totals and Summary A2 and A3 will show #REF!.
+        expect(review.totals).toMatchObject({ deleted: 6, deletedCaught: 2 });
+    });
+
+    it('passes the error on through a formula that catches it in only some of the cells it reads', async () => {
+        const source = await prices([
+            // Every read inside IFERROR or ISERROR: nothing passes on.
+            '=IFERROR(Data!D6,0)',
+            '=ISERROR(Data!D6)',
+            '=A1*2',
+            // The All total is read outside IFERROR's first argument.
+            '=IFERROR(Data!B2,0)+Data!D6',
+            '=IF(ISERROR(Data!D6),0,Data!D6)',
+            '=_xlfn.IFNA(Data!D6,0)',
+            '=A4*2',
+        ]);
+        const review = review_formula_divergence(source, [], price_deleted(source));
+        // The calculator doesn't evaluate IFERROR, IF, or IFNA, so each might
+        // show an error, and so might A7, which uses A4's result.
+        expect(listed(review)).toEqual([
+            '0!5:2 =SUM(C2:C5) ref',
+            '1!3:0 =IFERROR(Data!B2,0)+Data!C6 unchecked',
+            '1!4:0 =IF(ISERROR(Data!C6),0,Data!C6) unchecked',
+            '1!5:0 =_xlfn.IFNA(Data!C6,0) unchecked',
+            '1!6:0 =A4*2 unchecked',
+        ]);
+    });
+
+    it('says a formula that uses one that catches its #REF! but reads a broken cell outside IFERROR might show an error', async () => {
+        // A1 catches the #REF! Save writes for Data!C2, but its fallback is
+        // the All total, which breaks too. A3 catches every error it reads.
+        const source = await prices(['=IFERROR(Data!C2,Data!D6)', '=A1*2', '=IFERROR(Data!C3*Data!D6,0)', '=A3*2']);
+        const review = review_formula_divergence(source, [], price_deleted(source));
+        expect(review.deleted.filter((item) => item.sheetIndex === 1).map((item) => item.catchesErrors)).toEqual([true, true]);
+        // The calculator can't tell what A1 shows, so A2 might show an error.
+        expect(listed(review)).toEqual(['0!5:2 =SUM(C2:C5) ref', '1!1:0 =A1*2 unchecked']);
+    });
+
+    it('passes the error on through a pending formula that catches it in only some of the cells it reads', async () => {
+        const source = await prices(['=1', '=A1*2']);
+        const review = review_formula_divergence(source, [
+            { sheetIndex: 1, row: 0, column: 0, value: '=IFERROR(Data!B2,0)+Data!D6', writesFormula: true },
+        ], price_deleted(source));
+        expect(listed(review)).toEqual([
+            '0!5:2 =SUM(C2:C5) ref',
+            '1!0:0 =IFERROR(Data!B2,0)+Data!C6 unchecked',
+        ]);
+    });
+
     it('lists nothing when a value typed over a broken formula stops the chain', async () => {
         const source = await prices(['=Data!D6']);
         const review = review_formula_divergence(source, [

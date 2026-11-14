@@ -5,10 +5,12 @@
 //
 //   esbuild benchmarks/formulas/save-warnings-bench.ts --bundle --platform=node \
 //     --packages=external --outfile=test-results/save-warnings-bench.js
-//   node test-results/save-warnings-bench.js [rows] [dependents]
+//   node test-results/save-warnings-bench.js [rows] [dependents] [iferror]
 //
 // With `dependents`, every row also has `E = D*1.1` and the All row sums E,
 // so deleting Price breaks a formula on every row and one that uses it.
+// With `iferror`, each row's formulas are wrapped in IFERROR(…,0), so the
+// review reads where every operand sits in each one.
 //
 // Prints one JSON line per gesture: the review's total CPU time, its longest
 // uninterrupted slice when run cooperatively (8 ms slices, as the host runs
@@ -31,15 +33,18 @@ import {
 
 async function main(): Promise<void> {
     const rows = Number(process.argv[2] ?? 50_000);
-    const dependents = process.argv[3] === 'dependents';
+    const dependents = process.argv.slice(3).includes('dependents');
+    const wrap = process.argv.slice(3).includes('iferror')
+        ? (formula: string) => `IFERROR(${formula},0)`
+        : (formula: string) => formula;
     const body: string[] = [row(1, ['Item', 'Qty', 'Price', 'Total', 'Tax'].map((v, c) => cell(`${'ABCDE'[c]}1`, v)))];
     for (let n = 2; n <= rows + 1; n += 1) {
         body.push(row(n, [
             cell(`A${n}`, `item ${n}`),
             cell(`B${n}`, n % 17),
             cell(`C${n}`, (n % 13) / 4),
-            cell(`D${n}`, { f: `B${n}*C${n}` }),
-            ...(dependents ? [cell(`E${n}`, { f: `D${n}*1.1` })] : []),
+            cell(`D${n}`, { f: wrap(`B${n}*C${n}`) }),
+            ...(dependents ? [cell(`E${n}`, { f: wrap(`D${n}*1.1`) })] : []),
         ]));
     }
     body.push(row(rows + 2, [

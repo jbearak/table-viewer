@@ -241,15 +241,27 @@ function conflict_notices(input: PendingChangeNoticeInput): PendingChangeNotice[
     return out;
 }
 
-/** "4 formulas will show #REF! and 12 will point at different rows or columns." */
+/**
+ * "4 formulas will show #REF!, 1 will show its fallback value because it
+ * catches the error, and 12 will point at different rows or columns." A
+ * formula that catches the error is never said to show #REF!, as in the Save
+ * warning.
+ */
 export function formula_impact_text(impact: FormulaImpact): string | undefined {
-    const formulas = (n: number) => count(n, 'formula', 'formulas');
-    if (impact.ref > 0 && impact.moved > 0) {
-        return `${formulas(impact.ref)} will show #REF! and ${impact.moved.toLocaleString('en-US')} will point at different rows or columns.`;
-    }
-    if (impact.ref > 0) return `${formulas(impact.ref)} will show #REF!.`;
-    if (impact.moved > 0) return `${formulas(impact.moved)} will point at different rows or columns.`;
-    return undefined;
+    const one = impact.caught === 1;
+    const caught = `will show ${one ? 'its fallback value because it catches' : 'their fallback values because they catch'} `
+        + `the ${impact.ref > 0 ? 'error' : '#REF! error'}`;
+    const parts = [
+        { n: impact.ref, says: 'will show #REF!' },
+        { n: impact.caught, says: caught },
+        { n: impact.moved, says: 'will point at different rows or columns' },
+    ].filter((part) => part.n > 0);
+    if (parts.length === 0) return undefined;
+    const [first, ...rest] = parts;
+    return `${and_list([
+        `${count(first!.n, 'formula', 'formulas')} ${first!.says}`,
+        ...rest.map((part) => `${part.n.toLocaleString('en-US')} ${part.says}`),
+    ])}.`;
 }
 
 function layout_conflict_notice(

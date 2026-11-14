@@ -18442,8 +18442,8 @@ describe('structural conflict notice counts and the Save summary', () => {
             requestId: request!.requestId,
             sourceGeneration: request!.sourceGeneration,
             impacts: {
-                ...(reason === 'structuralBasisChanged' ? { keep: { ref: 0, moved: 12 } } : {}),
-                discard: { ref: 4, moved: 12 },
+                ...(reason === 'structuralBasisChanged' ? { keep: { ref: 0, caught: 0, moved: 12 } } : {}),
+                discard: { ref: 4, caught: 0, moved: 12 },
             },
         });
         expect(action('Discard row and column changes on Sales')?.disabled).toBe(false);
@@ -18542,7 +18542,7 @@ describe('structural conflict notice counts and the Save summary', () => {
             type: 'formulaImpact',
             requestId: retry.requestId,
             sourceGeneration: retry.sourceGeneration,
-            impacts: { keep: { ref: 0, moved: 2 }, discard: { ref: 1, moved: 0 } },
+            impacts: { keep: { ref: 0, caught: 0, moved: 2 }, discard: { ref: 1, caught: 0, moved: 0 } },
         });
         expect(notice.textContent).toContain('Discard row and column changes on Sales: 1 formula will show #REF!.');
         expect(notice.textContent).not.toContain('Checking formulas…');
