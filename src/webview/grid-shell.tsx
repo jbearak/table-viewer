@@ -8365,7 +8365,10 @@ export function GridShell({
                     show_formatting,
                     overlay,
                     font_size_px,
-                    get_cell_height(row, display_column) > default_row_height,
+                    // As for a loaded row: a toolbar fit's width ceiling can
+                    // leave the value wider than its column.
+                    auto_fit_active
+                        || get_cell_height(row, display_column) > default_row_height,
                     link_modifier_held,
                     diff_colors,
                 );

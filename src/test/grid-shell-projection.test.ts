@@ -5503,6 +5503,28 @@ describe('GridShell link-only edits', () => {
         expect(widths[1]).toBe('1E+15'.length * 7 + 16);
     });
 
+    it('keeps a Pending Appended Row wrapping while a toolbar fit is active', async () => {
+        grid_mock.sampled_row_count = 2;
+        const pending = create_pending_row_store({ session_id: 'session' });
+        pending.append_rows('session', ['appended'], {
+            id: 'xlsx-template',
+            format: { kind: 'xlsx', templateSourceRow: 0, styleFingerprint: 'style', cellStyleIndexes: [null, null] },
+        }, 1);
+        pending.set_cell('session', 'appended', 1, { value: 'a value longer than the fit ceiling allows' });
+        await render_auto_fit({
+            edit_syntax: 'markdown',
+            pending_row_store: pending,
+            auto_fit_active: true,
+            column_widths: { 1: MAX_AUTO_FIT_COLUMN_WIDTH_PX },
+        });
+
+        // The fit's width ceiling can leave a long value wider than its column;
+        // it wraps, as a loaded row's does, rather than clipping until Save.
+        const get_cell_content = grid_mock.props!.getCellContent as
+            (cell: [number, number]) => { allowWrapping?: boolean };
+        expect(get_cell_content([1, 2]).allowWrapping).toBe(true);
+    });
+
     it('auto-fits a source column by what a Pending Inserted Row paints', async () => {
         grid_mock.sampled_row_count = 2;
         const pending = create_pending_row_store({ session_id: 'session' });
