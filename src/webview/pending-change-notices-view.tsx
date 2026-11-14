@@ -33,7 +33,7 @@ export function PendingChangeNotices(props: PendingChangeNoticesProps): React.JS
                     {notice.status !== undefined && <p role="status">{notice.status}</p>}
                     {notice.formulas !== undefined && (
                         <FormulaList
-                            key={notice.dismissKey ?? notice.kind}
+                            key={formula_list_key(notice.kind, notice.formulas)}
                             id={`pending-change-formulas-${notice.kind}`}
                             formulas={notice.formulas}
                             on_intent={props.on_intent}
@@ -60,6 +60,15 @@ export function PendingChangeNotices(props: PendingChangeNoticesProps): React.JS
             )}
         </div>
     );
+}
+
+/**
+ * A list opened stays open while it lists the same formulas, though the
+ * sentences above it change: going to a cell on another worksheet rewords
+ * them ("on Data") and the person may go on to the next formula.
+ */
+function formula_list_key(kind: string, formulas: PendingChangeNoticeFormulas): string {
+    return `${kind}:${JSON.stringify(formulas.items.map((item) => [item.location, item.formula, item.note ?? null]))}`;
 }
 
 function FormulaList(props: {

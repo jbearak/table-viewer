@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useReducer, useRef } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useReducer, useRef } from 'react';
 import type { RenderedCell } from '../data-source/interface';
 import type { HostMessage } from '../types';
 import { host_bridge } from './host-bridge';
@@ -81,7 +81,11 @@ export function use_row_loader(
     }
     const loader = ref.current;
 
-    useEffect(() => {
+    // A layout effect, ahead of the caller's: a grid that mounts with a request
+    // waiting for it (a Go to cell on another sheet) asks for rows in its own
+    // layout effect, and an unconfigured loader has no rows to load, so it
+    // would report the row loaded without asking the host for it.
+    useLayoutEffect(() => {
         loader.configure(
             sheet_index,
             row_count,
@@ -100,7 +104,9 @@ export function use_row_loader(
         estimated_row_bytes,
     ]);
 
-    useEffect(() => {
+    // Listening from the same phase that configures, so rows asked for in a
+    // layout effect can't arrive before anything listens for them.
+    useLayoutEffect(() => {
         const handler = (e: MessageEvent) => {
             const data: unknown = e.data;
             if (data === null || typeof data !== 'object') return;

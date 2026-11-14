@@ -1010,7 +1010,8 @@ describe('align_sheet', () => {
             original: size + 1,
             modified: 3,
         });
-    });
+    // About 1 s locally, like the Myers bound below: CI gets the same headroom.
+    }, 60_000);
 
     it('yields while normalizing production-sized move candidates', async () => {
         const size = 1_000;
@@ -1502,7 +1503,8 @@ describe('align_sheet', () => {
             changedCells: block_size * block_count,
         });
         expect(shape(alignment.rows.slice(0, 3))).toEqual(['0,0', '1,1', '2,2']);
-    });
+    // About 1 s locally; it ran past the default 5 s on a GitHub runner (run 43598109905).
+    }, 60_000);
 
     it('yields inside a long middle-snake search so cancellation can arrive', async () => {
         const make_rows = (tag: string) =>

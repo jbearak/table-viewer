@@ -3170,7 +3170,7 @@ describe('formula questions', () => {
         ]);
         expect(answer.review.deletedCounts).toEqual([{ targetSheetIndex: 0, formulas: 2 }]);
         expect(answer.review.totals)
-            .toEqual({ deleted: 2, changedRanges: 0, unadjustable: 0, refDependents: 0, uncheckedDependents: 0 });
+            .toEqual({ deleted: 2, deletedCaught: 0, changedRanges: 0, unadjustable: 0, refDependents: 0, uncheckedDependents: 0 });
         expect(answer.review.dependents).toEqual([]);
     });
 

@@ -68,4 +68,24 @@ describe('PendingChangeNotices', () => {
             '.pending-change-formula-location',
         )?.textContent)).toEqual(['Total, row 1', 'Total, row 2']);
     });
+
+    it('keeps an opened list open while it lists the same formulas under reworded sentences', () => {
+        container = document.createElement('div');
+        document.body.appendChild(container);
+        root = createRoot(container);
+        // Going to a cell on Summary rewords the first sentence, and with it the dismissal key.
+        const notice = (where: string): PendingChangeNotice => ({
+            ...refusal([2, 3, 4, 5]),
+            kind: 'deletedReferences',
+            sentences: [`4 formulas use column Price${where}, which you deleted.`],
+            dismissKey: `deleted:${where}`,
+        });
+        render(notice(''));
+        act(() => (container!.querySelector('.pending-change-disclosure') as HTMLButtonElement).click());
+        expect(container.querySelectorAll('.pending-change-formulas li')).toHaveLength(4);
+
+        render(notice(' on Data'));
+        expect(container.querySelectorAll('.pending-change-formulas li')).toHaveLength(4);
+        expect(container.querySelector('.pending-change-disclosure')?.textContent).toBe('Hide formulas');
+    });
 });

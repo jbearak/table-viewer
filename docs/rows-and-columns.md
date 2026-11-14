@@ -102,7 +102,15 @@ An insert, delete, or move needs no notice: the tints show it. A notice appears 
   Restore the column, or undo, to keep them working.
   ```
 
-  Table Viewer calculates only arithmetic, `SUM`, and `AVERAGE`. A formula that uses a broken result through another function, such as `ROUND`, is counted separately: it might show an error and might not. A formula that catches errors, such as `IFERROR` or `ISERROR`, isn't counted.
+  Table Viewer calculates only arithmetic, `SUM`, and `AVERAGE`. A formula that uses a broken result through another function, such as `ROUND`, is counted separately: it might show an error and might not. A formula that uses a broken result inside a function that catches errors, such as `IFERROR` or `ISERROR`, isn't counted.
+
+  A formula that uses the deleted row or column inside such a function, like `=IFERROR(C2*2,0)` after you delete column C, won't show `#REF!`. Excel shows its fallback value instead. Save still writes `#REF!` into it, so the notice lists it and counts it on its own:
+
+  ```text
+  2 formulas use column Price, which you deleted. After you save, they will show #REF!.
+  1 more formula uses the deleted column but catches the error, so it will show its fallback value instead.
+  Restore the column, or undo, to keep them working.
+  ```
 
 - A move or delete changed a formula's range in a way Excel might not. Table Viewer adjusts a range from the final arrangement of rows and columns, while Excel adjusts it one change at a time, so moving the first or last row of a range, or inserting next to a deleted one, can give a different range:
 
@@ -114,7 +122,7 @@ An insert, delete, or move needs no notice: the tints show it. A notice appears 
 
 - Save will refuse the change, for example because a rule would split into too many rules or a formula can't be adjusted.
 
-Each notice lists the formulas as Save will write them, with what they were before, and **Go to cell**. Formulas listed because they use a broken one are marked "Uses a #REF! result" or "Might show an error". A list of more than three formulas starts collapsed behind **Show N formulas**. **Dismiss** hides a warning until what it says changes. A notice that explains why Save is refused can't be dismissed.
+Each notice lists the formulas as Save will write them, with what they were before, and **Go to cell**, which selects the formula's cell and switches to its sheet if it is on another one. Formulas listed because they use a broken one are marked "Uses a #REF! result" or "Might show an error", and one that catches the error is marked "Shows its fallback value". A list of more than three formulas starts collapsed behind **Show N formulas**. **Dismiss** hides a warning until what it says changes. A notice that explains why Save is refused can't be dismissed.
 
 The notice sits under the grid, so it never moves the row you are pointing at.
 

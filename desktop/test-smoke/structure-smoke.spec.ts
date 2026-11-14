@@ -5,7 +5,8 @@
 // webview by context menu, keyboard, and drag, checks the Edit menu's Undo label
 // after each gesture, saves with the Save button, and reads the file back.
 //
-// No focus assertions and no application-menu commands: the Undo labels are
+// No assertions that need the window focused, and no application-menu
+// commands. Checking which element has focus inside the page is fine. The Undo labels are
 // read from the history state the renderer reports for the Edit menu (see
 // `install_history_menu_capture`). Restored drafts after a relaunch are in
 // structure-relaunch.spec.ts.
@@ -558,13 +559,57 @@ test('an .xlsx counts the formulas that use a broken one, on other worksheets to
     await expect(items.nth(6)).toContainText('Might show an error');
     await expect(broken).not.toContainText('IFERROR');
 
-    // Summary shows the pending results; the notice stays, now naming Data.
+    // Go to cell on Summary switches to its tab and lands on the cell once
+    // Summary's rows load. Summary shows the pending results; the notice
+    // stays, now naming Data.
+    await broken.getByRole('button', { name: 'Go to Summary!A2' }).click();
     const summary = page.getByRole('button', { name: 'Summary', exact: true });
-    await summary.click();
     await expect(summary).toHaveClass(/active/);
+    // The accessible cells count the row markers as column 0.
+    const a2 = page.locator('#glide-cell-1-1');
+    await expect(a2).toHaveAttribute('aria-selected', 'true');
+    await expect(a2).toBeFocused();
+    await expect(page.locator('.pending-change-notices-status')).toHaveCount(0);
     await expect.poll(async () => (await grid_rows(page)).length).toBe(3);
     await expect(broken).toContainText('4 formulas use column Price on Data, which you deleted.');
     await save_screenshot(page, '16-summary-pending-results');
+
+    // And back, from the list still open: Total, row 3 on Data, past the
+    // deleted Price column the grid keeps in place until Save.
+    await broken.getByRole('button', { name: 'Go to Total, row 3 on Data' }).click();
+    await expect(page.getByRole('button', { name: 'Data', exact: true })).toHaveClass(/active/);
+    const total = page.locator('#glide-cell-4-1');
+    await expect(total).toHaveAttribute('aria-selected', 'true');
+    await expect(total).toBeFocused();
+    await expect(page.locator('.pending-change-notices-status')).toHaveCount(0);
+    await save_screenshot(page, '17-back-to-data');
+});
+
+test('an .xlsx formula that catches the #REF! a delete leaves is listed, not counted as showing it', async () => {
+    const { page } = await open_file('totals.xlsx', totals_workbook(['IFERROR(Data!C2*2,0)']));
+    await wait_for_grid(page);
+    await choose(await open_column_menu(page, 2), 'Delete column');
+    const broken = page.getByRole('status', { name: 'Formulas that will show #REF!' });
+    await expect(broken).toContainText(
+        '4 formulas use column Price, which you deleted. After you save, they will show #REF!.',
+        { timeout: 30_000 },
+    );
+    await broken.getByRole('button', { name: /^Show \d+ formulas$/ }).click();
+    await save_screenshot(page, '18-xlsx-iferror-deleted-reference');
+    // Save writes #REF! into Summary!A1, but Excel shows its fallback, 0.
+    await expect(broken).toContainText(
+        '1 more formula uses the deleted column but catches the error, so it will show its fallback value instead.');
+    const items = broken.locator('li');
+    await expect(items).toHaveCount(6);
+    await expect(items.last()).toContainText('Summary!A1');
+    await expect(items.last()).toContainText('=IFERROR(Data!#REF!*2,0)');
+    await expect(items.last()).toContainText('Shows its fallback value');
+
+    await broken.getByRole('button', { name: 'Go to Summary!A1' }).click();
+    await expect(page.getByRole('button', { name: 'Summary', exact: true })).toHaveClass(/active/);
+    const a1 = page.locator('#glide-cell-1-0');
+    await expect(a1).toHaveAttribute('aria-selected', 'true');
+    await expect(a1).toBeFocused();
 });
 
 test('a move that changes a summed range says so before Save', async () => {

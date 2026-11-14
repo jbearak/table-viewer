@@ -4367,6 +4367,104 @@ describe('GridShell column projection', () => {
         expect(on_cell_focus_applied).toHaveBeenCalledWith(2, true);
     });
 
+    it('goes to a cell once a sort being applied lands, in the sorted order', async () => {
+        const on_cell_focus_applied = vi.fn();
+        const base = props({
+            row_count: 3,
+            sheet_meta: { ...props().sheet_meta, rowCount: 3, sourceRowCount: 3 },
+            on_cell_focus_applied,
+            cell_focus: { sequence: 1, sheetIndex: 0, row: { kind: 'source', sourceRow: 2 }, column: { kind: 'source', sourceColumn: 0 } },
+        });
+        const GridShell = await render_grid({ ...base, transform_pending: true });
+        // The rows are about to change places: nothing is selected or refused yet.
+        expect(grid_mock.ensure_rows_loaded).not.toHaveBeenCalled();
+        expect(on_cell_focus_applied).not.toHaveBeenCalled();
+        grid_mock.source_row_for_display = (display_row: number) => [1, 2, 0][display_row];
+        await act(async () => {
+            root!.render(React.createElement(GridShell, {
+                ...base,
+                generation: 2,
+                transform_state: { sort: [{ colIndex: 0, direction: 'desc' }], filters: [] },
+            }));
+        });
+        await vi.waitFor(() => expect(on_cell_focus_applied).toHaveBeenCalledWith(1, true));
+        expect((grid_mock.props!.gridSelection as { current?: { cell: [number, number] } }).current?.cell)
+            .toEqual([0, 1]);
+    });
+
+    it('asks the host where an unloaded row went under a filter, and says the cell is not there only once it is filtered out', async () => {
+        for (const answer of [2, null] as const) {
+            // Display row 2 is not loaded.
+            grid_mock.source_row_for_display = (display_row: number) => [0, 1][display_row];
+            grid_mock.post_message.mockReset();
+            const on_cell_focus_applied = vi.fn();
+            await render_grid(props({
+                row_count: 3,
+                sheet_meta: { ...props().sheet_meta, rowCount: 3, sourceRowCount: 4 },
+                mapping_generation: 7,
+                transform_state: {
+                    sort: [],
+                    filters: [{ id: 'f1', colIndex: 0, operator: 'contains', value: 'x', caseSensitive: false, enabled: true }],
+                },
+                on_cell_focus_applied,
+                cell_focus: { sequence: 1, sheetIndex: 0, row: { kind: 'source', sourceRow: 2 }, column: { kind: 'source', sourceColumn: 0 } },
+            }));
+            const request = grid_mock.post_message.mock.calls
+                .map(([message]) => message)
+                .find((message) => message?.type === 'requestSourceDisplayRows');
+            expect(request?.sourceRows).toContain(2);
+            expect(on_cell_focus_applied).not.toHaveBeenCalled();
+            await act(async () => window.dispatchEvent(new MessageEvent('message', { data: {
+                type: 'sourceDisplayRows',
+                requestId: request.requestId,
+                sheetIndex: 0,
+                generation: 1,
+                mappingGeneration: 7,
+                sourceRows: request.sourceRows,
+                displayRows: request.sourceRows.map((row: number) => (row === 2 ? answer : row)),
+            } })));
+            if (answer === null) {
+                await vi.waitFor(() => expect(on_cell_focus_applied).toHaveBeenCalledWith(1, false));
+                expect(grid_mock.ensure_rows_loaded).not.toHaveBeenCalled();
+            } else {
+                await vi.waitFor(() => expect(on_cell_focus_applied).toHaveBeenCalledWith(1, true));
+                expect((grid_mock.props!.gridSelection as { current?: { cell: [number, number] } }).current?.cell)
+                    .toEqual([0, 2]);
+            }
+            act(() => root?.unmount());
+            root = null;
+        }
+    });
+
+    it('places a cell again in a new view that replaced the one its row was loading in', async () => {
+        grid_mock.source_row_for_display = (display_row: number) => (display_row === 2 ? undefined : display_row);
+        const loads: ((loaded: boolean) => void)[] = [];
+        grid_mock.ensure_rows_loaded.mockImplementation(() => new Promise<boolean>((resolve) => {
+            loads.push(resolve);
+        }));
+        const on_cell_focus_applied = vi.fn();
+        const base = props({
+            row_count: 3,
+            sheet_meta: { ...props().sheet_meta, rowCount: 3, sourceRowCount: 3 },
+            on_cell_focus_applied,
+            cell_focus: { sequence: 1, sheetIndex: 0, row: { kind: 'source', sourceRow: 2 }, column: { kind: 'source', sourceColumn: 0 } },
+        });
+        const GridShell = await render_grid(base);
+        expect(loads).toHaveLength(1);
+        // A refresh empties the loader, which settles the first load as not loaded.
+        await act(async () => {
+            root!.render(React.createElement(GridShell, { ...base, generation: 2 }));
+        });
+        await act(async () => { loads[0]!(false); });
+        expect(on_cell_focus_applied).not.toHaveBeenCalled();
+        expect(loads).toHaveLength(2);
+        grid_mock.source_row_for_display = null;
+        await act(async () => { loads[1]!(true); });
+        expect(on_cell_focus_applied).toHaveBeenCalledWith(1, true);
+        expect((grid_mock.props!.gridSelection as { current?: { cell: [number, number] } }).current?.cell)
+            .toEqual([0, 2]);
+    });
+
     it('publishes grid actions that select all and copy the whole sheet', async () => {
         const write_text = vi.fn(async () => {});
         Object.defineProperty(navigator, 'clipboard', {

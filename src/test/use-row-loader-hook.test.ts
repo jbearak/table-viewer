@@ -94,6 +94,47 @@ describe('use_row_loader', () => {
         expect(hook_result!.sample_loaded_rows).toBe(first.sample_loaded_rows);
     });
 
+    it('is configured for its sheet before the layout effects of the component that mounts it', async () => {
+        const { use_row_loader, postMessage } = await load_hook();
+        let load: Promise<boolean> | null = null;
+
+        // GridShell mounts with a Go to cell waiting for it and loads the
+        // cell's row from a layout effect.
+        function Harness() {
+            hook_result = use_row_loader(1, 3, 1);
+            const loader = hook_result;
+            React.useLayoutEffect(() => {
+                load = loader.ensure_rows_loaded(1, 1);
+            }, [loader]);
+            return null;
+        }
+
+        container = document.createElement('div');
+        document.body.appendChild(container);
+        root = createRoot(container);
+        let settled: boolean | null = null;
+        await act(async () => {
+            root!.render(React.createElement(Harness));
+        });
+        void load!.then((loaded) => { settled = loaded; });
+        await act(async () => {});
+        // Not settled before the row arrives: an unconfigured loader has no
+        // rows, so it would report row 1 loaded without asking for it.
+        expect(settled).toBeNull();
+        const request = postMessage.mock.calls.map(([message]) => message as WebviewMessage)
+            .find((message): message is Extract<WebviewMessage, { type: 'requestRows' }> =>
+                message.type === 'requestRows');
+        expect(request).toMatchObject({ sheetIndex: 1, startRow: 0, generation: 1 });
+
+        await act(async () => {
+            window.dispatchEvent(new MessageEvent('message', {
+                data: { ...row_data(0, 1, request!.requestId, [0, 1, 2]), sheetIndex: 1, rows: [[], [], []] },
+            }));
+        });
+        expect(settled).toBe(true);
+        expect(hook_result!.get_display_row_for_source(1)).toBe(1);
+    });
+
     it('settles a pending bulk load to false when the hook unmounts', async () => {
         const { use_row_loader } = await load_hook();
 
