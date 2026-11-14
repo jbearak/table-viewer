@@ -559,7 +559,7 @@ export interface PendingStructuralConflict {
     }[];
     /**
      * Why an `unsupportedStructure` save was refused, in the user's words
-     * ("Can't save these row and column changes: ..."), for Review Changes.
+     * ("Can't save these row and column changes: ..."), for the layout-conflict notice.
      */
     readonly message?: string;
 }

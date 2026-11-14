@@ -634,7 +634,7 @@ describe('host ordering rules', () => {
         await viewer.controller.drain();
         await vi.waitFor(() => expect(viewer.durable().pendingEdits?.[0]?.conflicts)
             .toEqual([{ reason: 'structuralBasisChanged', pendingRowIds: [], tailRemovalIds: [] }]));
-        // A further insert waits for Review Changes.
+        // A further insert waits for the layout-conflict notice.
         expect((await viewer.insert({ requestId: 'more' })).granted).toBe(false);
         await viewer.dispose();
     });

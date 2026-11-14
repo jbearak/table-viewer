@@ -1,7 +1,7 @@
 // The webview's half of a structural save (row and column structure design,
 // delivery step 5): the workbook-wide `structural-save` history barrier and
 // its Undo message, layout history arms through an append-only save, the
-// store clearing what a structural save wrote, and Review Changes' discard of
+// store clearing what a structural save wrote, and the layout-conflict notice's discard of
 // row and column changes after the file changed under them.
 import { describe, expect, it } from 'vitest';
 import {

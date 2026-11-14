@@ -541,6 +541,34 @@ test('a move that changes a summed range says so before Save', async () => {
     await save_screenshot(page, '14-xlsx-range-notice');
 });
 
+test('moving the last row of a summed range up, then another row beside it, warns with the shrunken range', async () => {
+    // Rows 2-5 summed in B7, a note in row 8. Row 5 (d) moves above row 4,
+    // then the note moves above row 4 too: rows 2, 3, 5, 8, 4, 6, 7, and the
+    // range ends on d, so it now sums a, b, and d.
+    const amounts: readonly (readonly [string, number])[] = [['a', 3], ['b', 5], ['c', 9], ['d', 7]];
+    const rows = [
+        row(1, [cell('A1', 'Name'), cell('B1', 'Amount')]),
+        ...amounts.map(([name, amount], index) => row(index + 2, [cell(`A${index + 2}`, name), cell(`B${index + 2}`, amount)])),
+        row(7, [cell('A7', 'Total'), cell('B7', { f: 'SUM(B2:B5)', v: 24 })]),
+        row(8, [cell('A8', 'Note')]),
+    ];
+    const book = Buffer.from(build_fixture_xlsx({ sheets: [{ name: 'Data', body: `<sheetData>${rows.join('')}</sheetData>` }] }));
+    const { page } = await open_file('budget.xlsx', book);
+    await wait_for_grid(page);
+    await select_row(page, 3);
+    await page.keyboard.press('Alt+Shift+ArrowUp');
+    await expect.poll(async () => (await grid_rows(page)).map((line) => line.split('|')[1]).slice(0, 4))
+        .toEqual(['a', 'b', 'd', 'c']);
+    await select_row(page, 6);
+    for (let i = 0; i < 3; i += 1) await page.keyboard.press('Alt+Shift+ArrowUp');
+    await expect.poll(async () => (await grid_rows(page)).map((line) => line.split('|')[1]))
+        .toEqual(['a', 'b', 'd', 'Note', 'c', '', 'Total']);
+    const ranges = page.getByRole('status', { name: 'Formulas whose ranges changed' });
+    await expect(ranges).toContainText('=SUM(B2:B4)', { timeout: 30_000 });
+    await expect(ranges).toContainText('was =SUM(B2:B5)');
+    await save_screenshot(page, '16-xlsx-last-row-moved-range-notice');
+});
+
 test('an external change conflicts, and both salvage actions resolve it', async () => {
     const { file, page } = await open_file(
         'fruit.csv',

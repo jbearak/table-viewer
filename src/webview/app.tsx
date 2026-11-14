@@ -268,7 +268,7 @@ import {
 
 /**
  * Structural conflicts about a whole worksheet rather than a row or cell:
- * they carry no row identities, and Review Changes answers them with a
+ * they carry no row identities, and the layout-conflict notice answers them with a
  * worksheet action ("Discard row and column changes on <sheet>"). An
  * `unsupportedStructure` refusal names its reason in `message` instead.
  */
@@ -1147,7 +1147,7 @@ export function App(): React.JSX.Element {
     }
 
     /**
-     * Review Changes' "Discard row and column changes on <sheet>": drop the
+     * The layout-conflict notice's "Discard row and column changes on <sheet>": drop the
      * active worksheet's layout, as one history action, after the file changed
      * under it. Cell edits and appended rows stay and reconcile as usual.
      */
@@ -1204,7 +1204,7 @@ export function App(): React.JSX.Element {
     }, [active_sheet_index]);
 
     /**
-     * Review Changes' "Keep new rows at the end": every live Pending Inserted
+     * The layout-conflict notice's "Keep new rows at the end": every live Pending Inserted
      * Row on the active worksheet becomes a Pending Appended Row, in layout
      * order, and the rest of the layout is dropped, as one history action
      * whose Undo puts the rows back where they were.
@@ -1510,7 +1510,7 @@ export function App(): React.JSX.Element {
     // One granted session makes every worksheet editable. The active tab chooses
     // only which per-sheet store the mounted grid views; it is not an edit pointer.
     const edit_mode_on_active_sheet = edit_mode;
-    // Review Changes' warning before Save: an `.xlsx` conditional-formatting
+    // The Save-refusal notice's input: an `.xlsx` conditional-formatting
     // element or data-validation rule on this worksheet that the current
     // layouts would split past the writer's cap, counted with the writer's
     // own partition. Rebuilt with the structural revision.

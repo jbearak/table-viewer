@@ -431,7 +431,7 @@ describe('structural save refusals', () => {
         return (result.rejection as { message: string }).message;
     }
 
-    it('re-runs the support scan on the bytes it rewrites, and records the refusal for Review Changes', async () => {
+    it('re-runs the support scan on the bytes it rewrites, and records the refusal for the layout-conflict notice', async () => {
         const raw = representative_workbook();
         const viewer = await open_xlsx(raw, { state: HEADER_ON });
         const changes = removal(viewer);

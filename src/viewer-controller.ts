@@ -489,7 +489,7 @@ function structural_save_error(
             ...(affected?.formulaCells === undefined ? {} : {
                 formulaCells: Object.freeze([...affected.formulaCells]),
             }),
-            // Review Changes names why: an `unsupportedStructure` refusal
+            // The layout-conflict notice names why: an `unsupportedStructure` refusal
             // carries no row to point at, only its reason.
             ...(reason === 'unsupportedStructure' ? {
                 message: message.length <= MAX_STRUCTURAL_CONFLICT_MESSAGE_LENGTH
@@ -1217,7 +1217,7 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
         if (!sheet_meta) throw new Error('Could not locate a worksheet to save.');
         const structural = structural_changes ?? own_pending_structural_changes({});
         // An `unsupportedStructure` conflict records the last save's refusal
-        // for Review Changes; the save re-derives it, so after the user
+        // for the layout-conflict notice; the save re-derives it, so after the user
         // changes the layout a save can succeed without a discard.
         const blocking_conflicts = structural.conflicts.filter(
             (conflict) => conflict.reason !== 'unsupportedStructure',
@@ -10024,7 +10024,7 @@ export function attach_viewer(
                 || current_basis === undefined
                 || !structural_bases_equal(durable.structuralBasis, current_basis)
             ) {
-                await refuse(`${sheet.name} changed on disk after you inserted, deleted, or moved rows or columns. Review Changes before appending rows.`);
+                await refuse(`${sheet.name} changed on disk after you inserted, deleted, or moved rows or columns. Choose what to do with them in the notice under the grid before appending rows.`);
                 return;
             }
         }
@@ -10398,7 +10398,7 @@ export function attach_viewer(
             || (durable?.structuralBasis !== undefined
                 && !structural_bases_equal(durable.structuralBasis, structuralBasis))
         ) {
-            await refuse(`${sheet.name} changed on disk after you inserted, deleted, or moved rows or columns. Review Changes before inserting more rows.`);
+            await refuse(`${sheet.name} changed on disk after you inserted, deleted, or moved rows or columns. Choose what to do with them in the notice under the grid before inserting more rows.`);
             return;
         }
         // 10,000 Pending Row admissions per worksheet per session, shared by
@@ -10701,7 +10701,7 @@ export function attach_viewer(
             || (durable?.structuralBasis !== undefined
                 && !structural_bases_equal(durable.structuralBasis, structuralBasis))
         ) {
-            await refuse(`${sheet.name} changed on disk after you inserted, deleted, or moved rows or columns. Review Changes before inserting more columns.`);
+            await refuse(`${sheet.name} changed on disk after you inserted, deleted, or moved rows or columns. Choose what to do with them in the notice under the grid before inserting more columns.`);
             return;
         }
         // 256 Pending Column admissions per worksheet per session, discarded
@@ -11594,7 +11594,7 @@ export function attach_viewer(
      * validator with the live worksheet and the session ledger, and, for a
      * worksheet with a live layout change, its Structural Basis against the
      * verified file. A basis that no longer matches is a structural
-     * rejection Review Changes shows; anything else is an internal error.
+     * rejection the layout-conflict notice shows; anything else is an internal error.
      */
     function structural_save_precheck(
         identity: CsvSaveOperation,
@@ -11655,7 +11655,7 @@ export function attach_viewer(
      * Record a refused structural save's `unsupportedStructure` conflict on
      * its worksheet's durable slot, replacing any earlier one, before the
      * webview hears of it. Conflicts are the host's to record: the webview
-     * keeps the rejection's conflict for Review Changes and echoes it in its
+     * keeps the rejection's conflict for the layout-conflict notice and echoes it in its
      * next publication and save, which the host accepts only when its own
      * slot holds the same conflicts. The planner re-derives the refusal on
      * every save, so the conflict never blocks one.

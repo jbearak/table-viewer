@@ -33,7 +33,7 @@ export class CsvDataSource implements DataSource {
     readonly originalColumnCounts: number[];
     /**
      * Fields in the shortest record, the header line included: a structural
-     * save writes every record at the prospective width, so Review Changes
+     * save writes every record at the prospective width, so the Save button's description
      * notes when that pads short rows.
      */
     readonly shortestRecordWidth: number;
