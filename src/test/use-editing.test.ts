@@ -85,36 +85,26 @@ afterEach(() => {
 });
 
 describe('use_editing', () => {
-    it('starts in read-only mode', async () => {
+    it('starts with no editor open and nothing unsaved', async () => {
         await render();
-        expect(hook_result!.edit_mode).toBe(false);
         expect(hook_result!.editing_cell).toBe(null);
         expect(hook_result!.is_dirty).toBe(false);
     });
 
-    it('can toggle edit mode', async () => {
-        await render();
-        await act(async () => { hook_result!.toggle_edit_mode(); });
-        expect(hook_result!.edit_mode).toBe(true);
-    });
-
     it('start_editing sets the active cell', async () => {
         await render();
-        await act(async () => { hook_result!.toggle_edit_mode(); });
         await act(async () => { hook_result!.start_editing(0, 1); });
         expect(hook_result!.editing_cell).toEqual({ source_row: 0, source_col: 1, value: 'b' });
     });
 
     it('start_editing on null cell uses empty string', async () => {
         await render();
-        await act(async () => { hook_result!.toggle_edit_mode(); });
         await act(async () => { hook_result!.start_editing(2, 1); });
         expect(hook_result!.editing_cell).toEqual({ source_row: 2, source_col: 1, value: '' });
     });
 
     it('confirm_edit stores the dirty value', async () => {
         await render();
-        await act(async () => { hook_result!.toggle_edit_mode(); });
         await act(async () => { hook_result!.start_editing(0, 0); });
         await act(async () => { hook_result!.confirm_edit('A'); });
         expect(hook_result!.is_dirty).toBe(true);
@@ -126,7 +116,6 @@ describe('use_editing', () => {
 
     it('cancel_edit does not store a dirty value', async () => {
         await render();
-        await act(async () => { hook_result!.toggle_edit_mode(); });
         await act(async () => { hook_result!.start_editing(0, 0); });
         await act(async () => { hook_result!.cancel_edit(); });
         expect(hook_result!.is_dirty).toBe(false);
@@ -135,7 +124,6 @@ describe('use_editing', () => {
 
     it('get_display_value returns dirty value when present', async () => {
         await render();
-        await act(async () => { hook_result!.toggle_edit_mode(); });
         await act(async () => { hook_result!.start_editing(0, 0); });
         await act(async () => { hook_result!.confirm_edit('A'); });
         expect(hook_result!.get_display_value(0, 0)).toBe('A');
@@ -144,7 +132,6 @@ describe('use_editing', () => {
 
     it('clear_dirty resets all edits', async () => {
         await render();
-        await act(async () => { hook_result!.toggle_edit_mode(); });
         await act(async () => { hook_result!.start_editing(0, 0); });
         await act(async () => { hook_result!.confirm_edit('A'); });
         await act(async () => { hook_result!.clear_dirty(); });
@@ -152,15 +139,8 @@ describe('use_editing', () => {
         expect(hook_result!.dirty_cells.size).toBe(0);
     });
 
-    it('does not allow editing when not in edit mode', async () => {
-        await render();
-        await act(async () => { hook_result!.start_editing(0, 0); });
-        expect(hook_result!.editing_cell).toBe(null);
-    });
-
     it('confirm_edit with unchanged value does not mark dirty', async () => {
         await render();
-        await act(async () => { hook_result!.toggle_edit_mode(); });
         await act(async () => { hook_result!.start_editing(0, 0); });
         await act(async () => { hook_result!.confirm_edit('a'); });
         expect(hook_result!.is_dirty).toBe(false);
@@ -168,7 +148,6 @@ describe('use_editing', () => {
 
     it('confirm_edit stores the base value alongside the dirty value', async () => {
         await render();
-        await act(async () => { hook_result!.toggle_edit_mode(); });
         await act(async () => { hook_result!.start_editing(0, 0); });
         await act(async () => { hook_result!.confirm_edit('A'); });
         const entry = hook_result!.dirty_cells.get('0:0');
@@ -177,7 +156,6 @@ describe('use_editing', () => {
 
     it('confirm_edit stores empty base for null cells', async () => {
         await render();
-        await act(async () => { hook_result!.toggle_edit_mode(); });
         await act(async () => { hook_result!.start_editing(2, 1); });
         await act(async () => { hook_result!.confirm_edit('X'); });
         const entry = hook_result!.dirty_cells.get('2:1');
@@ -194,7 +172,6 @@ describe('use_editing', () => {
         const resident: (CellData | null)[][] = [];
         resident[7] = [cell('base')];
         await render(resident, 0);
-        await act(async () => { hook_result!.toggle_edit_mode(); });
         await act(async () => { hook_result!.start_editing(7, 0); });
         expect(hook_result!.editing_cell).toEqual({
             source_row: 7,
@@ -232,7 +209,6 @@ describe('clear_saved_dirty_entries', () => {
 describe('commit_edit (location-based)', () => {
     it('stores the dirty value at the given location without start_editing', async () => {
         await render();
-        await act(async () => { hook_result!.toggle_edit_mode(); });
         await act(async () => { hook_result!.commit_edit(0, 0, 'A'); });
         expect(hook_result!.is_dirty).toBe(true);
         expect(hook_result!.dirty_cells.get('0:0')).toEqual({
@@ -242,14 +218,12 @@ describe('commit_edit (location-based)', () => {
 
     it('does not mark dirty when the value equals the original', async () => {
         await render();
-        await act(async () => { hook_result!.toggle_edit_mode(); });
         await act(async () => { hook_result!.commit_edit(0, 0, 'a'); });
         expect(hook_result!.is_dirty).toBe(false);
     });
 
     it('removes an existing dirty entry when reverted to the original', async () => {
         await render();
-        await act(async () => { hook_result!.toggle_edit_mode(); });
         await act(async () => { hook_result!.commit_edit(0, 0, 'A'); });
         expect(hook_result!.dirty_cells.has('0:0')).toBe(true);
         await act(async () => { hook_result!.commit_edit(0, 0, 'a'); });
@@ -258,7 +232,6 @@ describe('commit_edit (location-based)', () => {
 
     it('clears the active editor when it matches the committed location', async () => {
         await render();
-        await act(async () => { hook_result!.toggle_edit_mode(); });
         await act(async () => { hook_result!.start_editing(0, 0); });
         await act(async () => { hook_result!.commit_edit(0, 0, 'A'); });
         expect(hook_result!.editing_cell).toBe(null);
@@ -266,7 +239,6 @@ describe('commit_edit (location-based)', () => {
 
     it('stores empty base for null cells', async () => {
         await render();
-        await act(async () => { hook_result!.toggle_edit_mode(); });
         await act(async () => { hook_result!.commit_edit(2, 1, 'X'); });
         expect(hook_result!.dirty_cells.get('2:1')).toEqual({
             value: 'X', base: '', formattingKnown: true,
@@ -277,7 +249,6 @@ describe('commit_edit (location-based)', () => {
 describe('pending edits affected by file changes', () => {
     it('retains the original and tracks the latest file value after reload', async () => {
         await render(base_rows, 0);
-        await act(async () => { hook_result!.toggle_edit_mode(); });
         await act(async () => { hook_result!.start_editing(0, 0); });
         await act(async () => { hook_result!.confirm_edit('A'); });
 
@@ -318,7 +289,6 @@ describe('pending edits affected by file changes', () => {
 
     it('keeps original and current sides when the pending value is edited again', async () => {
         await render(base_rows, 0);
-        await act(async () => { hook_result!.toggle_edit_mode(); });
         await act(async () => { hook_result!.commit_edit(0, 0, 'first pending'); });
         const changed = base_rows.map((row) => [...row]);
         changed[0][0] = cell('current file');
@@ -382,7 +352,6 @@ describe('pending edits affected by file changes', () => {
         const resident: (CellData | null)[][] = [];
         resident[7] = [cell('base')];
         await render(resident, 0);
-        await act(async () => { hook_result!.toggle_edit_mode(); });
         await act(async () => { hook_result!.commit_edit(7, 0, 'edited'); });
         expect(hook_result!.dirty_cells.has('7:0')).toBe(true);
         expect(hook_result!.dirty_cells.get('7:0')!.base).toBe('base');
@@ -398,7 +367,6 @@ describe('pending edits affected by file changes', () => {
 
     it('does not mark conflict when base value unchanged after reload', async () => {
         await render(base_rows, 0);
-        await act(async () => { hook_result!.toggle_edit_mode(); });
         await act(async () => { hook_result!.start_editing(0, 0); });
         await act(async () => { hook_result!.confirm_edit('A'); });
 
@@ -415,7 +383,6 @@ describe('pending edits affected by file changes', () => {
 
     it('discard_edit removes a single dirty entry', async () => {
         await render(base_rows, 0);
-        await act(async () => { hook_result!.toggle_edit_mode(); });
         await act(async () => { hook_result!.start_editing(0, 0); });
         await act(async () => { hook_result!.confirm_edit('A'); });
         await act(async () => { hook_result!.start_editing(0, 1); });
@@ -455,7 +422,6 @@ describe('pending edits affected by file changes', () => {
 
     it('discard_conflicted removes only conflicted entries', async () => {
         await render(base_rows, 0);
-        await act(async () => { hook_result!.toggle_edit_mode(); });
         // Edit two cells
         await act(async () => { hook_result!.start_editing(0, 0); });
         await act(async () => { hook_result!.confirm_edit('A'); });
@@ -478,7 +444,6 @@ describe('pending edits affected by file changes', () => {
 
     it('discard_conflicted preserves active editor on non-conflicted cell', async () => {
         await render(base_rows, 0);
-        await act(async () => { hook_result!.toggle_edit_mode(); });
         // Edit cell 0:0 and confirm
         await act(async () => { hook_result!.start_editing(0, 0); });
         await act(async () => { hook_result!.confirm_edit('A'); });
@@ -508,14 +473,12 @@ describe('pending edits affected by file changes', () => {
 
     it('closes the active editor when the reload token changes', async () => {
         await render(base_rows, 0);
-        await act(async () => { hook_result!.toggle_edit_mode(); });
         await act(async () => { hook_result!.start_editing(0, 0); });
         expect(hook_result!.editing_cell).not.toBe(null);
 
-        // External reload bumps the token: open editor closes, edit mode stays on.
+        // External reload bumps the token: the open editor closes.
         await rerender(base_rows, 1);
         expect(hook_result!.editing_cell).toBe(null);
-        expect(hook_result!.edit_mode).toBe(true);
     });
 });
 
@@ -538,7 +501,6 @@ describe('conflict detection with non-resident pages', () => {
     it('B1: a dirty cell whose page is NOT resident is never conflicted', async () => {
         // Edit cell 1:0 (base 'd') while it is resident.
         await render(base_rows, 0);
-        await act(async () => { hook_result!.toggle_edit_mode(); });
         await act(async () => { hook_result!.start_editing(1, 0); });
         await act(async () => { hook_result!.confirm_edit('D'); });
         expect(hook_result!.dirty_cells.get('1:0')).toEqual({
@@ -554,7 +516,6 @@ describe('conflict detection with non-resident pages', () => {
 
     it('B2: a dirty cell whose page IS resident with disk != base is conflicted', async () => {
         await render(base_rows, 0);
-        await act(async () => { hook_result!.toggle_edit_mode(); });
         await act(async () => { hook_result!.start_editing(1, 0); });
         await act(async () => { hook_result!.confirm_edit('D'); });
 
@@ -571,7 +532,6 @@ describe('conflict detection with non-resident pages', () => {
 
     it('B3: a dirty cell whose page IS resident with disk == base is not conflicted', async () => {
         await render(base_rows, 0);
-        await act(async () => { hook_result!.toggle_edit_mode(); });
         await act(async () => { hook_result!.start_editing(1, 0); });
         await act(async () => { hook_result!.confirm_edit('D'); });
 
@@ -582,7 +542,6 @@ describe('conflict detection with non-resident pages', () => {
 
     it('B4: discard_conflicted does not drop an edit whose page is non-resident', async () => {
         await render(base_rows, 0);
-        await act(async () => { hook_result!.toggle_edit_mode(); });
         await act(async () => { hook_result!.start_editing(1, 0); });
         await act(async () => { hook_result!.confirm_edit('D'); });
 
@@ -840,7 +799,6 @@ describe('use_editing — markdown syntax', () => {
         await act(async () => {
             root!.render(React.createElement(MarkdownHarness, { rows, next_edit_order }));
         });
-        await act(async () => { hook_result!.toggle_edit_mode(); });
     }
 
     it('opens the editor with the cell\'s markup', async () => {
@@ -1103,7 +1061,6 @@ describe('use_editing — commit_hyperlink', () => {
         await act(async () => {
             root!.render(React.createElement(LinkHarness, { rows }));
         });
-        await act(async () => { hook_result!.toggle_edit_mode(); });
     }
 
     it('a link-only change makes a link-only entry, value pinned at the base', async () => {
@@ -1277,7 +1234,6 @@ describe('use_editing — history capture', () => {
         await act(async () => {
             root!.render(React.createElement(CaptureHarness, { rows }));
         });
-        await act(async () => { hook_result!.toggle_edit_mode(); });
     }
 
     function undo_stack() {
@@ -1571,7 +1527,6 @@ describe('use_editing — history capture', () => {
     it('leaves history alone when no worksheet identity is supplied', async () => {
         // The default harness supplies neither worksheet nor history.
         await render();
-        await act(async () => { hook_result!.toggle_edit_mode(); });
         await act(async () => { hook_result!.commit_edit(0, 0, 'A'); });
         expect(hook_result!.dirty_cells.get('0:0')?.value).toBe('A');
     });
@@ -1611,7 +1566,6 @@ describe('use_editing — hyperlink capture', () => {
         await act(async () => {
             root!.render(React.createElement(LinkCaptureHarness, { rows }));
         });
-        await act(async () => { hook_result!.toggle_edit_mode(); });
     }
 
     function only_change() {
@@ -1925,7 +1879,6 @@ describe('the history-ordering reservation', () => {
         await act(async () => {
             root!.render(React.createElement(GateHarness, { rows: base_rows }));
         });
-        await act(async () => { hook_result!.toggle_edit_mode(); });
     }
 
     it('admits a gesture when nothing is replaying', async () => {
@@ -1942,10 +1895,8 @@ describe('the history-ordering reservation', () => {
         await act(async () => { hook_result!.commit_edits([
             { source_row: 0, source_col: 0, value: 'typed' },
         ]); });
-        // Dropped like a keystroke arriving with no session — not an error, and
-        // not a reason to leave edit mode.
+        // Dropped like a keystroke arriving with no session — not an error.
         expect(session_store!.get('0:0')).toBeUndefined();
-        expect(hook_result!.edit_mode).toBe(true);
     });
 
     it('admits again once the replay has settled', async () => {

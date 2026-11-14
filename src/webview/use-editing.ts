@@ -115,10 +115,10 @@ export interface UseEditingOptions {
      * against a state the replay is about to move — then either lost to the
      * replay's own writes or, worse, silently overwritten by them.
      *
-     * Refusing the gesture is deliberately NOT the same as leaving edit mode or
-     * releasing the session: the user stays exactly where they are, and the
-     * keystroke is dropped like one arriving with no session at all. A replay that
-     * ended edit mode to protect itself would lose the user's other unsaved work.
+     * Refusing the gesture is deliberately NOT the same as releasing the
+     * session: the user stays exactly where they are, and the keystroke is
+     * dropped like one arriving with no session at all. A replay that ended the
+     * session to protect itself would lose the user's other unsaved work.
      */
     readonly gestures_admitted?: () => boolean;
     /**
@@ -516,9 +516,6 @@ export function use_editing(
     // subscribe + bump would silently drop that install.
     const dirty_cells = useSyncExternalStore(active_store.subscribe, active_store.snapshot);
 
-    // GridShell never reads this (it takes edit_mode as a prop from App), so it
-    // only gates the reload-token effect below.
-    const [edit_mode, set_edit_mode] = useState(() => active_store.size() > 0);
     // Stays local state on purpose: it names a cell whose editor is open right
     // now, and an editor cannot outlive the mount that opened it. Source-keyed
     // (see EditingCell), so a generation remount clears it for lifetime reasons
@@ -526,11 +523,6 @@ export function use_editing(
     const [editing_cell, set_editing_cell] = useState<EditingCell | null>(null);
 
     const is_dirty = dirty_cells.size > 0;
-
-    const toggle_edit_mode = useCallback(() => {
-        set_edit_mode((prev) => !prev);
-        set_editing_cell(null);
-    }, []);
 
     // The cell's edit base in edit space: its effective rich content when
     // the loaded cell is available in markdown mode, else the plain raw text.
@@ -610,7 +602,7 @@ export function use_editing(
     // GetCellRaw reader and EditingCell all live in source space, so nothing on
     // this path converts — and a caller holding a display row must convert
     // before it arrives (grid-shell does that in `commit_source_row`).
-    const begin_editing = useCallback(
+    const start_editing = useCallback(
         (source_row: number, source_col: number) => {
             const key = `${source_row}:${source_col}`;
             const dirty_entry = dirty_cells.get(key);
@@ -641,23 +633,6 @@ export function use_editing(
             });
         },
         [edit_base_at, dirty_cells, options?.formula_edit_text, syntax],
-    );
-
-    const start_editing = useCallback(
-        (source_row: number, source_col: number) => {
-            if (!edit_mode) return;
-            begin_editing(source_row, source_col);
-        },
-        [edit_mode, begin_editing],
-    );
-
-    // Like start_editing but bypasses the edit_mode check.
-    // Used when entering edit mode and starting editing in the same tick.
-    const force_start_editing = useCallback(
-        (source_row: number, source_col: number) => {
-            begin_editing(source_row, source_col);
-        },
-        [begin_editing],
     );
 
     const capture = options?.capture;
@@ -1185,11 +1160,11 @@ export function use_editing(
     // whose file-side cell changed.
     const prev_token_ref = useRef(reload_token);
     useEffect(() => {
-        if (prev_token_ref.current !== reload_token && edit_mode) {
+        if (prev_token_ref.current !== reload_token) {
             set_editing_cell(null);
         }
         prev_token_ref.current = reload_token;
-    }, [reload_token, edit_mode]);
+    }, [reload_token]);
 
     // Read the live value from the active cell's editor. Glide portals our custom
     // overlay editor into `.gdg-clip-region`; fall back to the committed value if
@@ -1201,14 +1176,10 @@ export function use_editing(
     }, [editing_cell]);
 
     return {
-        edit_mode,
         editing_cell,
         dirty_cells,
         is_dirty,
-        toggle_edit_mode,
-        set_edit_mode,
         start_editing,
-        force_start_editing,
         confirm_edit,
         commit_edit,
         commit_edits,

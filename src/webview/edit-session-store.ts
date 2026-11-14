@@ -96,7 +96,7 @@ export function clear_saved_dirty_entries(
 
 export interface EditSessionIdentity {
     /** Host-granted session id. `undefined` is a real, distinct value (edits
-     *  restored without a grant — app.tsx sets edit_mode from
+     *  restored without a grant — app.tsx sets editing_session_held from
      *  `restored_edits !== undefined` with no session), compared with ===,
      *  never treated as a wildcard.
      *

@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import React, { act } from 'react';
-import { ROWS_NOT_LOADED_MESSAGE } from '../webview/row-structure-model';
+import { ROWS_NOT_LOADED_MESSAGE, STRUCTURE_BUSY_MESSAGE } from '../webview/row-structure-model';
 import { createRoot, type Root } from 'react-dom/client';
 import { readFileSync } from 'node:fs';
 import { afterEach, describe, expect, it, onTestFinished, vi } from 'vitest';
@@ -512,7 +512,7 @@ describe('GridShell cell wrapping', () => {
         pending.set_cell('session', 'pending-row-1', 0, { value: 'Styled' });
         await render_grid(props({
             show_formatting: true,
-            edit_mode: true,
+            editing_session_held: true,
             csv_editable: true,
             edit_session_id: 'session',
             pending_row_store: pending,
@@ -546,7 +546,7 @@ describe('GridShell cell wrapping', () => {
             order === 7 ? '=B1' : '=A1'
         ));
         await render_grid(props({
-            edit_mode: true,
+            editing_session_held: true,
             csv_editable: true,
             edit_syntax: 'markdown',
             edit_session_id: 'session',
@@ -578,7 +578,7 @@ describe('GridShell cell wrapping', () => {
         };
         pending.set_cell('session', 'pending-row-1', 0, { value: 'moved', movedFrom });
         await render_grid(props({
-            edit_mode: true,
+            editing_session_held: true,
             csv_editable: true,
             edit_session_id: 'session',
             pending_row_store: pending,
@@ -624,7 +624,7 @@ describe('GridShell cell wrapping', () => {
             }],
         });
         await render_grid(props({
-            edit_mode: true,
+            editing_session_held: true,
             csv_editable: true,
             edit_session_id: 'session',
             edit_session: cells,
@@ -671,7 +671,7 @@ describe('GridShell cell wrapping', () => {
                 sourceRowCount: 5,
             },
             row_count: 5,
-            edit_mode: true,
+            editing_session_held: true,
             csv_editable: true,
             edit_session_id: 'session',
             pending_row_store: pending,
@@ -703,7 +703,7 @@ describe('GridShell cell wrapping', () => {
         }]);
         grid_mock.source_row_for_display = () => undefined;
         await render_grid(props({
-            edit_mode: true,
+            editing_session_held: true,
             csv_editable: true,
             edit_session_id: 'session',
             pending_row_store: pending,
@@ -739,7 +739,7 @@ describe('GridShell cell wrapping', () => {
             id: 'plain', format: { kind: 'none' },
         }, 1);
         await render_grid(props({
-            edit_mode: true,
+            editing_session_held: true,
             csv_editable: true,
             edit_session_id: 'session',
             pending_row_store: pending,
@@ -762,7 +762,7 @@ describe('GridShell cell wrapping', () => {
         const before_removal = pending.snapshot();
         pending.remove_rows('session', new Set(['pending-b']));
         await render_grid(props({
-            edit_mode: true,
+            editing_session_held: true,
             csv_editable: true,
             edit_session_id: 'session',
             pending_row_store: pending,
@@ -794,7 +794,7 @@ describe('GridShell cell wrapping', () => {
             id: 'plain', format: { kind: 'none' },
         }, 1);
         await render_grid(props({
-            edit_mode: true,
+            editing_session_held: true,
             csv_editable: true,
             edit_session_id: 'session',
             pending_row_store: pending,
@@ -830,7 +830,7 @@ describe('GridShell cell wrapping', () => {
             id: 'plain', format: { kind: 'none' },
         }, 1);
         await render_grid(props({
-            edit_mode: true,
+            editing_session_held: true,
             csv_editable: true,
             edit_session_id: 'session',
             pending_row_store: pending,
@@ -870,7 +870,7 @@ describe('GridShell cell wrapping', () => {
             id: 'plain', format: { kind: 'none' },
         }, 1);
         await render_grid(props({
-            edit_mode: true,
+            editing_session_held: true,
             csv_editable: true,
             edit_session_id: 'session',
             pending_row_store: pending,
@@ -907,7 +907,7 @@ describe('GridShell cell wrapping', () => {
                 sourceRowCount: 3,
             },
             row_count: 3,
-            edit_mode: true,
+            editing_session_held: true,
             csv_editable: true,
             edit_session_id: 'session',
             pending_row_store: pending,
@@ -957,7 +957,7 @@ describe('GridShell cell wrapping', () => {
                 sourceRowCount: 3,
             },
             row_count: 3,
-            edit_mode: true,
+            editing_session_held: true,
             csv_editable: true,
             edit_session_id: 'session',
             pending_row_store: pending,
@@ -1004,7 +1004,7 @@ describe('GridShell cell wrapping', () => {
                 sourceRowCount: 3,
             },
             row_count: 3,
-            edit_mode: true,
+            editing_session_held: true,
             csv_editable: true,
             edit_session_id: 'session',
             pending_row_store: pending,
@@ -1066,7 +1066,7 @@ describe('GridShell cell wrapping', () => {
                 sourceRowCount: 3,
             },
             row_count: 3,
-            edit_mode: true,
+            editing_session_held: true,
             csv_editable: true,
             edit_session_id: 'session',
             pending_row_store: pending,
@@ -1132,7 +1132,7 @@ describe('GridShell cell wrapping', () => {
                 sourceRowCount: 3,
             },
             row_count: 3,
-            edit_mode: true,
+            editing_session_held: true,
             csv_editable: true,
             edit_session_id: 'session',
             pending_row_store: pending,
@@ -1194,7 +1194,7 @@ describe('GridShell cell wrapping', () => {
                 sourceRowCount: 3,
             },
             row_count: 3,
-            edit_mode: true,
+            editing_session_held: true,
             csv_editable: true,
             edit_session_id: 'session',
             pending_row_store: pending,
@@ -1264,7 +1264,7 @@ describe('GridShell cell wrapping', () => {
                 sourceRowCount: 4,
             },
             row_count: 4,
-            edit_mode: true,
+            editing_session_held: true,
             csv_editable: true,
             edit_session_id: 'session',
             pending_row_store: pending,
@@ -1346,7 +1346,7 @@ describe('GridShell cell wrapping', () => {
                 sourceRowCount: 3,
             },
             row_count: 3,
-            edit_mode: true,
+            editing_session_held: true,
             csv_editable: true,
             edit_session_id: 'session',
             pending_row_store: pending,
@@ -1402,7 +1402,7 @@ describe('GridShell cell wrapping', () => {
                 sourceRowCount: 4,
             },
             row_count: 4,
-            edit_mode: true,
+            editing_session_held: true,
             csv_editable: true,
             edit_session_id: 'session',
             pending_row_store: pending,
@@ -1500,7 +1500,7 @@ describe('GridShell cell wrapping', () => {
                 sourceRowCount: 3,
             },
             row_count: 3,
-            edit_mode: true,
+            editing_session_held: true,
             csv_editable: true,
             edit_session_id: 'session',
             pending_row_store: pending,
@@ -1579,7 +1579,7 @@ describe('GridShell cell wrapping', () => {
                 sourceRowCount: 5,
             },
             row_count: 5,
-            edit_mode: true,
+            editing_session_held: true,
             csv_editable: true,
             edit_session_id: 'session',
             pending_row_store: pending,
@@ -1668,7 +1668,7 @@ describe('GridShell cell wrapping', () => {
                 sourceRowCount: 3,
             },
             row_count: 3,
-            edit_mode: true,
+            editing_session_held: true,
             csv_editable: true,
             edit_syntax: 'markdown',
             edit_session_id: 'session',
@@ -1718,7 +1718,7 @@ describe('GridShell cell wrapping', () => {
             id: 'plain', format: { kind: 'none' },
         }, 1);
         await render_grid(props({
-            edit_mode: true,
+            editing_session_held: true,
             csv_editable: true,
             edit_session_id: 'session',
             edit_session: cells,
@@ -2389,7 +2389,7 @@ describe('GridShell column projection', () => {
         await render_grid(props({
             sheet_meta: { ...props().sheet_meta, rowCount: 3, sourceRowCount: 3 },
             row_count: 3,
-            edit_mode: true,
+            editing_session_held: true,
             csv_editable: true,
         }));
         const finished = vi.fn();
@@ -2434,7 +2434,7 @@ describe('GridShell column projection', () => {
     it('clears display selection when projection changes without remounting editing state', async () => {
         const editing_ref = React.createRef<EditingHandle | null>();
         const GridShell = await render_grid(props({
-            edit_mode: true,
+            editing_session_held: true,
             csv_editable: true,
             editing_ref,
             initial_edits: { '0:2': { value: 'dirty', base: 'source-c' } },
@@ -2456,7 +2456,7 @@ describe('GridShell column projection', () => {
 
         await act(async () => {
             root!.render(React.createElement(GridShell, props({
-                edit_mode: true,
+                editing_session_held: true,
                 csv_editable: true,
                 editing_ref,
                 initial_edits: { '0:2': { value: 'dirty', base: 'source-c' } },
@@ -2476,7 +2476,7 @@ describe('GridShell column projection', () => {
     it('dismisses an open overlay and keeps a late finish on its original source column', async () => {
         const store = create_edit_session_store({ session_id: 'session-1' });
         const initial = props({
-            edit_mode: true,
+            editing_session_held: true,
             csv_editable: true,
             edit_session_id: 'session-1',
             edit_session: store,
@@ -2513,7 +2513,7 @@ describe('GridShell column projection', () => {
     it('dismisses and rejects an open overlay when a highlight revokes editing', async () => {
         const store = create_edit_session_store({ session_id: 'session-1' });
         const initial = props({
-            edit_mode: true,
+            editing_session_held: true,
             csv_editable: true,
             edit_session_id: 'session-1',
             edit_session: store,
@@ -2544,7 +2544,7 @@ describe('GridShell column projection', () => {
         const old_store = create_edit_session_store({ session_id: 'session-1' });
         const next_store = create_edit_session_store({ session_id: 'session-2' });
         const initial = props({
-            edit_mode: true,
+            editing_session_held: true,
             csv_editable: true,
             edit_session_id: 'session-1',
             edit_session: old_store,
@@ -2696,7 +2696,7 @@ describe('GridShell column projection', () => {
         const editing_ref = React.createRef<EditingHandle | null>();
         const on_editing_change = vi.fn();
         const GridShell = await render_grid(props({
-            edit_mode: true,
+            editing_session_held: true,
             csv_editable: true,
             editing_ref,
             on_editing_change,
@@ -2732,7 +2732,7 @@ describe('GridShell column projection', () => {
 
         await act(async () => {
             root!.render(React.createElement(GridShell, props({
-                edit_mode: true,
+                editing_session_held: true,
                 csv_editable: true,
                 editing_ref,
                 on_editing_change,
@@ -2748,7 +2748,7 @@ describe('GridShell column projection', () => {
 
         await act(async () => {
             root!.render(React.createElement(GridShell, props({
-                edit_mode: true,
+                editing_session_held: true,
                 csv_editable: true,
                 editing_ref,
                 on_editing_change,
@@ -3154,7 +3154,7 @@ describe('GridShell column projection', () => {
         });
         grid_mock.source_row_for_display = (row) => row + 1;
         await render_grid(props({
-            edit_mode: true,
+            editing_session_held: true,
             csv_editable: true,
             edit_syntax: 'markdown',
             initial_edits: { '0:2': { value: 'Pending C', base: 'C name' } },
@@ -3185,7 +3185,7 @@ describe('GridShell column projection', () => {
     it('opens a repeat column rename from the pending value', async () => {
         grid_mock.source_row_for_display = (row) => row + 1;
         await render_grid(props({
-            edit_mode: true,
+            editing_session_held: true,
             csv_editable: true,
             edit_syntax: 'markdown',
             initial_edits: { '0:2': { value: 'Pending C', base: 'C name' } },
@@ -3235,7 +3235,7 @@ describe('GridShell column projection', () => {
             value: { writeText: write_text },
         });
         await render_grid(props({
-            edit_mode: true,
+            editing_session_held: true,
             csv_editable: true,
             initial_edits: { '0:2': { value: 'edited-c', base: 'source-c' } },
         }));
@@ -3259,7 +3259,7 @@ describe('GridShell column projection', () => {
             value: { writeText: write_text },
         });
         await render_grid(props({
-            edit_mode: true,
+            editing_session_held: true,
             csv_editable: true,
             initial_edits: { '0:2': { value: 'dirty-c', base: 'source-c' } },
         }));
@@ -3296,7 +3296,7 @@ describe('GridShell column projection', () => {
             value: { writeText: write_text },
         });
         await render_grid(props({
-            edit_mode: true,
+            editing_session_held: true,
             csv_editable: true,
             initial_edits: { '0:2': { value: 'projected-edit', base: 'source-c' } },
             column_projection: {
@@ -3326,7 +3326,7 @@ describe('GridShell column projection', () => {
         });
         grid_mock.get_row.mockReturnValue(undefined);
         await render_grid(props({
-            edit_mode: true,
+            editing_session_held: true,
             csv_editable: true,
             initial_edits: { '0:2': { value: 'known-dirty', base: 'source-c' } },
         }));
@@ -3361,7 +3361,7 @@ describe('GridShell column projection', () => {
             appendedRows: [{ id: 'a2', cells: {}, formatTemplateId: 't', createdOrder: 2 }],
         }));
         await render_grid(props({
-            edit_mode: true,
+            editing_session_held: true,
             csv_editable: true,
             edit_syntax: 'markdown',
             formula_anchor_workbook,
@@ -3498,7 +3498,7 @@ describe('GridShell column projection', () => {
             id: 'plain', format: { kind: 'none' },
         }, 1);
         await render_grid(props({
-            edit_mode: true,
+            editing_session_held: true,
             csv_editable: true,
             edit_session_id: 'session',
             pending_row_store: pending,
@@ -3541,7 +3541,7 @@ describe('GridShell column projection', () => {
             savedRow: { cells: {}, format: { kind: 'none' } },
         }]);
         await render_grid(props({
-            edit_mode: true,
+            editing_session_held: true,
             csv_editable: true,
             edit_session_id: 'session',
             pending_row_store: pending,
@@ -3626,7 +3626,7 @@ describe('GridShell column projection', () => {
         expect(menu_button_labels()).not.toContain('Use row as header');
     });
 
-    // Hiding rows is a transform like any other, so edit mode no longer withholds
+    // Hiding rows is a transform like any other, so the editing session no longer withholds
     // it: the host admits it from the panel that owns the session. Preview keeps its
     // refusal, because natural source order is a trust boundary there.
     async function open_row_marker_menu(overrides: Partial<GridShellProps>) {
@@ -3646,8 +3646,8 @@ describe('GridShell column projection', () => {
         }));
     }
 
-    it('offers hiding rows from the row-marker menu in edit mode', async () => {
-        await open_row_marker_menu({ edit_mode: true, csv_editable: true });
+    it('offers hiding rows from the row-marker menu while a session is held', async () => {
+        await open_row_marker_menu({ editing_session_held: true, csv_editable: true });
         expect(menu_button_labels()).toContain('Hide row');
     });
 
@@ -3656,7 +3656,7 @@ describe('GridShell column projection', () => {
         expect(menu_button_labels()).not.toContain('Hide row');
     });
 
-    it('offers hiding rows from the cell menu in edit mode but not in preview', async () => {
+    it('offers hiding rows from the cell menu while a session is held but not in preview', async () => {
         const select_row_2 = async () => {
             const on_selection_change = grid_mock.props!.onGridSelectionChange as
                 (selection: unknown) => void;
@@ -3685,7 +3685,7 @@ describe('GridShell column projection', () => {
             row_count: 4,
             sheet_meta: { ...props().sheet_meta, rowCount: 4, sourceRowCount: 4 },
             transform_sections: true,
-            edit_mode: true,
+            editing_session_held: true,
             csv_editable: true,
         }));
         await select_row_2();
@@ -3708,7 +3708,7 @@ describe('GridShell column projection', () => {
     });
 
     it('omits row promotion under an edit-mode sort', async () => {
-        // `transform_state` is no longer emptied in edit mode, so this restriction —
+        // `transform_state` is no longer emptied while a session is held, so this restriction —
         // promoting a row hides the rows above it, which only means anything in
         // natural order — now actually sees the sort a user installed while editing.
         const base = props();
@@ -3723,7 +3723,7 @@ describe('GridShell column projection', () => {
             },
             transform_state: { sort: [{ colIndex: 0, direction: 'asc' }], filters: [] },
             can_promote_row_to_header: true,
-            edit_mode: true,
+            editing_session_held: true,
             csv_editable: true,
         });
         expect(menu_button_labels()).not.toContain('Use row as header');
@@ -4467,7 +4467,7 @@ describe('GridShell column projection', () => {
     it('renders a recoverable all-hidden status without grid overlays or row requests', async () => {
         const editing_ref = React.createRef<EditingHandle | null>();
         const GridShell = await render_grid(props({
-            edit_mode: true,
+            editing_session_held: true,
             csv_editable: true,
             editing_ref,
             initial_edits: { '0:2': { value: 'dirty', base: 'source-c' } },
@@ -4489,7 +4489,7 @@ describe('GridShell column projection', () => {
 
         await act(async () => {
             root!.render(React.createElement(GridShell, props({
-                edit_mode: true,
+                editing_session_held: true,
                 csv_editable: true,
                 editing_ref,
                 initial_edits: { '0:2': { value: 'dirty', base: 'source-c' } },
@@ -4846,7 +4846,7 @@ describe('GridShell pending-edit Diff painting', () => {
     it('shows the current file value after that cell changed', async () => {
         await render_grid(props({
             diff_mode: true,
-            edit_mode: true,
+            editing_session_held: true,
             csv_editable: true,
             initial_edits: {
                 '0:0': {
@@ -4882,7 +4882,7 @@ describe('GridShell link-only edits', () => {
         ] as any);
         await render_grid(props({
             show_formatting: true,
-            edit_mode: true,
+            editing_session_held: true,
             csv_editable: true,
             initial_edits: {
                 '0:0': {
@@ -4914,7 +4914,7 @@ describe('GridShell link-only edits', () => {
         ] as any);
         const initial = props({
             show_formatting: true,
-            edit_mode: true,
+            editing_session_held: true,
             csv_editable: true,
             initial_edits: { '0:0': { value: '9876.5', base: '1234.5' } },
         });
@@ -4971,7 +4971,7 @@ describe('GridShell link-only edits', () => {
         }] as any);
         const initial = props({
             show_formatting: true,
-            edit_mode: true,
+            editing_session_held: true,
             csv_editable: true,
             edit_syntax: 'markdown',
             on_editing_change,
@@ -5064,7 +5064,7 @@ describe('GridShell link-only edits', () => {
         }] as any);
         const initial = props({
             show_formatting: true,
-            edit_mode: true,
+            editing_session_held: true,
             csv_editable: true,
             edit_syntax: 'markdown',
             sheet_meta: {
@@ -5148,7 +5148,7 @@ describe('GridShell link-only edits', () => {
         }] as any);
         await render_grid(props({
             show_formatting: true,
-            edit_mode: true,
+            editing_session_held: true,
             csv_editable: true,
             edit_syntax: 'markdown',
             sheet_meta: {
@@ -5200,7 +5200,7 @@ describe('GridShell link-only edits', () => {
         };
         const shown = props({
             show_formatting: true,
-            edit_mode: true,
+            editing_session_held: true,
             csv_editable: true,
             edit_syntax: 'markdown',
             sheet_meta,
@@ -5239,7 +5239,7 @@ describe('GridShell link-only edits', () => {
         }] as any);
         await render_grid(props({
             show_formatting: true,
-            edit_mode: true,
+            editing_session_held: true,
             csv_editable: true,
             edit_syntax: 'markdown',
             sheet_meta: {
@@ -5279,7 +5279,7 @@ describe('GridShell link-only edits', () => {
 
     it('keeps a CSV value beginning with equals as literal text', async () => {
         await render_grid(props({
-            edit_mode: true,
+            editing_session_held: true,
             csv_editable: true,
             edit_syntax: 'plain',
             initial_edits: {
@@ -5297,7 +5297,7 @@ describe('GridShell link-only edits', () => {
     it('keeps formula-shaped XLSX rich text literal even if a result is present', async () => {
         await render_grid(props({
             show_formatting: true,
-            edit_mode: true,
+            editing_session_held: true,
             csv_editable: true,
             edit_syntax: 'markdown',
             initial_edits: {
@@ -5332,7 +5332,7 @@ describe('GridShell link-only edits', () => {
         }, null, null] as any);
         await render_grid(props({
             show_formatting: true,
-            edit_mode: true,
+            editing_session_held: true,
             csv_editable: true,
             edit_syntax: 'markdown',
             initial_edits: {
@@ -5363,7 +5363,7 @@ describe('GridShell link-only edits', () => {
         }, null, null] as any);
         await render_grid(props({
             show_formatting: true,
-            edit_mode: true,
+            editing_session_held: true,
             csv_editable: true,
             edit_syntax: 'markdown',
             initial_edits: {
@@ -5400,7 +5400,7 @@ describe('GridShell link-only edits', () => {
         }, null, null] as any);
         await render_grid(props({
             show_formatting: true,
-            edit_mode: true,
+            editing_session_held: true,
             csv_editable: true,
             edit_syntax: 'markdown',
             column_widths: { 0: 20, 1: 150, 2: 200 },
@@ -5430,7 +5430,7 @@ describe('GridShell link-only edits', () => {
         vi.useFakeTimers();
         await render_grid(props({
             show_formatting: true,
-            edit_mode: true,
+            editing_session_held: true,
             csv_editable: true,
             edit_syntax: 'markdown',
             column_widths: { 0: 20, 1: 150, 2: 200 },
@@ -5527,7 +5527,7 @@ describe('GridShell link-only edits', () => {
         ] as any);
         await render_grid(props({
             show_formatting: true,
-            edit_mode: true,
+            editing_session_held: true,
             csv_editable: true,
             initial_edits: {
                 '0:0': {
@@ -5569,7 +5569,7 @@ async function quick_add_rows(count = 1): Promise<void> {
 
 describe('GridShell edit-admission lifetime', () => {
     const editable = (overrides: Partial<GridShellProps> = {}) => props({
-        edit_mode: true,
+        editing_session_held: true,
         edit_activation_id: 1,
         csv_editable: true,
         edit_session_id: 'session-1',
@@ -5820,7 +5820,7 @@ describe('GridShell edit-admission lifetime', () => {
         await act(async () => {
             root!.render(React.createElement(GridShell, {
                 ...initial,
-                edit_mode: false,
+                editing_session_held: false,
             }));
         });
         expect(cell_is_editable()).toBe(false);
@@ -5828,7 +5828,7 @@ describe('GridShell edit-admission lifetime', () => {
         await act(async () => {
             root!.render(React.createElement(GridShell, {
                 ...initial,
-                edit_mode: true,
+                editing_session_held: true,
                 edit_activation_id: 2,
             }));
         });
@@ -5874,7 +5874,7 @@ describe('GridShell edit-admission lifetime', () => {
                 { fallback: null },
                 React.createElement(GridShell, {
                     ...initial,
-                    edit_mode: active,
+                    editing_session_held: active,
                     edit_activation_id: activation,
                 }),
                 suspend ? React.createElement(Suspend) : null,
@@ -6067,7 +6067,7 @@ describe('GridShell source-row edit identity', () => {
         await render_grid(props({
             sheet_meta: { ...props().sheet_meta, rowCount: 3, sourceRowCount: 3 },
             row_count: 3,
-            edit_mode: true,
+            editing_session_held: true,
             csv_editable: true,
         }));
         const get_cell_content = grid_mock.props!.getCellContent as
@@ -6097,7 +6097,7 @@ describe('GridShell source-row edit identity', () => {
         await render_grid(props({
             sheet_meta: { ...props().sheet_meta, rowCount: 3, sourceRowCount: 3 },
             row_count: 3,
-            edit_mode: true,
+            editing_session_held: true,
             csv_editable: true,
         }));
         const get_cell_content = grid_mock.props!.getCellContent as
@@ -6129,7 +6129,7 @@ describe('GridShell source-row edit identity', () => {
         await render_grid(props({
             sheet_meta: { ...props().sheet_meta, rowCount: 3, sourceRowCount: 3 },
             row_count: 3,
-            edit_mode: true,
+            editing_session_held: true,
             csv_editable: true,
             editing_ref,
             on_editing_change: (status) => { statuses.push(status as never); },
@@ -6171,7 +6171,7 @@ describe('GridShell source-row edit identity', () => {
         await render_grid(props({
             sheet_meta: { ...props().sheet_meta, rowCount: 3, sourceRowCount: 3 },
             row_count: 3,
-            edit_mode: true,
+            editing_session_held: true,
             csv_editable: true,
             editing_ref,
             edit_session_id: 'session-1',
@@ -6217,7 +6217,7 @@ describe('GridShell source-row edit identity', () => {
         await render_grid(props({
             sheet_meta: { ...props().sheet_meta, rowCount: 3, sourceRowCount: 3 },
             row_count: 3,
-            edit_mode: true,
+            editing_session_held: true,
             csv_editable: true,
             editing_ref,
         }));
@@ -6245,7 +6245,7 @@ describe('GridShell source-row edit identity', () => {
         await render_grid(props({
             sheet_meta: { ...props().sheet_meta, rowCount: 3, sourceRowCount: 3 },
             row_count: 3,
-            edit_mode: true,
+            editing_session_held: true,
             csv_editable: true,
             editing_ref,
             initial_edits: { '7:2': { value: 'dirty-c', base: 'source-c' } },
@@ -6282,7 +6282,7 @@ describe('GridShell source-row edit identity', () => {
         await render_grid(props({
             sheet_meta: { ...props().sheet_meta, rowCount: 3, sourceRowCount: 3 },
             row_count: 3,
-            edit_mode: true,
+            editing_session_held: true,
             csv_editable: true,
             initial_edits: { '7:2': { value: 'edited-c', base: 'source-c' } },
         }));
@@ -6311,7 +6311,7 @@ describe('GridShell source-row edit identity', () => {
         await render_grid(props({
             sheet_meta: { ...props().sheet_meta, rowCount: 3, sourceRowCount: 3 },
             row_count: 3,
-            edit_mode: true,
+            editing_session_held: true,
             csv_editable: true,
             editing_ref,
             initial_edits: { '7:2': { value: 'dirty-c', base: 'source-c' } },
@@ -6340,7 +6340,7 @@ describe('GridShell source-row edit identity', () => {
         const base_props = props({
             sheet_meta: { ...props().sheet_meta, rowCount: 3, sourceRowCount: 3 },
             row_count: 3,
-            edit_mode: true,
+            editing_session_held: true,
             csv_editable: true,
             initial_edits: { '7:2': { value: 'dirty-c', base: 'source-c' } },
         });
@@ -6371,7 +6371,7 @@ describe('GridShell source-row edit identity', () => {
 });
 
 /**
- * Rows must never move mid-edit. A sort or filter now survives edit mode, and it
+ * Rows must never move mid-edit. A sort or filter now survives an editing session, and it
  * deliberately does not recompute while the session is live: the user keeps typing
  * into the cell they clicked, exactly as a spreadsheet behaves. These are the
  * user-facing guarantees of the admission change, so they are pinned here rather
@@ -6424,7 +6424,7 @@ describe('GridShell stable rows during an edit session', () => {
             },
             transform_state,
             transform_sections: true,
-            edit_mode: true,
+            editing_session_held: true,
             csv_editable: true,
             ...overrides,
         });
@@ -6545,7 +6545,7 @@ describe('GridShell stable rows during an edit session', () => {
     // nothing in the shell needed to know any more.
     //
     // Still asserted as a pair, over rules that describe a permutation and rules that do
-    // not, because a permuted view is the one place transforms and edit mode coexist and
+    // not, because a permuted view is the one place transforms and an editing session coexist and
     // this row's rendered position is a permuted one in both runs. That the two runs now
     // differ only in the rule set — and grow the same row to the same height either way —
     // is the point: the shell has no notion of being permuted left to branch on.
@@ -6933,7 +6933,7 @@ describe('GridShell row resizing', () => {
 });
 
 describe('GridShell hyperlink dialog admission', () => {
-    // Opening the dialog: Edit mode on a markdown sheet, right-click a cell,
+    // Opening the dialog: a session held on a markdown sheet, right-click a cell,
     // click "Hyperlink…", then Save a valid target.
     async function open_dialog() {
         const on_cell_context_menu = grid_mock.props!.onCellContextMenu as
@@ -6958,7 +6958,7 @@ describe('GridShell hyperlink dialog admission', () => {
     }
 
     const link_props = (editing_ref: React.RefObject<EditingHandle | null>) => props({
-        edit_mode: true,
+        editing_session_held: true,
         csv_editable: true,
         edit_syntax: 'markdown',
         editing_ref,
@@ -7183,7 +7183,7 @@ describe('GridShell hyperlink dialog admission', () => {
 
         await act(async () => root!.render(React.createElement(GridShell, {
             ...link_props(editing_ref),
-            edit_mode: false,
+            editing_session_held: false,
             edit_session_id: undefined,
         })));
         expect(document.getElementById('hyperlink-target')).toBeNull();
@@ -7266,7 +7266,7 @@ describe('GridShell append dock', () => {
 
     function dock_props(overrides: Partial<GridShellProps> = {}) {
         return props({
-            edit_mode: true,
+            editing_session_held: true,
             edit_activation_id: 1,
             csv_editable: true,
             edit_session_id: 'session-1',
@@ -7449,7 +7449,7 @@ describe('GridShell append composer', () => {
 
     function composer_props(overrides: Partial<GridShellProps> = {}) {
         return props({
-            edit_mode: true,
+            editing_session_held: true,
             edit_activation_id: 1,
             csv_editable: true,
             edit_session_id: 'session-1',
@@ -7859,7 +7859,7 @@ describe('GridShell history capture', () => {
                 sourceRowCount: 3,
             },
             row_count: 3,
-            edit_mode: true,
+            editing_session_held: true,
             csv_editable: true,
             edit_session_id: 'session-1',
             history_store,
@@ -8038,7 +8038,7 @@ describe('GridShell history capture', () => {
         expect(grid_mock.props!.onPaste).toBe(true);
         expect(grid_mock.props!.fillHandle).toBe(false);
 
-        await render_grid(capture_props(history, { edit_mode: false }));
+        await render_grid(capture_props(history, { editing_session_held: false }));
         expect(grid_mock.props!.onPaste).toBe(false);
         expect(grid_mock.props!.fillHandle).toBe(false);
 
@@ -8567,7 +8567,7 @@ describe('GridShell find', () => {
             '0:0': { value: 'typed-new', base: 'stored-old' },
         });
         const ref = await render_find({
-            edit_mode: true,
+            editing_session_held: true,
             csv_editable: true,
             edit_session_id: 'session',
             edit_session: cells,
@@ -8587,7 +8587,7 @@ describe('GridShell find', () => {
         }, 1);
         pending.set_cell('session', 'pending-row-1', 2, { value: 'appended needle' });
         const ref = await render_find({
-            edit_mode: true,
+            editing_session_held: true,
             csv_editable: true,
             edit_session_id: 'session',
             pending_row_store: pending,
@@ -8618,7 +8618,7 @@ describe('GridShell find', () => {
             finish_load = resolve;
         }));
         const ref = await render_find({
-            edit_mode: true,
+            editing_session_held: true,
             csv_editable: true,
             edit_session_id: 'session',
             pending_row_store: pending,
@@ -8674,7 +8674,7 @@ describe('row Delete and Restore in the row-gutter menu', () => {
     const structure_props = (overrides: Partial<GridShellProps> = {}) => props({
         sheet_meta: { ...props().sheet_meta, rowCount: 4, sourceRowCount: 4 },
         row_count: 4,
-        edit_mode: true,
+        editing_session_held: true,
         csv_editable: true,
         edit_session_id: 'session',
         transform_sections: true,
@@ -8712,6 +8712,32 @@ describe('row Delete and Restore in the row-gutter menu', () => {
         expect(item.title).toBe('Not available yet');
     });
 
+    it('shows the structure items disabled while another change holds structural admission', async () => {
+        // An undo replay, a highlight or append round trip, or a full structural
+        // backlog closes admission without making the cells read-only. The
+        // gestures refuse then, so the menu must say so instead of offering a
+        // click that does nothing.
+        const pending = create_pending_row_store({ session_id: 'session' });
+        let admitted = false;
+        await render_grid(structure_props({
+            structural_support: supported,
+            pending_row_store: pending,
+            gestures_admitted: () => admitted,
+        }));
+        await open_row_menu(1);
+        for (const label of ['Insert row above', 'Insert row below', 'Delete row', 'Move rows up', 'Move rows down']) {
+            const item = menu_item(label)!;
+            expect(item.getAttribute('aria-disabled'), label).toBe('true');
+            expect(item.getAttribute('aria-description'), label).toBe(STRUCTURE_BUSY_MESSAGE);
+        }
+        await act(async () => menu_item('Delete row')!.click());
+        expect(pending.snapshot().rowLayout).toBeUndefined();
+
+        admitted = true;
+        await open_row_menu(1);
+        expect(menu_item('Delete row')!.getAttribute('aria-disabled')).not.toBe('true');
+    });
+
     it.each([
         ['row', 'canMoveRows', 'mouseup'],
         ['column', 'canMoveColumns', 'mouseup'],
@@ -8721,7 +8747,7 @@ describe('row Delete and Restore in the row-gutter menu', () => {
         const on_edit_session_idle = vi.fn();
         await render_grid(structure_props({
             structural_support: supported,
-            edit_mode: false,
+            editing_session_held: false,
             edit_session_id: undefined,
             editing_ref,
             // Answered at once, so only the drag itself is left holding on.
@@ -8965,7 +8991,7 @@ describe('row Insert in the row-gutter menu', () => {
     const structure_props = (overrides: Partial<GridShellProps> = {}) => props({
         sheet_meta: { ...props().sheet_meta, rowCount: 4, sourceRowCount: 4 },
         row_count: 4,
-        edit_mode: true,
+        editing_session_held: true,
         csv_editable: true,
         edit_session_id: 'session',
         transform_sections: true,
@@ -9476,7 +9502,7 @@ describe('row Move by menu, shortcut, and drag', () => {
     const structure_props = (overrides: Partial<GridShellProps> = {}) => props({
         sheet_meta: { ...props().sheet_meta, rowCount: 4, sourceRowCount: 4 },
         row_count: 4,
-        edit_mode: true,
+        editing_session_held: true,
         csv_editable: true,
         edit_session_id: 'session',
         transform_sections: true,
@@ -9611,7 +9637,7 @@ describe('row Move by menu, shortcut, and drag', () => {
         expect(announcement()).toBe('Moved 2 rows up');
     });
 
-    it('leaves Alt+Shift+arrows alone without a whole-row selection, in an editor, or outside Edit mode', async () => {
+    it('leaves Alt+Shift+arrows alone without a whole-row selection, or in an editor', async () => {
         const { pending } = await render_moves();
         const on_key_down = grid_mock.props!.onKeyDown as (args: Record<string, unknown>) => void;
         const on_selection_change = grid_mock.props!.onGridSelectionChange as (selection: unknown) => void;
@@ -9635,7 +9661,7 @@ describe('row Move by menu, shortcut, and drag', () => {
     it('wires row drags only where structure items are offered', async () => {
         await render_grid(structure_props({ structural_support: undefined }));
         expect(grid_mock.props!.onRowMoved).toBeUndefined();
-        await render_grid(structure_props({ edit_mode: false }));
+        await render_grid(structure_props({ editing_session_held: false }));
         expect(grid_mock.props!.onRowMoved).toBeUndefined();
     });
 
@@ -9824,7 +9850,7 @@ describe('columns: Insert, Delete, Restore, Move, rename, Pending Column cells, 
             sheet_meta: { ...props().sheet_meta, rowCount: 2, sourceRowCount: 2 },
             row_count: 2,
             column_projection: all_columns,
-            edit_mode: true,
+            editing_session_held: true,
             csv_editable: true,
             edit_session_id: 'session',
             transform_sections: true,
@@ -9853,7 +9879,7 @@ describe('columns: Insert, Delete, Restore, Move, rename, Pending Column cells, 
 
     it('enables the items of a menu opened before the session it acquired arrived', async () => {
         const { rerender } = await render_columns({
-            edit_mode: false,
+            editing_session_held: false,
             edit_session_id: undefined,
             on_request_edit_session: vi.fn(async () => true),
         });
@@ -9861,7 +9887,7 @@ describe('columns: Insert, Delete, Restore, Move, rename, Pending Column cells, 
         expect(menu_item('Insert column right')!.getAttribute('aria-disabled')).toBe('true');
 
         // The one render the grant causes; nothing renders the menu again after it.
-        await rerender({ edit_mode: true, edit_session_id: 'session', on_request_edit_session: undefined });
+        await rerender({ editing_session_held: true, edit_session_id: 'session', on_request_edit_session: undefined });
 
         expect(menu_item('Insert column right')!.getAttribute('aria-disabled')).not.toBe('true');
     });

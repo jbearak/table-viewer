@@ -341,7 +341,6 @@ async function render_hook(formula_workbook: FormulaAnchorWorkbook) {
     await act(async () => {
         root!.render(React.createElement(Harness, { formula_workbook, store, refused, bases }));
     });
-    await act(async () => { hook_result!.toggle_edit_mode(); });
     return { store, refused, bases };
 }
 

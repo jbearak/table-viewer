@@ -254,7 +254,7 @@ async function render_grid(
             after_order?: number,
         ) => string;
         // Editing without a session held yet.
-        edit_mode?: boolean;
+        editing_session_held?: boolean;
         edit_session_id?: string;
         on_request_edit_session?: (quiet?: boolean) => Promise<boolean>;
         on_edit_session_idle?: () => void;
@@ -311,7 +311,7 @@ async function render_grid(
         row_heights: {},
         on_row_resize: vi.fn(),
         merges: [],
-        edit_mode: true,
+        editing_session_held: true,
         csv_editable: true,
         edit_session_id: 'session-1',
         ...(test_edit_session ? { edit_session: test_edit_session } : {}),
@@ -1801,7 +1801,7 @@ describe('GridShell editing with no session held yet', () => {
         const request = vi.fn(() => new Promise<boolean>((resolve) => { settle = resolve; }));
         return { request, grant: () => settle(true), refuse: () => settle(false) };
     }
-    const no_session = { edit_mode: false, edit_session_id: undefined } as const;
+    const no_session = { editing_session_held: false, edit_session_id: undefined } as const;
     const flush = async () => { await act(async () => { await Promise.resolve(); }); };
 
     it('lets a cell answer an editing gesture, and asks the grid to check first', async () => {
@@ -1846,7 +1846,7 @@ describe('GridShell editing with no session held yet', () => {
         await flush();
         // Granted, but the grid that holds the session has not rendered yet.
         expect(grid_mock.open_overlay).not.toHaveBeenCalled();
-        await rerender({ edit_mode: true, edit_session_id: 'session-1', on_request_edit_session: undefined });
+        await rerender({ editing_session_held: true, edit_session_id: 'session-1', on_request_edit_session: undefined });
         await flush();
 
         expect(grid_mock.open_overlay).toHaveBeenCalledTimes(1);
@@ -1899,7 +1899,7 @@ describe('GridShell editing with no session held yet', () => {
 
         grant();
         await flush();
-        await rerender({ edit_mode: true, edit_session_id: 'session-1', on_request_edit_session: undefined });
+        await rerender({ editing_session_held: true, edit_session_id: 'session-1', on_request_edit_session: undefined });
         await flush();
 
         expect([...edit_session!.snapshot()]).toEqual([
@@ -1941,7 +1941,7 @@ describe('GridShell editing with no session held yet', () => {
 
         grant();
         await flush();
-        await rerender({ edit_mode: true, edit_session_id: 'session-1', on_request_edit_session: undefined });
+        await rerender({ editing_session_held: true, edit_session_id: 'session-1', on_request_edit_session: undefined });
         await flush();
 
         expect(admitted).toBe(true);

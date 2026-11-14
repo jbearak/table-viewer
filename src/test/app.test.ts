@@ -219,7 +219,7 @@ vi.mock('../webview/grid-shell', () => ({
             });
             if (
                 grid_shell_mock.emit_pending_edits_on_mount
-                && props.edit_mode
+                && props.editing_session_held
                 && props.edit_session_id
             ) {
                 (globalThis as typeof globalThis & {
@@ -279,7 +279,7 @@ vi.mock('../webview/grid-shell', () => ({
                 'data-show-formatting': String(props.show_formatting),
                 'data-auto-fit-active': String(props.auto_fit_active ?? false),
                 'data-preview': String(props.preview_mode ?? false),
-                'data-edit-mode': String(props.edit_mode ?? false),
+                'data-editing-session-held': String(props.editing_session_held ?? false),
                 'data-diff-mode': String(props.diff_mode ?? false),
                 'data-edit-activation-id': String(props.edit_activation_id),
                 'data-host-rejected-keys': JSON.stringify(props.host_rejected_keys ?? []),
@@ -805,7 +805,7 @@ async function request_edit_session(
     return { granted };
 }
 
-async function enter_edit_mode(
+async function acquire_editing_session(
     post_message: ReturnType<typeof vi.fn>,
     edit_session_id = 'test-edit-session',
     diff_on_by_default?: boolean,
@@ -1241,7 +1241,7 @@ describe('cell highlight clear-all wiring', () => {
         await dispatch_host_message(initial_snapshot_message(meta, {
             capabilities: { csvEditable: true, csvEditingSupported: true },
         }));
-        await enter_edit_mode(post_message, 'append-session');
+        await acquire_editing_session(post_message, 'append-session');
         post_message.mockClear();
         grid_shell_mock.commit_live_edit.mockClear();
 
@@ -1297,7 +1297,7 @@ describe('cell highlight clear-all wiring', () => {
         await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1'], false), {
             capabilities: { csvEditable: true, csvEditingSupported: true },
         }));
-        await enter_edit_mode(post_message, 'old-session');
+        await acquire_editing_session(post_message, 'old-session');
         const request_append = grid_shell_mock.latest_props!.on_append_rows as
             (count: number) => Promise<unknown>;
         let completion!: Promise<unknown>;
@@ -1529,7 +1529,7 @@ describe('workbook snapshot hydration', () => {
         expect(grid_stub().getAttribute('data-generation')).toBe('4');
         expect(grid_stub().getAttribute('data-sheet-index')).toBe('1');
         expect(grid_stub().getAttribute('data-preview')).toBe('true');
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('true');
         expect(JSON.parse(grid_stub().getAttribute('data-store-edits')!))
             .toEqual({ '0:0': { value: 'new', base: 'old' } });
         // Orientation now lives on the tab strip: the rail is what shows it applied.
@@ -1689,7 +1689,7 @@ describe('workbook snapshot hydration', () => {
                 csvEditingSupported: true,
             },
         }));
-        await enter_edit_mode(post_message);
+        await acquire_editing_session(post_message);
         await report_grid_editing(true, true, [], {
             '0:0': { value: 'local', base: 'base' },
         });
@@ -2515,7 +2515,7 @@ describe('Excel first-row header toggle', () => {
             state: { transforms: [transform] },
         }));
         await acknowledge_transform(latest_transform_request(post_message), 2);
-        await enter_edit_mode(post_message);
+        await acquire_editing_session(post_message);
         post_message.mockClear();
 
         const button = get_button('Header Row');
@@ -3093,7 +3093,7 @@ describe('Excel first-row header toggle', () => {
                 { type: 'setExcelFirstRowHeader' }
             > => message.type === 'setExcelFirstRowHeader')!;
 
-        await enter_edit_mode(post_message);
+        await acquire_editing_session(post_message);
         await dispatch_host_message(refresh_snapshot_message(
             excel_meta_multi([true, false]),
             {
@@ -5036,7 +5036,7 @@ describe('auto-fit state', () => {
         await click_button('Auto-fit Columns');
         expect(get_button('Auto-fit Columns').classList.contains('active')).toBe(true);
 
-        await enter_edit_mode(post_message);
+        await acquire_editing_session(post_message);
         // Claiming the edit session makes the host redeliver the projection: same
         // source and generation, new capabilities, and the fitted widths this
         // panel already persisted.
@@ -5073,7 +5073,7 @@ describe('auto-fit state', () => {
         await click_button('Auto-fit Columns');
         expect(get_button('Auto-fit Columns').classList.contains('active')).toBe(true);
 
-        await enter_edit_mode(post_message);
+        await acquire_editing_session(post_message);
         // The host read its state before the fitted-width write landed, so the
         // refresh reverts the columns. The toggle must not claim fitted columns
         // the grid no longer has.
@@ -5272,7 +5272,7 @@ describe('editing without an edit mode', () => {
         expect(save.classList.contains('has-unsaved')).toBe(false);
         expect(find_button((text) => text === 'Discard')).toBeUndefined();
         expect(find_button((text) => text === 'Diff')).toBeUndefined();
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('false');
         expect(await tooltip_of('Save')).toBe(
             'No unsaved changes. Double-click a cell or start typing to edit it.',
         );
@@ -5301,7 +5301,7 @@ describe('editing without an edit mode', () => {
         })]);
         // An ordinary editing gesture, so the host is free to announce a refusal.
         expect(requests[0]).not.toHaveProperty('quiet');
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('false');
 
         await dispatch_host_message({
             type: 'editSessionResult',
@@ -5310,7 +5310,7 @@ describe('editing without an edit mode', () => {
         });
 
         expect(await granted).toBe(true);
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('true');
         expect(grid_shell_mock.latest_props?.edit_session_id).toBe('granted-session');
         expect(offered_request()).toBeUndefined();
         // Diff has a session to compare against; Discard still has nothing to drop.
@@ -5325,7 +5325,7 @@ describe('editing without an edit mode', () => {
         await dispatch_host_message({ type: 'editSessionResult', granted: false });
 
         expect(await granted).toBe(false);
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('false');
         expect(offered_request()).toBeDefined();
         expect(posted(post_message, 'requestEditSession')).toHaveLength(1);
     });
@@ -5353,7 +5353,7 @@ describe('editing without an edit mode', () => {
             type: 'showWarning',
             message: 'Wait for sorting and filtering to finish before editing.',
         }]);
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('false');
     });
 
     it('refuses a quiet request while a transform is in flight without a warning', async () => {
@@ -5390,14 +5390,14 @@ describe('editing without an edit mode', () => {
 
     it('releases a clean held session once the grid no longer needs it', async () => {
         const post_message = await editable_sheet();
-        await enter_edit_mode(post_message, 'idle-session');
+        await acquire_editing_session(post_message, 'idle-session');
         post_message.mockClear();
 
         // Still busy (an open editor, say): being told to look again changes nothing.
         const idle = grid_shell_mock.latest_props?.on_edit_session_idle as () => void;
         await act(async () => idle());
         expect(posted(post_message, 'releaseEditSession')).toEqual([]);
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('true');
 
         await release_idle_edit_session();
 
@@ -5405,7 +5405,7 @@ describe('editing without an edit mode', () => {
             type: 'releaseEditSession',
             editSessionId: 'idle-session',
         }]);
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('false');
         expect(find_button((text) => text === 'Diff')).toBeUndefined();
         // And the next editing gesture can acquire another.
         expect(offered_request()).toBeDefined();
@@ -5413,7 +5413,7 @@ describe('editing without an edit mode', () => {
 
     it('releases a clean idle session on the next render, without being told', async () => {
         const post_message = await editable_sheet();
-        await enter_edit_mode(post_message, 'idle-session');
+        await acquire_editing_session(post_message, 'idle-session');
         post_message.mockClear();
 
         // The grid stops needing the session and says nothing; any render will do.
@@ -5424,19 +5424,19 @@ describe('editing without an edit mode', () => {
             type: 'releaseEditSession',
             editSessionId: 'idle-session',
         }]);
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('false');
     });
 
     it('keeps an idle session that holds unsaved edits', async () => {
         const post_message = await editable_sheet();
-        await enter_edit_mode(post_message);
+        await acquire_editing_session(post_message);
         seed_mounted_store();
         post_message.mockClear();
 
         await release_idle_edit_session();
 
         expect(posted(post_message, 'releaseEditSession')).toEqual([]);
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('true');
         expect(latest_store_edits()).toEqual({ '0:0': { value: 'dirty', base: 'base' } });
         expect(get_button('Save').getAttribute('aria-disabled')).not.toBe('true');
         expect(await tooltip_of('Save')).toBe('Save: 1 cell edited.');
@@ -5444,7 +5444,7 @@ describe('editing without an edit mode', () => {
 
     it('keeps an idle, clean session while a save is in flight', async () => {
         const post_message = await editable_sheet();
-        await enter_edit_mode(post_message);
+        await acquire_editing_session(post_message);
         // The grid reports a save in flight with nothing left dirty in the store.
         await report_grid_editing(false, false, [], {}, true);
         post_message.mockClear();
@@ -5452,19 +5452,19 @@ describe('editing without an edit mode', () => {
         await release_idle_edit_session();
 
         expect(posted(post_message, 'releaseEditSession')).toEqual([]);
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('true');
         expect(await tooltip_of('Save')).toBe('Saving changes.');
 
         // The save's end is the only thing that was holding it.
         await report_grid_editing(false, false);
         await release_idle_edit_session();
         expect(posted(post_message, 'releaseEditSession')).toHaveLength(1);
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('false');
     });
 
     it('discards every unsaved edit from the Discard button', async () => {
         const post_message = await editable_sheet();
-        await enter_edit_mode(post_message, 'discard-session');
+        await acquire_editing_session(post_message, 'discard-session');
         seed_mounted_store();
         expect(await tooltip_of('Discard')).toBe(
             'Discard all unsaved changes. Undo brings them back.',
@@ -5478,7 +5478,7 @@ describe('editing without an edit mode', () => {
             editSessionId: 'discard-session',
         }]);
         expect(latest_store_edits()).toEqual({});
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('false');
         expect(find_button((text) => text === 'Discard')).toBeUndefined();
         expect(get_button('Save').getAttribute('aria-disabled')).toBe('true');
         // Undoable, which is what the tooltip promised.
@@ -5496,7 +5496,7 @@ describe('editing session save and release', () => {
         );
 
         expect(container!.textContent).not.toContain('Diff');
-        await enter_edit_mode(post_message);
+        await acquire_editing_session(post_message);
 
         expect(get_button('Diff').getAttribute('aria-pressed')).toBe('false');
         expect(grid_stub().getAttribute('data-diff-mode')).toBe('false');
@@ -5513,7 +5513,7 @@ describe('editing session save and release', () => {
 
         // The host samples configuration for the grant, so a setting changed after
         // the viewer opened still controls the first grant.
-        await enter_edit_mode(post_message, 'test-edit-session', true);
+        await acquire_editing_session(post_message, 'test-edit-session', true);
 
         expect(get_button('Diff').getAttribute('aria-pressed')).toBe('true');
         expect(grid_stub().getAttribute('data-diff-mode')).toBe('true');
@@ -5526,7 +5526,7 @@ describe('editing session save and release', () => {
             configuration: { diffOnByDefault: true },
             capabilities: { csvEditable: true, csvEditingSupported: true },
         }));
-        await enter_edit_mode(post_message, 'same-session');
+        await acquire_editing_session(post_message, 'same-session');
         await click_button('Diff');
         expect(grid_stub().getAttribute('data-diff-mode')).toBe('false');
 
@@ -5541,8 +5541,8 @@ describe('editing session save and release', () => {
         expect(get_button('Diff').getAttribute('aria-pressed')).toBe('false');
 
         await release_idle_edit_session();
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
-        await enter_edit_mode(post_message, 'same-session');
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('false');
+        await acquire_editing_session(post_message, 'same-session');
         expect(get_button('Diff').getAttribute('aria-pressed')).toBe('false');
         expect(grid_stub().getAttribute('data-diff-mode')).toBe('false');
     });
@@ -5560,7 +5560,7 @@ describe('editing session save and release', () => {
             }),
         );
 
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('true');
         expect(get_button('Diff').getAttribute('aria-pressed')).toBe('true');
         expect(grid_stub().getAttribute('data-diff-mode')).toBe('true');
     });
@@ -5632,7 +5632,7 @@ describe('editing session save and release', () => {
                 },
             })
         );
-        await enter_edit_mode(post_message);
+        await acquire_editing_session(post_message);
         seed_mounted_store();
 
         post_message.mockClear();
@@ -5646,7 +5646,7 @@ describe('editing session save and release', () => {
         expect(post_message).toHaveBeenCalledWith(expect.objectContaining({
             type: 'discardEditSession',
         }));
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('false');
     });
 
     it('a discard empties every worksheet’s store, not just the mounted one', async () => {
@@ -5700,7 +5700,7 @@ describe('editing session save and release', () => {
                 capabilities: { csvEditable: true, csvEditingSupported: true },
             })
         );
-        await enter_edit_mode(post_message);
+        await acquire_editing_session(post_message);
         seed_mounted_store();
         await click_button('Discard');
 
@@ -5747,7 +5747,7 @@ describe('editing session save and release', () => {
             pendingEdits,
         });
 
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('true');
         expect(grid_stub().getAttribute('data-store-edits')).toBe(
             JSON.stringify(pendingEdits)
         );
@@ -5857,7 +5857,7 @@ describe('editing session save and release', () => {
         await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1'], false), {
             capabilities: { csvEditable: true, csvEditingSupported: true },
         }));
-        await enter_edit_mode(post_message, 'basis-session');
+        await acquire_editing_session(post_message, 'basis-session');
         const operation: CsvSaveOperation = {
             editSessionId: 'basis-session',
             saveRequestId: 'save-basis',
@@ -5903,7 +5903,7 @@ describe('editing session save and release', () => {
         await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1'], false), {
             capabilities: { csvEditable: true, csvEditingSupported: true },
         }));
-        await enter_edit_mode(post_message, 'unsupported-session');
+        await acquire_editing_session(post_message, 'unsupported-session');
         const operation: CsvSaveOperation = {
             editSessionId: 'unsupported-session',
             saveRequestId: 'save-unsupported',
@@ -6037,7 +6037,7 @@ describe('editing session save and release', () => {
         await dispatch_host_message(initial_snapshot_message(meta, {
             capabilities: { csvEditable: true, csvEditingSupported: true },
         }));
-        await enter_edit_mode(post_message, 'insert-session');
+        await acquire_editing_session(post_message, 'insert-session');
         const request_insert = grid_shell_mock.latest_props!.on_insert_rows as
             (request: unknown) => Promise<{ rowIds: readonly string[]; settle(accepted: boolean): void } | undefined>;
         let admitted: Promise<{ rowIds: readonly string[]; settle(accepted: boolean): void } | undefined>;
@@ -6130,7 +6130,7 @@ describe('editing session save and release', () => {
         await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1'], false), {
             capabilities: { csvEditable: true, csvEditingSupported: true },
         }));
-        await enter_edit_mode(post_message, 'sort-session');
+        await acquire_editing_session(post_message, 'sort-session');
         const change_transform = grid_shell_mock.latest_props?.on_transform_change as (
             state: SheetTransformState,
         ) => void;
@@ -6706,17 +6706,17 @@ describe('editing session save and release', () => {
         );
         expect(grid_stub().getAttribute('data-edit-activation-id')).toBe('0');
 
-        await enter_edit_mode(post_message, 'same-session');
+        await acquire_editing_session(post_message, 'same-session');
         expect(grid_stub().getAttribute('data-edit-activation-id')).toBe('1');
 
         // Releasing is a new activation too: it is what lifts the fence the grid
         // put on the one that ended, so the next gesture finds cells that accept it.
         await release_idle_edit_session();
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('false');
         expect(grid_stub().getAttribute('data-edit-activation-id')).toBe('2');
-        await enter_edit_mode(post_message, 'same-session');
+        await acquire_editing_session(post_message, 'same-session');
 
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('true');
         expect(grid_stub().getAttribute('data-edit-activation-id')).toBe('3');
     });
 
@@ -6745,7 +6745,7 @@ describe('editing session save and release', () => {
             },
         }));
 
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('true');
         expect(grid_stub().getAttribute('data-edit-activation-id')).toBe('2');
     });
 
@@ -6770,13 +6770,13 @@ describe('editing session save and release', () => {
             sheetIndex: 1,
             pendingEdits,
         });
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('true');
 
         await click_sheet_tab('People');
         // The grant is workbook-scoped: every worksheet is editable immediately,
         // while each grid still projects only its own store.
         expect(grid_stub().getAttribute('data-sheet-index')).toBe('0');
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('true');
         expect(grid_stub().getAttribute('data-store-edits')).toBe('{}');
         // Nothing more to ask for, and Save still answers for Inventory's edits.
         expect(grid_shell_mock.latest_props?.on_request_edit_session).toBeUndefined();
@@ -6813,7 +6813,7 @@ describe('editing session save and release', () => {
         post_message.mockClear();
         await click_sheet_tab('Inventory');
 
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('true');
         expect(grid_shell_mock.latest_props?.edit_session_id).toBe('workbook-session');
         expect(post_message).not.toHaveBeenCalledWith(
             expect.objectContaining({ type: 'requestEditSession' })
@@ -6833,14 +6833,14 @@ describe('editing session save and release', () => {
                 },
             }),
         );
-        await enter_edit_mode(post_message, 'clean-exit-session');
+        await acquire_editing_session(post_message, 'clean-exit-session');
         grid_shell_mock.stop_edit_admission.mockImplementation(() => {
             // The real editing controller refuses commits after the exit fence.
             grid_shell_mock.commit_live_edit.mockReturnValue(false);
         });
 
         await release_idle_edit_session();
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('false');
         expect(grid_shell_mock.stop_edit_admission).toHaveBeenCalledOnce();
         await click_sheet_tab('Inventory');
 
@@ -7071,7 +7071,7 @@ describe('editing session save and release', () => {
             .pending_row_store!;
         expect(active.snapshot().appendedRows.map((row) => row.id))
             .toEqual(['blank-restored-row']);
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('true');
 
         await click_sheet_tab('Inventory');
         const sibling = (grid_shell_mock.latest_props as unknown as GridShellProps)
@@ -7754,7 +7754,7 @@ describe('editing session save and release', () => {
             editSessionId: 'workbook-session',
             sheetIndex: 1,
         });
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('true');
 
         // A sibling sheet's slot commits durably \u2014 slot 0 is now the first
         // dirty one \u2014 and the same session refreshes.
@@ -7778,7 +7778,7 @@ describe('editing session save and release', () => {
 
         // Still editing Inventory: the pointer stayed put.
         expect(grid_stub().getAttribute('data-sheet-index')).toBe('1');
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('true');
     });
 
     it('does not transfer a deleted clean pointer grant to its replacement index', async () => {
@@ -7796,7 +7796,7 @@ describe('editing session save and release', () => {
             editSessionId: 'workbook-session',
             sheetIndex: 1,
         });
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('true');
 
         await dispatch_host_message(
             refresh_snapshot_message(make_meta(['People', 'Archive'], false), {
@@ -7809,7 +7809,7 @@ describe('editing session save and release', () => {
         );
 
         expect(grid_stub().getAttribute('data-sheet-index')).toBe('1');
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('false');
         post_message.mockClear();
         await request_edit_session();
         expect(post_message).toHaveBeenCalledTimes(1);
@@ -7817,7 +7817,7 @@ describe('editing session save and release', () => {
             type: 'requestEditSession',
             sheetIndex: 1,
         }));
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('false');
     });
 
     it('keeps the session and offers Save when only another worksheet\u2019s store is dirty', async () => {
@@ -7844,7 +7844,7 @@ describe('editing session save and release', () => {
         // The restored workbook session is active while People is mounted clean;
         // Inventory's registry store still owns the unsaved work.
         expect(grid_stub().getAttribute('data-sheet-index')).toBe('0');
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('true');
         expect(grid_stub().getAttribute('data-store-edits')).toBe('{}');
         const save = get_button('Save');
         expect(save.classList.contains('has-unsaved')).toBe(true);
@@ -7857,7 +7857,7 @@ describe('editing session save and release', () => {
         expect(post_message).not.toHaveBeenCalledWith(
             expect.objectContaining({ type: 'releaseEditSession' })
         );
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('true');
     });
 
     it('keeps the workbook session when a dirty sibling blocks save preflight', async () => {
@@ -7896,7 +7896,7 @@ describe('editing session save and release', () => {
         expect(post_message).not.toHaveBeenCalledWith(expect.objectContaining({
             type: 'releaseEditSession',
         }));
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('true');
         expect(get_button('Save').classList.contains('has-unsaved')).toBe(true);
     });
 
@@ -7959,7 +7959,7 @@ describe('editing session save and release', () => {
                 csvEditSessionId: 'restored-session',
             },
         }));
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('true');
 
         const after = make_meta(['Inventory', 'People'], false);
         after.sheets[0].worksheetId = '2';
@@ -8037,7 +8037,7 @@ describe('editing session save and release', () => {
         expect(post_message).not.toHaveBeenCalledWith(
             expect.objectContaining({ type: 'releaseEditSession' })
         );
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('true');
     });
 
     it('folds the open overlay through the privileged close barrier before publishing', async () => {
@@ -9022,9 +9022,9 @@ describe('editing session save and release', () => {
         ));
 
         expect(grid_stub().getAttribute('data-sheet-index')).toBe('1');
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('true');
         await click_sheet_tab('People');
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('true');
     });
 
     it('restores a clean owned edit session after receiver recreation', async () => {
@@ -9040,7 +9040,7 @@ describe('editing session save and release', () => {
             },
         ));
 
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('true');
         expect(grid_shell_mock.latest_props?.edit_session_id).toBe('clean-owned-session');
         expect(latest_store_edits()).toEqual({});
         expect(grid_stub().getAttribute('data-store-edits')).toBe('{}');
@@ -9069,7 +9069,7 @@ describe('editing session save and release', () => {
         expect(latest_store_edits()).toEqual(stale);
 
         await click_button('Discard');
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('false');
         // The next request waits out the host's cleanup of the discarded session.
         await dispatch_host_message({
             type: 'discardEditSessionResult',
@@ -9084,7 +9084,7 @@ describe('editing session save and release', () => {
             editSessionId: 'new-session',
         });
 
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('true');
         // Authoritative absence has to reach the live store: the stale entry must
         // be gone from what a mounted grid paints from, without a remount to wipe it.
         expect(latest_store_edits()).toEqual({});
@@ -9135,10 +9135,10 @@ describe('editing session save and release', () => {
         expect(post_message.mock.calls.some(([message]) => (
             (message as { type?: string }).type === 'pendingEditsChanged'
         ))).toBe(false);
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('false');
     });
 
-    it('drops edit mode and pending restoration when the host revokes a saved session', async () => {
+    it('drops the session and pending restoration when the host revokes a saved session', async () => {
         const { post_message } = await render_app();
         await dispatch_host_message(
             initial_snapshot_message(make_meta(['Sheet1'], false), {
@@ -9154,7 +9154,7 @@ describe('editing session save and release', () => {
             granted: true,
             pendingEdits: { '0:0': { value: 'draft', base: 'a' } },
         });
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('true');
 
         post_message.mockClear();
         const operation: CsvSaveOperation = {
@@ -9176,7 +9176,7 @@ describe('editing session save and release', () => {
             lifecycle: { revision: 2, state: 'succeeded', operation },
         });
 
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('false');
         expect(post_message.mock.calls.some(([message]) => (
             (message as { type?: string }).type === 'releaseEditSession'
         ))).toBe(false);
@@ -9210,7 +9210,7 @@ describe('editing session save and release', () => {
         }));
         await dispatch_host_message({ type: 'editSessionResult', granted: true });
 
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('false');
     });
 
     it('disables Save and Discard while GridShell is saving', async () => {
@@ -9223,7 +9223,7 @@ describe('editing session save and release', () => {
                 },
             })
         );
-        await enter_edit_mode(post_message);
+        await acquire_editing_session(post_message);
         seed_mounted_store();
         // Enabled by the unsaved edit, so what disables them next is the save.
         expect(get_button('Save').getAttribute('aria-disabled')).not.toBe('true');
@@ -9244,7 +9244,7 @@ describe('editing session save and release', () => {
         await dispatch_host_message(initial_snapshot_message(meta, {
             capabilities: { csvEditable: true, csvEditingSupported: true },
         }));
-        await enter_edit_mode(post_message);
+        await acquire_editing_session(post_message);
         seed_mounted_store();
         const before_mount = grid_stub().getAttribute('data-mount-id');
 
@@ -9291,7 +9291,7 @@ describe('editing session save and release', () => {
             make_meta(['Sheet1'], false),
             { capabilities: { csvEditable: true, csvEditingSupported: true } },
         ));
-        await enter_edit_mode(post_message);
+        await acquire_editing_session(post_message);
         const dirty = { '0:0': { value: 'draft', base: 'base' } };
         await act(async () => seed_mounted_store(dirty));
         await report_grid_editing(true, true, [], dirty);
@@ -9413,7 +9413,7 @@ describe('editing session save and release', () => {
                 },
             },
         }));
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('true');
 
         await click_button('Save');
         const proposed = grid_shell_mock.latest_props?.save_operation as CsvSaveOperation;
@@ -9554,7 +9554,7 @@ describe('editing session save and release', () => {
                 sourceBasis: { physicalRevision: 10, projectionRevision: 0 },
             },
         }));
-        await enter_edit_mode(post_message);
+        await acquire_editing_session(post_message);
         seed_mounted_store();
         await click_button('Save');
         const operation = grid_shell_mock.latest_props?.save_operation as CsvSaveOperation;
@@ -9618,7 +9618,7 @@ describe('editing session save and release', () => {
         expect(latest_store_edits()).toEqual(
             operation.worksheets[0].dirtyEdits,
         );
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('true');
     });
 
     it('does not hydrate a failed operation over a different current session', async () => {
@@ -9651,7 +9651,7 @@ describe('editing session save and release', () => {
         ));
 
         expect(latest_store_edits()).toEqual(newer);
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('true');
     });
 
     it('tombstones stale pending edits for a succeeded current session', async () => {
@@ -9683,7 +9683,7 @@ describe('editing session save and release', () => {
         ));
 
         expect(latest_store_edits()).toEqual({});
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('false');
     });
 
     it('clears a saved cell observed from disk before its success terminal', async () => {
@@ -9729,7 +9729,7 @@ describe('editing session save and release', () => {
 
         expect(Object.fromEntries(store.snapshot())).toEqual({});
         expect(get_button('Save').classList.contains('has-unsaved')).toBe(false);
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('false');
     });
 
     it('keeps saved entries cleared across reliable success, remount, and edit reacquisition', async () => {
@@ -9793,7 +9793,7 @@ describe('editing session save and release', () => {
             editSessionId: 'new-session',
         });
 
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('true');
         expect(latest_store_edits()).toEqual({});
     });
 
@@ -9827,7 +9827,7 @@ describe('editing session save and release', () => {
         ));
 
         expect(latest_store_edits()).toEqual(newer);
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('true');
     });
 
     for (const save_order of ['snapshot-first', 'result-first'] as const) {
@@ -9955,7 +9955,7 @@ describe('editing session save and release', () => {
         }
 
         expect(pending_rows().snapshot().appendedRows).toEqual([]);
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('false');
         expect(get_button('Save').classList.contains('has-unsaved')).toBe(false);
         expect(grid_shell_mock.latest_props?.saved_row_focus).toMatchObject({
             sheetIndex: 1,
@@ -10026,7 +10026,7 @@ describe('editing session save and release', () => {
         const pending_rows = grid_shell_mock.latest_props!
             .pending_row_store as GridShellProps['pending_row_store'];
         expect(pending_rows?.snapshot().appendedRows).toEqual([]);
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('false');
     });
 
     it('honors an authoritative success while local editing status is stale', async () => {
@@ -10044,8 +10044,8 @@ describe('editing session save and release', () => {
             })
         );
 
-        await enter_edit_mode(post_message);
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        await acquire_editing_session(post_message);
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('true');
         seed_mounted_store();
 
         post_message.mockClear();
@@ -10055,7 +10055,7 @@ describe('editing session save and release', () => {
         await dispatch_host_message({ type: 'saveResult', success: true });
         await report_grid_editing(true);
 
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('false');
     });
 
     it('ends the session after a busy save succeeds with no remaining dirty work', async () => {
@@ -10073,8 +10073,8 @@ describe('editing session save and release', () => {
             })
         );
 
-        await enter_edit_mode(post_message);
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        await acquire_editing_session(post_message);
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('true');
         seed_mounted_store();
 
         post_message.mockClear();
@@ -10084,7 +10084,7 @@ describe('editing session save and release', () => {
         await dispatch_host_message({ type: 'saveResult', success: true });
         await report_grid_editing(false);
 
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('false');
     });
 
     it('discards an operation-owned live overlay after save success', async () => {
@@ -10102,10 +10102,10 @@ describe('editing session save and release', () => {
             })
         );
 
-        await enter_edit_mode(post_message);
+        await acquire_editing_session(post_message);
         await report_grid_editing(false, true);
         seed_mounted_store();
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('true');
 
         post_message.mockClear();
         await click_button('Save');
@@ -10113,7 +10113,7 @@ describe('editing session save and release', () => {
 
         await dispatch_host_message({ type: 'saveResult', success: true });
 
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('false');
     });
 
     it('ends the session after a successful save once a still-open overlay later resolves clean (no timer)', async () => {
@@ -10131,23 +10131,23 @@ describe('editing session save and release', () => {
             })
         );
 
-        await enter_edit_mode(post_message);
+        await acquire_editing_session(post_message);
         await report_grid_editing(false, true);
         seed_mounted_store();
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('true');
 
         post_message.mockClear();
         await click_button('Save');
         await dispatch_host_message({ type: 'saveResult', success: true });
         // The accepted operation owns the overlay, so success is terminal even if
         // a stale editing-status report still says it is open.
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('false');
 
         // The overlay commits/clears — GridShell reports the live-editor state
         // going clean. The editing-status effect (not a timer) completes the exit.
         await report_grid_editing(false, false);
 
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('false');
     });
 
     it('ignores stray failed save results after a save already succeeded', async () => {
@@ -10165,20 +10165,20 @@ describe('editing session save and release', () => {
             })
         );
 
-        await enter_edit_mode(post_message);
+        await acquire_editing_session(post_message);
         await report_grid_editing(false, true);
         seed_mounted_store();
         post_message.mockClear();
         await click_button('Save');
         await dispatch_host_message({ type: 'saveResult', success: true });
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('false');
 
         // A stray failed save after success must not bring the ended session
         // back; when the overlay later resolves clean, it stays ended.
         await dispatch_host_message({ type: 'saveResult', success: false });
         await report_grid_editing(false, false);
 
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('false');
     });
 
     it('does not let a finished save end a fresh document’s restored session', async () => {
@@ -10196,13 +10196,13 @@ describe('editing session save and release', () => {
             })
         );
 
-        await enter_edit_mode(post_message);
+        await acquire_editing_session(post_message);
         await report_grid_editing(false, true);
         seed_mounted_store();
         post_message.mockClear();
         await click_button('Save');
         await dispatch_host_message({ type: 'saveResult', success: true });
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('false');
 
         // A fresh document arrives (resetting the save's bookkeeping) and brings
         // restored edits, so editing re-engages. The earlier save's ending must
@@ -10217,11 +10217,11 @@ describe('editing session save and release', () => {
                 generation: 2,
             })
         );
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('true');
 
         await report_grid_editing(false, false);
 
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('true');
     });
 
     it('a discard fences the mounted editor before releasing edit ownership', async () => {
@@ -10237,7 +10237,7 @@ describe('editing session save and release', () => {
                 },
             })
         );
-        await enter_edit_mode(post_message);
+        await acquire_editing_session(post_message);
         await report_grid_editing(true, true, ['0:0']);
         seed_mounted_store();
 
@@ -10252,7 +10252,7 @@ describe('editing session save and release', () => {
         ));
         expect(grid_shell_mock.stop_edit_admission.mock.invocationCallOrder[0])
             .toBeLessThan(discard_call!);
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('false');
     });
 
     it('leaves editing usable when a discard abandons', async () => {
@@ -10274,7 +10274,7 @@ describe('editing session save and release', () => {
                 },
             })
         );
-        await enter_edit_mode(post_message);
+        await acquire_editing_session(post_message);
         await report_grid_editing(true, true, ['0:0']);
         seed_mounted_store();
 
@@ -10285,7 +10285,7 @@ describe('editing session save and release', () => {
         expect(post_message).not.toHaveBeenCalledWith(
             expect.objectContaining({ type: 'discardEditSession' }),
         );
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('true');
     });
 
     it('refuses a discard while a highlight gesture awaits the host', async () => {
@@ -10301,7 +10301,7 @@ describe('editing session save and release', () => {
                 },
             })
         );
-        await enter_edit_mode(post_message);
+        await acquire_editing_session(post_message);
         await report_grid_editing(true, true, ['0:0']);
         seed_mounted_store();
 
@@ -10330,7 +10330,7 @@ describe('editing session save and release', () => {
                 message: expect.stringContaining('cell highlight'),
             }),
         );
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('true');
         expect(JSON.parse(grid_stub().getAttribute('data-undo-labels')!)).toEqual([]);
     });
 
@@ -10389,7 +10389,7 @@ describe('editing session save and release', () => {
                 capabilities: { csvEditable: true, csvEditingSupported: true },
             })
         );
-        await enter_edit_mode(post_message);
+        await acquire_editing_session(post_message);
         await report_grid_editing(true, true, [], {
             '4:1': { value: 'edited', base: 'stale' },
         });
@@ -10480,7 +10480,7 @@ describe('editing session save and release', () => {
                 capabilities: { csvEditable: true, csvEditingSupported: true },
             }),
         );
-        await enter_edit_mode(post_message);
+        await acquire_editing_session(post_message);
         await act(async () => {
             (grid_shell_mock.latest_props?.edit_session as EditSessionStore).commit(
                 'test-edit-session',
@@ -10513,7 +10513,7 @@ describe('editing session save and release', () => {
                 capabilities: { csvEditable: true, csvEditingSupported: true },
             }),
         );
-        await enter_edit_mode(post_message);
+        await acquire_editing_session(post_message);
         await report_grid_editing(true, true, ['0:1'], {
             '0:0': {
                 value: 'replacement typed after the move',
@@ -10542,7 +10542,7 @@ describe('editing session save and release', () => {
                 capabilities: { csvEditable: true, csvEditingSupported: true },
             }),
         );
-        await enter_edit_mode(post_message);
+        await acquire_editing_session(post_message);
         const submitted = {
             '4:1': {
                 value: 'edited',
@@ -10596,7 +10596,7 @@ describe('editing session save and release', () => {
                 capabilities: { csvEditable: true, csvEditingSupported: true },
             }),
         );
-        await enter_edit_mode(post_message);
+        await acquire_editing_session(post_message);
         const original_runs = {
             runs: [{ text: 'Anchor', style: { bold: true as const } }],
         };
@@ -10650,7 +10650,7 @@ describe('editing session save and release', () => {
                 capabilities: { csvEditable: true, csvEditingSupported: true },
             }),
         );
-        await enter_edit_mode(post_message);
+        await acquire_editing_session(post_message);
         await report_grid_editing(true, true, ['4:1'], {
             '4:1': {
                 value: 'edited', base: 'stale',
@@ -10680,7 +10680,7 @@ describe('editing session save and release', () => {
                 capabilities: { csvEditable: true, csvEditingSupported: true },
             }),
         );
-        await enter_edit_mode(post_message);
+        await acquire_editing_session(post_message);
         await report_grid_editing(true, true, ['0:0'], {
             '0:0': {
                 value: 'pending', base: 'original',
@@ -10710,7 +10710,7 @@ describe('editing session save and release', () => {
                 capabilities: { csvEditable: true, csvEditingSupported: true },
             }),
         );
-        await enter_edit_mode(post_message);
+        await acquire_editing_session(post_message);
         const original = 'A'.repeat(800);
         const current = `${'A'.repeat(799)}B`;
         const entry = (row: number): CsvDirtyEntry => ({
@@ -10735,7 +10735,7 @@ describe('editing session save and release', () => {
                 capabilities: { csvEditable: true, csvEditingSupported: true },
             })
         );
-        await enter_edit_mode(post_message);
+        await acquire_editing_session(post_message);
         const ordinary = { '0:0': { value: 'pending', base: 'original' } };
         const affected = {
             '0:0': {
@@ -10763,7 +10763,7 @@ describe('editing session save and release', () => {
                 capabilities: { csvEditable: true, csvEditingSupported: true },
             }),
         );
-        await enter_edit_mode(post_message);
+        await acquire_editing_session(post_message);
         const first = {
             '0:0': {
                 value: 'pending one', base: 'original one',
@@ -10801,7 +10801,7 @@ describe('editing session save and release', () => {
                 capabilities: { csvEditable: true, csvEditingSupported: true },
             }),
         );
-        await enter_edit_mode(post_message);
+        await acquire_editing_session(post_message);
         const first = {
             value: 'pending one', base: 'original one',
             observedBase: { value: 'current one' },
@@ -10832,7 +10832,7 @@ describe('editing session save and release', () => {
                 capabilities: { csvEditable: true, csvEditingSupported: true },
             }),
         );
-        await enter_edit_mode(post_message);
+        await acquire_editing_session(post_message);
         const ordinary = { '0:0': { value: 'pending', base: 'original' } };
         const affected = {
             '0:0': {
@@ -10863,7 +10863,7 @@ describe('editing session save and release', () => {
                 capabilities: { csvEditable: true, csvEditingSupported: true },
             }),
         );
-        await enter_edit_mode(post_message);
+        await acquire_editing_session(post_message);
         const ordinary = { '0:0': { value: 'pending', base: 'original' } };
         await report_grid_editing(true, true, ['0:0'], {
             '0:0': {
@@ -10890,7 +10890,7 @@ describe('editing session save and release', () => {
                 capabilities: { csvEditable: true, csvEditingSupported: true },
             }),
         );
-        await enter_edit_mode(post_message);
+        await acquire_editing_session(post_message);
         const affected = {
             '0:0': {
                 value: 'pending',
@@ -10930,7 +10930,7 @@ describe('editing session save and release', () => {
                 capabilities: { csvEditable: true, csvEditingSupported: true },
             }),
         );
-        await enter_edit_mode(post_message);
+        await acquire_editing_session(post_message);
         const second = {
             value: 'pending two',
             base: 'original two',
@@ -10982,7 +10982,7 @@ describe('editing session save and release', () => {
                 capabilities: { csvEditable: true, csvEditingSupported: true },
             }),
         );
-        await enter_edit_mode(post_message);
+        await acquire_editing_session(post_message);
         const submitted = { '0:0': { value: 'pending', base: 'original' } };
         await report_grid_editing(true, true, [], submitted);
         await dispatch_host_message({
@@ -11043,7 +11043,7 @@ describe('editing session save and release', () => {
                 capabilities: { csvEditable: true, csvEditingSupported: true },
             }),
         );
-        await enter_edit_mode(post_message);
+        await acquire_editing_session(post_message);
         await report_grid_editing(true, true, ['0:0'], {
             '0:0': {
                 value: 'Applefff',
@@ -11068,7 +11068,7 @@ describe('editing session save and release', () => {
                 capabilities: { csvEditable: true, csvEditingSupported: true },
             }),
         );
-        await enter_edit_mode(post_message);
+        await acquire_editing_session(post_message);
         await report_grid_editing(true, true, ['0:0'], {
             '0:0': {
                 value: 'Apple',
@@ -11091,7 +11091,7 @@ describe('editing session save and release', () => {
                 capabilities: { csvEditable: true, csvEditingSupported: true },
             }),
         );
-        await enter_edit_mode(post_message);
+        await acquire_editing_session(post_message);
         await report_grid_editing(true, true, ['0:0'], {
             '0:0': {
                 value: 'Banana',
@@ -11116,7 +11116,7 @@ describe('editing session save and release', () => {
                 capabilities: { csvEditable: true, csvEditingSupported: true },
             }),
         );
-        await enter_edit_mode(post_message);
+        await acquire_editing_session(post_message);
         await report_grid_editing(true, true, ['0:0'], {
             '0:0': {
                 value: 'Dragonfruit',
@@ -11144,7 +11144,7 @@ describe('editing session save and release', () => {
                 capabilities: { csvEditable: true, csvEditingSupported: true },
             }),
         );
-        await enter_edit_mode(post_message);
+        await acquire_editing_session(post_message);
         const legacy_entry = {
             value: 'Banana',
             base: 'Apple',
@@ -11182,7 +11182,7 @@ describe('editing session save and release', () => {
                 capabilities: { csvEditable: true, csvEditingSupported: true },
             }),
         );
-        await enter_edit_mode(post_message);
+        await acquire_editing_session(post_message);
         await report_grid_editing(true, true, ['0:0'], {
             '0:0': {
                 value: 'Apple',
@@ -11211,7 +11211,7 @@ describe('editing session save and release', () => {
                 capabilities: { csvEditable: true, csvEditingSupported: true },
             }),
         );
-        await enter_edit_mode(post_message);
+        await acquire_editing_session(post_message);
         grid_shell_mock.can_reveal_source_cell.mockReturnValue(false);
         await report_grid_editing(true, true, ['75:0'], {
             '75:0': {
@@ -11232,7 +11232,7 @@ describe('editing session save and release', () => {
                 capabilities: { csvEditable: true, csvEditingSupported: true },
             })
         );
-        await enter_edit_mode(post_message);
+        await acquire_editing_session(post_message);
         const orphan_with_link: CsvDirtyEntry = {
             value: 'orphan',
             base: 'gone',
@@ -11299,7 +11299,7 @@ describe('editing session save and release', () => {
                 capabilities: { csvEditable: true, csvEditingSupported: true },
             })
         );
-        await enter_edit_mode(post_message);
+        await acquire_editing_session(post_message);
         await report_grid_editing(true, true, [], {
             '4:1': { value: 'edited', base: 'stale' },
             '0:0': { value: 'fine', base: 'a' },
@@ -11354,7 +11354,7 @@ describe('editing session save and release', () => {
                 capabilities: { csvEditable: true, csvEditingSupported: true },
             })
         );
-        await enter_edit_mode(post_message);
+        await acquire_editing_session(post_message);
         const people_edits = { '4:1': { value: 'Bob', base: 'Alice' } };
         const inventory_edits = { '4:1': { value: 'Gadget', base: 'stale' } };
         seed_mounted_store(people_edits);
@@ -11417,7 +11417,7 @@ describe('editing session save and release', () => {
             state: { activeSheetIndex: 1 },
             capabilities: { csvEditable: true, csvEditingSupported: true },
         }));
-        await enter_edit_mode(post_message);
+        await acquire_editing_session(post_message);
         const edits = { '4:1': { value: 'Gadget', base: 'stale' } };
         await report_grid_editing(true, true, [], edits);
 
@@ -11465,7 +11465,7 @@ describe('editing session save and release', () => {
                 capabilities: { csvEditable: true, csvEditingSupported: true },
             })
         );
-        await enter_edit_mode(post_message);
+        await acquire_editing_session(post_message);
         const edits = { '4:1': { value: 'edited', base: 'stale' } };
         await report_grid_editing(true, true, [], edits);
         await dispatch_host_message({
@@ -11500,7 +11500,7 @@ describe('editing session save and release', () => {
                 capabilities: { csvEditable: true, csvEditingSupported: true },
             })
         );
-        await enter_edit_mode(post_message);
+        await acquire_editing_session(post_message);
         // '4:1' is the host's verdict; '9:3' is one the webview derived on its own
         // (its page is resident, so is_entry_conflicted could see the drift). The
         // grid reports the union, which is what the banner tints.
@@ -11561,7 +11561,7 @@ describe('editing session save and release', () => {
                 capabilities: { csvEditable: true, csvEditingSupported: true },
             })
         );
-        await enter_edit_mode(post_message);
+        await acquire_editing_session(post_message);
         await report_grid_editing(true, true, [], {
             '4:1': { value: 'edited', base: 'stale' },
             '0:0': { value: 'fine', base: 'a' },
@@ -11623,7 +11623,7 @@ describe('editing session save and release', () => {
                 capabilities: { csvEditable: true, csvEditingSupported: true },
             })
         );
-        await enter_edit_mode(post_message);
+        await acquire_editing_session(post_message);
         await report_grid_editing(true, true, [], {
             '4:1': { value: 'edited', base: 'stale' },
         });
@@ -11683,7 +11683,7 @@ describe('editing session save and release', () => {
                 capabilities: { csvEditable: true, csvEditingSupported: true },
             })
         );
-        await enter_edit_mode(post_message);
+        await acquire_editing_session(post_message);
         await report_grid_editing(true, true, [], {
             '4:1': { value: 'edited', base: 'stale' },
         });
@@ -11745,7 +11745,7 @@ describe('editing session save and release', () => {
                 capabilities: { csvEditable: true, csvEditingSupported: true },
             })
         );
-        await enter_edit_mode(post_message);
+        await acquire_editing_session(post_message);
         await report_grid_editing(true, true, [], {
             '4:1': { value: 'edited', base: 'stale' },
         });
@@ -11810,7 +11810,7 @@ describe('editing session save and release', () => {
                 capabilities: { csvEditable: true, csvEditingSupported: true },
             })
         );
-        await enter_edit_mode(post_message);
+        await acquire_editing_session(post_message);
         await report_grid_editing(true, true, [], {
             '4:1': { value: 'edited', base: 'stale' },
         });
@@ -11875,7 +11875,7 @@ describe('editing session save and release', () => {
                 capabilities: { csvEditable: true, csvEditingSupported: true },
             })
         );
-        await enter_edit_mode(post_message);
+        await acquire_editing_session(post_message);
         await report_grid_editing(true, true, [], {
             '4:1': { value: 'edited', base: 'stale' },
         });
@@ -11947,7 +11947,7 @@ describe('editing session save and release', () => {
                 capabilities: { csvEditable: true, csvEditingSupported: true },
             })
         );
-        await enter_edit_mode(post_message);
+        await acquire_editing_session(post_message);
         const dirty = { '4:1': { value: 'edited', base: 'stale' } };
         await report_grid_editing(true, true, [], dirty);
         await dispatch_host_message({
@@ -12034,7 +12034,7 @@ describe('editing session save and release', () => {
                 capabilities: { csvEditable: true, csvEditingSupported: true },
             })
         );
-        await enter_edit_mode(post_message);
+        await acquire_editing_session(post_message);
         await report_grid_editing(true, true, [], {
             '4:1': { value: 'edited', base: 'stale' },
         });
@@ -12092,7 +12092,7 @@ describe('editing session save and release', () => {
                 capabilities: { csvEditable: true, csvEditingSupported: true },
             })
         );
-        await enter_edit_mode(post_message);
+        await acquire_editing_session(post_message);
         await report_grid_editing(true, true, [], {
             '4:1': { value: 'edited', base: 'stale' },
         });
@@ -12441,7 +12441,7 @@ describe('sorting and filtering', () => {
         expect(grid_shell_mock.latest_props?.transform_sections).toBe(false);
 
         await dispatch_host_message({ type: 'editSessionResult', granted: true });
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('true');
         // Specifically the pending window, not the held session: once it is
         // granted the controls come back, because the host admits a transform from
         // the panel that owns the session.
@@ -13309,7 +13309,7 @@ describe('edit session store hydration', () => {
         await dispatch_host_message(initial_snapshot_message(meta, {
             capabilities: { csvEditable: true, csvEditingSupported: true },
         }));
-        await enter_edit_mode(post_message);
+        await acquire_editing_session(post_message);
         const mount_id = grid_stub().getAttribute('data-mount-id');
         const generation = grid_stub().getAttribute('data-generation');
 
@@ -13344,7 +13344,7 @@ describe('edit session store hydration', () => {
         await dispatch_host_message(initial_snapshot_message(meta, {
             capabilities: { csvEditable: true, csvEditingSupported: true },
         }));
-        await enter_edit_mode(post_message);
+        await acquire_editing_session(post_message);
         grid_shell_mock.commit_live_edit.mockImplementation(() => {
             (grid_shell_mock.latest_props?.edit_session as EditSessionStore)
                 .commit('test-edit-session', '0:0', { value: 'half-typed', base: 'base' });
@@ -13375,7 +13375,7 @@ describe('edit session store hydration', () => {
         await dispatch_host_message(initial_snapshot_message(meta, {
             capabilities: { csvEditable: true, csvEditingSupported: true },
         }));
-        await enter_edit_mode(post_message);
+        await acquire_editing_session(post_message);
         // A committed edit, the way the grid's own hook writes one. It exists only
         // in the registry store that the remounted grid receives.
         await act(async () => {
@@ -13409,7 +13409,7 @@ describe('edit session store hydration', () => {
         await dispatch_host_message(initial_snapshot_message(meta, {
             capabilities: { csvEditable: true, csvEditingSupported: true },
         }));
-        await enter_edit_mode(post_message);
+        await acquire_editing_session(post_message);
         const pending_store = grid_shell_mock.latest_props?.pending_row_store as {
             append_rows: (...args: unknown[]) => boolean;
         };
@@ -13481,7 +13481,7 @@ describe('edit session store hydration', () => {
         await dispatch_host_message(initial_snapshot_message(meta, {
             capabilities: { csvEditable: true, csvEditingSupported: true },
         }));
-        await enter_edit_mode(post_message);
+        await acquire_editing_session(post_message);
         await dispatch_host_message(refresh_snapshot_message(meta, {
             generation: 3,
             sourceGeneration: 3,
@@ -13518,7 +13518,7 @@ describe('edit session store hydration', () => {
         await dispatch_host_message(initial_snapshot_message(meta, {
             capabilities: { csvEditable: true, csvEditingSupported: true },
         }));
-        await enter_edit_mode(post_message);
+        await acquire_editing_session(post_message);
 
         await dispatch_host_message(refresh_snapshot_message(meta, {
             generation: 3,
@@ -13552,7 +13552,7 @@ describe('edit session store hydration', () => {
         await dispatch_host_message(initial_snapshot_message(meta, {
             capabilities: { csvEditable: true, csvEditingSupported: true },
         }));
-        await enter_edit_mode(post_message);
+        await acquire_editing_session(post_message);
 
         // Bump the generation so the shell's listener is re-registered last.
         // No requestId, matching the undefined pending id, so the guard admits it:
@@ -13586,7 +13586,7 @@ describe('edit session store hydration', () => {
         await dispatch_host_message(initial_snapshot_message(meta, {
             capabilities: { csvEditable: true, csvEditingSupported: true },
         }));
-        await enter_edit_mode(post_message);
+        await acquire_editing_session(post_message);
         grid_shell_mock.commit_live_edit.mockImplementation(() => {
             (grid_shell_mock.latest_props?.edit_session as EditSessionStore)
                 .commit('test-edit-session', '0:0', { value: 'live', base: 'base' });
@@ -13613,7 +13613,7 @@ describe('edit session store hydration', () => {
         await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1'], false), {
             capabilities: { csvEditable: true, csvEditingSupported: true },
         }));
-        await enter_edit_mode(post_message);
+        await acquire_editing_session(post_message);
         // Stand in for the real overlay fold: the value only reaches the next mount
         // if the write happens before the generation bump destroys this one.
         grid_shell_mock.commit_live_edit.mockImplementation(() => {
@@ -13669,23 +13669,23 @@ describe('transforms during an edit session', () => {
     }
 
     /** Acquire a session, then install a sort on column 0 while it is held. */
-    async function edit_mode_with_sort(post_message: ReturnType<typeof vi.fn>) {
-        await enter_edit_mode(post_message);
+    async function session_with_sort(post_message: ReturnType<typeof vi.fn>) {
+        await acquire_editing_session(post_message);
         await act(async () => (
             container!.querySelector('.stub-shortcut-transform') as HTMLButtonElement
         ).click());
         const request = latest_transform_request(post_message);
         await acknowledge_transform(request, 2);
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('true');
         // The ack landed rather than being dropped by the requestId guard: only an
         // install moves the generation, and the rules it carried describe a permutation.
         expect(grid_stub().getAttribute('data-generation')).toBe('2');
     }
 
-    it('keeps transform controls enabled in edit mode and lets a sort through', async () => {
+    it('keeps transform controls enabled while a session is held and lets a sort through', async () => {
         const { post_message } = await editable_csv();
-        await enter_edit_mode(post_message);
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        await acquire_editing_session(post_message);
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('true');
         expect(grid_shell_mock.latest_props?.transform_sections).toBe(true);
 
         post_message.mockClear();
@@ -13699,13 +13699,13 @@ describe('transforms during an edit session', () => {
         // installed sort's chip live rather than greyed out.
         await acknowledge_transform(request, 2);
         expect(grid_stub().getAttribute('data-generation')).toBe('2');
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('true');
         expect(sort_chip_disabled()).toBeNull();
     });
 
     it('disables transform controls only while a save is in flight', async () => {
         const { post_message } = await editable_csv();
-        await edit_mode_with_sort(post_message);
+        await session_with_sort(post_message);
         expect(grid_shell_mock.latest_props?.transform_sections).toBe(true);
         expect(sort_chip_disabled()).toBeNull();
 
@@ -13737,17 +13737,17 @@ describe('transforms during an edit session', () => {
             editSessionId: 'granted-session',
         });
 
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('true');
         expect(document.querySelector(
             '[role="dialog"][aria-label="Choose visible columns"]',
         )).not.toBeNull();
     });
 
     it('restores a stored transform during an edit session', async () => {
-        // `edit_mode` is no longer a dep of the restore effect, so a refresh that
+        // `editing_session_held` is no longer a dep of the restore effect, so a refresh that
         // ships a persisted transform has to reinstall it even mid-session.
         const { post_message } = await editable_csv();
-        await enter_edit_mode(post_message);
+        await acquire_editing_session(post_message);
         post_message.mockClear();
 
         await dispatch_host_message(refresh_snapshot_message(
@@ -13767,7 +13767,7 @@ describe('transforms during an edit session', () => {
             },
         ));
 
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('true');
         expect(latest_transform_request(post_message).state.sort)
             .toEqual([{ colIndex: 0, direction: 'desc' }]);
     });
@@ -13791,7 +13791,7 @@ describe('snapshots arriving during an in-flight transform', () => {
             make_meta(['Sheet1'], false),
             { capabilities: { csvEditable: true, csvEditingSupported: true } },
         ));
-        await enter_edit_mode(post_message);
+        await acquire_editing_session(post_message);
         await act(async () => (
             container!.querySelector('.stub-shortcut-transform') as HTMLButtonElement
         ).click());
@@ -14009,7 +14009,7 @@ describe('an applied transform across a refresh', () => {
         ));
         // The snapshot already names a session this panel owns, so it opens in edit
         // mode — the state in which every commit provokes a same-basis refresh.
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('true');
         expect(grid_stub().getAttribute('data-merges')).toBe('0');
         expect(grid_stub().getAttribute('data-row-count'))
             .toBe(String(FILTERED_ROW_COUNT));
@@ -14706,7 +14706,7 @@ describe('refused transforms', () => {
             make_meta(['Sheet1'], false),
             { capabilities: { csvEditable: true, csvEditingSupported: true } },
         ));
-        await enter_edit_mode(rendered.post_message);
+        await acquire_editing_session(rendered.post_message);
         return rendered;
     }
 
@@ -15275,13 +15275,13 @@ describe('stale-view banner', () => {
         expect(offenders).toEqual([]);
     }
 
-    async function edit_mode_sorted_on_column_0() {
+    async function session_sorted_on_column_0() {
         const { post_message } = await render_app();
         await dispatch_host_message(initial_snapshot_message(
             make_meta(['Sheet1'], false),
             { capabilities: { csvEditable: true, csvEditingSupported: true } },
         ));
-        await enter_edit_mode(post_message);
+        await acquire_editing_session(post_message);
         await act(async () => (
             container!.querySelector('.stub-shortcut-transform') as HTMLButtonElement
         ).click());
@@ -15341,7 +15341,7 @@ describe('stale-view banner', () => {
         // hidden-ness is a property of the *row*, so the edited column has nothing to
         // do with it. Here no dirty cell is in the sorted column — the column test
         // alone says nothing — and there is still unsaved work the user cannot see.
-        await edit_mode_sorted_on_column_0();
+        await session_sorted_on_column_0();
         await report_grid_editing(true, true, [], dirty('0:1'));
         expect(banner()).toBeNull();
 
@@ -15358,7 +15358,7 @@ describe('stale-view banner', () => {
     });
 
     it('pluralizes the hidden-cell sentence as one phrase', async () => {
-        await edit_mode_sorted_on_column_0();
+        await session_sorted_on_column_0();
         await report_grid_editing(true, true, [], dirty('0:1', '1:1'));
 
         await reinstall_with_hidden_cells(['0:1', '1:1']);
@@ -15378,7 +15378,7 @@ describe('stale-view banner', () => {
         // has already thrown away is out of sight. Narrowing to the live map is what
         // makes the sentence answerable at all times rather than only just after an
         // install.
-        await edit_mode_sorted_on_column_0();
+        await session_sorted_on_column_0();
         await report_grid_editing(true, true, [], dirty('0:1', '1:1'));
         await reinstall_with_hidden_cells(['0:1', '1:1']);
         expect(banner()?.textContent)
@@ -15429,7 +15429,7 @@ describe('stale-view banner', () => {
         // is ever asked. Here the install says nothing is hidden, the dirty map never
         // changes, and the only new information is the host's re-answer on the refresh
         // the durable write triggers.
-        await edit_mode_sorted_on_column_0();
+        await session_sorted_on_column_0();
         // Column 1, which the installed sort does not read, so the column half of the
         // signature is silent throughout and only the hidden cells can speak.
         await report_grid_editing(true, true, [], dirty('0:1'));
@@ -15468,7 +15468,7 @@ describe('stale-view banner', () => {
         // precisely so it stays true of a removed row, and the counts differ by design
         // and by unit — cells out of sight here, rows lost there, each stated in its own
         // sentence with its own noun.
-        await edit_mode_sorted_on_column_0();
+        await session_sorted_on_column_0();
         const removed = { '7:1': { value: 'orphan', base: 'gone' } };
         await report_grid_editing(true, true, [], removed);
         await same_basis_refresh(['7:1']);
@@ -15512,7 +15512,7 @@ describe('stale-view banner', () => {
         // the host reads the *durable* map, which can name an entry the user has
         // already discarded, and the intersection still has to run over what a refresh
         // brings in exactly as it does over what an install brings in.
-        await edit_mode_sorted_on_column_0();
+        await session_sorted_on_column_0();
         await report_grid_editing(true, true, [], dirty('0:1'));
 
         await same_basis_refresh(['2:1']);
@@ -15524,7 +15524,7 @@ describe('stale-view banner', () => {
     it('drops the claim entirely when the last hidden edit is discarded', async () => {
         // The end of the same road, and the shape codex named: with nothing else to
         // say, the whole notice goes rather than standing there over an empty claim.
-        await edit_mode_sorted_on_column_0();
+        await session_sorted_on_column_0();
         await report_grid_editing(true, true, [], dirty('0:1'));
         await reinstall_with_hidden_cells(['0:1']);
         expect(banner()).not.toBeNull();
@@ -15538,7 +15538,7 @@ describe('stale-view banner', () => {
     it('says nothing about hidden cells when the count is zero', async () => {
         // The pre-existing reason on its own: an edit in a sorted column, nothing
         // hidden. The sentence must not appear with a count of 0 in it.
-        await edit_mode_sorted_on_column_0();
+        await session_sorted_on_column_0();
         await report_grid_editing(true, true, [], dirty('0:0'));
 
         expect(banner()?.textContent).toContain(BANNER_TEXT);
@@ -15548,7 +15548,7 @@ describe('stale-view banner', () => {
     });
 
     it('reappears after Dismiss when the hidden-cell count changes', async () => {
-        await edit_mode_sorted_on_column_0();
+        await session_sorted_on_column_0();
         await report_grid_editing(true, true, [], dirty('0:1', '1:1'));
         await reinstall_with_hidden_cells(['0:1']);
         expect(banner()).not.toBeNull();
@@ -15569,7 +15569,7 @@ describe('stale-view banner', () => {
         // same view a new fact, or Dismiss would never stick under a hiding filter.
         // Including an echo that names them in another order, which is all
         // `Object.keys` on the host's durable map promises.
-        await edit_mode_sorted_on_column_0();
+        await session_sorted_on_column_0();
         await report_grid_editing(true, true, [], dirty('0:1', '1:1'));
         await reinstall_with_hidden_cells(['0:1', '1:1']);
         await click_button('Dismiss');
@@ -15580,21 +15580,21 @@ describe('stale-view banner', () => {
         expect_no_call_to_action();
     });
 
-    it('goes silent when edit mode ends with the dirty map still reported', async () => {
+    it('goes silent when the session ends with the dirty map still reported', async () => {
         // Probing for holes rather than only mutating the new code found this one: the
-        // `edit_mode` term on the signature was holding up the whole notice and no test
-        // was holding it to account — deleting it failed nothing across the suite.
+        // `editing_session_held` term on the signature was holding up the whole notice
+        // and no test was holding it to account — deleting it failed nothing across the suite.
         //
         // Reachable without a discard: the file becoming uneditable (a truncating
-        // reload, a sibling taking the session) leaves edit mode through
-        // `leave_edit_mode`, which releases the session but keeps the dirty map, so
+        // reload, a sibling taking the session) ends the session through
+        // `end_editing_session`, which releases the session but keeps the dirty map, so
         // GridShell goes on reporting the same edits. The statement is about editing;
         // outside it the order recomputes as normal and there is nothing to say.
         //
         // Same-basis refresh deliberately — a moved basis would replace the record
         // with a natural view and the hidden half would fall silent for that reason
         // instead, which is what makes this pin the gate rather than the record.
-        await edit_mode_sorted_on_column_0();
+        await session_sorted_on_column_0();
         await report_grid_editing(true, true, [], dirty('0:0', '0:1'));
         await reinstall_with_hidden_cells(['0:1']);
         expect(banner()).not.toBeNull();
@@ -15606,7 +15606,7 @@ describe('stale-view banner', () => {
                 sourceGeneration: 1,
                 // Re-asserted, not dropped: a same-basis refresh now hands the record
                 // a fresh answer, and letting this default to empty would silence the
-                // notice through the record and leave the `edit_mode` gate untested
+                // notice through the record and leave the `editing_session_held` gate untested
                 // again — the exact hole this test was written to hold.
                 hiddenEditedCellKeys: [['0:1']],
                 capabilities: { csvEditable: false, csvEditingSupported: true },
@@ -15621,10 +15621,10 @@ describe('stale-view banner', () => {
         ));
         await report_grid_editing(true, true, [], dirty('0:0', '0:1'));
 
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('false');
         // Not vacuous: the record the count came from is still the installed one. The
         // refresh above was same-basis and stayed on generation 2, which is the record
-        // written by the install in `edit_mode_sorted_on_column_0` — a dropped record
+        // written by the install in `session_sorted_on_column_0` — a dropped record
         // would have taken the natural view with it and there would be no count to gate.
         expect(grid_stub().getAttribute('data-generation')).toBe('2');
         expect(banner()).toBeNull();
@@ -15788,7 +15788,7 @@ describe('stale-view banner', () => {
         await report_grid_editing(true, true, [], dirty('0:0'));
         // Deliberately unacknowledged: the record standing here is the snapshot's own,
         // which is the one under test.
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('true');
         // The fabricated record's row count, which is the constant this test exists to
         // hold to account: the sheet's own count, because a record built here says no
         // permutation is in place and therefore shows every row.
@@ -15799,7 +15799,7 @@ describe('stale-view banner', () => {
     });
 
     it('appears when an edit lands in a sorted column', async () => {
-        await edit_mode_sorted_on_column_0();
+        await session_sorted_on_column_0();
         await report_grid_editing(true, true, [], dirty('0:0'));
 
         expect(banner()?.textContent).toContain(BANNER_TEXT);
@@ -15807,7 +15807,7 @@ describe('stale-view banner', () => {
     });
 
     it('disappears when that edit is reverted', async () => {
-        await edit_mode_sorted_on_column_0();
+        await session_sorted_on_column_0();
         await report_grid_editing(true, true, [], dirty('0:0'));
         expect(banner()).not.toBeNull();
 
@@ -15819,7 +15819,7 @@ describe('stale-view banner', () => {
     });
 
     it('stays away for an edit in a column the order does not read', async () => {
-        await edit_mode_sorted_on_column_0();
+        await session_sorted_on_column_0();
         await report_grid_editing(true, true, [], dirty('0:1'));
 
         expect(banner()).toBeNull();
@@ -15827,7 +15827,7 @@ describe('stale-view banner', () => {
     });
 
     it('reappears after Dismiss when a second edit lands in the sorted column', async () => {
-        const post_message = await edit_mode_sorted_on_column_0();
+        const post_message = await session_sorted_on_column_0();
         await report_grid_editing(true, true, [], dirty('0:0'));
         post_message.mockClear();
         await click_button('Dismiss');
@@ -15844,7 +15844,7 @@ describe('stale-view banner', () => {
     });
 
     it('survives an identical same-session hydration', async () => {
-        const post_message = await edit_mode_sorted_on_column_0();
+        const post_message = await session_sorted_on_column_0();
         await report_grid_editing(true, true, [], dirty('0:0'));
         await click_button('Dismiss');
         expect(banner()).toBeNull();
@@ -15881,7 +15881,7 @@ describe('stale-view banner', () => {
     });
 
     it('expires with the session it was pressed in', async () => {
-        // Restored-session route rather than a re-grant: entering edit mode refuses
+        // Restored-session route rather than a re-grant: a fresh grant refuses
         // while a sort is installed, so a *second* session that already has both can
         // only arrive with a document load.
         const { post_message } = await render_app();
@@ -15906,7 +15906,7 @@ describe('stale-view banner', () => {
             ));
             await acknowledge_transform(latest_transform_request(post_message), 2);
             await report_grid_editing(true, true, [], dirty('0:0'));
-            expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+            expect(grid_stub().getAttribute('data-editing-session-held')).toBe('true');
             // The restore installed the stored sort, so each session opens over a
             // permuted view — which is what the banner has something to say about.
             expect(grid_stub().getAttribute('data-generation')).toBe('2');
@@ -15932,7 +15932,7 @@ describe('stale-view banner', () => {
      * the host's record in answer — because the record has to be the host's word for the
      * `permuted` arm to be the real one.
      */
-    async function edit_mode_hiding_row_1(
+    async function session_hiding_row_1(
         hidden: readonly string[],
         edits: Record<string, { value: string; base: string }>,
     ) {
@@ -15980,7 +15980,7 @@ describe('stale-view banner', () => {
         // row and orders nothing, so there is no sort and no enabled filter for the
         // statement to be about. The hidden sentence has to carry the notice alone, and
         // read as a complete statement doing it.
-        await edit_mode_hiding_row_1(['1:1'], dirty('1:1'));
+        await session_hiding_row_1(['1:1'], dirty('1:1'));
 
         expect(banner()?.textContent)
             .toContain('1 edited cell is in a row this view doesn\'t show.');
@@ -15994,7 +15994,7 @@ describe('stale-view banner', () => {
         // The other half of the same gate: with the first sentence conditional, a view
         // that reads no column and hides no unsaved work has nothing to say. Before the
         // change this rendered the sorting sentence over a view with no sort in it.
-        await edit_mode_hiding_row_1([], dirty('0:0', '0:1'));
+        await session_hiding_row_1([], dirty('0:0', '0:1'));
 
         expect(banner()).toBeNull();
         expect_no_call_to_action();
@@ -16002,7 +16002,7 @@ describe('stale-view banner', () => {
 
     it('says both when the order is stale and a cell is out of sight', async () => {
         // Two independent facts, two sentences, one notice — and still nothing to press.
-        await edit_mode_sorted_on_column_0();
+        await session_sorted_on_column_0();
         await report_grid_editing(true, true, [], dirty('0:0', '1:1'));
 
         await reinstall_with_hidden_cells(['1:1']);
@@ -16018,7 +16018,7 @@ describe('stale-view banner', () => {
         // The two reasons occupy their own fields of the signature, so an
         // acknowledgement of one is not an acknowledgement of the other. Dismissed while
         // only the hidden half was speaking; the order half then starts.
-        await edit_mode_sorted_on_column_0();
+        await session_sorted_on_column_0();
         await report_grid_editing(true, true, [], dirty('0:1'));
         await reinstall_with_hidden_cells(['0:1']);
         expect(banner()?.textContent).not.toContain(BANNER_TEXT);
@@ -16036,7 +16036,7 @@ describe('stale-view banner', () => {
     it('does not let a dismissed stale order silence a later hidden cell', async () => {
         // And the other direction, which is the one a single summed signature would
         // break: the count of things said would be unchanged.
-        await edit_mode_sorted_on_column_0();
+        await session_sorted_on_column_0();
         await report_grid_editing(true, true, [], dirty('0:0'));
         expect(banner()?.textContent).toContain(BANNER_TEXT);
         expect(banner()?.textContent).not.toContain('doesn\'t show');
@@ -16356,7 +16356,7 @@ describe('undo and redo, from the keyboard and the desktop menu', () => {
         await dispatch_host_message(initial_snapshot_message(meta, {
             capabilities: { csvEditable: true, csvEditingSupported: true },
         }));
-        await enter_edit_mode(post_message, 'restore-replay-session');
+        await acquire_editing_session(post_message, 'restore-replay-session');
         const props = grid_shell_mock.latest_props as unknown as GridShellProps;
         props.edit_session!.commit('restore-replay-session', '0:0', {
             value: 'edited',
@@ -16445,7 +16445,7 @@ describe('undo and redo, from the keyboard and the desktop menu', () => {
         await dispatch_host_message(initial_snapshot_message(meta, {
             capabilities: { csvEditable: true, csvEditingSupported: true },
         }));
-        await enter_edit_mode(post_message, 'restore-old-session');
+        await acquire_editing_session(post_message, 'restore-old-session');
         const props = grid_shell_mock.latest_props as unknown as GridShellProps;
         const template = { id: 'restored-template', format: { kind: 'none' as const } };
         const row = {
@@ -16512,7 +16512,7 @@ describe('undo and redo, from the keyboard and the desktop menu', () => {
         await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1'], false), {
             capabilities: { csvEditable: true, csvEditingSupported: true },
         }));
-        await enter_edit_mode(post_message, 'validation-old-session');
+        await acquire_editing_session(post_message, 'validation-old-session');
         const props = grid_shell_mock.latest_props as unknown as GridShellProps;
         const removal = {
             appendHistoryId: 'saved-row-id',
@@ -16604,7 +16604,7 @@ describe('undo and redo, from the keyboard and the desktop menu', () => {
         await dispatch_host_message(initial_snapshot_message(meta, {
             capabilities: { csvEditable: true, csvEditingSupported: true },
         }));
-        await enter_edit_mode(post_message, 'saved-edit-session');
+        await acquire_editing_session(post_message, 'saved-edit-session');
         const props = grid_shell_mock.latest_props as unknown as GridShellProps;
         props.edit_session!.commit('saved-edit-session', '0:0', { value: 'edited', base: 'Alice' });
         record_cell_edit(props.history_store!, 'edited', 'Alice');
@@ -16676,7 +16676,7 @@ describe('undo and redo, from the keyboard and the desktop menu', () => {
         await dispatch_host_message(initial_snapshot_message(meta, {
             capabilities: { csvEditable: true, csvEditingSupported: true },
         }));
-        await enter_edit_mode(post_message, 'released-session');
+        await acquire_editing_session(post_message, 'released-session');
         const props = grid_shell_mock.latest_props as unknown as GridShellProps;
         record_cell_edit(props.history_store!, 'edited', 'Alice');
         await release_idle_edit_session();
@@ -16701,7 +16701,7 @@ describe('undo and redo, from the keyboard and the desktop menu', () => {
         await dispatch_host_message(initial_snapshot_message(meta, {
             capabilities: { csvEditable: true, csvEditingSupported: true },
         }));
-        await enter_edit_mode(post_message, 'structural-replay-session');
+        await acquire_editing_session(post_message, 'structural-replay-session');
         const props = grid_shell_mock.latest_props as unknown as GridShellProps;
         const pending_store = props.pending_row_store!;
         const before = pending_store.snapshot();
@@ -16880,7 +16880,7 @@ describe('undo and redo, from the keyboard and the desktop menu', () => {
         await dispatch_host_message(initial_snapshot_message(meta, {
             capabilities: { csvEditable: true, csvEditingSupported: true },
         }));
-        await enter_edit_mode(post_message, 'aggregate-replay-session');
+        await acquire_editing_session(post_message, 'aggregate-replay-session');
         const props = grid_shell_mock.latest_props as unknown as GridShellProps;
         const cell_store = props.edit_session!;
         const pending_store = props.pending_row_store!;
@@ -17041,7 +17041,7 @@ describe('undo and redo, from the keyboard and the desktop menu', () => {
         await dispatch_host_message(initial_snapshot_message(meta, {
             capabilities: { csvEditable: true, csvEditingSupported: true },
         }));
-        await enter_edit_mode(post_message, 'legacy-replay-session');
+        await acquire_editing_session(post_message, 'legacy-replay-session');
         const props = grid_shell_mock.latest_props as unknown as GridShellProps;
         const empty_structural = props.pending_row_store!.snapshot();
         const wire_cells: Record<string, string> = Object.fromEntries(
@@ -17350,7 +17350,7 @@ describe('undo and redo, from the keyboard and the desktop menu', () => {
                 capabilities: { csvEditable: true, csvEditingSupported: true },
             },
         });
-        await enter_edit_mode(post_message);
+        await acquire_editing_session(post_message);
         seed_mounted_store();
 
         await undo_via_menu();
@@ -17394,7 +17394,7 @@ describe('undo and redo, from the keyboard and the desktop menu', () => {
                 capabilities: { csvEditable: true, csvEditingSupported: true },
             },
         });
-        await enter_edit_mode(post_message);
+        await acquire_editing_session(post_message);
         seed_mounted_store();
         // The first sheet's store, which the diverging replay below writes to.
         const first_sheet_store = grid_shell_mock.latest_props!.edit_session as EditSessionStore;
@@ -17666,12 +17666,12 @@ describe('undo and redo, from the keyboard and the desktop menu', () => {
         }
     });
 
-    it('never leaves edit mode, and never releases the session', async () => {
+    it('never drops the held session, and never releases it', async () => {
         const { post_message } = await render_app();
         await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1']), {
             capabilities: { csvEditable: true, csvEditingSupported: true },
         }));
-        await enter_edit_mode(post_message);
+        await acquire_editing_session(post_message);
         await click_button('Highlight');
         await click_button('Clear all highlights');
         const request = sent(post_message, 'clearAllCellHighlights');
@@ -17689,7 +17689,7 @@ describe('undo and redo, from the keyboard and the desktop menu', () => {
         await undo_via_menu();
         await complete_replay(post_message);
 
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('true');
         expect(sent(post_message, 'releaseEditSession')).toBeUndefined();
         expect(sent(post_message, 'discardEditSession')).toBeUndefined();
     });
@@ -18154,7 +18154,7 @@ describe('auto-fit with Pending Columns', () => {
         await dispatch_host_message(initial_snapshot_message(meta, {
             capabilities: { csvEditable: true, csvEditingSupported: true },
         }));
-        await enter_edit_mode(post_message, 'fit-session');
+        await acquire_editing_session(post_message, 'fit-session');
         const store = (grid_shell_mock.latest_props as unknown as GridShellProps).pending_row_store!;
         const before = store.snapshot();
         await act(async () => {
@@ -18192,7 +18192,7 @@ describe('auto-fit with Pending Columns', () => {
             capabilities: { csvEditable: true, csvEditingSupported: true },
         });
         await dispatch_host_message(snapshot);
-        await enter_edit_mode(post_message, 'held-session');
+        await acquire_editing_session(post_message, 'held-session');
         const store = (grid_shell_mock.latest_props as unknown as GridShellProps).pending_row_store!;
         const before = store.snapshot();
         await act(async () => {
@@ -18236,7 +18236,7 @@ describe('auto-fit with Pending Columns', () => {
         const meta = make_meta(['Sheet1'], false);
         const capabilities = { csvEditable: true, csvEditingSupported: true };
         await dispatch_host_message(initial_snapshot_message(meta, { capabilities }));
-        await enter_edit_mode(post_message, 'refit-session');
+        await acquire_editing_session(post_message, 'refit-session');
         const store = (grid_shell_mock.latest_props as unknown as GridShellProps).pending_row_store!;
         const before = store.snapshot();
         await act(async () => {
@@ -18540,7 +18540,7 @@ describe('structural conflict notice counts and the Save summary', () => {
                 },
             },
         }));
-        await enter_edit_mode(post_message, 'padding-session');
+        await acquire_editing_session(post_message, 'padding-session');
         const store = (grid_shell_mock.latest_props as unknown as GridShellProps).pending_row_store!;
         const before = store.snapshot();
         await act(async () => {
@@ -18606,7 +18606,7 @@ describe('rapid structural gestures against refresh echoes', () => {
             structuralEditing: { sheets: [{ rows: { supported: true as const }, columns: { supported: true as const } }] },
         };
         await dispatch_host_message(initial_snapshot_message(meta, { capabilities }));
-        await enter_edit_mode(post_message, 'echo-session');
+        await acquire_editing_session(post_message, 'echo-session');
         const store = (grid_shell_mock.latest_props as unknown as GridShellProps).pending_row_store!;
         const { pending_changes_durability } = await import('../webview/host-bridge');
         const publications = () => post_message.mock.calls
@@ -18661,7 +18661,7 @@ describe('rapid structural gestures against refresh echoes', () => {
             structuralEditing: { sheets: [{ rows: { supported: true as const }, columns: { supported: true as const } }] },
         };
         await dispatch_host_message(initial_snapshot_message(meta, { capabilities }));
-        await enter_edit_mode(post_message, 'slow-session');
+        await acquire_editing_session(post_message, 'slow-session');
         const store = (grid_shell_mock.latest_props as unknown as GridShellProps).pending_row_store!;
         const { pending_changes_durability } = await import('../webview/host-bridge');
         // Distinct row orders, in lexicographic order after the identity.
@@ -18716,7 +18716,7 @@ describe('rapid structural gestures against refresh echoes', () => {
         await dispatch_host_message(initial_snapshot_message(meta, {
             capabilities: { csvEditable: true, csvEditingSupported: true },
         }));
-        await enter_edit_mode(post_message, 'stalled-session');
+        await acquire_editing_session(post_message, 'stalled-session');
         const { pending_changes_durability, MAX_UNACKNOWLEDGED_STRUCTURAL_PUBLICATIONS } =
             await import('../webview/host-bridge');
         const admitted = () => (grid_shell_mock.latest_props as unknown as GridShellProps).gestures_admitted!();
@@ -18760,7 +18760,7 @@ describe('rapid structural gestures against refresh echoes', () => {
             structuralEditing: { sheets: [{ rows: { supported: true as const }, columns: { supported: true as const } }] },
         };
         await dispatch_host_message(initial_snapshot_message(meta, { capabilities }));
-        await enter_edit_mode(post_message, 'settle-session');
+        await acquire_editing_session(post_message, 'settle-session');
         const store = (grid_shell_mock.latest_props as unknown as GridShellProps).pending_row_store!;
         const { pending_changes_durability } = await import('../webview/host-bridge');
         const cell_store = (grid_shell_mock.latest_props as unknown as GridShellProps).edit_session!;
