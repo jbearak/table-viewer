@@ -321,6 +321,7 @@ import {
 } from './history-replay-protocol';
 import { resolve_replay_display_focus } from './history-replay-focus-model';
 import { create_history_replay_lease_registry } from './history-replay-lease-model';
+import { FileSettleTracker, type FileSettleSample } from './file-settle';
 import {
     pending_edits_with_replay_writes,
     prepared_content_unchanged,
@@ -3181,6 +3182,9 @@ export function attach_viewer(
     // loaded; reopening the file returns to the configured limit.
     let load_all_csv_rows = false;
     let reload_retry_timer: ReturnType<typeof setTimeout> | undefined;
+    // Whether the file a local refresh failed on is still being written; one
+    // per local load, reset with its retry budget.
+    let local_refresh_settle: FileSettleTracker | undefined;
     let refresh_retry_wait: {
         timer: ReturnType<typeof setTimeout>;
         resolve: (proceed: boolean) => void;
@@ -9332,7 +9336,10 @@ export function attach_viewer(
         wait.resolve(false);
     }
 
-    function wait_for_refresh_retry(request: PanelLoadRequest): Promise<boolean> {
+    function wait_for_refresh_retry(
+        request: PanelLoadRequest,
+        delay_ms = RELOAD_RETRY_MS,
+    ): Promise<boolean> {
         if (!load_is_current(request.seq, request.refreshEvent)) {
             return Promise.resolve(false);
         }
@@ -9345,7 +9352,7 @@ export function attach_viewer(
             wait.timer = setTimeout(() => {
                 if (refresh_retry_wait === wait) refresh_retry_wait = undefined;
                 resolve(load_is_current(request.seq, request.refreshEvent));
-            }, RELOAD_RETRY_MS);
+            }, delay_ms);
             refresh_retry_wait = wait;
         });
     }
@@ -9426,6 +9433,20 @@ export function attach_viewer(
         return new Error('The original version changed while the comparison was being refreshed.');
     }
 
+    /** A stat of the file for `FileSettleTracker`, taken after a failed read. */
+    async function file_settle_sample(): Promise<FileSettleSample | undefined> {
+        try {
+            const stat = await host.fs.stat(uri);
+            return { size: stat.size, mtime: stat.mtime };
+        } catch (error) {
+            return is_file_not_found_error(error) ? 'absent' : undefined;
+        }
+    }
+
+    function new_file_settle_tracker(): FileSettleTracker {
+        return new FileSettleTracker({ min_retry_ms: RELOAD_RETRY_MS });
+    }
+
     async function run_physical_refresh(
         request: PanelLoadRequest,
         force: boolean,
@@ -9436,12 +9457,16 @@ export function attach_viewer(
         let include_compare_original = true;
         let comparison_fallback_error: Error | undefined;
         let last_error: unknown = new Error('The file changed while it was being refreshed.');
+        const settle = new_file_settle_tracker();
         for (;;) {
             if (!load_is_current(request.seq, request.refreshEvent)) {
                 return inactive_refresh_result();
             }
             let candidate: SourceCandidate | undefined;
             let comparison_stale = false;
+            // Set when the attempt failed in a way a half-written file causes:
+            // an unreadable read, or the file changing under the read.
+            let file_failure = false;
             try {
                 const expected_authority = file_coordinator.authority().authorityRevision;
                 const build = await build_source_with_file_size_decision(
@@ -9465,6 +9490,7 @@ export function attach_viewer(
                         return inactive_refresh_result();
                     }
                     comparison_stale = currency === 'comparison-stale';
+                    file_failure = !comparison_stale;
                     last_error = comparison_stale
                         ? unstable_comparison_error()
                         : new Error('The file changed while it was being refreshed.');
@@ -9559,8 +9585,24 @@ export function attach_viewer(
                     return { type: 'completed' };
                 }
                 last_error = error;
+                file_failure = true;
             } finally {
                 dispose_unadopted_candidate(candidate);
+            }
+            if (file_failure) {
+                // A file another program is still writing is waited on, not
+                // charged to the retry budget: its writer's last byte, not a
+                // retry count, decides when a read can succeed.
+                const verdict = settle.after_failure(await file_settle_sample());
+                if (!load_is_current(request.seq, request.refreshEvent)) {
+                    return inactive_refresh_result();
+                }
+                if (verdict.type === 'unsettled') {
+                    if (!await wait_for_refresh_retry(request, verdict.retry_in_ms)) {
+                        return inactive_refresh_result();
+                    }
+                    continue;
+                }
             }
             if (attempts >= RELOAD_RETRY_COUNT) {
                 if (!load_is_current(request.seq, request.refreshEvent)) {
@@ -9607,13 +9649,21 @@ export function attach_viewer(
             candidate = build.candidate;
             const currency = await built_source_currency(request.seq, candidate);
             if (currency !== 'current') {
-                const retry_scheduled = schedule_local_refresh_retry(
-                    request,
-                    force,
-                    reason,
-                    initial,
-                    include_compare_original,
-                );
+                const retry_scheduled = currency === 'comparison-stale'
+                    ? schedule_local_refresh_retry(
+                        request,
+                        force,
+                        reason,
+                        initial,
+                        include_compare_original,
+                    )
+                    : await schedule_local_refresh_retry_after_file_failure(
+                        request,
+                        force,
+                        reason,
+                        initial,
+                        include_compare_original,
+                    );
                 if (!retry_scheduled && load_is_current(request.seq)) {
                     if (currency === 'comparison-stale' && include_compare_original) {
                         reset_reload_retry();
@@ -9715,7 +9765,7 @@ export function attach_viewer(
         } catch (error) {
             if (!load_is_current(request.seq)) return false;
             if (error instanceof AlignmentCancelledError) return false;
-            if (!schedule_local_refresh_retry(
+            if (!await schedule_local_refresh_retry_after_file_failure(
                 request,
                 force,
                 reason,
@@ -9777,10 +9827,49 @@ export function attach_viewer(
 
     function reset_reload_retry(): void {
         reload_retry_attempts = 0;
+        local_refresh_settle = undefined;
         if (reload_retry_timer !== undefined) {
             clearTimeout(reload_retry_timer);
             reload_retry_timer = undefined;
         }
+    }
+
+    /**
+     * `schedule_local_refresh_retry` for a failure a half-written file causes.
+     * While the file is still changing, the retry waits for it to go quiet
+     * and is not charged to the budget. False only when the caller should
+     * report the failure.
+     */
+    async function schedule_local_refresh_retry_after_file_failure(
+        request: PanelLoadRequest,
+        force: boolean,
+        reason: 'ready' | 'fileReload' | 'recovery',
+        initial: boolean,
+        include_compare_original: boolean,
+    ): Promise<boolean> {
+        const sample = await file_settle_sample();
+        // A newer load owns the file now; there is nothing to report.
+        if (!load_is_current(request.seq)) return true;
+        local_refresh_settle ??= new_file_settle_tracker();
+        const verdict = local_refresh_settle.after_failure(sample);
+        if (verdict.type === 'settled') {
+            return schedule_local_refresh_retry(
+                request,
+                force,
+                reason,
+                initial,
+                include_compare_original,
+            );
+        }
+        start_local_refresh_retry_timer(
+            request,
+            force,
+            reason,
+            initial,
+            include_compare_original,
+            verdict.retry_in_ms,
+        );
+        return true;
     }
 
     function schedule_local_refresh_retry(
@@ -9797,6 +9886,25 @@ export function attach_viewer(
             return false;
         }
         reload_retry_attempts += 1;
+        start_local_refresh_retry_timer(
+            request,
+            force,
+            reason,
+            initial,
+            include_compare_original,
+            RELOAD_RETRY_MS,
+        );
+        return true;
+    }
+
+    function start_local_refresh_retry_timer(
+        request: PanelLoadRequest,
+        force: boolean,
+        reason: 'ready' | 'fileReload' | 'recovery',
+        initial: boolean,
+        include_compare_original: boolean,
+        delay_ms: number,
+    ): void {
         if (reload_retry_timer !== undefined) clearTimeout(reload_retry_timer);
         reload_retry_timer = setTimeout(() => {
             reload_retry_timer = undefined;
@@ -9811,8 +9919,7 @@ export function attach_viewer(
                     log_sanitized_failure('Failed to retry table viewer refresh', error);
                 });
             }
-        }, RELOAD_RETRY_MS);
-        return true;
+        }, delay_ms);
     }
 
     function wait_for_ready_state_retry(ms: number): Promise<boolean> {

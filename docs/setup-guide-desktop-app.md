@@ -86,7 +86,7 @@ This is the part Table Viewer is chiefly meant to make less annoying.
 4. Leave the workbook open in Table Viewer.
 5. Make a copy of [the revised workbook](https://github.com/jbearak/table-viewer/raw/refs/heads/main/docs/examples/garden-cafe-revised.xlsx), rename that copy to `garden-cafe-working.xlsx`, and use it to replace the existing working file in the same folder.
 
-Table Viewer should refresh automatically. The data will change, while your compatible viewing choices remain in place. The important detail is that the revised workbook replaces the file at the same path; opening it under a different filename creates a separate saved view.
+Table Viewer should refresh automatically. The data will change, while your compatible viewing choices remain in place. If the copy is slow, say to a network drive, Table Viewer waits for it to finish rather than reporting the half-copied workbook as unreadable. The important detail is that the revised workbook replaces the file at the same path; opening it under a different filename creates a separate saved view.
 
 You can repeat the replacement while keeping the file open—handy when a script in R, Stata, or Python regenerates the same output file.
 
