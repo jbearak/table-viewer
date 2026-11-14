@@ -94,12 +94,15 @@ Hover over **Save**, or move keyboard focus to it, to see what it will do, such 
 
 An insert, delete, or move needs no notice: the tints show it. A notice appears under the grid, without anything to click, only when Save will do something the grid can't show:
 
-- Formulas will show `#REF!` because they use a row or column you deleted:
+- Formulas will show `#REF!` because they use a row or column you deleted. The notice also counts the formulas that use their results, on any sheet, since those break too. A total that sums the broken cells shows `#REF!` as well:
 
   ```text
   2 formulas use column Price, which you deleted. After you save, they will show #REF!.
+  1 more formula uses their results and will show #REF! too.
   Restore the column, or undo, to keep them working.
   ```
+
+  Table Viewer calculates only arithmetic, `SUM`, and `AVERAGE`. A formula that uses a broken result through another function, such as `ROUND`, is counted separately: it might show an error and might not. A formula that catches errors, such as `IFERROR` or `ISERROR`, isn't counted.
 
 - A move or delete changed a formula's range in a way Excel might not. Table Viewer adjusts a range from the final arrangement of rows and columns, while Excel adjusts it one change at a time, so moving the first or last row of a range, or inserting next to a deleted one, can give a different range:
 
@@ -111,7 +114,7 @@ An insert, delete, or move needs no notice: the tints show it. A notice appears 
 
 - Save will refuse the change, for example because a rule would split into too many rules or a formula can't be adjusted.
 
-Each notice lists the formulas as Save will write them, with what they were before, and **Go to cell**. A list of more than three formulas starts collapsed behind **Show N formulas**. **Dismiss** hides a warning until what it says changes. A notice that explains why Save is refused can't be dismissed.
+Each notice lists the formulas as Save will write them, with what they were before, and **Go to cell**. Formulas listed because they use a broken one are marked "Uses a #REF! result" or "Might show an error". A list of more than three formulas starts collapsed behind **Show N formulas**. **Dismiss** hides a warning until what it says changes. A notice that explains why Save is refused can't be dismissed.
 
 The notice sits under the grid, so it never moves the row you are pointing at.
 
@@ -147,7 +150,7 @@ Both actions keep your edits to existing cells and your appended rows, and both 
 
 ## `.xlsx` workbooks
 
-While row or column changes are unsaved, Table Viewer recalculates the formulas it can. A cell whose result changes shows the old value struck through beside the new one, such as `24 → 34` for a total that gained a row. Formulas whose results stay the same look as they did. A formula that referred to a row or column you deleted shows `?? (invalid reference)`, and Save writes `#REF!` in its place, as Excel does. A notice under the grid counts these formulas before you save. Restore the row or column, or undo, to get the formula back.
+While row or column changes are unsaved, Table Viewer recalculates the formulas it can. A cell whose result changes shows the old value struck through beside the new one, such as `24 → 34` for a total that gained a row. Formulas whose results stay the same look as they did. A formula that referred to a row or column you deleted shows `?? (invalid reference)`, and Save writes `#REF!` in its place, as Excel does. A formula that uses such a result, like a total over those cells, shows `?? (invalid reference)` too. A notice under the grid counts all of these before you save, including ones on other sheets. Restore the row or column, or undo, to get the formula back.
 
 A range's first and last rows move with their rows, and so do its first and last columns. If `B7` is `=SUM(B2:B5)` and you move row 5 above row 3, the range ends where row 5 now is: `=SUM(B2:B3)`, and the rows that were rows 3 and 4 drop out of the total. The same happens to formulas on other sheets that refer to the range. Excel moves the end of a range the same way when you cut that cell; LibreOffice keeps the range as it was. Because spreadsheet programs disagree here, a notice under the grid lists every formula whose range has a first or last row or column that a move carried, as Save will write it and as it was, with **Go to cell** (see [Before you save](#before-you-save)). Check those before you save.
 

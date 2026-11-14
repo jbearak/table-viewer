@@ -8,7 +8,8 @@
  * - Save is refused: the file changed under a worksheet's layout, the
  *   worksheet can't be restructured, pending rows no longer fit, a rule
  *   would split past the writer's cap, or a formula can't be adjusted;
- * - formulas will show `#REF!` because a row or column they use was deleted;
+ * - formulas will show `#REF!` because a row or column they use was deleted,
+ *   and the formulas that use their results will show errors too;
  * - formulas whose range a move or delete changed in a way Excel might not.
  *
  * A pure function of its input: the workbook's pending structure as the
@@ -41,6 +42,7 @@ import {
 } from '../worksheet-layout';
 import type {
     FormulaDeletedItem,
+    FormulaDependentResult,
     FormulaDivergenceClass,
     FormulaDivergenceItem,
     FormulaDivergenceReview,
@@ -507,13 +509,48 @@ function deleted_thing_words(
     return `rows and columns you deleted${where}`;
 }
 
+/** Why a formula that uses a broken one is listed. */
+const DEPENDENT_NOTES: Readonly<Record<FormulaDependentResult, string>> = Object.freeze({
+    ref: 'Uses a #REF! result',
+    unchecked: 'Might show an error',
+});
+
+/**
+ * The formulas that use the broken ones' results, after the first sentence:
+ * "2 more formulas use their results and will show #REF! too." and "Table
+ * Viewer can't calculate 1 more formula that uses their results, so it might
+ * show an error too."
+ */
+function dependent_sentences(direct: number, ref: number, unchecked: number): string[] {
+    const results = direct === 1 ? 'its result' : 'their results';
+    const sentences: string[] = [];
+    if (ref > 0) {
+        sentences.push(`${count(ref, 'more formula uses', 'more formulas use')} ${results} and will show #REF! too.`);
+    }
+    if (unchecked > 0) {
+        sentences.push(`Table Viewer can't calculate ${count(unchecked, 'more formula that uses', 'more formulas that use')} `
+            + `${results}, so ${unchecked === 1 ? 'it might show an error' : 'they might show errors'} too.`);
+    }
+    return sentences;
+}
+
 function deleted_references_notice(input: PendingChangeNoticeInput): PendingChangeNotice | undefined {
     const review = input.formulaReview?.review;
     if (review === undefined || review === null || review.deleted.length === 0) return undefined;
     const groups = unique_cells(review.deleted);
-    const entries = groups.map((group) => formula_entry(input, group[0]!));
-    // The host's total counts every formula cell, past its item cap too.
-    const total = Math.max(groups.length, review.totals.deleted);
+    const dependents = review.dependents;
+    const entries = [
+        ...groups.map((group) => formula_entry(input, group[0]!)),
+        ...dependents.map((item) => formula_entry(input, item, DEPENDENT_NOTES[item.result])),
+    ];
+    // The host's totals count every formula cell, past its item cap too.
+    const direct = Math.max(groups.length, review.totals.deleted);
+    const ref = Math.max(dependents.filter((item) => item.result === 'ref').length, review.totals.refDependents);
+    const unchecked = Math.max(
+        dependents.filter((item) => item.result === 'unchecked').length,
+        review.totals.uncheckedDependents,
+    );
+    const total = direct + ref + unchecked;
     const distinct = (pick: (item: FormulaDeletedItem) => readonly unknown[]) => new Set(review.deleted.flatMap((item) =>
         pick(item).map((identity) => `${item.targetSheetIndex}:${JSON.stringify(identity)}`))).size;
     const rows = distinct((item) => item.rows);
@@ -523,8 +560,9 @@ function deleted_references_notice(input: PendingChangeNoticeInput): PendingChan
         : columns > 0 ? (columns === 1 ? 'column' : 'columns') : (rows === 1 ? 'row' : 'rows');
     const pronoun = total === 1 ? 'it' : 'them';
     const sentences = [
-        `${count(total, 'formula uses', 'formulas use')} ${deleted_thing_words(input, review.deleted)}. `
-            + `After you save, ${total === 1 ? 'it' : 'they'} will show #REF!.`,
+        `${count(direct, 'formula uses', 'formulas use')} ${deleted_thing_words(input, review.deleted)}. `
+            + `After you save, ${direct === 1 ? 'it' : 'they'} will show #REF!.`,
+        ...dependent_sentences(direct, ref, unchecked),
         `Restore the ${restore}, or undo, to keep ${pronoun} working.`,
     ];
     const deleted = [...new Set(review.deleted.flatMap((item) => [
