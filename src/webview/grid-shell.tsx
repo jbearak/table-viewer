@@ -1897,7 +1897,8 @@ export function GridShell({
         y: number;
         row: number;
         display_col: number;
-        source_col: number;
+        /** Undefined for a cell in a Pending Column. */
+        source_col: number | undefined;
     } | {
         kind: 'header';
         x: number;
@@ -10610,8 +10611,6 @@ export function GridShell({
                 select_rect(anchor, anchor_range);
             }
 
-            const source_column = source_column_for_display(anchor_col);
-            if (source_column === undefined) return;
             hide_cell_tooltip();
             set_context_menu({
                 kind: 'cell',
@@ -10619,7 +10618,7 @@ export function GridShell({
                 y: event.bounds.y + event.localEventY,
                 row: anchor_row,
                 display_col: anchor_col,
-                source_col: source_column,
+                source_col: source_column_for_display(anchor_col),
             });
         },
         [hide_cell_tooltip, merges, row_markers, select_rect, source_column_for_display],
@@ -11293,16 +11292,21 @@ export function GridShell({
             ? undefined
             : column_structure_actions(cell_menu_structure.columns, display_col);
         // Columns the selection spans; hide targets all of them (falls back to
-        // the clicked column when the selection maps to nothing usable).
-        const selected_column_sources = selected_display_columns(
+        // the clicked column when the selection maps to nothing usable). A
+        // Pending Column has no source column to hide until it is saved.
+        const selected_column_displays = selected_display_columns(
             grid_selection,
             display_column_count,
-        )
+        );
+        const selected_column_sources = selected_column_displays
             .map(source_column_for_display)
             .filter((column): column is number => column !== undefined);
         const hide_column_targets = selected_column_sources.length > 0
             ? selected_column_sources
-            : [source_col];
+            : source_col === undefined ? [] : [source_col];
+        const hide_spans_pending_column = (
+            selected_column_displays.length > 0 ? selected_column_displays : [display_col]
+        ).some((display) => source_column_for_display(display) === undefined);
         const selected_row_count = selected_rows?.reduce(
             (total, interval) => total + interval.end - interval.start + 1,
             0,
@@ -11371,11 +11375,12 @@ export function GridShell({
             : menu_projected_row === undefined
                 ? get_source_row(row)
                 : undefined;
-        const menu_dirty_key = menu_source_row === undefined
+        const menu_dirty_key = menu_source_row === undefined || source_col === undefined
             ? undefined
             : cell_key(menu_source_row, source_col);
-        const pending_menu_cell = menu_projected_row?.kind === 'pending'
-            || menu_projected_row?.kind === 'replacement'
+        const pending_menu_cell = source_col !== undefined
+            && (menu_projected_row?.kind === 'pending'
+                || menu_projected_row?.kind === 'replacement')
             ? menu_projected_row.row.cells[source_col]
             : undefined;
         const menu_row_identity: RowIdentity | undefined = pending_menu_cell !== undefined
@@ -11385,7 +11390,9 @@ export function GridShell({
             : menu_source_row === undefined
                 ? undefined
                 : { kind: 'source', sourceRow: menu_source_row };
-        const discard_edit_cell_count = menu_row_identity === undefined
+        // Edits in a Pending Column belong to the column; only source columns
+        // carry a cell edit to discard.
+        const discard_edit_cell_count = menu_row_identity === undefined || source_col === undefined
             ? 0
             : plan_pending_move_discard(
                 dirty_cells,
@@ -11399,6 +11406,7 @@ export function GridShell({
         // the commit path needs to have a durable key.
         const may_edit_hyperlink = editable_cells
             && edit_syntax === 'markdown'
+            && source_col !== undefined
             && menu_projected_row?.kind !== 'removal'
             && (menu_source_row !== undefined
                 || menu_projected_row?.kind === 'pending'
@@ -11442,6 +11450,9 @@ export function GridShell({
             ...(inserted_rows_lock ? { hide_rows_disabled_reason: INSERTED_ROWS_TRANSFORM_MESSAGE } : {}),
             selected_row_count,
             selected_column_count: hide_column_targets.length,
+            ...(hide_spans_pending_column
+                ? { hide_columns_disabled_reason: PENDING_COLUMN_HIDE_MESSAGE }
+                : {}),
             can_clear_highlight: pending_selection_has_highlight
                 || highlight_selection_may_have_renderable_highlight(
                     highlight_selection,
@@ -11461,7 +11472,9 @@ export function GridShell({
                     },
                 ),
             highlight_cell_count,
-            on_discard_edit: () => discard_edit(row, display_col, source_col),
+            on_discard_edit: () => {
+                if (source_col !== undefined) discard_edit(row, display_col, source_col);
+            },
             on_copy_cell: () => copy_rect({
                 x: display_col,
                 y: row,
@@ -11473,7 +11486,8 @@ export function GridShell({
                     copy_source_selection({
                         y: 0,
                         height: row_count,
-                        source_columns: selected_column_sources,
+                        source_columns: selected_column_displays
+                            .map((display) => copy_columns[display]!),
                     }, true);
                 } else if (has_explicit_row_selection) {
                     if (selected_rows) copy_display_rows(selected_rows);

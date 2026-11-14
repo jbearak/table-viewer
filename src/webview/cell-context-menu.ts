@@ -26,6 +26,8 @@ export interface CellContextMenuModelProps {
     hide_rows_disabled_reason?: string;
     selected_row_count: number;
     selected_column_count: number;
+    /** Why "Hide column(s)" is disabled: the columns include a Pending Column. */
+    hide_columns_disabled_reason?: string;
     can_clear_highlight: boolean;
     highlight_cell_count: number;
     /** Set when the cell carries a valid external hyperlink. */
@@ -136,9 +138,10 @@ export function cell_context_menu_items(props: CellContextMenuModelProps): MenuI
             props.hide_rows_disabled_reason,
         ));
     }
-    hide_items.push(
-        hide_columns_menu_item(props.selected_column_count, props.on_hide_columns),
-    );
+    const hide_columns = hide_columns_menu_item(props.selected_column_count, props.on_hide_columns);
+    hide_items.push(props.hide_columns_disabled_reason === undefined
+        ? hide_columns
+        : { ...hide_columns, disabled: true, disabled_reason: props.hide_columns_disabled_reason });
     const { row_structure, column_structure } = props;
     const insert_items: MenuItem[] = [
         ...(row_structure === undefined ? [] : [

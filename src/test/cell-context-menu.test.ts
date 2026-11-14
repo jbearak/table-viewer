@@ -131,6 +131,16 @@ describe('cell context menu model', () => {
         expect(action(submenu(items, 'Hide'), 'Hide row').disabled).toBe(true);
     });
 
+    it('keeps Hide column visible but disabled, with its reason, on a Pending Column', () => {
+        const items = cell_context_menu_items({
+            ...base(),
+            hide_columns_disabled_reason: 'Save the new column to hide it.',
+        });
+        const hide = action(submenu(items, 'Hide'), 'Hide column');
+        expect(hide.disabled).toBe(true);
+        expect(hide.disabled_reason).toBe('Save the new column to hide it.');
+    });
+
     it('wires submenu callbacks', () => {
         const props = { ...base() };
         const items = cell_context_menu_items(props);
