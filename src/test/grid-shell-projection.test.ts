@@ -5445,6 +5445,155 @@ describe('GridShell link-only edits', () => {
         expect(widths[1]).toBe('0.123456789'.length * 7 + 16);
     });
 
+    /** A 7-px-per-character canvas, a 2-column sheet with `b` loaded, and its auto-fit. */
+    const render_auto_fit = async (overrides: Partial<GridShellProps>) => {
+        const canvas_context = vi.spyOn(HTMLCanvasElement.prototype, 'getContext')
+            .mockReturnValue({
+                font: '',
+                measureText: (text: string) => ({ width: text.length * 7 }),
+            } as unknown as CanvasRenderingContext2D);
+        onTestFinished(() => canvas_context.mockRestore());
+        grid_mock.get_row.mockImplementation(() => [
+            { raw: 'b', formatted: 'b', bold: false, italic: false },
+            { raw: 'b', formatted: 'b', bold: false, italic: false },
+        ] as any);
+        const auto_fit_ref: { current: (() => Record<number, number> | null) | null } = { current: null };
+        await render_grid(props({
+            show_formatting: true,
+            editing_session_held: true,
+            csv_editable: true,
+            edit_session_id: 'session',
+            sheet_meta: { ...props().sheet_meta, columnCount: 2, rowCount: 2, sourceRowCount: 2 },
+            row_count: 2,
+            column_projection: { visible_to_source: [0, 1], source_to_visible: [0, 1], hidden_count: 0 },
+            auto_fit_ref,
+            ...overrides,
+        }));
+        return auto_fit_ref;
+    };
+    const painted_text = (column: number, row: number) => {
+        const content = (grid_mock.props!.getCellContent as (cell: [number, number]) => {
+            displayData?: string;
+            data?: string | { lines: Array<Array<{ text: string }>> };
+        })([column, row]);
+        return typeof content.data === 'object'
+            ? content.data.lines.flat().map((part) => part.text).join('')
+            : content.displayData;
+    };
+
+    it('auto-fits a source column by what a Pending Appended Row paints: a formula result, a number through General', async () => {
+        grid_mock.sampled_row_count = 2;
+        const pending = create_pending_row_store({ session_id: 'session' });
+        pending.append_rows('session', ['appended'], {
+            id: 'xlsx-template',
+            format: { kind: 'xlsx', templateSourceRow: 0, styleFingerprint: 'style', cellStyleIndexes: [null, null] },
+        }, 1);
+        pending.set_cell('session', 'appended', 0, { value: '=19/9' });
+        pending.set_cell('session', 'appended', 1, { value: '1000000000000000' });
+        const auto_fit_ref = await render_auto_fit({
+            edit_syntax: 'markdown',
+            pending_row_store: pending,
+            // The appended row is prospective row 2.
+            formula_results: new Map([['2:0', '2.11111111111111']]),
+        });
+        expect(painted_text(0, 2)).toBe('2.111111111');
+        expect(painted_text(1, 2)).toBe('1E+15');
+        const widths = auto_fit_ref.current!()!;
+        expect(widths[0]).toBe('2.111111111'.length * 7 + 16);
+        expect(widths[1]).toBe('1E+15'.length * 7 + 16);
+    });
+
+    it('keeps a Pending Appended Row wrapping while a toolbar fit is active', async () => {
+        grid_mock.sampled_row_count = 2;
+        const pending = create_pending_row_store({ session_id: 'session' });
+        pending.append_rows('session', ['appended'], {
+            id: 'xlsx-template',
+            format: { kind: 'xlsx', templateSourceRow: 0, styleFingerprint: 'style', cellStyleIndexes: [null, null] },
+        }, 1);
+        pending.set_cell('session', 'appended', 1, { value: 'a value longer than the fit ceiling allows' });
+        await render_auto_fit({
+            edit_syntax: 'markdown',
+            pending_row_store: pending,
+            auto_fit_active: true,
+            column_widths: { 1: MAX_AUTO_FIT_COLUMN_WIDTH_PX },
+        });
+
+        // The fit's width ceiling can leave a long value wider than its column;
+        // it wraps, as a loaded row's does, rather than clipping until Save.
+        const get_cell_content = grid_mock.props!.getCellContent as
+            (cell: [number, number]) => { allowWrapping?: boolean };
+        expect(get_cell_content([1, 2]).allowWrapping).toBe(true);
+    });
+
+    it('auto-fits a source column by what a Pending Inserted Row paints', async () => {
+        grid_mock.sampled_row_count = 2;
+        const pending = create_pending_row_store({ session_id: 'session' });
+        expect(pending.install({ session_id: 'session' }, {
+            ...EMPTY_PENDING_STRUCTURAL_CHANGES,
+            formatTemplates: [{ id: 'plain', format: { kind: 'none' } }],
+            appendedRows: [{
+                id: 'inserted',
+                origin: 'insert',
+                cells: { 1: { value: 'a long inserted value' } },
+                formatTemplateId: 'plain',
+                createdOrder: 1,
+            }],
+            rowLayout: {
+                runs: [
+                    { kind: 'source', start: 0, count: 1 },
+                    { kind: 'pending', ids: ['inserted'] },
+                    { kind: 'source', start: 1, count: 1 },
+                ],
+                removedSourceRows: [],
+                discardedPendingRows: [],
+            },
+        })).toBe(true);
+        const auto_fit_ref = await render_auto_fit({ pending_row_store: pending });
+        expect(painted_text(1, 1)).toBe('a long inserted value');
+        const widths = auto_fit_ref.current!()!;
+        expect(widths[0]).toBe(40);
+        expect(widths[1]).toBe('a long inserted value'.length * 7 + 16);
+    });
+
+    it('auto-fits with no loaded rows, by the Pending Rows alone', async () => {
+        const pending = create_pending_row_store({ session_id: 'session' });
+        pending.append_rows('session', ['appended'], { id: 'plain', format: { kind: 'none' } }, 1);
+        pending.set_cell('session', 'appended', 0, { value: 'only row' });
+        const auto_fit_ref = await render_auto_fit({ pending_row_store: pending });
+        expect(auto_fit_ref.current!()![0]).toBe('only row'.length * 7 + 16);
+    });
+
+    it('measures at most as many Pending Rows as loaded rows, spread across them', async () => {
+        const measured: string[] = [];
+        const canvas_context = vi.spyOn(HTMLCanvasElement.prototype, 'getContext')
+            .mockReturnValue({
+                font: '',
+                measureText: (text: string) => {
+                    measured.push(text);
+                    return { width: text.length * 7 };
+                },
+            } as unknown as CanvasRenderingContext2D);
+        onTestFinished(() => canvas_context.mockRestore());
+        // 5,000 rows: every third is measured, the last among them.
+        const ids = Array.from({ length: 5_000 }, (_, index) => `row-${index}`);
+        const pending = create_pending_row_store({ session_id: 'session' });
+        pending.append_rows('session', ids, { id: 'plain', format: { kind: 'none' } }, 1);
+        ids.forEach((id, index) => pending.set_cell('session', id, 0, {
+            value: index === 4_998 ? 'the widest value' : 'x',
+        }));
+        const auto_fit_ref: { current: (() => Record<number, number> | null) | null } = { current: null };
+        await render_grid(props({
+            editing_session_held: true,
+            csv_editable: true,
+            edit_session_id: 'session',
+            pending_row_store: pending,
+            auto_fit_ref,
+        }));
+        measured.length = 0;
+        expect(auto_fit_ref.current!()![0]).toBe('the widest value'.length * 7 + 16);
+        expect(measured).toHaveLength(Math.ceil(5_000 / 3));
+    }, 60_000);
+
     it('does not invalidate formulas for a hyperlink-only edit', async () => {
         grid_mock.get_row.mockImplementation(() => [{
             raw: '2', formatted: '2', bold: false, italic: false,
