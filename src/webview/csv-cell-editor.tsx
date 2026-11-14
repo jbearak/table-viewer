@@ -3,7 +3,9 @@ import { GridCellKind, type GridCell } from './glide-data-grid';
 import {
     editor_key_intent,
     insert_newline,
+    replay_editor_keys,
     type EditorCommitNavigation,
+    type EditorKeyEvent,
 } from './csv-cell-editor-model';
 import { count_lines, has_line_break } from './line-breaks';
 import type { RichCellData } from './rich-text-layout';
@@ -27,7 +29,15 @@ export interface CsvCellEditorProps {
      * could open.
      */
     commitRef?: React.MutableRefObject<((navigation: EditorCommitNavigation) => void) | null>;
+    /**
+     * Keys typed for this editor before it could open. It opens as if they
+     * had been typed into it.
+     */
+    heldKeys?: readonly EditorKeyEvent[];
 }
+
+// Chromium leaves the caret alone on Up and Down in a single line on Windows.
+const WINDOWS = typeof navigator !== 'undefined' && /^Win/.test(navigator.platform);
 
 function cell_text(cell: GridCell): string {
     if (cell.kind === GridCellKind.Text) return cell.data ?? '';
@@ -63,14 +73,18 @@ export function CsvCellEditor({
     onCommitNavigation,
     initialValue,
     commitRef,
+    heldKeys,
 }: CsvCellEditorProps): React.JSX.Element {
     // Glide rewrites built-in Text cells with the type-to-edit seed before it
     // opens the overlay, but Custom cells are passed through unchanged. Rich
     // Markdown cells use Custom so the canvas can keep painting their runs;
     // prefer the explicit seed for both kinds to give them identical behavior.
     const initial = initialValue ?? cell_text(value);
-    const [text, set_text] = useState(initial);
-    const [is_multiline, set_is_multiline] = useState(has_line_break(initial));
+    const [opened] = useState(() => (heldKeys && heldKeys.length > 0
+        ? replay_editor_keys(initial, initialValue === undefined, heldKeys, WINDOWS)
+        : undefined));
+    const [text, set_text] = useState(opened?.text ?? initial);
+    const [is_multiline, set_is_multiline] = useState(has_line_break(opened?.text ?? initial));
     const input_ref = useRef<HTMLInputElement | HTMLTextAreaElement | null>(null);
     const mounted_ref = useRef(false);
     const cursor_pos_ref = useRef<number | null>(null);
@@ -85,7 +99,11 @@ export function CsvCellEditor({
             el.setSelectionRange(pos, pos);
             cursor_pos_ref.current = null;
         } else {
-            if (initialValue === undefined) {
+            if (opened) {
+                el.setSelectionRange(opened.start, opened.end);
+                // Glide commits its own copy of the value on a click away.
+                if (opened.text !== initial) onChange(with_text(value, opened.text));
+            } else if (initialValue === undefined) {
                 // Mouse/Enter activation starts with the existing cell selected.
                 el.select();
             } else {

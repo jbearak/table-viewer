@@ -5,6 +5,15 @@ import { createRoot, type Root } from 'react-dom/client';
 import { GridCellKind, type GridCell } from '../webview/glide-data-grid';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { CsvCellEditor } from '../webview/csv-cell-editor';
+import type { EditorKeyEvent } from '../webview/csv-cell-editor-model';
+
+const key = (name: string): EditorKeyEvent => ({
+    key: name,
+    shiftKey: false,
+    altKey: false,
+    metaKey: false,
+    ctrlKey: false,
+});
 
 let root: Root | null = null;
 let container: HTMLDivElement | null = null;
@@ -26,6 +35,7 @@ async function render_editor(
     on_navigation = vi.fn(),
     initial_value?: string,
     grid_value: GridCell = value(text),
+    held_keys?: readonly EditorKeyEvent[],
 ) {
     container = document.createElement('div');
     document.body.appendChild(container);
@@ -37,6 +47,7 @@ async function render_editor(
             onFinishedEditing: on_finished,
             onCommitNavigation: on_navigation,
             initialValue: initial_value,
+            heldKeys: held_keys,
         };
         root!.render(React.createElement(CsvCellEditor, props));
     });
@@ -52,6 +63,32 @@ afterEach(() => {
 });
 
 describe('CsvCellEditor', () => {
+    it('opens as if the keys typed before it opened had been typed into it', async () => {
+        const on_change = vi.fn();
+        await render_editor('a', on_change, vi.fn(), vi.fn(), 'a', value('a'), [
+            key('b'), key('ArrowLeft'), key('c'),
+        ]);
+
+        const input = container!.querySelector('input')!;
+        expect(input.value).toBe('acb');
+        expect(input.selectionStart).toBe(2);
+        expect(input.selectionEnd).toBe(2);
+        // Glide commits its own copy of the value when the person clicks away.
+        expect(on_change).toHaveBeenCalledWith(expect.objectContaining({ data: 'acb' }));
+    });
+
+    it('applies held keys to a value it opens with selected', async () => {
+        const on_change = vi.fn();
+        await render_editor('London', on_change, vi.fn(), vi.fn(), undefined, value('London'), [
+            key('ArrowLeft'), key('X'),
+        ]);
+
+        const input = container!.querySelector('input')!;
+        expect(input.value).toBe('XLondon');
+        expect(input.selectionStart).toBe(1);
+        expect(on_change).toHaveBeenCalledWith(expect.objectContaining({ data: 'XLondon' }));
+    });
+
     it('places the caret after the seed character when typing opens the editor', async () => {
         await render_editor('a', vi.fn(), vi.fn(), vi.fn(), 'a');
 
