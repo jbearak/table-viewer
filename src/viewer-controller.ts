@@ -3067,6 +3067,13 @@ export function attach_viewer(
     const transform_commit_barriers = new Set<TransformAuthority>();
     let load_seq = 0;
     let latest_refresh_event: FileRefreshEvent | undefined;
+    /**
+     * The bytes the latest save wrote, until this panel adopts a source. A
+     * watcher can report that write after the save's checked-write window has
+     * closed and supersede the postSave refresh still reading it; the newer
+     * refresh that reads those same bytes is still the save, not a reload.
+     */
+    let unadopted_saved_digest: string | undefined;
     let disposed = false;
     /**
      * What a replay lease retains, so a commit mutates only what preparation
@@ -9478,6 +9485,7 @@ export function attach_viewer(
                     if (deduplicated.type === 'committed') {
                         source_observation = candidate.observation;
                         source_authority = deduplicated.receipt.resultingBasis;
+                        unadopted_saved_digest = undefined;
                         update_session_state_material(
                             deduplicated.receipt.stateSnapshot,
                             true,
@@ -9501,14 +9509,18 @@ export function attach_viewer(
                     }
                     if (committed.type === 'committed') {
                         // A postSave episode may absorb watcher work that arrived
-                        // during the checked-write reservation. The digest proves
-                        // this candidate is the save's own bytes, while the source
-                        // signatures prove those bytes did not change display-row
-                        // identity. Absorbed external bytes, compare alignments and
-                        // changed header projections retain reload semantics.
-                        const adoption_reason = request.refreshEvent?.reason === 'postSave'
-                            && request.refreshEvent.savedDigest
-                                === candidate.observation.digest
+                        // during the checked-write reservation, and a watcher
+                        // episode may supersede a postSave one still reading the
+                        // save. The digest proves this candidate is the save's own
+                        // bytes, while the source signatures prove those bytes did
+                        // not change display-row identity. Absorbed external bytes,
+                        // compare alignments and changed header projections retain
+                        // reload semantics.
+                        const saved_digest = request.refreshEvent?.reason === 'postSave'
+                            ? request.refreshEvent.savedDigest
+                            : unadopted_saved_digest;
+                        const adoption_reason = saved_digest !== undefined
+                            && saved_digest === candidate.observation.digest
                             && source_row_projections_match(source, candidate.borrow())
                             ? 'save'
                             : reason;
@@ -9524,6 +9536,7 @@ export function attach_viewer(
                             return inactive_refresh_result();
                         }
                         if (adopted) {
+                            unadopted_saved_digest = undefined;
                             if (comparison_fallback_error) {
                                 warn_compare_unavailable(comparison_fallback_error);
                             }
@@ -9633,6 +9646,7 @@ export function attach_viewer(
                 if (deduplicated.type === 'committed' && load_is_current(request.seq)) {
                     source_observation = candidate.observation;
                     source_authority = deduplicated.receipt.resultingBasis;
+                    unadopted_saved_digest = undefined;
                     update_session_state_material(deduplicated.receipt.stateSnapshot, true);
                     if (!include_compare_original) {
                         warn_compare_unavailable(unstable_comparison_error());
@@ -9692,6 +9706,7 @@ export function attach_viewer(
                 editing_supported ? await read_file_state() : undefined,
             );
             if (!adopted) return false;
+            unadopted_saved_digest = undefined;
             if (!include_compare_original) {
                 warn_compare_unavailable(unstable_comparison_error());
             }
@@ -9736,6 +9751,7 @@ export function attach_viewer(
     ): Promise<FileRefreshSubscriberResult> {
         if (disposed) return Promise.resolve({ type: 'disposed' });
         latest_refresh_event = event;
+        if (event.reason === 'postSave') unadopted_saved_digest = event.savedDigest;
         session.wake_delivery();
         const request = {
             seq: supersede_panel_load(),
