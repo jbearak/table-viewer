@@ -2800,11 +2800,13 @@ export function App(): React.JSX.Element {
                 install_edit_session(hydrated, current_session_id, sheet_index);
                 if (disposition === 'tombstone') {
                     const sheet = meta_ref.current?.sheets[sheet_index];
-                    saved_cells.push(...saved_history_cells(worksheet, {
+                    // One at a time: a save can write more cells than a
+                    // spread may pass as arguments.
+                    for (const cell of saved_history_cells(worksheet, {
                         sheetIndex: sheet_index,
                         sheetName: sheet?.name ?? worksheet.sheetName,
                         worksheetId: sheet?.worksheetId ?? worksheet.worksheetId,
-                    }, hydrated));
+                    }, hydrated)) saved_cells.push(cell);
                 }
                 if (disposition === 'tombstone' && worksheet.structuralChanges) {
                     const structural_store = edit_session_registry_ref.current!

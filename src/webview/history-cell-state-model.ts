@@ -799,9 +799,11 @@ function link_in_overlay(state: CellOverlayState): boolean {
 function overlay_is_plain_content(state: CellOverlayState): boolean {
     if (state.kind === 'absent' || state.value.kind === 'untouched') return true;
     const value = state.value;
+    // An ordinary formula edit records an empty list of bases: it names no
+    // pending row, and is content like any other.
     return !value.basePending
         && value.movedFrom === undefined
-        && value.formulaReferenceBases === undefined
+        && (value.formulaReferenceBases ?? []).length === 0
         && value.formulaAnchors === undefined;
 }
 
@@ -868,7 +870,9 @@ function overlay_over_saved(
     // Rewritten over the saved content, the value is an ordinary edit: the
     // flags that disambiguate a value equal to its base no longer apply, and
     // formatting was observed on both sides. An unwritten dimension keeps
-    // every field it recorded.
+    // every field it recorded. Either way a formula keeps its recorded list
+    // of bases, which is empty here: empty says it was authored naming no
+    // pending row, where a missing list means nobody recorded.
     const base = saved.value ?? recorded!.base;
     const write_value = saved.value === undefined ? recorded?.writeValue : undefined;
     const retain_value = saved.value === undefined ? recorded?.retainValue : undefined;
@@ -877,12 +881,12 @@ function overlay_over_saved(
         ? combined_overlay(
             value, base, link, link_base, false,
             write_value, retain_value, formatting_known,
-            undefined, recorded?.valueEditOrder,
+            undefined, recorded?.valueEditOrder, recorded?.formulaReferenceBases,
         )
         : value_only_overlay(
             value, base, false,
             write_value, retain_value, formatting_known,
-            undefined, recorded?.valueEditOrder,
+            undefined, recorded?.valueEditOrder, recorded?.formulaReferenceBases,
         );
 }
 

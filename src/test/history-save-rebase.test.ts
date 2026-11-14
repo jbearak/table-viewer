@@ -431,6 +431,51 @@ describe('rebase_saved_cell_delta', () => {
         expect(rebase_saved_cell_delta(moved, { value: history_value('B') })).toBe(moved);
     });
 
+    it('rewrites an ordinary formula edit, which records an empty list of bases', () => {
+        const formula = delta_of(
+            absent_overlay(),
+            value_only_overlay(
+                history_value('=1+1'), history_value('A'), false, undefined, undefined, true,
+                undefined, 3, [],
+            ),
+        );
+        const rebased = rebase_saved_cell_delta(formula, { value: history_value('=1+1') });
+        expect(rebased?.afterOverlay).toEqual(absent_overlay());
+        expect(rebased?.beforeOverlay).toEqual(
+            value_only_overlay(history_value('A'), history_value('=1+1'), false, undefined, undefined, true),
+        );
+    });
+
+    it('keeps the empty list of bases on a formula it rewrites as an edit', () => {
+        // Empty and missing are different facts downstream: a missing list makes
+        // the pending-row conflict check infer references from coordinates.
+        const formula = (text: string) => value_only_overlay(
+            history_value(text), history_value('A'), false, undefined, undefined, true,
+            undefined, 3, [],
+        );
+        const rebased = rebase_saved_cell_delta(
+            delta_of(formula('=1+1'), formula('=2+2')),
+            { value: history_value('=2+2') },
+        );
+        expect(rebased?.afterOverlay).toEqual(absent_overlay());
+        expect(rebased?.beforeOverlay).toEqual(value_only_overlay(
+            history_value('=1+1'), history_value('=2+2'), false, undefined, undefined, true,
+            undefined, 3, [],
+        ));
+    });
+
+    it('leaves a formula that names pending rows exactly as recorded', () => {
+        const formula = delta_of(
+            absent_overlay(),
+            value_only_overlay(
+                history_value('=A9'), history_value('A'), false, undefined, undefined, true,
+                undefined, 3,
+                [{ targetSheetIndex: 0, targetSheetName: 'Sheet1', provisionalStartRow: 8, provisionalRowCount: 1 }],
+            ),
+        );
+        expect(rebase_saved_cell_delta(formula, { value: history_value('=A9') })).toBe(formula);
+    });
+
     it('leaves a state whose base was never observed exactly as recorded', () => {
         const pending = delta_of(
             value_only_overlay(history_value('B'), history_value(''), true),
