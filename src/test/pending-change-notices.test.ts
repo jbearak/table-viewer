@@ -633,7 +633,7 @@ describe('conflict notices', () => {
     it('adds the counts and lost values once the host answers, and Retry when it cannot', () => {
         const [ready] = pending_change_notices(conflicted([basis], {
             columnValuesLost: 2,
-            impact: { state: 'ready', keep: { ref: 0, moved: 12 }, discard: { ref: 4, moved: 12 } },
+            impact: { state: 'ready', keep: { ref: 0, caught: 0, moved: 12 }, discard: { ref: 4, caught: 0, moved: 12 } },
         }));
         expect(ready!.sentences.slice(2)).toEqual([
             'Values typed in 2 new columns will be discarded.',
@@ -645,6 +645,21 @@ describe('conflict notices', () => {
         expect(unavailable!.sentences).toContain('Formula impact unavailable. Retry, or choose an action without the count.');
         expect(unavailable!.actions[0]).toEqual({ label: 'Retry', intent: { kind: 'retryFormulaImpact' } });
         expect(unavailable!.actions.every((action) => !action.disabled)).toBe(true);
+    });
+
+    it('never counts a formula that catches the #REF! an action leaves as one that shows it', () => {
+        const [notice] = pending_change_notices(conflicted([basis], {
+            impact: {
+                state: 'ready',
+                keep: { ref: 0, caught: 1, moved: 0 },
+                discard: { ref: 1, caught: 1, moved: 0 },
+            },
+        }));
+        expect(notice!.sentences.slice(2)).toEqual([
+            'Keep new rows at the end: 1 formula will show its fallback value because it catches the #REF! error.',
+            'Discard row and column changes on Data: 1 formula will show #REF! '
+                + 'and 1 will show its fallback value because it catches the error.',
+        ]);
     });
 
     it('offers only Discard for an unsupported structure, with its reason', () => {
@@ -800,11 +815,25 @@ describe('small helpers', () => {
     });
 
     it('counts #REF! formulas and formulas pointing at different rows or columns', () => {
-        expect(formula_impact_text({ ref: 4, moved: 12 }))
+        expect(formula_impact_text({ ref: 4, caught: 0, moved: 12 }))
             .toBe('4 formulas will show #REF! and 12 will point at different rows or columns.');
-        expect(formula_impact_text({ ref: 1, moved: 0 })).toBe('1 formula will show #REF!.');
-        expect(formula_impact_text({ ref: 0, moved: 1 })).toBe('1 formula will point at different rows or columns.');
-        expect(formula_impact_text({ ref: 0, moved: 0 })).toBeUndefined();
+        expect(formula_impact_text({ ref: 1, caught: 0, moved: 0 })).toBe('1 formula will show #REF!.');
+        expect(formula_impact_text({ ref: 0, caught: 0, moved: 1 })).toBe('1 formula will point at different rows or columns.');
+        expect(formula_impact_text({ ref: 0, caught: 0, moved: 0 })).toBeUndefined();
+    });
+
+    it('counts a formula that catches the #REF! apart, as showing its fallback value', () => {
+        expect(formula_impact_text({ ref: 0, caught: 1, moved: 0 }))
+            .toBe('1 formula will show its fallback value because it catches the #REF! error.');
+        expect(formula_impact_text({ ref: 1, caught: 1, moved: 0 }))
+            .toBe('1 formula will show #REF! and 1 will show its fallback value because it catches the error.');
+        expect(formula_impact_text({ ref: 4, caught: 2, moved: 12 })).toBe('4 formulas will show #REF!, '
+            + '2 will show their fallback values because they catch the error, '
+            + 'and 12 will point at different rows or columns.');
+        expect(formula_impact_text({ ref: 0, caught: 3, moved: 1 })).toBe('3 formulas will show their fallback values '
+            + 'because they catch the #REF! error and 1 will point at different rows or columns.');
+        expect(JSON.stringify([0, 1, 2].map((moved) => formula_impact_text({ ref: 0, caught: 2, moved }))))
+            .not.toContain('will show #REF!');
     });
 
     it('notes padding only for a live column change with a shorter record', () => {

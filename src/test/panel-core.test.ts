@@ -3212,6 +3212,6 @@ describe('formula questions', () => {
         expect(answered).toEqual(expect.arrayContaining(['review-new', 'impact-1']));
         // Discarding the deletion restores every formula that would have shown #REF!.
         expect(posted.find((message) => message.type === 'formulaImpact')?.impacts)
-            .toEqual({ discard: { ref: 0, moved: 20_000 } });
+            .toEqual({ discard: { ref: 0, caught: 0, moved: 20_000 } });
     });
 });

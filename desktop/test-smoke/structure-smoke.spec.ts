@@ -896,3 +896,37 @@ test('an external edit that turns on an .xlsx Header Row conflicts, and Keep new
     await expect.poll(saved)
         .toEqual([['x', 'y'], ['3', '4'], ['5', '6'], ['7', '8'], ['9', 'typed-under-conflict']]);
 });
+
+test('a conflict notice counts a formula that catches the #REF! a salvage action leaves apart from those that show it', async () => {
+    const book = (first: number) => Buffer.from(build_fixture_xlsx({
+        sheets: [{
+            name: 'Data',
+            body: `<sheetData>${[[first, 'x'], [3, 'y'], [5, 'z']].map((cells, index) =>
+                row(index + 1, cells.map((value, column) => cell(`${'AB'[column]}${index + 1}`, value))))
+                .join('')}</sheetData>`,
+        }],
+    }));
+    const { file, page } = await open_file('salvage.xlsx', book(1));
+    await wait_for_grid(page);
+
+    // A new column B, and two formulas in C that use it: one catches errors.
+    await choose(await open_column_menu(page, 0), 'Insert column right');
+    await expect.poll(async () => (await grid_headers(page)).length).toBe(3);
+    await type_into_cell(page, 2, 0, '10');
+    await type_into_cell(page, 3, 0, '=IFERROR(B1*2,0)');
+    await type_into_cell(page, 3, 1, '=B1*2');
+
+    // Another program changes a value in place, so the layout conflicts. Both
+    // salvage actions drop the new column, and Save writes #REF! into both
+    // formulas, but the IFERROR shows its fallback value, 0.
+    fs.writeFileSync(file, book(2));
+    const review = page.getByRole('alert', { name: 'Row and column changes that need review' });
+    await expect(review).toContainText('Data changed on disk after you inserted, deleted, or moved rows or columns.',
+        { timeout: 30_000 });
+    await expect(review).toContainText('Discard row and column changes on Data: ', { timeout: 30_000 });
+    await save_screenshot(page, '19-xlsx-conflict-iferror');
+    const counts = 'will show #REF! and 1 will show its fallback value because it catches the error.';
+    await expect(review).toContainText(`Discard row and column changes on Data: 1 formula ${counts}`);
+    await expect(review).toContainText(`Keep new rows at the end: 1 formula ${counts}`);
+    await expect(review).not.toContainText('2 formulas will show #REF!');
+});

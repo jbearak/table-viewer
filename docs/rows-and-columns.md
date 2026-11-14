@@ -156,6 +156,12 @@ The notice offers three actions.
 
 Both actions keep your edits to existing cells and your appended rows, and both can be undone.
 
+Before you choose, the notice counts what each action does to formulas. A formula that uses a new column or inserted row the action drops gets `#REF!`. If it uses that column or row inside a function that catches errors, such as `IFERROR`, Excel shows its fallback value instead, and the notice counts it separately, as the notice before you save does:
+
+```text
+Discard row and column changes on Sales: 1 formula will show #REF! and 1 will show its fallback value because it catches the error.
+```
+
 ## `.xlsx` workbooks
 
 While row or column changes are unsaved, Table Viewer recalculates the formulas it can. A cell whose result changes shows the old value struck through beside the new one, such as `24 → 34` for a total that gained a row. Formulas whose results stay the same look as they did. A formula that referred to a row or column you deleted shows `?? (invalid reference)`, and Save writes `#REF!` in its place, as Excel does. A formula that uses such a result, like a total over those cells, shows `?? (invalid reference)` too. A notice under the grid counts all of these before you save, including ones on other sheets. Restore the row or column, or undo, to get the formula back.

@@ -477,7 +477,7 @@ describe('review_formula_impact', () => {
         );
         // Summary!A3 shows #REF!; Data!C2, Data!C7, Summary!A1, and Summary!A2
         // lose the inserted row and render one row up.
-        expect(impact).toEqual({ ref: 1, moved: 4 });
+        expect(impact).toEqual({ ref: 1, caught: 0, moved: 4 });
         // A `#REF!` inside a string literal is text, not a broken reference.
         const quoted = anchor_formula(
             '="#REF!"&Data!A3',
@@ -493,13 +493,13 @@ describe('review_formula_impact', () => {
             source,
             { edits: [quoted_edit], layouts: before_layouts },
             { edits: [quoted_edit], layouts: [layout_of(undefined, 1), layout_of(undefined, 0)] },
-        )).toEqual({ ref: 1, moved: 4 });
+        )).toEqual({ ref: 1, caught: 0, moved: 4 });
         // Nothing changes when the layouts do not.
         expect(review_formula_impact(
             source,
             { edits: [edit], layouts: before_layouts },
             { edits: [edit], layouts: before_layouts },
-        )).toEqual({ ref: 0, moved: 0 });
+        )).toEqual({ ref: 0, caught: 0, moved: 0 });
     });
 
     it('counts what a plain column delete does, with no conflict: #REF! for every reference wholly in it', () => {
@@ -547,7 +547,34 @@ describe('review_formula_impact', () => {
         // `=SUM(Data!B:C)`, and `=Data!C1`. Not counted: C4, on the deleted
         // column; `=A4+#REF!` and `=A5`, unchanged though their cells move left;
         // and the `#REF!` inside a string.
-        expect(impact).toEqual({ ref: 5, moved: 3 });
+        expect(impact).toEqual({ ref: 5, caught: 0, moved: 3 });
+    });
+
+    it('counts a formula that catches the #REF! it gains apart from those that show it', () => {
+        // The same rule as the Save warning: Save writes #REF! into
+        // `=IFERROR(Data!C2*2,0)` and `=ISERROR(Data!C3)`, but they show
+        // their fallback values. `=ROUND(Data!C2,0)` passes the error on.
+        const source = source_of([
+            { name: 'Data', rows: [[value('1'), value('2'), value('3')], [value('1'), value('2'), value('3')]] },
+            {
+                name: 'Summary',
+                rows: [
+                    [formula('=IFERROR(Data!C2*2,0)')],
+                    [formula('=_xlfn.IFNA(Data!C1,0)+ISERROR(Data!C2)')],
+                    [formula('=ROUND(Data!C2,0)')],
+                ],
+            },
+        ]);
+        const deleted = delete_layout_columns(source_column_layout(3), [{ kind: 'source', sourceColumn: 2 }], () => 0);
+        if (!deleted.ok) throw new Error(deleted.refusal.reason);
+        expect(review_formula_impact(
+            source,
+            { edits: [], layouts: [layout_of(undefined, 0), layout_of(undefined, 0)] },
+            {
+                edits: [],
+                layouts: [{ bodyStart: 0, columnLayout: deleted.layout, band: [] }, layout_of(undefined, 0)],
+            },
+        )).toEqual({ ref: 1, caught: 2, moved: 0 });
     });
 
     it('yields while rendering formula edits, not only source formulas', async () => {
@@ -581,7 +608,7 @@ describe('review_formula_impact', () => {
             workSliceMs: 0,
             yieldControl: async () => { yields += 1; },
         });
-        expect(impact).toEqual({ ref: 0, moved: 0 });
+        expect(impact).toEqual({ ref: 0, caught: 0, moved: 0 });
         // Rendering yields every 256 formulas in each state; comparing does too.
         expect(yields).toBeGreaterThanOrEqual(3 * Math.floor(3_000 / 256));
     });

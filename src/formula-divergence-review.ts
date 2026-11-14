@@ -203,8 +203,9 @@ const FORMULAS_PER_STEP = 256;
 /**
  * Functions that catch an error or test for one instead of passing it on.
  * A formula calling one is not claimed to show `#REF!`, even when Save writes
- * `#REF!` into it, and its result does not carry `#REF!` on to the formulas
- * that use it. Matched in the text, since the calculator doesn't evaluate them.
+ * `#REF!` into it, whether in the Save warning or in a conflict notice's
+ * counts, and its result does not carry `#REF!` on to the formulas that use
+ * it. Matched in the text, since the calculator doesn't evaluate them.
  */
 const CATCHES_ERRORS = /(?:^|[^A-Za-z0-9_.])(?:_xlfn\.)?(?:IFERROR|IFNA|ERROR\.TYPE|AGGREGATE|IS(?:ERROR|ERR|NA|REF|BLANK|NUMBER|TEXT|NONTEXT|LOGICAL|FORMULA))\s*\(/i;
 
@@ -672,8 +673,17 @@ export interface FormulaImpactState {
 
 /** What an action would do to the workbook's formulas. */
 export interface FormulaImpact {
-    /** Formulas whose rendered text gains a `#REF!` error token (not one inside a string). */
+    /**
+     * Formulas whose rendered text gains a `#REF!` error token (not one inside
+     * a string) and that will show it.
+     */
     readonly ref: number;
+    /**
+     * Formulas whose rendered text gains a `#REF!` error token but that catch
+     * errors (`CATCHES_ERRORS`, the Save warning's rule), so they show their
+     * fallback values.
+     */
+    readonly caught: number;
     /** Other formulas whose rendered text changes: they point at different rows or columns. */
     readonly moved: number;
 }
@@ -683,7 +693,9 @@ export interface FormulaImpact {
  * `after`, matched by the row and column identities of its cell, so a cell a
  * layout renumbers is still the same cell. Formulas only one state holds
  * (on a row or column the action drops) are not counted. "4 formulas will
- * show #REF! and 12 will point at different rows or columns."
+ * show #REF! and 12 will point at different rows or columns." A formula that
+ * gains `#REF!` inside IFERROR or the like is counted apart, as the Save
+ * warning counts it.
  */
 function* impact_steps(
     source: DataSource,
@@ -763,6 +775,7 @@ function* impact_steps(
     const was = yield* rendered(before);
     const will = yield* rendered(after);
     let ref = 0;
+    let caught = 0;
     let moved = 0;
     let compared = 0;
     for (const [key, text] of will) {
@@ -770,10 +783,11 @@ function* impact_steps(
         if (++compared % FORMULAS_PER_STEP === 0) yield;
         const previous = was.get(key);
         if (previous === undefined || previous === text) continue;
-        if (formula_ref_error_count(text) > formula_ref_error_count(previous)) ref += 1;
-        else moved += 1;
+        if (formula_ref_error_count(text) <= formula_ref_error_count(previous)) moved += 1;
+        else if (CATCHES_ERRORS.test(text)) caught += 1;
+        else ref += 1;
     }
-    return Object.freeze({ ref, moved });
+    return Object.freeze({ ref, caught, moved });
 }
 
 /** Synchronous form, for tests. */
