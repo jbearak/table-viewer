@@ -12,6 +12,7 @@ import type {
     PerFileState,
 } from '../types';
 import { decode_stored_per_file_state } from '../types';
+import { CompactSelection } from '../webview/glide-data-grid';
 import type { EditingHandle, GridFocusHandle } from '../webview/grid-shell';
 import {
     create_edit_session_store,
@@ -33,6 +34,7 @@ const grid_mock = vi.hoisted(() => ({
             source: string,
         ) => boolean | 'refused' | void;
         onGridSelectionChange?: (selection: unknown) => void;
+        onKeyDown?: (args: Record<string, unknown>) => void;
         getCellContent?: (cell: [number, number]) => {
             data?: string;
             allowOverlay?: boolean;
@@ -135,6 +137,9 @@ vi.mock('../webview/use-row-loader', () => ({
     use_row_loader: () => ({
         ensure_rows: vi.fn(),
         ensure_row_intervals: vi.fn(),
+        // An editor mounted on a cell pins that cell's row while it is open.
+        pin_rows: () => Symbol('pin'),
+        unpin_rows: vi.fn(),
         // Rows are looked up by display row but their *contents* are addressed by
         // source row, exactly as the real loader does: the host ships each page's
         // sourceRows alongside its rows, and a permuted view reorders the rows
@@ -1856,6 +1861,129 @@ describe('GridShell editing with no session held yet', () => {
         expect(grid_mock.props!.onOverlayOpenRequest).toBeUndefined();
         // Still in use until the editor it asked for has mounted or been refused.
         expect(editing_ref.current!.session_busy()).toBe(true);
+    });
+
+    /** A key on the grid, as Glide hands it to GridShell before acting on it. */
+    function grid_key(key: string, mods: { shiftKey?: boolean; altKey?: boolean; metaKey?: boolean } = {}) {
+        const args = {
+            key,
+            altKey: false,
+            shiftKey: false,
+            ctrlKey: false,
+            metaKey: false,
+            ...mods,
+            rawEvent: { code: '', target: document.createElement('canvas') },
+            cancel: vi.fn(),
+            preventDefault: vi.fn(),
+        };
+        grid_mock.props!.onKeyDown!(args);
+        return args;
+    }
+    async function select_first_cell() {
+        await act(async () => {
+            grid_mock.props!.onGridSelectionChange!({
+                current: { cell: [0, 0], range: { x: 0, y: 0, width: 1, height: 1 }, rangeStack: [] },
+                columns: CompactSelection.empty(),
+                rows: CompactSelection.empty(),
+            });
+        });
+    }
+
+    it('keeps a space, and every key the editor would take, typed while the session is on its way', async () => {
+        const { request, grant } = session_request();
+        const { rerender } = await render_grid(undefined, {
+            ...no_session,
+            on_request_edit_session: request,
+        });
+        await select_first_cell();
+
+        grid_mock.props!.onOverlayOpenRequest!([0, 0], 'N');
+        const typed = [
+            grid_key('e'), grid_key('w'),
+            // Glide alone takes Space to activate the cell, Shift+Space to
+            // select the row, Backspace to clear it, and an arrow to move.
+            grid_key(' '), grid_key('Y'), grid_key('x'), grid_key('Backspace'),
+            grid_key('o'), grid_key('ArrowLeft'), grid_key(' ', { shiftKey: true }),
+            grid_key('Enter', { shiftKey: true }), grid_key('é', { altKey: true }),
+        ];
+        for (const args of typed) {
+            expect(args.cancel).toHaveBeenCalled();
+            expect(args.preventDefault).toHaveBeenCalled();
+        }
+        // A shortcut is still the app's.
+        expect(grid_key('z', { metaKey: true }).cancel).not.toHaveBeenCalled();
+        expect((grid_mock.props!.gridSelection as any).current.cell).toEqual([0, 0]);
+
+        grant();
+        await flush();
+        await rerender({ editing_session_held: true, edit_session_id: 'session-1', on_request_edit_session: undefined });
+        await flush();
+        expect(grid_mock.open_overlay).toHaveBeenCalledWith([0, 0], 'New Yo \né');
+    });
+
+    it('starts from what is typed after Enter opened the editor, as the open editor would', async () => {
+        const { request, grant } = session_request();
+        const { rerender } = await render_grid(undefined, {
+            ...no_session,
+            on_request_edit_session: request,
+        });
+
+        // Enter (or Space, or a double click) opens on the cell's own value,
+        // all of it selected, so the first key typed replaces it.
+        grid_mock.props!.onOverlayOpenRequest!([0, 0], undefined);
+        grid_key('a');
+        grid_key(' ');
+        grid_key('b');
+
+        grant();
+        await flush();
+        await rerender({ editing_session_held: true, edit_session_id: 'session-1', on_request_edit_session: undefined });
+        await flush();
+        expect(grid_mock.open_overlay).toHaveBeenCalledWith([0, 0], 'a b');
+    });
+
+    it('opens and commits on the grant for a Tab typed before it, and keeps the grid from moving first', async () => {
+        const { request, grant } = session_request();
+        const { rerender } = await render_grid(undefined, {
+            ...no_session,
+            on_request_edit_session: request,
+        });
+        await select_first_cell();
+        const on_finished_editing = vi.fn();
+        const editor_root = createRoot(document.createElement('div'));
+        grid_mock.open_overlay.mockImplementationOnce((cell, initial) => {
+            const props = grid_mock.props as unknown as {
+                provideEditor: (content: unknown) => { editor: React.ComponentType<Record<string, unknown>> };
+            };
+            const value = grid_mock.props!.getCellContent!(cell);
+            const { editor } = props.provideEditor(value);
+            flushSync(() => editor_root.render(React.createElement(editor, {
+                value,
+                initialValue: initial,
+                onChange: vi.fn(),
+                onFinishedEditing: on_finished_editing,
+            })));
+            return true;
+        });
+
+        grid_mock.props!.onOverlayOpenRequest!([0, 0], 'H');
+        grid_key('i');
+        expect(grid_key('Tab').cancel).toHaveBeenCalled();
+        // There is no editor for a key typed after it to go to.
+        grid_key('x');
+        expect((grid_mock.props!.gridSelection as any).current.cell).toEqual([0, 0]);
+
+        grant();
+        await flush();
+        await rerender({ editing_session_held: true, edit_session_id: 'session-1', on_request_edit_session: undefined });
+        await flush();
+        expect(grid_mock.open_overlay).toHaveBeenCalledWith([0, 0], 'Hi');
+        expect(on_finished_editing).toHaveBeenCalledTimes(1);
+        expect(on_finished_editing).toHaveBeenCalledWith(
+            expect.objectContaining({ data: 'Hi' }),
+            [0, 0],
+        );
+        await act(async () => { editor_root.unmount(); });
     });
 
     it('lets the session go once an editor that mounted inside openOverlay is cancelled', async () => {

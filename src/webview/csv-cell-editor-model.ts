@@ -61,3 +61,56 @@ export function insert_newline(
         cursor: start + 1,
     };
 }
+
+/**
+ * What a key typed while an editor is waiting to open does to the text it will
+ * open with:
+ *  - `text`     the editor would change its text to `text`.
+ *  - `commit`   the editor would commit and move; it opens and commits at once.
+ *  - `pass`     a shortcut, or Escape, which the grid handles as usual.
+ *  - `hold`     a key the editor keeps to itself, such as an arrow moving the
+ *               caret; the grid must not act on it either.
+ *
+ * `text` is undefined when the editor will open on the cell's own value, all of
+ * it selected, as it does after Enter, Space, or a double click; the first key
+ * typed then replaces that value. Glide maps Space and Shift+Space to grid
+ * actions, so they reach a waiting editor only through here.
+ */
+export type HeldEditorKey =
+    | { readonly kind: 'text'; readonly text: string }
+    | { readonly kind: 'commit'; readonly navigation: EditorCommitNavigation }
+    | { readonly kind: 'pass' }
+    | { readonly kind: 'hold' };
+
+export function held_editor_key(
+    text: string | undefined,
+    e: EditorKeyEvent,
+): HeldEditorKey {
+    if (e.metaKey || e.ctrlKey) return { kind: 'pass' };
+    switch (editor_key_intent(e)) {
+        case 'cancel':
+        case 'save':
+            return { kind: 'pass' };
+        case 'commit-tab-forward':
+            return { kind: 'commit', navigation: 'next' };
+        case 'commit-tab-backward':
+            return { kind: 'commit', navigation: 'previous' };
+        case 'commit-down':
+            return { kind: 'commit', navigation: 'below' };
+        case 'newline':
+            return { kind: 'text', text: (text ?? '') + '\n' };
+        case 'default':
+            break;
+    }
+    // The caret sits at the end of typed text, so Delete removes nothing there.
+    // Either key removes a selected value.
+    if (e.key === 'Backspace') return { kind: 'text', text: Array.from(text ?? '').slice(0, -1).join('') };
+    if (e.key === 'Delete') return text === undefined ? { kind: 'text', text: '' } : { kind: 'hold' };
+    // 'Dead' and 'Process' belong to a character still being composed.
+    if (e.key === 'Dead' || e.key === 'Process' || e.key === 'Unidentified') return { kind: 'pass' };
+    const code = e.key.codePointAt(0) ?? 0;
+    if (Array.from(e.key).length === 1 && code >= 0x20 && code !== 0x7f) {
+        return { kind: 'text', text: (text ?? '') + e.key };
+    }
+    return { kind: 'hold' };
+}

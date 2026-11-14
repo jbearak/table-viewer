@@ -82,7 +82,9 @@ test('typing starts an edit and keeps every key; Save writes it', async () => {
     // One key at a time, and long enough that the session is granted partway
     // through: the keys typed while it is being acquired, and those typed while
     // the editor opens on the grant, belong to the edit the first one started.
-    const typed = 'HelloTypedOneKeyAtATime';
+    // That includes a space, which the grid alone would take to mean "open the
+    // editor".
+    const typed = 'New York keeps its spaces';
     await page.keyboard.type(typed, { delay: 3 });
     await expect(editor()).toBeVisible();
     await expect(editor()).toHaveValue(typed);
@@ -101,6 +103,20 @@ test('typing starts an edit and keeps every key; Save writes it', async () => {
     await expect.poll(() => fs.readFileSync(csv, 'utf8'))
         .toBe(`Name,Age,City\n${typed},30,New York\nBob,25,London\nCharlie,35,Paris\n`);
     await expect_nothing_unsaved();
+});
+
+test('Tab typed before the session is granted commits the edit and moves on', async () => {
+    await select_cell(1, 0);
+    // Short enough that Tab usually comes before the grant. The grid alone
+    // would take Tab to mean "select the next cell", and the edit waiting for
+    // the session would then have nowhere to open.
+    await page.keyboard.type('Hi you', { delay: 3 });
+    await page.keyboard.press('Tab');
+    await expect(cell(2, 0)).toHaveAttribute('aria-selected', 'true');
+    await expect(editor()).toBeHidden();
+    await expect(cell(1, 0)).toHaveText('Hi you');
+    await expect(cell(2, 0)).toHaveText('30');
+    await expect(save()).toHaveClass(/has-unsaved/);
 });
 
 test('an editor opened and cancelled leaves nothing behind, and the next edit just works', async () => {

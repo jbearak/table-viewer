@@ -13,7 +13,7 @@ The mode existed to keep stray keystrokes from changing cells. It cost more than
 ## Consequences
 
 - Viewing an editable file runs the same code as viewing a read-only one. The only difference is that its cells answer an editing gesture, which costs one shared object per painted cell.
-- A gesture made before the session exists is held and replayed, so each kind of gesture has one hand-off point: the editor open request, the batch of cell edits, paste admission, the menus (which acquire quietly as they open), row and column drags, the move shortcuts, and the add-row launcher. A new editing gesture needs one too.
+- A gesture made before the session exists is held and replayed, so each kind of gesture has one hand-off point: the editor open request, the batch of cell edits, paste admission, the menus (which acquire quietly as they open), row and column drags, the move shortcuts, and the add-row launcher. A new editing gesture needs one too. Keys typed while the editor open request waits belong to that editor, not the grid. Each one changes the text the editor opens with, or commits it once it opens, just as it would in the open editor.
 - Acquisition happens per burst of editing rather than once per sitting, so its cost is felt. A session that starts with nothing to publish publishes nothing, and the host waits out its own release before answering the next request.
 - In a file that can be edited, a letter key edits the selected cell, so `h`/`j`/`k`/`l` navigate only in read-only files.
 - Discard is a toolbar button with no confirmation. It is undoable, and the undo has to work on the first press.

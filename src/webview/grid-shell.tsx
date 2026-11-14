@@ -9,6 +9,7 @@ import React, {
     useSyncExternalStore,
     type MutableRefObject,
 } from 'react';
+import { flushSync } from 'react-dom';
 import {
     CompactSelection,
     DataEditor,
@@ -227,6 +228,7 @@ import {
     type MeasurableCell,
 } from './fit-column-model';
 import { CsvCellEditor, type CsvCellEditorProps } from './csv-cell-editor';
+import { held_editor_key, type EditorCommitNavigation } from './csv-cell-editor-model';
 import {
     RowResizeOverlay,
     type RowResizeOverlayHandle,
@@ -3312,8 +3314,17 @@ export function GridShell({
     const view_identity_ref = useRef('');
     view_identity_ref.current = `${generation}:${source_generation}:${mapping_generation}`;
     // An editor the grid was asked to open before a session existed, and the
-    // interval between asking Glide to open it and the editor mounting.
-    const overlay_intent_ref = useRef<{ cell: Item; initial: string | undefined } | null>(null);
+    // interval between asking Glide to open it and the editor mounting. Keys
+    // typed while it waits are applied to `initial` as the editor would apply
+    // them; an Enter or Tab among them is kept in `commit`, and the editor
+    // commits as soon as it opens.
+    const overlay_intent_ref = useRef<{
+        cell: Item;
+        initial: string | undefined;
+        commit?: EditorCommitNavigation;
+    } | null>(null);
+    // Commits the open editor; set while one is mounted.
+    const open_editor_commit_ref = useRef<((navigation: EditorCommitNavigation) => void) | null>(null);
     const overlay_opening_ref = useRef(false);
     const overlay_mounted_ref = useRef(false);
     const session_surface_open_ref = useRef(false);
@@ -9454,6 +9465,7 @@ export function GridShell({
                     onChange={handle_change}
                     onFinishedEditing={handle_finished}
                     onCommitNavigation={handle_commit_navigation}
+                    commitRef={open_editor_commit_ref}
                 />
             );
         }
@@ -9548,16 +9560,17 @@ export function GridShell({
         const waiting = overlay_intent_ref.current;
         if (waiting !== null) {
             // Keys typed while the session is on its way belong to the edit
-            // the first one started.
+            // the first one started. on_key_down applies them before Glide
+            // sees them; this catches any that reach Glide anyway.
             if (
-                waiting.initial !== undefined
+                waiting.commit === undefined
                 && initial !== undefined
                 && waiting.cell[0] === cell[0]
                 && waiting.cell[1] === cell[1]
-            ) waiting.initial += initial;
+            ) waiting.initial = (waiting.initial ?? '') + initial;
             return true;
         }
-        const intent = { cell, initial };
+        const intent: NonNullable<typeof overlay_intent_ref.current> = { cell, initial };
         overlay_intent_ref.current = intent;
         void ensure_edit_session().then((granted) => {
             if (overlay_intent_ref.current !== intent) return;
@@ -9569,6 +9582,14 @@ export function GridShell({
                 overlay_opening_ref.current = true;
                 opened = grid_ref.current?.openOverlay(intent.cell, intent.initial) === true;
                 if (!opened) overlay_opening_ref.current = false;
+                // An Enter or Tab typed while waiting. Commit synchronously, as
+                // openOverlay opens, so the next key finds the editor closed
+                // and the selection moved.
+                const commit = open_editor_commit_ref.current;
+                const navigation = intent.commit;
+                if (opened && navigation !== undefined && commit) {
+                    flushSync(() => commit(navigation));
+                }
             }
             if (!opened) notify_session_idle();
         });
@@ -10741,6 +10762,26 @@ export function GridShell({
     // shortcuts) stay native to Glide, which steps past merges itself.
     const on_key_down = useCallback(
         (args: GridKeyEventArgs) => {
+            // An editor is waiting for the session to open, so a key typed now
+            // belongs to it. Left to the grid, Space would activate the cell,
+            // Shift+Space select the row, Backspace clear it, and Tab move away
+            // from the edit.
+            const waiting = overlay_intent_ref.current;
+            if (waiting !== null && !is_editable_target(args.rawEvent?.target ?? null)) {
+                // After a held Enter or Tab there is no editor for a key to go
+                // to. It is dropped rather than let move the selection out
+                // from under the commit.
+                const held = waiting.commit === undefined
+                    ? held_editor_key(waiting.initial, args)
+                    : { kind: args.metaKey || args.ctrlKey ? 'pass' : 'hold' } as const;
+                if (held.kind !== 'pass') {
+                    if (held.kind === 'text') waiting.initial = held.text;
+                    if (held.kind === 'commit') waiting.commit = held.navigation;
+                    args.cancel();
+                    args.preventDefault();
+                    return;
+                }
+            }
             // Alt+Shift+Up/Down move whole selected rows. Neither the
             // transform shortcuts (letters and digits) nor Find use arrows.
             if (
