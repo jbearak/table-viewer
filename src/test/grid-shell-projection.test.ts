@@ -9365,6 +9365,11 @@ describe('row Insert in the row-gutter menu', () => {
         await act(async () => menu_item('Insert row below')!.click());
         await act(async () => host.grant());
         await vi.waitFor(() => expect(host.settled).toEqual([true]));
+        // The insert then moves the caret to the new row. Let that land, so a
+        // test's own selection is not replaced by it on a slow runner.
+        await vi.waitFor(() => expect((grid_mock.props!.gridSelection as {
+            current?: { cell: [number, number] };
+        }).current?.cell).toEqual([0, 1]));
         return { pending, history, GridShell };
     };
     const topology_key = () => grid_mock.props!.pasteTopologyKey as string;
@@ -9468,10 +9473,6 @@ describe('row Insert in the row-gutter menu', () => {
         const { pending } = await insert_after_first();
         const on_selection_change = grid_mock.props!.onGridSelectionChange as (selection: unknown) => void;
         // Display rows 0 (source 0), 1 (inserted), 2 (source 1).
-        // Let the insert's focus move land first, so it does not replace this selection.
-        await vi.waitFor(() => expect((grid_mock.props!.gridSelection as {
-            current?: { cell: [number, number] };
-        }).current?.cell).toEqual([0, 1]));
         await act(async () => on_selection_change({ columns: compact([]), rows: compact([0, 1, 2]) }));
         expect(selected_rows()).toEqual([0, 1, 2]);
         await keep_at_end(pending);
