@@ -5778,8 +5778,8 @@ describe('CSV edit sessions', () => {
     });
 
     it('keeps csvEditable true after the owning panel installs a transform', async () => {
-        // Without this the webview's `edit_mode && !csv_editable` guard would eject
-        // the user from edit mode the instant their own sort landed, so admission
+        // Without this the webview's `editing_session_held && !csv_editable` guard would eject
+        // the user from the editing session the instant their own sort landed, so admission
         // would undo itself. A transform alone re-projects nothing, so the stale
         // capability rides along until something recaptures — and the very next
         // thing the user does after sorting is keep typing. That posts

@@ -1470,7 +1470,7 @@ export interface GridShellProps {
     // for the user to enter: App acquires the session behind the first editing
     // gesture (see `on_request_edit_session`) and releases it once nothing is
     // unsaved. Editing is only possible when csv_editable.
-    edit_mode?: boolean;
+    editing_session_held?: boolean;
     /**
      * Ask App for the editing session, resolving once the host has granted or
      * refused it. Supplied only while the file can be edited and no session is
@@ -1697,7 +1697,7 @@ export function GridShell({
     on_row_resize,
     merges,
     preview_mode = false,
-    edit_mode = false,
+    editing_session_held = false,
     on_request_edit_session,
     on_edit_session_idle,
     diff_mode = false,
@@ -3182,7 +3182,7 @@ export function GridShell({
     // Keep the underlying activation separate so the post-await fence can ignore
     // only this request's `append_in_flight` affordance, while still observing a
     // save, highlight, close barrier, or deactivated edit session.
-    const append_admission_active = edit_mode
+    const append_admission_active = editing_session_held
         && csv_editable
         && !save_in_flight
         && !highlight_in_flight
@@ -3192,7 +3192,7 @@ export function GridShell({
     // they do under a session; each one asks App for the session first and runs
     // on the grant. Nothing else about the grid changes, so a file that is only
     // being read costs exactly what a read-only one does.
-    const edit_armed = !edit_mode
+    const edit_armed = !editing_session_held
         && on_request_edit_session !== undefined
         && !preview_mode
         && !save_in_flight
@@ -3482,13 +3482,13 @@ export function GridShell({
     // Persist a complete dirty map under a renderer-monotonic sequence. The host
     // acknowledges only after the corresponding state-store write resolves.
     useEffect(() => {
-        if (!edit_mode || !edit_session_id || save_in_flight_ref.current) return;
+        if (!editing_session_held || !edit_session_id || save_in_flight_ref.current) return;
         post_pending_edits(
             dirty_cells.size > 0 ? Object.fromEntries(dirty_cells) : null,
         );
     }, [
         dirty_cells,
-        edit_mode,
+        editing_session_held,
         edit_session_id,
         pending_rows,
         post_pending_edits,
@@ -3556,7 +3556,7 @@ export function GridShell({
     // Row Delete and Restore appear only where the file can be edited and the
     // host reports structural editing for this worksheet.
     const structure_items_offered = structural_support !== undefined
-        && ((edit_mode && csv_editable && edit_session_id !== undefined)
+        && ((editing_session_held && csv_editable && edit_session_id !== undefined)
             // Before a session exists the items are offered all the same; the
             // menu, shortcut, or drag that reaches for one acquires it.
             || edit_armed);
@@ -6702,7 +6702,7 @@ export function GridShell({
             : undefined;
     }, [get_source_row, pending_projection]);
 
-    // Leaving edit mode (or a save taking the grid read-only) makes provide_editor
+    // The session ending (or a save taking the grid read-only) makes provide_editor
     // stop supplying an editor, which unmounts it and runs the cleanup below — but
     // only if Glide re-renders the overlay. Releasing here too makes the lifecycle
     // independent of that: an unreleased pin would hold a page resident for the
@@ -8323,8 +8323,8 @@ export function GridShell({
             const highlight_bg = source_row === undefined
                 ? undefined
                 : get_highlight_background(source_row, source_column);
-            // Tint + dirty text whenever an edit exists; open the overlay only in
-            // edit mode and only where source identity resolved. A resident blank
+            // Tint + dirty text whenever an edit exists; open the overlay only while
+            // cells accept edits and only where source identity resolved. A resident blank
             // cell stays editable so blanks can still be typed.
             // dirty read through the stable `store` handle and conflict through
             // conflicted_keys_ref — never through the subscribed dirty_cells — so
@@ -8435,7 +8435,7 @@ export function GridShell({
                     // the only situation where Glide's paste path needs closing. A
                     // read-only sheet is not refusing anything — it never offered —
                     // and it does reach this branch, via highlight_bg, which is
-                    // plain view state independent of edit mode.
+                    // plain view state independent of the editing session.
                     refused: cells_accept_edits
                         && (source_row === undefined || pending_removal || layout_removal
                             || formula_unrenderable),
@@ -9434,7 +9434,7 @@ export function GridShell({
 
     // Custom overlay editor (Enter/Tab advance, Shift/Alt+Enter newline, Esc
     // cancel). Rich Markdown cells adapt through the same text editor so their
-    // canvas renderer can remain active throughout Edit mode.
+    // canvas renderer can remain active while editing.
     /**
      * The editor refuses to open on a formula that cannot render for the
      * current layouts (the cell is read-only); activating it says why.
@@ -9539,7 +9539,7 @@ export function GridShell({
     // Arm/clear the row-resize strip as the pointer nears a row border. Glide's
     // hover args give the cell's client `bounds` + in-cell `localEventY`.
     // Also drives the truncated-cell tooltip: dwell on an overflowing cell
-    // surfaces the full displayed value without changing selection or edit mode.
+    // surfaces the full displayed value without changing selection or editing state.
     const on_item_hovered = useCallback(
         (args: GridMouseEventArgs) => {
             row_markers.observe_hover(args);
@@ -10346,7 +10346,7 @@ export function GridShell({
         hyperlink_focus_restore_epoch_ref.current += 1;
     }, []);
 
-    const hyperlink_dialog_admitted = edit_mode
+    const hyperlink_dialog_admitted = editing_session_held
         && csv_editable
         && edit_session_id !== undefined
         && hyperlink_dialog?.edit_session_id === edit_session_id
@@ -11441,7 +11441,7 @@ export function GridShell({
                 ),
             preview_mode,
             can_highlight: highlight_selection !== null,
-            // Hiding rows is offered in edit mode: it is a transform like any
+            // Hiding rows is offered while a session is held: it is a transform like any
             // other, and the host admits it from the panel holding the session.
             // Preview keeps its refusal — natural source order is a trust
             // boundary there.
@@ -11775,7 +11775,7 @@ export function GridShell({
                             : `Row actions for ${selected_row_count} selected rows`}
                         items={row_context_menu_items({
                             selected_row_count,
-                            // Offered in edit mode, refused in preview; see the
+                            // Offered while editing, refused in preview; see the
                             // cell menu's can_hide_rows above.
                             can_hide_rows: transform_sections
                                 && !transform_pending

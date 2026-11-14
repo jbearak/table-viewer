@@ -1074,7 +1074,11 @@ export function App(): React.JSX.Element {
         ],
     );
     const too_many_formula_calculation_edits = structural_formula_state.tooManyEdits;
-    const [edit_mode, set_edit_mode_state] = useState(false);
+    // Whether this panel holds the workbook's editing session. Nobody enters or
+    // leaves it: the first editing gesture acquires it, and it is released once
+    // it holds nothing. One granted session makes every worksheet editable; the
+    // active tab chooses only which per-sheet store the mounted grid views.
+    const [editing_session_held, set_editing_session_held_state] = useState(false);
     // Diff toggle (before/after view of dirty cells). Deliberately never reset
     // when a session ends: the button hides when nothing is unsaved, but the
     // choice is still there the next time something is.
@@ -1114,7 +1118,7 @@ export function App(): React.JSX.Element {
     // tells the renderer a comparison is being aligned at all.
     const [compare_progress, set_compare_progress] =
         useState<{ scannedRows: number; totalRows: number } | undefined>(undefined);
-    const edit_mode_ref = useRef(false);
+    const editing_session_held_ref = useRef(false);
     // Passed down as the admission lifetime instead of asking GridShell to derive
     // one during render. React can abandon a child render; only these parent-owned
     // state updates make a new activation observable to the mounted tree.
@@ -1122,14 +1126,14 @@ export function App(): React.JSX.Element {
     const advance_edit_activation = useCallback(() => {
         set_edit_activation_id((current) => current + 1);
     }, []);
-    const set_edit_mode = useCallback((next: boolean) => {
-        const previous = edit_mode_ref.current;
-        edit_mode_ref.current = next;
+    const set_editing_session_held = useCallback((next: boolean) => {
+        const previous = editing_session_held_ref.current;
+        editing_session_held_ref.current = next;
         // Leaving is a new activation too. The grid fences the one that ended,
         // and with no mode to re-enter nothing else would lift that fence: the
         // next editing gesture has to find cells that accept it.
         if (next !== previous) advance_edit_activation();
-        set_edit_mode_state(next);
+        set_editing_session_held_state(next);
     }, [advance_edit_activation]);
     /**
      * The workbook's undo history — one, for the whole workbook, because undoing
@@ -1507,16 +1511,13 @@ export function App(): React.JSX.Element {
         csv_edit_session_id_ref.current = next;
         set_csv_edit_session_id_state(next);
     }, []);
-    // One granted session makes every worksheet editable. The active tab chooses
-    // only which per-sheet store the mounted grid views; it is not an edit pointer.
-    const edit_mode_on_active_sheet = edit_mode;
     // The Save-refusal notice's input: an `.xlsx` conditional-formatting
     // element or data-validation rule on this worksheet that the current
     // layouts would split past the writer's cap, counted with the writer's
     // own partition. Rebuilt with the structural revision.
     const rule_split_warning_messages = useMemo(() => {
         const rules = structural_editing?.sheets[active_sheet_index]?.relativeRules ?? [];
-        if (!meta || edit_syntax !== 'markdown' || !edit_mode_on_active_sheet || rules.length === 0) return [];
+        if (!meta || edit_syntax !== 'markdown' || !editing_session_held || rules.length === 0) return [];
         const pending_by_sheet = new Map(edit_session_registry_ref.current!.pending_entries());
         const changes_for = (sheet_index: number) => pending_by_sheet.get(sheet_index)?.snapshot();
         try {
@@ -1533,7 +1534,7 @@ export function App(): React.JSX.Element {
     },
         // eslint-disable-next-line react-hooks/exhaustive-deps
         [formula_roots_projection.structuralRevision, meta, edit_syntax, structural_editing,
-            active_sheet_index, edit_mode_on_active_sheet],
+            active_sheet_index, editing_session_held],
     );
     const [edit_session_pending, set_edit_session_pending] = useState(false);
     const [save_operation, set_save_operation] = useState<CsvSaveOperation>();
@@ -1960,7 +1961,7 @@ export function App(): React.JSX.Element {
     );
     // The worksheets Save will restructure: a live layout change on each.
     const restructured_sheets = useMemo(() => {
-        if (!meta || !edit_mode_on_active_sheet || structural_editing === undefined) return [];
+        if (!meta || !editing_session_held || structural_editing === undefined) return [];
         const pending_by_sheet = new Map(edit_session_registry_ref.current!.pending_entries());
         return meta.sheets.flatMap((sheet, sheetIndex) => {
             const changes = pending_by_sheet.get(sheetIndex)?.snapshot();
@@ -1970,11 +1971,11 @@ export function App(): React.JSX.Element {
         });
     },
         // eslint-disable-next-line react-hooks/exhaustive-deps
-        [formula_roots_projection.structuralRevision, meta, structural_editing, edit_mode_on_active_sheet],
+        [formula_roots_projection.structuralRevision, meta, structural_editing, editing_session_held],
     );
     // The Save button's description: what Save will do, per worksheet.
     const save_description = useMemo(() => {
-        if (!meta || !edit_mode_on_active_sheet) return undefined;
+        if (!meta || !editing_session_held) return undefined;
         const registry = edit_session_registry_ref.current!;
         const pending_by_sheet = new Map(registry.pending_entries());
         return save_summary({
@@ -2004,7 +2005,7 @@ export function App(): React.JSX.Element {
         });
     },
         // eslint-disable-next-line react-hooks/exhaustive-deps
-        [meta, edit_mode_on_active_sheet, edit_syntax, active_sheet_index, structural_editing,
+        [meta, editing_session_held, edit_syntax, active_sheet_index, structural_editing,
             formula_roots_projection.calculationRevision, formula_roots_projection.structuralRevision,
             // A link-only write adds an edited cell without moving either revision above.
             edit_session_registry_ref.current.revision()],
@@ -2525,10 +2526,10 @@ export function App(): React.JSX.Element {
         });
     }, [csv_edit_session_id, fence_edit_session_exit]);
 
-    const leave_edit_mode = useCallback(() => {
-        set_edit_mode(false);
+    const end_editing_session = useCallback(() => {
+        set_editing_session_held(false);
         release_edit_session();
-        // A verdict is scoped to an editing session. Leaving edit mode ends the one
+        // A verdict is scoped to an editing session. Ending the session ends the one
         // it belonged to, so nothing it named can still be pending.
         clear_save_verdict();
     }, [clear_save_verdict, release_edit_session]);
@@ -2546,7 +2547,7 @@ export function App(): React.JSX.Element {
         //
         // Answered rather than silently dropped, because one caller is the save
         // dialog's "discard" choice: the dialog has already closed by the time this
-        // runs, so a bare `return` would leave the user in edit mode with their
+        // runs, so a bare `return` would leave the user holding the session with their
         // edits intact and no account of why. The button caller is harmless either
         // way — it is visibly still there to press again.
         //
@@ -2589,7 +2590,7 @@ export function App(): React.JSX.Element {
         // Nothing was emptied and nothing recorded, so the user presses it again —
         // which is why the fence comes AFTER this and not before. Fenced first,
         // this return would leave the session alive but its admission stopped and
-        // its publication silenced: the user stays in edit mode with their edits,
+        // its publication silenced: the user keeps the session and their edits,
         // unable to type, and nothing else lowers the fence for a session that is
         // never leaving.
         if (outcome.kind === 'abandoned') return;
@@ -2602,7 +2603,7 @@ export function App(): React.JSX.Element {
                 message: 'These edits were too large to keep in the undo history, so discarding them cannot be undone.',
             });
         }
-        set_edit_mode(false);
+        set_editing_session_held(false);
         // Every edit is being thrown away, including the rejected ones.
         clear_save_verdict();
         // Undo of this discard must wait for the host's cleanup: until it settles,
@@ -2749,7 +2750,7 @@ export function App(): React.JSX.Element {
         // The verdict expires on its own facts instead: the session stamp and the
         // per-key value/base comparison in `live_rejected_keys` (a replaced or
         // departed entry stops matching), the clear at the top of the saveResult
-        // handler for a superseding result, leave_edit_mode/discard_edit_session for
+        // handler for a superseding result, end_editing_session/discard_edit_session for
         // a session that ends, and the explicit clear in the 'initial' reset block
         // for a fresh document.
     }, []);
@@ -2866,11 +2867,11 @@ export function App(): React.JSX.Element {
                 hydrate_and_install(incoming.operation, 'tombstone');
                 set_csv_edit_session_id(undefined);
                 set_edit_session_pending(false);
-                set_edit_mode(false);
+                set_editing_session_held(false);
             }
         }
         return { previous, next, changed: true };
-    }, [install_edit_session, set_csv_edit_session_id, set_edit_mode]);
+    }, [install_edit_session, set_csv_edit_session_id, set_editing_session_held]);
 
     const apply_save_receipt = useCallback((
         operation: CsvSaveOperation,
@@ -3374,7 +3375,7 @@ export function App(): React.JSX.Element {
                     // Every applied snapshot is lifecycle-relevant, including the
                     // first snapshot for a newly selected file.
                     const applied_save_transition = save_transition!;
-                    const edit_mode_before_snapshot = edit_mode_ref.current;
+                    const session_held_before_snapshot = editing_session_held_ref.current;
                     const edit_session_before_snapshot = csv_edit_session_id_ref.current;
                     last_applied_snapshot_ref.current = snapshot.identity;
                     // Fold the open overlay into the store before this snapshot's
@@ -3996,12 +3997,12 @@ export function App(): React.JSX.Element {
                     edit_session_sheet_index_ref.current = snapshot_edit_sheet_index;
                     const refresh_editing_current_session =
                         snapshot.presentation === 'refresh'
-                        && edit_mode_ref.current
+                        && editing_session_held_ref.current
                         && csv_edit_session_id_ref.current === snapshot_edit_session_id
                         && (!pointer_deleted || pending_edit_sheet_index !== undefined);
                     if (pointer_deleted && pending_edit_sheet_index === undefined) {
-                        edit_mode_ref.current = false;
-                        set_edit_mode(false);
+                        editing_session_held_ref.current = false;
+                        set_editing_session_held(false);
                     }
                     const refresh_edits = refresh_edits_for_sheet(snapshot_edit_sheet_index);
                     if (refresh_editing_current_session) {
@@ -4192,7 +4193,7 @@ export function App(): React.JSX.Element {
                     // generation (durable transform reconciliation bumps the
                     // generation without the source, and reports it only here), or a
                     // changed header row — and with nothing else. A same-generation
-                    // capability refresh, which entering edit mode and every
+                    // capability refresh, which a session grant and every
                     // edit-store notification during an owned session redeliver,
                     // leaves the rows exactly where they were.
                     const row_basis_changed =
@@ -4421,11 +4422,11 @@ export function App(): React.JSX.Element {
                                     changes,
                                 );
                         });
-                        const enters_edit_mode = owns_clean_or_dirty_session
+                        const holds_session = owns_clean_or_dirty_session
                             || restored_edits !== undefined
                             || restored_has_structural_changes;
-                        diff_mode_initialized_ref.current = enters_edit_mode;
-                        set_edit_mode(enters_edit_mode);
+                        diff_mode_initialized_ref.current = holds_session;
+                        set_editing_session_held(holds_session);
                         set_editing_status(null);
                         set_editing_status_sheet_index(null);
                         // A fresh document: the rejection and the dismissal go
@@ -4707,8 +4708,8 @@ export function App(): React.JSX.Element {
                     set_csv_editable(snapshot.capabilities.csvEditable);
                     const next_edit_session = snapshot.capabilities.csvEditSessionId;
                     if (
-                        edit_mode_before_snapshot
-                        && edit_mode_ref.current
+                        session_held_before_snapshot
+                        && editing_session_held_ref.current
                         && next_edit_session !== undefined
                         && next_edit_session !== edit_session_before_snapshot
                     ) {
@@ -5218,7 +5219,7 @@ export function App(): React.JSX.Element {
     // host intentionally drops permutations on reload because matching schema
     // does not imply matching values.
     //
-    // Not gated on edit_mode: the host admits a transform from the panel holding
+    // Not gated on editing_session_held: the host admits a transform from the panel holding
     // the session, so re-requesting the stored transform during an owned session
     // is legitimate — and skipping it would leave the user's own saved sort
     // silently uninstalled for the rest of the session. Preview keeps its gate
@@ -5316,10 +5317,10 @@ export function App(): React.JSX.Element {
         // there is nothing durable left at all is the empty state sent, stamped with
         // this sheet's schema the way handle_transform_change does.
         //
-        // Deliberately not gated on edit mode. `admit_transform_for_phase` refuses a
+        // Deliberately not gated on the session. `admit_transform_for_phase` refuses a
         // sibling's transform while we own the session, so the durable rules cannot
         // go inactive from a sibling mid-session; a gate here would instead create a
-        // state that never reconciles, since leaving edit mode moves no dep of this
+        // state that never reconciles, since ending the session moves no dep of this
         // effect.
         restore_request_blockers_ref.current[active_sheet_index] =
             restore_blocker_epoch;
@@ -5392,7 +5393,7 @@ export function App(): React.JSX.Element {
             // committing the text. Fold it first, as the transform and refresh
             // remounts do; the store lives above the grid and keeps it.
             if (
-                edit_mode_ref.current
+                editing_session_held_ref.current
                 && editing_ref.current?.commit_live_edit() === false
             ) return;
             set_filter_editor(null);
@@ -6319,13 +6320,13 @@ export function App(): React.JSX.Element {
         const header = sheet?.excelFirstRowHeader;
         // Every header affordance funnels through here: the primary toggle, row
         // promotion, Unhide all for a promoted header, and the all-sheets queue.
-        // Edit mode can commit an open cell and refresh the worksheet before this
+        // An editing session can commit an open cell and refresh the worksheet before this
         // command reaches the host, invalidating the generation it was posted with.
         // Keep this guard at the shared command boundary as well as disabling each
         // visible affordance, so a stale callback or a queue cannot bypass it.
         if (!sheet || !header) return 'skip';
         if (
-            (!session_is_empty && (edit_mode || edit_mode_ref.current))
+            (!session_is_empty && (editing_session_held || editing_session_held_ref.current))
             || (
                 header_row !== undefined
                 && (preview_mode || preview_mode_ref.current)
@@ -6370,7 +6371,7 @@ export function App(): React.JSX.Element {
         return 'posted';
     }, [
         active_sheet_index,
-        edit_mode,
+        editing_session_held,
         header_waits_for_transform,
         meta,
         preview_mode,
@@ -6420,7 +6421,7 @@ export function App(): React.JSX.Element {
     /** Queue every sheet that is not already in `enabled`, for the chevron menu. */
     const set_excel_header_all_sheets = useCallback((enabled: boolean) => {
         if (
-            edit_mode_ref.current
+            editing_session_held_ref.current
             || header_waits_for_transform(active_sheet_index, false)
         ) return;
         const sheets = (meta?.sheets ?? [])
@@ -6444,7 +6445,7 @@ export function App(): React.JSX.Element {
         // The row menu acquires the session for its editing items, so one is
         // held here even when nothing was edited. Empty, it locks nothing: the
         // request goes ahead of the release the closing menu causes.
-        const session_is_empty = edit_mode_ref.current
+        const session_is_empty = editing_session_held_ref.current
             && !edit_session_registry_ref.current!.has_dirty_entries()
             && editing_ref.current?.has_uncommitted_changes() === false
             // Text typed into the append composer is unsaved work too.
@@ -6500,7 +6501,7 @@ export function App(): React.JSX.Element {
         // Held, not merely named: a session released a moment ago keeps its id
         // here until the host's next snapshot, and a replay prepared against
         // it would be refused for a session this panel no longer owns.
-        if (edit_mode_ref.current && csv_edit_session_id_ref.current !== undefined) return true;
+        if (editing_session_held_ref.current && csv_edit_session_id_ref.current !== undefined) return true;
         // A request already in flight — an editing gesture made a moment ago —
         // is joined rather than duplicated: the host answers one request, and a
         // second would be refused while the first is outstanding.
@@ -6554,7 +6555,7 @@ export function App(): React.JSX.Element {
      * waits out a discard's cleanup for the same reason it does.
      */
     const request_edit_session = useCallback(async (quiet = false): Promise<boolean> => {
-        const held = () => edit_mode_ref.current
+        const held = () => editing_session_held_ref.current
             && csv_edit_session_id_ref.current !== undefined;
         if (held()) return true;
         const discarding = discard_cleanup_ref.current;
@@ -6614,7 +6615,7 @@ export function App(): React.JSX.Element {
     const release_edit_session_if_idle = useCallback(() => {
         const editing = editing_ref.current;
         if (
-            !edit_mode_ref.current
+            !editing_session_held_ref.current
             || csv_edit_session_id_ref.current === undefined
             || editing === null
             || editing.session_busy()
@@ -6630,8 +6631,8 @@ export function App(): React.JSX.Element {
                 draft.some((row) => Object.values(row).some((value) => value !== '')))
             || edit_session_registry_ref.current!.has_dirty_entries()
         ) return;
-        leave_edit_mode();
-    }, [edit_gestures_admitted, leave_edit_mode]);
+        end_editing_session();
+    }, [edit_gestures_admitted, end_editing_session]);
     // After every render, because the facts above change through a dozen
     // handlers and none of them should have to remember this. GridShell asks
     // again when something only it can see has ended, such as an editor closed
@@ -6646,7 +6647,7 @@ export function App(): React.JSX.Element {
      * answer and drifted once already: Cancel checked only the save, and a cancel is
      * itself a transform request.
      *
-     * Edit mode is deliberately not here: the host admits a transform from the panel
+     * The editing session is deliberately not here: the host admits a transform from the panel
      * that owns the session. A save in flight is, because it has already validated
      * every edit's base against the natural source (see `save_blocks_transform` in
      * viewer-controller.ts). `edit_session_pending` is a claim mid-flight, which the
@@ -7184,7 +7185,7 @@ export function App(): React.JSX.Element {
                         diff_mode_initialized_ref.current = true;
                     }
                     if (
-                        edit_mode_ref.current
+                        editing_session_held_ref.current
                         && csv_edit_session_id_ref.current !== msg.editSessionId
                     ) {
                         advance_edit_activation();
@@ -7217,7 +7218,7 @@ export function App(): React.JSX.Element {
                     // useSyncExternalStore rather than a useState initializer, and
                     // `install` force-notifies, so a changed map — including an empty
                     // one — installs into the mounted grid. Bumping load_epoch here
-                    // would also reset column visibility, and entering edit mode is
+                    // would also reset column visibility, and a session grant is
                     // not a data reload.
                     install_edit_session(
                         msg.pendingChanges?.cells ?? msg.pendingEdits,
@@ -7225,10 +7226,10 @@ export function App(): React.JSX.Element {
                         msg.sheetIndex ?? 0,
                         msg.pendingChanges,
                     );
-                    set_edit_mode(true);
+                    set_editing_session_held(true);
                 } else if (csv_edit_session_id_ref.current === undefined) {
                     set_csv_edit_session_id(undefined);
-                    set_edit_mode(false);
+                    set_editing_session_held(false);
                 }
                 // After the install and the edit-mode transition, so a replay
                 // resuming here reads the stores the grant just replaced rather
@@ -7717,8 +7718,8 @@ export function App(): React.JSX.Element {
     // If editing becomes unavailable (e.g. a reload disables CSV editing), let
     // the session go so the toolbar and banners don't dangle.
     useEffect(() => {
-        if (edit_mode && !csv_editable) leave_edit_mode();
-    }, [edit_mode, csv_editable, leave_edit_mode]);
+        if (editing_session_held && !csv_editable) end_editing_session();
+    }, [editing_session_held, csv_editable, end_editing_session]);
 
     // Keep the store's session stamp level with the session id GridShell's hook
     // writes under. The host advances csvEditSessionId on *every* applied
@@ -8544,7 +8545,7 @@ export function App(): React.JSX.Element {
     // The active worksheet's structural conflict, whose notice counts what
     // each salvage action does to formulas: Discard for either reason, Keep
     // only for a Structural Basis change.
-    const impact_conflict = !edit_mode_on_active_sheet
+    const impact_conflict = !editing_session_held
         ? undefined
         : active_pending_conflicts.some((conflict) => conflict.reason === 'structuralBasisChanged')
             ? 'structuralBasisChanged'
@@ -8632,7 +8633,7 @@ export function App(): React.JSX.Element {
             : salvage_impact.answer === null || salvage_impact.answer === undefined
                 ? { state: 'unavailable' }
                 : { state: 'ready', ...salvage_impact.answer };
-    const notice_conflicts = edit_mode_on_active_sheet ? active_pending_conflicts : EMPTY_CONFLICTS;
+    const notice_conflicts = editing_session_held ? active_pending_conflicts : EMPTY_CONFLICTS;
     const notice_worksheet_key = !meta
         ? ''
         : worksheet_target_key({
@@ -8763,7 +8764,7 @@ export function App(): React.JSX.Element {
             items: [
                 {
                     label: `Use first row as header on ${all_sheets}`,
-                    disabled: edit_mode_on_active_sheet
+                    disabled: editing_session_held
                         || pending_transforms.some(Boolean)
                         || header_capable_sheets.every((sheet) =>
                             sheet.excelFirstRowHeader!.mode === 'on'
@@ -8772,7 +8773,7 @@ export function App(): React.JSX.Element {
                 },
                 {
                     label: `Show first row as data on ${all_sheets}`,
-                    disabled: edit_mode_on_active_sheet
+                    disabled: editing_session_held
                         || pending_transforms.some(Boolean)
                         || header_capable_sheets.every((sheet) =>
                             !(sheet.excelFirstRowHeader!.mode === 'on'
@@ -8818,7 +8819,7 @@ export function App(): React.JSX.Element {
     // editor to the wrong line (see the guard above `handle_transform_message`
     // and the `hideRows` preview reject in viewer-controller.ts).
     //
-    // Edit mode, separately, no longer suppresses anything: an installed sort or
+    // An editing session, separately, suppresses nothing: an installed sort or
     // filter stays visible while the user edits, and deliberately does not
     // recompute, so rows keep their positions mid-edit.
     const visible_transform = preview_mode ? EMPTY_TRANSFORM : current_transform;
@@ -8852,14 +8853,14 @@ export function App(): React.JSX.Element {
         (!excel_header_candidate_available
             && !excel_header.active
             && excel_header.mode !== 'on')
-        || edit_mode_on_active_sheet
+        || editing_session_held
         || any_transform_pending
         || excel_header_pending
     );
     // Promotion is offered from the row menu, which holds a session of its own
     // while open: only a session with unsaved work locks the header row there.
     const promote_row_blocked = !!excel_header && (
-        (edit_mode_on_active_sheet
+        (editing_session_held
             && (edit_session_registry_ref.current!.has_dirty_entries()
                 || editing_status?.has_live_uncommitted === true))
         || any_transform_pending
@@ -8874,7 +8875,7 @@ export function App(): React.JSX.Element {
             : pending_excel_header_promote_ref.current
             ? 'Making row header…'
             : 'Updating column names…'
-        : edit_mode_on_active_sheet
+        : editing_session_held
         ? 'Save or discard your changes before changing the header row.'
         : 'Wait for sorting and filtering to finish.';
     const effective_row_count = installed_view?.rowCount ?? current_sheet.rowCount;
@@ -8915,7 +8916,7 @@ export function App(): React.JSX.Element {
     /**
      * The one reason set that hides or disables transform affordances, shared by
      * the grid's header sections and the toolbar so the two can never disagree.
-     * Edit mode is deliberately absent — sorting and filtering stay available
+     * The editing session is deliberately absent — sorting and filtering stay available
      * while editing. What remains are the windows in which the host would refuse
      * the request anyway (a save in flight, a claim mid-flight) or in which the
      * displayed order is not the user's to change (preview, an Excel header
@@ -8944,16 +8945,17 @@ export function App(): React.JSX.Element {
 
     // Stale-view banner: derived from the rules actually *installed* in the grid, not
     // the requested ones, because the statement is about the order the user is
-    // looking at. Only meaningful in edit mode — outside it the order recomputes as
-    // normal.
+    // looking at. Only meaningful while the session is held — outside it the order
+    // recomputes as normal.
     //
     // The hidden cells ride the same record, so they need no state of their own and
-    // cannot disagree with the rules they were computed against. No `edit_mode` term
-    // of their own either: the signature below carries the only one there should be,
-    // and the message is rendered only when the banner is. Probed rather than assumed
+    // cannot disagree with the rules they were computed against. No
+    // `editing_session_held` term of their own either: the signature below carries
+    // the only one there should be, and the message is rendered only when the banner
+    // is. Probed rather than assumed
     // — a second copy of that gate here fails no test, which makes it a guard nothing
-    // could hold to account. The one below is now pinned: see "goes silent when edit
-    // mode ends with the dirty map still reported", which deleting it fails.
+    // could hold to account. The one below is now pinned: see "goes silent when the
+    // session ends with the dirty map still reported", which deleting it fails.
     //
     // Narrowed to keys the dirty map still holds, which is the *subtracting* half of
     // keeping this current. The host answers membership, which only an install can
@@ -8995,7 +8997,7 @@ export function App(): React.JSX.Element {
         installed_rules,
         dirty_keys,
     );
-    const stale_view_current_signature = edit_mode_on_active_sheet
+    const stale_view_current_signature = editing_session_held
         ? stale_view_signature(
             installed_rules,
             dirty_keys,
@@ -9035,7 +9037,7 @@ export function App(): React.JSX.Element {
     const externally_changed_keys = editing_status_is_for_active_sheet
         ? editing_status?.conflicted ?? []
         : [];
-    const show_host_rejection = edit_mode_on_active_sheet
+    const show_host_rejection = editing_session_held
         && live_rejected_keys.length > 0;
     const removed_keys = show_host_rejection
         && save_rejection?.reason === 'rowsRemoved'
@@ -9141,7 +9143,7 @@ export function App(): React.JSX.Element {
         external_change_navigation_pending_key?.startsWith(
             `${external_change_occurrence_key}\u0000`,
         ) === true;
-    const show_external_change_banner = edit_mode_on_active_sheet
+    const show_external_change_banner = editing_session_held
         && (changed_items.length > 0 || removed_items.length > 0)
         && dismissed_external_change_occurrences[external_change_worksheet_key]
             !== external_change_occurrence;
@@ -9276,13 +9278,13 @@ export function App(): React.JSX.Element {
             on_row_resize={handle_row_resize}
             merges={merges_flattened ? [] : current_sheet.merges}
             preview_mode={preview_mode}
-            edit_mode={edit_mode_on_active_sheet}
+            editing_session_held={editing_session_held}
             // Present exactly while an editing gesture should be accepted with
             // no session behind it yet: the file can be edited, and nothing
             // known here would make the host refuse for good.
             on_request_edit_session={
                 csv_editing_supported
-                && !edit_mode_on_active_sheet
+                && !editing_session_held
                 && !save_ui_fenced
                 && !(truncation_message && !csv_editable)
                     ? request_edit_session
@@ -9431,7 +9433,7 @@ export function App(): React.JSX.Element {
                 hidden_rows={{
                     count: hidden_row_count,
                     pending: transform_pending,
-                    disabled: edit_mode_on_active_sheet
+                    disabled: editing_session_held
                         && excel_header?.mode === 'on'
                         && excel_header.sourceRow !== 0,
                     on_unhide_all: handle_unhide_all_rows,
@@ -9536,7 +9538,7 @@ export function App(): React.JSX.Element {
                         : 'Wait for sorting and filtering to finish.'
                 }
                 editable={csv_editing_supported}
-                editing={edit_mode_on_active_sheet}
+                editing={editing_session_held}
                 diff_mode={diff_mode}
                 on_toggle_diff_mode={handle_toggle_diff_mode}
                 is_dirty={is_dirty}
