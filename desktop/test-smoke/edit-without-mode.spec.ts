@@ -180,3 +180,57 @@ test('the add-row launcher is there from the start and its first use adds a row'
     await expect.poll(() => fs.readFileSync(csv, 'utf8').split('\n').length).toBe(6);
     await expect_nothing_unsaved();
 });
+
+// Save releases the editing session and leaves the file holding what the
+// overlay held, so the two tests below are the ones that prove history survives
+// both: the first undo after a save has to act, with no second press and no
+// warning.
+test('undo after Save walks a saved edit back on the first press, and redo returns it', async () => {
+    await select_cell(1, 0);
+    await page.keyboard.type('Hello', { delay: 0 });
+    await expect(editor()).toHaveValue('Hello');
+    await page.keyboard.press('Enter');
+    await expect(cell(1, 0)).toHaveText('Hello');
+    await save().click();
+    const saved = 'Name,Age,City\nHello,30,New York\nBob,25,London\nCharlie,35,Paris\n';
+    await expect.poll(() => fs.readFileSync(csv, 'utf8')).toBe(saved);
+    await expect_nothing_unsaved();
+
+    // One press: the cell goes back, as an unsaved change over the saved file.
+    await undo();
+    await expect(cell(1, 0)).toHaveText('Alice');
+    await expect(save()).toHaveClass(/has-unsaved/);
+    expect(fs.readFileSync(csv, 'utf8')).toBe(saved);
+
+    // Redo lands on what the file already holds, so nothing is left to save.
+    await page.evaluate(() => window.postMessage({ type: 'editCommand', command: 'redo' }, '*'));
+    await expect(cell(1, 0)).toHaveText('Hello');
+    await expect_nothing_unsaved();
+
+    // And the undo can be saved, which writes the original back.
+    await undo();
+    await expect(cell(1, 0)).toHaveText('Alice');
+    await save().click();
+    await expect.poll(() => fs.readFileSync(csv, 'utf8')).toBe(fixture_text);
+    await expect_nothing_unsaved();
+});
+
+test('undo after Save takes a saved appended row back out on the first press', async () => {
+    const rows = page.locator('tbody tr');
+    await page.getByRole('button', { name: 'Add rows' }).click();
+    await page.getByRole('button', { name: 'Add row', exact: true }).click();
+    await expect(rows).toHaveCount(4);
+    await save().click();
+    await expect.poll(() => fs.readFileSync(csv, 'utf8')).toBe(`${fixture_text},,\n`);
+    await expect_nothing_unsaved();
+    // The saved row is a row of the file now, with a cell of its own.
+    await expect(cell(1, 3)).toBeAttached();
+
+    // The row stays in place until the next save removes it.
+    await undo();
+    await expect(save()).toHaveClass(/has-unsaved/);
+    await save().click();
+    await expect.poll(() => fs.readFileSync(csv, 'utf8')).toBe(fixture_text);
+    await expect(rows).toHaveCount(3);
+    await expect_nothing_unsaved();
+});

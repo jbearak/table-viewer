@@ -461,7 +461,8 @@ describe('xlsx edit sessions', () => {
         };
     }
 
-    async function prepare_saved_row_restoration(
+    /** Append one row to People and save it, returning the save's assignment. */
+    async function save_appended_row(
         panel: Awaited<ReturnType<typeof open_ready_xlsx>>,
         prefix: string,
     ) {
@@ -524,7 +525,14 @@ describe('xlsx edit sessions', () => {
             (result) => result.lifecycle.operation.saveRequestId === `${prefix}-save-append`,
         )!;
         expect(append_result.success).toBe(true);
-        const assignment = append_result.receipt!.appendedRows[0];
+        return append_result.receipt!.appendedRows[0];
+    }
+
+    async function prepare_saved_row_restoration(
+        panel: Awaited<ReturnType<typeof open_ready_xlsx>>,
+        prefix: string,
+    ) {
+        const assignment = await save_appended_row(panel, prefix);
 
         const remove_session = await request_edit_session_when_available(
             panel,
@@ -7603,6 +7611,60 @@ describe('xlsx edit sessions', () => {
             requestId: 'undelivered-lease-restore-retry',
             granted: true,
         }));
+    });
+
+    it('keeps saved-row authority when a retention report still names the row as pending', async () => {
+        const panel = await open_ready_xlsx(file_path, versioned_state_store({}));
+        const opened = latest_snapshot(panel).sourceGeneration;
+        const assignment = await save_appended_row(panel, 'stale-retention');
+        // The host validates against the file it has observed, so wait for the
+        // post-save reload that observes the saved row.
+        await wait_for_observable(() => latest_snapshot(panel).sourceGeneration !== opened);
+        const people = { sheetIndex: 0, sheetName: 'People', worksheetId: '1' };
+        const validate = async (request_id: string) => {
+            const session = await request_edit_session_when_available(panel, `${request_id}-edit`);
+            await panel.__receive({
+                type: 'validateTailRemovalReplay',
+                requestId: request_id,
+                editSessionId: session,
+                sourceGeneration: latest_snapshot(panel).sourceGeneration,
+                worksheets: [{
+                    ...people,
+                    removals: [{
+                        appendHistoryId: assignment.pendingRowId,
+                        sourceRow: assignment.sourceRow,
+                        savedFingerprint: assignment.savedFingerprint,
+                    }],
+                }],
+            });
+            return panel.__messages.find((message) => (
+                typeof message === 'object'
+                && message !== null
+                && (message as { type?: unknown }).type === 'tailRemovalReplayValidated'
+                && (message as { requestId?: unknown }).requestId === request_id
+            )) as { valid?: boolean } | undefined;
+        };
+
+        // The report the renderer built before it applied the save's receipt:
+        // its history still calls the row pending. It arrives after the save
+        // created the capability, and must not retire it.
+        await panel.__receive({
+            type: 'retainedSavedAppendAuthoritiesChanged',
+            authorities: [{ ...people, appendHistoryIds: [], pendingRowIds: [assignment.pendingRowId] }],
+        });
+        // And the one it sends once its history names the row as saved.
+        await panel.__receive({
+            type: 'retainedSavedAppendAuthoritiesChanged',
+            authorities: [{ ...people, appendHistoryIds: [assignment.pendingRowId], pendingRowIds: [] }],
+        });
+        expect((await validate('stale-retention-kept'))?.valid).toBe(true);
+
+        // A report that names the row neither way still retires it.
+        await panel.__receive({
+            type: 'retainedSavedAppendAuthoritiesChanged',
+            authorities: [{ ...people, appendHistoryIds: [], pendingRowIds: [] }],
+        });
+        expect((await validate('stale-retention-retired'))?.valid).toBe(false);
     });
 
     it('keeps saved-row authority while its worksheet is temporarily absent', async () => {

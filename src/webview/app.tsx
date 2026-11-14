@@ -197,6 +197,7 @@ import {
     resolve_csv_save_structural_hydration_from_worksheets,
     save_lifecycle_correlation,
     save_operation_worksheets,
+    saved_history_cells,
     terminal_csv_save_settles_operation,
     type CsvSaveProjection,
 } from './csv-save-lifecycle';
@@ -241,6 +242,7 @@ import {
     is_structural_history_change,
     retained_saved_append_authorities,
     type HistoryEntry,
+    type SavedHistoryCell,
 } from './history-stack-model';
 import {
     plan_pending_row_history_replay,
@@ -2313,6 +2315,16 @@ export function App(): React.JSX.Element {
     const last_applied_snapshot_ref = useRef<WorkbookSnapshotIdentity | null>(null);
     const processed_snapshot_results_ref = useRef(new Set<string>());
     const document_epoch_ref = useRef(0);
+    /**
+     * Which document the workbook history belongs to, counted up each time a
+     * different file replaces it and the history is cleared.
+     *
+     * Not `document_epoch_ref`, which moves on every applied snapshot. An undo
+     * that has to acquire an editing session receives snapshots as part of the
+     * grant, so a replay guarded by that epoch read its own session arriving as
+     * the document leaving, and stopped without doing or saying anything.
+     */
+    const history_document_ref = useRef(0);
     const preview_mode_ref = useRef(false);
     const preview_scroll_sequence_ref = useRef(0);
     const pending_preview_scroll_ref = useRef<PendingPreviewScroll | null>(null);
@@ -2775,6 +2787,7 @@ export function App(): React.JSX.Element {
                 seen.add(sheet_index);
                 resolved.push([sheet_index, worksheet]);
             }
+            const saved_cells: SavedHistoryCell[] = [];
             for (const [sheet_index, worksheet] of resolved) {
                 const entries = edit_session_registry_ref.current!
                     .for_sheet(sheet_index).snapshot();
@@ -2785,6 +2798,16 @@ export function App(): React.JSX.Element {
                     ? worksheet.dirtyEdits
                     : remove_operation_owned_pending_edits(pending, worksheet);
                 install_edit_session(hydrated, current_session_id, sheet_index);
+                if (disposition === 'tombstone') {
+                    const sheet = meta_ref.current?.sheets[sheet_index];
+                    // One at a time: a save can write more cells than a
+                    // spread may pass as arguments.
+                    for (const cell of saved_history_cells(worksheet, {
+                        sheetIndex: sheet_index,
+                        sheetName: sheet?.name ?? worksheet.sheetName,
+                        worksheetId: sheet?.worksheetId ?? worksheet.worksheetId,
+                    }, hydrated)) saved_cells.push(cell);
+                }
                 if (disposition === 'tombstone' && worksheet.structuralChanges) {
                     const structural_store = edit_session_registry_ref.current!
                         .pending_rows_for_sheet(sheet_index);
@@ -2798,6 +2821,13 @@ export function App(): React.JSX.Element {
                     );
                 }
             }
+            // The overlays the save wrote are gone, and the file now holds what
+            // they held. History still describes every one of those cells as a
+            // difference from the file before the save, so it is re-expressed
+            // over the saved content here, in the same step that drops them.
+            // Without that, undo finds no overlay where it recorded one and
+            // refuses.
+            history_store_ref.current!.rebase_saved_cells(saved_cells);
         };
         if (incoming.state === 'active') {
             if (
@@ -3671,6 +3701,7 @@ export function App(): React.JSX.Element {
                         // edits, waiting to be replayed through whatever
                         // worksheet identity happened to match here.
                         history_store_ref.current!.clear();
+                        history_document_ref.current += 1;
                         // And any replay still in flight was planned against the
                         // document that just left. Its caller is awaiting an
                         // answer, so it is settled rather than dropped — a promise
@@ -5697,7 +5728,7 @@ export function App(): React.JSX.Element {
     const run_history_command = useCallback(async (direction: HistoryDirection) => {
         const coordinator = replay_coordinator_ref.current;
         if (coordinator === null) return;
-        const replay_document_epoch = document_epoch_ref.current;
+        const replay_document = history_document_ref.current;
         if (!edit_gestures_admitted()) return;
         const initial = peek_history(history_store_ref.current!.snapshot(), direction);
         if (
@@ -5715,7 +5746,7 @@ export function App(): React.JSX.Element {
                 const replay_session_ready = await (
                     ensure_replay_session_ref.current?.() ?? Promise.resolve(false)
                 );
-                if (document_epoch_ref.current !== replay_document_epoch) return;
+                if (history_document_ref.current !== replay_document) return;
                 if (!replay_session_ready) {
                     host_bridge.postMessage({
                         type: 'showWarning',
@@ -5782,7 +5813,7 @@ export function App(): React.JSX.Element {
                             appendHistoryIds: ids,
                         });
                     });
-                    if (document_epoch_ref.current !== replay_document_epoch) return;
+                    if (history_document_ref.current !== replay_document) return;
                     if (admission === undefined) {
                         host_bridge.postMessage({
                             type: 'showWarning',
@@ -5921,7 +5952,7 @@ export function App(): React.JSX.Element {
                                 worksheets: removals_to_validate,
                             });
                         });
-                        if (document_epoch_ref.current !== replay_document_epoch) return;
+                        if (history_document_ref.current !== replay_document) return;
                         if (!valid) {
                             host_bridge.postMessage({
                                 type: 'showWarning',
@@ -5942,7 +5973,7 @@ export function App(): React.JSX.Element {
                     restorations_handed_off = true;
                     const barrier = history_store_ref.current?.snapshot().barrier;
                     const outcome = await coordinator.begin(direction);
-                    if (document_epoch_ref.current !== replay_document_epoch) return;
+                    if (history_document_ref.current !== replay_document) return;
                     if (outcome.kind === 'refused') {
                         const warning = history_refusal_warning(
                             outcome.reason,
@@ -5972,7 +6003,7 @@ export function App(): React.JSX.Element {
         // in the way, and the stack may move under the await.
         const barrier = history_store_ref.current?.snapshot().barrier;
         const outcome = await coordinator.begin(direction);
-        if (document_epoch_ref.current !== replay_document_epoch) return;
+        if (history_document_ref.current !== replay_document) return;
         if (outcome.kind !== 'refused') return;
         const warning = history_refusal_warning(
             outcome.reason,
