@@ -71,11 +71,19 @@ async function expect_undo_label(label: string): Promise<void> {
     await expect.poll(() => undo_menu_label(app!), { timeout: 15_000 }).toBe(`Undo ${label}`);
 }
 
-/** Close a cell menu by clicking its cell: a press outside the menu closes it, with no focus needed. */
+/**
+ * Close a cell menu by clicking its cell: a press outside the menu closes it,
+ * with no focus needed. The menu opens with its corner at the cell's center,
+ * so the click lands left of center, clear of the menu's edge. The menu only
+ * listens for outside presses after a zero-delay timer, which a background
+ * window throttles, so an early click can miss; click again until it closes.
+ */
 async function close_cell_menu(page: Page, column: number, row: number): Promise<void> {
     const point = await cell_point(page, column, row);
-    await page.mouse.click(point.x, point.y);
-    await expect(page.locator('[role="menu"]')).toHaveCount(0);
+    await expect(async () => {
+        await page.mouse.click(point.x - 40, point.y);
+        await expect(page.locator('[role="menu"]')).toHaveCount(0, { timeout: 1_000 });
+    }).toPass({ timeout: 15_000 });
 }
 
 test('CSV rows: insert, delete, restore, move by keyboard and drag, then save', async () => {
