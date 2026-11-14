@@ -9,7 +9,8 @@
  *   worksheet can't be restructured, pending rows no longer fit, a rule
  *   would split past the writer's cap, or a formula can't be adjusted;
  * - formulas will show `#REF!` because a row or column they use was deleted,
- *   and the formulas that use their results will show errors too;
+ *   and the formulas that use their results will show errors too; one that
+ *   catches the error shows its fallback value, but Save still rewrites it;
  * - formulas whose range a move or delete changed in a way Excel might not.
  *
  * A pure function of its input: the workbook's pending structure as the
@@ -515,6 +516,9 @@ const DEPENDENT_NOTES: Readonly<Record<FormulaDependentResult, string>> = Object
     unchecked: 'Might show an error',
 });
 
+/** Why a formula that catches the error is listed: Save still writes #REF! into it. */
+const CAUGHT_NOTE = 'Shows its fallback value';
+
 /**
  * The formulas that use the broken ones' results, after the first sentence:
  * "2 more formulas use their results and will show #REF! too." and "Table
@@ -534,23 +538,49 @@ function dependent_sentences(direct: number, ref: number, unchecked: number): st
     return sentences;
 }
 
+/**
+ * The formulas that use what was deleted but catch the error, so they show
+ * their fallback values rather than #REF!: "1 more formula uses the deleted
+ * column but catches the error, so it will show its fallback value instead."
+ * `deleted` names what was deleted: "column", "rows and columns".
+ */
+function caught_sentences(direct: number, caught: number, deleted: string, thing_words: string): string[] {
+    if (caught === 0) return [];
+    const one = caught === 1;
+    const result = one ? 'it will show its fallback value' : 'they will show their fallback values';
+    if (direct > 0) {
+        return [`${count(caught, 'more formula uses', 'more formulas use')} the deleted ${deleted} `
+            + `but ${one ? 'catches' : 'catch'} the error, so ${result} instead.`];
+    }
+    return [
+        `${count(caught, 'formula uses', 'formulas use')} ${thing_words}.`,
+        `${one ? 'It catches' : 'They catch'} the error, so after you save, ${result} instead of #REF!.`,
+    ];
+}
+
 function deleted_references_notice(input: PendingChangeNoticeInput): PendingChangeNotice | undefined {
     const review = input.formulaReview?.review;
     if (review === undefined || review === null || review.deleted.length === 0) return undefined;
     const groups = unique_cells(review.deleted);
+    // Save writes #REF! into both kinds; one that catches the error shows its
+    // fallback value instead, so it is listed but not counted as showing #REF!.
+    const caught_groups = groups.filter((group) => group[0]!.catchesErrors === true);
+    const ref_groups = groups.filter((group) => group[0]!.catchesErrors !== true);
     const dependents = review.dependents;
     const entries = [
-        ...groups.map((group) => formula_entry(input, group[0]!)),
+        ...ref_groups.map((group) => formula_entry(input, group[0]!)),
         ...dependents.map((item) => formula_entry(input, item, DEPENDENT_NOTES[item.result])),
+        ...caught_groups.map((group) => formula_entry(input, group[0]!, CAUGHT_NOTE)),
     ];
     // The host's totals count every formula cell, past its item cap too.
-    const direct = Math.max(groups.length, review.totals.deleted);
+    const direct = Math.max(ref_groups.length, review.totals.deleted);
+    const caught = Math.max(caught_groups.length, review.totals.deletedCaught);
     const ref = Math.max(dependents.filter((item) => item.result === 'ref').length, review.totals.refDependents);
     const unchecked = Math.max(
         dependents.filter((item) => item.result === 'unchecked').length,
         review.totals.uncheckedDependents,
     );
-    const total = direct + ref + unchecked;
+    const total = direct + caught + ref + unchecked;
     const distinct = (pick: (item: FormulaDeletedItem) => readonly unknown[]) => new Set(review.deleted.flatMap((item) =>
         pick(item).map((identity) => `${item.targetSheetIndex}:${JSON.stringify(identity)}`))).size;
     const rows = distinct((item) => item.rows);
@@ -559,10 +589,14 @@ function deleted_references_notice(input: PendingChangeNoticeInput): PendingChan
         ? 'rows and columns'
         : columns > 0 ? (columns === 1 ? 'column' : 'columns') : (rows === 1 ? 'row' : 'rows');
     const pronoun = total === 1 ? 'it' : 'them';
+    const thing_words = deleted_thing_words(input, review.deleted);
     const sentences = [
-        `${count(direct, 'formula uses', 'formulas use')} ${deleted_thing_words(input, review.deleted)}. `
-            + `After you save, ${direct === 1 ? 'it' : 'they'} will show #REF!.`,
+        ...(direct > 0
+            ? [`${count(direct, 'formula uses', 'formulas use')} ${thing_words}. `
+                + `After you save, ${direct === 1 ? 'it' : 'they'} will show #REF!.`]
+            : []),
         ...dependent_sentences(direct, ref, unchecked),
+        ...caught_sentences(direct, caught, restore, thing_words),
         `Restore the ${restore}, or undo, to keep ${pronoun} working.`,
     ];
     const deleted = [...new Set(review.deleted.flatMap((item) => [
@@ -574,7 +608,7 @@ function deleted_references_notice(input: PendingChangeNoticeInput): PendingChan
         kind: 'deletedReferences',
         role: 'status',
         severity: 'warning',
-        label: 'Formulas that will show #REF!',
+        label: direct > 0 ? 'Formulas that will show #REF!' : 'Formulas that use what you deleted',
         sentences,
         formulas: formula_list(entries, total),
         actions: [{ label: 'Dismiss', intent: { kind: 'dismiss', key: dismissKey } }],

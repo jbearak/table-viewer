@@ -2159,7 +2159,13 @@ export function GridShell({
             && saved_row_focus.sourceRow < sheet_meta.sourceRowCount
             ? [saved_row_focus.sourceRow]
             : []),
+        ...(cell_focus !== null
+            && cell_focus.sheetIndex === sheet_index
+            && cell_focus.row.kind === 'source'
+            ? [cell_focus.row.sourceRow]
+            : []),
     ])].sort((left, right) => left - right), [
+        cell_focus,
         pending_rows.tailRemovals,
         saved_row_focus,
         sheet_index,
@@ -4776,6 +4782,8 @@ export function GridShell({
         transform_pending,
     ]);
     const applied_cell_focus_ref = useRef<number | null>(null);
+    /** The request and the view it is being placed in; `null` while it waits. */
+    const cell_focus_attempt_ref = useRef<string | null>(null);
     const cell_focus_mounted_ref = useRef(true);
     useEffect(() => {
         cell_focus_mounted_ref.current = true;
@@ -4784,18 +4792,46 @@ export function GridShell({
     useLayoutEffect(() => {
         if (cell_focus === null || cell_focus.sheetIndex !== sheet_index) return;
         if (applied_cell_focus_ref.current === cell_focus.sequence) return;
-        applied_cell_focus_ref.current = cell_focus.sequence;
         const sequence = cell_focus.sequence;
         const { row, column } = cell_focus;
+        // A request often arrives with this grid: Go to cell on another sheet
+        // switches to it. It waits until the grid can place the cell, so it
+        // says the cell isn't there only when it isn't. While a sort, filter,
+        // or hidden-row change is applied, rows are about to change places;
+        // under one, only the host knows where an unloaded row went
+        // (`source_display_query_rows` asks it).
+        const waiting = transform_pending || (
+            row.kind === 'source'
+            && rows_are_projected
+            && get_display_row_for_source(row.sourceRow) === undefined
+            && (
+                resolved_source_display_rows.generation !== generation
+                || resolved_source_display_rows.mappingGeneration !== mapping_generation
+                || !resolved_source_display_rows.rows.has(row.sourceRow)
+            )
+        );
+        if (waiting) {
+            cell_focus_attempt_ref.current = null;
+            return;
+        }
+        // A new view (a refresh, a sort landing) empties the loader under a
+        // page load in flight; the attempt in the new view replaces it.
+        const attempt = [sequence, generation, mapping_generation, source_generation].join(':');
+        if (cell_focus_attempt_ref.current === attempt) return;
+        cell_focus_attempt_ref.current = attempt;
+        const settle = (visible: boolean) => {
+            applied_cell_focus_ref.current = sequence;
+            on_cell_focus_applied(sequence, visible);
+        };
         const display_column = projected_columns.findIndex((projected) =>
             column_identities_equal(projected.identity, column));
         // A source row may be on a page not loaded yet: the source path loads
-        // it, for a source or a Pending Column cell. A newer request, or the
-        // shell unmounting, retires this one, so a late load cannot move the
-        // caret off the newer cell.
+        // it, for a source or a Pending Column cell. A newer request or view,
+        // or the shell unmounting, retires this attempt, so a late load cannot
+        // move the caret off the newer cell.
         if (row.kind === 'source' && (column.kind === 'source' || display_column >= 0)) {
             const is_current = () => cell_focus_mounted_ref.current
-                && applied_cell_focus_ref.current === sequence;
+                && cell_focus_attempt_ref.current === attempt;
             // A Pending Column is found again by identity after the load: it
             // may have moved, or gone, while the page loaded.
             const pending_column_now = () => {
@@ -4807,29 +4843,36 @@ export function GridShell({
                 ? reveal_source_cell(row.sourceRow, column.sourceColumn, is_current)
                 : reveal_source_row_cell(row.sourceRow, pending_column_now, is_current);
             void revealed.then((visible) => {
-                if (is_current()) on_cell_focus_applied(sequence, visible);
+                if (is_current()) settle(visible);
             });
             return;
         }
         const display_row = pending_projection.display_row_for_identity(row);
         if (display_row === undefined || display_column < 0) {
             focus_grid();
-            on_cell_focus_applied(sequence, false);
+            settle(false);
             return;
         }
         select_active_display_cell([display_column, display_row]);
         focus_grid();
-        on_cell_focus_applied(sequence, true);
+        settle(true);
     }, [
         cell_focus,
         focus_grid,
+        generation,
+        get_display_row_for_source,
+        mapping_generation,
         on_cell_focus_applied,
         pending_projection,
         projected_columns,
+        resolved_source_display_rows,
         reveal_source_cell,
         reveal_source_row_cell,
+        rows_are_projected,
         select_active_display_cell,
         sheet_index,
+        source_generation,
+        transform_pending,
     ]);
     const applied_pending_row_focus_ref = useRef<number | null>(null);
     useLayoutEffect(() => {

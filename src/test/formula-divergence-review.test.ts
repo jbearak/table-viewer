@@ -218,7 +218,7 @@ describe('review_formula_divergence', () => {
         );
         expect(review.items).toHaveLength(MAX_FORMULA_DIVERGENCE_ITEMS);
         expect(review.counts).toEqual([{ targetSheetIndex: 0, formulas: MAX_FORMULA_DIVERGENCE_ITEMS + 12 }]);
-        expect(review.totals).toEqual({ deleted: 0, changedRanges: MAX_FORMULA_DIVERGENCE_ITEMS + 12, unadjustable: 0, refDependents: 0, uncheckedDependents: 0 });
+        expect(review.totals).toEqual({ deleted: 0, deletedCaught: 0, changedRanges: MAX_FORMULA_DIVERGENCE_ITEMS + 12, unadjustable: 0, refDependents: 0, uncheckedDependents: 0 });
     });
 
     describe('past the item cap, totals count each formula cell once', () => {
@@ -249,7 +249,7 @@ describe('review_formula_divergence', () => {
                 { targetSheetIndex: 0, formulas: past_cap },
                 { targetSheetIndex: 1, formulas: past_cap },
             ]);
-            expect(review.totals).toEqual({ deleted: past_cap, changedRanges: 0, unadjustable: 0, refDependents: 0, uncheckedDependents: 0 });
+            expect(review.totals).toEqual({ deleted: past_cap, deletedCaught: 0, changedRanges: 0, unadjustable: 0, refDependents: 0, uncheckedDependents: 0 });
         });
 
         it('counts range changes on two worksheets once, and an unadjustable formula the cap left unlisted', () => {
@@ -270,7 +270,7 @@ describe('review_formula_divergence', () => {
                 { targetSheetIndex: 0, formulas: past_cap + 1 },
                 { targetSheetIndex: 1, formulas: past_cap },
             ]);
-            expect(review.totals).toEqual({ deleted: 0, changedRanges: past_cap, unadjustable: 1, refDependents: 0, uncheckedDependents: 0 });
+            expect(review.totals).toEqual({ deleted: 0, deletedCaught: 0, changedRanges: past_cap, unadjustable: 1, refDependents: 0, uncheckedDependents: 0 });
         });
     });
 

@@ -111,6 +111,12 @@ export interface FormulaDeletedItem {
     /** The deleted rows and columns of the target worksheet the formula names. */
     readonly rows: readonly RowIdentity[];
     readonly columns: readonly ColumnIdentity[];
+    /**
+     * The formula catches errors (IFERROR, ISERROR, …; `CATCHES_ERRORS`), so
+     * it shows its fallback value after Save rather than `#REF!`, though Save
+     * still writes `#REF!` into its text.
+     */
+    readonly catchesErrors?: true;
 }
 
 /**
@@ -150,8 +156,10 @@ export interface FormulaTargetCount {
  * Unlike the per-worksheet counts, a formula naming two worksheets counts once.
  */
 export interface FormulaDivergenceTotals {
-    /** Formulas that will show `#REF!`. */
+    /** Formulas Save writes `#REF!` into that will show it. */
     readonly deleted: number;
+    /** Formulas Save writes `#REF!` into that catch it, so they show their fallback values. */
+    readonly deletedCaught: number;
     /** Formulas flagged `moved`, `refilled`, or `discarded` on some worksheet they name. */
     readonly changedRanges: number;
     /** Formulas flagged `unadjustable` on some worksheet they name; Save refuses them. */
@@ -167,7 +175,10 @@ export interface FormulaDivergenceReview {
     readonly items: readonly FormulaDivergenceItem[];
     /** Every flagged formula per target worksheet, including those past the item cap. */
     readonly counts: readonly FormulaTargetCount[];
-    /** Formulas that will show `#REF!`, per target worksheet, at most `MAX_FORMULA_DIVERGENCE_ITEMS` overall. */
+    /**
+     * Formulas Save writes `#REF!` into, per target worksheet, at most
+     * `MAX_FORMULA_DIVERGENCE_ITEMS` overall, including those that catch it.
+     */
     readonly deleted: readonly FormulaDeletedItem[];
     /** Every such formula per target worksheet, including those past the item cap. */
     readonly deletedCounts: readonly FormulaTargetCount[];
@@ -191,9 +202,9 @@ const FORMULAS_PER_STEP = 256;
 
 /**
  * Functions that catch an error or test for one instead of passing it on.
- * A formula calling one is not claimed as broken, and its result does not
- * carry `#REF!` on to the formulas that use it. Matched in the text, since
- * the calculator doesn't evaluate them.
+ * A formula calling one is not claimed to show `#REF!`, even when Save writes
+ * `#REF!` into it, and its result does not carry `#REF!` on to the formulas
+ * that use it. Matched in the text, since the calculator doesn't evaluate them.
  */
 const CATCHES_ERRORS = /(?:^|[^A-Za-z0-9_.])(?:_xlfn\.)?(?:IFERROR|IFNA|ERROR\.TYPE|AGGREGATE|IS(?:ERROR|ERR|NA|REF|BLANK|NUMBER|TEXT|NONTEXT|LOGICAL|FORMULA))\s*\(/i;
 
@@ -434,7 +445,14 @@ function* review_steps(
     const counts = new Map<number, number>();
     const deleted: FormulaDeletedItem[] = [];
     const deleted_counts = new Map<number, number>();
-    const totals = { deleted: 0, changedRanges: 0, unadjustable: 0, refDependents: 0, uncheckedDependents: 0 };
+    const totals = {
+        deleted: 0,
+        deletedCaught: 0,
+        changedRanges: 0,
+        unadjustable: 0,
+        refDependents: 0,
+        uncheckedDependents: 0,
+    };
     // Formulas Save writes #REF! into, and formulas whose results don't carry
     // #REF! on: those that catch errors, and those whose text already held it.
     const direct = new Map<string, DirectFormula>();
@@ -451,7 +469,8 @@ function* review_steps(
         source_cell?: WorkbookCellAddress,
     ): void => {
         checked += 1;
-        if (CATCHES_ERRORS.test(text) || (text.includes('#REF!') && formula_ref_error_count(text) > 0)) {
+        const catches_errors = CATCHES_ERRORS.test(text);
+        if (catches_errors || (text.includes('#REF!') && formula_ref_error_count(text) > 0)) {
             untargeted.add(`${sheet_index}:${row}:${column}`);
         }
         const context = formula_anchor_context(workbook, sheet_index);
@@ -511,7 +530,8 @@ function* review_steps(
             deleted_by_target.set(deletion.worksheet, entry);
         }
         if (deleted_by_target.size > 0) {
-            totals.deleted += 1;
+            if (catches_errors) totals.deletedCaught += 1;
+            else totals.deleted += 1;
             direct.set(`${sheet_index}:${row}:${column}`, { sheetIndex: sheet_index, row, column, source: source_cell });
         }
         for (const [target, entry] of [...deleted_by_target].sort(([left], [right]) => left - right)) {
@@ -526,6 +546,7 @@ function* review_steps(
                 written: text,
                 rows: Object.freeze([...entry.rows.values()]),
                 columns: Object.freeze([...entry.columns.values()]),
+                ...(catches_errors ? { catchesErrors: true as const } : {}),
             }));
         }
     };

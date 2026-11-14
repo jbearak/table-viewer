@@ -133,6 +133,22 @@ describe('formulas that use a #REF! formula', () => {
         expect(listed(review)).toEqual(['0!5:2 =SUM(C2:C5) ref']);
     });
 
+    it('lists a formula that catches the error apart from those that will show #REF!', async () => {
+        // Summary: A1 names a deleted Price inside IFERROR, A2 names one bare,
+        // and A3 uses A1's result.
+        const source = await prices(['=IFERROR(Data!C2*2,0)', '=Data!C3', '=A1*2']);
+        const review = review_formula_divergence(source, [], price_deleted(source));
+        // Save writes #REF! into A1 too, but Excel shows its fallback value.
+        const summary = review.deleted.filter((item) => item.sheetIndex === 1)
+            .map((item) => `${item.row}:${item.column} ${item.formula} ${item.catchesErrors === true ? 'caught' : 'ref'}`);
+        expect(summary).toEqual(['0:0 =IFERROR(Data!#REF!*2,0) caught', '1:0 =Data!#REF! ref']);
+        // The four Totals and Summary!A2 will show #REF!; A1 is counted apart.
+        expect(review.totals).toMatchObject({ deleted: 5, deletedCaught: 1 });
+        expect(review.deletedCounts).toEqual([{ targetSheetIndex: 0, formulas: 6 }]);
+        // A1's result carries no #REF! on to A3.
+        expect(listed(review)).toEqual(['0!5:2 =SUM(C2:C5) ref']);
+    });
+
     it('lists nothing when a value typed over a broken formula stops the chain', async () => {
         const source = await prices(['=Data!D6']);
         const review = review_formula_divergence(source, [

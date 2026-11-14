@@ -18031,7 +18031,7 @@ describe('Save warnings for row and column structure', () => {
         deleted: [],
         deletedCounts: [],
         dependents: [],
-        totals: { deleted: 0, changedRanges: 0, unadjustable: 0, refDependents: 0, uncheckedDependents: 0 },
+        totals: { deleted: 0, deletedCaught: 0, changedRanges: 0, unadjustable: 0, refDependents: 0, uncheckedDependents: 0 },
     };
 
     it('shows no banner for a plain row or column change, and asks the host about formulas without a click', async () => {
@@ -18081,7 +18081,7 @@ describe('Save warnings for row and column structure', () => {
                     columns: [{ kind: 'source', sourceColumn: 2 }],
                 }],
                 deletedCounts: [{ targetSheetIndex: 0, formulas: 1 }],
-                totals: { deleted: 1, changedRanges: 0, unadjustable: 0, refDependents: 0, uncheckedDependents: 0 },
+                totals: { deleted: 1, deletedCaught: 0, changedRanges: 0, unadjustable: 0, refDependents: 0, uncheckedDependents: 0 },
             },
         });
         const notice = document.querySelector('[aria-label="Formulas that will show #REF!"]');
@@ -18123,7 +18123,7 @@ describe('Save warnings for row and column structure', () => {
                     axes: ['row'],
                 }],
                 counts: [{ targetSheetIndex: 0, formulas: 1 }],
-                totals: { deleted: 0, changedRanges: 1, unadjustable: 0, refDependents: 0, uncheckedDependents: 0 },
+                totals: { deleted: 0, deletedCaught: 0, changedRanges: 1, unadjustable: 0, refDependents: 0, uncheckedDependents: 0 },
             },
         });
         const notice = () => document.querySelector('[aria-label="Formulas whose ranges changed"]');

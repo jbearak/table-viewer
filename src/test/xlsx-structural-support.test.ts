@@ -1177,5 +1177,7 @@ describe('worksheet child inventory', () => {
             });
         }
         expect(unknown).toEqual([]);
-    });
+    // Unzips and scans every committed workbook: about 1.5 s locally, so a
+    // shared CI runner can pass the default 5 s.
+    }, 60_000);
 });
