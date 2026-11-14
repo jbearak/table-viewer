@@ -470,6 +470,90 @@ describe('edit session registry', () => {
         expect(registry.formula_projection().structuralRevision).toBeGreaterThan(reordered);
     });
 
+    it('keeps formula results current when only a Pending Row height or a highlight changes, and through the refresh after it', () => {
+        const { registry } = make_session_ref('session');
+        const pending = registry.pending_rows_for_sheet(0);
+        expect(pending.install({ session_id: 'session' }, {
+            ...EMPTY_PENDING_STRUCTURAL_CHANGES,
+            formatTemplates: [{ id: 'plain', format: { kind: 'none' } }],
+            appendedRows: [{
+                id: 'inserted',
+                origin: 'insert',
+                cells: { 1: { value: '=A1/9' } },
+                formatTemplateId: 'plain',
+                createdOrder: 1,
+            }, {
+                id: 'appended',
+                cells: { 1: { value: '=A1/7' } },
+                formatTemplateId: 'plain',
+                createdOrder: 2,
+            }],
+            rowLayout: {
+                runs: [
+                    { kind: 'source', start: 0, count: 1 },
+                    { kind: 'pending', ids: ['inserted'] },
+                    { kind: 'source', start: 1, count: 1 },
+                ],
+                removedSourceRows: [],
+                discardedPendingRows: [],
+            },
+            columnLayout: {
+                columns: [{ kind: 'source', sourceColumn: 0 }, { kind: 'pending', pendingColumnId: 'c1' }],
+                removedSourceColumns: [],
+                discardedPendingColumns: [],
+            },
+            pendingColumns: [{
+                id: 'c1', header: 'New', cells: { 's:0': { value: '=A1/3' } }, format: { kind: 'default' }, createdOrder: 3,
+            }],
+        })).toBe(true);
+        const replace = (next: (before: PendingStructuralChanges) => PendingStructuralChanges) => {
+            const before = pending.snapshot();
+            const staged = pending.stage_replace('session', before, next(before))!;
+            staged.commit();
+            staged.notify();
+        };
+        const rows = (
+            before: PendingStructuralChanges,
+            change: (row: NonNullable<PendingStructuralChanges['appendedRows']>[number]) => object,
+        ): PendingStructuralChanges => ({
+            ...before,
+            appendedRows: before.appendedRows!.map((row) => ({ ...row, ...change(row) })),
+        });
+        const first = registry.formula_projection();
+        const revision = registry.revision();
+
+        // A drag on an inserted row's edge, then on an appended row's.
+        replace((before) => rows(before, (row) => row.id === 'inserted' ? { viewerRowHeight: 40 } : {}));
+        replace((before) => rows(before, (row) => row.id === 'appended' ? { viewerRowHeight: 56 } : {}));
+        expect(registry.revision()).toBeGreaterThan(revision);
+        expect(registry.formula_projection().structuralRevision).toBe(first.structuralRevision);
+
+        // A highlight on a Pending Row's cell and on a Pending Column's.
+        replace((before) => rows(before, () => ({ highlights: { 1: 'yellow' } })));
+        replace((before) => ({
+            ...before,
+            pendingColumns: [{ ...before.pendingColumns![0]!, highlights: { 's:0': 'yellow' } }],
+        }));
+        expect(registry.formula_projection().structuralRevision).toBe(first.structuralRevision);
+
+        // The refresh the host sends after it stores them.
+        const sheets = [{ name: 'Data', worksheetId: '1' }];
+        registry.reconcile_sheets(sheets, sheets, () => true);
+        expect(registry.formula_projection().structuralRevision).toBe(first.structuralRevision);
+
+        // A height and a cell together are a change a formula can read.
+        replace((before) => rows(before, (row) => row.id === 'inserted'
+            ? { viewerRowHeight: 24, cells: { 1: { value: '=A1/5' } } }
+            : {}));
+        const edited = registry.formula_projection().structuralRevision;
+        expect(edited).toBeGreaterThan(first.structuralRevision);
+        // So are a highlight and a cell.
+        replace((before) => rows(before, (row) => row.id === 'appended'
+            ? { highlights: undefined, cells: { 1: { value: '=A1/6' } } }
+            : {}));
+        expect(registry.formula_projection().structuralRevision).toBeGreaterThan(edited);
+    });
+
     it('reindexes cached pending formula inputs after a structural removal', () => {
         const { registry } = make_session_ref('session');
         const pending = registry.pending_rows_for_sheet(0);

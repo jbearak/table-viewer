@@ -272,23 +272,39 @@ export function target_for_sheet(
 }
 
 /**
- * Whether two snapshots differ only in Pending Column widths. A width is how
- * the column is viewed; no formula reads it, so a resize or an auto-fit must
- * not send the worksheet's results back to pending.
+ * Whether two snapshots differ only in how their Pending Rows and Pending
+ * Columns are viewed: a row's height, a column's width, a cell's highlight. No
+ * formula reads any of them, so a resize, an auto-fit, or a highlight must not
+ * send the worksheet's results back to pending.
  */
-function only_pending_column_widths_differ(
+function only_pending_view_differs(
     before: PendingStructuralChanges,
     after: PendingStructuralChanges,
 ): boolean {
-    const prior = before.pendingColumns ?? [];
-    const next = after.pendingColumns ?? [];
-    if (prior.length !== next.length) return false;
-    if (prior.every((column, index) => column.viewerWidth === next[index]!.viewerWidth)) return false;
-    const without_widths = (changes: PendingStructuralChanges) => JSON.stringify({
+    const prior_rows = pending_rows(before);
+    const next_rows = pending_rows(after);
+    const prior_columns = before.pendingColumns ?? [];
+    const next_columns = after.pendingColumns ?? [];
+    if (prior_rows.length !== next_rows.length || prior_columns.length !== next_columns.length) {
+        return false;
+    }
+    const view_differs = prior_rows.some((row, index) =>
+        row.viewerRowHeight !== next_rows[index]!.viewerRowHeight
+        || row.highlights !== next_rows[index]!.highlights)
+        || prior_columns.some((column, index) =>
+            column.viewerWidth !== next_columns[index]!.viewerWidth
+            || column.highlights !== next_columns[index]!.highlights);
+    if (!view_differs) return false;
+    const without_view = (changes: PendingStructuralChanges) => JSON.stringify({
         ...changes,
-        pendingColumns: changes.pendingColumns!.map(({ viewerWidth: _width, ...column }) => column),
+        appendedRows: pending_rows(changes).map(
+            ({ viewerRowHeight: _height, highlights: _highlights, ...row }) => row,
+        ),
+        pendingColumns: (changes.pendingColumns ?? []).map(
+            ({ viewerWidth: _width, highlights: _highlights, ...column }) => column,
+        ),
     });
-    return without_widths(before) === without_widths(after);
+    return without_view(before) === without_view(after);
 }
 
 export function create_edit_session_registry(
@@ -890,7 +906,7 @@ export function create_edit_session_registry(
         pending_subscriptions.set(store, store.subscribe((change) => {
             const previous_snapshot = last_snapshot;
             last_snapshot = store.snapshot();
-            if (change.kind === 'reset' && only_pending_column_widths_differ(previous_snapshot, last_snapshot)) {
+            if (change.kind === 'reset' && only_pending_view_differs(previous_snapshot, last_snapshot)) {
                 publish();
                 return;
             }
@@ -1122,8 +1138,8 @@ export function create_edit_session_registry(
                 retry_structural_publications.push(entry);
             }
             // A refresh that leaves every worksheet's Pending Changes where
-            // they were, such as the one a column width change brings, changes
-            // nothing a formula reads from them.
+            // they were, such as the one a row height, column width, or
+            // highlight change brings, changes nothing a formula reads from them.
             const pending_moved = moved_pending.size !== pending_stores.size
                 || [...moved_pending].some(([index, store]) => pending_stores.get(index) !== store)
                 || pending_parked.size !== parked_pending_before.size
