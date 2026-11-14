@@ -8,6 +8,12 @@ type RowDataMsg = Extract<HostMessage, { type: 'rowData' }>;
 type CompareDiffMsg = Extract<HostMessage, { type: 'compareDiff' }>;
 type Row = (RenderedCell | null)[];
 
+/** A resident row and the canonical source row it shows. */
+export interface LoadedRowSample {
+    readonly cells: Row;
+    readonly source_row: number | undefined;
+}
+
 interface CompareCellBase {
     readonly raw: string;
     readonly formatted: string;
@@ -464,17 +470,19 @@ export class RowLoader {
 
     /**
      * Up to `max` resident rows drawn across all cached pages, for sampling
-     * (column auto-fit measures loaded text only — it never forces a fetch).
-     * Rows past `row_count` in a partial final page are excluded.
+     * (column auto-fit measures loaded rows only — it never forces a fetch),
+     * each with its canonical source row so an unsaved edit or recalculated
+     * result there can be measured as painted. Rows past `row_count` in a
+     * partial final page are excluded.
      */
-    sample_loaded_rows(max: number): Row[] {
-        const out: Row[] = [];
+    sample_loaded_rows(max: number): LoadedRowSample[] {
+        const out: LoadedRowSample[] = [];
         for (const [start, page] of this.pages) {
             for (let i = 0; i < page.rows.length; i++) {
                 if (out.length >= max) return out;
                 const abs = start + i;
                 if (this.row_count > 0 && abs >= this.row_count) break;
-                out.push(page.rows[i]);
+                out.push({ cells: page.rows[i], source_row: page.source_rows[i] });
             }
         }
         return out;

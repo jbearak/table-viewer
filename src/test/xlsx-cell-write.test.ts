@@ -2786,6 +2786,23 @@ describe('write_xlsx_cell_edits', () => {
         expect(String(data.sheets[0].rows[0][0]!.raw)).toBe('12345678901234567890');
     });
 
+    it('stores a 16-digit integer as a number when its trailing zeros carry no precision', async () => {
+        // Excel keeps 15 significant digits. 1000000000000000 has one, so it is
+        // saved as the number Excel stores and displays as General does; a
+        // 16-digit 1234567890123456 would lose its last digit, so it stays text.
+        const out = write_xlsx_cell_edits(readFileSync(EMPTY), 0, [
+            { row: 0, col: 0, value: '1000000000000000' },
+            { row: 1, col: 0, value: '1234567890123450' },
+            { row: 2, col: 0, value: '1234567890123456' },
+        ]);
+        const { data } = await parse_xlsx(out);
+        const [first, second, third] = data.sheets[0].rows.map((cells) => cells[0]!);
+        expect([first.raw, first.formatted]).toEqual([1e15, '1E+15']);
+        expect([second.raw, second.formatted]).toEqual([1234567890123450, '1.23457E+15']);
+        // A string, not the number 1234567890123456.
+        expect(third.raw).toBe('1234567890123456');
+    });
+
     it('still stores ordinary numbers as numbers', async () => {
         // The guard above must not sweep in the values that actually dominate;
         // trailing zeros and exponents cost no precision and stay numeric.

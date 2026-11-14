@@ -15,6 +15,8 @@ After an edit, Table Viewer recalculates affected formulas when it can. Its buil
 
 A recalculated result uses the cell's number format, or Excel's General format if the cell has none, so it looks the same before and after Save. For example, `=19/9` displays `2.111111111` both times. A cell in an inserted column uses the number format Save will give it: that of the same row's cell in the column it copies its formatting from.
 
+A number you type into a cell displays the same way. General shows a number with 12 or more digits in scientific notation, as Excel does, so a result or typed value of `1000000000000000` displays `1E+15`, and typing `1.50` displays `1.5`. Excel keeps 15 significant digits of a number and turns any digits after that into zeros. Table Viewer saves a typed number that has more, such as `1234567890123456`, as text, so it keeps every digit.
+
 A formula that contains `#REF!`, which is what a reference becomes when its row, column, or worksheet is deleted, displays `?? (invalid reference)`.
 
 If a formula uses another function, has a cycle, cannot be parsed safely, or exceeds the calculation limits, Table Viewer removes its stale cached result instead of displaying a result it cannot trust. The cell displays `??` until Excel or another spreadsheet engine recalculates the workbook.

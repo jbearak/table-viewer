@@ -2,7 +2,7 @@ import { useCallback, useEffect, useReducer, useRef } from 'react';
 import type { RenderedCell } from '../data-source/interface';
 import type { HostMessage } from '../types';
 import { host_bridge } from './host-bridge';
-import { RowLoader, type CompareRowDiff } from './row-loader';
+import { RowLoader, type CompareRowDiff, type LoadedRowSample } from './row-loader';
 
 export { RowLoader };
 
@@ -50,8 +50,8 @@ export interface UseRowLoader {
     get_compare_status(row: number): CompareRowDiff['status'] | undefined;
     /** Original-side text of a changed cell in git compare mode, when resident. */
     get_compare_base(row: number, col: number, show_formatting?: boolean): string | undefined;
-    /** Up to `max` resident rows for sampling (column auto-fit). */
-    sample_loaded_rows(max: number): (RenderedCell | null)[][];
+    /** Up to `max` resident rows, with their source rows, for sampling (column auto-fit). */
+    sample_loaded_rows(max: number): LoadedRowSample[];
     /** Rows per loader page after its width and byte caps. */
     get_page_size(): number;
     /** Bumps on every ingested page so consumers can re-key Glide redraws. */

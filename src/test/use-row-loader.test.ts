@@ -638,7 +638,9 @@ describe('RowLoader', () => {
             loader.on_row_data(reply_for(post, 0, 0, 1));
             const sample = loader.sample_loaded_rows(5);
             expect(sample.length).toBe(5);
-            expect(sample[0]?.[0]?.raw).toBe('r0c0');
+            expect(sample[0]?.cells[0]?.raw).toBe('r0c0');
+            // Each row carries the source row it shows, for measuring its edits.
+            expect(sample.map((row) => row.source_row)).toEqual([0, 1, 2, 3, 4]);
         });
 
         it('is empty when no page is resident', () => {

@@ -46,6 +46,18 @@ describe('dirty XLSX number-format preview', () => {
         expect(format_xlsx_edit_preview(value, { code: '#,##0.00' })).toBe(value);
     });
 
+    it('formats an integer whose trailing zeros pass 15 digits as the number Excel stores', () => {
+        // Excel keeps 15 significant digits; trailing zeros are not among them.
+        const general = { code: 'General' };
+        expect(format_xlsx_edit_preview('1000000000000000', general)).toBe('1E+15');
+        expect(format_xlsx_edit_preview('1234567890123460', general)).toBe('1.23457E+15');
+        expect(format_xlsx_edit_preview('-20000000000000000000', general)).toBe('-2E+19');
+        expect(format_xlsx_edit_preview('1000000000000000', { code: '#,##0' }))
+            .toBe('1,000,000,000,000,000');
+        // Sixteen significant digits would lose the last one, so it stays text.
+        expect(format_xlsx_edit_preview('1234567890123456', general)).toBe('1234567890123456');
+    });
+
     it('formats ISO input only when its candidate section is date-like', () => {
         const date_first = { code: '[>40000]m/d/yyyy;0' };
         const number_first = { code: '[>50000]m/d/yyyy;0' };
