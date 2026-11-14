@@ -417,7 +417,9 @@ describe('the worksheet row limit at save', () => {
         expect(result).toMatchObject({ success: true });
         const rows = rows_of(part_text(viewer.file.bytes, 'xl/worksheets/sheet1.xml')!);
         expect(rows.get(last)?.inner).toContain('fig');
-    });
+    // A sheet at the row limit: 0.4 s locally, 3–6 s on a shared CI runner,
+    // so the default 5 s cut it off. The other at-the-limit tests here wait 60 s.
+    }, 60_000);
 });
 
 describe('structural save refusals', () => {

@@ -569,6 +569,60 @@ test('moving the last row of a summed range up, then another row beside it, warn
     await save_screenshot(page, '16-xlsx-last-row-moved-range-notice');
 });
 
+test('a number in a Pending Column shows the format and digits it has after Save', async () => {
+    // A holds numbers with no number format; B is formatted 0% (style 2).
+    const book = Buffer.from(build_fixture_xlsx({
+        sheets: [{
+            name: 'Data',
+            body: `<sheetData>${[
+                row(1, [cell('A1', 19), cell('B1', 0.5, 2)]),
+                row(2, [cell('A2', 1), cell('B2', 0.25, 2)]),
+            ].join('')}</sheetData>`,
+        }],
+    }));
+    const { file, page } = await open_file('ninths-pending.xlsx', book);
+    await wait_for_grid(page);
+    // A column right of B takes B's 0%; then one right of A takes A's General.
+    await choose(await open_column_menu(page, 1), 'Insert column right');
+    await expect.poll(async () => (await grid_headers(page)).length).toBe(3);
+    await choose(await open_column_menu(page, 0), 'Insert column right');
+    await expect.poll(async () => (await grid_headers(page)).length).toBe(4);
+    await type_into_cell(page, 2, 0, '=A1/9');
+    await type_into_cell(page, 4, 0, '=A1/9');
+    await type_into_cell(page, 4, 1, '0.125');
+
+    // Find matches what each cell paints: 19/9 as General and as 0%, 0.125 as 0%.
+    const find_input = page.locator('input[aria-label="Find"]');
+    const painted = async (text: string, column: number, row: number) => {
+        if (await find_input.count() === 0) await page.keyboard.press('ControlOrMeta+F');
+        await find_input.fill(text);
+        await expect(page.locator(`#glide-cell-${column}-${row}`)).toHaveAttribute('aria-selected', 'true');
+    };
+    const not_painted = async (text: string) => {
+        await find_input.fill(text);
+        await expect(page.locator('.find-bar-status')).toHaveText('No matches');
+    };
+    const expect_painted = async () => {
+        await painted('2.111111111', 2, 0);
+        await not_painted('2.1111111111');
+        await painted('211%', 4, 0);
+        await painted('13%', 4, 1);
+        await not_painted('0.125');
+    };
+    await save_screenshot(page, '14-xlsx-pending-column-before-save');
+    await expect_painted();
+
+    await save_changes(page);
+    await expect_painted();
+    await save_screenshot(page, '15-xlsx-pending-column-after-save');
+    // The file gives D1 and D2 B's 0% and B1 no format. Save writes a new
+    // formula with no cached value, so the reader has no digits to show for it.
+    const [first, second] = (await parse_xlsx(new Uint8Array(fs.readFileSync(file)))).data.sheets[0].rows;
+    expect([first[1]?.formula, first[1]?.numberFormat?.code]).toEqual(['=A1/9', undefined]);
+    expect([first[3]?.formula, first[3]?.numberFormat?.code]).toEqual(['=A1/9', '0%']);
+    expect(second[3]?.formatted).toBe('13%');
+});
+
 test('an external change conflicts, and both salvage actions resolve it', async () => {
     const { file, page } = await open_file(
         'fruit.csv',

@@ -24,7 +24,7 @@ import {
 import { create_history_store, type HistoryStore } from '../webview/history-store';
 import { peek_history } from '../webview/history-stack-model';
 import { webview_formula_workbook } from '../webview/formula-anchor-model';
-import { EMPTY_PENDING_STRUCTURAL_CHANGES, inserted_rows, own_pending_structural_changes, type PendingRowCell, type StructuralBasis } from '../pending-changes';
+import { EMPTY_PENDING_STRUCTURAL_CHANGES, inserted_rows, own_pending_structural_changes, type PendingColumn, type PendingRowCell, type StructuralBasis } from '../pending-changes';
 import { plan_pending_row_history_replay } from '../webview/pending-row-history';
 import { create_pending_row_store, keep_inserted_rows_at_end } from '../webview/pending-row-store';
 import {
@@ -10068,7 +10068,11 @@ describe('columns: Insert, Delete, Restore, Move, rename, Pending Column cells, 
         sourceRowCount: 2,
         sourceColumnCount: 3,
     };
-    const with_pending_column = (cells: Record<string, PendingRowCell>, structural_basis: StructuralBasis = basis) => {
+    const with_pending_column = (
+        cells: Record<string, PendingRowCell>,
+        structural_basis: StructuralBasis = basis,
+        format: PendingColumn['format'] = { kind: 'default' },
+    ) => {
         const pending = create_pending_row_store({ session_id: 'session' });
         expect(pending.install({ session_id: 'session' }, {
             formatTemplates: [],
@@ -10080,7 +10084,7 @@ describe('columns: Insert, Delete, Restore, Move, rename, Pending Column cells, 
                 removedSourceColumns: [],
                 discardedPendingColumns: [],
             },
-            pendingColumns: [{ id: 'c1', header: 'New', cells, format: { kind: 'default' }, createdOrder: 1 }],
+            pendingColumns: [{ id: 'c1', header: 'New', cells, format, createdOrder: 1 }],
             structuralBasis: structural_basis,
         })).toBe(true);
         return pending;
@@ -10160,6 +10164,64 @@ describe('columns: Insert, Delete, Restore, Move, rename, Pending Column cells, 
         const cell = get_cell_content([1, 1]);
         expect(JSON.stringify(cell)).toContain('"2"');
         expect(cell.data?.edit_value ?? (cell as { copyData?: string }).copyData).toBe('=1+1');
+    });
+
+    it('shows a Pending Column number through the number format Save gives its cell', async () => {
+        // Save styles each cell like the same row's cell in the column it
+        // inherits from: source row 1's A has 0.00, source row 0's has none.
+        grid_mock.get_row.mockImplementation((row?: number) => [
+            {
+                raw: '1', formatted: row === 1 ? '1.00' : '1', bold: false, italic: false, rawType: 'number',
+                ...(row === 1 ? { numberFormat: { code: '0.00' } } : {}),
+            },
+            { raw: 'b', formatted: 'b', bold: false, italic: false },
+            { raw: 'c', formatted: 'c', bold: false, italic: false },
+        ] as any);
+        const formulas = { 's:0': { value: '=19/9' }, 's:1': { value: '=19/9' } };
+        const pending = with_pending_column(formulas, xlsx_basis, { kind: 'source', sourceColumn: 0 });
+        const sheet_meta = { ...props().sheet_meta, rowCount: 2, sourceRowCount: 2 };
+        const shown = {
+            pending_row_store: pending,
+            edit_syntax: 'markdown' as const,
+            show_formatting: true,
+            structural_support: { ...supported, basis: xlsx_basis },
+            formula_anchor_workbook: webview_formula_workbook(true, [sheet_meta], () => pending.snapshot()),
+            formula_results: new Map([['0:1', '2.11111111111111'], ['1:1', '2.11111111111111']]),
+        };
+        const { rerender } = await render_columns(shown);
+        const painted = (row: number) => {
+            const content = (grid_mock.props!.getCellContent as (cell: [number, number]) => {
+                displayData?: string;
+                data?: string | { lines: Array<Array<{ text: string }>> };
+            })([1, row]);
+            return typeof content.data === 'object'
+                ? content.data.lines.flat().map((part) => part.text).join('')
+                : content.displayData;
+        };
+        expect(painted(0)).toBe('2.111111111');
+        expect(painted(1)).toBe('2.11');
+
+        // A typed number takes the format too; with none it shows as typed,
+        // as a source cell's edit does.
+        await act(async () => {
+            const before = pending.snapshot();
+            const staged = pending.stage_replace('session', before, {
+                ...before,
+                pendingColumns: [{
+                    ...before.pendingColumns![0]!,
+                    cells: { 's:0': { value: '0.125' }, 's:1': { value: '0.125' } },
+                }],
+            });
+            staged!.commit();
+            staged!.notify();
+        });
+        await rerender({ ...shown, formula_results: new Map() });
+        expect(painted(0)).toBe('0.125');
+        expect(painted(1)).toBe('0.13');
+
+        // Formatting off shows values.
+        await rerender({ ...shown, formula_results: new Map(), show_formatting: false });
+        expect(painted(1)).toBe('0.125');
     });
 
     it('auto-fits a Pending Column formula by its calculated result', async () => {
