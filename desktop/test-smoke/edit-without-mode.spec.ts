@@ -119,6 +119,38 @@ test('Tab typed before the session is granted commits the edit and moves on', as
     await expect(save()).toHaveClass(/has-unsaved/);
 });
 
+/**
+ * Press `keys` without waiting for each to be handled before sending the next,
+ * so that they reach the app, in order, before the session is granted.
+ */
+async function press_at_once(keys: readonly string[]): Promise<void> {
+    await Promise.all(keys.map((key) => page.keyboard.press(key)));
+}
+
+test('keys after an Enter typed before the session is granted start the next edit, as under one', async () => {
+    await select_cell(1, 0);
+    // Under a session, Enter commits "abc" and selects the cell below, where
+    // "def" starts a new edit.
+    await press_at_once(['a', 'b', 'c', 'Enter', 'd', 'e', 'f']);
+    await expect(cell(1, 1)).toHaveAttribute('aria-selected', 'true');
+    await expect(editor()).toBeVisible();
+    await expect(editor()).toHaveValue('def');
+    await expect(cell(1, 0)).toHaveText('abc');
+    await page.keyboard.press('Enter');
+    await expect(editor()).toBeHidden();
+    await expect(cell(1, 1)).toHaveText('def');
+});
+
+test('arrows typed before the session is granted move the caret, as in the open editor', async () => {
+    await select_cell(1, 0);
+    // In the open editor Left steps back a character, Home goes to the start,
+    // and End to the end.
+    await press_at_once(['a', 'b', 'ArrowLeft', 'c', 'Home', '<', 'End', '>']);
+    await expect(editor()).toBeVisible();
+    await expect(editor()).toHaveValue('<acb>');
+    await expect(cell(1, 0)).toHaveAttribute('aria-selected', 'true');
+});
+
 test('an editor opened and cancelled leaves nothing behind, and the next edit just works', async () => {
     await select_cell(2, 0);
     await page.keyboard.press('Enter');
