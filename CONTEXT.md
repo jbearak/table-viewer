@@ -60,6 +60,10 @@ A column held in an editing session that is not yet part of the workbook on disk
 **Pending Column Removal**:
 A source column that the session will delete at save.
 
+**Pending-change notice**:
+A notice under the grid, shown without a click, about something Save will do that the grid can't show or that needs a decision: a refused Save, formulas that will show `#REF!` because a row or column they use was deleted, or a formula range a move or delete changed in a way Excel might not. A plain insert, delete, or move gets none; its tint is the record. What Save will do is summarized in the Save button's description instead.
+_Avoid_: Review Changes, structure banner
+
 **Formula Anchor**:
 The row and column identities a formula reference names, recorded when the formula is authored, from which its text is rendered for any Worksheet Layout.
 

@@ -88,6 +88,33 @@ Can't undo past a save that inserted, deleted, or moved rows or columns.
 
 Save with `Ctrl+S` or `Cmd+S`, or with the **Save** button. Saving writes rows and columns in their new structural order: the file's order with your inserts and moves applied. A sort never changes the saved order. It only changes the view, so a sorted grid can show rows in a different order than the file will have. Deleted rows and columns are removed from the file at that point, so check the red rows before you save.
 
+Hover over **Save**, or move keyboard focus to it, to see what it will do, such as "Save: 1 row inserted, 1 column deleted, 3 cells edited." In a workbook, the summary names each sheet when more than one sheet has changes, or when the changes are on a sheet that isn't showing.
+
+### Before you save
+
+An insert, delete, or move needs no notice: the tints show it. A notice appears under the grid, without anything to click, only when Save will do something the grid can't show:
+
+- Formulas will show `#REF!` because they use a row or column you deleted:
+
+  ```text
+  2 formulas use column Price, which you deleted. After you save, they will show #REF!.
+  Restore the column, or undo, to keep them working.
+  ```
+
+- A move or delete changed a formula's range in a way Excel might not. Table Viewer adjusts a range from the final arrangement of rows and columns, while Excel adjusts it one change at a time, so moving the first or last row of a range, or inserting next to a deleted one, can give a different range:
+
+  ```text
+  Moving rows changed the range in 1 formula.
+  A row you moved was the first or last row of its range.
+  Excel might adjust it differently, so check it before you save.
+  ```
+
+- Save will refuse the change, for example because a rule would split into too many rules or a formula can't be adjusted.
+
+Each notice lists the formulas as Save will write them, with what they were before, and **Go to cell**. A list of more than three formulas starts collapsed behind **Show N formulas**. **Dismiss** hides a warning until what it says changes. A notice that explains why Save is refused can't be dismissed.
+
+The notice sits under the grid, so it never moves the row you are pointing at.
+
 **Discard** drops unsaved row and column changes along with cell edits, and puts every row and column back where the file has it. Undo brings them back.
 
 Unsaved changes survive closing the tab, the window, or the app. When you open the file again they come back, tinted as before, ready to save or discard.
@@ -120,7 +147,7 @@ Both actions keep your edits to existing cells and your appended rows, and both 
 
 ## `.xlsx` workbooks
 
-While row or column changes are unsaved, Table Viewer recalculates the formulas it can. A cell whose result changes shows the old value struck through beside the new one, such as `24 → 34` for a total that gained a row. Formulas whose results stay the same look as they did. A formula that referred to a row or column you deleted shows `?? (invalid reference)`, and Save writes `#REF!` in its place, as Excel does. Restore the row or column, or undo, to get the formula back.
+While row or column changes are unsaved, Table Viewer recalculates the formulas it can. A cell whose result changes shows the old value struck through beside the new one, such as `24 → 34` for a total that gained a row. Formulas whose results stay the same look as they did. A formula that referred to a row or column you deleted shows `?? (invalid reference)`, and Save writes `#REF!` in its place, as Excel does. A notice under the grid counts these formulas before you save. Restore the row or column, or undo, to get the formula back.
 
 A range's first and last rows move with their rows, and so do its first and last columns. If `B7` is `=SUM(B2:B5)` and you move row 5 above row 3, the range ends where row 5 now is: `=SUM(B2:B3)`, and the rows that were rows 3 and 4 drop out of the total. The same happens to formulas on other sheets that refer to the range. Excel moves the end of a range the same way when you cut that cell; LibreOffice keeps the range as it was. Because spreadsheet programs disagree here, **Review changes** lists every formula whose range has a first or last row or column that a move carried, under "A move carried a corner of the range", with **Go to cell**. Check those before you save.
 
@@ -167,7 +194,7 @@ A column move that would carry a filtered column outside the sheet's AutoFilter 
 
 A rule whose formula points at other cells applies to each cell relative to its own position. After a move, a single rule sometimes can't keep every cell's meaning, so Table Viewer splits it into as many rules as it needs. It does this rather than let some cells silently change their formatting or validation. Excel keeps one rule instead.
 
-One rule may split into at most 64 rules. Past that, a warning appears above the grid before you save, and Save refuses the change:
+One rule may split into at most 64 rules. Past that, a notice appears under the grid before you save, and Save refuses the change:
 
 ```text
 Moving these rows would split the conditional formatting on B2:B500 into more than 64 rules. Save will refuse it.
