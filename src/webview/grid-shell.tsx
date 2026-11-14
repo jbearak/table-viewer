@@ -9562,13 +9562,15 @@ export function GridShell({
         void ensure_edit_session().then((granted) => {
             if (overlay_intent_ref.current !== intent) return;
             overlay_intent_ref.current = null;
+            let opened = false;
             if (granted) {
-                overlay_opening_ref.current = grid_ref.current?.openOverlay(
-                    intent.cell,
-                    intent.initial,
-                ) === true;
+                // Set before asking: openOverlay mounts the editor before it
+                // returns, and the mount is what clears this.
+                overlay_opening_ref.current = true;
+                opened = grid_ref.current?.openOverlay(intent.cell, intent.initial) === true;
+                if (!opened) overlay_opening_ref.current = false;
             }
-            if (!overlay_opening_ref.current) notify_session_idle();
+            if (!opened) notify_session_idle();
         });
         return true;
     }, [ensure_edit_session, notify_session_idle]);
