@@ -31,8 +31,23 @@ const workbook: PendingChangeNoticeInput = {
     dismissed: new Set(),
 };
 
+/** A review whose totals, unless given, are the listed cells: an uncapped list. */
 function review(parts: Partial<FormulaDivergenceReview>): FormulaDivergenceReview {
-    return { items: [], counts: [], deleted: [], deletedCounts: [], ...parts };
+    const cells = (items: readonly { sheetIndex: number; row: number; column: number }[]) =>
+        new Set(items.map((item) => `${item.sheetIndex}:${item.row}:${item.column}`)).size;
+    const items = parts.items ?? [];
+    return {
+        items: [],
+        counts: [],
+        deleted: [],
+        deletedCounts: [],
+        totals: {
+            deleted: cells(parts.deleted ?? []),
+            changedRanges: cells(items.filter((item) => item.classes.some((name) => name !== 'unadjustable'))),
+            unadjustable: cells(items.filter((item) => item.classes.includes('unadjustable'))),
+        },
+        ...parts,
+    };
 }
 
 function deleted(row: number, column: number, parts: Partial<FormulaDeletedItem> = {}): FormulaDeletedItem {
@@ -181,6 +196,7 @@ describe('pending_change_notices', () => {
         const [notice] = pending_change_notices(with_review(review({
             deleted: many,
             deletedCounts: [{ targetSheetIndex: 0, formulas: 700 }],
+            totals: { deleted: 700, changedRanges: 0, unadjustable: 0 },
         })));
         expect(notice!.formulas).toMatchObject({
             total: 700,
@@ -189,6 +205,65 @@ describe('pending_change_notices', () => {
             truncatedNote: `Showing the first ${INLINE_FORMULA_LIMIT + 2}.`,
         });
         expect(notice!.sentences[0]).toMatch(/^700 formulas use column Price/);
+    });
+
+    it('counts a capped list by formula cell, not once per worksheet each formula names', () => {
+        // 300 formulas each use deleted columns on Data and Other: the host
+        // listed some of them and counted 300 on each worksheet.
+        const two_sheets = (row: number) => [
+            deleted(row, 3),
+            deleted(row, 3, { targetSheetIndex: 1, columns: [{ kind: 'source', sourceColumn: 0 }] }),
+        ];
+        const ranged_on_two = (row: number) => [flagged(row), flagged(row, { targetSheetIndex: 1 })];
+        const notices = pending_change_notices({
+            ...workbook,
+            worksheets: [...workbook.worksheets, { name: 'Other', columnNames: ['A'] }],
+            formulaReview: {
+                current: true,
+                review: review({
+                    items: Array.from({ length: 250 }, (_, row) => ranged_on_two(row)).flat(),
+                    counts: [{ targetSheetIndex: 0, formulas: 300 }, { targetSheetIndex: 1, formulas: 300 }],
+                    deleted: Array.from({ length: 250 }, (_, row) => two_sheets(row)).flat(),
+                    deletedCounts: [{ targetSheetIndex: 0, formulas: 300 }, { targetSheetIndex: 1, formulas: 300 }],
+                    totals: { deleted: 300, changedRanges: 300, unadjustable: 0 },
+                }),
+            },
+        });
+        expect(kinds(notices)).toEqual(['deletedReferences', 'changedRanges']);
+        expect(notices[0]!.sentences[0]).toBe('300 formulas use columns you deleted. After you save, they will show #REF!.');
+        expect(notices[0]!.formulas).toMatchObject({ total: 300, truncatedNote: 'Showing the first 250.' });
+        expect(notices[1]!.sentences[0]).toBe('Moving rows changed the range in 300 formulas.');
+        expect(notices[1]!.formulas).toMatchObject({ total: 300, truncatedNote: 'Showing the first 250.' });
+    });
+
+    it('says Save will refuse a formula past the host\'s cap, and counts range changes the cap left unlisted', () => {
+        // The capped list holds only range changes; one formula past it is
+        // unadjustable. Then the reverse: unadjustable formulas fill the list.
+        const ranged_first = pending_change_notices(with_review(review({
+            items: Array.from({ length: 500 }, (_, row) => flagged(row)),
+            counts: [{ targetSheetIndex: 0, formulas: 501 }],
+            totals: { deleted: 0, changedRanges: 500, unadjustable: 1 },
+        })));
+        expect(kinds(ranged_first)).toEqual(['saveRefusal', 'changedRanges']);
+        expect(ranged_first[0]!.sentences).toEqual([
+            "Table Viewer can't adjust 1 formula for these row and column changes, so Save will refuse it. "
+                + 'Undo the change, or edit it.',
+        ]);
+        expect(ranged_first[0]!.formulas).toBeUndefined();
+        expect(ranged_first[1]!.formulas!.total).toBe(500);
+
+        const unadjustable_first = pending_change_notices(with_review(review({
+            items: Array.from({ length: 500 }, (_, row) => flagged(row, { classes: ['unadjustable'] })),
+            counts: [{ targetSheetIndex: 0, formulas: 502 }],
+            totals: { deleted: 0, changedRanges: 2, unadjustable: 500 },
+        })));
+        expect(kinds(unadjustable_first)).toEqual(['saveRefusal', 'changedRanges']);
+        expect(unadjustable_first[0]!.formulas!.total).toBe(500);
+        expect(unadjustable_first[1]!.sentences).toEqual([
+            'Your row and column changes changed the range in 2 formulas.',
+            'Excel might adjust them differently, so check them before you save.',
+        ]);
+        expect(unadjustable_first[1]!.formulas).toBeUndefined();
     });
 
     it('lists a formula naming two worksheets once', () => {

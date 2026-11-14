@@ -107,6 +107,19 @@ export interface FormulaTargetCount {
     readonly formulas: number;
 }
 
+/**
+ * Distinct formula cells per Save warning, including those past the item cap.
+ * Unlike the per-worksheet counts, a formula naming two worksheets counts once.
+ */
+export interface FormulaDivergenceTotals {
+    /** Formulas that will show `#REF!`. */
+    readonly deleted: number;
+    /** Formulas flagged `moved`, `refilled`, or `discarded` on some worksheet they name. */
+    readonly changedRanges: number;
+    /** Formulas flagged `unadjustable` on some worksheet they name; Save refuses them. */
+    readonly unadjustable: number;
+}
+
 export interface FormulaDivergenceReview {
     /** Flagged formulas, per target worksheet, at most `MAX_FORMULA_DIVERGENCE_ITEMS` overall. */
     readonly items: readonly FormulaDivergenceItem[];
@@ -116,9 +129,10 @@ export interface FormulaDivergenceReview {
     readonly deleted: readonly FormulaDeletedItem[];
     /** Every such formula per target worksheet, including those past the item cap. */
     readonly deletedCounts: readonly FormulaTargetCount[];
+    readonly totals: FormulaDivergenceTotals;
 }
 
-/** Items listed per kind in the Save warnings; the counts still cover every formula. */
+/** Items listed per kind in the Save warnings; the counts and totals still cover every formula. */
 export const MAX_FORMULA_DIVERGENCE_ITEMS = 500;
 
 type ReviewSteps<T> = Generator<void, T, void>;
@@ -137,6 +151,7 @@ function* review_steps(
     const counts = new Map<number, number>();
     const deleted: FormulaDeletedItem[] = [];
     const deleted_counts = new Map<number, number>();
+    const totals = { deleted: 0, changedRanges: 0, unadjustable: 0 };
     const overridden = new Set(edits.map((edit) => `${edit.sheetIndex}:${edit.row}:${edit.column}`));
     let checked = 0;
     const check = (
@@ -178,6 +193,9 @@ function* review_steps(
                 by_target.set(target, entry);
             }
         }
+        const classes = new Set([...by_target.values()].flatMap((entry) => [...entry.classes]));
+        if ([...classes].some((name) => name !== 'unadjustable')) totals.changedRanges += 1;
+        if (classes.has('unadjustable')) totals.unadjustable += 1;
         for (const [target, entry] of [...by_target].sort(([left], [right]) => left - right)) {
             counts.set(target, (counts.get(target) ?? 0) + 1);
             if (items.length >= MAX_FORMULA_DIVERGENCE_ITEMS) continue;
@@ -200,6 +218,7 @@ function* review_steps(
             for (const identity of deletion.columns) entry.columns.set(JSON.stringify(identity), identity);
             deleted_by_target.set(deletion.worksheet, entry);
         }
+        if (deleted_by_target.size > 0) totals.deleted += 1;
         for (const [target, entry] of [...deleted_by_target].sort(([left], [right]) => left - right)) {
             deleted_counts.set(target, (deleted_counts.get(target) ?? 0) + 1);
             if (deleted.length >= MAX_FORMULA_DIVERGENCE_ITEMS) continue;
@@ -262,6 +281,7 @@ function* review_steps(
         counts: by_target(counts),
         deleted: Object.freeze(deleted),
         deletedCounts: by_target(deleted_counts),
+        totals: Object.freeze(totals),
     });
 }
 

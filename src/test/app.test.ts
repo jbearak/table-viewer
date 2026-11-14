@@ -18025,7 +18025,13 @@ describe('Save warnings for row and column structure', () => {
         .filter((message): message is Extract<WebviewMessage, { type: 'requestFormulaDivergence' }> =>
             message.type === 'requestFormulaDivergence');
     const notices = () => document.querySelector('.pending-change-notices');
-    const empty_review = { items: [], counts: [], deleted: [], deletedCounts: [] };
+    const empty_review = {
+        items: [],
+        counts: [],
+        deleted: [],
+        deletedCounts: [],
+        totals: { deleted: 0, changedRanges: 0, unadjustable: 0 },
+    };
 
     it('shows no banner for a plain row or column change, and asks the host about formulas without a click', async () => {
         const { post_message } = await open_restructured_workbook();
@@ -18074,6 +18080,7 @@ describe('Save warnings for row and column structure', () => {
                     columns: [{ kind: 'source', sourceColumn: 2 }],
                 }],
                 deletedCounts: [{ targetSheetIndex: 0, formulas: 1 }],
+                totals: { deleted: 1, changedRanges: 0, unadjustable: 0 },
             },
         });
         const notice = document.querySelector('[aria-label="Formulas that will show #REF!"]');
@@ -18115,6 +18122,7 @@ describe('Save warnings for row and column structure', () => {
                     axes: ['row'],
                 }],
                 counts: [{ targetSheetIndex: 0, formulas: 1 }],
+                totals: { deleted: 0, changedRanges: 1, unadjustable: 0 },
             },
         });
         const notice = () => document.querySelector('[aria-label="Formulas whose ranges changed"]');

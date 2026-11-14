@@ -218,6 +218,60 @@ describe('review_formula_divergence', () => {
         );
         expect(review.items).toHaveLength(MAX_FORMULA_DIVERGENCE_ITEMS);
         expect(review.counts).toEqual([{ targetSheetIndex: 0, formulas: MAX_FORMULA_DIVERGENCE_ITEMS + 12 }]);
+        expect(review.totals).toEqual({ deleted: 0, changedRanges: MAX_FORMULA_DIVERGENCE_ITEMS + 12, unadjustable: 0 });
+    });
+
+    describe('past the item cap, totals count each formula cell once', () => {
+        // Data and Other: Header Row 1 and six body rows of values in A and B.
+        // Summary: past the cap, formulas that each name both worksheets.
+        const values = () => Array.from({ length: 7 }, (_, row) => [value(`${row}`), value(`${row}`)]);
+        const past_cap = MAX_FORMULA_DIVERGENCE_ITEMS + 5;
+        const source = (summary: (RenderedCell | null)[][]) => source_of([
+            { name: 'Data', header: true, rows: values() },
+            { name: 'Other', header: true, rows: values() },
+            { name: 'Summary', rows: summary },
+        ]);
+
+        it('counts a formula using deleted columns on two worksheets once', () => {
+            const deleted = delete_layout_columns(source_column_layout(2), [{ kind: 'source', sourceColumn: 0 }], () => 0);
+            if (!deleted.ok) throw new Error(deleted.refusal.reason);
+            const review = review_formula_divergence(
+                source(Array.from({ length: past_cap }, () => [formula('=Data!A2+Other!A2')])),
+                [],
+                [
+                    { bodyStart: 1, columnLayout: deleted.layout, band: [] },
+                    { bodyStart: 1, columnLayout: deleted.layout, band: [] },
+                    layout_of(undefined, 0),
+                ],
+            );
+            expect(review.deleted).toHaveLength(MAX_FORMULA_DIVERGENCE_ITEMS);
+            expect(review.deletedCounts).toEqual([
+                { targetSheetIndex: 0, formulas: past_cap },
+                { targetSheetIndex: 1, formulas: past_cap },
+            ]);
+            expect(review.totals).toEqual({ deleted: past_cap, changedRanges: 0, unadjustable: 0 });
+        });
+
+        it('counts range changes on two worksheets once, and an unadjustable formula the cap left unlisted', () => {
+            // Both worksheets: source row 1 moved below source row 4, so
+            // A2:A4's first corner was carried.
+            const layout = layout_of(moved(), 1);
+            const review = review_formula_divergence(
+                source([
+                    ...Array.from({ length: past_cap }, () => [formula('=SUM(Data!A2:A4)+SUM(Other!A2:A4)')]),
+                    [formula('=SUM(INDEX(Data!A:A,MATCH("x",Data!A:A,0)):Data!B5)')],
+                ]),
+                [],
+                [layout, layout, layout_of(undefined, 0)],
+            );
+            expect(review.items).toHaveLength(MAX_FORMULA_DIVERGENCE_ITEMS);
+            expect(review.items.some((item) => item.classes.includes('unadjustable'))).toBe(false);
+            expect(review.counts).toEqual([
+                { targetSheetIndex: 0, formulas: past_cap + 1 },
+                { targetSheetIndex: 1, formulas: past_cap },
+            ]);
+            expect(review.totals).toEqual({ deleted: 0, changedRanges: past_cap, unadjustable: 1 });
+        });
     });
 
     it('maps each flag reason to the spec class it belongs to', () => {

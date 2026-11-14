@@ -45,7 +45,6 @@ import type {
     FormulaDivergenceItem,
     FormulaDivergenceReview,
     FormulaImpact,
-    FormulaTargetCount,
 } from '../formula-divergence-review';
 
 // --- Notices -----------------------------------------------------------------
@@ -431,13 +430,6 @@ function unique_cells<T extends FormulaCell>(items: readonly T[]): T[][] {
     return [...by_cell.values()];
 }
 
-function formula_total(listed: number, items: number, counts: readonly FormulaTargetCount[]): number {
-    const sum = counts.reduce((total, entry) => total + entry.formulas, 0);
-    // Uncapped, the listed cells are exact; capped, the per-worksheet counts
-    // are the best there is.
-    return items >= sum ? listed : Math.max(listed, sum);
-}
-
 function formula_list(
     entries: readonly PendingChangeNoticeFormula[],
     total: number,
@@ -520,7 +512,8 @@ function deleted_references_notice(input: PendingChangeNoticeInput): PendingChan
     if (review === undefined || review === null || review.deleted.length === 0) return undefined;
     const groups = unique_cells(review.deleted);
     const entries = groups.map((group) => formula_entry(input, group[0]!));
-    const total = formula_total(groups.length, review.deleted.length, review.deletedCounts);
+    // The host's total counts every formula cell, past its item cap too.
+    const total = Math.max(groups.length, review.totals.deleted);
     const distinct = (pick: (item: FormulaDeletedItem) => readonly unknown[]) => new Set(review.deleted.flatMap((item) =>
         pick(item).map((identity) => `${item.targetSheetIndex}:${JSON.stringify(identity)}`))).size;
     const rows = distinct((item) => item.rows);
@@ -583,8 +576,10 @@ function changed_ranges_notice(input: PendingChangeNoticeInput): PendingChangeNo
     const review = input.formulaReview?.review;
     if (review === undefined || review === null) return undefined;
     const ranged = review.items.filter((item) => item.classes.some((name) => name !== 'unadjustable'));
-    if (ranged.length === 0) return undefined;
     const groups = unique_cells(ranged);
+    // The host's total counts every formula cell, past its item cap too.
+    const total = Math.max(groups.length, review.totals.changedRanges);
+    if (total === 0) return undefined;
     const classes = RANGE_CLASSES.filter((name) => ranged.some((item) => item.classes.includes(name)));
     const axes = new Set(ranged.flatMap((item) => item.axes));
     const mixed = classes.length > 1;
@@ -595,19 +590,19 @@ function changed_ranges_notice(input: PendingChangeNoticeInput): PendingChangeNo
             : undefined;
         return formula_entry(input, group[0]!, note);
     });
-    // The host's per-worksheet counts include formulas it flags as
-    // unadjustable, so they stand in only when it capped its list.
-    const counted = review.counts.reduce((total, entry) => total + entry.formulas, 0);
-    const total = review.items.length >= counted ? groups.length : Math.max(groups.length, counted);
-    const cause = classes.length === 1 && classes[0] === 'moved'
-        ? `Moving ${axis_words(axes, true)}`
-        : classes.length === 1 && classes[0] === 'discarded'
-            ? 'Removing appended rows'
-            : `Your ${axis_words(axes, false)} changes`;
+    // Formulas Save refuses can fill the capped list and leave none of these
+    // listed: then say how many, without a reason.
+    const cause = classes.length === 0
+        ? 'Your row and column changes'
+        : classes.length === 1 && classes[0] === 'moved'
+            ? `Moving ${axis_words(axes, true)}`
+            : classes.length === 1 && classes[0] === 'discarded'
+                ? 'Removing appended rows'
+                : `Your ${axis_words(axes, false)} changes`;
     const pronoun = total === 1 ? 'it' : 'them';
     const sentences = [
         `${cause} changed the range in ${count(total, 'formula', 'formulas')}.`,
-        ...(mixed ? [] : [range_reason(classes[0]!, main_axis(axes), total !== 1)]),
+        ...(classes.length === 1 ? [range_reason(classes[0]!, main_axis(axes), total !== 1)] : []),
         `Excel might adjust ${pronoun} differently, so check ${pronoun} before you save.`,
     ];
     const dismissKey = signature('ranges', sentences, entries);
@@ -617,7 +612,7 @@ function changed_ranges_notice(input: PendingChangeNoticeInput): PendingChangeNo
         severity: 'warning',
         label: 'Formulas whose ranges changed',
         sentences,
-        formulas: formula_list(entries, total),
+        ...(entries.length > 0 ? { formulas: formula_list(entries, total) } : {}),
         actions: [{ label: 'Dismiss', intent: { kind: 'dismiss', key: dismissKey } }],
         dismissKey,
     };
@@ -628,14 +623,17 @@ function save_refusal_notice(input: PendingChangeNoticeInput): PendingChangeNoti
     const unadjustable: FormulaDivergenceItem[] = review === undefined || review === null
         ? []
         : review.items.filter((item) => item.classes.includes('unadjustable'));
-    if (input.refusals.length === 0 && unadjustable.length === 0) return undefined;
     const groups = unique_cells(unadjustable);
+    // The host's total counts every formula cell, past its item cap too, so a
+    // formula Save refuses is named even when earlier ones filled the list.
+    const total = Math.max(groups.length, review?.totals.unadjustable ?? 0);
+    if (input.refusals.length === 0 && total === 0) return undefined;
     const entries = groups.map((group) => formula_entry(input, group[0]!));
     const sentences = [...input.refusals];
-    if (groups.length > 0) {
-        const pronoun = groups.length === 1 ? 'it' : 'them';
+    if (total > 0) {
+        const pronoun = total === 1 ? 'it' : 'them';
         sentences.push(
-            `Table Viewer can't adjust ${count(groups.length, 'formula', 'formulas')} for these row and column changes, `
+            `Table Viewer can't adjust ${count(total, 'formula', 'formulas')} for these row and column changes, `
                 + `so Save will refuse ${pronoun}. Undo the change, or edit ${pronoun}.`,
         );
     }
@@ -645,7 +643,7 @@ function save_refusal_notice(input: PendingChangeNoticeInput): PendingChangeNoti
         severity: 'refusal',
         label: 'Row and column changes Save will refuse',
         sentences,
-        ...(entries.length > 0 ? { formulas: formula_list(entries, groups.length) } : {}),
+        ...(entries.length > 0 ? { formulas: formula_list(entries, total) } : {}),
         actions: [],
     };
 }
