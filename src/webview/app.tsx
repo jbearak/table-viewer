@@ -6,7 +6,6 @@ import React, {
     useCallback,
     useMemo,
     useLayoutEffect,
-    useSyncExternalStore,
 } from 'react';
 import {
     EMPTY_TRANSFORM,
@@ -128,9 +127,9 @@ import {
     needs_prospective_formula_request,
     prospective_formula_request,
     prospective_formula_targets,
-    webview_anchor_inputs,
     webview_formula_workbook,
 } from './formula-anchor-model';
+import { use_pending_snapshot } from './pending-snapshot';
 import { capture_pending_formula_reference_bases } from '../pending-formula-rebase';
 import {
     classify_snapshot,
@@ -877,11 +876,14 @@ export function App(): React.JSX.Element {
             () => csv_edit_session_id_ref.current,
         );
     }
-    useSyncExternalStore(
-        edit_session_registry_ref.current.subscribe,
-        edit_session_registry_ref.current.revision,
-        edit_session_registry_ref.current.revision,
+    // Every Pending Change this render reads, and what is derived from them.
+    // Subscribing here re-renders App whenever the registry publishes.
+    const pending_snapshot = use_pending_snapshot(
+        edit_session_registry_ref.current,
+        meta?.sheets,
+        edit_syntax === 'markdown',
     );
+    const { structure: pending_structure, cells: pending_cells } = pending_snapshot;
     const formula_roots_projection = edit_session_registry_ref.current.formula_projection(
         meta?.sheets.map((sheet) => sheet.sourceRowCount),
     );
@@ -893,20 +895,8 @@ export function App(): React.JSX.Element {
         ],
     ));
     // The workbook every formula renders against: each worksheet's layout and
-    // append band. Rebuilt with the structural revision, which every pending
-    // store change bumps.
-    const formula_anchor_workbook = useMemo(() => {
-        if (!meta) return undefined;
-        const pending_by_sheet = new Map(edit_session_registry_ref.current!.pending_entries());
-        return webview_formula_workbook(
-            edit_syntax === 'markdown',
-            meta.sheets,
-            (sheet_index) => pending_by_sheet.get(sheet_index)?.snapshot(),
-        );
-    },
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-        [formula_roots_projection.structuralRevision, meta, edit_syntax],
-    );
+    // append band.
+    const formula_anchor_workbook = meta ? pending_structure.formula_workbook() : undefined;
     const structural_formula_state = useMemo(() => {
         const edits: FormulaCalculationEdit[] = formula_roots_projection.edits.map((edit) => {
             const sheet = meta?.sheets[edit.sheetIndex];
@@ -915,8 +905,7 @@ export function App(): React.JSX.Element {
                 ? { ...edit, writesFormula: false }
                 : edit;
         });
-        const pending_by_sheet = new Map(edit_session_registry_ref.current!.pending_entries());
-        const changes_for = (sheet_index: number) => pending_by_sheet.get(sheet_index)?.snapshot();
+        const { changes_for } = pending_structure;
         // A pending cut move retargets formulas only on the move path, which
         // calculates nothing live; the two are never combined.
         if (formula_roots_projection.moves.length === 0
@@ -950,16 +939,14 @@ export function App(): React.JSX.Element {
             };
         }
         const prospectiveRowCounts = (meta?.sheets ?? []).map((sheet, sheetIndex) => {
-            const changes = pending_by_sheet.get(sheetIndex)?.snapshot()
-                ?? EMPTY_PENDING_STRUCTURAL_CHANGES;
+            const changes = changes_for(sheetIndex) ?? EMPTY_PENDING_STRUCTURAL_CHANGES;
             const prospective_start = sheet.sourceRowCount - changes.tailRemovals.length;
             return prospective_start + pending_rows(changes).length;
         });
         for (const edit of formula_roots_projection.pendingEdits) {
             const sheet = meta?.sheets[edit.sheetIndex];
             if (sheet === undefined || edit.column >= sheet.columnCount) continue;
-            const changes = pending_by_sheet.get(edit.sheetIndex)?.snapshot()
-                ?? EMPTY_PENDING_STRUCTURAL_CHANGES;
+            const changes = changes_for(edit.sheetIndex) ?? EMPTY_PENDING_STRUCTURAL_CHANGES;
             edits.push({
                 sheetIndex: edit.sheetIndex,
                 row: sheet.sourceRowCount - changes.tailRemovals.length
@@ -970,8 +957,8 @@ export function App(): React.JSX.Element {
                 ...(edit.runs !== undefined ? { runs: edit.runs } : {}),
             });
         }
-        const removedRows = [...pending_by_sheet].flatMap(([sheetIndex, store]) =>
-            store.snapshot().tailRemovals.map(({ sourceRow }) => ({ sheetIndex, row: sourceRow })));
+        const removedRows = [...pending_structure.by_sheet].flatMap(([sheetIndex, changes]) =>
+            changes.tailRemovals.map(({ sourceRow }) => ({ sheetIndex, row: sourceRow })));
         edits.sort((left, right) => (left.sheetIndex - right.sheetIndex)
             || (left.row - right.row)
             || (left.column - right.column));
@@ -985,8 +972,10 @@ export function App(): React.JSX.Element {
                 || edits.length > MAX_WORKBOOK_FORMULAS,
         };
     },
+        // The projection's revisions stand in for its edit arrays.
         // eslint-disable-next-line react-hooks/exhaustive-deps
         [
+            pending_structure,
             formula_roots_projection.structuralRevision,
             formula_roots_projection.calculationRevision,
             formula_header_coordinate_signature,
@@ -1514,28 +1503,23 @@ export function App(): React.JSX.Element {
     // The Save-refusal notice's input: an `.xlsx` conditional-formatting
     // element or data-validation rule on this worksheet that the current
     // layouts would split past the writer's cap, counted with the writer's
-    // own partition. Rebuilt with the structural revision.
+    // own partition.
     const rule_split_warning_messages = useMemo(() => {
         const rules = structural_editing?.sheets[active_sheet_index]?.relativeRules ?? [];
         if (!meta || edit_syntax !== 'markdown' || !editing_session_held || rules.length === 0) return [];
-        const pending_by_sheet = new Map(edit_session_registry_ref.current!.pending_entries());
-        const changes_for = (sheet_index: number) => pending_by_sheet.get(sheet_index)?.snapshot();
         try {
             const warnings = rule_split_warnings(
-                webview_anchor_inputs(meta.sheets, changes_for),
+                pending_structure.anchor_inputs(),
                 active_sheet_index,
                 rules,
             );
-            const changes = changes_for(active_sheet_index) ?? EMPTY_PENDING_STRUCTURAL_CHANGES;
+            const changes = pending_structure.changes_for(active_sheet_index)
+                ?? EMPTY_PENDING_STRUCTURAL_CHANGES;
             return warnings.map((warning) => rule_split_warning_message(warning, changes));
         } catch {
             return [];
         }
-    },
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-        [formula_roots_projection.structuralRevision, meta, edit_syntax, structural_editing,
-            active_sheet_index, editing_session_held],
-    );
+    }, [pending_structure, meta, edit_syntax, structural_editing, active_sheet_index, editing_session_held]);
     const [edit_session_pending, set_edit_session_pending] = useState(false);
     const [save_operation, set_save_operation] = useState<CsvSaveOperation>();
     const [save_lifecycle, set_save_lifecycle] = useState<CsvSaveLifecycle>(
@@ -1962,32 +1946,26 @@ export function App(): React.JSX.Element {
     // The worksheets Save will restructure: a live layout change on each.
     const restructured_sheets = useMemo(() => {
         if (!meta || !editing_session_held || structural_editing === undefined) return [];
-        const pending_by_sheet = new Map(edit_session_registry_ref.current!.pending_entries());
         return meta.sheets.flatMap((sheet, sheetIndex) => {
-            const changes = pending_by_sheet.get(sheetIndex)?.snapshot();
+            const changes = pending_structure.changes_for(sheetIndex);
             return changes !== undefined && has_live_layout_change(changes)
                 ? [{ sheetIndex, name: sheet.name, changes }]
                 : [];
         });
-    },
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-        [formula_roots_projection.structuralRevision, meta, structural_editing, editing_session_held],
-    );
+    }, [pending_structure, meta, structural_editing, editing_session_held]);
     // The Save button's description: what Save will do, per worksheet.
     const save_description = useMemo(() => {
         if (!meta || !editing_session_held) return undefined;
-        const registry = edit_session_registry_ref.current!;
-        const pending_by_sheet = new Map(registry.pending_entries());
         return save_summary({
             singleTable: edit_syntax !== 'markdown',
             activeSheetIndex: active_sheet_index,
             worksheets: meta.sheets.map((sheet, sheetIndex) => {
-                const changes = pending_by_sheet.get(sheetIndex)?.snapshot();
-                const store = registry.for_sheet(sheetIndex);
+                const changes = pending_structure.changes_for(sheetIndex);
+                const cells = pending_cells.cells_for(sheetIndex);
                 const header = sheet.excelFirstRowHeader;
                 const renamed = header?.active === true && changes !== undefined
                     ? renamed_source_columns(sheet.columnNames, changes, (column) => {
-                        const entry = store.get(`${header.sourceRow ?? 0}:${column}`);
+                        const entry = cells.get(`${header.sourceRow ?? 0}:${column}`);
                         return entry === undefined ? undefined : committed_column_name(entry.value);
                     })
                     : 0;
@@ -1998,18 +1976,13 @@ export function App(): React.JSX.Element {
                     sheetIndex,
                     name: sheet.name,
                     ...(changes === undefined ? {} : { counts: worksheet_structure_counts(changes, renamed) }),
-                    cellEdits: store.size() === 0 ? 0 : saved_cell_edit_count(store.snapshot().keys(), changes, renamed),
+                    cellEdits: cells.size === 0 ? 0 : saved_cell_edit_count(cells.keys(), changes, renamed),
                     ...(note === undefined ? {} : { note }),
                 };
             }),
         });
-    },
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-        [meta, editing_session_held, edit_syntax, active_sheet_index, structural_editing,
-            formula_roots_projection.calculationRevision, formula_roots_projection.structuralRevision,
-            // A link-only write adds an edited cell without moving either revision above.
-            edit_session_registry_ref.current.revision()],
-    );
+    }, [meta, editing_session_held, edit_syntax, active_sheet_index, structural_editing,
+        pending_structure, pending_cells]);
     const [cell_focus, set_cell_focus] = useState<CellFocus | null>(null);
     const cell_focus_sequence_ref = useRef(0);
     /** `handle_sheet_select`, defined below with the sheet tabs. */
@@ -8310,8 +8283,6 @@ export function App(): React.JSX.Element {
     }, [meta, restore_widths_for_sheets, update_pending_auto_fit_sheets]);
 
     const current_sheet = meta?.sheets[active_sheet_index];
-    const active_pending_row_store = edit_session_registry_ref.current!
-        .pending_rows_for_sheet(active_sheet_index);
     // Discarded tombstones a stored Formula Anchor names must survive a
     // structural action: every worksheet's cell edits, and every other
     // worksheet's Pending Rows and Pending Columns. The acting worksheet's own
@@ -8349,43 +8320,17 @@ export function App(): React.JSX.Element {
                     .snapshot()),
             { [active_sheet_index]: additional_pending_rows },
         ), [active_sheet_index, meta]);
-    const subscribe_active_pending_conflicts = useCallback((listener: () => void) =>
-        active_pending_row_store.subscribe((change) => {
-            if (change.kind === 'reset') listener();
-        }), [active_pending_row_store]);
-    const active_pending_conflict_snapshot = useCallback(
-        () => active_pending_row_store.snapshot().conflicts,
-        [active_pending_row_store],
-    );
-    const active_pending_conflicts = useSyncExternalStore(
-        subscribe_active_pending_conflicts,
-        active_pending_conflict_snapshot,
-        active_pending_conflict_snapshot,
-    );
+    const active_pending_changes = pending_structure.changes_for(active_sheet_index)
+        ?? EMPTY_PENDING_STRUCTURAL_CHANGES;
+    const active_pending_conflicts = active_pending_changes.conflicts;
     // Merges display unmerged on a worksheet with a layout change, as they do
     // in a transformed view: a removed row inside a merge keeps its place, so
     // the merge's display span no longer means its saved span.
-    const active_layout_change_snapshot = useCallback(
-        () => has_live_layout_change(active_pending_row_store.snapshot()),
-        [active_pending_row_store],
-    );
-    const active_layout_changed = useSyncExternalStore(
-        subscribe_active_pending_conflicts,
-        active_layout_change_snapshot,
-        active_layout_change_snapshot,
-    );
+    const active_layout_changed = has_live_layout_change(active_pending_changes);
     // What "Keep new rows at the end" loses, counted for its notice: Pending
     // Columns that hold typed values or formulas.
-    const active_column_values_lost_snapshot = useCallback(
-        () => (active_pending_row_store.snapshot().pendingColumns ?? []).filter((column) =>
-            Object.values(column.cells).some((cell) => cell.value !== '')).length,
-        [active_pending_row_store],
-    );
-    const active_column_values_lost = useSyncExternalStore(
-        subscribe_active_pending_conflicts,
-        active_column_values_lost_snapshot,
-        active_column_values_lost_snapshot,
-    );
+    const active_column_values_lost = (active_pending_changes.pendingColumns ?? []).filter((column) =>
+        Object.values(column.cells).some((cell) => cell.value !== '')).length;
     const current_column_projection = useMemo(
         () => create_column_projection(
             current_sheet?.columnCount ?? 0,
@@ -8563,8 +8508,7 @@ export function App(): React.JSX.Element {
             || formula_anchor_workbook === undefined) return undefined;
         const sheet = meta.sheets[active_sheet_index];
         if (sheet === undefined) return undefined;
-        const pending_by_sheet = new Map(edit_session_registry_ref.current!.pending_entries());
-        const changes_for = (sheet_index: number) => pending_by_sheet.get(sheet_index)?.snapshot();
+        const { changes_for } = pending_structure;
         const current = changes_for(active_sheet_index) ?? EMPTY_PENDING_STRUCTURAL_CHANGES;
         const context = salvage_context(active_sheet_index);
         if (context === undefined) return undefined;
@@ -8598,9 +8542,10 @@ export function App(): React.JSX.Element {
             return undefined;
         }
     },
+        // The edit signature stands in for the source and pending formula edits.
         // eslint-disable-next-line react-hooks/exhaustive-deps
         [impact_conflict, formula_calculation_edit_signature, active_sheet_index, meta,
-            edit_syntax, formula_anchor_workbook],
+            edit_syntax, pending_structure, formula_anchor_workbook],
     );
     // Each state the actions would act on gets its own key, so counts for an
     // older state never show beside actions that act on a newer one.
@@ -8647,16 +8592,15 @@ export function App(): React.JSX.Element {
     // which show, what they say, and what each action does.
     const notices = useMemo(() => {
         if (!meta) return [];
-        const pending_by_sheet = new Map(edit_session_registry_ref.current!.pending_entries());
         const worksheets = meta.sheets.map((sheet, sheet_index): PendingChangeNoticeWorksheet => {
-            const pending_columns = pending_by_sheet.get(sheet_index)?.snapshot().pendingColumns ?? [];
+            const pending_columns = pending_structure.changes_for(sheet_index)?.pendingColumns ?? [];
             const pending_names = new Map(pending_columns.map((column) => [column.id, column.header]));
             const header = sheet.excelFirstRowHeader;
             const columns = formula_anchor_workbook?.worksheets[sheet_index]?.columns;
             // The names the grid shows over each column, a rename included.
-            const store = edit_session_registry_ref.current!.for_sheet(sheet_index);
+            const cells = pending_cells.cells_for(sheet_index);
             const shown_name = (source_column: number): string | undefined => {
-                const entry = store.get(`${header?.sourceRow ?? 0}:${source_column}`);
+                const entry = cells.get(`${header?.sourceRow ?? 0}:${source_column}`);
                 return entry === undefined
                     ? sheet.columnNames?.[source_column]
                     : committed_column_name(entry.value);
@@ -8697,12 +8641,12 @@ export function App(): React.JSX.Element {
             dismissed: dismissed_notices,
         });
     },
+        // The impact answer and key stand in for `formula_impact_view`, rebuilt every render.
         // eslint-disable-next-line react-hooks/exhaustive-deps
         [meta, edit_syntax, active_sheet_index, notice_worksheet_key, notice_conflicts, active_column_values_lost,
             salvage_impact.answer, salvage_impact.current, formula_impact_key, rule_split_warning_messages,
             formula_review_key, formula_review.answer, formula_review.current, dismissed_notices,
-            formula_roots_projection.structuralRevision, formula_roots_projection.calculationRevision,
-            formula_anchor_workbook],
+            pending_structure, pending_cells, formula_anchor_workbook],
     );
     if (!meta) {
         return compare_progress

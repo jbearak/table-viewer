@@ -5442,6 +5442,27 @@ describe('editing without an edit mode', () => {
         expect(await tooltip_of('Save')).toBe('Save: 1 cell edited.');
     });
 
+    it('counts a link-only write in the Save description', async () => {
+        const post_message = await editable_sheet();
+        await acquire_editing_session(post_message);
+        seed_mounted_store();
+        expect(await tooltip_of('Save')).toBe('Save: 1 cell edited.');
+
+        // A link changes no value, so neither formula revision moves (#349).
+        const props = grid_shell_mock.latest_props as {
+            edit_session: EditSessionStore;
+            edit_session_id: string;
+        };
+        act(() => props.edit_session.commit(props.edit_session_id, '1:0', {
+            value: 'same',
+            base: 'same',
+            link: { kind: 'external', target: 'https://example.com' },
+            baseLink: null,
+        }));
+
+        expect(await tooltip_of('Save')).toBe('Save: 2 cells edited.');
+    });
+
     it('keeps an idle, clean session while a save is in flight', async () => {
         const post_message = await editable_sheet();
         await acquire_editing_session(post_message);
