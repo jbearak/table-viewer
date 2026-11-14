@@ -882,3 +882,87 @@ export function formula_divergence_flags(
     }
     return flags;
 }
+
+// --- Deleted references -----------------------------------------------------
+
+/**
+ * A reference that renders `#REF!` because a row or column it names was
+ * deleted in this session: the error Save writes in its place, as Excel does.
+ */
+export interface FormulaDeletedReference {
+    /** UTF-16 span of the reference in the stored text. */
+    readonly start: number;
+    readonly end: number;
+    /** Index into the context's `worksheets` of the worksheet the reference names. */
+    readonly worksheet: number;
+    /** The deleted rows among the reference's corners, when its rows no longer render. */
+    readonly rows: readonly RowIdentity[];
+    /** The deleted columns among the reference's corners, when its columns no longer render. */
+    readonly columns: readonly ColumnIdentity[];
+}
+
+function deleted_corners<Identity>(
+    axis: Axis<Identity>,
+    view: AnchorAxisView<Identity>,
+    anchors: readonly AxisAnchor[],
+    written: readonly number[],
+): Identity[] {
+    if (render_axis(axis, view, anchors, written) !== undefined) return [];
+    const out: Identity[] = [];
+    const seen = new Set<string>();
+    for (const anchor of anchors) {
+        const placement = place(axis, view, anchor);
+        if (placement.kind !== 'body' || placement.live) continue;
+        const identity = axis.identity_of(anchor);
+        const key = JSON.stringify(identity);
+        if (identity === undefined || seen.has(key)) continue;
+        seen.add(key);
+        out.push(identity);
+    }
+    return out;
+}
+
+/**
+ * Every reference of a formula that renders `#REF!` because a corner it
+ * names is a tombstone: a row or column deleted in this session. A
+ * reference that renders `#REF!` for another reason (a discarded appended
+ * row, a corner pushed past the sheet's edge) is left out, and so is a
+ * formula that does not render.
+ */
+export function formula_deleted_references(
+    text: string,
+    anchors: FormulaAnchors | undefined,
+    context: FormulaAnchorContext,
+): readonly FormulaDeletedReference[] {
+    if (context.format !== 'xlsx' || !text.startsWith('=')) return [];
+    const lex = formula_reference_tokens(text);
+    if (blocking_issues(lex.issues, workbook_of(context)).length > 0) return [];
+    const out: FormulaDeletedReference[] = [];
+    for (const { token, worksheet, anchor } of resolved_references(lex.references, anchors, context)) {
+        const rows = token.corners[0].row === undefined
+            ? []
+            : deleted_corners(
+                ROW_AXIS,
+                worksheet.rows,
+                anchor.corners.map((corner) => corner.row!),
+                token.corners.map((corner) => corner.row!.value),
+            );
+        const columns = token.corners[0].column === undefined
+            ? []
+            : deleted_corners(
+                COLUMN_AXIS,
+                worksheet.columns,
+                anchor.corners.map((corner) => corner.column!),
+                token.corners.map((corner) => corner.column!.value),
+            );
+        if (rows.length === 0 && columns.length === 0) continue;
+        out.push(Object.freeze({
+            start: token.start,
+            end: token.end,
+            worksheet: context.worksheets.indexOf(worksheet),
+            rows: Object.freeze(rows),
+            columns: Object.freeze(columns),
+        }));
+    }
+    return out;
+}

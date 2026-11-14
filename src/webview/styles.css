@@ -1231,38 +1231,117 @@ body.vscode-high-contrast-light .toolbar-split-caret.open {
     margin-top: 8px;
 }
 
-.structure-review p {
-    margin: 4px 0;
+/* Pending-change notices: what Save will do that the grid can't show. Docked
+   under the grid inside the sheet pane, so a notice that appears or goes after
+   a gesture moves the grid's bottom edge, never the row under the pointer. */
+.pending-change-notices {
+    flex-shrink: 0;
+    max-height: min(40vh, 360px);
+    overflow: auto;
+    border-top: 1px solid var(--vscode-panel-border, #444);
+    background: var(--vscode-sideBar-background, var(--vscode-editor-background, #1e1e1e));
+    color: var(--vscode-foreground, #ccc);
+    font-size: var(--tv-font-size-md);
 }
 
-.structure-review h4 {
-    margin: 8px 0 4px;
+.pending-change-notice {
+    padding: 6px 12px 8px 10px;
+    border-left: 3px solid var(--vscode-editorInfo-foreground, #3794ff);
+}
+
+.pending-change-notice + .pending-change-notice {
+    border-top: 1px solid var(--vscode-panel-border, #444);
+}
+
+.pending-change-notice-warning {
+    border-left-color: var(--vscode-editorWarning-foreground, #cca700);
+}
+
+.pending-change-notice-refusal {
+    border-left-color: var(--vscode-editorError-foreground, #f14c4c);
+}
+
+.pending-change-notice h2 {
+    margin: 0 0 4px;
+    font-size: var(--tv-font-size-md);
+}
+
+.pending-change-notice p {
+    margin: 2px 0;
+}
+
+.pending-change-notice button {
+    background: var(--vscode-button-secondaryBackground, #3a3d41);
+    color: var(--vscode-button-secondaryForeground, #ccc);
+    border: 1px solid var(--vscode-panel-border, #444);
+    border-radius: 2px;
+    padding: 2px 8px;
+    cursor: pointer;
     font-size: var(--tv-font-size-sm);
-    font-weight: 600;
 }
 
-.structure-review-formulas {
+.pending-change-notice button:hover:not(:disabled) {
+    background: var(--vscode-button-secondaryHoverBackground, #45494e);
+}
+
+.pending-change-notice button:disabled {
+    opacity: 0.5;
+    cursor: default;
+}
+
+.pending-change-notice-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 5px;
+    margin-top: 6px;
+}
+
+.pending-change-disclosure {
+    margin-top: 4px;
+}
+
+.pending-change-formulas {
     display: grid;
-    gap: 4px;
+    gap: 3px;
     list-style: none;
     padding: 0;
-    margin: 0;
+    margin: 6px 0 0;
 }
 
-.structure-review-formulas li {
+.pending-change-formulas li {
     display: grid;
     grid-template-columns: max-content minmax(0, 1fr) max-content;
     align-items: baseline;
-    column-gap: 8px;
+    column-gap: 10px;
 }
 
-.structure-review-formulas code {
+.pending-change-formula-location {
+    font-family: var(--vscode-editor-font-family, monospace);
+}
+
+.pending-change-formulas code {
     white-space: pre-wrap;
     overflow-wrap: anywhere;
     padding: 1px 4px;
     color: var(--vscode-textPreformat-foreground, var(--vscode-foreground, #ccc));
     background: var(--vscode-textCodeBlock-background, rgba(128, 128, 128, 0.15));
     border-radius: 2px;
+}
+
+.pending-change-formula-written,
+.pending-change-formula-note {
+    color: var(--vscode-descriptionForeground, #aaa);
+}
+
+.pending-change-formula-note {
+    display: block;
+    margin-top: 1px;
+}
+
+.pending-change-notices-status {
+    margin: 0;
+    padding: 4px 12px;
+    color: var(--vscode-descriptionForeground, #aaa);
 }
 
 .external-change-review-status {

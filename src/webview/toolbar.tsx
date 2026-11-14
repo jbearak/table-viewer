@@ -91,6 +91,12 @@ export interface ToolbarProps {
     on_toggle_diff_mode: () => void;
     /** There is unsaved work for Save to write and Discard to drop. */
     is_dirty: boolean;
+    /**
+     * What Save will do, such as "Save: 1 row inserted, 1 column deleted.",
+     * as its tooltip and accessible description. Undefined falls back to a
+     * generic line.
+     */
+    save_description?: string;
     on_save: () => void;
     on_discard: () => void;
     /** A save is being written. */
@@ -158,7 +164,7 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
                 tooltip_text={props.save_busy
                     ? 'Saving changes.'
                     : props.is_dirty
-                    ? 'Save changes to the file.'
+                    ? props.save_description ?? 'Save changes to the file.'
                     : 'No unsaved changes. Double-click a cell or start typing to edit it.'}
                 onClick={props.on_save}
                 on_action_complete={props.on_action_complete}

@@ -43,10 +43,12 @@ import {
     type FormulaCalculationEdit,
     type FormulaCalculationRequest,
     type FormulaCalculationResult,
+    type FormulaCalculationSchedule,
 } from './formula-calculation';
 import {
     review_formula_divergence_cooperatively,
     review_formula_impact_cooperatively,
+    type FormulaDivergenceReview,
     type FormulaImpact,
     type FormulaImpactState,
 } from './formula-divergence-review';
@@ -423,9 +425,12 @@ export class ViewerPanelCore {
     private readonly histogram_cache: HistogramLruCache;
     private readonly histogram_operations = new Map<string, TransformOperationToken>();
     private formula_calculation_operation = 0;
-    /** Bumped by each divergence review request, so only the latest answers. */
-    private formula_divergence_operation = 0;
-    private formula_impact_operation = 0;
+    /**
+     * Bumped per kind by each formula question (the Save warnings' review,
+     * the conflict notice's impact count), so only the latest of each kind
+     * answers.
+     */
+    private readonly formula_question_operations = { divergence: 0, impact: 0 };
     private active_formula_calculation?: {
         readonly requestId: string;
         readonly sourceGeneration: number;
@@ -1052,81 +1057,73 @@ export class ViewerPanelCore {
             && formula_calculation_edit_anchors_valid(edits as FormulaCalculationEdit[]);
     }
 
+    /**
+     * Answer one formula question the webview asked: run `compute`
+     * cooperatively, and post its answer unless a newer question of the same
+     * kind, a new receiver, a reload, or disposal superseded it on the way.
+     * `compute` answers `undefined` when it was cancelled, and a throw
+     * answers `null`, which the webview reads as "couldn't check".
+     */
+    private async answer_formula_question<Answer>(
+        kind: 'divergence' | 'impact',
+        source_generation: number,
+        compute: (schedule: FormulaCalculationSchedule) => Promise<Answer | null | undefined>,
+        answer: (result: Answer | null) => HostMessage,
+    ): Promise<void> {
+        const receiver_epoch = this.receiver_epoch;
+        if (source_generation !== this._source_generation) return;
+        const operation = ++this.formula_question_operations[kind];
+        const cancelled = () => this.disposed
+            || operation !== this.formula_question_operations[kind]
+            || receiver_epoch !== this.receiver_epoch
+            || source_generation !== this._source_generation;
+        let result: Answer | null | undefined;
+        try {
+            result = await compute({ isCancelled: cancelled });
+        } catch {
+            result = null;
+        }
+        if (result === undefined || cancelled()) return;
+        await this.post(answer(result), receiver_epoch);
+    }
+
     private async handle_formula_impact(
         msg: Extract<WebviewMessage, { type: 'requestFormulaImpact' }>,
     ): Promise<void> {
-        const receiver_epoch = this.receiver_epoch;
-        if (msg.sourceGeneration !== this._source_generation) return;
-        this.formula_impact_operation += 1;
-        const operation = this.formula_impact_operation;
-        const cancelled = () => this.disposed
-            || operation !== this.formula_impact_operation
-            || receiver_epoch !== this.receiver_epoch
-            || msg.sourceGeneration !== this._source_generation;
-        const before = this.own_impact_state(msg.before);
-        const discard = this.own_impact_state(msg.discard);
-        const keep = msg.keep === undefined ? undefined : this.own_impact_state(msg.keep);
-        let impacts: { keep?: FormulaImpact; discard?: FormulaImpact } | null = null;
-        if (before !== undefined && discard !== undefined && (msg.keep === undefined || keep !== undefined)) {
-            try {
-                const schedule = { isCancelled: cancelled };
-                const discard_impact = await review_formula_impact_cooperatively(this.source, before, discard, schedule);
-                if (discard_impact === undefined) return;
-                let keep_impact: FormulaImpact | undefined;
-                if (keep !== undefined) {
-                    keep_impact = await review_formula_impact_cooperatively(this.source, before, keep, schedule);
-                    if (keep_impact === undefined) return;
-                }
-                impacts = { discard: discard_impact, ...(keep_impact === undefined ? {} : { keep: keep_impact }) };
-            } catch {
-                impacts = null;
+        type Impacts = { keep?: FormulaImpact; discard?: FormulaImpact };
+        await this.answer_formula_question<Impacts>('impact', msg.sourceGeneration, async (schedule) => {
+            const before = this.own_impact_state(msg.before);
+            const discard = this.own_impact_state(msg.discard);
+            const keep = msg.keep === undefined ? undefined : this.own_impact_state(msg.keep);
+            if (before === undefined || discard === undefined || (msg.keep !== undefined && keep === undefined)) {
+                return null;
             }
-        }
-        if (cancelled()) return;
-        await this.post({
+            const discard_impact = await review_formula_impact_cooperatively(this.source, before, discard, schedule);
+            if (discard_impact === undefined) return undefined;
+            if (keep === undefined) return { discard: discard_impact };
+            const keep_impact = await review_formula_impact_cooperatively(this.source, before, keep, schedule);
+            return keep_impact === undefined ? undefined : { discard: discard_impact, keep: keep_impact };
+        }, (impacts) => ({
             type: 'formulaImpact',
             requestId: msg.requestId,
             sourceGeneration: msg.sourceGeneration,
             impacts,
-        }, receiver_epoch);
+        }));
     }
 
     private async handle_formula_divergence(
         msg: Extract<WebviewMessage, { type: 'requestFormulaDivergence' }>,
     ): Promise<void> {
-        const receiver_epoch = this.receiver_epoch;
-        if (msg.sourceGeneration !== this._source_generation) return;
-        this.formula_divergence_operation += 1;
-        const operation = this.formula_divergence_operation;
-        const sheets = this.source.meta().sheets;
-        const layouts = own_formula_calculation_layouts(msg.layouts, sheets);
-        const edits_valid = this.formula_review_edits_valid(msg.edits);
-        let review = null;
-        if (layouts !== undefined && edits_valid) {
-            try {
-                review = await review_formula_divergence_cooperatively(this.source, msg.edits, layouts, {
-                    isCancelled: () => this.disposed
-                        || operation !== this.formula_divergence_operation
-                        || receiver_epoch !== this.receiver_epoch
-                        || msg.sourceGeneration !== this._source_generation,
-                }) ?? undefined;
-            } catch {
-                review = null;
-            }
-            if (review === undefined) return;
-        }
-        if (
-            this.disposed
-            || operation !== this.formula_divergence_operation
-            || receiver_epoch !== this.receiver_epoch
-            || msg.sourceGeneration !== this._source_generation
-        ) return;
-        await this.post({
+        await this.answer_formula_question<FormulaDivergenceReview>('divergence', msg.sourceGeneration, async (schedule) => {
+            const layouts = own_formula_calculation_layouts(msg.layouts, this.source.meta().sheets);
+            if (layouts === undefined || !this.formula_review_edits_valid(msg.edits)) return null;
+            return review_formula_divergence_cooperatively(this.source, msg.edits, layouts, schedule);
+        }, (review) => ({
             type: 'formulaDivergence',
             requestId: msg.requestId,
             sourceGeneration: msg.sourceGeneration,
             review,
-        }, receiver_epoch);
+        }));
     }
 
     private async handle_histogram_request(

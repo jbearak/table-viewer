@@ -104,6 +104,8 @@ test('CSV rows: insert, delete, restore, move by keyboard and drag, then save', 
         '|elderberry|5',
     ]);
     await expect_undo_label('Insert row');
+    // The green row is the record: no banner pushes the grid down.
+    await expect(page.locator('.pending-change-notices')).toHaveCount(0);
     await type_into_cell(page, 1, 1, 'kiwi');
 
     // Delete cherry, restore it, and delete it again. A Pending Row Removal
@@ -148,6 +150,10 @@ test('CSV rows: insert, delete, restore, move by keyboard and drag, then save', 
         '|apple|1',
     ]);
     await expect_undo_label('Move row');
+    // Save says what it will do, without naming the sheet a CSV file doesn't have.
+    await save_button(page).hover();
+    await expect(page.getByRole('tooltip')).toHaveText(/^Save: 1 row inserted, 1 row deleted, \d+ rows? moved\.$/);
+    await expect(page.locator('.pending-change-notices')).toHaveCount(0);
     await save_screenshot(page, '01-csv-rows-before-save');
 
     await save_changes(page);
@@ -438,6 +444,101 @@ test('an .xlsx formula recalculated before Save shows General digits, as it does
     await expect(await hovered_formula()).toContainText(' → ');
     await save_screenshot(page, '13-xlsx-row-change-recalculated');
     await expect(await hovered_formula()).toHaveText('2.111111111 → 2.333333333');
+});
+
+/**
+ * Data: Item / Qty / Price / Total, with Total `=B*C` on rows 2-5, and an All
+ * row summing Qty and Total.
+ */
+function totals_workbook(): Buffer {
+    const fruit: readonly (readonly [string, number, number])[] = [
+        ['Apple', 3, 0.5], ['Banana', 5, 0.25], ['Cherry', 7, 2], ['Date', 9, 1.5],
+    ];
+    const rows = [
+        row(1, ['Item', 'Qty', 'Price', 'Total'].map((value, column) => cell(`${'ABCD'[column]}1`, value))),
+        ...fruit.map(([item, qty, price], index) => {
+            const n = index + 2;
+            return row(n, [
+                cell(`A${n}`, item),
+                cell(`B${n}`, qty),
+                cell(`C${n}`, price),
+                cell(`D${n}`, { f: `B${n}*C${n}`, v: qty * price }),
+            ]);
+        }),
+        row(6, [
+            cell('A6', 'All'),
+            cell('B6', { f: 'SUM(B2:B5)', v: 24 }),
+            cell('D6', { f: 'SUM(D2:D5)', v: 30.25 }),
+        ]),
+    ];
+    return Buffer.from(build_fixture_xlsx({
+        sheets: [{ name: 'Data', body: `<sheetData>${rows.join('')}</sheetData>` }],
+    }));
+}
+
+async function canvas_top(page: Page): Promise<number> {
+    const box = await page.locator('[data-testid="data-grid-canvas"]').first().boundingBox();
+    if (!box) throw new Error('the grid canvas has no box');
+    return box.y;
+}
+
+test('an .xlsx warns before Save only about formulas a change breaks, under the grid', async () => {
+    const { page } = await open_file('totals.xlsx', totals_workbook());
+    await wait_for_grid(page);
+    await expect.poll(() => grid_headers(page)).toEqual(['|Item', '|Qty', '|Price', '|Total']);
+    const notices = page.locator('.pending-change-notices');
+
+    // A plain insert breaks nothing: the green row says it all.
+    await choose(await open_row_menu(page, 1), 'Insert row below');
+    await expect.poll(async () => (await grid_rows(page))[2]).toMatch(/^Row 4, inserted\|/);
+    await expect(notices).toHaveCount(0);
+    await save_screenshot(page, '11-xlsx-insert-no-notice');
+    const top = await canvas_top(page);
+
+    // Deleting Price breaks every Total formula. The warning comes without a
+    // click, docked under the grid, so the grid doesn't move.
+    await choose(await open_column_menu(page, 2), 'Delete column');
+    const broken = page.getByRole('status', { name: 'Formulas that will show #REF!' });
+    await expect(broken).toContainText(
+        '4 formulas use column Price, which you deleted. After you save, they will show #REF!.',
+        { timeout: 30_000 },
+    );
+    await expect(broken).toContainText('Restore the column, or undo, to keep them working.');
+    expect(await canvas_top(page)).toBe(top);
+    await broken.getByRole('button', { name: 'Show 4 formulas' }).click();
+    // Labelled the way the grid shows the cell: by its column's name and row number.
+    await expect(broken.locator('li').first()).toContainText('Total, row 2');
+    await expect(broken.locator('li').first()).toContainText('=B2*#REF!');
+    await expect(broken.locator('li').first()).toContainText('was =B2*C2');
+    await save_screenshot(page, '12-xlsx-ref-notice');
+
+    await save_button(page).hover();
+    await expect(page.getByRole('tooltip')).toHaveText('Save: 1 row inserted, 1 column deleted.');
+    await save_screenshot(page, '13-save-tooltip');
+
+    // Restoring the column takes the warning away, and the grid stays put.
+    await choose(await open_column_menu(page, 2), 'Restore column');
+    await expect(notices).toHaveCount(0, { timeout: 30_000 });
+    expect(await canvas_top(page)).toBe(top);
+});
+
+test('a move that changes a summed range says so before Save', async () => {
+    const { page } = await open_file('totals.xlsx', totals_workbook());
+    await wait_for_grid(page);
+
+    // Apple, the first row of SUM(B2:B5), moves below Banana: Banana leaves
+    // the range, where Excel would keep it.
+    await select_row(page, 0);
+    await choose(await open_row_menu(page, 0), 'Move rows down');
+    await expect.poll(async () => (await grid_rows(page)).map((line) => line.split('|')[1]).slice(0, 2))
+        .toEqual(['Banana', 'Apple']);
+    const ranges = page.getByRole('status', { name: 'Formulas whose ranges changed' });
+    await expect(ranges).toContainText('Moving rows changed the range in 2 formulas.', { timeout: 30_000 });
+    await expect(ranges).toContainText('Excel might adjust them differently, so check them before you save.');
+    await expect(ranges).toContainText('Qty, row 6');
+    await expect(ranges).toContainText('=SUM(B3:B5)');
+    await expect(ranges).toContainText('was =SUM(B2:B5)');
+    await save_screenshot(page, '14-xlsx-range-notice');
 });
 
 test('an external change conflicts, and both salvage actions resolve it', async () => {

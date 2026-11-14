@@ -5439,7 +5439,7 @@ describe('editing without an edit mode', () => {
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
         expect(latest_store_edits()).toEqual({ '0:0': { value: 'dirty', base: 'base' } });
         expect(get_button('Save').getAttribute('aria-disabled')).not.toBe('true');
-        expect(await tooltip_of('Save')).toBe('Save changes to the file.');
+        expect(await tooltip_of('Save')).toBe('Save: 1 cell edited.');
     });
 
     it('keeps an idle, clean session while a save is in flight', async () => {
@@ -17950,7 +17950,7 @@ describe('structural editing capability wiring', () => {
     });
 });
 
-describe('Review Changes for row and column structure', () => {
+describe('Save warnings for row and column structure', () => {
     const supported = { supported: true as const };
     const xlsx_basis = {
         kind: 'xlsx' as const,
@@ -18020,46 +18020,69 @@ describe('Review Changes for row and column structure', () => {
         return rendered;
     }
 
-    const review = () => document.querySelector('[aria-label="Row and column changes"]');
+    const divergence_requests = (post_message: ReturnType<typeof vi.fn>) => post_message.mock.calls
+        .map(([message]) => message as WebviewMessage)
+        .filter((message): message is Extract<WebviewMessage, { type: 'requestFormulaDivergence' }> =>
+            message.type === 'requestFormulaDivergence');
+    const notices = () => document.querySelector('.pending-change-notices');
+    const empty_review = { items: [], counts: [], deleted: [], deletedCounts: [] };
 
-    it('stays collapsed and asks the host nothing until Review changes is pressed', async () => {
+    it('shows no banner for a plain row or column change, and asks the host about formulas without a click', async () => {
         const { post_message } = await open_restructured_workbook();
-        expect(review()?.textContent).toContain('Save will insert, delete, or move rows or columns on Data.');
-        expect(post_message.mock.calls.some(([message]) => message?.type === 'requestFormulaDivergence')).toBe(false);
-    });
-
-    it('lists the counts and the flagged formulas by class, and goes to a formula on another sheet', async () => {
-        const { post_message } = await open_restructured_workbook();
-        await click_button('Review changes');
-        expect(review()?.textContent).toContain('1 row deleted, 1 row moved; 1 column deleted, 1 column renamed.');
-        const request = post_message.mock.calls.map(([message]) => message as WebviewMessage)
-            .find((message): message is Extract<WebviewMessage, { type: 'requestFormulaDivergence' }> =>
-                message.type === 'requestFormulaDivergence');
-        expect(request).toBeDefined();
-        expect(request!.layouts[0]!.rowLayout).toBeDefined();
-        expect(review()?.textContent).toContain('Checking formulas…');
+        expect(document.querySelector('[aria-label="Row and column changes"]')).toBeNull();
+        expect([...document.querySelectorAll('button')].some((button) => button.textContent === 'Review changes'))
+            .toBe(false);
+        // Asked once the gestures settle, with the layouts.
+        await vi.waitUntil(() => divergence_requests(post_message).length > 0);
+        const request = divergence_requests(post_message)[0]!;
+        expect(request.layouts[0]!.rowLayout).toBeDefined();
+        // Nothing to warn about: still no notice.
         await dispatch_host_message({
             type: 'formulaDivergence',
-            requestId: request!.requestId,
-            sourceGeneration: request!.sourceGeneration,
+            requestId: request.requestId,
+            sourceGeneration: request.sourceGeneration,
+            review: empty_review,
+        });
+        expect(notices()).toBeNull();
+    });
+
+    it("tells the Save button what Save will do", async () => {
+        await open_restructured_workbook();
+        await act(async () => get_button('Save').focus());
+        expect(document.querySelector('[role="tooltip"]')?.textContent)
+            .toBe('Save: 1 row deleted, 1 row moved, 1 column deleted, 1 column renamed.');
+    });
+
+    it('warns about formulas that will show #REF!, and goes to one on another sheet', async () => {
+        const { post_message } = await open_restructured_workbook();
+        await vi.waitUntil(() => divergence_requests(post_message).length > 0);
+        const request = divergence_requests(post_message)[0]!;
+        await dispatch_host_message({
+            type: 'formulaDivergence',
+            requestId: request.requestId,
+            sourceGeneration: request.sourceGeneration,
             review: {
-                items: [{
+                ...empty_review,
+                deleted: [{
                     targetSheetIndex: 0,
                     sheetIndex: 1,
                     row: 0,
                     column: 0,
-                    formula: '=SUM(Data!A2:A4)',
-                    classes: ['moved'],
-                    axes: ['row'],
+                    formula: '=SUM(Data!#REF!)',
+                    written: '=SUM(Data!C2:C5)',
+                    rows: [],
+                    columns: [{ kind: 'source', sourceColumn: 2 }],
                 }],
-                counts: [{ targetSheetIndex: 0, formulas: 1 }],
+                deletedCounts: [{ targetSheetIndex: 0, formulas: 1 }],
             },
         });
-        const text = review()?.textContent ?? '';
-        expect(text).toContain('1 formula has a range whose first or last row was moved or deleted; check it before saving.');
-        expect(text).toContain('A move carried a corner of the range');
+        const notice = document.querySelector('[aria-label="Formulas that will show #REF!"]');
+        expect(notice?.getAttribute('role')).toBe('status');
+        const text = notice?.textContent ?? '';
+        expect(text).toContain('1 formula uses column Total, which you deleted. After you save, it will show #REF!.');
         expect(text).toContain('Summary!A1');
-        expect(text).toContain('=SUM(Data!A2:A4)');
+        expect(text).toContain('=SUM(Data!#REF!)');
+        expect(text).toContain('was =SUM(Data!C2:C5)');
         await click_button('Go to cell');
         // Summary is not on screen, so the tab switches and the grid is asked for the cell.
         const props = grid_shell_mock.latest_props as unknown as GridShellProps;
@@ -18069,6 +18092,50 @@ describe('Review Changes for row and column structure', () => {
             row: { kind: 'source', sourceRow: 0 },
             column: { kind: 'source', sourceColumn: 0 },
         });
+    });
+
+    it('explains a range a move changed, and Dismiss hides it until it changes', async () => {
+        const { post_message } = await open_restructured_workbook();
+        await vi.waitUntil(() => divergence_requests(post_message).length > 0);
+        const request = divergence_requests(post_message)[0]!;
+        await dispatch_host_message({
+            type: 'formulaDivergence',
+            requestId: request.requestId,
+            sourceGeneration: request.sourceGeneration,
+            review: {
+                ...empty_review,
+                items: [{
+                    targetSheetIndex: 0,
+                    sheetIndex: 1,
+                    row: 0,
+                    column: 0,
+                    formula: '=SUM(Data!A2:A4)',
+                    written: '=SUM(Data!A2:A5)',
+                    classes: ['moved'],
+                    axes: ['row'],
+                }],
+                counts: [{ targetSheetIndex: 0, formulas: 1 }],
+            },
+        });
+        const notice = () => document.querySelector('[aria-label="Formulas whose ranges changed"]');
+        expect(notice()?.textContent).toContain('Moving rows changed the range in 1 formula.');
+        expect(notice()?.textContent).toContain('Excel might adjust it differently, so check it before you save.');
+        await click_button('Dismiss');
+        expect(notice()).toBeNull();
+        expect(notices()).toBeNull();
+    });
+
+    it('ignores an answer from before a reload', async () => {
+        const { post_message } = await open_restructured_workbook();
+        await vi.waitUntil(() => divergence_requests(post_message).length > 0);
+        const request = divergence_requests(post_message)[0]!;
+        await dispatch_host_message({
+            type: 'formulaDivergence',
+            requestId: request.requestId,
+            sourceGeneration: request.sourceGeneration + 1,
+            review: { ...empty_review, deleted: [], deletedCounts: [] },
+        });
+        expect(notices()).toBeNull();
     });
 });
 
@@ -18273,7 +18340,7 @@ describe('cursor after a structural save', () => {
     });
 });
 
-describe('structural conflict notice counts and Review Changes notes', () => {
+describe('structural conflict notice counts and the Save summary', () => {
     for (const reason of ['structuralBasisChanged', 'unsupportedStructure'] as const) it(
         `asks the host what each salvage action does to formulas and shows the counts (${reason})`, async () => {
         const conflict = {
@@ -18452,7 +18519,7 @@ describe('structural conflict notice counts and Review Changes notes', () => {
         expect([...notice.querySelectorAll('button')].some((button) => button.textContent === 'Retry')).toBe(false);
     });
 
-    it('notes that a column change pads short rows', async () => {
+    it('says in the Save tooltip that a column change pads short rows', async () => {
         const { post_message } = await render_app();
         const meta = make_meta(['Sheet1'], false);
         Object.assign(meta.sheets[0], { columnCount: 3, sourceRowCount: 2, rowCount: 2 });
@@ -18487,10 +18554,11 @@ describe('structural conflict notice counts and Review Changes notes', () => {
             staged!.commit();
             staged!.notify();
         });
-        await click_button('Review changes');
-        const review = document.querySelector('[aria-label="Row and column changes"]');
-        expect(review?.textContent).toContain('1 column moved.');
-        expect(review?.textContent).toContain('Short rows will be padded to 3 columns.');
+        // CSV names no worksheet; the padding note rides along with the summary.
+        await act(async () => get_button('Save').focus());
+        expect(document.querySelector('[role="tooltip"]')?.textContent)
+            .toBe('Save: 1 column moved. Short rows will be padded to 3 columns.');
+        expect(document.querySelector('.pending-change-notices')).toBeNull();
     });
 });
 

@@ -68,6 +68,7 @@ import {
     has_live_layout_change,
     type PendingAppendBasis,
     type PendingStructuralChanges,
+    type PendingStructuralConflict,
     pending_rows,
     appended_rows,
     pending_changes_carry_layout,
@@ -108,16 +109,19 @@ import {
 } from '../spreadsheet-safety';
 import { prospective_cell_at, referenced_pending_ids } from '../formula-anchor-layout';
 import {
-    divergence_cell_label,
-    divergence_groups,
-    divergence_summary_text,
-    formula_impact_text,
-    short_rows_note,
+    is_conflict_dismissal,
+    pending_change_notices,
     renamed_source_columns,
-    structure_counts_text,
-    worksheet_needs_structure_review,
+    save_summary,
+    saved_cell_edit_count,
+    short_rows_note,
     worksheet_structure_counts,
-} from './structural-review-model';
+    type PendingChangeFormulaImpact,
+    type PendingChangeNoticeIntent,
+    type PendingChangeNoticeWorksheet,
+} from './pending-change-notices';
+import { PendingChangeNotices } from './pending-change-notices-view';
+import { use_host_question } from './host-question';
 import type { FormulaDivergenceReview, FormulaImpact, FormulaImpactState } from '../formula-divergence-review';
 import {
     layout_affected_formula_cells,
@@ -319,6 +323,12 @@ type TransformOrigin = 'grid' | 'toolbar' | 'restore';
 type FilterHistogramState = FilterHistogramStatus;
 
 const GRID_FOCUS_RESTORE_MAX_ATTEMPTS = 8;
+/**
+ * How long the Save warnings' formula question waits after the layouts or
+ * edits last changed, so a burst of gestures (a held move shortcut) asks once.
+ */
+const FORMULA_REVIEW_DELAY_MS = 150;
+const EMPTY_CONFLICTS: readonly PendingStructuralConflict[] = Object.freeze([]);
 const GRID_FOCUS_RESTORE_RETRY_MS = 16;
 const EXTERNAL_CHANGE_FORMATTING_COMPARISON_BUDGET = 1_000_000;
 
@@ -1625,8 +1635,8 @@ export function App(): React.JSX.Element {
     // acknowledging one tab from resurrecting an unchanged notice on another.
     const [dismissed_external_change_occurrences, set_dismissed_external_change_occurrences] =
         useState<Readonly<Record<string, number>>>({});
-    const [dismissed_structural_conflict_signature, set_dismissed_structural_conflict_signature] =
-        useState<string>();
+    // Dismissal keys of pending-change notices; each notice owns its own.
+    const [dismissed_notices, set_dismissed_notices] = useState<ReadonlySet<string>>(() => new Set());
     const [open_external_change_occurrence, set_open_external_change_occurrence] =
         useState<string | null>(null);
     const [external_change_navigation_status, set_external_change_navigation_status] =
@@ -1948,16 +1958,13 @@ export function App(): React.JSX.Element {
         // eslint-disable-next-line react-hooks/exhaustive-deps
         [formula_graph_key],
     );
-    // Review Changes for row and column structure: the worksheets Save will
-    // restructure, their counts, and the formulas that might render
-    // differently from Excel. The section stays collapsed until asked, and
-    // only then are counts and the host's divergence review computed.
-    const structure_review_sheets = useMemo(() => {
+    // The worksheets Save will restructure: a live layout change on each.
+    const restructured_sheets = useMemo(() => {
         if (!meta || !edit_mode_on_active_sheet || structural_editing === undefined) return [];
         const pending_by_sheet = new Map(edit_session_registry_ref.current!.pending_entries());
         return meta.sheets.flatMap((sheet, sheetIndex) => {
             const changes = pending_by_sheet.get(sheetIndex)?.snapshot();
-            return changes !== undefined && worksheet_needs_structure_review(changes)
+            return changes !== undefined && has_live_layout_change(changes)
                 ? [{ sheetIndex, name: sheet.name, changes }]
                 : [];
         });
@@ -1965,94 +1972,84 @@ export function App(): React.JSX.Element {
         // eslint-disable-next-line react-hooks/exhaustive-deps
         [formula_roots_projection.structuralRevision, meta, structural_editing, edit_mode_on_active_sheet],
     );
-    const [structure_review_open, set_structure_review_open] = useState(false);
-    const structure_review_counts = useMemo(() => {
-        if (!structure_review_open || !meta) return [];
-        return structure_review_sheets.map(({ sheetIndex, name, changes }) => {
-            const sheet = meta.sheets[sheetIndex]!;
-            const header = sheet.excelFirstRowHeader;
-            const store = edit_session_registry_ref.current!.for_sheet(sheetIndex);
-            const renamed = header?.active === true
-                ? renamed_source_columns(sheet.columnNames, changes, (column) => {
-                    const entry = store.get(`${header.sourceRow ?? 0}:${column}`);
-                    return entry === undefined ? undefined : committed_column_name(entry.value);
-                })
-                : 0;
-            return {
-                sheetIndex,
-                name,
-                text: structure_counts_text(worksheet_structure_counts(changes, renamed)),
-                padding: short_rows_note(changes, structural_editing?.sheets[sheetIndex]?.shortestRowWidth),
-            };
+    // The Save button's description: what Save will do, per worksheet.
+    const save_description = useMemo(() => {
+        if (!meta || !edit_mode_on_active_sheet) return undefined;
+        const registry = edit_session_registry_ref.current!;
+        const pending_by_sheet = new Map(registry.pending_entries());
+        return save_summary({
+            singleTable: edit_syntax !== 'markdown',
+            activeSheetIndex: active_sheet_index,
+            worksheets: meta.sheets.map((sheet, sheetIndex) => {
+                const changes = pending_by_sheet.get(sheetIndex)?.snapshot();
+                const store = registry.for_sheet(sheetIndex);
+                const header = sheet.excelFirstRowHeader;
+                const renamed = header?.active === true && changes !== undefined
+                    ? renamed_source_columns(sheet.columnNames, changes, (column) => {
+                        const entry = store.get(`${header.sourceRow ?? 0}:${column}`);
+                        return entry === undefined ? undefined : committed_column_name(entry.value);
+                    })
+                    : 0;
+                const note = changes === undefined
+                    ? undefined
+                    : short_rows_note(changes, structural_editing?.sheets[sheetIndex]?.shortestRowWidth);
+                return {
+                    sheetIndex,
+                    name: sheet.name,
+                    ...(changes === undefined ? {} : { counts: worksheet_structure_counts(changes, renamed) }),
+                    cellEdits: store.size() === 0 ? 0 : saved_cell_edit_count(store.snapshot().keys(), changes, renamed),
+                    ...(note === undefined ? {} : { note }),
+                };
+            }),
         });
     },
         // eslint-disable-next-line react-hooks/exhaustive-deps
-        [structure_review_open, structure_review_sheets, meta, formula_roots_projection.calculationRevision,
-            structural_editing],
+        [meta, edit_mode_on_active_sheet, edit_syntax, active_sheet_index, structural_editing,
+            formula_roots_projection.calculationRevision, formula_roots_projection.structuralRevision],
     );
-    const [formula_divergence, set_formula_divergence] = useState<{
-        readonly key: string;
-        readonly review: FormulaDivergenceReview | null;
-    }>();
-    const formula_divergence_request_ref = useRef<{ readonly requestId: string; readonly key: string }>();
-    const formula_divergence_sequence_ref = useRef(0);
     const [cell_focus, set_cell_focus] = useState<CellFocus | null>(null);
     const cell_focus_sequence_ref = useRef(0);
     /** `handle_sheet_select`, defined below with the sheet tabs. */
     const handle_sheet_select_ref = useRef<(sheet_index: number) => void>(() => {});
-    const [structure_review_status, set_structure_review_status] = useState('');
-    // Asked only while the section is open, and again only when the
-    // layouts or the edits change: the key is the calculator's own.
-    const formula_divergence_key = structure_review_open
-        && edit_syntax === 'markdown'
+    const [pending_change_notice_status, set_pending_change_notice_status] = useState('');
+    // The Save warnings' formula question (ADR 0006): which formulas Save
+    // will write #REF! into and which ranges a move or delete changed in a
+    // way Excel might not. Asked without a click whenever the layouts or the
+    // edits change, a moment after a burst of gestures settles, and only
+    // while a worksheet has a layout change in a workbook that has formulas.
+    // The key is the calculator's own.
+    const workbook_has_formulas = (meta?.sheets ?? []).some((sheet) =>
+        (sheet.formulaCells?.length ?? 0) > 0 || (sheet.pendingFormulaCells?.length ?? 0) > 0)
+        || formula_calculation_edits.some((edit) => edit.writesFormula);
+    const formula_review_key = edit_syntax === 'markdown'
         && prospective_formula_state !== undefined
-        && structure_review_sheets.length > 0
+        && restructured_sheets.length > 0
+        && workbook_has_formulas
         ? `${load_epoch}:${source_generation_ref.current}:${formula_calculation_edit_signature}`
         : undefined;
-    useEffect(() => {
-        if (formula_divergence_key === undefined || prospective_formula_state === undefined) {
-            formula_divergence_request_ref.current = undefined;
-            return;
-        }
-        if (formula_divergence?.key === formula_divergence_key) return;
-        formula_divergence_sequence_ref.current += 1;
-        const requestId = `formula-divergence:${load_epoch}:${formula_divergence_sequence_ref.current}`;
-        formula_divergence_request_ref.current = { requestId, key: formula_divergence_key };
-        host_bridge.postMessage({
+    const formula_review = use_host_question({
+        type: 'formulaDivergence',
+        key: formula_review_key,
+        delayMs: FORMULA_REVIEW_DELAY_MS,
+        sourceGeneration: () => source_generation_ref.current,
+        ask: (requestId, sourceGeneration) => ({
             type: 'requestFormulaDivergence',
             requestId,
-            sourceGeneration: source_generation_ref.current,
+            sourceGeneration,
             edits: formula_calculation_edits,
-            layouts: prospective_formula_state.layouts,
-        });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [formula_divergence_key]);
-    useEffect(() => {
-        const on_message = (event: MessageEvent) => {
-            const msg = event.data as HostMessage;
-            if (msg.type !== 'formulaDivergence') return;
-            const active = formula_divergence_request_ref.current;
-            if (active === undefined || active.requestId !== msg.requestId) return;
-            if (msg.sourceGeneration !== source_generation_ref.current) return;
-            formula_divergence_request_ref.current = undefined;
-            set_formula_divergence({ key: active.key, review: msg.review });
-        };
-        window.addEventListener('message', on_message);
-        return () => window.removeEventListener('message', on_message);
-    }, []);
-    const current_formula_divergence = formula_divergence !== undefined
-        && formula_divergence.key === formula_divergence_key
-        ? formula_divergence.review
-        : undefined;
-    /** Review Changes' Go to cell: select a formula's prospective cell, on its own sheet. */
+            layouts: prospective_formula_state!.layouts,
+        }),
+        read: (message): FormulaDivergenceReview | null => message.review,
+    });
+    /** A Save warning's Go to cell: select a formula's prospective cell, on its own sheet. */
     const go_to_prospective_cell = useCallback((sheet_index: number, row: number, column: number) => {
         const worksheet = formula_anchor_workbook?.worksheets[sheet_index];
         const cell = worksheet === undefined ? undefined : prospective_cell_at(worksheet, row, column);
         if (cell === undefined) {
-            set_structure_review_status('That cell is not available in the current view.');
+            set_pending_change_notice_status('That cell is not available in the current view.');
             return;
         }
-        set_structure_review_status('');
+        set_pending_change_notice_status('');
         set_cell_focus({
             sequence: ++cell_focus_sequence_ref.current,
             sheetIndex: sheet_index,
@@ -2063,7 +2060,7 @@ export function App(): React.JSX.Element {
     }, [active_sheet_index, formula_anchor_workbook]);
     const handle_cell_focus_applied = useCallback((sequence: number, visible: boolean) => {
         set_cell_focus((current) => current?.sequence === sequence ? null : current);
-        if (!visible) set_structure_review_status('That cell is not available in the current view.');
+        if (!visible) set_pending_change_notice_status('That cell is not available in the current view.');
     }, []);
     const source_has_formula_work = (meta?.sheets ?? []).some((sheet) =>
         (sheet.formulaCells?.length ?? 0) > 0
@@ -2620,9 +2617,12 @@ export function App(): React.JSX.Element {
     }, [clear_save_verdict, csv_edit_session_id, fence_edit_session_exit]);
 
     const begin_save_operation = useCallback((): CsvSaveOperation | undefined => {
-        // Structural review dismissal is occurrence-scoped: Save is the user's
-        // explicit request to see whether the condition still blocks persistence.
-        set_dismissed_structural_conflict_signature(undefined);
+        // A conflict notice's dismissal is occurrence-scoped: Save is the
+        // user's explicit request to see whether the condition still blocks
+        // persistence. Dismissed formula warnings stay dismissed.
+        set_dismissed_notices((current) => [...current].some(is_conflict_dismissal)
+            ? new Set([...current].filter((key) => !is_conflict_dismissal(key)))
+            : current);
         if (!csv_edit_session_id || save_projection_ref.current.operation) return undefined;
         const sheets = meta_ref.current?.sheets ?? [];
         const preflight = edit_session_registry_ref.current!
@@ -8597,43 +8597,108 @@ export function App(): React.JSX.Element {
         [impact_conflict, formula_calculation_edit_signature, active_sheet_index, meta,
             edit_syntax, formula_anchor_workbook],
     );
-    // Each answer carries the input states it was asked for, so counts for
-    // an older state never show beside actions that act on a newer one.
-    const [formula_impacts, set_formula_impacts] = useState<{
-        readonly states: NonNullable<typeof formula_impact_states>;
-        readonly impacts: { readonly keep?: FormulaImpact; readonly discard?: FormulaImpact } | null;
-    }>();
-    const formula_impact_request_ref = useRef<{
-        readonly requestId: string;
-        readonly states: NonNullable<typeof formula_impact_states>;
-    }>();
-    // Bumped by Retry after the host could not count: the effect below asks
-    // again for the same states.
-    const [formula_impact_attempt, set_formula_impact_attempt] = useState(0);
-    useEffect(() => {
-        if (formula_impact_states === undefined) {
-            formula_impact_request_ref.current = undefined;
-            return;
-        }
-        const requestId = `formula-impact:${load_epoch}:${++formula_divergence_sequence_ref.current}`;
-        formula_impact_request_ref.current = { requestId, states: formula_impact_states };
-        host_bridge.postMessage({
+    // Each state the actions would act on gets its own key, so counts for an
+    // older state never show beside actions that act on a newer one.
+    const formula_impact_key_ref = useRef(0);
+    const formula_impact_key = useMemo(
+        () => formula_impact_states === undefined
+            ? undefined
+            : `${load_epoch}:${++formula_impact_key_ref.current}`,
+        [formula_impact_states, load_epoch],
+    );
+    const salvage_impact = use_host_question({
+        type: 'formulaImpact',
+        key: formula_impact_key,
+        sourceGeneration: () => source_generation_ref.current,
+        ask: (requestId, sourceGeneration) => ({
             type: 'requestFormulaImpact',
             requestId,
-            sourceGeneration: source_generation_ref.current,
-            ...formula_impact_states,
+            sourceGeneration,
+            ...formula_impact_states!,
+        }),
+        read: (message) => message.impacts,
+    });
+    // The counts describe what each salvage action does, so the actions wait
+    // for the answer to the current request. A host that cannot count
+    // answers null, and the actions go ahead without counts.
+    const formula_impact_view: PendingChangeFormulaImpact | undefined = formula_impact_key === undefined
+        ? undefined
+        : !salvage_impact.current
+            ? { state: 'pending' }
+            : salvage_impact.answer === null || salvage_impact.answer === undefined
+                ? { state: 'unavailable' }
+                : { state: 'ready', ...salvage_impact.answer };
+    const notice_conflicts = edit_mode_on_active_sheet ? active_pending_conflicts : EMPTY_CONFLICTS;
+    const notice_worksheet_key = !meta
+        ? ''
+        : worksheet_target_key({
+            sheetIndex: active_sheet_index,
+            sheetName: meta.sheets[active_sheet_index]?.name ?? '',
+            ...(meta.sheets[active_sheet_index]?.worksheetId !== undefined
+                ? { worksheetId: meta.sheets[active_sheet_index]!.worksheetId! }
+                : {}),
         });
-    }, [formula_impact_attempt, formula_impact_states, load_epoch]);
-    useEffect(() => {
-        const on_message = (event: MessageEvent) => {
-            const msg = event.data as HostMessage;
-            const request = formula_impact_request_ref.current;
-            if (msg.type !== 'formulaImpact' || msg.requestId !== request?.requestId) return;
-            set_formula_impacts({ states: request.states, impacts: msg.impacts });
-        };
-        window.addEventListener('message', on_message);
-        return () => window.removeEventListener('message', on_message);
-    }, []);
+    // Every pending-change notice, in order (ADR 0006); the module decides
+    // which show, what they say, and what each action does.
+    const notices = useMemo(() => {
+        if (!meta) return [];
+        const pending_by_sheet = new Map(edit_session_registry_ref.current!.pending_entries());
+        const worksheets = meta.sheets.map((sheet, sheet_index): PendingChangeNoticeWorksheet => {
+            const pending_columns = pending_by_sheet.get(sheet_index)?.snapshot().pendingColumns ?? [];
+            const pending_names = new Map(pending_columns.map((column) => [column.id, column.header]));
+            const header = sheet.excelFirstRowHeader;
+            const columns = formula_anchor_workbook?.worksheets[sheet_index]?.columns;
+            // The names the grid shows over each column, a rename included.
+            const store = edit_session_registry_ref.current!.for_sheet(sheet_index);
+            const shown_name = (source_column: number): string | undefined => {
+                const entry = store.get(`${header?.sourceRow ?? 0}:${source_column}`);
+                return entry === undefined
+                    ? sheet.columnNames?.[source_column]
+                    : committed_column_name(entry.value);
+            };
+            const prospective = header?.active === true && columns !== undefined
+                ? Array.from({ length: columns.liveCount }, (_, column) => {
+                    const identity = columns.identity_at(column + 1);
+                    return identity === undefined
+                        ? undefined
+                        : identity.kind === 'source'
+                            ? shown_name(identity.sourceColumn)
+                            : pending_names.get(identity.pendingColumnId);
+                })
+                : undefined;
+            return {
+                name: sheet.name,
+                ...(header?.active === true && sheet.columnNames !== undefined
+                    ? { columnNames: sheet.columnNames }
+                    : {}),
+                ...(pending_names.size > 0 ? { pendingColumnNames: pending_names } : {}),
+                ...(prospective === undefined ? {} : { prospectiveColumnNames: prospective }),
+            };
+        });
+        return pending_change_notices({
+            singleTable: edit_syntax !== 'markdown',
+            activeSheetIndex: active_sheet_index,
+            worksheets,
+            conflicts: {
+                worksheetKey: notice_worksheet_key,
+                items: notice_conflicts,
+                columnValuesLost: active_column_values_lost,
+                ...(formula_impact_view === undefined ? {} : { impact: formula_impact_view }),
+            },
+            refusals: rule_split_warning_messages,
+            ...(formula_review_key !== undefined && formula_review.answer !== undefined
+                ? { formulaReview: { review: formula_review.answer, current: formula_review.current } }
+                : {}),
+            dismissed: dismissed_notices,
+        });
+    },
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+        [meta, edit_syntax, active_sheet_index, notice_worksheet_key, notice_conflicts, active_column_values_lost,
+            salvage_impact.answer, salvage_impact.current, formula_impact_key, rule_split_warning_messages,
+            formula_review_key, formula_review.answer, formula_review.current, dismissed_notices,
+            formula_roots_projection.structuralRevision, formula_roots_projection.calculationRevision,
+            formula_anchor_workbook],
+    );
     if (!meta) {
         return compare_progress
             ? (
@@ -8999,18 +9064,6 @@ export function App(): React.JSX.Element {
         }`;
     };
     const removed_rows = rejected_rows(removed_keys);
-    const structural_conflicts = edit_mode_on_active_sheet
-        ? active_pending_conflicts
-        : [];
-    const structurally_conflicted_pending_row_ids = [...new Set(
-        structural_conflicts.flatMap((conflict) => conflict.pendingRowIds),
-    )];
-    const structurally_conflicted_tail_removal_ids = [...new Set(
-        structural_conflicts.flatMap((conflict) => conflict.tailRemovalIds),
-    )];
-    const structurally_conflicted_formula_cells = structural_conflicts.flatMap(
-        (conflict) => conflict.formulaCells ?? [],
-    );
     const external_change_item_count = changed_items.length + removed_items.length;
     const external_change_is_active = external_change_item_count > 0;
     const external_change_worksheet_key = worksheet_target_key({
@@ -9020,38 +9073,6 @@ export function App(): React.JSX.Element {
             ? { worksheetId: current_sheet.worksheetId }
             : {}),
     });
-    const structural_conflict_signature = JSON.stringify([
-        external_change_worksheet_key,
-        structural_conflicts,
-    ]);
-    const show_structural_conflicts = structural_conflicts.length > 0
-        && dismissed_structural_conflict_signature !== structural_conflict_signature;
-    // Worksheet-level conflicts on a Worksheet Layout get the design's own
-    // notice ("External changes"); the append conflicts keep theirs.
-    const layout_conflicts = structural_conflicts.filter((conflict) =>
-        conflict.reason === 'structuralBasisChanged' || conflict.reason === 'unsupportedStructure');
-    const append_conflicts = structural_conflicts.filter((conflict) => !layout_conflicts.includes(conflict));
-    const show_layout_conflicts = show_structural_conflicts && layout_conflicts.length > 0;
-    const show_append_conflicts = show_structural_conflicts && append_conflicts.length > 0;
-    const basis_changed = layout_conflicts.some((conflict) => conflict.reason === 'structuralBasisChanged');
-    const current_formula_impacts = formula_impact_states !== undefined
-        && formula_impacts?.states === formula_impact_states
-        ? formula_impacts.impacts
-        : undefined;
-    // The counts describe what each salvage action does, so the actions wait
-    // for the answer to the current request. A host that cannot count
-    // answers null, and the actions go ahead without counts.
-    const formula_impact_pending = formula_impact_states !== undefined
-        && formula_impacts?.states !== formula_impact_states;
-    const formula_impact_unavailable = formula_impact_states !== undefined
-        && formula_impacts?.states === formula_impact_states
-        && formula_impacts.impacts === null;
-    const keep_impact_text = current_formula_impacts?.keep === undefined
-        ? undefined
-        : formula_impact_text(current_formula_impacts.keep);
-    const discard_impact_text = current_formula_impacts?.discard === undefined
-        ? undefined
-        : formula_impact_text(current_formula_impacts.discard);
     const previous_external_change = external_change_occurrences_ref.current.get(
         external_change_worksheet_key,
     ) ?? {
@@ -9362,6 +9383,40 @@ export function App(): React.JSX.Element {
     // Sort, filter, row hiding and the merge notice — worksheet state, so it sits
     // with the worksheet's pane below the tabs rather than in the workbook chrome
     // above them (#154). Renders nothing when the view is untransformed.
+    const handle_notice_intent = (intent: PendingChangeNoticeIntent): void => {
+        switch (intent.kind) {
+            case 'goToCell':
+                go_to_prospective_cell(intent.sheetIndex, intent.row, intent.column);
+                return;
+            case 'dismiss':
+                set_dismissed_notices((current) => new Set([...current, intent.key]));
+                queueMicrotask(() => grid_focus_ref.current?.focus());
+                return;
+            case 'keepInsertedRowsAtEnd':
+                keep_active_inserted_rows_at_end();
+                return;
+            case 'discardLayoutChanges':
+                discard_active_layout_changes();
+                return;
+            case 'retryFormulaImpact':
+                salvage_impact.retry();
+                return;
+            case 'goToAffectedRow': {
+                const target = intent.target;
+                if (target.kind === 'pendingRow') editing_ref.current?.reveal_pending_row(target.pendingRowId);
+                else if (target.kind === 'tailRemoval') editing_ref.current?.reveal_tail_removal(target.tailRemovalId);
+                else void editing_ref.current?.reveal_source_cell(target.sourceRow, target.sourceColumn);
+                return;
+            }
+            case 'removePendingRows':
+                editing_ref.current?.remove_pending_rows(intent.pendingRowIds);
+                return;
+            case 'cancelTailRemovals':
+                editing_ref.current?.cancel_tail_removals(intent.tailRemovalIds);
+                return;
+        }
+    };
+
     const sheet_pane = (
         <div className="sheet-pane">
             <StateStrip
@@ -9395,6 +9450,16 @@ export function App(): React.JSX.Element {
                 on_cancel_transform={handle_cancel_transform}
             />
             {grid}
+            {notices.length > 0 && (
+                // Docked under the grid rather than above it, so a notice that
+                // appears or goes after a gesture never moves the row under
+                // the pointer.
+                <PendingChangeNotices
+                    notices={notices}
+                    status={pending_change_notice_status}
+                    on_intent={handle_notice_intent}
+                />
+            )}
             {find_open && (
                 <FindBar
                     ref={find_bar_ref}
@@ -9471,6 +9536,7 @@ export function App(): React.JSX.Element {
                 diff_mode={diff_mode}
                 on_toggle_diff_mode={handle_toggle_diff_mode}
                 is_dirty={is_dirty}
+                save_description={save_description}
                 on_save={handle_save}
                 on_discard={discard_edit_session}
                 save_busy={save_ui_fenced}
@@ -9577,281 +9643,6 @@ export function App(): React.JSX.Element {
                         </button>
                     </div>
                 </div>
-            )}
-            {rule_split_warning_messages.length > 0 && (
-                // Before Save, not after: Save refuses a rule split past the
-                // cap, so the user sees which rule while the layout can change.
-                <section
-                    className="external-change-review structural-split-warning"
-                    role="status"
-                    aria-label="Row and column changes Save will refuse"
-                >
-                    <ul className="external-change-list">
-                        {rule_split_warning_messages.map((message) => (
-                            <li key={message}>{message}</li>
-                        ))}
-                    </ul>
-                </section>
-            )}
-            {structure_review_sheets.length > 0 && (
-                // Review Changes' row and column list (design "Saving and
-                // discarding"): what Save will insert, delete, move, or rename
-                // on each worksheet, and every formula whose range might
-                // render differently from Excel ("Where this differs from
-                // Excel"), with Go to cell.
-                <section
-                    className="external-change-review structure-review"
-                    aria-label="Row and column changes"
-                >
-                    <div className="external-change-review-header">
-                        <h2>Row and column changes</h2>
-                        <button
-                            aria-expanded={structure_review_open}
-                            aria-controls="structure-review-details"
-                            onClick={() => {
-                                set_structure_review_open((open) => !open);
-                                set_structure_review_status('');
-                            }}
-                        >
-                            {structure_review_open ? 'Hide' : 'Review changes'}
-                        </button>
-                    </div>
-                    {!structure_review_open && (
-                        <p>
-                            {`Save will insert, delete, or move rows or columns on ${
-                                structure_review_sheets.map(({ name }) => name).join(', ')}.`}
-                        </p>
-                    )}
-                    {structure_review_open && (
-                        <div id="structure-review-details">
-                            <ul className="external-change-list">
-                                {structure_review_counts.map(({ sheetIndex, name, text, padding }) => {
-                                    const groups = current_formula_divergence
-                                        ? divergence_groups(current_formula_divergence.items, sheetIndex)
-                                        : [];
-                                    const flagged = current_formula_divergence?.counts
-                                        .find((entry) => entry.targetSheetIndex === sheetIndex)?.formulas ?? 0;
-                                    const listed = new Set(groups.flatMap((group) => group.items));
-                                    const axes = new Set([...listed].flatMap((item) => item.axes));
-                                    return (
-                                        <li key={sheetIndex}>
-                                            <h3>{name}</h3>
-                                            <p>{text}</p>
-                                            {padding !== undefined && <p>{padding}</p>}
-                                            {formula_divergence_key !== undefined
-                                                && current_formula_divergence === undefined && (
-                                                <p role="status">Checking formulas…</p>
-                                            )}
-                                            {current_formula_divergence === null && (
-                                                <p>Table Viewer couldn't check the formulas on this sheet.</p>
-                                            )}
-                                            {flagged > 0 && (
-                                                <>
-                                                    <p>{divergence_summary_text(flagged, axes)}</p>
-                                                    {flagged > listed.size && (
-                                                        <p>{`Showing the first ${listed.size.toLocaleString('en-US')}.`}</p>
-                                                    )}
-                                                    {groups.map((group) => (
-                                                        <div key={group.divergenceClass} className="structure-review-group">
-                                                            <h4>{group.heading}</h4>
-                                                            <ul className="structure-review-formulas">
-                                                                {group.items.map((item) => {
-                                                                    const location = divergence_cell_label(
-                                                                        meta?.sheets[item.sheetIndex]?.name ?? '',
-                                                                        item.row,
-                                                                        item.column,
-                                                                    );
-                                                                    return (
-                                                                        <li key={location}>
-                                                                            <span>{location}</span>
-                                                                            <code>{item.formula}</code>
-                                                                            <button
-                                                                                aria-label={`Go to ${location}`}
-                                                                                onClick={() => go_to_prospective_cell(
-                                                                                    item.sheetIndex,
-                                                                                    item.row,
-                                                                                    item.column,
-                                                                                )}
-                                                                            >
-                                                                                Go to cell
-                                                                            </button>
-                                                                        </li>
-                                                                    );
-                                                                })}
-                                                            </ul>
-                                                        </div>
-                                                    ))}
-                                                </>
-                                            )}
-                                        </li>
-                                    );
-                                })}
-                            </ul>
-                            <p className="external-change-review-status" role="status">{structure_review_status}</p>
-                        </div>
-                    )}
-                </section>
-            )}
-            {show_layout_conflicts && (
-                // The design's notice for a worksheet-level conflict on a
-                // Worksheet Layout ("External changes"): its two lines, the
-                // counts the user needs before choosing, and three actions.
-                <section
-                    className="external-change-review structural-conflict-review"
-                    role="alert"
-                    aria-label="Row and column changes that need review"
-                >
-                    {basis_changed && (
-                        <>
-                            <p>{`${current_sheet.name} changed on disk after you inserted, deleted, or moved rows or columns.`}</p>
-                            <p>Table Viewer can&apos;t tell where those changes belong in the new version.</p>
-                        </>
-                    )}
-                    {layout_conflicts.filter((conflict) => conflict.reason === 'unsupportedStructure')
-                        .map((conflict, index) => (
-                            <p key={`unsupported:${index}`}>
-                                {`${current_sheet.name}: ${conflict.message ?? "Can't save these row and column changes: the worksheet has a structure Table Viewer can't shift."}`}
-                            </p>
-                        ))}
-                    {basis_changed && active_column_values_lost > 0 && (
-                        <p>
-                            {`Values typed in ${active_column_values_lost} new ${active_column_values_lost === 1 ? 'column' : 'columns'} will be discarded.`}
-                        </p>
-                    )}
-                    {formula_impact_pending && <p role="status">Checking formulas…</p>}
-                    {formula_impact_unavailable && (
-                        <p>
-                            Formula impact unavailable. Retry, or choose an action without the count.
-                            {' '}
-                            <button
-                                onClick={() => {
-                                    set_formula_impacts(undefined);
-                                    set_formula_impact_attempt((attempt) => attempt + 1);
-                                }}
-                            >
-                                Retry
-                            </button>
-                        </p>
-                    )}
-                    {basis_changed && keep_impact_text !== undefined && (
-                        <p>{`Keep new rows at the end: ${keep_impact_text}`}</p>
-                    )}
-                    {discard_impact_text !== undefined && (
-                        <p>{`Discard row and column changes on ${current_sheet.name}: ${discard_impact_text}`}</p>
-                    )}
-                    <div className="external-change-item-actions">
-                        {basis_changed && (
-                            <button onClick={keep_active_inserted_rows_at_end} disabled={formula_impact_pending}>
-                                Keep new rows at the end
-                            </button>
-                        )}
-                        <button onClick={discard_active_layout_changes} disabled={formula_impact_pending}>
-                            {`Discard row and column changes on ${current_sheet.name}`}
-                        </button>
-                        <button
-                            onClick={() => {
-                                set_dismissed_structural_conflict_signature(
-                                    structural_conflict_signature,
-                                );
-                                queueMicrotask(() => grid_focus_ref.current?.focus());
-                            }}
-                        >
-                            Dismiss notice
-                        </button>
-                    </div>
-                </section>
-            )}
-            {show_append_conflicts && (
-                <section
-                    className="external-change-review structural-conflict-review"
-                    role="alert"
-                    aria-label="Pending rows that need review"
-                >
-                    <div className="external-change-review-header">
-                        <h2>Pending rows need review</h2>
-                    </div>
-                    <p>
-                        The worksheet structure changed, so these row changes cannot be
-                        saved until you edit or remove pending rows, or cancel affected removals.
-                    </p>
-                    <ul className="external-change-list">
-                        {append_conflicts.map((conflict, index) => (
-                            <li key={`${conflict.reason}:${index}`}>
-                                {conflict.reason === 'ambiguousColumns'
-                                    ? 'Column identities no longer match.'
-                                    : conflict.reason === 'ambiguousPendingFormula'
-                                        ? 'A pending formula would refer to a different row after rebasing.'
-                                        : conflict.reason === 'worksheetReplaced'
-                                            ? 'The worksheet was replaced.'
-                                            : conflict.reason === 'rowLimitExceeded'
-                                                ? 'The worksheet no longer has room for every pending row.'
-                                                : conflict.reason === 'templateChanged'
-                                                    ? 'The row-format template changed.'
-                                                    : conflict.reason === 'structuralBasisChanged'
-                                                        ? `${current_sheet.name} changed on disk after you inserted, deleted, or moved rows or columns. Table Viewer can't tell where those changes belong in the new version.`
-                                                        : conflict.reason === 'unsupportedStructure'
-                                                            ? `${current_sheet.name}: ${conflict.message ?? "Can't save these row and column changes: the worksheet has a structure Table Viewer can't shift."}`
-                                                            : 'The saved worksheet suffix changed.'}
-                            </li>
-                        ))}
-                    </ul>
-                    <div className="external-change-item-actions">
-                        <button
-                            disabled={structurally_conflicted_pending_row_ids.length === 0
-                                && structurally_conflicted_tail_removal_ids.length === 0
-                                && structurally_conflicted_formula_cells.length === 0}
-                            onClick={() => {
-                                const pending = structurally_conflicted_pending_row_ids[0];
-                                const removal = structurally_conflicted_tail_removal_ids[0];
-                                const formula = structurally_conflicted_formula_cells[0];
-                                if (pending !== undefined) {
-                                    editing_ref.current?.reveal_pending_row(pending);
-                                } else if (removal !== undefined) {
-                                    editing_ref.current?.reveal_tail_removal(removal);
-                                } else if (formula?.rowIdentity.kind === 'source') {
-                                    void editing_ref.current?.reveal_source_cell(
-                                        formula.rowIdentity.sourceRow,
-                                        formula.sourceColumn,
-                                    );
-                                }
-                            }}
-                        >
-                            Go to affected row
-                        </button>
-                        {structurally_conflicted_pending_row_ids.length > 0 && (
-                            <button
-                                onClick={() => {
-                                    editing_ref.current?.remove_pending_rows(
-                                        structurally_conflicted_pending_row_ids,
-                                    );
-                                }}
-                            >
-                                Remove affected pending rows
-                            </button>
-                        )}
-                        {structurally_conflicted_tail_removal_ids.length > 0 && (
-                            <button
-                                onClick={() => {
-                                    editing_ref.current?.cancel_tail_removals(
-                                        structurally_conflicted_tail_removal_ids,
-                                    );
-                                }}
-                            >
-                                Cancel affected row removals
-                            </button>
-                        )}
-                        <button
-                            onClick={() => {
-                                set_dismissed_structural_conflict_signature(
-                                    structural_conflict_signature,
-                                );
-                                queueMicrotask(() => grid_focus_ref.current?.focus());
-                            }}
-                        >
-                            Dismiss notice
-                        </button>
-                    </div>
-                </section>
             )}
             {structural_save_notice !== null && (
                 // The host could not tell whether the last structural save of

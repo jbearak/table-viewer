@@ -1,12 +1,18 @@
 /**
- * Review Changes' list of formulas that might render differently from Excel
+ * The Save warnings' list of formulas that might render differently from Excel
  * (design "Rendering formulas", "Where this differs from Excel"): every
  * formula of the workbook, source formulas and pending ones alike, whose
  * range references `formula_divergence_flags` flags for the current layouts.
  *
+ * The same pass lists the formulas Save will write `#REF!` into because a
+ * row or column they name was deleted, so the Save warnings can name what
+ * was deleted.
+ *
  * Source formula text lives only in the host's source, so the host runs this;
  * the webview sends the same layouts and prospective edits it sends the
- * calculator. It runs only when Review Changes asks, never per gesture.
+ * calculator. The webview asks after layout changes settle, debounced and
+ * keyed to the layouts and edits, and the host runs it cooperatively and
+ * drops a run a newer question supersedes.
  */
 import { read_source_columns, type DataSource } from './data-source/interface';
 import { formula_ref_error_count } from './xlsx-formula';
@@ -23,10 +29,13 @@ import {
     prospective_row_of,
 } from './formula-anchor-layout';
 import {
+    formula_deleted_references,
     formula_divergence_flags,
     render_formula,
     type FormulaDivergenceReason,
 } from './formula-anchors';
+import type { RowIdentity } from './pending-changes';
+import type { ColumnIdentity } from './worksheet-layout';
 
 /**
  * The spec's three classes, plus formulas no layout change can adjust:
@@ -66,19 +75,50 @@ export interface FormulaDivergenceItem {
     readonly column: number;
     /** The formula as it renders for the current layouts (as written when it can't render). */
     readonly formula: string;
+    /** The formula as written: the file's text, or the pending text as typed. */
+    readonly written: string;
     readonly classes: readonly FormulaDivergenceClass[];
     /** Whether either flagged axis is rows, columns, or both. */
     readonly axes: readonly ('row' | 'column')[];
+}
+
+/**
+ * One formula that Save writes `#REF!` into because a row or column it names
+ * was deleted, for one worksheet whose deletion it names.
+ */
+export interface FormulaDeletedItem {
+    /** The worksheet whose deleted rows or columns the formula names. */
+    readonly targetSheetIndex: number;
+    /** Where the formula is: its worksheet and 0-based prospective cell. */
+    readonly sheetIndex: number;
+    readonly row: number;
+    readonly column: number;
+    /** The formula as Save writes it, with `#REF!` in place of each deleted reference. */
+    readonly formula: string;
+    /** The formula as written. */
+    readonly written: string;
+    /** The deleted rows and columns of the target worksheet the formula names. */
+    readonly rows: readonly RowIdentity[];
+    readonly columns: readonly ColumnIdentity[];
+}
+
+export interface FormulaTargetCount {
+    readonly targetSheetIndex: number;
+    readonly formulas: number;
 }
 
 export interface FormulaDivergenceReview {
     /** Flagged formulas, per target worksheet, at most `MAX_FORMULA_DIVERGENCE_ITEMS` overall. */
     readonly items: readonly FormulaDivergenceItem[];
     /** Every flagged formula per target worksheet, including those past the item cap. */
-    readonly counts: readonly { readonly targetSheetIndex: number; readonly formulas: number }[];
+    readonly counts: readonly FormulaTargetCount[];
+    /** Formulas that will show `#REF!`, per target worksheet, at most `MAX_FORMULA_DIVERGENCE_ITEMS` overall. */
+    readonly deleted: readonly FormulaDeletedItem[];
+    /** Every such formula per target worksheet, including those past the item cap. */
+    readonly deletedCounts: readonly FormulaTargetCount[];
 }
 
-/** Items listed in Review Changes; the counts still cover every flagged formula. */
+/** Items listed per kind in the Save warnings; the counts still cover every formula. */
 export const MAX_FORMULA_DIVERGENCE_ITEMS = 500;
 
 type ReviewSteps<T> = Generator<void, T, void>;
@@ -95,6 +135,8 @@ function* review_steps(
     const workbook = formula_calculation_workbook(sheets, layouts);
     const items: FormulaDivergenceItem[] = [];
     const counts = new Map<number, number>();
+    const deleted: FormulaDeletedItem[] = [];
+    const deleted_counts = new Map<number, number>();
     const overridden = new Set(edits.map((edit) => `${edit.sheetIndex}:${edit.row}:${edit.column}`));
     let checked = 0;
     const check = (
@@ -107,12 +149,25 @@ function* review_steps(
         checked += 1;
         const context = formula_anchor_context(workbook, sheet_index);
         let flags;
+        let deletions;
         try {
             flags = formula_divergence_flags(text, anchors, context);
         } catch {
             return;
         }
-        if (flags.length === 0) return;
+        try {
+            deletions = formula_deleted_references(text, anchors, context);
+        } catch {
+            deletions = [];
+        }
+        if (flags.length === 0 && deletions.length === 0) return;
+        let rendered = text;
+        try {
+            const result = render_formula(text, anchors, context);
+            if (result.kind === 'rendered') rendered = result.text;
+        } catch {
+            // Keep the stored text.
+        }
         const by_target = new Map<number, { classes: Set<FormulaDivergenceClass>; axes: Set<'row' | 'column'> }>();
         for (const flag of flags) {
             for (const target of flag.worksheets) {
@@ -123,13 +178,6 @@ function* review_steps(
                 by_target.set(target, entry);
             }
         }
-        let rendered = text;
-        try {
-            const result = render_formula(text, anchors, context);
-            if (result.kind === 'rendered') rendered = result.text;
-        } catch {
-            // Keep the stored text.
-        }
         for (const [target, entry] of [...by_target].sort(([left], [right]) => left - right)) {
             counts.set(target, (counts.get(target) ?? 0) + 1);
             if (items.length >= MAX_FORMULA_DIVERGENCE_ITEMS) continue;
@@ -139,8 +187,31 @@ function* review_steps(
                 row,
                 column,
                 formula: rendered,
+                written: text,
                 classes: Object.freeze(FORMULA_DIVERGENCE_CLASSES.filter((name) => entry.classes.has(name))),
                 axes: Object.freeze((['row', 'column'] as const).filter((axis) => entry.axes.has(axis))),
+            }));
+        }
+        const deleted_by_target = new Map<number, { rows: Map<string, RowIdentity>; columns: Map<string, ColumnIdentity> }>();
+        for (const deletion of deletions) {
+            const entry = deleted_by_target.get(deletion.worksheet)
+                ?? { rows: new Map<string, RowIdentity>(), columns: new Map<string, ColumnIdentity>() };
+            for (const identity of deletion.rows) entry.rows.set(JSON.stringify(identity), identity);
+            for (const identity of deletion.columns) entry.columns.set(JSON.stringify(identity), identity);
+            deleted_by_target.set(deletion.worksheet, entry);
+        }
+        for (const [target, entry] of [...deleted_by_target].sort(([left], [right]) => left - right)) {
+            deleted_counts.set(target, (deleted_counts.get(target) ?? 0) + 1);
+            if (deleted.length >= MAX_FORMULA_DIVERGENCE_ITEMS) continue;
+            deleted.push(Object.freeze({
+                targetSheetIndex: target,
+                sheetIndex: sheet_index,
+                row,
+                column,
+                formula: rendered,
+                written: text,
+                rows: Object.freeze([...entry.rows.values()]),
+                columns: Object.freeze([...entry.columns.values()]),
             }));
         }
     };
@@ -183,10 +254,14 @@ function* review_steps(
             }
         }
     }
+    const by_target = (totals: Map<number, number>) => Object.freeze([...totals]
+        .sort(([left], [right]) => left - right)
+        .map(([targetSheetIndex, formulas]) => Object.freeze({ targetSheetIndex, formulas })));
     return Object.freeze({
         items: Object.freeze(items),
-        counts: Object.freeze([...counts].sort(([left], [right]) => left - right)
-            .map(([targetSheetIndex, formulas]) => Object.freeze({ targetSheetIndex, formulas }))),
+        counts: by_target(counts),
+        deleted: Object.freeze(deleted),
+        deletedCounts: by_target(deleted_counts),
     });
 }
 
