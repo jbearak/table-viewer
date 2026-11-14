@@ -2106,6 +2106,40 @@ describe('CSV reload races', () => {
         expect(panel.__messages).toContainEqual(expect.objectContaining({ type: 'saveResult', success: true }));
     });
 
+    it('keeps save semantics when a late report of the save supersedes postSave', async () => {
+        const file_path = '/tmp/late-own-watcher.csv';
+        let bytes = enc.encode('h\na\n');
+        let builds = 0;
+        const post_save_build = deferred<void>();
+        vscode_mock.__setStatImplementation(async () => ({ size: bytes.byteLength, mtime: 1 }));
+        vscode_mock.__setReadFileImplementation(async () => bytes);
+        vscode_mock.__setWriteFileImplementation(async (_uri, content) => {
+            bytes = new Uint8Array(content);
+        });
+        const panel = open_csv_table(uri(file_path), state_store(), {
+            editing: true,
+            plan_save: plan_csv_save,
+            async build_source(raw, path) {
+                builds += 1;
+                if (builds === 2) await post_save_build.promise;
+                return build_csv_source(raw, path);
+            },
+        });
+        await panel.__receive({ type: 'ready' });
+        await panel.__receive({ type: 'requestEditSession' });
+
+        await panel.__receive({ type: 'saveCsv', edits: { '0:0': 'saved' } });
+        await vi.waitFor(() => expect(builds).toBe(2));
+        // The watcher reports the save only after its own checked-write window
+        // has closed, while the postSave build is still parsing the saved bytes.
+        await vscode_mock.__getActiveWatchers()[0].__fireChange();
+        post_save_build.resolve();
+        await vi.waitFor(() => expect(source_refresh_snapshots(panel)).toHaveLength(1));
+        await flush_promises();
+
+        expect(source_refresh_snapshots(panel)).toMatchObject([{ reason: 'save' }]);
+    });
+
     it('keeps absorbed external bytes on fileReload semantics', async () => {
         const file_path = '/tmp/absorbed-external-write.csv';
         let bytes = enc.encode('h\na\n');
