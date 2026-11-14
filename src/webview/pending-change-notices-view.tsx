@@ -82,7 +82,7 @@ function FormulaList(props: {
                     {open ? 'Hide formulas' : formulas.disclosureLabel}
                 </button>
             )}
-            {open && (
+            {(open || !formulas.collapsed) && (
                 <ul className="pending-change-formulas" id={props.id}>
                     {formulas.items.map((item) => (
                         <li key={item.location}>

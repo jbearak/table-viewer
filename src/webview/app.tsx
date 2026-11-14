@@ -2005,7 +2005,9 @@ export function App(): React.JSX.Element {
     },
         // eslint-disable-next-line react-hooks/exhaustive-deps
         [meta, edit_mode_on_active_sheet, edit_syntax, active_sheet_index, structural_editing,
-            formula_roots_projection.calculationRevision, formula_roots_projection.structuralRevision],
+            formula_roots_projection.calculationRevision, formula_roots_projection.structuralRevision,
+            // A link-only write adds an edited cell without moving either revision above.
+            edit_session_registry_ref.current.revision()],
     );
     const [cell_focus, set_cell_focus] = useState<CellFocus | null>(null);
     const cell_focus_sequence_ref = useRef(0);
@@ -3272,6 +3274,8 @@ export function App(): React.JSX.Element {
                     pending_excel_header_promote_ref.current = false;
                     set_pending_excel_header(null);
                     set_excel_header_status('');
+                    // A warning dismissed in one file says nothing about another.
+                    set_dismissed_notices(new Set());
                 }
                 const same_file = previous_native_identity?.authority.fileId
                     === snapshot.identity.authority.fileId;
