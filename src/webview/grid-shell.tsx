@@ -197,7 +197,7 @@ import {
     parse_cell_edit,
     type EditSyntax,
 } from '../cell-edit-model';
-import { format_xlsx_edit_preview } from '../spreadsheet-format';
+import { format_xlsx_edit_preview, type XlsxNumberFormat } from '../spreadsheet-format';
 import { MAX_SHEET_ROWS } from '../spreadsheet-safety';
 import {
     xlsx_edit_writes_formula,
@@ -423,6 +423,9 @@ function cached_markdown_edit_text(
     return text;
 }
 
+/** What a loaded number with no number format displays through. */
+const GENERAL_NUMBER_FORMAT: XlsxNumberFormat = Object.freeze({ code: 'General' });
+
 function calculated_formula_display(
     result: string | undefined,
     show_formatting: boolean,
@@ -431,14 +434,15 @@ function calculated_formula_display(
     if (
         result === undefined
         || !show_formatting
-        || !cell?.numberFormat
         || result.startsWith(UNKNOWN_XLSX_FORMULA_RESULT)
     ) {
         return result;
     }
-    return format_xlsx_edit_preview(result, cell.numberFormat, {
+    // A cell with no number format shows General: the 15 digits the calculator
+    // reports, 19/9 as 2.11111111111111, would read 2.111111111 once saved.
+    return format_xlsx_edit_preview(result, cell?.numberFormat ?? GENERAL_NUMBER_FORMAT, {
         was_boolean: false,
-        was_iso_date: cell.xlsxIsoDate,
+        was_iso_date: cell?.xlsxIsoDate,
     });
 }
 

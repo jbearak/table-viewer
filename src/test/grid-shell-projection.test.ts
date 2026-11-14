@@ -5178,6 +5178,58 @@ describe('GridShell link-only edits', () => {
             .toBe('$12.00 → $17.00');
     });
 
+    it('paints a recalculated General number with the digits it shows once saved', async () => {
+        // The calculator reports 15 significant digits; a cell with no number
+        // format displays them through General, as its cached value does.
+        const ninths = (raw: string, formatted: string, formula: string) => ({
+            raw, formatted, bold: false, italic: false, rawType: 'number' as const, formula,
+        });
+        grid_mock.get_row.mockImplementation(() => [
+            ninths('1.8888888888888888', '1.888888889', '=C1/9'),
+            ninths('1.8888888888888888', '1.888888889', '=SUM(C1:C3)/9'),
+        ] as any);
+        const formula_results = new Map([
+            ['0:0', '1.88888888888889'],
+            ['0:1', '2.11111111111111'],
+        ]);
+        const sheet_meta = { ...props().sheet_meta, columnCount: 2 };
+        const column_projection = {
+            visible_to_source: [0, 1],
+            source_to_visible: [0, 1],
+            hidden_count: 0,
+        };
+        const shown = props({
+            show_formatting: true,
+            edit_mode: true,
+            csv_editable: true,
+            edit_syntax: 'markdown',
+            sheet_meta,
+            column_projection,
+            formula_results,
+        });
+        const GridShell = await render_grid(shown);
+        const get_cell_content = () => grid_mock.props!.getCellContent as
+            (cell: [number, number]) => {
+                kind: string;
+                displayData?: string;
+                data?: string | { lines: Array<Array<{ text: string }>> };
+            };
+        const painted = (column: number) => {
+            const content = get_cell_content()([column, 0]);
+            return typeof content.data === 'object'
+                ? content.data.lines.flat().map((part) => part.text).join('')
+                : content.displayData;
+        };
+        expect(painted(0)).toBe('1.888888889');
+        expect(painted(1)).toBe('1.888888889 → 2.111111111');
+
+        // Formatting off shows values, not display text.
+        await act(async () => {
+            root!.render(React.createElement(GridShell, { ...shown, show_formatting: false }));
+        });
+        expect(painted(1)).toBe('1.8888888888888888 → 2.11111111111111');
+    });
+
     it('does not invalidate formulas for a hyperlink-only edit', async () => {
         grid_mock.get_row.mockImplementation(() => [{
             raw: '2', formatted: '2', bold: false, italic: false,
