@@ -5126,6 +5126,58 @@ describe('GridShell link-only edits', () => {
 
     });
 
+    it('paints a formula recalculated to its cached value plainly', async () => {
+        // A row or column change recalculates every formula on the sheet;
+        // only a result that differs is a change worth a before and after.
+        grid_mock.get_row.mockImplementation(() => [{
+            raw: '4',
+            formatted: '$4.00',
+            bold: false,
+            italic: false,
+            rawType: 'number' as const,
+            formula: '=C1*2',
+            numberFormat: { code: '$0.00' },
+        }, {
+            raw: '12',
+            formatted: '$12.00',
+            bold: false,
+            italic: false,
+            rawType: 'number' as const,
+            formula: '=SUM(C1:C3)',
+            numberFormat: { code: '$0.00' },
+        }] as any);
+        await render_grid(props({
+            show_formatting: true,
+            edit_mode: true,
+            csv_editable: true,
+            edit_syntax: 'markdown',
+            sheet_meta: {
+                ...props().sheet_meta,
+                columnCount: 2,
+            },
+            column_projection: {
+                visible_to_source: [0, 1],
+                source_to_visible: [0, 1],
+                hidden_count: 0,
+            },
+            formula_results: new Map([
+                ['0:0', '4'],
+                ['0:1', '17'],
+            ]),
+        }));
+        const get_cell_content = grid_mock.props!.getCellContent as
+            (cell: [number, number]) => {
+                kind: string;
+                displayData?: string;
+                data?: string | { lines: Array<Array<{ text: string }>> };
+            };
+        expect(get_cell_content([0, 0])).toMatchObject({ kind: 'text', displayData: '$4.00' });
+        const changed = get_cell_content([1, 0]);
+        expect(typeof changed.data === 'object'
+            && changed.data.lines.flat().map((part) => part.text).join(''))
+            .toBe('$12.00 → $17.00');
+    });
+
     it('does not invalidate formulas for a hyperlink-only edit', async () => {
         grid_mock.get_row.mockImplementation(() => [{
             raw: '2', formatted: '2', bold: false, italic: false,

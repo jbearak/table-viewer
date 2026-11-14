@@ -541,6 +541,10 @@ describe('calculate_workbook_formulas', () => {
         ['=MEDIAN(A1:A2)', 'unsupported function'],
         ['=SUM(A1:A2', 'parse error'],
         ['=1/0', 'numeric error'],
+        // What a formula becomes when a row or column it named is deleted.
+        ['=#REF!*A1', 'invalid reference'],
+        ['=SUM(Sheet1!#REF!)', 'invalid reference'],
+        ['=MEDIAN(#REF!)', 'invalid reference'],
     ] as const)('reports %s as a %s', (formula, error) => {
         const source = workbook([{ name: 'Sheet1', rows: [[
             cell('1'),

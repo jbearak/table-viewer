@@ -143,6 +143,80 @@ describe('cell context menu model', () => {
     });
 });
 
+describe('row and column structure', () => {
+    const enabled = (count = 1) => ({ count, on_click: vi.fn() });
+
+    function structure() {
+        return {
+            row_structure: {
+                insert_rows_above: enabled(2),
+                insert_rows_below: enabled(2),
+                delete_rows: enabled(2),
+                move_rows_up: enabled(2),
+                move_rows_down: enabled(2),
+            },
+            column_structure: {
+                insert_left: enabled(),
+                insert_right: enabled(),
+                delete: enabled(),
+                move_left: enabled(),
+                move_right: enabled(),
+            },
+        };
+    }
+
+    it('is absent in a file whose rows and columns cannot be changed', () => {
+        const items = cell_context_menu_items(base());
+        expect(items.some((item) => item.kind === 'submenu'
+            && (item.label === 'Insert' || item.label === 'Delete'))).toBe(false);
+    });
+
+    it('offers Insert and Delete for the selected rows and columns, between copy and Select', () => {
+        const parts = structure();
+        const items = cell_context_menu_items({ ...base(), ...parts });
+        expect(items.map((item) => item.kind === 'separator' ? '|' : item.label))
+            .toEqual([
+                'Highlight yellow', 'Highlight green', 'Highlight blue', 'Highlight pink',
+                '|', 'Copy cell', '|', 'Insert', 'Delete', '|', 'Select', 'Hide',
+            ]);
+        // Moving stays with the row numbers and column headers.
+        expect(submenu(items, 'Insert').map((item) => item.kind === 'separator' ? '' : item.label))
+            .toEqual(['Insert 2 rows above', 'Insert 2 rows below', 'Insert column left', 'Insert column right']);
+        expect(submenu(items, 'Delete').map((item) => item.kind === 'separator' ? '' : item.label))
+            .toEqual(['Delete 2 rows', 'Delete column']);
+
+        action(submenu(items, 'Insert'), 'Insert 2 rows above').on_click({} as never);
+        action(submenu(items, 'Insert'), 'Insert column right').on_click({} as never);
+        action(submenu(items, 'Delete'), 'Delete 2 rows').on_click({} as never);
+        action(submenu(items, 'Delete'), 'Delete column').on_click({} as never);
+        expect(parts.row_structure.insert_rows_above.on_click).toHaveBeenCalledOnce();
+        expect(parts.column_structure.insert_right.on_click).toHaveBeenCalledOnce();
+        expect(parts.row_structure.delete_rows.on_click).toHaveBeenCalledOnce();
+        expect(parts.column_structure.delete.on_click).toHaveBeenCalledOnce();
+        expect(parts.row_structure.move_rows_up.on_click).not.toHaveBeenCalled();
+    });
+
+    it('offers Restore beside Delete on a deleted row or column, and keeps a refusal reason', () => {
+        const parts = structure();
+        const items = cell_context_menu_items({
+            ...base(),
+            row_structure: {
+                ...parts.row_structure,
+                delete_rows: { count: 1, disabled_reason: 'Select at least one row that isn\'t deleted.' },
+                restore_rows: enabled(),
+            },
+            column_structure: { ...parts.column_structure, restore: enabled() },
+        });
+        const deletes = submenu(items, 'Delete');
+        expect(deletes.map((item) => item.kind === 'separator' ? '' : item.label))
+            .toEqual(['Delete row', 'Restore row', 'Delete column', 'Restore column']);
+        expect(action(deletes, 'Delete row')).toMatchObject({
+            disabled: true,
+            disabled_reason: 'Select at least one row that isn\'t deleted.',
+        });
+    });
+});
+
 describe('copy selection visibility', () => {
     const merged_cell = { startRow: 2, startCol: 3, endRow: 3, endCol: 5 };
 

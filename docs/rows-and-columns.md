@@ -22,6 +22,8 @@ To move rows with the keyboard, select whole rows and press `Alt+Shift+↑` or `
 
 Inserting and deleting have no keyboard shortcuts. `Ctrl/Cmd+Shift+=` and `Ctrl/Cmd+-`, which Excel uses for them, zoom the view in VS Code and in the desktop app.
 
+You can also right-click a cell. Its menu has **Insert** and **Delete** submenus with the same Insert, Delete, and Restore items for both rows and columns. They act on the rows and columns your selection spans, so right-clicking inside a block three rows tall offers **Insert 3 rows above**. Move is on the row and column menus only.
+
 Row actions apply to body rows only. The header row and any rows above it can't be deleted or moved, and you can't insert above the header row.
 
 A deleted row stays where it was, tinted and read-only, with no row number, until you save. The other row numbers show what the file will have after the save, so no two rows share a number.
@@ -117,6 +119,8 @@ The notice offers three actions.
 Both actions keep your edits to existing cells and your appended rows, and both can be undone.
 
 ## `.xlsx` workbooks
+
+While row or column changes are unsaved, Table Viewer recalculates the formulas it can. A cell whose result changes shows the old value struck through beside the new one, such as `24 → 34` for a total that gained a row. Formulas whose results stay the same look as they did. A formula that referred to a row or column you deleted shows `?? (invalid reference)`, and Save writes `#REF!` in its place, as Excel does. Restore the row or column, or undo, to get the formula back.
 
 Table Viewer moves the parts of a worksheet it understands along with the rows and columns: cell formulas on every sheet, defined names, merged cells, conditional formatting, data validation, hyperlinks, the AutoFilter range, column widths, page breaks, and the frozen-pane position. A new row copies the formatting of the row above it, or of the row below it when it is first under the header. A new column copies the formatting of the column to its left, or to its right when it is first. New rows and columns don't copy values, formulas, links, or validation.
 

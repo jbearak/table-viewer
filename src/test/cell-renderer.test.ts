@@ -3,6 +3,7 @@ import { GridCellKind } from '../webview/glide-data-grid';
 import {
     build_grid_cell,
     font_style,
+    formula_result_matches_persisted,
     rich_cell_display_data,
 } from '../webview/cell-renderer';
 import type { RenderedCell } from '../data-source/interface';
@@ -385,6 +386,47 @@ describe('build_grid_cell — edit overlay (CSV edit mode)', () => {
         expect(c.kind).toBe(GridCellKind.Text);
         expect((c as { data: string }).data).toBe('new');
         expect((c as { allowOverlay: boolean }).allowOverlay).toBe(true);
+    });
+});
+
+describe('formula_result_matches_persisted', () => {
+    const formula = (raw: string, formatted: string): RenderedCell => ({
+        raw, formatted, bold: false, italic: false, rawType: 'number', formula: '=A1/B1',
+    });
+
+    it('matches the displayed text under either Formatting state', () => {
+        const cell = formula('4', '$4.00');
+        expect(formula_result_matches_persisted(cell, true, '$4.00')).toBe(true);
+        expect(formula_result_matches_persisted(cell, false, '4')).toBe(true);
+        expect(formula_result_matches_persisted(cell, true, '$6.00')).toBe(false);
+    });
+
+    it('matches an unformatted number the file stores with more digits than either side shows', () => {
+        // The file holds 17 digits, the grid shows 9, and the calculator reports 15.
+        expect(formula_result_matches_persisted(
+            formula('0.33333333333333331', '0.333333333'), true, '0.333333333333333',
+        )).toBe(true);
+        expect(formula_result_matches_persisted(
+            formula('0.30000000000000004', '0.3'), false, '0.3',
+        )).toBe(true);
+        expect(formula_result_matches_persisted(
+            formula('0.33333333333333331', '0.333333333'), true, '0.25',
+        )).toBe(false);
+    });
+
+    it('compares text results as text', () => {
+        // `=A1` cached as the text "001": a result of "1" is a change.
+        const text: RenderedCell = { ...formula('001', '001'), rawType: 'string' };
+        expect(formula_result_matches_persisted(text, true, '1')).toBe(false);
+        expect(formula_result_matches_persisted(text, true, '001')).toBe(true);
+    });
+
+    it('never matches an unknown result or a cell with no cached value', () => {
+        expect(formula_result_matches_persisted(formula('4', '4'), true, '?? (cycle)')).toBe(false);
+        expect(formula_result_matches_persisted(
+            { ...formula('=A1/B1', '??'), formulaResultPending: true }, true, '??',
+        )).toBe(false);
+        expect(formula_result_matches_persisted(null, true, '')).toBe(false);
     });
 });
 

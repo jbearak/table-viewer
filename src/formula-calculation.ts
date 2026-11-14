@@ -6,6 +6,7 @@ import {
 import {
     UNKNOWN_XLSX_FORMULA_RESULT,
     a1_formula_reference_at,
+    formula_ref_error_count,
     is_xlsx_formula_text,
     structured_formula_reference_at,
 } from './xlsx-formula';
@@ -186,6 +187,8 @@ export function formula_calculation_edit_anchors_valid(
 export type FormulaCalculationError =
     | 'unsupported function'
     | 'parse error'
+    /** The formula holds `#REF!`: something it referred to was deleted. */
+    | 'invalid reference'
     | 'cycle'
     | 'numeric error'
     | 'unknown column'
@@ -255,6 +258,7 @@ const PARSE_ERROR: Scalar = Object.freeze({ kind: 'unknown', error: 'parse error
 const UNSUPPORTED_FUNCTION: Scalar = Object.freeze({
     kind: 'unknown', error: 'unsupported function',
 });
+const INVALID_REFERENCE: Scalar = Object.freeze({ kind: 'unknown', error: 'invalid reference' });
 const CYCLE: Scalar = Object.freeze({ kind: 'unknown', error: 'cycle' });
 const NUMERIC_ERROR: Scalar = Object.freeze({ kind: 'unknown', error: 'numeric error' });
 const UNKNOWN_COLUMN: Scalar = Object.freeze({ kind: 'unknown', error: 'unknown column' });
@@ -654,6 +658,9 @@ function* calculate_workbook_formula_steps(
                 !is_xlsx_formula_text(this.formula)
                 || this.formula.length > MAX_CALCULATED_FORMULA_LENGTH
             ) return PARSE_ERROR;
+            // Excel evaluates any formula holding `#REF!` to that error, and
+            // no function the calculator supports can catch one.
+            if (formula_ref_error_count(this.formula) > 0) return INVALID_REFERENCE;
             consume_work(this.formula.length);
             const value = yield* this.additive();
             yield* this.whitespace();

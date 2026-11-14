@@ -1,8 +1,17 @@
 import type { CellHighlightColor } from '../types';
 import type { MenuItem } from './context-menu';
 import { CELL_HIGHLIGHT_COLORS } from './highlight-theme';
-import { hide_rows_menu_item } from './row-context-menu';
-import { hide_columns_menu_item } from './column-context-menu';
+import {
+    hide_rows_menu_item,
+    row_structure_menu_item,
+    type RowStructureMenuActions,
+} from './row-context-menu';
+import {
+    column_delete_menu_items,
+    column_insert_menu_items,
+    hide_columns_menu_item,
+    type ColumnStructureMenuActions,
+} from './column-context-menu';
 
 export interface CellContextMenuModelProps {
     dirty: boolean;
@@ -39,6 +48,15 @@ export interface CellContextMenuModelProps {
     on_select_row: () => void;
     on_select_column: () => void;
     on_select_all: () => void;
+    /**
+     * Insert, Delete, and Restore for the rows the selection spans, in an
+     * editable file. A cell is where people right-click to change a table's
+     * shape, so the row and column menus' items are offered here too. Moves
+     * stay with the row numbers and column headers, where they can be dragged.
+     */
+    row_structure?: RowStructureMenuActions;
+    /** The same for the columns the selection spans. */
+    column_structure?: ColumnStructureMenuActions;
 }
 
 interface CellSelectionRect {
@@ -121,6 +139,30 @@ export function cell_context_menu_items(props: CellContextMenuModelProps): MenuI
     hide_items.push(
         hide_columns_menu_item(props.selected_column_count, props.on_hide_columns),
     );
+    const { row_structure, column_structure } = props;
+    const insert_items: MenuItem[] = [
+        ...(row_structure === undefined ? [] : [
+            row_structure_menu_item('Insert above', row_structure.insert_rows_above),
+            row_structure_menu_item('Insert below', row_structure.insert_rows_below),
+        ]),
+        ...(column_structure === undefined ? [] : column_insert_menu_items(column_structure)),
+    ];
+    const delete_items: MenuItem[] = [
+        ...(row_structure === undefined ? [] : [
+            row_structure_menu_item('Delete', row_structure.delete_rows),
+            ...(row_structure.restore_rows === undefined
+                ? []
+                : [row_structure_menu_item('Restore', row_structure.restore_rows)]),
+        ]),
+        ...(column_structure === undefined ? [] : column_delete_menu_items(column_structure)),
+    ];
+    if (insert_items.length > 0) {
+        items.push(
+            { kind: 'separator' },
+            { kind: 'submenu', label: 'Insert', items: insert_items },
+            { kind: 'submenu', label: 'Delete', items: delete_items },
+        );
+    }
     items.push(
         { kind: 'separator' },
         {

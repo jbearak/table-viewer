@@ -18,6 +18,8 @@ import { build_fixture_xlsx, cell, row } from '../../src/test/helpers/xlsx-struc
 import { isolated_user_data, repo_dir, state_database_path } from './smoke-helpers';
 import {
     choose,
+    choose_from_submenu,
+    open_cell_menu,
     save_button,
     wait_for_grid,
     exit_app,
@@ -144,6 +146,53 @@ test('CSV rows: insert, delete, restore, move by keyboard and drag, then save', 
     ]);
     // A structural save is a history barrier.
     await expect.poll(() => undo_menu_label(app!)).toBe('Undo');
+});
+
+test('the cell menu inserts, deletes, and restores rows and columns', async () => {
+    const { file, page } = await open_file(
+        'fruit.csv',
+        'name,qty,price\napple,1,0.5\nbanana,2,0.25\ncherry,3,3\n',
+    );
+    await wait_for_grid(page);
+
+    // Nothing is unsaved and no whole row is selected: a right-click on a
+    // cell is enough to insert beside it.
+    await choose_from_submenu(await open_cell_menu(page, 0, 1), 'Insert', 'Insert row above');
+    await expect.poll(() => grid_rows(page)).toEqual([
+        '|apple|1|0.5',
+        'Row 2, inserted|||',
+        '|banana|2|0.25',
+        '|cherry|3|3',
+    ]);
+    await expect_undo_label('Insert row');
+
+    await choose_from_submenu(await open_cell_menu(page, 2, 0), 'Insert', 'Insert column left');
+    await expect.poll(() => grid_headers(page)).toEqual([
+        '|name',
+        '|qty',
+        'Column C, inserted|New column',
+        '|price',
+    ]);
+    await expect_undo_label('Insert column');
+
+    // Delete qty from one of its cells, bring it back, and delete it again.
+    await choose_from_submenu(await open_cell_menu(page, 1, 2), 'Delete', 'Delete column');
+    await expect.poll(() => grid_headers(page)).toContain('Column removed, was qty|qty');
+    await expect_undo_label('Delete column');
+    await choose_from_submenu(await open_cell_menu(page, 1, 2), 'Delete', 'Restore column');
+    await expect.poll(() => grid_headers(page)).toContain('|qty');
+    await choose_from_submenu(await open_cell_menu(page, 1, 2), 'Delete', 'Delete column');
+    await expect.poll(() => grid_headers(page)).toContain('Column removed, was qty|qty');
+
+    // Delete cherry from its name cell.
+    await choose_from_submenu(await open_cell_menu(page, 0, 3), 'Delete', 'Delete row');
+    await expect.poll(() => grid_rows(page)).toContain('Row removed, was row 3|cherry|3||3');
+    await expect_undo_label('Delete row');
+    await save_screenshot(page, '10-cell-menu-before-save');
+
+    await save_changes(page);
+    await expect.poll(() => fs.readFileSync(file, 'utf8'))
+        .toBe('name,New column,price\napple,,0.5\n,,\nbanana,,0.25\n');
 });
 
 test('a row drag and a column drag are the first edits to a file', async () => {

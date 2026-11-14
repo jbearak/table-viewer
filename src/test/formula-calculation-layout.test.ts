@@ -135,7 +135,7 @@ describe('calculation with layouts', () => {
         // C2 is now B2: =SUM(A2:A5).
         expect(calculated['1:1']).toBe('130');
         // C5 is now B4: `=B6+A2` names the removed column, so it is `#REF!`.
-        expect(calculated['3:1']).toBe('?? (parse error)');
+        expect(calculated['3:1']).toBe('?? (invalid reference)');
         // Row 6 and column C are past the prospective sheet.
         expect(calculated['5:0']).toBe('?? (parse error)');
         expect(calculated['1:2']).toBe('?? (parse error)');

@@ -38,21 +38,32 @@ function counted(verb: string, count: number, side?: string): string {
     return side === undefined ? columns : `${columns} ${side}`;
 }
 
-/** The structure items, in menu order: Insert, Delete, Restore, Move. */
-export function column_structure_menu_items(actions: ColumnStructureMenuActions): ActionMenuItem[] {
-    const items = [
+/** "Insert column left" and "Insert column right", labeled for the selection's count. */
+export function column_insert_menu_items(actions: ColumnStructureMenuActions): ActionMenuItem[] {
+    return [
         column_structure_item(counted('Insert', actions.insert_left.count, 'left'), actions.insert_left),
         column_structure_item(counted('Insert', actions.insert_right.count, 'right'), actions.insert_right),
-        column_structure_item(counted('Delete', actions.delete.count), actions.delete),
     ];
-    if (actions.restore !== undefined) {
-        items.push(column_structure_item(counted('Restore', actions.restore.count), actions.restore));
-    }
-    items.push(
+}
+
+/** "Delete column", and "Restore column" when the selection includes a removal. */
+export function column_delete_menu_items(actions: ColumnStructureMenuActions): ActionMenuItem[] {
+    return [
+        column_structure_item(counted('Delete', actions.delete.count), actions.delete),
+        ...(actions.restore === undefined
+            ? []
+            : [column_structure_item(counted('Restore', actions.restore.count), actions.restore)]),
+    ];
+}
+
+/** The structure items, in menu order: Insert, Delete, Restore, Move. */
+export function column_structure_menu_items(actions: ColumnStructureMenuActions): ActionMenuItem[] {
+    return [
+        ...column_insert_menu_items(actions),
+        ...column_delete_menu_items(actions),
         column_structure_item('Move columns left', actions.move_left),
         column_structure_item('Move columns right', actions.move_right),
-    );
-    return items;
+    ];
 }
 
 /** Merged children can inherit a displayed header but are not editable cells. */
