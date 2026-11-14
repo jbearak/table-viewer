@@ -335,6 +335,31 @@ CASES = [
         "formulas": [f("=SUM(B3:B6)", expect=flagged()), f("=SUM($B$3:$B$6)", expect=flagged()), f("=$B$6")],
     },
     {
+        "name": "move a range's last row up inside it",
+        "gestures": [move(R, S, 6, 1, 4)],
+        "formulas": [f("=SUM(B3:B6)", expect=flagged()), f("=SUM($B$3:$B$6)", expect=flagged()), f("=B6")],
+    },
+    {
+        "name": "move a range's first row down inside it",
+        "gestures": [move(R, S, 3, 1, 6)],
+        "formulas": [f("=SUM(B3:B6)", expect=flagged()), f("=B3")],
+    },
+    {
+        "name": "move a range's last row up inside it under a Header Row",
+        "headerRow": 1,
+        "gestures": [move(R, S, 5, 1, 3)],
+        "formulas": [f("=SUM(B2:B5)", expect=flagged())],
+    },
+    {
+        "name": "move a range's last row up inside it on a referenced sheet",
+        "sheets": [S, "My Data"],
+        "gestures": [move(R, "My Data", 6, 1, 4)],
+        "formulas": [
+            f("=SUM('My Data'!B3:B6)", expect=flagged()),
+            f("=SUM(B3:B6)", sheet="My Data", expect=flagged()),
+        ],
+    },
+    {
         "name": "move a range's first column past its last",
         "gestures": [move(C, S, 3, 1, 8)],
         "formulas": [f("=SUM(C2:F2)", expect=flagged())],
