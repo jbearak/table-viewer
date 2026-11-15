@@ -3389,7 +3389,9 @@ export function GridShell({
     const acquire_session_for_drag = useCallback(() => {
         if (drag_holds_session_ref.current) return;
         drag_holds_session_ref.current = true;
-        void ensure_edit_session(true);
+        // A click releases before the grant lands, when the request still
+        // counts as busy: ask again once it settles.
+        void ensure_edit_session(true).finally(notify_session_idle);
         // The button coming up ends the drag, and so does the window losing
         // focus: a release outside it may never deliver a mouseup.
         const release = () => {
@@ -3403,7 +3405,7 @@ export function GridShell({
         };
         window.addEventListener('mouseup', release, true);
         window.addEventListener('blur', release);
-    }, [ensure_edit_session]);
+    }, [ensure_edit_session, notify_session_idle]);
 
     useEffect(() => {
         if (
@@ -10844,9 +10846,11 @@ export function GridShell({
     // Asked again when a sort or filter settles: one in flight is refused.
     useEffect(() => {
         if (menu_open && edit_armed && menu_offers_edits && !transform_pending) {
-            void ensure_edit_session(true);
+            // The menu may close before the grant lands, when the request
+            // still counts as busy: ask again once it settles.
+            void ensure_edit_session(true).finally(notify_session_idle);
         }
-    }, [edit_armed, ensure_edit_session, menu_offers_edits, menu_open, transform_pending]);
+    }, [edit_armed, ensure_edit_session, menu_offers_edits, menu_open, notify_session_idle, transform_pending]);
 
     // Surfaces that hold the session open with nothing unsaved behind them.
     // When the last one closes, App is told the session may be empty.

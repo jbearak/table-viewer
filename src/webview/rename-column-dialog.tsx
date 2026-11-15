@@ -42,6 +42,7 @@ export function RenameColumnDialog(props: {
     const dialog_ref = useRef<HTMLDivElement>(null);
     const input_ref = useRef<HTMLInputElement>(null);
     const error = column_rename_error(value, props.column_names, props.source_column, props.removed_names);
+    const unchanged = committed_column_name(value) === committed_column_name(props.initial);
     use_dismiss(dialog_ref, props.on_cancel);
     useEffect(() => {
         const timer = window.setTimeout(() => {
@@ -51,10 +52,11 @@ export function RenameColumnDialog(props: {
         return () => window.clearTimeout(timer);
     }, []);
     const commit = useCallback(() => {
-        if (error === undefined && props.on_commit(committed_column_name(value))) {
-            props.on_cancel();
-        }
-    }, [error, props, value]);
+        if (error !== undefined) return;
+        // Renaming to the same name commits nothing, so it would never close:
+        // Enter on it cancels, which is what the disabled Rename button offers.
+        if (unchanged || props.on_commit(committed_column_name(value))) props.on_cancel();
+    }, [error, props, unchanged, value]);
     return (
         <div
             ref={dialog_ref}
@@ -92,9 +94,7 @@ export function RenameColumnDialog(props: {
                 <button
                     type="button"
                     className="filter-popover-btn filter-popover-btn-primary"
-                    disabled={error !== undefined
-                        || committed_column_name(value)
-                            === committed_column_name(props.initial)}
+                    disabled={error !== undefined || unchanged}
                     onClick={commit}
                 >
                     Rename
