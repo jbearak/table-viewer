@@ -1388,6 +1388,68 @@ describe('GridShell edits across a generation bump', () => {
         });
     });
 
+    describe('folding under an exiting session\'s fence', () => {
+        /** A grid whose session is on its way out, with the cell editor as given. */
+        async function fenced_grid(typed: string | null) {
+            const store = create_edit_session_store({ session_id: 'session-1' });
+            const rendered = await render_grid(undefined, {
+                edit_session: store,
+                generation: 1,
+            });
+            if (typed !== null) {
+                const clip = document.createElement('div');
+                clip.className = 'gdg-clip-region';
+                const input = document.createElement('input');
+                input.value = typed;
+                clip.appendChild(input);
+                document.body.appendChild(clip);
+                await act(async () => {
+                    grid_mock.props!.onGridSelectionChange!({
+                        columns: {},
+                        rows: {},
+                        current: {
+                            cell: [0, 0],
+                            range: { x: 0, y: 0, width: 1, height: 1 },
+                            rangeStack: [],
+                        },
+                    });
+                });
+            }
+            await act(async () => rendered.editing_ref.current!.stop_edit_admission());
+            rendered.post_message.mockClear();
+            return { ...rendered, store };
+        }
+
+        it('refuses with nothing open, as it always has, unless told that is fine', async () => {
+            const { editing_ref, post_message } = await fenced_grid(null);
+
+            expect(editing_ref.current!.commit_live_edit()).toBe(false);
+            expect(editing_ref.current!.flush_live_edit()).toBe(false);
+            expect(editing_ref.current!.commit_live_edit({ fenced_empty_ok: true })).toBe(true);
+            expect(editing_ref.current!.flush_live_edit({ fenced_empty_ok: true })).toBe(true);
+            // Publication is what the fence forbids: nothing is posted.
+            expect(post_message.mock.calls.map((call) => call[0].type))
+                .not.toContain('pendingEditsChanged');
+        });
+
+        it('dismisses an editor whose text is unchanged, writing nothing', async () => {
+            const { editing_ref, store } = await fenced_grid('base');
+
+            expect(editing_ref.current!.commit_live_edit({ fenced_empty_ok: true })).toBe(true);
+
+            expect(store.snapshot().size).toBe(0);
+        });
+
+        it('still refuses with changed text in the editor, and leaves it uncommitted', async () => {
+            const { editing_ref, store } = await fenced_grid('typed but not closed');
+
+            expect(editing_ref.current!.commit_live_edit({ fenced_empty_ok: true })).toBe(false);
+            expect(editing_ref.current!.flush_live_edit({ fenced_empty_ok: true })).toBe(false);
+
+            expect(store.snapshot().size).toBe(0);
+        });
+    });
+
     it('leaves a pre-installed store alone when mounting at a settled revision', async () => {
         // applied_save_lifecycle_revision_ref is per-mount and initialized to the
         // revision it mounted with, so apply_save_lifecycle never runs for the

@@ -140,7 +140,10 @@ It also removes other friction from reading tables:
 - Undoing everything and then redoing it works: redo is still there after the last unsaved change is undone and **Save** goes quiet
 - Changing an Excel header row keeps undo and redo. A change made before it is undone or redone in the cell or row it was made in. Two kinds of change wait while the header row is somewhere they can't follow: a cell typed in a row that has since become the header row (or in a header row that is now an ordinary row), and a row change that names rows now in or above the header. Undo or redo then says which header row to use, and the change is still there when you get back to it
 - If a change is hidden by an active filter or a hidden column, it is still applied and you are told where it went rather than left watching a still cursor
-- Sorts, filters, and column visibility are not part of history — they are view state, with their own toolbar chips and **Columns** menu for undoing them
+- Sorts, filters, hidden rows (and **Unhide all**), and hidden and shown columns are steps too, in the same history as your edits: "Undo Sort", "Redo Hide 3 rows". They change the view and not the file, so undoing one never makes the file unsaved, and the view the file remembers follows what you undo and redo
+- A view step that no longer fits is skipped with a message and does not hold up the steps under it: a sort or filter whose columns have since changed, or hidden rows that are gone or now sit above the header row
+- While your own sort, filter, or hide is still being applied, cells do not open for editing and a second view change waits for the first
+- Column widths, row heights, and the header row choice are not steps yet
 - `Ctrl+Z` / `Cmd+Z` **inside** an open cell editor is ordinary text undo for what you are typing, and does not touch the workbook's history
 - History lives with the window: closing the tab, window, or app clears it. Unsaved edits are cached and survive that, so a reopened file can show edits that can no longer be undone
 
