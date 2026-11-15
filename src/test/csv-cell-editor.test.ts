@@ -3,16 +3,17 @@
 import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { GridCellKind, type GridCell } from '../webview/glide-data-grid';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { CsvCellEditor } from '../webview/csv-cell-editor';
 import type { EditorKeyEvent } from '../webview/csv-cell-editor-model';
 
-const key = (name: string): EditorKeyEvent => ({
+const key = (name: string, mods: Partial<EditorKeyEvent> = {}): EditorKeyEvent => ({
     key: name,
     shiftKey: false,
     altKey: false,
     metaKey: false,
     ctrlKey: false,
+    ...mods,
 });
 
 let root: Root | null = null;
@@ -172,5 +173,64 @@ describe('CsvCellEditor', () => {
             expect.objectContaining({ data: 'Alice\n' }),
         );
         expect(on_finished).not.toHaveBeenCalled();
+    });
+
+    describe('with keys the browser moves the caret for', () => {
+        // jsdom has no Selection.modify. This one acts on the focused input,
+        // as Chromium's does, for the two moves these tests use.
+        const modify = vi.fn((alter: string, direction: string, granularity: string) => {
+            const el = document.activeElement as HTMLInputElement | HTMLTextAreaElement;
+            const start = el.selectionStart!;
+            const end = el.selectionEnd!;
+            if (alter !== 'extend' || (direction !== 'left' && direction !== 'backward')) return;
+            const to = granularity === 'word'
+                ? el.value.slice(0, start).replace(/\S+\s*$/u, '').length
+                : start - 1;
+            el.setSelectionRange(to, end, 'backward');
+        });
+        beforeEach(() => {
+            modify.mockClear();
+            Object.defineProperty(Selection.prototype, 'modify', { value: modify, configurable: true });
+        });
+        afterEach(() => {
+            delete (Selection.prototype as { modify?: unknown }).modify;
+        });
+
+        it('lets the browser move them in the input, in turn with the text typed around them', async () => {
+            const on_change = vi.fn();
+            await render_editor('a', on_change, vi.fn(), vi.fn(), 'a', value('a'), [
+                key('b'), key('c'), key('ArrowLeft', { shiftKey: true }), key('X'),
+            ]);
+
+            expect(modify).toHaveBeenCalledWith('extend', 'left', 'character');
+            const input = container!.querySelector('input')!;
+            expect(input.value).toBe('abX');
+            expect(input.selectionStart).toBe(3);
+            expect(on_change).toHaveBeenCalledWith(expect.objectContaining({ data: 'abX' }));
+        });
+
+        it('deletes what the browser selects for a word delete', async () => {
+            // Ctrl+Backspace outside macOS, which jsdom stands in for.
+            await render_editor('x', vi.fn(), vi.fn(), vi.fn(), 'o', value('x'), [
+                ...'ne two'.split('').map((c) => key(c)), key('Backspace', { ctrlKey: true }),
+            ]);
+
+            expect(modify).toHaveBeenCalledWith('extend', 'backward', 'word');
+            expect(container!.querySelector('input')!.value).toBe('one ');
+        });
+
+        it('switches to lines for a held line break, and moves the caret in them after it', async () => {
+            const on_change = vi.fn();
+            await render_editor('a', on_change, vi.fn(), vi.fn(), 'a', value('a'), [
+                key('Enter', { shiftKey: true }), key('b'), key('c'), key('ArrowLeft', { shiftKey: true }), key('X'),
+            ]);
+
+            expect(container!.querySelector('input')).toBeNull();
+            const textarea = container!.querySelector('textarea')!;
+            expect(textarea.value).toBe('a\nbX');
+            expect(document.activeElement).toBe(textarea);
+            expect(textarea.selectionStart).toBe(4);
+            expect(on_change).toHaveBeenLastCalledWith(expect.objectContaining({ data: 'a\nbX' }));
+        });
     });
 });

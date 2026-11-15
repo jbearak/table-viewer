@@ -1,11 +1,13 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { GridCellKind, type GridCell } from './glide-data-grid';
 import {
+    apply_held_keys,
     editor_key_intent,
     insert_newline,
-    replay_editor_keys,
     type EditorCommitNavigation,
     type EditorKeyEvent,
+    type EditorPlatform,
+    type HeldKeysTarget,
 } from './csv-cell-editor-model';
 import { count_lines, has_line_break } from './line-breaks';
 import type { RichCellData } from './rich-text-layout';
@@ -36,8 +38,44 @@ export interface CsvCellEditorProps {
     heldKeys?: readonly EditorKeyEvent[];
 }
 
-// Chromium leaves the caret alone on Up and Down in a single line on Windows.
-const WINDOWS = typeof navigator !== 'undefined' && /^Win/.test(navigator.platform);
+// The caret keys of an input differ by platform: Chromium leaves the caret
+// alone on Up and Down in a single line on Windows, and macOS moves by word
+// with Alt and by line with Cmd.
+const PLATFORM: EditorPlatform = typeof navigator === 'undefined' ? 'linux'
+    : /^Mac/.test(navigator.platform) ? 'mac'
+    : /^Win/.test(navigator.platform) ? 'windows'
+    : 'linux';
+
+/**
+ * The editor's input as somewhere to apply held keys. The browser applies
+ * its own caret rules through the document's selection, which follows the
+ * focused input.
+ */
+function input_target(el: HTMLInputElement | HTMLTextAreaElement): HeldKeysTarget {
+    return {
+        read: () => ({
+            text: el.value,
+            start: el.selectionStart ?? el.value.length,
+            end: el.selectionEnd ?? el.value.length,
+        }),
+        write: ({ text, start, end }) => {
+            if (el.value !== text) {
+                el.value = text;
+                // A line per line, as the render after each key typed gives
+                // it, so whether the text overflows is measured as it would be.
+                if (el instanceof HTMLTextAreaElement) el.rows = count_lines(text);
+            }
+            el.setSelectionRange(start, end);
+        },
+        select: (moves) => {
+            const selection = el.ownerDocument.getSelection();
+            if (typeof selection?.modify !== 'function') return;
+            for (const [alter, direction, granularity] of moves) selection.modify(alter, direction, granularity);
+        },
+        overflows: () => el.scrollHeight > el.clientHeight,
+        holds_line_breaks: el instanceof HTMLTextAreaElement,
+    };
+}
 
 function cell_text(cell: GridCell): string {
     if (cell.kind === GridCellKind.Text) return cell.data ?? '';
@@ -80,16 +118,17 @@ export function CsvCellEditor({
     // Markdown cells use Custom so the canvas can keep painting their runs;
     // prefer the explicit seed for both kinds to give them identical behavior.
     const initial = initialValue ?? cell_text(value);
-    const [opened] = useState(() => (heldKeys && heldKeys.length > 0
-        ? replay_editor_keys(initial, initialValue === undefined, heldKeys, WINDOWS)
-        : undefined));
-    const [text, set_text] = useState(opened?.text ?? initial);
-    const [is_multiline, set_is_multiline] = useState(has_line_break(opened?.text ?? initial));
+    const [text, set_text] = useState(initial);
+    const [is_multiline, set_is_multiline] = useState(has_line_break(initial));
     const input_ref = useRef<HTMLInputElement | HTMLTextAreaElement | null>(null);
     const mounted_ref = useRef(false);
     const cursor_pos_ref = useRef<number | null>(null);
+    // Held keys not yet applied, or null once the editor has applied them.
+    const held_ref = useRef<readonly EditorKeyEvent[] | null>(heldKeys && heldKeys.length > 0 ? heldKeys : null);
 
-    useEffect(() => {
+    // A layout effect, so the held keys are applied before the grid that
+    // opened this editor looks at it again, as it does to commit a held Enter.
+    useLayoutEffect(() => {
         const el = input_ref.current;
         if (!el) return;
         el.focus();
@@ -99,11 +138,7 @@ export function CsvCellEditor({
             el.setSelectionRange(pos, pos);
             cursor_pos_ref.current = null;
         } else {
-            if (opened) {
-                el.setSelectionRange(opened.start, opened.end);
-                // Glide commits its own copy of the value on a click away.
-                if (opened.text !== initial) onChange(with_text(value, opened.text));
-            } else if (initialValue === undefined) {
+            if (initialValue === undefined) {
                 // Mouse/Enter activation starts with the existing cell selected.
                 el.select();
             } else {
@@ -115,6 +150,27 @@ export function CsvCellEditor({
             }
             mounted_ref.current = true;
         }
+        const held = held_ref.current;
+        if (held === null) return;
+        // Apply the keys typed before the editor could open to the input
+        // itself, so the browser's own caret rules apply as they would have.
+        const target = input_target(el);
+        const applied = apply_held_keys(target, held, PLATFORM);
+        if (applied < held.length) {
+            // A line break, which only a textarea holds: switch, as Shift+Enter
+            // does, and apply the rest there.
+            const { start, end } = target.read();
+            const { value: next, cursor } = insert_newline(el.value, start, end);
+            held_ref.current = held.slice(applied + 1);
+            cursor_pos_ref.current = cursor;
+            set_text(next);
+            set_is_multiline(true);
+            return;
+        }
+        held_ref.current = null;
+        if (el.value !== text) set_text(el.value);
+        // Glide commits its own copy of the value on a click away.
+        if (el.value !== initial) onChange(with_text(value, el.value));
     }, [is_multiline]);
 
     const commit = (navigation: EditorCommitNavigation) => {

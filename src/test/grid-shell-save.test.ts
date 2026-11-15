@@ -1872,7 +1872,7 @@ describe('GridShell editing with no session held yet', () => {
     });
 
     /** A key on the grid, as Glide hands it to GridShell before acting on it. */
-    function grid_key(key: string, mods: { shiftKey?: boolean; altKey?: boolean; metaKey?: boolean } = {}) {
+    function grid_key(key: string, mods: { shiftKey?: boolean; altKey?: boolean; metaKey?: boolean; ctrlKey?: boolean } = {}) {
         const args = {
             key,
             altKey: false,
@@ -2193,6 +2193,139 @@ describe('GridShell editing with no session held yet', () => {
         expect(grid_mock.open_overlay).toHaveBeenCalledTimes(2);
         expect(selected_cell()).toEqual([2, 0]);
         expect(overlay.input()).toBeNull();
+        await overlay.unmount();
+    });
+
+    /** A request every gesture joins until the host answers, as App's is. */
+    function joined_session_request() {
+        let settle!: (granted: boolean) => void;
+        const answer = new Promise<boolean>((resolve) => { settle = resolve; });
+        return { request: vi.fn(() => answer), grant: () => settle(true) };
+    }
+
+    it('cancels the edit for an Escape typed while the session is on its way, and lets the session go', async () => {
+        const { request, grant } = joined_session_request();
+        const on_edit_session_idle = vi.fn();
+        const overlay = open_editors_as_glide_does();
+        const { rerender, editing_ref } = await render_grid(undefined, {
+            ...no_session,
+            on_request_edit_session: request,
+            on_edit_session_idle,
+        });
+        await select_cell([0, 0]);
+
+        grid_mock.props!.onOverlayOpenRequest!([0, 0], 'a');
+        grid_key('b');
+        expect(editing_ref.current!.typing_held()).toBe(true);
+        // Kept from the grid, which would clear the selection: the open
+        // editor takes Escape for itself.
+        const escape = grid_key('Escape');
+        expect(escape.cancel).toHaveBeenCalled();
+        expect(escape.preventDefault).toHaveBeenCalled();
+        expect(selected_cell()).toEqual([0, 0]);
+        expect(editing_ref.current!.typing_held()).toBe(false);
+        // The session is still on its way.
+        expect(editing_ref.current!.session_busy()).toBe(true);
+        on_edit_session_idle.mockClear();
+
+        await grant_session(grant, rerender);
+        expect(grid_mock.open_overlay).not.toHaveBeenCalled();
+        expect(overlay.input()).toBeNull();
+        expect(on_edit_session_idle).toHaveBeenCalled();
+        expect(editing_ref.current!.session_busy()).toBe(false);
+    });
+
+    it('takes keys after a held Escape as the grid would after the editor closed', async () => {
+        const { request, grant } = joined_session_request();
+        const overlay = open_editors_as_glide_does();
+        const { rerender } = await render_grid(undefined, {
+            ...no_session,
+            on_request_edit_session: request,
+        });
+        await select_cell([0, 0]);
+
+        grid_mock.props!.onOverlayOpenRequest!([0, 0], 'a');
+        grid_key('b');
+        grid_key('Escape');
+        // Glide starts a new edit for the next key, in the same cell.
+        expect(grid_key('x').cancel).not.toHaveBeenCalled();
+        expect(grid_mock.props!.onOverlayOpenRequest!([0, 0], 'x')).toBe(true);
+        grid_key('y');
+
+        await grant_session(grant, rerender);
+        expect(grid_mock.open_overlay.mock.calls).toEqual([[[0, 0], 'x']]);
+        expect(overlay.input()!.value).toBe('xy');
+        expect(overlay.finished).toEqual([]);
+        await overlay.unmount();
+    });
+
+    it('cancels only the edit after a held commit on Escape', async () => {
+        const { request, grant } = session_request();
+        const overlay = open_editors_as_glide_does();
+        const { rerender } = await render_grid(three_columns, {
+            ...no_session,
+            on_request_edit_session: request,
+        });
+        await select_cell([0, 0]);
+
+        grid_mock.props!.onOverlayOpenRequest!([0, 0], 'a');
+        for (const key of ['Tab', 'b', 'c', 'Escape', 'd']) expect(grid_key(key).cancel).toHaveBeenCalled();
+
+        await grant_session(grant, rerender, { column_projection: three_columns });
+        // "a" is committed; "bc" never opens, and "d" starts over in its cell.
+        expect(overlay.finished).toEqual(['a']);
+        expect(grid_mock.open_overlay.mock.calls).toEqual([[[0, 0], 'a'], [[1, 0], 'd']]);
+        expect(selected_cell()).toEqual([1, 0]);
+        expect(overlay.input()!.value).toBe('d');
+        await overlay.unmount();
+    });
+
+    it('keeps Cmd and Ctrl with a caret key from the grid while the session is on its way', async () => {
+        const { request, grant } = session_request();
+        const overlay = open_editors_as_glide_does();
+        const { rerender } = await render_grid(three_columns, {
+            ...no_session,
+            on_request_edit_session: request,
+        });
+        await select_cell([1, 0]);
+
+        grid_mock.props!.onOverlayOpenRequest!([1, 0], 'a');
+        // On the grid these jump to the edge of the data, out from under the edit.
+        for (const args of [
+            grid_key('ArrowLeft', { metaKey: true }), grid_key('ArrowDown', { metaKey: true }),
+            grid_key('Home', { ctrlKey: true }), grid_key('End', { ctrlKey: true, shiftKey: true }),
+        ]) {
+            expect(args.cancel).toHaveBeenCalled();
+            expect(args.preventDefault).toHaveBeenCalled();
+        }
+        // Other shortcuts are still the app's.
+        expect(grid_key('z', { metaKey: true }).cancel).not.toHaveBeenCalled();
+        expect(selected_cell()).toEqual([1, 0]);
+
+        await grant_session(grant, rerender, { column_projection: three_columns });
+        expect(grid_mock.open_overlay).toHaveBeenCalledWith([1, 0], 'a');
+        expect(overlay.input()!.value).toBe('a');
+        await overlay.unmount();
+    });
+
+    it('commits all the lines of a held edit for an Enter typed after a held line break', async () => {
+        const { request, grant } = session_request();
+        const overlay = open_editors_as_glide_does();
+        const { rerender } = await render_grid(three_columns, {
+            ...no_session,
+            on_request_edit_session: request,
+        });
+        await select_cell([0, 0]);
+
+        grid_mock.props!.onOverlayOpenRequest!([0, 0], 'a');
+        grid_key('Enter', { shiftKey: true });
+        grid_key('b');
+        grid_key('Tab');
+
+        await grant_session(grant, rerender, { column_projection: three_columns });
+        // The editor has switched to lines, and has every key, before the Tab
+        // commits it.
+        expect(overlay.finished).toEqual(['a\nb']);
         await overlay.unmount();
     });
 
