@@ -9452,20 +9452,29 @@ export function GridShell({
                     // tears the editor down (onFinishEditing commits, then clears the
                     // overlay), so releasing here cannot strip the capture out from
                     // under the commit that needs it.
-                    const target = pending_editor_navigation_ref.current;
-                    pending_editor_navigation_ref.current = null;
-                    closed_editor_target_ref.current = target;
                     release_open_overlay_row();
                     set_live_uncommitted(false);
                     // An editor closed without a change leaves the session
                     // holding nothing.
                     overlay_mounted_ref.current = false;
                     notify_session_idle();
-                    if (target) {
-                        select_active_display_cell_ref.current(target);
-                        focus_grid_ref.current();
-                    }
                 };
+            }, []);
+            // An Enter or Tab that closes the editor selects the next cell as
+            // it closes, in a layout effect, so the selection renders in the
+            // same task as the key. A selection set in a passive effect
+            // renders in a later task, and a key typed fast enough (a barcode
+            // scanner, a text expander, key repeat) would land first: the
+            // grid would open its next editor on the cell just committed and
+            // write over it.
+            useLayoutEffect(() => () => {
+                const target = pending_editor_navigation_ref.current;
+                pending_editor_navigation_ref.current = null;
+                closed_editor_target_ref.current = target;
+                if (target) {
+                    select_active_display_cell_ref.current(target);
+                    focus_grid_ref.current();
+                }
             }, []);
             const handle_change = (next: GridCell) => {
                 if (save_in_flight_ref.current || edit_admission_is_fenced()) return;
@@ -9664,10 +9673,6 @@ export function GridShell({
                 || overlay_mounted_ref.current
                 || next === undefined
             ) return true;
-            // The editor selected the cell as it unmounted, outside the batch
-            // flushSync rendered. Render it now, so Glide opens the next
-            // editor there.
-            flushSync(() => set_grid_selection(grid_selection_ref.current));
             at = [next[0], next[1]];
         }
         return true;
