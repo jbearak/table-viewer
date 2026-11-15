@@ -5913,7 +5913,11 @@ export function App(): React.JSX.Element {
         const coordinator = replay_coordinator_ref.current;
         if (coordinator === null) return;
         const replay_document = history_document_ref.current;
-        if (!edit_gestures_admitted()) return;
+        if (!edit_gestures_admitted()) {
+            // Says nothing unless the header fence is what holds edits.
+            warn_edit_waits_for_header();
+            return;
+        }
         const initial = peek_history(history_store_ref.current!.snapshot(), direction);
         if (
             initial.kind === 'available'
@@ -6199,7 +6203,7 @@ export function App(): React.JSX.Element {
             barrier?.reason,
         );
         if (warning !== null) host_bridge.postMessage({ type: 'showWarning', message: warning });
-    }, [active_sheet_index, handle_sheet_select, wake_header_drain]);
+    }, [active_sheet_index, handle_sheet_select, wake_header_drain, warn_edit_waits_for_header]);
 
     /**
      * Undo and redo from the keyboard, for the VS Code webview.

@@ -2801,6 +2801,36 @@ describe('Excel first-row header toggle', () => {
         ]));
     });
 
+    it('says why undo and redo do nothing while a header change holds the fence', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(excel_meta(true), {
+            capabilities: EDITABLE,
+        }));
+        await acquire_editing_session(post_message);
+        await click_button('Header Row');
+        expect(header_requests(post_message)).toHaveLength(1);
+        expect(edits_admitted()).toBe(false);
+        post_message.mockClear();
+
+        await dispatch_host_message({ type: 'editCommand', command: 'undo' });
+        await act(async () => {
+            window.dispatchEvent(new KeyboardEvent('keydown', {
+                key: 'z', bubbles: true, cancelable: true, metaKey: true, shiftKey: true,
+            }));
+        });
+
+        const warnings = post_message.mock.calls
+            .map(([message]) => message as { type?: string; message?: string })
+            .filter((message) => message.type === 'showWarning');
+        // Once per fence, like a typed key.
+        expect(warnings).toEqual([{
+            type: 'showWarning',
+            message: 'Wait for the header row change to finish, then edit.',
+        }]);
+        expect(post_message.mock.calls.some(([message]) =>
+            message?.type === 'prepareHistoryReplay')).toBe(false);
+    });
+
     it('lets an append awaiting admission finish before the fence goes up', async () => {
         const { post_message } = await render_app();
         const meta = excel_meta(true);
