@@ -3356,11 +3356,13 @@ export function GridShell({
     // and for any edit an Enter or Tab among them leads on to; they are
     // replayed as the session is granted.
     const overlay_intent_ref = useRef<{ cell: Item; typing: HeldTyping } | null>(null);
-    // Adds the row an editor's Enter or Tab on the last row moves to; see
+    // Adds the row an Enter or Tab on the last row moves to; see
     // `append_holding_keys`.
-    const append_holding_keys_ref = useRef<(navigation: EditorCommitNavigation, display_column: number) => void>(
-        () => undefined,
-    );
+    const append_holding_keys_ref = useRef<(
+        navigation: EditorCommitNavigation,
+        display_column: number,
+        acquire_session?: boolean,
+    ) => void>(() => undefined);
     // Commits the open editor; set while one is mounted.
     const open_editor_commit_ref = useRef<((navigation: EditorCommitNavigation) => void) | null>(null);
     // Keys for the editor that is mounting to apply as it opens.
@@ -6617,6 +6619,9 @@ export function GridShell({
         : body_start + index_row_layout(pending_rows.rowLayout).liveCount + appended_rows(pending_rows).length + 1;
     const may_append_rows_ref = useRef(may_append_rows);
     may_append_rows_ref.current = may_append_rows;
+    // Whether a row could be added once the session is acquired.
+    const may_append_rows_armed_ref = useRef(may_offer_armed_dock);
+    may_append_rows_armed_ref.current = may_offer_armed_dock;
     const append_and_focus_ref = useRef(append_and_focus);
     append_and_focus_ref.current = append_and_focus;
     const allow_rectangular_paste = useCallback((
@@ -9762,21 +9767,34 @@ export function GridShell({
     }, []);
 
     /**
-     * Adds the row an editor's Enter or Tab on the last row moves to. The host
-     * takes a moment to admit it, and the grid takes no edit until it has, so
-     * keys typed meanwhile are held, as they are while a session is acquired,
-     * and open in the new row's cell, as they would in the next cell anywhere
-     * else.
+     * Adds the row an Enter or Tab on the last row moves to, from an editor or
+     * from the grid. The host takes a moment to admit it, and the grid takes
+     * no edit until it has, so keys typed meanwhile are held, as they are
+     * while a session is acquired, and open in the new row's cell, as they
+     * would in the next cell anywhere else. With `acquire_session`, a Tab on
+     * the grid before any session exists, the session is acquired first.
      */
-    const append_holding_keys = useCallback((navigation: EditorCommitNavigation, display_column: number) => {
-        // The editor that added the row, committed: keys after it start the
-        // edits to open in the new row.
+    const append_holding_keys = useCallback((
+        navigation: EditorCommitNavigation,
+        display_column: number,
+        acquire_session = false,
+    ) => {
+        // The Enter or Tab that adds the row, as if it closed an editor: keys
+        // after it start the edits to open in the new row.
         const intent: NonNullable<typeof overlay_intent_ref.current> = {
             cell: grid_selection_ref.current.current?.cell ?? [display_column, 0],
             typing: { edits: [{ initial: undefined, keys: [], commit: navigation }] },
         };
         overlay_intent_ref.current = intent;
-        void append_and_focus_ref.current(display_column).then(async (appended) => {
+        const armed_view = view_identity_ref.current;
+        const appending = acquire_session
+            ? ensure_edit_session().then((granted) => granted
+                && overlay_intent_ref.current === intent
+                && view_identity_ref.current === armed_view
+                && may_append_rows_ref.current
+                && append_and_focus_ref.current(display_column))
+            : append_and_focus_ref.current(display_column);
+        void appending.then(async (appended) => {
             if (overlay_intent_ref.current !== intent) return;
             let editable = appended && editable_cells_ref.current;
             if (appended && append_in_flight_ref.current) {
@@ -9796,7 +9814,7 @@ export function GridShell({
             const cell = grid_selection_ref.current.current?.cell;
             if (cell === undefined || !open_held_edits(cell, typing)) notify_session_idle();
         });
-    }, [notify_session_idle, open_held_edits]);
+    }, [ensure_edit_session, notify_session_idle, open_held_edits]);
     append_holding_keys_ref.current = append_holding_keys;
 
     /**
@@ -11189,10 +11207,13 @@ export function GridShell({
                 })();
             args.cancel();
             args.preventDefault();
+            // Before any session, a Tab past the last cell adds a row too,
+            // once the session it asks for is granted.
+            const acquire_session = !may_append_rows_ref.current && may_append_rows_armed_ref.current;
             if (
                 decision.kind === 'sequential'
                 && (decision.navigation === 'next' || decision.navigation === 'below')
-                && may_append_rows_ref.current
+                && (may_append_rows_ref.current || acquire_session)
             ) {
                 const append_column = sequential_append_target_column(
                     cur,
@@ -11202,7 +11223,7 @@ export function GridShell({
                     target,
                 );
                 if (append_column !== undefined) {
-                    void append_and_focus_ref.current(append_column);
+                    append_holding_keys_ref.current(decision.navigation, append_column, acquire_session);
                     return;
                 }
             }

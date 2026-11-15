@@ -626,19 +626,7 @@ const inline = (ref: string, text: string) => `<c r="${ref}" t="inlineStr"><is><
 // new row, as they would to the next cell anywhere else.
 for (const extension of ['csv', 'xlsx']) {
     test(`keys typed fast after an Enter or Tab that adds a row to a ${extension} start the next edit in the new row`, async () => {
-        if (extension === 'xlsx') {
-            const file = path.join(root, 'basic.xlsx');
-            fs.writeFileSync(file, Buffer.from(build_fixture_xlsx({ sheets: [{
-                name: 'People',
-                body: '<sheetData>'
-                    + `<row r="1">${inline('A1', 'Name')}${inline('B1', 'Age')}${inline('C1', 'City')}</row>`
-                    + `<row r="2">${inline('A2', 'Alice')}<c r="B2"><v>30</v></c>${inline('C2', 'New York')}</row>`
-                    + `<row r="3">${inline('A3', 'Bob')}<c r="B3"><v>25</v></c>${inline('C3', 'London')}</row>`
-                    + `<row r="4">${inline('A4', 'Charlie')}<c r="B4"><v>35</v></c>${inline('C4', 'Paris')}</row>`
-                    + '</sheetData>',
-            }] })));
-            await relaunch_with(file);
-        }
+        if (extension === 'xlsx') await relaunch_with_xlsx();
         const rows = page.locator('tbody tr');
         const last = (await rows.count()) - 1;
         await hold_session();
@@ -678,4 +666,75 @@ test('keys after an Enter that adds a row, typed before the session is granted, 
     await page.keyboard.press('Tab');
     await expect(editor()).toBeHidden();
     await expect(cell(1, 3)).toHaveText('xyz');
+});
+
+/** Replace the fixture with the same table as an xlsx workbook. */
+async function relaunch_with_xlsx(): Promise<void> {
+    const file = path.join(root, 'basic.xlsx');
+    fs.writeFileSync(file, Buffer.from(build_fixture_xlsx({ sheets: [{
+        name: 'People',
+        body: '<sheetData>'
+            + `<row r="1">${inline('A1', 'Name')}${inline('B1', 'Age')}${inline('C1', 'City')}</row>`
+            + `<row r="2">${inline('A2', 'Alice')}<c r="B2"><v>30</v></c>${inline('C2', 'New York')}</row>`
+            + `<row r="3">${inline('A3', 'Bob')}<c r="B3"><v>25</v></c>${inline('C3', 'London')}</row>`
+            + `<row r="4">${inline('A4', 'Charlie')}<c r="B4"><v>35</v></c>${inline('C4', 'Paris')}</row>`
+            + '</sheetData>',
+    }] })));
+    await relaunch_with(file);
+}
+
+// A Tab on the grid past the last cell, with no editor open, adds a row the
+// same way, and keys typed while it is added belong to the new row too.
+for (const extension of ['csv', 'xlsx']) {
+    test(`keys typed while a Tab on the grid adds a row to a ${extension} start an edit in the new row`, async () => {
+        if (extension === 'xlsx') await relaunch_with_xlsx();
+        const rows = page.locator('tbody tr');
+        const last = (await rows.count()) - 1;
+        // The session is held by an edit away from the last row, whose cells
+        // keep their values.
+        await select_cell(1, 0);
+        await page.keyboard.press('Delete');
+        await expect(cell(1, 0)).toHaveText('');
+        await expect(save()).toHaveClass(/has-unsaved/);
+
+        await select_cell(3, last);
+        await press_at_once(['Tab', 'x', 'y', 'z']);
+        await expect(rows).toHaveCount(last + 2);
+        await expect(cell(1, last + 1)).toHaveAttribute('aria-selected', 'true');
+        await expect(editor()).toHaveValue('xyz');
+        await page.keyboard.press('Tab');
+        await expect(editor()).toBeHidden();
+        await expect(cell(1, last + 1)).toHaveText('xyz');
+        await expect(cell(3, last)).toHaveText('Paris');
+    });
+}
+
+test('a Tab on the grid past the last cell adds a row before any session, and keys typed after it go there', async () => {
+    const rows = page.locator('tbody tr');
+    await expect(page.locator('.grid-shell-root')).toHaveAttribute('data-edit-session', 'none');
+    await select_cell(3, 2);
+    await press_at_once(['Tab', 'x', 'y', 'z']);
+    await expect(rows).toHaveCount(4);
+    await expect(cell(1, 3)).toHaveAttribute('aria-selected', 'true');
+    await expect(editor()).toHaveValue('xyz');
+    await page.keyboard.press('Tab');
+    await expect(editor()).toBeHidden();
+    await expect(cell(1, 3)).toHaveText('xyz');
+    await expect(cell(3, 2)).toHaveText('Paris');
+});
+
+test('a Tab on the grid that adds a row before any session lets go of the session once the row is undone', async () => {
+    const rows = page.locator('tbody tr');
+    const root_el = page.locator('.grid-shell-root');
+    await expect(root_el).toHaveAttribute('data-edit-session', 'none');
+    await select_cell(3, 2);
+    await page.keyboard.press('Tab');
+    await expect(rows).toHaveCount(4);
+    await expect(cell(1, 3)).toHaveAttribute('aria-selected', 'true');
+    await expect(editor()).toBeHidden();
+    await expect(save()).toHaveClass(/has-unsaved/);
+    await undo();
+    await expect(rows).toHaveCount(3);
+    await expect_nothing_unsaved();
+    await expect(root_el).toHaveAttribute('data-edit-session', 'none');
 });

@@ -6041,9 +6041,10 @@ describe('GridShell edit-admission lifetime', () => {
             pending_row_store: pending,
             on_append_rows,
         }));
-        // Driven through the in-grid path rather than the dock: the dock
-        // latches busy on its own request, so two overlapping gestures can only
-        // come from somewhere that does not — Tab past the last cell does.
+        // Tab past the last cell, then quick add before the host has answered
+        // it. Neither control repeats its own request while it is in flight:
+        // the dock latches busy, and the grid holds keys typed after the Tab
+        // for the new row.
         const on_selection_change = grid_mock.props!.onGridSelectionChange as
             (selection: unknown) => void;
         await act(async () => on_selection_change({
@@ -6066,7 +6067,9 @@ describe('GridShell edit-admission lifetime', () => {
             cancel: () => {},
             preventDefault: () => {},
         });
-        await act(async () => { press_tab(); press_tab(); });
+        await act(async () => { press_tab(); });
+        await open_append_dock();
+        await quick_add_rows();
         await vi.waitUntil(() => on_append_rows.mock.calls.length === 1);
 
         const first_settle = vi.fn();
