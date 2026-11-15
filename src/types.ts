@@ -3551,6 +3551,16 @@ export type HostMessage =
     /** Correlated only for a mixed source/pending resize that must commit atomically. */
     | { type: 'rowHeightsChanged'; requestId: string; sheetIndex: number; applied: boolean; sourceGeneration: number }
     /**
+     * The answer to a `setColumnVisibility` that carried a `requestId`.
+     *
+     * `applied` says one thing: the durable state holds the requested
+     * visibility because of this request (its write committed). It does not
+     * say the request was still current afterwards, so `false` means nothing
+     * was written. When a delivery of the committed state could be made it is
+     * posted before this answer.
+     */
+    | { type: 'columnVisibilityChanged'; requestId: string; sheetIndex: number; applied: boolean; sourceGeneration: number }
+    /**
      * The host installed a view. This is the *only* answer that describes one, and
      * the only message that can move the view generation, so a consumer that reads
      * `view` is by construction reading something that actually happened.
@@ -3892,6 +3902,11 @@ export type WebviewMessage =
      * nothing on either side reads.
      */
     | { type: 'setRowHeights'; sheetIndex: number; rows: DisplayRowInterval[]; height: number; generation: number; sourceGeneration: number; requestId?: string }
-    | { type: 'setColumnVisibility'; sheetIndex: number; sheetName: string; state: SheetColumnVisibilityState | undefined; sourceGeneration: number; snapshotIdentity: WorkbookSnapshotIdentity }
+    /**
+     * `requestId` asks for an answer (`columnVisibilityChanged`). A sender that
+     * records the change in undo history, or moves history on it, sends one:
+     * the host can decline this write and would otherwise say nothing.
+     */
+    | { type: 'setColumnVisibility'; sheetIndex: number; sheetName: string; state: SheetColumnVisibilityState | undefined; sourceGeneration: number; snapshotIdentity: WorkbookSnapshotIdentity; requestId?: string }
     | { type: 'applyCellHighlights'; sheetIndex: number; sheetName: string; selection: CellHighlightSelection; mutation: CellHighlightMutation; requestId: string; generation: number; sourceGeneration: number; snapshotIdentity: WorkbookSnapshotIdentity }
     | { type: 'clearAllCellHighlights'; requestId: string; generation: number; sourceGeneration: number; snapshotIdentity: WorkbookSnapshotIdentity };

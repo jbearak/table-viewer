@@ -4453,6 +4453,173 @@ describe('CSV edit sessions', () => {
         expect(versioned.get_state(file_path).columnVisibility).toBeUndefined();
     });
 
+    describe('a column visibility write that asks for an answer', () => {
+        const schema = '["Sheet1",1,["h"]]';
+        const hidden = { visibleColumns: [], schema };
+        type Posted = { type?: string; requestId?: string; applied?: boolean };
+        const answers = (panel: { __messages: unknown[] }) => (panel.__messages as Posted[])
+            .filter((message) => message.type === 'columnVisibilityChanged');
+        /** The types posted from `from` on, snapshots and answers only. */
+        const posts_since = (panel: { __messages: unknown[] }, from: number) =>
+            (panel.__messages.slice(from) as Posted[])
+                .map((message) => message.type)
+                .filter((type) => type === 'workbookSnapshot' || type === 'columnVisibilityChanged');
+        const write = (snapshot: WorkbookSnapshot, extra: Record<string, unknown> = {}) => ({
+            type: 'setColumnVisibility',
+            sheetIndex: 0,
+            sheetName: 'Sheet1',
+            sourceGeneration: snapshot.sourceGeneration,
+            snapshotIdentity: snapshot.identity,
+            state: hidden,
+            requestId: 'columns-1',
+            ...extra,
+        });
+
+        it('answers applied after the durable write, behind a delivery of it', async () => {
+            const file_path = '/tmp/visibility-answer-applied.csv';
+            const state = state_store();
+            const panel = open_csv_table(uri(file_path), state.store);
+            await panel.__receive({ type: 'ready' });
+            const from = panel.__messages.length;
+            await panel.__receive(write(latest_snapshot(panel)));
+            await flush_promises();
+
+            expect(state.get_state(file_path).columnVisibility).toEqual([hidden]);
+            expect(answers(panel)).toEqual([expect.objectContaining({
+                requestId: 'columns-1', sheetIndex: 0, applied: true, sourceGeneration: 1,
+            })]);
+            // The delivery, then the answer: the answer never overtakes the state.
+            expect(posts_since(panel, from)).toEqual(['workbookSnapshot', 'columnVisibilityChanged']);
+            expect(latest_snapshot(panel).state.columnVisibility).toEqual([hidden]);
+        });
+
+        it('answers applied for a request identical to the durable state', async () => {
+            const file_path = '/tmp/visibility-answer-identical.csv';
+            const state = state_store({ columnVisibility: [hidden] });
+            const panel = open_csv_table(uri(file_path), state.store);
+            await panel.__receive({ type: 'ready' });
+            await panel.__receive(write(latest_snapshot(panel)));
+            await flush_promises();
+            expect(answers(panel)).toEqual([expect.objectContaining({ applied: true })]);
+        });
+
+        it('posts no answer for a write without a request id', async () => {
+            const file_path = '/tmp/visibility-answer-none.csv';
+            const state = state_store();
+            const panel = open_csv_table(uri(file_path), state.store);
+            await panel.__receive({ type: 'ready' });
+            await panel.__receive(write(latest_snapshot(panel), { requestId: undefined }));
+            await flush_promises();
+            expect(state.get_state(file_path).columnVisibility).toEqual([hidden]);
+            expect(answers(panel)).toEqual([]);
+        });
+
+        it('answers not applied, and writes nothing, for a stale snapshot identity or another sheet name', async () => {
+            const file_path = '/tmp/visibility-answer-stale.csv';
+            const state = state_store();
+            const panel = open_csv_table(uri(file_path), state.store);
+            await panel.__receive({ type: 'ready' });
+            const current = latest_snapshot(panel);
+            const from = panel.__messages.length;
+
+            await panel.__receive(write(current, {
+                requestId: 'stale',
+                snapshotIdentity: { ...current.identity, deliveryId: `${current.identity.deliveryId}-old` },
+            }));
+            await panel.__receive(write(current, { requestId: 'renamed', sheetName: 'Other' }));
+            await flush_promises();
+
+            expect(state.get_state(file_path).columnVisibility).toBeUndefined();
+            expect(answers(panel)).toEqual([
+                expect.objectContaining({ requestId: 'stale', applied: false }),
+                expect.objectContaining({ requestId: 'renamed', applied: false }),
+            ]);
+            // Nothing was written, so nothing is delivered.
+            expect(posts_since(panel, from)).toEqual(['columnVisibilityChanged', 'columnVisibilityChanged']);
+        });
+
+        it('answers not applied when the state store throws', async () => {
+            const file_path = '/tmp/visibility-answer-throws.csv';
+            const versioned = state_store();
+            let fail = false;
+            const store: FileStateStore = {
+                ...versioned.store,
+                async compare_and_set(path, expected, next, validate) {
+                    if (fail) throw new Error('disk full');
+                    return versioned.store.compare_and_set(path, expected, next, validate);
+                },
+            };
+            const panel = open_csv_table(uri(file_path), store);
+            await panel.__receive({ type: 'ready' });
+            fail = true;
+            await panel.__receive(write(latest_snapshot(panel))).catch(() => undefined);
+            await flush_promises();
+            expect(versioned.get_state(file_path).columnVisibility).toBeUndefined();
+            expect(answers(panel)).toEqual([expect.objectContaining({ applied: false })]);
+        });
+
+        it('answers applied, behind a delivery, when a later revision was installed before the handler resumed', async () => {
+            const file_path = '/tmp/visibility-answer-later-revision.csv';
+            const versioned = state_store();
+            const committed = deferred();
+            const resume = deferred();
+            let hold = true;
+            // Gated outside the per-file queue, so the commit has left the queue
+            // and another write of this session can run before the visibility
+            // handler resumes.
+            const queued = with_in_memory_authority_transactions(versioned.store);
+            const store: FileStateStore = {
+                ...queued,
+                async compare_and_set(path, expected, next, validate, basis) {
+                    const result = await queued.compare_and_set(path, expected, next, validate, basis);
+                    if (hold && next.columnVisibility?.[0] && result.type === 'committed') {
+                        hold = false;
+                        committed.resolve();
+                        await resume.promise;
+                    }
+                    return result;
+                },
+            };
+            const panel = vscode_mock.window.createWebviewPanel('tableViewer.editor', 'table');
+            const controller = attach_viewer(
+                panel as unknown as Parameters<typeof attach_viewer>[0],
+                uri(file_path),
+                store,
+                csv_table_profile(),
+                fake_viewer_host,
+            );
+            panel.onDidDispose(() => controller.dispose());
+            await panel.__receive({ type: 'ready' });
+            const ready = latest_snapshot(panel);
+            const from = panel.__messages.length;
+
+            const visibility = panel.__receive(write(ready));
+            await committed.promise;
+            // The same renderer's layout write installs a later revision that
+            // leaves the columns alone. Re-installing the visibility write's
+            // own snapshot would now be refused as stale and deliver nothing.
+            await panel.__receive({
+                type: 'stateChanged',
+                sourceGeneration: ready.sourceGeneration,
+                snapshotIdentity: ready.identity,
+                state: { columnWidths: [{ 0: 77 }] },
+            });
+            await flush_promises();
+            expect(versioned.get_state(file_path).columnWidths).toEqual([{ 0: 77 }]);
+            expect(posts_since(panel, from)).toEqual([]);
+            resume.resolve();
+            await visibility;
+            await flush_promises();
+
+            expect(versioned.get_state(file_path).columnVisibility).toEqual([hidden]);
+            // A delivery carrying the committed columns, then the answer.
+            expect(posts_since(panel, from)).toEqual(['workbookSnapshot', 'columnVisibilityChanged']);
+            expect(answers(panel)).toEqual([expect.objectContaining({ applied: true })]);
+            expect(latest_snapshot(panel).state.columnVisibility).toEqual([hidden]);
+            expect(latest_snapshot(panel).state.columnWidths).toEqual([{ 0: 77 }]);
+        });
+    });
+
     it('rebases a transform-blocked replacement ready and cancels a conflicting old visibility retry', async () => {
         const file_path = '/tmp/ready-visibility-conflict-rebase.csv';
         const versioned = state_store();

@@ -13809,27 +13809,55 @@ export function attach_viewer(
                         && message.snapshotIdentity.authority.revision === expected_authority
                         && message.sourceGeneration === core?.source_generation;
                 };
-                const committed = await update_file_state((current) => {
-                    if (!visibility_is_current() || !source || !core) return current;
-                    const sheet = source.meta().sheets[message.sheetIndex];
-                    if (!sheet || sheet.name !== message.sheetName) return current;
-                    const columnVisibility = [...(current.columnVisibility ?? [])];
-                    columnVisibility[message.sheetIndex] = sanitize_column_visibility_state(
-                        message.state,
-                        sheet.columnCount,
-                        transform_schema_for_sheet(sheet),
-                    );
-                    return { ...current, columnVisibility };
-                }, undefined, visibility_is_current, {
-                    expectedAuthorityRevision: expected_authority,
-                    expectedPhysicalRevision: expected_physical_revision,
-                    expectedProjectionRevision: expected_projection_revision,
-                });
-                if (committed && visibility_is_current()) {
-                    session.update_state_snapshot(
-                        project_state_for_panel(committed),
-                        { deliver: true },
-                    );
+                // Whether the durable state holds the requested visibility
+                // because of this request. Every way of not writing leaves it
+                // false: a request not current when the updater ran, a sheet
+                // that does not match, a refused compare-and-set, a throw.
+                let committed: FileStateSnapshot | undefined;
+                try {
+                    committed = await update_file_state((current) => {
+                        if (!visibility_is_current() || !source || !core) return current;
+                        const sheet = source.meta().sheets[message.sheetIndex];
+                        if (!sheet || sheet.name !== message.sheetName) return current;
+                        const columnVisibility = [...(current.columnVisibility ?? [])];
+                        columnVisibility[message.sheetIndex] = sanitize_column_visibility_state(
+                            message.state,
+                            sheet.columnCount,
+                            transform_schema_for_sheet(sheet),
+                        );
+                        return { ...current, columnVisibility };
+                    }, undefined, visibility_is_current, {
+                        expectedAuthorityRevision: expected_authority,
+                        expectedPhysicalRevision: expected_physical_revision,
+                        expectedProjectionRevision: expected_projection_revision,
+                    });
+                } finally {
+                    // The committed material is already installed
+                    // (`update_file_state`); what the renderer needs is a
+                    // delivery of it. The held material is delivered, whether
+                    // or not this request is still current: a refresh captured
+                    // before the commit can still be in transit with the old
+                    // columns, and this one is posted behind it. It is not
+                    // `update_state_snapshot(committed)`, which delivers
+                    // nothing once another writer has installed a later
+                    // revision; the later revision contains this commit.
+                    if (committed !== undefined && !disposed) session.deliver_current_material();
+                    // After the delivery, so the answer never overtakes the
+                    // state it reports. Only a receiver that is gone gets none.
+                    if (
+                        message.requestId !== undefined
+                        && !disposed
+                        && session.current_receiver_epoch === receiver_epoch
+                    ) {
+                        void post_to_receiver({
+                            type: 'columnVisibilityChanged',
+                            requestId: message.requestId,
+                            sheetIndex: message.sheetIndex,
+                            applied: committed !== undefined,
+                            sourceGeneration: core?.source_generation
+                                ?? message.sourceGeneration,
+                        }, receiver_epoch);
+                    }
                 }
                 return;
             }

@@ -9,6 +9,7 @@
 import type { HistoryDirection } from './history-cell-state-model';
 import type { ReplayRefusalReason } from './history-replay-request-model';
 import type { HeaderWait } from './history-header-rebase';
+import type { ViewSkipReason } from './view-history-model';
 import {
     STRUCTURAL_SAVE_BARRIER_MESSAGE,
     type HistoryBarrier,
@@ -121,4 +122,93 @@ export function header_wait_warning(
     const then = wait.from > 0 ? `row ${wait.from} was the header row` : 'the header row was off';
     return `${sheet}Can't ${direction} this change while ${now}: it was made when ${then}. `
         + `${remedy} to ${direction} it.`;
+}
+
+// ---- View steps (a sort, a filter, hidden rows, hidden columns) ----
+
+/** A view gesture that cannot start while another one of this window is in flight. */
+export const VIEW_GESTURE_WAIT_MESSAGE = 'Wait for the table view to finish updating.';
+
+/** A view gesture or replay whose open cell editor would not commit. */
+export const FOLD_REFUSED_MESSAGE = 'Finish or cancel the cell edit first.';
+
+/** Redo, after committing the open cell editor cleared what there was to redo. */
+export const REDO_REPLACED_BY_FOLD_MESSAGE =
+    'Nothing to redo: the cell edit you just finished replaced it.';
+
+/** A column hide or show the host did not write. */
+export const COLUMN_WRITE_REFUSED_MESSAGE =
+    'Could not change the columns because the file was refreshing. Try again.';
+
+/** Why a view replay did not start, when the reason clears by itself. */
+export type ViewReplayWait =
+    | 'applying'
+    | 'updating'
+    | 'refreshing'
+    | 'finishing'
+    | 'preview';
+
+/**
+ * What to say about a view replay that did not run and left its entry where
+ * it was. Each of these clears without the person doing anything but pressing
+ * again, except `preview`, where a sort or filter cannot be installed at all.
+ */
+export function view_replay_wait_warning(wait: ViewReplayWait, direction: HistoryDirection): string {
+    switch (wait) {
+        case 'applying':
+            return `${verb(direction)} did not run because another change is still being applied. Try again.`;
+        case 'updating':
+            return `${verb(direction)} did not run because the table view is still updating. Try again.`;
+        case 'refreshing':
+            return `${verb(direction)} did not run because the file was refreshing. Try again.`;
+        case 'finishing':
+            return `${verb(direction)} did not run because editing is still finishing. Try again.`;
+        case 'preview':
+            return `${verb(direction)} is unavailable in preview.`;
+    }
+}
+
+/** A view replay the host, or a rule of this window, refused. The entry stays. */
+export function view_replay_refusal_warning(
+    direction: HistoryDirection,
+    label: string,
+    reason: string,
+): string {
+    return `Can't ${direction} “${label}”: ${reason}`;
+}
+
+const VIEW_SKIP_TEXT: Readonly<Record<ViewSkipReason, string>> = {
+    'columns-changed': 'the columns of this worksheet changed since then',
+    'rows-above-header': 'rows above the header row stay hidden',
+    'header-row': "the header row can't be hidden",
+    'rows-gone': 'rows that are no longer in the worksheet were left out',
+    'too-many-hidden': 'too many rows would be hidden',
+};
+
+/**
+ * What to say when part of a view step, or all of it, could not be applied
+ * and the step moved on all the same. `whole` is true when nothing of the
+ * step was applied. `sheet_name` is given when the workbook has more than one
+ * worksheet.
+ */
+export function view_skip_warning(
+    direction: HistoryDirection,
+    label: string,
+    skipped: readonly ViewSkipReason[],
+    whole: boolean,
+    sheet_name?: string,
+): string {
+    const sheet = sheet_name === undefined ? '' : `Sheet “${sheet_name}”: `;
+    const reasons = skipped.map((reason) => VIEW_SKIP_TEXT[reason]).join('; ');
+    return `${sheet}${verb(direction)} skipped ${whole ? '' : 'part of '}“${label}”: ${reasons}.`;
+}
+
+/** The host installed something other than what the replay asked for. */
+export function view_partly_applied_warning(direction: HistoryDirection, label: string): string {
+    return `${verb(direction)} of “${label}” was only partly applied.`;
+}
+
+/** A view replay landed after history was cleared or cut off behind a barrier. */
+export function view_replay_dropped_warning(direction: HistoryDirection): string {
+    return `The view change was ${replayed_verb(direction)}, but it is no longer in history.`;
 }
