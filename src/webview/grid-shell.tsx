@@ -3320,11 +3320,28 @@ export function GridShell({
         on_edit_session_idle,
         on_request_edit_session,
     ]);
+    /**
+     * Settled by the commit that renders App's answer to a row admission,
+     * with whether the grid takes edits again. The admission resolves before
+     * React has rendered that answer, so the grid still refuses every edit.
+     */
+    const append_answered_ref = useRef<PendingSignal<boolean> | null>(null);
+    const append_in_flight_ref = useRef(append_in_flight);
+    useLayoutEffect(() => {
+        append_in_flight_ref.current = append_in_flight;
+        if (append_in_flight) return;
+        const answered = append_answered_ref.current;
+        append_answered_ref.current = null;
+        answered?.settle(editable_cells);
+    }, [append_in_flight, editable_cells]);
     useEffect(() => () => {
         // A gesture still waiting when this grid goes away is told no.
         const committed = editable_commit_ref.current;
         editable_commit_ref.current = null;
         committed?.settle(false);
+        const answered = append_answered_ref.current;
+        append_answered_ref.current = null;
+        answered?.settle(false);
     }, []);
     // Gestures waiting on the session. Counted so the session they are about
     // to use is not released as empty in the moment before they run.
@@ -3339,6 +3356,11 @@ export function GridShell({
     // and for any edit an Enter or Tab among them leads on to; they are
     // replayed as the session is granted.
     const overlay_intent_ref = useRef<{ cell: Item; typing: HeldTyping } | null>(null);
+    // Adds the row an editor's Enter or Tab on the last row moves to; see
+    // `append_holding_keys`.
+    const append_holding_keys_ref = useRef<(navigation: EditorCommitNavigation, display_column: number) => void>(
+        () => undefined,
+    );
     // Commits the open editor; set while one is mounted.
     const open_editor_commit_ref = useRef<((navigation: EditorCommitNavigation) => void) | null>(null);
     // Keys for the editor that is mounting to apply as it opens.
@@ -9564,7 +9586,7 @@ export function GridShell({
                     )
                     : undefined;
                 if (append_column !== undefined) {
-                    void append_and_focus_ref.current(append_column);
+                    append_holding_keys_ref.current(navigation, append_column);
                     return;
                 }
                 pending_editor_navigation_ref.current = [target[0], target[1]];
@@ -9715,8 +9737,17 @@ export function GridShell({
             if (navigation === undefined || commit === null) return true;
             closed_editor_target_ref.current = null;
             flushSync(() => commit(navigation));
-            // A commit that appended a row moves the selection later, and one
-            // the grid refused leaves the editor open: the rest is not
+            // A commit that appended a row holds the keys typed while the row
+            // is added, for its cell. The rest were typed before them.
+            const appending = overlay_intent_ref.current;
+            if (appending !== null) {
+                appending.typing = {
+                    edits: [...appending.typing.edits, ...typing.edits.slice(index + 1)],
+                    dropping: typing.dropping,
+                };
+                return true;
+            }
+            // One the grid refused leaves the editor open: the rest is not
             // replayed.
             const next = grid_selection_ref.current.current?.cell;
             if (
@@ -9729,6 +9760,44 @@ export function GridShell({
         }
         return true;
     }, []);
+
+    /**
+     * Adds the row an editor's Enter or Tab on the last row moves to. The host
+     * takes a moment to admit it, and the grid takes no edit until it has, so
+     * keys typed meanwhile are held, as they are while a session is acquired,
+     * and open in the new row's cell, as they would in the next cell anywhere
+     * else.
+     */
+    const append_holding_keys = useCallback((navigation: EditorCommitNavigation, display_column: number) => {
+        // The editor that added the row, committed: keys after it start the
+        // edits to open in the new row.
+        const intent: NonNullable<typeof overlay_intent_ref.current> = {
+            cell: grid_selection_ref.current.current?.cell ?? [display_column, 0],
+            typing: { edits: [{ initial: undefined, keys: [], commit: navigation }] },
+        };
+        overlay_intent_ref.current = intent;
+        void append_and_focus_ref.current(display_column).then(async (appended) => {
+            if (overlay_intent_ref.current !== intent) return;
+            let editable = appended && editable_cells_ref.current;
+            if (appended && append_in_flight_ref.current) {
+                const answered = append_answered_ref.current ?? pending_signal<boolean>();
+                append_answered_ref.current = answered;
+                editable = await answered.settled;
+            }
+            if (overlay_intent_ref.current !== intent) return;
+            overlay_intent_ref.current = null;
+            const typing: HeldTyping = { ...intent.typing, edits: intent.typing.edits.slice(1) };
+            if (!editable || typing.edits.length === 0) {
+                notify_session_idle();
+                return;
+            }
+            // Glide opens an editor at the selection it has rendered.
+            flushSync(() => set_grid_selection(grid_selection_ref.current));
+            const cell = grid_selection_ref.current.current?.cell;
+            if (cell === undefined || !open_held_edits(cell, typing)) notify_session_idle();
+        });
+    }, [notify_session_idle, open_held_edits]);
+    append_holding_keys_ref.current = append_holding_keys;
 
     /**
      * Glide asks before it opens an editor. Under a session it simply opens.

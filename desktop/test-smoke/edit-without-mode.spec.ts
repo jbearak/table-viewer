@@ -606,3 +606,76 @@ test('a barcode scan under a session fills one cell per scan, each ending with E
     await expect(cell(2, 1)).toHaveText('67890');
     await expect(cell(2, 2)).toHaveText('35');
 });
+
+/** Open `file` in a fresh app, in place of the fixture. */
+async function relaunch_with(file: string): Promise<void> {
+    await app!.close();
+    app = await launch_app(isolated_user_data('tv-edit-without-mode-data-'), [file]);
+    await expect.poll(
+        () => app!.windows().filter((candidate) => candidate.url().startsWith(VIEWER_URL_PREFIX)).length,
+        { timeout: 30_000 },
+    ).toBe(1);
+    page = app.windows().find((candidate) => candidate.url().startsWith(VIEWER_URL_PREFIX))!;
+    await page.locator('#glide-cell-1-0').waitFor({ state: 'attached' });
+}
+
+const inline = (ref: string, text: string) => `<c r="${ref}" t="inlineStr"><is><t>${text}</t></is></c>`;
+
+// An Enter on the last row, or a Tab on its last cell, adds a row, and the
+// host takes a moment to admit it. Keys typed in that moment belong to the
+// new row, as they would to the next cell anywhere else.
+for (const extension of ['csv', 'xlsx']) {
+    test(`keys typed fast after an Enter or Tab that adds a row to a ${extension} start the next edit in the new row`, async () => {
+        if (extension === 'xlsx') {
+            const file = path.join(root, 'basic.xlsx');
+            fs.writeFileSync(file, Buffer.from(build_fixture_xlsx({ sheets: [{
+                name: 'People',
+                body: '<sheetData>'
+                    + `<row r="1">${inline('A1', 'Name')}${inline('B1', 'Age')}${inline('C1', 'City')}</row>`
+                    + `<row r="2">${inline('A2', 'Alice')}<c r="B2"><v>30</v></c>${inline('C2', 'New York')}</row>`
+                    + `<row r="3">${inline('A3', 'Bob')}<c r="B3"><v>25</v></c>${inline('C3', 'London')}</row>`
+                    + `<row r="4">${inline('A4', 'Charlie')}<c r="B4"><v>35</v></c>${inline('C4', 'Paris')}</row>`
+                    + '</sheetData>',
+            }] })));
+            await relaunch_with(file);
+        }
+        const rows = page.locator('tbody tr');
+        const last = (await rows.count()) - 1;
+        await hold_session();
+
+        await select_cell(1, last);
+        await press_at_once(['a', 'b', 'Enter', 'x', 'y', 'z']);
+        await expect(rows).toHaveCount(last + 2);
+        await expect(cell(1, last + 1)).toHaveAttribute('aria-selected', 'true');
+        await expect(editor()).toHaveValue('xyz');
+        await expect(cell(1, last)).toHaveText('ab');
+        await page.keyboard.press('Tab');
+        await expect(editor()).toBeHidden();
+        await expect(cell(1, last + 1)).toHaveText('xyz');
+
+        // Tab on the new row's last cell adds another and moves to its first.
+        await page.keyboard.press('Tab');
+        await expect(cell(3, last + 1)).toHaveAttribute('aria-selected', 'true');
+        await press_at_once(['c', 'Tab', 'q', 'r']);
+        await expect(rows).toHaveCount(last + 3);
+        await expect(cell(1, last + 2)).toHaveAttribute('aria-selected', 'true');
+        await expect(editor()).toHaveValue('qr');
+        await expect(cell(3, last + 1)).toHaveText('c');
+        await page.keyboard.press('Tab');
+        await expect(editor()).toBeHidden();
+        await expect(cell(1, last + 2)).toHaveText('qr');
+    });
+}
+
+test('keys after an Enter that adds a row, typed before the session is granted, start the next edit in the new row', async () => {
+    const rows = page.locator('tbody tr');
+    await select_cell(1, 2);
+    await press_at_once(['a', 'b', 'Enter', 'x', 'y', 'z']);
+    await expect(rows).toHaveCount(4);
+    await expect(cell(1, 3)).toHaveAttribute('aria-selected', 'true');
+    await expect(editor()).toHaveValue('xyz');
+    await expect(cell(1, 2)).toHaveText('ab');
+    await page.keyboard.press('Tab');
+    await expect(editor()).toBeHidden();
+    await expect(cell(1, 3)).toHaveText('xyz');
+});
