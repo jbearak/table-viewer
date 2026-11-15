@@ -459,3 +459,152 @@ describe('commit_staged_transaction', () => {
         expect(history.snapshot().redoStack).toHaveLength(0);
     });
 });
+
+describe('create_history_store, body starts', () => {
+    const OTHER: WorksheetTarget = { sheetIndex: 1, sheetName: 'Notes', worksheetId: 'rId2' };
+    const other_cell = (): HistoryChange => {
+        const change = cell_change(4, 0, 'other');
+        if (change.kind !== 'cell') throw new Error('not a cell');
+        return { kind: 'cell', delta: { ...change.delta, worksheet: OTHER } };
+    };
+
+    it('stamps each entry with where its worksheets\' bodies started, omitting 0', () => {
+        let starts: Record<string, number> = { rId1: 2, rId2: 0 };
+        const store = create_history_store(undefined, {
+            body_start: (worksheet) => starts[worksheet.worksheetId ?? ''] ?? 0,
+        });
+        store.stage_record({ label: 'Both', changes: [cell_change(3, 0, 'a'), other_cell()] }).commit();
+        store.stage_record({ label: 'Other', changes: [other_cell()] }).commit();
+        starts = { rId1: 0, rId2: 1 };
+        store.stage_record({ label: 'Later', changes: [cell_change(5, 0, 'b'), other_cell()] }).commit();
+
+        const [both, other, later] = store.snapshot().undoStack;
+        expect(both.bodyStarts).toEqual({ 'id:rId1': 2 });
+        // Header off everywhere the entry touches: no stamp at all.
+        expect(other.bodyStarts).toBeUndefined();
+        expect(later.bodyStarts).toEqual({ 'id:rId2': 1 });
+    });
+
+    it('records no stamp without a body-start reader', () => {
+        const store = create_history_store();
+        store.stage_record(typed('Edit')).commit();
+        expect(store.snapshot().undoStack[0].bodyStarts).toBeUndefined();
+    });
+
+    it('asks once per worksheet, from the action it owns, after the bounded walk', () => {
+        const asked: string[] = [];
+        const store = create_history_store(undefined, {
+            body_start: (worksheet) => { asked.push(worksheet.worksheetId ?? ''); return 3; },
+        });
+        let walks = 0;
+        const source = {
+            label: 'Streamed',
+            changes: {
+                *[Symbol.iterator]() {
+                    walks += 1;
+                    yield cell_change(0, 0, 'a');
+                    yield cell_change(1, 0, 'b');
+                    yield other_cell();
+                },
+            },
+        };
+        const staged = store.stage_record(source);
+        expect(staged.outcome.kind).toBe('recorded');
+        expect(walks).toBe(1);
+        expect(asked).toEqual(['rId1', 'rId2']);
+        staged.commit();
+        expect(store.snapshot().undoStack[0].bodyStarts).toEqual({ 'id:rId1': 3, 'id:rId2': 3 });
+
+        // A stream too large to keep is refused where the bound is passed, and
+        // nothing is asked about an action history does not own.
+        asked.length = 0;
+        let yielded = 0;
+        const refused = store.stage_record({
+            label: 'Too large',
+            changes: {
+                *[Symbol.iterator]() {
+                    while (true) {
+                        if (yielded > 3) throw new Error('recorder read past the bound');
+                        yielded += 1;
+                        yield cell_change(yielded, 0, 'x');
+                    }
+                },
+            },
+        }, TINY);
+        expect(refused.outcome.kind).toBe('refused');
+        expect(asked).toEqual([]);
+    });
+
+    it('keeps the stamp when the entry moves between the stacks, and when a redo is adopted', () => {
+        const store = create_history_store(undefined, { body_start: () => 2 });
+        store.stage_record(typed('Edit')).commit();
+        const recorded = store.snapshot().undoStack[0];
+        store.stage_move('undo', recorded).commit();
+        const undone = store.snapshot().redoStack[0];
+        expect(undone.bodyStarts).toEqual({ 'id:rId1': 2 });
+
+        // A redo in flight when a fresh recording clears the redo stack lands
+        // afterwards and is adopted, as the entry it was.
+        store.stage_record(typed('Newer')).commit();
+        expect(store.snapshot().redoStack).toEqual([]);
+        const adopted = store.stage_move('redo', undone);
+        expect(adopted.outcome.kind).toBe('moved');
+        adopted.commit();
+        const top = store.snapshot().undoStack.at(-1)!;
+        expect(top.id).toBe(recorded.id);
+        expect(top.bodyStarts).toEqual({ 'id:rId1': 2 });
+        expect(top.action).toBe(recorded.action);
+    });
+
+    it('keeps the stamp when a save rewrites the entry', () => {
+        const store = create_history_store(undefined, { body_start: () => 2 });
+        store.stage_record(typed('Edit')).commit();
+        expect(store.rebase_saved_cells([{
+            worksheet: SHEET, sourceRow: 0, sourceColumn: 0, value: history_value('typed'),
+        }])).toEqual({ kind: 'rekeyed', changed: true });
+        expect(store.snapshot().undoStack[0].bodyStarts).toEqual({ 'id:rId1': 2 });
+
+        const rows = create_history_store(undefined, { body_start: () => 2 });
+        rows.stage_record({
+            label: 'Append row',
+            changes: [{
+                kind: 'rowAppend',
+                delta: {
+                    worksheet: SHEET,
+                    pendingRowId: 'pending-a',
+                    before: null,
+                    after: {
+                        id: 'pending-a',
+                        cells: { 0: { value: 'saved' } },
+                        formatTemplateId: 'plain',
+                        createdOrder: 1,
+                    },
+                    beforeIndex: null,
+                    afterIndex: 0,
+                    formatTemplates: [{ id: 'plain', format: { kind: 'none' } }],
+                },
+            }],
+        }).commit();
+        const removal: PendingTailRemoval = {
+            appendHistoryId: 'pending-a',
+            sourceRow: 8,
+            savedFingerprint: 'fingerprint',
+            savedRow: { cells: { 0: { value: 'saved' } }, format: { kind: 'none' } },
+        };
+        expect(rows.rekey_saved_rows([{
+            worksheet: SHEET,
+            pendingRowId: 'pending-a',
+            sourceRow: removal.sourceRow,
+            savedFingerprint: removal.savedFingerprint,
+            savedRow: removal.savedRow,
+        }])).toEqual({ kind: 'rekeyed', changed: true });
+        expect(rows.snapshot().undoStack[0].action.changes[0].kind).toBe('tailRemoval');
+        expect(rows.snapshot().undoStack[0].bodyStarts).toEqual({ 'id:rId1': 2 });
+    });
+
+    it('has no barrier a Header Row change installs', () => {
+        const store = create_history_store();
+        expect(Object.keys(store).filter((name) => name.includes('barrier')))
+            .toEqual(['install_structural_save_barrier']);
+    });
+});

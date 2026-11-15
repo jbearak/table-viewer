@@ -117,6 +117,15 @@ export interface ReplayCoordinatorHost extends ReplayRequestSources {
      * retry, and never acquires a session on a promise it cannot keep.
      */
     readonly ensure_session: () => Promise<boolean>;
+    /**
+     * The entry as it reads under the current Header Row, or undefined when it
+     * cannot be replayed under it (see `entry_for_current_header`).
+     *
+     * The answer is for building the request and the plan only. History moves
+     * the STORED entry: a re-expressed copy still carries the body start the
+     * entry was recorded at, so adopting it would re-express it twice.
+     */
+    readonly entry_for_replay?: (entry: HistoryEntry) => HistoryEntry | undefined;
     readonly post: (
         message:
             | { readonly type: 'prepareHistoryReplay'; readonly request: PrepareHistoryReplayRequest }
@@ -170,7 +179,10 @@ export interface HistoryReplayCoordinator {
 /** What a started replay is waiting for. */
 interface RunningReplay {
     readonly direction: HistoryDirection;
+    /** The stored entry: what history moves when the replay lands. */
     readonly entry: HistoryEntry;
+    /** The same entry as it reads under the current Header Row: what is planned. */
+    readonly replayEntry: HistoryEntry;
     readonly requestId: string;
     readonly replayId: string;
     readonly settle: (outcome: ReplayOutcome) => void;
@@ -235,6 +247,9 @@ export function create_history_replay_coordinator(
 ): HistoryReplayCoordinator {
     let active: ActiveReplay | undefined;
 
+    const entry_for_replay = (entry: HistoryEntry): HistoryEntry | undefined =>
+        host.entry_for_replay === undefined ? entry : host.entry_for_replay(entry);
+
     /** The slot's occupant, but only once it is actually replaying. */
     const running_replay = (): (RunningReplay & { kind: 'running' }) | undefined =>
         active?.kind === 'running' ? active : undefined;
@@ -294,6 +309,13 @@ export function create_history_replay_coordinator(
             // entry actually replayed is not the one this decision was made about.
             // Acquiring a session for a highlight-only undo would put the user into
             // edit mode for a gesture that was never a content edit.
+            // Before acquiring, for the same reason: an entry that cannot be
+            // replayed under the current Header Row must not put the user into
+            // an editing session on its way to saying so.
+            if (entry_for_replay(before_acquiring.entry) === undefined) {
+                resolve({ kind: 'refused', reason: 'header-row' });
+                return;
+            }
             const needs_session = action_requires_edit_session(before_acquiring.entry.action);
             const held: AcquiringReplay = { kind: 'acquiring', direction, settle: resolve };
             active = held;
@@ -337,7 +359,12 @@ export function create_history_replay_coordinator(
                 // We only await here when the original entry needed a session, so
                 // the session now held is sufficient for any replacement entry
                 // (and harmless for a highlight-only one).
-                const request = build_prepare_request(peek.entry, direction, host);
+                const replay_entry = entry_for_replay(peek.entry);
+                if (replay_entry === undefined) {
+                    release(held, { kind: 'refused', reason: 'header-row' });
+                    return;
+                }
+                const request = build_prepare_request(replay_entry, direction, host);
                 if (request === undefined) {
                     // A cell the renderer cannot see right now. Refusing beats
                     // sending a request the host would have to answer
@@ -352,6 +379,7 @@ export function create_history_replay_coordinator(
                     kind: 'running',
                     direction,
                     entry: peek.entry,
+                    replayEntry: replay_entry,
                     requestId: request.requestId,
                     replayId: request.replayId,
                     highlightCount: request.highlights.length,
@@ -386,7 +414,7 @@ export function create_history_replay_coordinator(
             // never the live store: planning against a state the host never
             // verified would authorize a write it never checked.
             const result: ReplayPlanResult = plan_history_replay(
-                replay.entry.action,
+                replay.replayEntry.action,
                 replay.direction,
                 read_state_from_prepared_replay(prepared),
             );

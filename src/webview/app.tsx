@@ -222,7 +222,8 @@ import {
     type AcceptedReplay,
     type HistoryReplayCoordinator,
 } from './history-replay-coordinator';
-import { history_refusal_warning, replayed_verb } from './history-command-model';
+import { header_wait_warning, history_refusal_warning, replayed_verb } from './history-command-model';
+import { entry_for_current_header, type HeaderSheet, type HeaderWait } from './history-header-rebase';
 import {
     history_menu_projection,
     history_menu_projections_equal,
@@ -242,7 +243,6 @@ import {
     type HistoryDirection,
 } from './history-cell-state-model';
 import {
-    history_needs_header_change_barrier,
     peek_history,
     retained_pending_row_authorities,
     is_structural_history_change,
@@ -772,6 +772,23 @@ function same_json(left: unknown, right: unknown): boolean {
     return JSON.stringify(canonical(left)) === JSON.stringify(canonical(right));
 }
 
+/** A worksheet's body start and size as `meta` has them, for history. */
+function history_header_sheet(
+    meta: WorkbookMeta | null,
+    worksheet: WorksheetTarget,
+): HeaderSheet | undefined {
+    const sheets = meta?.sheets;
+    if (sheets === undefined) return undefined;
+    const index = worksheet_target_index(sheets, worksheet);
+    const sheet = index === undefined ? undefined : sheets[index];
+    return sheet === undefined
+        ? undefined
+        : {
+            bodyStart: header_body_start(sheet.excelFirstRowHeader),
+            sourceRowCount: sheet.sourceRowCount,
+        };
+}
+
 export function App(): React.JSX.Element {
     const [meta, set_meta] = useState<WorkbookMeta | null>(null);
     const [generation, set_generation] = useState(0);
@@ -1204,8 +1221,32 @@ export function App(): React.JSX.Element {
      */
     const history_store_ref = useRef<HistoryStore | null>(null);
     if (history_store_ref.current === null) {
-        history_store_ref.current = create_history_store();
+        history_store_ref.current = create_history_store(undefined, {
+            // Read when a gesture is recorded, never during this render.
+            body_start: (worksheet) => history_header_sheet(meta_ref.current, worksheet)?.bodyStart ?? 0,
+        });
     }
+    /**
+     * Why the entry the last replay asked about cannot be replayed under the
+     * current Header Row, for the warning. Written by `entry_for_replay`.
+     */
+    const header_wait_ref = useRef<HeaderWait | null>(null);
+    /**
+     * The entry as it reads under the current Header Row, for building a
+     * replay; undefined, with the reason kept for the warning, when it has no
+     * form under it. History always moves the stored entry.
+     */
+    const entry_for_replay = (entry: HistoryEntry): HistoryEntry | undefined => {
+        const result = entry_for_current_header(
+            entry,
+            (worksheet) => history_header_sheet(meta_ref.current, worksheet),
+        );
+        if (result.ok) return result.entry;
+        header_wait_ref.current = result;
+        return undefined;
+    };
+    const entry_for_replay_ref = useRef(entry_for_replay);
+    entry_for_replay_ref.current = entry_for_replay;
 
     /**
      * The layout-conflict notice's "Discard row and column changes on <sheet>": drop the
@@ -1359,6 +1400,7 @@ export function App(): React.JSX.Element {
         replay_coordinator_ref.current = create_history_replay_coordinator({
             history: () => history_store_ref.current!.snapshot(),
             ensure_session: () => ensure_replay_session_ref.current?.() ?? Promise.resolve(false),
+            entry_for_replay: (entry) => entry_for_replay_ref.current(entry),
             read_overlay: (worksheet, source_row, source_column) => {
                 // Resolved through the live workbook rather than the target's own
                 // index, because history is workbook-wide: an action recorded
@@ -3613,8 +3655,10 @@ export function App(): React.JSX.Element {
                     });
                     // A Header Row change carries what the session holds for its
                     // worksheet (the host moved the Pending Changes in the same
-                    // write; the reconcile below adopts them). Two webview-only
-                    // holdings follow here, whatever the snapshot's reason:
+                    // write; the reconcile below adopts them). Composer drafts,
+                    // held only here, follow whatever the snapshot's reason.
+                    // History needs nothing: an entry is re-expressed for the
+                    // current Header Row when it is replayed.
                     for (const index of header_changed) {
                         const sheet = snapshot.meta.sheets[index]!;
                         const previous = previous_sheet_for(sheet, index)!;
@@ -3631,24 +3675,6 @@ export function App(): React.JSX.Element {
                                 ...draft,
                                 schema: transform_schema_for_sheet(sheet),
                             });
-                        }
-                        // History authored at the old body start can't replay at
-                        // the new one when it records row structure, or cells on
-                        // the rows that crossed it.
-                        const from = header_body_start(previous.excelFirstRowHeader);
-                        const to = header_body_start(sheet.excelFirstRowHeader);
-                        if (from !== to && history_needs_header_change_barrier(
-                            history_store_ref.current!.snapshot(),
-                            {
-                                sheetIndex: index,
-                                sheetName: sheet.name,
-                                ...(sheet.worksheetId === undefined
-                                    ? {}
-                                    : { worksheetId: sheet.worksheetId }),
-                            },
-                            { start: Math.max(0, Math.min(from, to) - 1), end: Math.max(from, to) },
-                        )) {
-                            history_store_ref.current!.install_header_change_barrier();
                         }
                     }
                     // Capture authoritative edits before generation/source updates
@@ -5918,7 +5944,28 @@ export function App(): React.JSX.Element {
             warn_edit_waits_for_header();
             return;
         }
+        const warn_header_wait = () => {
+            const wait = header_wait_ref.current;
+            if (wait === null) return;
+            // Replay refuses before it would switch to the change's worksheet,
+            // so in a workbook with several the message says which one.
+            const sheets = meta_ref.current?.sheets ?? [];
+            const index = worksheet_target_index(sheets, wait.worksheet);
+            const sheet_name = sheets.length > 1
+                ? (index === undefined ? undefined : sheets[index]?.name) ?? wait.worksheet.sheetName
+                : undefined;
+            host_bridge.postMessage({
+                type: 'showWarning',
+                message: header_wait_warning(wait, direction, sheet_name),
+            });
+        };
         const initial = peek_history(history_store_ref.current!.snapshot(), direction);
+        // Before a session is acquired for it: a change that has no form under
+        // the current Header Row says so and stays where it is.
+        if (initial.kind === 'available' && entry_for_replay_ref.current(initial.entry) === undefined) {
+            warn_header_wait();
+            return;
+        }
         if (
             initial.kind === 'available'
             && initial.entry.action.changes.some((change) =>
@@ -5938,7 +5985,7 @@ export function App(): React.JSX.Element {
                 if (!replay_session_ready) {
                     host_bridge.postMessage({
                         type: 'showWarning',
-                        message: 'Undo is unavailable because editing could not be started.',
+                        message: `${direction === 'undo' ? 'Undo' : 'Redo'} is unavailable because editing could not be started.`,
                     });
                     return;
                 }
@@ -5948,6 +5995,13 @@ export function App(): React.JSX.Element {
                 // still structural.
                 const current = peek_history(history_store_ref.current!.snapshot(), direction);
                 if (current.kind !== 'available') return;
+                // Planned from the entry as it reads under the current Header
+                // Row; history moves the stored entry, `current.entry`.
+                const replay_entry = entry_for_replay_ref.current(current.entry);
+                if (replay_entry === undefined) {
+                    warn_header_wait();
+                    return;
+                }
                 const sheets = meta_ref.current?.sheets;
                 const session_id = csv_edit_session_id_ref.current;
                 if (sheets === undefined || session_id === undefined) return;
@@ -5955,7 +6009,7 @@ export function App(): React.JSX.Element {
                     worksheet: WorksheetTarget;
                     ids: string[];
                 }>();
-                for (const change of current.entry.action.changes) {
+                for (const change of replay_entry.action.changes) {
                     if (
                         change.kind !== 'rowAppend'
                         || change.delta.restoredFromSavedRemoval !== true
@@ -6017,7 +6071,7 @@ export function App(): React.JSX.Element {
                     );
                 }
                 let planned = plan_pending_row_history_replay(
-                    current.entry.action,
+                    replay_entry.action,
                     direction,
                     (worksheet) => {
                         const sheet_index = worksheet_target_index(sheets, worksheet);
@@ -6163,6 +6217,7 @@ export function App(): React.JSX.Element {
                     const outcome = await coordinator.begin(direction);
                     if (history_document_ref.current !== replay_document) return;
                     if (outcome.kind === 'refused') {
+                        if (outcome.reason === 'header-row') warn_header_wait();
                         const warning = history_refusal_warning(
                             outcome.reason,
                             direction,
@@ -6196,6 +6251,7 @@ export function App(): React.JSX.Element {
         wake_header_drain();
         if (history_document_ref.current !== replay_document) return;
         if (outcome.kind !== 'refused') return;
+        if (outcome.reason === 'header-row') warn_header_wait();
         const warning = history_refusal_warning(
             outcome.reason,
             direction,

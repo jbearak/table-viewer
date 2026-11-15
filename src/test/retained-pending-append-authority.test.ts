@@ -100,4 +100,46 @@ describe('RetainedPendingAppendAuthorityStore', () => {
         expect(store.get('target-b', 'row-b')).toBeUndefined();
         expect(store.get('target-c', 'row-c')).toBeDefined();
     });
+
+    it('moves one worksheet\'s authorities to a new schema fingerprint, in place', () => {
+        const store = new RetainedPendingAppendAuthorityStore(64 * 1024);
+        const formatTemplate = Object.freeze({ id: 'format', format: Object.freeze({ kind: 'none' as const }) });
+        const basis = (schemaFingerprint: string) => ({
+            sourceRowCount: 3,
+            provisionalStartRow: 3,
+            provisionalRowCount: 1,
+            columnCount: 2,
+            schemaFingerprint,
+        });
+        const remember = (target: string, row: string, fingerprint?: string) => store.remember(target, row, {
+            formatTemplate,
+            formatTemplateId: formatTemplate.id,
+            sourceGeneration: 1,
+            ...(fingerprint === undefined ? {} : { appendBasis: basis(fingerprint) }),
+        });
+        remember('people', 'current', 'sha256:old');
+        remember('people', 'stale', 'sha256:older');
+        remember('people', 'no-basis');
+        remember('inventory', 'other', 'sha256:old');
+        const bytes = store.byte_count;
+        const order = () => [...store.entries()].flatMap(([target, rows]) =>
+            [...rows.keys()].map((row) => `${target}/${row}`));
+        const before = order();
+
+        store.move_schema_fingerprint('people', 'sha256:old', 'sha256:new');
+
+        expect(store.get('people', 'current')?.appendBasis).toEqual(basis('sha256:new'));
+        // An authority that was not current before stays as stale as it was.
+        expect(store.get('people', 'stale')?.appendBasis).toEqual(basis('sha256:older'));
+        expect(store.get('people', 'no-basis')?.appendBasis).toBeUndefined();
+        // Another worksheet's rows are not this worksheet's to move.
+        expect(store.get('inventory', 'other')?.appendBasis).toEqual(basis('sha256:old'));
+        // Nothing was used: eviction order and the byte total are as they were.
+        expect(order()).toEqual(before);
+        expect(store.byte_count).toBe(bytes);
+
+        store.move_schema_fingerprint('missing', 'sha256:old', 'sha256:new');
+        store.move_schema_fingerprint('people', 'sha256:new', 'sha256:new');
+        expect(order()).toEqual(before);
+    });
 });

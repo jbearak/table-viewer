@@ -67,6 +67,28 @@ export class RetainedPendingAppendAuthorityStore {
         if (rows!.size === 0) this.authorities.delete(target_key);
     }
 
+    /**
+     * Move one worksheet's authorities from the schema fingerprint `from` to
+     * `to`: the worksheet was re-projected (its Header Row moved, so its
+     * column names and their fingerprint did) over the same file. Only an
+     * authority that holds `from` moves; one already stale from a real schema
+     * change stays stale. In place: neither the recency order nor the byte
+     * total changes, so nothing is evicted.
+     */
+    public move_schema_fingerprint(target_key: string, from: string, to: string): void {
+        const rows = this.authorities.get(target_key);
+        if (rows === undefined || from === to) return;
+        for (const [row_id, authority] of rows) {
+            if (authority.appendBasis?.schemaFingerprint !== from) continue;
+            // Same key, so the row keeps its place; same cost, a fingerprint
+            // for a fingerprint.
+            rows.set(row_id, Object.freeze({
+                ...authority,
+                appendBasis: Object.freeze({ ...authority.appendBasis, schemaFingerprint: to }),
+            }));
+        }
+    }
+
     public remember(
         target_key: string,
         row_id: string,

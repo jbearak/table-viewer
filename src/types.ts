@@ -1400,6 +1400,19 @@ export function worksheet_target_key(target: WorksheetTarget): string {
             : `index:${target.sheetIndex}`;
 }
 
+/**
+ * Whether two targets are the same value, field for field, and so have the
+ * same `worksheet_target_key`. For a walk over a gesture's changes, which come
+ * in long runs on one worksheet: the key is built when the run changes.
+ */
+export function same_worksheet_target(left: WorksheetTarget, right: WorksheetTarget): boolean {
+    return left === right || (
+        left.sheetIndex === right.sheetIndex
+        && left.sheetName === right.sheetName
+        && left.worksheetId === right.worksheetId
+    );
+}
+
 export function worksheet_target_matches(
     target: WorksheetTarget,
     candidate: WorksheetTarget,

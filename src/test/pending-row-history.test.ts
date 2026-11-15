@@ -170,6 +170,56 @@ describe('pending-row history planning', () => {
         expect(redone.appendBasis).toEqual(basis);
     });
 
+    it('undoes two appended rows one after the other though the host advanced the basis under the first', () => {
+        // The append basis counts every row the host ever admitted, so undoing
+        // the second row leaves the count where it was. The first row's entry
+        // recorded a count of 1; the store now holds 2.
+        const a = row('a', 1);
+        const b = row('b', 2);
+        const basis = (provisionalRowCount: number) => ({
+            sourceRowCount: 3,
+            provisionalStartRow: 3,
+            provisionalRowCount,
+            columnCount: 2,
+            schemaFingerprint: 'schema-v1',
+        });
+        const one = { ...state([a]), appendBasis: basis(1) };
+        const two = { ...state([a, b]), appendBasis: basis(2) };
+        const first: HistoryAction = {
+            label: 'Append row',
+            changes: [
+                row_change('a', null, a, null, 0),
+                // The basis arm: the same rows, before and after the host's admission.
+                { kind: 'pendingRows', delta: { worksheet, before: { ...one, appendBasis: undefined }, after: one } },
+            ],
+        };
+        const second: HistoryAction = {
+            label: 'Append row',
+            changes: [
+                row_change('b', null, b, null, 1),
+                { kind: 'pendingRows', delta: { worksheet, before: { ...two, appendBasis: basis(1) }, after: two } },
+            ],
+        };
+
+        const second_undone = replay(second, 'undo', two);
+        expect(second_undone.appendedRows).toEqual([a]);
+        // What the host holds after that undo: one row, the count still 2.
+        const host_filled = { ...second_undone, appendBasis: basis(2) };
+        const first_undone = replay(first, 'undo', host_filled);
+        expect(first_undone.appendedRows).toEqual([]);
+        expect(first_undone.appendBasis).toBeUndefined();
+
+        // And back, again over a basis that is not the recorded one.
+        const first_redone = replay(first, 'redo', first_undone);
+        expect(replay(second, 'redo', { ...first_redone, appendBasis: basis(7) }).appendedRows)
+            .toEqual([a, b]);
+        // A row that differs is still a conflict.
+        expect(plan_pending_row_history_replay(first, 'undo', () => ({
+            ...host_filled,
+            appendedRows: [{ ...a, cells: { 0: { value: 'typed', valueEditOrder: 9 } } }],
+        }))).toEqual({ kind: 'refused', reason: 'conflict' });
+    });
+
     it('restores rows removed together with their contents and positions', () => {
         const a = row('a', 1);
         const b = row('b', 2, 'B');
@@ -774,6 +824,40 @@ describe('layout history arms', () => {
         const undone = replay(action, 'undo', deleted.next);
         expect(undone).toEqual(own_pending_structural_changes(typed));
         expect(replay(action, 'redo', undone)).toEqual(deleted.next);
+    });
+
+    it('replays an insert whose recorded append basis the host has since advanced', () => {
+        const basis = (provisionalRowCount: number) => ({
+            sourceRowCount: 4,
+            provisionalStartRow: 4,
+            provisionalRowCount,
+            columnCount: 2,
+            schemaFingerprint: 'schema-v1',
+        });
+        const inserted = planned(insert_rows(state([]), structure_context(), { kind: 'source', sourceRow: 1 },
+            'after', ['ins'], template, 1));
+        if (inserted.change.kind !== 'rowLayout') throw new Error('not a row change');
+        const action = recorded({
+            label: 'Insert row',
+            changes: [{
+                kind: 'rowLayout',
+                delta: { ...inserted.change.delta, appendBasis: { before: null, after: basis(1) } },
+            }],
+        });
+        // The host admitted more rows since: the store's count is past the recorded one.
+        const current = own_pending_structural_changes({ ...inserted.next, appendBasis: basis(4) });
+        const undone = replay(action, 'undo', current);
+        expect(undone.appendedRows).toEqual([]);
+        expect(undone.appendBasis).toBeUndefined();
+        // Redo asks for a basis; which one is the host's to say.
+        const redone = replay(action, 'redo', undone);
+        expect(redone.appendedRows.map((candidate) => candidate.id)).toEqual(['ins']);
+        expect(redone.appendBasis).toEqual(basis(1));
+        // The Structural Basis is still compared.
+        expect(plan_pending_row_history_replay(action, 'undo', () => ({
+            ...current,
+            structuralBasis: { ...structure_context().structuralBasis!, digest: 'sha256:other' },
+        }))).toEqual({ kind: 'refused', reason: 'conflict' });
     });
 
     it('refuses a replay when the store moved since the action (compare-and-swap)', () => {

@@ -32,6 +32,8 @@ import {
     history_value,
     value_only_overlay,
 } from '../webview/history-cell-state-model';
+import { rebase_pending_edits_for_header } from '../header-rebase';
+import { delete_rows } from '../webview/pending-row-store';
 
 const grid_shell_mock = vi.hoisted(() => ({
     is_dirty: false,
@@ -2654,41 +2656,256 @@ describe('Excel first-row header toggle', () => {
         ]);
     });
 
-    it('bars history across a header change that a reload delivers under a new sheet name', async () => {
-        // History addresses the worksheet by ID. A reload that renames it while
-        // turning the Header Row on must still find the predecessor, or a body
-        // edit on row 1 would replay into the new header row.
+    /** People with six source rows, the first of them the Header Row when `active`. */
+    function six_row_meta(active: boolean, name = 'People') {
+        const meta = excel_meta(active, active ? 'on' : 'off');
+        meta.sheets[0] = {
+            ...meta.sheets[0],
+            name,
+            worksheetId: 'ws-people',
+            sourceRowCount: 6,
+            rowCount: active ? 5 : 6,
+        };
+        return meta;
+    }
+
+    const HELD = { ...EDITABLE, csvEditSessionId: 'test-edit-session' };
+
+    function posted_since_clear<T extends WebviewMessage['type']>(
+        post_message: ReturnType<typeof vi.fn>,
+        type: T,
+    ): Extract<WebviewMessage, { type: T }>[] {
+        return post_message.mock.calls
+            .map((call) => call[0] as WebviewMessage)
+            .filter((message): message is Extract<WebviewMessage, { type: T }> => message.type === type);
+    }
+
+    it('keeps history across a header change, and holds back only a change with no form under the new header', async () => {
+        // A reload renames the worksheet while turning the Header Row on.
+        // History finds it by ID. The cell typed on row 1 is still undoable in
+        // principle, but row 1 is a column name now, so it waits and says so.
         const { post_message } = await render_app();
-        const before = excel_meta(false, 'off');
-        before.sheets[0].worksheetId = 'ws-people';
-        await dispatch_host_message(initial_snapshot_message(before, { capabilities: EDITABLE }));
+        await dispatch_host_message(initial_snapshot_message(six_row_meta(false), { capabilities: EDITABLE }));
         await acquire_editing_session(post_message);
         const props = grid_shell_mock.latest_props as unknown as GridShellProps;
         const worksheet = { sheetIndex: 0, sheetName: 'People', worksheetId: 'ws-people' };
-        const cell_delta = build_cell_history_delta({
-            worksheet,
-            sourceRow: 0,
-            sourceColumn: 0,
-            before: absent_overlay(),
-            after: value_only_overlay(history_value('edited'), history_value('Name')),
-            persistedValue: history_value('Name'),
-            persistedHyperlink: null,
+        const cell = (row: number, text: string) => ({
+            kind: 'cell' as const,
+            delta: build_cell_history_delta({
+                worksheet,
+                sourceRow: row,
+                sourceColumn: 0,
+                before: absent_overlay(),
+                after: value_only_overlay(history_value(text), history_value('base')),
+                persistedValue: history_value('base'),
+                persistedHyperlink: null,
+            })!,
         });
+        for (const [label, row] of [['Edit header-to-be', 0], ['Edit body', 3]] as const) {
+            props.edit_session!.commit('test-edit-session', `${row}:0`, { value: label, base: 'base' });
+            const record = props.history_store!.stage_record({ label, changes: [cell(row, label)] });
+            expect(record.commit()).toBe(true);
+            record.notify();
+        }
+
+        await dispatch_host_message(refresh_snapshot_message(six_row_meta(true, 'Staff'), { capabilities: HELD }));
+        const history = () => props.history_store!.snapshot();
+        expect(history().barrier).toBeUndefined();
+        expect(history().undoStack.map((entry) => entry.action.label))
+            .toEqual(['Edit header-to-be', 'Edit body']);
+
+        // The body edit is on a row that is still an ordinary row: it replays.
+        post_message.mockClear();
+        await dispatch_host_message({ type: 'editCommand', command: 'undo' });
+        await vi.waitUntil(() => posted_since_clear(post_message, 'prepareHistoryReplay').length > 0);
+        const [prepare] = posted_since_clear(post_message, 'prepareHistoryReplay');
+        expect(prepare.request.cells.map((entry) => entry.sourceRow)).toEqual([3]);
+        await dispatch_host_message({
+            type: 'historyReplayPrepareRefused',
+            refusal: {
+                requestId: prepare.request.requestId,
+                replayId: prepare.request.replayId,
+                reason: 'busy',
+            },
+        });
+
+        // Put the header-row edit on top, as if the body edit had been undone.
+        const top = history().undoStack.at(-1)!;
+        const moved = props.history_store!.stage_move('undo', top);
+        expect(moved.commit()).toBe(true);
+        moved.notify();
+        post_message.mockClear();
+        await dispatch_host_message({ type: 'editCommand', command: 'undo' });
+        expect(posted_since_clear(post_message, 'showWarning')).toEqual([{
+            type: 'showWarning',
+            message: "Can't undo this cell change while row 1 is the header row: "
+                + 'it was made when row 1 was an ordinary row. '
+                + 'Use another row as the header row, or turn the header row off, to undo it.',
+        }]);
+        expect(posted_since_clear(post_message, 'prepareHistoryReplay')).toEqual([]);
+        // Nothing was dropped: it is still the next thing to undo.
+        expect(history().undoStack.map((entry) => entry.action.label)).toEqual(['Edit header-to-be']);
+        expect(history().redoStack.map((entry) => entry.action.label)).toEqual(['Edit body']);
+
+        // With the header off again the same press goes out.
+        await dispatch_host_message(refresh_snapshot_message(six_row_meta(false, 'Staff'), {
+            generation: 3,
+            sourceGeneration: 3,
+            capabilities: HELD,
+        }));
+        post_message.mockClear();
+        await dispatch_host_message({ type: 'editCommand', command: 'undo' });
+        await vi.waitUntil(() => posted_since_clear(post_message, 'prepareHistoryReplay').length > 0);
+        expect(posted_since_clear(post_message, 'prepareHistoryReplay')[0].request.cells
+            .map((entry) => entry.sourceRow)).toEqual([0]);
+        expect(posted_since_clear(post_message, 'showWarning')).toEqual([]);
+    });
+
+    it('does not acquire an editing session to say that a change waits on the header row', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(six_row_meta(false), { capabilities: EDITABLE }));
+        const props = grid_shell_mock.latest_props as unknown as GridShellProps;
         const record = props.history_store!.stage_record({
             label: 'Edit cell',
-            changes: [{ kind: 'cell' as const, delta: cell_delta! }],
+            changes: [{
+                kind: 'cell',
+                delta: build_cell_history_delta({
+                    worksheet: { sheetIndex: 0, sheetName: 'People', worksheetId: 'ws-people' },
+                    sourceRow: 0,
+                    sourceColumn: 0,
+                    before: absent_overlay(),
+                    after: value_only_overlay(history_value('edited'), history_value('Name')),
+                    persistedValue: history_value('Name'),
+                    persistedHyperlink: null,
+                })!,
+            }],
         });
         expect(record.commit()).toBe(true);
         record.notify();
+        await dispatch_host_message(refresh_snapshot_message(six_row_meta(true), { capabilities: EDITABLE }));
+        post_message.mockClear();
 
-        const after = excel_meta(true, 'on');
-        after.sheets[0] = { ...after.sheets[0], name: 'Staff', worksheetId: 'ws-people' };
-        await dispatch_host_message(refresh_snapshot_message(after, {
-            capabilities: { ...EDITABLE, csvEditSessionId: 'test-edit-session' },
+        await dispatch_host_message({ type: 'editCommand', command: 'undo' });
+        expect(posted_since_clear(post_message, 'showWarning')).toHaveLength(1);
+        expect(posted_since_clear(post_message, 'requestEditSession')).toEqual([]);
+    });
+
+    it('names the worksheet when the change that waits is on another one', async () => {
+        // Replay refuses before it would switch worksheets, so "row 1" alone
+        // would read as the row on screen.
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(excel_meta_multi([true, false]), {
+            capabilities: EDITABLE,
         }));
-        const history = props.history_store!.snapshot();
-        expect(history.barrier?.reason).toBe('header-change');
-        expect(history.undoStack).toEqual([]);
+        const props = grid_shell_mock.latest_props as unknown as GridShellProps;
+        const record = props.history_store!.stage_record({
+            label: 'Edit cell',
+            changes: [{
+                kind: 'cell',
+                delta: build_cell_history_delta({
+                    worksheet: { sheetIndex: 1, sheetName: 'S2' },
+                    sourceRow: 0,
+                    sourceColumn: 0,
+                    before: absent_overlay(),
+                    after: value_only_overlay(history_value('edited'), history_value('Name')),
+                    persistedValue: history_value('Name'),
+                    persistedHyperlink: null,
+                })!,
+            }],
+        });
+        expect(record.commit()).toBe(true);
+        record.notify();
+        await dispatch_host_message(refresh_snapshot_message(excel_meta_multi([true, true]), {
+            capabilities: EDITABLE,
+        }));
+        expect(grid_stub().getAttribute('data-sheet-index')).toBe('0');
+        post_message.mockClear();
+
+        await dispatch_host_message({ type: 'editCommand', command: 'undo' });
+        expect(posted_since_clear(post_message, 'showWarning')).toEqual([{
+            type: 'showWarning',
+            message: "Sheet “S2”: Can't undo this cell change while row 1 is the header row: "
+                + 'it was made when row 1 was an ordinary row. '
+                + 'Use another row as the header row, or turn the header row off, to undo it.',
+        }]);
+        expect(grid_stub().getAttribute('data-sheet-index')).toBe('0');
+    });
+
+    it('undoes a row delete made before a header change, at the body start there is now', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(six_row_meta(true), { capabilities: EDITABLE }));
+        await acquire_editing_session(post_message);
+        const props = () => grid_shell_mock.latest_props as unknown as GridShellProps;
+        const worksheet = { sheetIndex: 0, sheetName: 'People', worksheetId: 'ws-people' };
+        const basis = (body_start: number) => ({
+            kind: 'xlsx' as const,
+            worksheetPartDigest: 'part',
+            sharedStringsDigest: null,
+            stylesDigest: null,
+            workbookDigest: 'book',
+            sourceRowCount: 6,
+            sourceColumnCount: 2,
+            bodyStart: body_start,
+        });
+        const deleted = delete_rows(
+            { formatTemplates: [], appendedRows: [], tailRemovals: [], conflicts: [] },
+            {
+                worksheet,
+                bodyStart: 1,
+                sourceRowCount: 6,
+                sourceColumnCount: 2,
+                bodyViewTransformed: false,
+                structuralBasis: basis(1),
+            },
+            [{ kind: 'source', sourceRow: 3 }],
+        );
+        if (!deleted.ok) throw new Error(deleted.refusal.message);
+        await act(async () => {
+            expect(props().pending_row_store!.install(
+                { session_id: 'test-edit-session' }, deleted.outcome.next,
+            )).toBe(true);
+        });
+        const record = props().history_store!.stage_record({
+            label: 'Delete row',
+            changes: [deleted.outcome.change],
+        });
+        expect(record.commit()).toBe(true);
+        record.notify();
+        const stored = props().history_store!.snapshot().undoStack[0];
+        expect(stored.bodyStarts).toEqual({ 'id:ws-people': 1 });
+
+        // The header is turned off. The host's write carries the slot; the
+        // webview installs what the snapshot hands it.
+        const carried = rebase_pending_edits_for_header(
+            { cells: {}, ...deleted.outcome.next },
+            { from: 1, to: 0, sourceRowCount: 6 },
+        );
+        if (!carried.ok) throw new Error(carried.message);
+        const { cells: _cells, ...carried_slot } = carried.slot;
+        await dispatch_host_message(refresh_snapshot_message(six_row_meta(false), { capabilities: HELD }));
+        await act(async () => {
+            expect(props().pending_row_store!.install(
+                { session_id: 'test-edit-session' }, carried_slot,
+            )).toBe(true);
+        });
+        expect(props().history_store!.snapshot().undoStack).toEqual([stored]);
+        post_message.mockClear();
+
+        await dispatch_host_message({ type: 'editCommand', command: 'undo' });
+        await vi.waitUntil(() => posted_since_clear(post_message, 'prepareHistoryReplay').length > 0);
+        const [prepare] = posted_since_clear(post_message, 'prepareHistoryReplay');
+        expect(posted_since_clear(post_message, 'showWarning')).toEqual([]);
+        expect(prepare.request.structures).toHaveLength(1);
+        const [structure] = prepare.request.structures!;
+        // What the store holds, and the same worksheet with the row back: both
+        // read from row 1 of the sheet now, where the body starts.
+        expect(structure.expected.rowLayout).toEqual(carried_slot.rowLayout);
+        expect(deleted.outcome.next.rowLayout?.runs[0]).toMatchObject({ kind: 'source', start: 1 });
+        expect(structure.expected.rowLayout?.runs[0]).toMatchObject({ kind: 'source', start: 0 });
+        expect(structure.expected.structuralBasis).toEqual(basis(0));
+        expect(structure.desired.rowLayout).toBeUndefined();
+        // The stored entry is as it was recorded.
+        expect(props().history_store!.snapshot().undoStack).toEqual([stored]);
     });
 
     it('sends a header change that waited on a discard as soon as the discard settles', async () => {
@@ -18146,8 +18363,23 @@ describe('undo and redo, from the keyboard and the desktop menu', () => {
         expect(sent(post_message, 'showWarning').message).toContain('hidden by the current view');
     });
 
+    it('says the file was refreshing when the host refuses over a view of it that moved', async () => {
+        const { post_message } = await render_app();
+        await record_highlight(post_message);
+        await undo_via_menu();
+        await refuse_prepare(post_message, 'document-changed');
+
+        expect(sent(post_message, 'showWarning')).toEqual({
+            type: 'showWarning',
+            message: 'Undo did not run because the file was refreshing. Try again.',
+        });
+        // The change is still there to undo.
+        expect(JSON.parse(grid_stub().getAttribute('data-undo-labels')!))
+            .toEqual(['Clear all highlights']);
+    });
+
     it('stays silent for the refusals that are not the user\'s problem', async () => {
-        for (const reason of ['busy', 'document-changed', 'malformed'] as const) {
+        for (const reason of ['busy', 'malformed'] as const) {
             const { post_message } = await render_app();
             await record_highlight(post_message);
             await undo_via_menu();

@@ -8,10 +8,17 @@ import {
     HEADER_REBASE_PREFIX_MESSAGE,
     HEADER_REBASE_TRANSFORMED_MESSAGE,
     header_rebase_slot_refusal,
+    rebase_pending_column_for_header,
     rebase_pending_edits_for_header,
+    row_switched_header_role,
     type HeaderRebaseSlot,
 } from '../header-rebase';
-import { pending_structure_error, type PendingStructuralChanges } from '../pending-changes';
+import {
+    own_pending_structural_changes,
+    pending_structure_error,
+    type PendingColumn,
+    type PendingStructuralChanges,
+} from '../pending-changes';
 import {
     delete_rows,
     insert_rows,
@@ -265,5 +272,85 @@ describe('rebase_pending_edits_for_header', () => {
         expect(header_rebase_slot_refusal(slot({ pendingColumns: [column] }), 1))
             .toBe(HEADER_REBASE_PENDING_COLUMN_MESSAGE);
         expect(header_rebase_slot_refusal(slot({ structuralBasis: xlsx_basis(1) }), 1)).toBeUndefined();
+    });
+});
+
+describe('row_switched_header_role', () => {
+    it('is true for the old and the new Header Row, and for no other row', () => {
+        // Row 0 was the header (body start 1); row 2 becomes it (body start 3).
+        expect([0, 1, 2, 3].map((row) => row_switched_header_role(row, 1, 3)))
+            .toEqual([true, false, true, false]);
+        // Header turned on: only the row that became it.
+        expect([0, 1].map((row) => row_switched_header_role(row, 0, 1))).toEqual([true, false]);
+        expect([0, 1].map((row) => row_switched_header_role(row, 1, 0))).toEqual([true, false]);
+        // No change: the header stays a header.
+        expect(row_switched_header_role(0, 1, 1)).toBe(false);
+    });
+});
+
+describe('rebase_pending_column_for_header', () => {
+    const typed = { value: 'x', valueEditOrder: 1 };
+    const column = (fields: Partial<PendingColumn> = {}): PendingColumn => ({
+        id: 'c', header: 'Total', cells: {}, format: { kind: 'none' }, createdOrder: 1, ...fields,
+    });
+
+    it('returns the column itself when the body start does not move', () => {
+        const given = column({ cells: { 's:0': typed } });
+        expect(rebase_pending_column_for_header(given, 2, 2)).toBe(given);
+    });
+
+    it('re-keys cells and highlights for where their rows are now, and nothing else', () => {
+        const given = column({
+            cells: { 's:1': typed, 's:6': typed, 'p:row': typed },
+            highlights: { 's:1': 'yellow', 's:6': 'green', 'p:row': 'yellow' },
+            viewerWidth: 120,
+        });
+        // Rows 1 and 2 leave the body; row 2 is the header.
+        const down = rebase_pending_column_for_header(given, 1, 3);
+        expect(down).toEqual({
+            ...given,
+            cells: { 'f:1': typed, 's:6': typed, 'p:row': typed },
+            highlights: { 'f:1': 'yellow', 's:6': 'green', 'p:row': 'yellow' },
+        });
+        // And back: the identity.
+        expect(rebase_pending_column_for_header(down!, 3, 1)).toEqual(given);
+        // Header off: every fixed row joins the body.
+        expect(rebase_pending_column_for_header(column({ cells: { 'f:1': typed } }), 3, 0)?.cells)
+            .toEqual({ 's:1': typed });
+    });
+
+    it('refuses a cell on a row that is the Header Row at exactly one body start', () => {
+        expect(rebase_pending_column_for_header(column({ cells: { 'f:0': typed } }), 1, 3)).toBeUndefined();
+        expect(rebase_pending_column_for_header(column({ cells: { 's:2': typed } }), 1, 3)).toBeUndefined();
+        expect(rebase_pending_column_for_header(column({ cells: { 's:0': typed } }), 0, 1)).toBeUndefined();
+        // A highlight is not a column name: it moves.
+        expect(rebase_pending_column_for_header(column({ highlights: { 's:2': 'yellow' } }), 1, 3)?.highlights)
+            .toEqual({ 'f:2': 'yellow' });
+    });
+
+    it('produces a column the slot accepts at the new body start', () => {
+        const moved = rebase_pending_column_for_header(
+            column({ cells: { 's:1': typed, 's:6': typed } }), 1, 3,
+        )!;
+        const slot = own_pending_structural_changes({
+            formatTemplates: [],
+            appendedRows: [],
+            tailRemovals: [],
+            conflicts: [],
+            pendingColumns: [moved],
+            columnLayout: {
+                columns: [
+                    { kind: 'source', sourceColumn: 0 },
+                    { kind: 'pending', pendingColumnId: 'c' },
+                    { kind: 'source', sourceColumn: 1 },
+                ],
+                removedSourceColumns: [],
+                discardedPendingColumns: [],
+            },
+            structuralBasis: xlsx_basis(3),
+        });
+        expect(pending_structure_error(
+            slot, {}, { bodyStart: 3, sourceRowCount: ROWS, sourceColumnCount: 2 },
+        )).toBeUndefined();
     });
 });

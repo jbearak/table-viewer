@@ -3688,6 +3688,17 @@ export function attach_viewer(
             : { formatTemplate: ledger.formatTemplate }),
     });
 
+    /** A session's ledger for a worksheet it has admitted nothing on yet. */
+    const empty_append_admission_ledger = (source_generation: number): AppendAdmissionLedger => ({
+        ownedRowIds: new Set<string>(),
+        insertMintedRowIds: new Set<string>(),
+        ownedColumnIds: new Set<string>(),
+        templateIdByRowId: new Map<string, string>(),
+        reservedRowIds: new Map<string, number>(),
+        unsettledRequestByRowId: new Map<string, string>(),
+        sourceGeneration: source_generation,
+    });
+
     const project_retained_pending_rows = (
         ledger: AppendAdmissionLedger | undefined,
         target: WorksheetTarget,
@@ -4425,6 +4436,7 @@ export function attach_viewer(
     const adopt_header_rebased_ledger = (
         slots: PerFileState['pendingEdits'],
         sheet_index: number,
+        fingerprints_before: ReadonlyMap<string, string> | undefined,
     ): void => {
         const edit_session_id = active_edit_session_id;
         const sheet = source?.meta().sheets[sheet_index];
@@ -4453,9 +4465,80 @@ export function attach_viewer(
         } else if (
             ledger.appendBasis !== undefined
             && ledger.appendBasis.schemaFingerprint !== fingerprint
+            // Only a basis that was current before the re-projection follows
+            // it. One already stale from an external schema change stays so.
+            && ledger.appendBasis.schemaFingerprint
+                === fingerprints_before?.get(worksheet_target_key(target))
         ) {
             ledger.appendBasis = Object.freeze({ ...ledger.appendBasis, schemaFingerprint: fingerprint });
         }
+    };
+    /** Each worksheet's append schema fingerprint, by the key its row authority is held under. */
+    const worksheet_schema_fingerprints = (
+        sheets: readonly SheetMeta[],
+    ): ReadonlyMap<string, string> => new Map(sheets.map((sheet, sheet_index) => [
+        worksheet_target_key({
+            sheetIndex: sheet_index,
+            sheetName: sheet.name,
+            ...(sheet.worksheetId === undefined ? {} : { worksheetId: sheet.worksheetId }),
+        }),
+        worksheet_append_schema_fingerprint(sheet),
+    ]));
+    /**
+     * After this panel adopts another projection of the same file: the
+     * history-retained row authority of each worksheet whose fingerprint
+     * moved follows it. A Header Row change is such a re-projection (the
+     * fingerprint hashes the column names), and without this a Redo of an
+     * appended row, undone before the header moved, is refused as a schema
+     * mismatch. `fingerprints_before` is what the worksheets read before the
+     * re-projection; an authority that did not hold that value was already
+     * stale, and stays so.
+     */
+    const follow_reprojected_schema = (
+        fingerprints_before: ReadonlyMap<string, string>,
+    ): void => {
+        const after = worksheet_schema_fingerprints(source?.meta().sheets ?? []);
+        for (const [target_key, to] of after) {
+            const from = fingerprints_before.get(target_key);
+            if (from !== undefined && from !== to) {
+                retained_pending_append_authorities.move_schema_fingerprint(target_key, from, to);
+            }
+        }
+    };
+    /**
+     * The same for this session's own ledgers, at a refresh adoption that no
+     * header request is waiting on (`settle_header_on_adoption` moves only
+     * the waiting request's worksheet). A window can go on showing the old
+     * Header Row after another window changed it, when the reload for that
+     * change is overtaken by one that keeps the source it has. Rows it then
+     * admits are recorded under the column names it shows, and the reload
+     * that finally brings the header finds no request waiting. Only
+     * worksheets whose fingerprint moved are touched, so a layout another
+     * worksheet holds in conflict stays as it was authored. The fingerprint
+     * hashes the column names, as for the retained authorities above: a
+     * header change that leaves every name as it was (a header row spelling
+     * the generated names) is not seen here, and a ledger Structural Basis
+     * the slot no longer carries then keeps its old body start. A layout
+     * replayed or published at the current one is still accepted, as the
+     * current file's (`structural_basis_authorized`).
+     */
+    const follow_reprojected_ledgers = (
+        state: Readonly<FileStateSnapshot>['state'],
+        fingerprints_before: ReadonlyMap<string, string>,
+    ): void => {
+        if (active_edit_session_id === undefined) return;
+        const sheets = source?.meta().sheets ?? [];
+        let slots: PerFileState['pendingEdits'] | undefined;
+        sheets.forEach((sheet, sheet_index) => {
+            const from = fingerprints_before.get(worksheet_target_key({
+                sheetIndex: sheet_index,
+                sheetName: sheet.name,
+                ...(sheet.worksheetId === undefined ? {} : { worksheetId: sheet.worksheetId }),
+            }));
+            if (from === undefined || from === worksheet_append_schema_fingerprint(sheet)) return;
+            slots ??= normalize_host_state(state, sheets).pendingEdits;
+            adopt_header_rebased_ledger(slots, sheet_index, fingerprints_before);
+        });
     };
     // The worksheet currently shown in edit mode and worksheets with a pending
     // publication that has not crossed the durable state boundary. Neither is
@@ -8994,11 +9077,27 @@ export function attach_viewer(
                             );
                         }
                     }
+                    // Read off the source being replaced, and only when the
+                    // adopted one is another projection of the same bytes: a
+                    // Header Row change adopted through a refresh. Every
+                    // physical adoption records its digest, so both are known
+                    // once a source is installed; one that is not known cannot
+                    // vouch for the bytes, and row authority then stays where
+                    // it is (a redo is refused, never relabelled).
+                    const previous_digest = source_authority.physicalDigest;
+                    const fingerprints_before = source !== undefined
+                        && previous_digest !== undefined
+                        && previous_digest === committed.receipt.resultingBasis.physicalDigest
+                        ? worksheet_schema_fingerprints(source.meta().sheets)
+                        : undefined;
                     // Until this adoption's snapshot is acknowledged, the renderer
                     // still indexes sheets using the preceding workbook projection.
                     core = installed;
                     source = next;
                     source_authority = committed.receipt.resultingBasis;
+                    if (fingerprints_before !== undefined) {
+                        follow_reprojected_schema(fingerprints_before);
+                    }
                     observe_unresolved_structural_save(
                         committed.receipt.stateSnapshot.state as PerFileState,
                     );
@@ -9013,7 +9112,10 @@ export function attach_viewer(
                     sync_active_transform_panel();
                     // The reconciled state this adoption delivers, so the ledger
                     // judges the renderer's next publication against what it holds.
-                    settle_header_on_adoption(adoption_state.state);
+                    if (fingerprints_before !== undefined) {
+                        follow_reprojected_ledgers(adoption_state.state, fingerprints_before);
+                    }
+                    settle_header_on_adoption(adoption_state.state, fingerprints_before);
                     session.replace_adoption(adoption, () => {
                         confirm_transfer();
                         source_observation = candidate.observation;
@@ -9091,7 +9193,10 @@ export function attach_viewer(
     }
 
     /** At an adoption, immediately before `replace_adoption`, so its snapshot carries the result. */
-    function settle_header_on_adoption(state: Readonly<FileStateSnapshot>['state']): void {
+    function settle_header_on_adoption(
+        state: Readonly<FileStateSnapshot>['state'],
+        fingerprints_before: ReadonlyMap<string, string> | undefined,
+    ): void {
         const waiter = header_settlement_waiter;
         if (waiter === undefined) return;
         header_settlement_waiter = undefined;
@@ -9108,6 +9213,7 @@ export function attach_viewer(
             adopt_header_rebased_ledger(
                 normalize_host_state(state, sheets).pendingEdits,
                 sheet_index,
+                fingerprints_before,
             );
         }
         retire_failed_save_superseded_by(state);
@@ -9209,6 +9315,10 @@ export function attach_viewer(
                             receipt.stateSnapshot.state,
                             source.meta().sheets,
                         );
+                        // Before either call below: both rebuild the meta.
+                        const fingerprints_before = worksheet_schema_fingerprints(
+                            source.meta().sheets,
+                        );
                         source.set_hidden_rows(
                             receipt.sheetName,
                             excel_hidden_rows_for_source(
@@ -9219,6 +9329,16 @@ export function attach_viewer(
                         if (!source.set_override(receipt.sheetName, receipt.override)) {
                             throw new Error('The selected worksheet no longer exists.');
                         }
+                        // The source shows the new header from here on, whatever
+                        // becomes of the adoption below, so row authority follows
+                        // it now: a refresh that recovers from a failed adoption
+                        // would find nothing left to compare.
+                        follow_reprojected_schema(fingerprints_before);
+                        adopt_header_rebased_ledger(
+                            receipt_state.pendingEdits,
+                            receipt.sheetIndex,
+                            fingerprints_before,
+                        );
                         const projection_adoption = adopt_source_into_core(
                             core,
                             panel,
@@ -9231,8 +9351,12 @@ export function attach_viewer(
                             adopt_header_rebased_ledger(
                                 receipt_state.pendingEdits,
                                 receipt.sheetIndex,
+                                fingerprints_before,
                             );
-                            settle_header_on_adoption(receipt.stateSnapshot.state);
+                            settle_header_on_adoption(
+                                receipt.stateSnapshot.state,
+                                fingerprints_before,
+                            );
                             if (is_origin) {
                                 retire_failed_save_superseded_by(receipt.stateSnapshot.state);
                                 session.retain_command_result({
@@ -16254,12 +16378,27 @@ export function attach_viewer(
             resolved_structures,
             replay_core.source_generation,
         );
+        // The desired append bases become the host's own before anything
+        // reads them: the lease, the durable write, and the echo the renderer
+        // installs all carry the filled-in structures.
+        const filled_structures = authorized_row_admissions === undefined
+            ? undefined
+            : fill_replay_append_bases(resolved_structures, authorized_row_admissions);
+        if (filled_structures !== undefined) {
+            resolved_structures.splice(
+                0,
+                resolved_structures.length,
+                ...filled_structures as typeof resolved_structures,
+            );
+        }
         if (
             authorized_row_admissions === undefined
+            || filled_structures === undefined
             || !await replay_structures_are_authorized(
                 resolved_structures,
                 src,
                 authorized_row_admissions,
+                true,
             )
         ) {
             refuse('conflict');
@@ -16618,13 +16757,24 @@ export function attach_viewer(
             payload.sourceGeneration,
             request.leaseId,
         );
+        // The lease holds bases the host filled in at prepare. Filled again
+        // now they must come out the same: a ledger that advanced, or a Header
+        // Row that moved, in between means the leased bases are no longer the
+        // host's, and writing them would put a count under the high-water mark.
+        const refilled_structures = authorized_row_admissions === undefined
+            ? undefined
+            : fill_replay_append_bases(payload.structures, authorized_row_admissions);
         if (
             authorization_source === undefined
             || authorized_row_admissions === undefined
+            || refilled_structures === undefined
+            || JSON.stringify(refilled_structures.map((structural) => structural.desired))
+                !== JSON.stringify(payload.structures.map((structural) => structural.desired))
             || !await replay_structures_are_authorized(
                 payload.structures,
                 authorization_source,
                 authorized_row_admissions,
+                true,
             )
         ) {
             return refused('conflict');
@@ -17032,6 +17182,29 @@ export function attach_viewer(
             payload.rowAdmissionRequestIds,
             request.leaseId,
         )) return refused('conflict');
+        // The replay's rows are durable now, and the renderer publishes them
+        // next. A worksheet this session has admitted nothing on yet gets its
+        // ledger here, so that publication is planned against one and projects
+        // the same retained authority the replay was checked against.
+        // `payload.isCurrent()` held just above, so the session that owns the
+        // lease is the active one.
+        const lease_session_id = active_edit_session_id;
+        if (lease_session_id !== undefined) {
+            for (const structural of payload.structures) {
+                const target = canonical_worksheet_target({
+                    ...structural.worksheet,
+                    sheetIndex: structural.resolvedSheetIndex,
+                });
+                if (target === undefined) continue;
+                const ledger_key = append_ledger_key(lease_session_id, target);
+                if (!append_admission_ledgers.has(ledger_key)) {
+                    append_admission_ledgers.set(
+                        ledger_key,
+                        empty_append_admission_ledger(payload.sourceGeneration),
+                    );
+                }
+            }
+        }
         // An unchanged updater reports `undefined` — for a replay that means the document
         // already held everything the replay would write, a byte-identical redo of
         // a gesture that changed nothing durable, which is a success and not a
@@ -17168,11 +17341,111 @@ export function attach_viewer(
         return false;
     }
 
+    /**
+     * What the host holds for one replayed worksheet: the session's ledger,
+     * a clone of it with the history-retained rows the replay asks for
+     * projected in, and the append basis that authority accepts.
+     *
+     * `missing_ledger_is_empty` is for a replay. A session's ledger for a
+     * worksheet is created by its first admission, so a session acquired
+     * again after "undo everything" has none for a worksheet whose rows a redo
+     * is about to bring back. An empty ledger grants nothing by itself:
+     * ownership still comes only from the retained authority projected here
+     * and from admissions. It is local to this check; the commit registers one
+     * once the replay has landed.
+     */
+    const replay_structure_authority = (
+        structural: ResolvedReplayStructure,
+        additionally_authorized: ReadonlySet<string>,
+        missing_ledger_is_empty: boolean,
+    ) => {
+        const edit_session_id = active_edit_session_id;
+        const target = canonical_worksheet_target({
+            ...structural.worksheet,
+            sheetIndex: structural.resolvedSheetIndex,
+        });
+        if (target === undefined || edit_session_id === undefined) return undefined;
+        const ledger_key = append_ledger_key(edit_session_id, target);
+        const live_ledger = append_admission_ledgers.get(ledger_key)
+            ?? (missing_ledger_is_empty
+                ? empty_append_admission_ledger(core?.source_generation ?? 0)
+                : undefined);
+        const ledger = live_ledger === undefined
+            ? undefined
+            : clone_append_admission_ledger(live_ledger);
+        const retained_templates = project_retained_pending_rows(
+            ledger,
+            target,
+            pending_rows(structural.desired),
+        );
+        return {
+            target,
+            ledger_key,
+            live_ledger,
+            ledger,
+            retained_templates,
+            basis: accepted_append_basis_for_ledger(ledger, ledger_key, additionally_authorized),
+        };
+    };
+
+    /**
+     * A replay's structures with each desired append basis set to the one the
+     * host accepts, or undefined when one cannot be.
+     *
+     * An append basis is the host's record of what it admitted: a high-water
+     * row count that only advances, and the fingerprint of the column names it
+     * was admitted under. History records a basis only to say whether one is
+     * there. Its recorded count can be behind the ledger's (a later append
+     * advanced it), and its fingerprint can be an earlier Header Row's, so a
+     * replay installs the host's own value. Every other field is still the
+     * recorded one's to match, and the strict check that follows reads the
+     * filled-in basis against the worksheet as it is now.
+     */
+    function fill_replay_append_bases(
+        structures: readonly ResolvedReplayStructure[],
+        additionally_authorized: ReadonlySet<string>,
+    ): readonly ResolvedReplayStructure[] | undefined {
+        const filled: ResolvedReplayStructure[] = [];
+        for (const structural of structures) {
+            const recorded = structural.desired.appendBasis;
+            if (recorded === undefined) {
+                filled.push(structural);
+                continue;
+            }
+            let basis: PendingAppendBasis | undefined;
+            // A slot with no Pending Rows holds no basis, as a publication's does not.
+            if (pending_rows(structural.desired).length > 0) {
+                basis = replay_structure_authority(structural, additionally_authorized, true)?.basis;
+                if (
+                    basis === undefined
+                    || basis.sourceRowCount !== recorded.sourceRowCount
+                    || basis.provisionalStartRow !== recorded.provisionalStartRow
+                    || basis.columnCount !== recorded.columnCount
+                    || basis.styleFingerprint !== recorded.styleFingerprint
+                ) return undefined;
+            }
+            const { appendBasis: _recorded, ...rest } = structural.desired;
+            try {
+                filled.push(Object.freeze({
+                    ...structural,
+                    desired: own_pending_structural_changes({
+                        ...rest,
+                        ...(basis === undefined ? {} : { appendBasis: basis }),
+                    }),
+                }));
+            } catch {
+                return undefined;
+            }
+        }
+        return Object.freeze(filled);
+    }
+
     /** Structural replay writes stay current and inside authority already issued. */
     async function replay_structures_are_authorized(
         structures: readonly ResolvedReplayStructure[],
         replay_source: DataSource,
         additionally_authorized: ReadonlySet<string> = new Set(),
+        missing_ledger_is_empty = false,
     ): Promise<boolean> {
         const edit_session_id = active_edit_session_id;
         if (structures.length > 0 && edit_session_id === undefined) return false;
@@ -17276,13 +17549,13 @@ export function attach_viewer(
         // Validate the whole request before admitting retained rows into any
         // ledger, so one invalid worksheet cannot partially mutate authority.
         for (const structural of structures) {
-            const target = canonical_worksheet_target({
-                ...structural.worksheet,
-                sheetIndex: structural.resolvedSheetIndex,
-            });
-            if (target === undefined || edit_session_id === undefined) return false;
-            const ledger_key = append_ledger_key(edit_session_id, target);
-            const live_ledger = append_admission_ledgers.get(ledger_key);
+            const authority = replay_structure_authority(
+                structural,
+                additionally_authorized,
+                missing_ledger_is_empty,
+            );
+            if (authority === undefined) return false;
+            const { target, ledger_key, live_ledger, ledger, retained_templates } = authority;
             // A replayed layout meets the publication's layout rules: the
             // release gate, the ledger origin rule, issued Pending Columns,
             // and the recorded Structural Basis. The commit's own decode of
@@ -17305,14 +17578,6 @@ export function attach_viewer(
                 structural.desired.appendBasis,
                 additionally_authorized,
             )) return false;
-            const ledger = live_ledger === undefined
-                ? undefined
-                : clone_append_admission_ledger(live_ledger);
-            const retained_templates = project_retained_pending_rows(
-                ledger,
-                target,
-                pending_rows(structural.desired),
-            );
             if (!appended_rows_match_ledger(ledger, pending_rows(structural.desired))) return false;
             if (structural.desired.formatTemplates.some((template) => {
                 const issued = retained_templates.get(template.id)
@@ -17325,11 +17590,7 @@ export function attach_viewer(
                 return issued === undefined
                     || JSON.stringify(issued) !== JSON.stringify(template);
             })) return false;
-            const provisional_basis = accepted_append_basis_for_ledger(
-                ledger,
-                ledger_key,
-                additionally_authorized,
-            );
+            const provisional_basis = authority.basis;
             if (
                 structural.desired.appendBasis !== undefined
                 && JSON.stringify(structural.desired.appendBasis)
