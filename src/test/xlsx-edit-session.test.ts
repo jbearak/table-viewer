@@ -8459,6 +8459,10 @@ describe('xlsx edit sessions', () => {
         expect(committed.appendBasis).toBeDefined();
         expect(committed.appendBasis!.schemaFingerprint)
             .not.toBe(admission.appendBasis!.schemaFingerprint);
+        // The renderer publishes the basis the adopted snapshot gave it.
+        const adopted = recovered.state!.pendingEdits!
+            .find((slot) => slot?.worksheetId === '1')!;
+        expect(adopted.appendBasis).toBeDefined();
         await panel.__receive({
             type: 'snapshotApplied',
             identity: recovered.identity,
@@ -8478,7 +8482,7 @@ describe('xlsx edit sessions', () => {
                 formatTemplates: [admission.formatTemplate!],
                 appendedRows: [appended_row],
                 tailRemovals: [],
-                appendBasis: committed.appendBasis!,
+                appendBasis: adopted.appendBasis!,
                 conflicts: [],
             },
         });
@@ -8505,6 +8509,15 @@ describe('xlsx edit sessions', () => {
             (zip) => rewrite_workbook_xml(zip, (xml) => xml.replace('name="People"', 'name="Renamed"')),
             { sheetIndex: 0, sheetName: 'Renamed', sheetNames: ['Renamed', 'Inventory'] },
             { excelFirstRowHeaders: { Renamed: 'off' } },
+        );
+    });
+
+    it('moves the append ledger to the adopted basis when a fallback reload renames the sheet and its header comes back', async () => {
+        // No override follows the new name, so the reloaded sheet detects its
+        // header again and the adoption reconciles the append basis to it.
+        await header_change_through_reshaping_reload(
+            (zip) => rewrite_workbook_xml(zip, (xml) => xml.replace('name="People"', 'name="Renamed"')),
+            { sheetIndex: 0, sheetName: 'Renamed', sheetNames: ['Renamed', 'Inventory'] },
         );
     });
 

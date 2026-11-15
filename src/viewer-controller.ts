@@ -9011,7 +9011,9 @@ export function attach_viewer(
                     // must stay recoverable by a lost acknowledgement.
                     replay_leases.invalidate();
                     sync_active_transform_panel();
-                    settle_header_on_adoption(committed.receipt.stateSnapshot.state);
+                    // The reconciled state this adoption delivers, so the ledger
+                    // judges the renderer's next publication against what it holds.
+                    settle_header_on_adoption(adoption_state.state);
                     session.replace_adoption(adoption, () => {
                         confirm_transfer();
                         source_observation = candidate.observation;
