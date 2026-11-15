@@ -2590,6 +2590,16 @@ describe('Excel first-row header toggle', () => {
             type: 'showWarning',
             message: 'Wait for the header row change to finish, then save.',
         });
+        // An edit gesture the fence refuses says so too, once for the fence,
+        // not once for every key typed into it.
+        const edit_warnings = () => post_message.mock.calls
+            .map((call) => call[0] as WebviewMessage)
+            .filter((message) => message.type === 'showWarning'
+                && message.message === 'Wait for the header row change to finish, then edit.');
+        const refused_edit = grid_shell_mock.latest_props?.on_edit_paused_gesture as () => void;
+        act(() => { refused_edit(); });
+        act(() => { refused_edit(); });
+        expect(edit_warnings()).toHaveLength(1);
 
         await dispatch_host_message({
             type: 'pendingEditsAcknowledged',
@@ -2823,6 +2833,15 @@ describe('Excel first-row header toggle', () => {
         expect(post_message).toHaveBeenCalledWith(reload_warning);
         expect(post_message.mock.calls.some(([message]) => message?.type === 'saveCsv'))
             .toBe(false);
+        // Nor can an edit; a refused edit gesture says to reload, once.
+        post_message.mockClear();
+        const refused_edit = grid_shell_mock.latest_props?.on_edit_paused_gesture as () => void;
+        act(() => { refused_edit(); });
+        act(() => { refused_edit(); });
+        expect(post_message.mock.calls.map(([message]) => message)).toEqual([{
+            type: 'showWarning',
+            message: 'Reload this window to finish the header row change, then edit.',
+        }]);
     });
 
     it('drops a queued promotion when the view changes before it can be sent', async () => {

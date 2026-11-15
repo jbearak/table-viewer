@@ -113,6 +113,26 @@ export function is_copy_key(
     return input.key === 'c' || input.key === 'C';
 }
 
+/**
+ * Whether a key pressed on the grid asks to change a cell: a character it
+ * types, Space, Enter or F2 to open an editor, Delete or Backspace to clear,
+ * or Ctrl/Cmd+V or X to paste or cut. A typed character follows the Glide
+ * fork's rule (any one character, but not a non-ASCII one with Alt, which
+ * on macOS is an Option shortcut).
+ */
+export function is_edit_key(
+    input: Pick<NavInput, 'key' | 'ctrl' | 'meta' | 'shift' | 'alt'>,
+): boolean {
+    if (input.ctrl || input.meta) {
+        return !input.shift && !input.alt
+            && ['v', 'V', 'x', 'X'].includes(input.key);
+    }
+    if (['Enter', 'F2', 'Delete', 'Backspace'].includes(input.key)) return true;
+    const code = input.key.codePointAt(0) ?? 0;
+    if (Array.from(input.key).length !== 1 || code < 0x20 || code === 0x7f) return false;
+    return code < 0x7f || !input.alt;
+}
+
 export function resolve_nav(input: NavInput): GridNavigationDecision | null {
     if (input.ctrl || input.meta || input.alt) return null;
     if (input.key === 'Tab') {

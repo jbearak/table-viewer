@@ -1927,6 +1927,19 @@ export function App(): React.JSX.Element {
                 : 'Wait for the header row change to finish, then save.',
         });
     };
+    // The edit warning last shown for this fence, so a burst of keys says it
+    // once; cleared when the fence drops.
+    const header_edit_warning_ref = useRef<string | null>(null);
+    /** Say why an edit gesture does nothing while the header fence is up. */
+    const warn_edit_waits_for_header = useCallback(() => {
+        if (!header_fence_ref.current) return;
+        const message = header_reload_required_ref.current
+            ? 'Reload this window to finish the header row change, then edit.'
+            : 'Wait for the header row change to finish, then edit.';
+        if (header_edit_warning_ref.current === message) return;
+        header_edit_warning_ref.current = message;
+        host_bridge.postMessage({ type: 'showWarning', message });
+    }, []);
     const [header_fence, set_header_fence] = useState(false);
     // The header queue's verdict on a header result; see `drain_excel_header_queue`.
     const header_result_handler_ref = useRef<
@@ -6582,6 +6595,7 @@ export function App(): React.JSX.Element {
     const lower_header_fence = useCallback(() => {
         header_fence_ref.current = false;
         header_reload_required_ref.current = false;
+        header_edit_warning_ref.current = null;
         set_header_fence(false);
         header_in_flight_ref.current = null;
         for (const timer of header_timer_refs.current) clearTimeout(timer);
@@ -9695,6 +9709,7 @@ export function App(): React.JSX.Element {
             edit_activation_id={edit_activation_id}
             highlight_in_flight={highlight_request_pending}
             edits_paused={header_fence}
+            on_edit_paused_gesture={warn_edit_waits_for_header}
             append_in_flight={append_request_pending}
             csv_editable={csv_editable}
             append_row_ceiling={append_row_ceiling}

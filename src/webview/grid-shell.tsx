@@ -139,6 +139,7 @@ import {
 import {
     resolve_nav,
     is_copy_key,
+    is_edit_key,
     move_sequential_cell,
     sequential_append_target_column,
 } from './grid-nav-model';
@@ -1569,6 +1570,12 @@ export interface GridShellProps {
      * it lands: like a highlight in flight, but App's own fence.
      */
     edits_paused?: boolean;
+    /**
+     * An edit gesture (a typed key, Delete, Enter, paste, cut, double-click)
+     * met a cell that `edits_paused` alone keeps from taking it, so App can
+     * say why nothing happened.
+     */
+    on_edit_paused_gesture?: () => void;
     /** A host-backed append reservation is outstanding; all edits are fenced. */
     append_in_flight?: boolean;
     /**
@@ -1774,6 +1781,7 @@ export function GridShell({
     csv_editable = false,
     highlight_in_flight = false,
     edits_paused = false,
+    on_edit_paused_gesture,
     append_in_flight = false,
     append_row_ceiling = MAX_SHEET_ROWS,
     structural_support,
@@ -3299,6 +3307,15 @@ export function GridShell({
         && !close_barrier_active;
     // Whether a cell answers an editing gesture at all, session or not.
     const cells_accept_edits = editable_cells || edit_armed;
+    // Cells would take edits but for `edits_paused`: an edit gesture is then
+    // refused for App's reason, which App explains.
+    const edits_held_by_pause = edits_paused
+        && !save_in_flight
+        && !highlight_in_flight
+        && !close_barrier_active
+        && (editing_session_held
+            ? csv_editable && !append_in_flight
+            : on_request_edit_session !== undefined && !preview_mode);
     // Stable row identities let cuts survive harmless sort/filter/projection
     // changes. Numeric fallback coordinates retain a separate generation guard.
     const clipboard_source = sheet_meta.worksheetId
@@ -9676,7 +9693,10 @@ export function GridShell({
      * current layouts (the cell is read-only); activating it says why.
      */
     const on_cell_activated = useCallback((cell: Item) => {
-        if (!editable_cells) return;
+        if (!editable_cells) {
+            if (edits_held_by_pause) on_edit_paused_gesture?.();
+            return;
+        }
         const [display_column, row] = cell;
         const source_column = source_column_for_display(display_column);
         if (source_column === undefined) return;
@@ -9705,8 +9725,10 @@ export function GridShell({
     }, [
         commit_source_row,
         editable_cells,
+        edits_held_by_pause,
         formula_display_for,
         get_row,
+        on_edit_paused_gesture,
         pending_projection,
         pending_rendered_rows,
         refuse_formula,
@@ -11209,14 +11231,26 @@ export function GridShell({
                 }
                 return;
             }
-            const decision = resolve_nav({
+            const keys = {
                 key: args.key,
                 shift: args.shiftKey,
                 ctrl: args.ctrlKey,
                 meta: args.metaKey,
                 alt: args.altKey,
-                // Typing edits wherever a cell would accept it, session or not.
-                editable: cells_accept_edits,
+            };
+            if (
+                edits_held_by_pause
+                && grid_selection_ref.current.current !== undefined
+                && !is_editable_target(args.rawEvent?.target ?? null)
+                && is_edit_key(keys)
+            ) {
+                on_edit_paused_gesture?.();
+            }
+            const decision = resolve_nav({
+                ...keys,
+                // Typing edits wherever a cell would accept it, session or not;
+                // a pause doesn't turn letters into vim navigation.
+                editable: cells_accept_edits || edits_held_by_pause,
             });
             if (!decision) return;
             const cur = grid_selection_ref.current.current?.cell;
@@ -11274,9 +11308,11 @@ export function GridShell({
             display_column_count,
             display_column_for_source,
             cells_accept_edits,
+            edits_held_by_pause,
             inserted_rows_lock,
             merge_index,
             merges,
+            on_edit_paused_gesture,
             on_open_filter,
             on_transform_change,
             row_count,
