@@ -2583,9 +2583,13 @@ describe('Excel first-row header toggle', () => {
         expect(grid_shell_mock.latest_props?.edits_paused).toBe(true);
         expect(edits_admitted()).toBe(false);
         expect(header_requests(post_message)).toEqual([]);
-        // Save waits for the header change too.
+        // Save waits for the header change too, and says so.
         const save = grid_shell_mock.latest_props?.on_save_request as () => unknown;
         expect(save()).toBeUndefined();
+        expect(post_message).toHaveBeenCalledWith({
+            type: 'showWarning',
+            message: 'Wait for the header row change to finish, then save.',
+        });
 
         await dispatch_host_message({
             type: 'pendingEditsAcknowledged',
@@ -2803,6 +2807,22 @@ describe('Excel first-row header toggle', () => {
             type: 'showWarning',
             message: 'Reload this window to keep editing this file. Failed to reload: disk unavailable',
         });
+        // Save can't run until the reload either; Cmd+S and the Save button
+        // say what to do rather than nothing.
+        seed_mounted_store({ '1:0': { value: 'Alicia', base: 'Alice' } });
+        const reload_warning = {
+            type: 'showWarning',
+            message: 'Reload this window to finish the header row change, then save.',
+        };
+        post_message.mockClear();
+        const save = grid_shell_mock.latest_props?.on_save_request as () => unknown;
+        expect(save()).toBeUndefined();
+        expect(post_message).toHaveBeenCalledWith(reload_warning);
+        post_message.mockClear();
+        await click_button('Save');
+        expect(post_message).toHaveBeenCalledWith(reload_warning);
+        expect(post_message.mock.calls.some(([message]) => message?.type === 'saveCsv'))
+            .toBe(false);
     });
 
     it('drops a queued promotion when the view changes before it can be sent', async () => {

@@ -1914,7 +1914,19 @@ export function App(): React.JSX.Element {
     // asks for a Header Row change, lowered by its last result. A ref for the
     // gesture gates, which read it synchronously; the state re-renders.
     const header_fence_ref = useRef(false);
+    // A header result that needs a reload keeps the fence up with nothing
+    // left to wait for; only a reload lowers it.
+    const header_reload_required_ref = useRef(false);
     const lower_header_fence_ref = useRef<() => void>(() => {});
+    /** Say why Save does nothing while the header fence is up. */
+    const warn_save_waits_for_header = () => {
+        host_bridge.postMessage({
+            type: 'showWarning',
+            message: header_reload_required_ref.current
+                ? 'Reload this window to finish the header row change, then save.'
+                : 'Wait for the header row change to finish, then save.',
+        });
+    };
     const [header_fence, set_header_fence] = useState(false);
     // The header queue's verdict on a header result; see `drain_excel_header_queue`.
     const header_result_handler_ref = useRef<
@@ -2706,7 +2718,10 @@ export function App(): React.JSX.Element {
         if (!csv_edit_session_id || save_projection_ref.current.operation) return undefined;
         // A Header Row change carries the session's Pending Changes to the new
         // header in its own durable write; Save waits until it has landed.
-        if (header_fence_ref.current) return undefined;
+        if (header_fence_ref.current) {
+            warn_save_waits_for_header();
+            return undefined;
+        }
         const sheets = meta_ref.current?.sheets ?? [];
         const preflight = edit_session_registry_ref.current!
             .collect_dirty_worksheets(sheets);
@@ -6566,6 +6581,7 @@ export function App(): React.JSX.Element {
      */
     const lower_header_fence = useCallback(() => {
         header_fence_ref.current = false;
+        header_reload_required_ref.current = false;
         set_header_fence(false);
         header_in_flight_ref.current = null;
         for (const timer of header_timer_refs.current) clearTimeout(timer);
@@ -6703,6 +6719,7 @@ export function App(): React.JSX.Element {
         header_in_flight_ref.current = null;
         if (in_flight === null) return 'report';
         if (result.reloadRequired === true) {
+            header_reload_required_ref.current = true;
             replace_excel_header_queue(null);
             set_excel_header_status('Reload this window to finish the header row change.');
             host_bridge.postMessage({
@@ -7523,7 +7540,10 @@ export function App(): React.JSX.Element {
         const editing = editing_ref.current;
         if (!editing) return false;
         // See `begin_save_operation`: nothing is saved across a header change.
-        if (header_fence_ref.current) return true;
+        if (header_fence_ref.current) {
+            warn_save_waits_for_header();
+            return true;
+        }
         // request_save() has side effects, so it is evaluated first. If workbook
         // preflight blocks, the active sheet may be clean while a sibling store is
         // still dirty; keep the session open from the registry-wide truth.
