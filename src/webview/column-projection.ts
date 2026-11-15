@@ -194,6 +194,30 @@ export function hide_source_columns(
     return canonical_visibility_from_hidden(hidden, column_count, schema ?? state?.schema);
 }
 
+/**
+ * The hidden source columns a visibility state means, sorted. The stored state
+ * has two forms (`hiddenColumns`, or `visibleColumns` when that list is the
+ * shorter one); this is the set either one describes.
+ */
+export function hidden_source_columns(
+    state: SheetColumnVisibilityState | undefined,
+    column_count: number,
+): number[] {
+    if (!state) return [];
+    return state.visibleColumns
+        ? complement(sanitize_indexes(state.visibleColumns, column_count), column_count)
+        : sanitize_indexes(state.hiddenColumns ?? [], column_count);
+}
+
+/** The canonical visibility state for a set of hidden source columns. */
+export function visibility_from_hidden_columns(
+    hidden_columns: Iterable<number>,
+    column_count: number,
+    schema?: string,
+): SheetColumnVisibilityState | undefined {
+    return canonical_visibility_from_hidden(hidden_columns, column_count, schema);
+}
+
 export function show_all_columns(): undefined {
     return undefined;
 }

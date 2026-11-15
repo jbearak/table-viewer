@@ -4568,7 +4568,7 @@ describe('CSV edit sessions', () => {
             // and another write of this session can run before the visibility
             // handler resumes.
             const queued = with_in_memory_authority_transactions(versioned.store);
-            const store: FileStateStore = {
+            const store: typeof queued = {
                 ...queued,
                 async compare_and_set(path, expected, next, validate, basis) {
                     const result = await queued.compare_and_set(path, expected, next, validate, basis);

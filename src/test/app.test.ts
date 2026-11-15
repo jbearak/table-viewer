@@ -738,6 +738,34 @@ async function acknowledge_transform(
     );
 }
 
+function latest_column_write(post_message: ReturnType<typeof vi.fn>) {
+    const request = post_message.mock.calls
+        .map((call) => call[0] as WebviewMessage)
+        .filter((message): message is Extract<WebviewMessage, { type: 'setColumnVisibility' }> => (
+            message.type === 'setColumnVisibility'
+        ))
+        .at(-1);
+    expect(request).toBeDefined();
+    return request!;
+}
+
+/** The host's answer to the latest column visibility write. */
+async function answer_column_write(
+    post_message: ReturnType<typeof vi.fn>,
+    applied = true,
+    source_generation?: number,
+) {
+    const request = latest_column_write(post_message);
+    expect(request.requestId).toEqual(expect.any(String));
+    await dispatch_host_message({
+        type: 'columnVisibilityChanged',
+        requestId: request.requestId!,
+        sheetIndex: request.sheetIndex,
+        applied,
+        sourceGeneration: source_generation ?? request.sourceGeneration,
+    });
+}
+
 async function flush_focus_restore() {
     await act(async () => new Promise((resolve) => window.setTimeout(resolve, 0)));
 }
@@ -4639,6 +4667,8 @@ describe('column visibility projection', () => {
                 hiddenColumns: [1],
                 schema: '["Sheet1",3,["Name","Value","Notes"]]',
             },
+            // The write asks for an answer: its step is recorded on that.
+            requestId: expect.any(String),
         }]);
         expect(state_messages).toHaveLength(1);
         expect(visibility_messages.indexOf(targeted_messages[0]))
@@ -4659,6 +4689,7 @@ describe('column visibility projection', () => {
         expect(grid_shell_mock.commit_live_edit.mock.invocationCallOrder.at(-1))
             .toBeLessThan(post_message.mock.invocationCallOrder.at(-1)!);
 
+        await answer_column_write(post_message);
         post_message.mockClear();
         await click_button('Show all');
         expect(JSON.parse(grid_stub().getAttribute('data-projection')!))
@@ -4671,6 +4702,7 @@ describe('column visibility projection', () => {
             state: undefined,
             sourceGeneration: 1,
             snapshotIdentity: initial.snapshot.identity,
+            requestId: expect.any(String),
         });
         const restored = post_message.mock.calls.at(-1)![0];
         expect(restored.type).toBe('stateChanged');
@@ -4717,6 +4749,7 @@ describe('column visibility projection', () => {
             .map((call) => call[0])
             .some((message) => message.type === 'setTransform')).toBe(false);
 
+        await answer_column_write(post_message);
         await click_button('Show all');
         expect(JSON.parse(grid_stub().getAttribute('data-projection')!))
             .toEqual([0, 1]);
@@ -5317,7 +5350,7 @@ describe('merges', () => {
     });
 
     it('flattens merges on hide and restores them on Show all', async () => {
-        await render_app();
+        const { post_message } = await render_app();
         const meta = make_meta(['Sheet1']);
         meta.sheets[0].columnCount = 2;
         meta.sheets[0].columnNames = ['Left', 'Right'];
@@ -5335,6 +5368,7 @@ describe('merges', () => {
         expect(grid_stub().getAttribute('data-merges')).toBe('0');
         expect(document.body.textContent).toContain('Merged cells shown unmerged');
 
+        await answer_column_write(post_message);
         await click_button('Show all');
         expect(grid_stub().getAttribute('data-merges')).toBe('1');
         expect(document.body.textContent).not.toContain('Merged cells shown unmerged');
@@ -14600,20 +14634,46 @@ describe('snapshots arriving during an in-flight transform', () => {
         expect(grid_shell_mock.latest_props?.transform_pending).toBe(false);
     });
 
-    it('loses no edit across commits interleaved with a compute that lands last', async () => {
-        // The whole sequence the feature makes reachable: type and commit, keep
-        // typing while the sort is still computing, then let it land. Each commit
-        // provokes a same-basis refresh, and the landing bumps the generation and
-        // remounts the grid that owns the open overlay — three separate ways an edit
-        // could be dropped, exercised in one order.
-        const { request } = await sorting_while_editing();
+    it('folds the open cell when the sort is asked for, and loses no edit when the compute lands last', async () => {
+        // No cell editor is open while this window's own sort is computing: the
+        // open cell is committed before the request is posted, and the install
+        // has nothing left to fold. What still arrives during the compute is the
+        // refresh each commit provokes, and then the landing bumps the generation
+        // and remounts the grid: two ways an edit could be dropped.
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(
+            make_meta(['Sheet1'], false),
+            { capabilities: { csvEditable: true, csvEditingSupported: true } },
+        ));
+        await acquire_editing_session(post_message);
         const store = () => grid_shell_mock.latest_props?.edit_session as EditSessionStore;
         const store_edits = () => JSON.parse(grid_stub().getAttribute('data-store-edits')!);
-
         await act(async () => {
             store().commit('test-edit-session', '0:0', { value: 'first', base: 'a' });
         });
-        // The refresh that commit provokes: same rows, same generation, and the
+        // A second cell is still open in the editor when the sort is asked for.
+        grid_shell_mock.commit_live_edit.mockImplementation(() => {
+            store().commit('test-edit-session', '1:0', { value: 'live', base: 'b' });
+        });
+        post_message.mockClear();
+
+        await act(async () => (
+            container!.querySelector('.stub-shortcut-transform') as HTMLButtonElement
+        ).click());
+
+        // Folded once, before the request left, and under the option that lets
+        // an exiting session's fence pass when nothing is open.
+        expect(grid_shell_mock.commit_live_edit).toHaveBeenCalledTimes(1);
+        expect(grid_shell_mock.commit_live_edit).toHaveBeenCalledWith({ fenced_empty_ok: true });
+        const request = latest_transform_request(post_message);
+        expect(grid_shell_mock.commit_live_edit.mock.invocationCallOrder[0])
+            .toBeLessThan(post_message.mock.invocationCallOrder[
+                post_message.mock.calls.findIndex((call) => call[0] === request)
+            ]);
+        // And no cell opens until the sort lands.
+        expect(grid_shell_mock.latest_props?.highlight_in_flight).toBe(true);
+
+        // The refresh those commits provoke: same rows, same generation, and the
         // host's authoritative projection of what it has just written.
         await dispatch_host_message(refresh_snapshot_message(
             make_meta(['Sheet1'], false),
@@ -14622,32 +14682,30 @@ describe('snapshots arriving during an in-flight transform', () => {
                 sourceGeneration: 1,
                 reason: 'other',
                 capabilities: CSV_CAPABILITIES,
-                state: { pendingEdits: sheet_edits({ '0:0': { value: 'first', base: 'a' } }) },
+                state: {
+                    pendingEdits: sheet_edits({
+                        '0:0': { value: 'first', base: 'a' },
+                        '1:0': { value: 'live', base: 'b' },
+                    }),
+                },
             },
         ));
-        // A second confirmed edit, typed while the compute is still outstanding.
-        await act(async () => {
-            store().commit('test-edit-session', '2:0', { value: 'second', base: 'c' });
-        });
-        // And a third cell still open in the editor when the ack arrives, which only
-        // the fold can carry across the remount.
-        grid_shell_mock.commit_live_edit.mockImplementation(() => {
-            store().commit('test-edit-session', '1:0', { value: 'live', base: 'b' });
-        });
         const mount_id = grid_stub().getAttribute('data-mount-id');
+        const folds = grid_shell_mock.commit_live_edit.mock.calls.length;
 
         await acknowledge_transform(request, 7);
 
         // The remount really happened, so the survival below is not vacuous.
         expect(grid_stub().getAttribute('data-mount-id')).not.toBe(mount_id);
-        expect(grid_shell_mock.commit_live_edit).toHaveBeenCalledTimes(1);
-        // All three, under the source-row keys they were typed against. Display row 0
+        // The install folded nothing: there was nothing open to fold.
+        expect(grid_shell_mock.commit_live_edit).toHaveBeenCalledTimes(folds);
+        expect(grid_shell_mock.latest_props?.highlight_in_flight).toBe(false);
+        // Both, under the source-row keys they were typed against. Display row 0
         // under this sort is not source row 0, so a display-keyed map would name
         // different cells here.
         expect(store_edits()).toEqual({
             '0:0': { value: 'first', base: 'a' },
             '1:0': { value: 'live', base: 'b' },
-            '2:0': { value: 'second', base: 'c' },
         });
     });
 

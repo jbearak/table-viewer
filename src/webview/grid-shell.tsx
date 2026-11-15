@@ -1269,6 +1269,12 @@ export interface StructuralColumnInsertAdmission {
  * toggle and file-change notice live in App's layout, but the dirty map lives here
  * next to the loader). Populated into a ref App provides.
  */
+/** How a fold of the open cell editor treats an exiting session's fence. */
+export interface LiveEditFoldOptions {
+    /** Fenced with no changed overlay answers true (and dismisses) instead of false. */
+    readonly fenced_empty_ok?: boolean;
+}
+
 export interface EditingHandle {
     /** Fold this sheet's live editor, then ask App to atomically save the workbook. */
     request_save(): boolean;
@@ -1301,12 +1307,27 @@ export interface EditingHandle {
     cancel_tail_removals(append_history_ids: readonly string[]): boolean;
     /** Fence every renderer-side mutation before a host close/reload flush. */
     stop_edit_admission(): void;
-    /** Snapshot the current Glide overlay into the source-keyed dirty map. */
-    commit_live_edit(): boolean;
+    /**
+     * Snapshot the current Glide overlay into the source-keyed dirty map.
+     *
+     * Under an exiting session's fence it answers false before it looks at the
+     * overlay, so it refuses with nothing open. `fenced_empty_ok` asks it to
+     * look first: fenced with a changed overlay still answers false; fenced
+     * with no overlay, or an unchanged one, dismisses the overlay and answers
+     * true, since nothing would be written. Only a caller that must not be
+     * stopped by a fence with nothing behind it passes the option (a view
+     * gesture's fold, a remounting snapshot); every other caller gets the
+     * plain answer.
+     */
+    commit_live_edit(options?: LiveEditFoldOptions): boolean;
     /** Fold the overlay that was open when the close/reload fence was raised, once. */
     commit_live_edit_at_close_barrier(): boolean;
-    /** Commit the overlay and synchronously publish this worksheet's complete map. */
-    flush_live_edit(): boolean;
+    /**
+     * Commit the overlay and synchronously publish this worksheet's complete map.
+     * With `fenced_empty_ok`, fenced and nothing changed answers true without
+     * publishing: publication is what the fence forbids.
+     */
+    flush_live_edit(options?: LiveEditFoldOptions): boolean;
     /** True when there are committed edits or an open editor with changes. */
     has_uncommitted_changes(): boolean;
     /**
@@ -7465,10 +7486,20 @@ export function GridShell({
         save_in_flight_ref,
     ]);
 
-    const commit_live_edit = useCallback((): boolean => {
-        if (edit_admission_is_fenced()) return false;
+    /** Fenced, and the caller accepts a fence with no changed overlay behind it. */
+    const dismiss_unchanged_under_fence = useCallback((options?: LiveEditFoldOptions): boolean => {
+        if (options?.fenced_empty_ok !== true) return false;
+        const live = read_live_edit();
+        if (live && live.value !== live.original) return false;
+        set_live_uncommitted(false);
+        grid_ref.current?.dismissOverlay();
+        return true;
+    }, [read_live_edit]);
+
+    const commit_live_edit = useCallback((options?: LiveEditFoldOptions): boolean => {
+        if (edit_admission_is_fenced()) return dismiss_unchanged_under_fence(options);
         return commit_live_edit_unfenced();
-    }, [commit_live_edit_unfenced, edit_admission_is_fenced]);
+    }, [commit_live_edit_unfenced, dismiss_unchanged_under_fence, edit_admission_is_fenced]);
 
     const commit_live_edit_at_close_barrier = useCallback((): boolean => {
         if (!edit_admission_is_fenced()) return false;
@@ -7477,14 +7508,21 @@ export function GridShell({
         return commit_live_edit_unfenced();
     }, [commit_live_edit_unfenced, edit_activation_id, edit_admission_is_fenced]);
 
-    const flush_live_edit = useCallback((): boolean => {
-        if (edit_admission_is_fenced() || !commit_live_edit_unfenced()) return false;
+    const flush_live_edit = useCallback((options?: LiveEditFoldOptions): boolean => {
+        if (edit_admission_is_fenced()) return dismiss_unchanged_under_fence(options);
+        if (!commit_live_edit_unfenced()) return false;
         const snapshot = store.snapshot();
         post_pending_edits(
             snapshot.size > 0 ? Object.fromEntries(snapshot) : null,
         );
         return true;
-    }, [commit_live_edit_unfenced, edit_admission_is_fenced, post_pending_edits, store]);
+    }, [
+        commit_live_edit_unfenced,
+        dismiss_unchanged_under_fence,
+        edit_admission_is_fenced,
+        post_pending_edits,
+        store,
+    ]);
 
     const has_uncommitted_changes = useCallback((): boolean => {
         if (store.size() > 0) return true;
