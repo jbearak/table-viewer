@@ -15,7 +15,7 @@ import * as path from 'path';
 import { expect, test } from '@playwright/test';
 import type { ElectronApplication, Locator, Page } from '@playwright/test';
 import { parse_xlsx } from '../../src/parse-xlsx';
-import { CHANNEL_HOST_MESSAGE } from '../shared/ipc';
+import { CHANNEL_HOST_MESSAGE, CHANNEL_WEBVIEW_MESSAGE } from '../shared/ipc';
 import { build_fixture_xlsx, cell, row } from '../../src/test/helpers/xlsx-structure-fixture';
 import { isolated_user_data, read_workbook, repo_dir, state_database_path } from './smoke-helpers';
 import {
@@ -51,6 +51,17 @@ test.beforeEach(() => {
 });
 
 test.afterEach(async () => {
+    // A test that failed holding the host's messages would hold up the quit.
+    if (app) {
+        await app.evaluate(() => {
+            const main = globalThis as typeof globalThis & {
+                __held_host_messages?: { replay: () => void }[];
+            };
+            const held = main.__held_host_messages ?? [];
+            main.__held_host_messages = undefined;
+            for (const message of held) message.replay();
+        }).catch(() => {});
+    }
     if (app) await exit_app(app);
     app = undefined;
     fs.rmSync(test_root, { recursive: true, force: true });
@@ -1222,6 +1233,54 @@ async function watch_menu_items(page: Page): Promise<void> {
         };
         state.__menu_observer = new MutationObserver(record);
         state.__menu_observer.observe(document.body, { subtree: true, childList: true, characterData: true });
+        // A menu already open is its first list.
+        record();
+    });
+}
+
+/**
+ * Hold everything the host sends the page from now on, until
+ * `release_host_messages` delivers it in order.
+ */
+async function hold_host_messages(): Promise<void> {
+    await app!.evaluate(({ webContents }, channel) => {
+        const main = globalThis as typeof globalThis & {
+            __held_host_messages?: { type?: string; replay: () => void }[];
+            __host_send_wrapped?: WeakSet<object>;
+        };
+        main.__held_host_messages = [];
+        main.__host_send_wrapped ??= new WeakSet();
+        for (const contents of webContents.getAllWebContents()) {
+            if (main.__host_send_wrapped.has(contents)) continue;
+            main.__host_send_wrapped.add(contents);
+            const send = contents.send.bind(contents);
+            contents.send = (sent_channel: string, ...args: unknown[]) => {
+                const held = main.__held_host_messages;
+                if (sent_channel !== channel || held === undefined) return send(sent_channel, ...args);
+                held.push({
+                    type: (args[0] as { message?: { type?: string } }).message?.type,
+                    replay: () => send(sent_channel, ...args),
+                });
+            };
+        }
+    }, CHANNEL_HOST_MESSAGE);
+}
+
+/** Wait until a held host message of `type` is among those held. */
+async function expect_host_message_held(type: string): Promise<void> {
+    await expect.poll(() => app!.evaluate((_electron, wanted) => (globalThis as typeof globalThis & {
+        __held_host_messages?: { type?: string }[];
+    }).__held_host_messages!.some((message) => message.type === wanted), type)).toBe(true);
+}
+
+async function release_host_messages(): Promise<void> {
+    await app!.evaluate(() => {
+        const main = globalThis as typeof globalThis & {
+            __held_host_messages?: { replay: () => void }[];
+        };
+        const held = main.__held_host_messages!;
+        main.__held_host_messages = undefined;
+        for (const message of held) message.replay();
     });
 }
 
@@ -1304,27 +1363,9 @@ test('a click on a workbook row menu item as first drawn, before the session arr
     // Hold everything the host says from here on, the answer to the menu's
     // session request among it, so the click is sure to come while the
     // session is on its way.
-    await app!.evaluate(({ webContents }, channel) => {
-        const main = globalThis as typeof globalThis & {
-            __held_host_messages?: { type?: string; replay: () => void }[];
-        };
-        main.__held_host_messages = [];
-        for (const contents of webContents.getAllWebContents()) {
-            const send = contents.send.bind(contents);
-            contents.send = (sent_channel: string, ...args: unknown[]) => {
-                const held = main.__held_host_messages;
-                if (sent_channel !== channel || held === undefined) return send(sent_channel, ...args);
-                held.push({
-                    type: (args[0] as { message?: { type?: string } }).message?.type,
-                    replay: () => send(sent_channel, ...args),
-                });
-            };
-        }
-    }, CHANNEL_HOST_MESSAGE);
+    await hold_host_messages();
     const menu = await open_row_menu(page, 0);
-    await expect.poll(() => app!.evaluate(() => (globalThis as typeof globalThis & {
-        __held_host_messages?: { type?: string }[];
-    }).__held_host_messages!.some((message) => message.type === 'editSessionResult'))).toBe(true);
+    await expect_host_message_held('editSessionResult');
     await expect(page.locator('.grid-shell-root')).toHaveAttribute('data-edit-session', 'none');
     // Aimed at "Move rows down" where the menu first drew it.
     const { first_rects } = await menu_watch(page);
@@ -1335,14 +1376,7 @@ test('a click on a workbook row menu item as first drawn, before the session arr
     // ran in its place, and the menu is still open.
     await expect(menu).toBeVisible();
     await expect(save_button(page)).toBeDisabled();
-    await app!.evaluate(() => {
-        const main = globalThis as typeof globalThis & {
-            __held_host_messages?: { replay: () => void }[];
-        };
-        const held = main.__held_host_messages!;
-        main.__held_host_messages = undefined;
-        for (const message of held) message.replay();
-    });
+    await release_host_messages();
     await expect(page.locator('.grid-shell-root')).toHaveAttribute('data-edit-session', 'held');
     await expect(menu.locator('.context-menu-item').filter({
         has: page.locator('.context-menu-label').getByText('Move rows down', { exact: true }),
@@ -1384,4 +1418,268 @@ test('a month typed into an .xlsx mmm-yy date cell keeps the day the cell held',
 
     await expect.poll(async () => (await month())?.formatted).toBe('Jul-23');
     expect(await month()).toMatchObject({ raw: '2023-07-15T00:00:00.000Z', rawType: 'date' });
+});
+
+/** Click a body cell, focusing the grid on it for a keyboard shortcut. */
+async function focus_cell(page: Page, column: number, row: number): Promise<void> {
+    const point = await cell_point(page, column, row);
+    await page.mouse.click(point.x, point.y);
+    await expect.poll(() => page.evaluate(
+        () => document.activeElement?.closest('.grid-shell-root') != null,
+    )).toBe(true);
+}
+
+function menu_item(menu: Locator, label: string): Locator {
+    return menu.locator('.context-menu-item').filter({
+        has: menu.page().locator('.context-menu-label').getByText(label, { exact: true }),
+    });
+}
+
+async function menu_labels(menu: Locator): Promise<string[]> {
+    return menu.locator('.context-menu-item .context-menu-label').allTextContents();
+}
+
+async function close_menu(page: Page): Promise<void> {
+    await page.keyboard.press('Escape');
+    await expect(page.locator('[role="menu"]')).toHaveCount(0);
+    await expect(page.locator('.grid-shell-root')).toHaveAttribute('data-edit-session', 'none');
+    await expect.poll(() => page.evaluate(
+        () => document.activeElement?.closest('.grid-shell-root') != null,
+    )).toBe(true);
+}
+
+/** The cell menu with its Hide submenu open, where "Hide row" is. */
+async function open_cell_hide_menu(page: Page): Promise<Locator> {
+    const menu = await open_cell_menu(page, 0, 1);
+    await menu.getByRole('menuitem', { name: 'Hide', exact: true }).click();
+    await expect(page.getByRole('menuitem', { name: 'Hide column', exact: true })).toBeVisible();
+    return menu;
+}
+
+/** Sort ascending by the column of the cell clicked, and wait for the sort to land. */
+async function sort_by_column(page: Page, column = 1): Promise<void> {
+    await focus_cell(page, column, 1);
+    await page.keyboard.press('Shift+Alt+A');
+    await expect(page.locator('.sort-strip .sort-chip')).toHaveCount(1);
+}
+
+/**
+ * Start a sort or filter change with the host's answer held, so it stays in
+ * flight, and open a menu. The menu offers the items it will offer once the
+ * change lands: `item` disabled, `absent` absent. Landing remounts the grid,
+ * closing the menu; the same menu opened afterwards lists the same items,
+ * `item` now enabled.
+ */
+async function expect_menu_offers_settled_items(page: Page, options: {
+    name: string;
+    start: () => Promise<void>;
+    settled: () => Promise<void>;
+    open: () => Promise<Locator>;
+    item: string;
+    absent?: readonly string[];
+}): Promise<void> {
+    const { name, start, settled, open, item, absent = [] } = options;
+    await hold_host_messages();
+    await start();
+    await expect_host_message_held('transformInstalled');
+    const pending_menu = await open();
+    await expect(menu_item(pending_menu, item)).toHaveAttribute('aria-disabled', 'true');
+    for (const label of absent) await expect(menu_item(pending_menu, label)).toHaveCount(0);
+    const pending_labels = await menu_labels(pending_menu);
+    await release_host_messages();
+    await settled();
+    if (await page.locator('[role="menu"]').count() > 0) await page.keyboard.press('Escape');
+    await expect(page.locator('[role="menu"]')).toHaveCount(0);
+    await expect(page.locator('.grid-shell-root')).toHaveAttribute('data-edit-session', 'none');
+    // The remounted grid takes focus back; a menu opened before then loses it.
+    await expect.poll(() => page.evaluate(
+        () => document.activeElement?.closest('.grid-shell-root') != null,
+    )).toBe(true);
+    const menu = await open();
+    await expect(menu_item(menu, item)).not.toHaveAttribute('aria-disabled', 'true');
+    await expect(page.locator('.grid-shell-root')).toHaveAttribute('data-edit-session', 'held');
+    expect(await menu_labels(menu), `${name} offered while the change was in flight what it offers once landed`)
+        .toEqual(pending_labels);
+    await close_menu(page);
+}
+
+/**
+ * Keep the page's next sort or filter request from reaching the host, as if
+ * the host were still computing it. Its Cancel then asks for the rules the
+ * host already holds, which the host acknowledges without remounting the grid.
+ */
+async function withhold_next_transform_request(): Promise<void> {
+    await app!.evaluate(({ ipcMain }, channel) => {
+        const main = globalThis as typeof globalThis & {
+            __withhold_transform?: boolean;
+            __transform_withholder?: boolean;
+        };
+        main.__withhold_transform = true;
+        if (main.__transform_withholder) return;
+        main.__transform_withholder = true;
+        const listeners = ipcMain.listeners(channel) as ((...args: unknown[]) => void)[];
+        ipcMain.removeAllListeners(channel);
+        ipcMain.on(channel, (...args: unknown[]) => {
+            const message = (args[1] as { message?: { type?: string; intent?: string } })?.message;
+            if (main.__withhold_transform && message?.type === 'setTransform' && message.intent !== 'cancel') {
+                main.__withhold_transform = false;
+                return;
+            }
+            for (const listener of listeners) listener(...args);
+        });
+    }, CHANNEL_WEBVIEW_MESSAGE);
+}
+
+/**
+ * Open a menu while a cancelled sort or filter change is in flight, then let
+ * the cancel's answer through. The menu stays open and shows one list of
+ * items throughout: `item` disabled while the cancel is in flight and enabled
+ * once it lands, and nothing appears, vanishes, or moves as it lands.
+ */
+async function expect_menu_steady_through_cancel(page: Page, options: {
+    name: string;
+    change: () => Promise<void>;
+    open: () => Promise<Locator>;
+    item: string;
+    absent?: readonly string[];
+}): Promise<void> {
+    const { name, change, open, item, absent = [] } = options;
+    const root = page.locator('.grid-shell-root');
+    await withhold_next_transform_request();
+    await change();
+    const cancel = page.locator('.toolbar-cancel', { hasText: 'Cancel' });
+    await expect(cancel).toBeEnabled();
+    await hold_host_messages();
+    await cancel.click();
+    await expect_host_message_held('transformInstalled');
+    const menu = await open();
+    await watch_menu_items(page);
+    await expect(menu_item(menu, item)).toHaveAttribute('aria-disabled', 'true');
+    await release_host_messages();
+    await expect(menu_item(menu, item)).not.toHaveAttribute('aria-disabled', 'true');
+    await expect(root).toHaveAttribute('data-edit-session', 'held');
+    for (const label of absent) await expect(menu_item(menu, label)).toHaveCount(0);
+    const { lists, first_rects } = await menu_watch(page);
+    expect(lists, `${name} showed one list of items`).toHaveLength(1);
+    const items = menu.locator('.context-menu-item');
+    for (let index = 0; index < await items.count(); index += 1) {
+        const entry = items.nth(index);
+        const label = await entry.locator('.context-menu-label').textContent() ?? '';
+        const top = await entry.evaluate((element) => element.getBoundingClientRect().top);
+        expect(top, `${name}: "${label}" stayed where it was first drawn`).toBe(first_rects[label]);
+    }
+    await close_menu(page);
+}
+
+function open_basic_xlsx(): Promise<{ file: string; page: Page }> {
+    return open_file(
+        'basic.xlsx',
+        fs.readFileSync(path.join(repo_dir, 'src', 'test', 'fixtures', 'basic.xlsx')),
+    );
+}
+
+const sort_chips = (page: Page) => page.locator('.sort-strip .sort-chip');
+
+test('a workbook menu opened while a sort is added offers the items it offers once the sort lands', async () => {
+    const { page } = await open_basic_xlsx();
+    await wait_for_grid(page);
+    // Row 2: a click where the cell menu was just opened would be a double-click.
+    // Column 0 after the first sort: a sorted grid may size its columns anew.
+    const add_sort = async (key: string, column = 1) => {
+        await focus_cell(page, column, 2);
+        await page.keyboard.press(key);
+    };
+    // A sorted view offers no "Use row as header": not while the sort is in
+    // flight either.
+    await expect_menu_offers_settled_items(page, {
+        name: 'the row menu',
+        start: () => add_sort('Shift+Alt+A'),
+        settled: () => expect(sort_chips(page)).toHaveCount(1),
+        open: () => open_row_menu(page, 0),
+        item: 'Hide row',
+        absent: ['Use row as header'],
+    });
+    await expect_menu_offers_settled_items(page, {
+        name: 'the cell menu',
+        start: () => add_sort('Shift+Alt+D', 0),
+        settled: () => expect(page.getByRole('button', { name: /^Sort key 1: Name, descending/ })).toHaveCount(1),
+        open: () => open_cell_hide_menu(page),
+        item: 'Hide row',
+    });
+    // The column's own sort items follow the sort that is landing.
+    await expect_menu_offers_settled_items(page, {
+        name: 'the column menu',
+        start: () => add_sort('Shift+Alt+A', 0),
+        settled: () => expect(page.getByRole('button', { name: /^Sort key 1: Name, ascending/ })).toHaveCount(1),
+        open: () => open_column_menu(page, 0),
+        item: 'Clear sort on this column',
+    });
+});
+
+test('a workbook menu opened while its only sort is cleared offers the items it offers once the change lands', async () => {
+    const { page } = await open_basic_xlsx();
+    await wait_for_grid(page);
+    const clear_sorts = async () => {
+        await focus_cell(page, 1, 1);
+        await page.keyboard.press('Shift+Alt+0');
+    };
+    const cleared = () => expect(sort_chips(page)).toHaveCount(0);
+    // With the sort cleared the view offers "Use row as header": shown,
+    // disabled, while the change is in flight.
+    for (const { name, open, item, absent } of [
+        { name: 'the row menu', open: () => open_row_menu(page, 0), item: 'Use row as header' },
+        { name: 'the row menu', open: () => open_row_menu(page, 1), item: 'Hide row' },
+        { name: 'the cell menu', open: () => open_cell_hide_menu(page), item: 'Hide row' },
+        {
+            name: 'the column menu',
+            open: () => open_column_menu(page, 1),
+            item: 'Sort ascending',
+            absent: ['Clear sort on this column', 'Clear all sorts'],
+        },
+    ]) {
+        await sort_by_column(page);
+        await expect_menu_offers_settled_items(page, {
+            name, start: clear_sorts, settled: cleared, open, item, ...(absent ? { absent } : {}),
+        });
+    }
+});
+
+test('a workbook menu opened while a sort is cancelled keeps its items as the cancel lands', async () => {
+    const { page } = await open_basic_xlsx();
+    await wait_for_grid(page);
+    // Sorted and cleared again, so the host holds an empty view to go back to.
+    await sort_by_column(page);
+    await focus_cell(page, 1, 1);
+    await page.keyboard.press('Shift+Alt+0');
+    await expect(sort_chips(page)).toHaveCount(0);
+    const add_sort = async () => {
+        await focus_cell(page, 1, 1);
+        await page.keyboard.press('Shift+Alt+A');
+    };
+    await expect_menu_steady_through_cancel(page, {
+        name: 'the row menu',
+        change: add_sort,
+        open: () => open_row_menu(page, 0),
+        item: 'Use row as header',
+    });
+    await expect_menu_steady_through_cancel(page, {
+        name: 'the row menu',
+        change: add_sort,
+        open: () => open_row_menu(page, 1),
+        item: 'Hide row',
+    });
+    await expect_menu_steady_through_cancel(page, {
+        name: 'the cell menu',
+        change: add_sort,
+        open: () => open_cell_hide_menu(page),
+        item: 'Hide row',
+    });
+    await expect_menu_steady_through_cancel(page, {
+        name: 'the column menu',
+        change: add_sort,
+        open: () => open_column_menu(page, 1),
+        item: 'Sort ascending',
+        absent: ['Clear sort on this column', 'Clear all sorts'],
+    });
+    await expect(sort_chips(page)).toHaveCount(0);
 });

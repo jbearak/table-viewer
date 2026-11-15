@@ -3738,6 +3738,71 @@ describe('GridShell column projection', () => {
         expect(menu_button_labels()).not.toContain('Use row as header');
     });
 
+    describe('while a sort or filter is in flight', () => {
+        const sorted: SheetTransformState = { sort: [{ colIndex: 0, direction: 'asc' }], filters: [] };
+        const unsorted: SheetTransformState = { sort: [], filters: [] };
+        const header_meta = () => ({
+            ...props().sheet_meta,
+            rowCount: 4,
+            sourceRowCount: 4,
+            excelFirstRowHeader: {
+                mode: 'off' as const, detected: false, active: false, available: true,
+            },
+        });
+        const item = (label: string) => Array.from(document.querySelectorAll('button'))
+            .find((button) => button.querySelector('.context-menu-label')?.textContent === label);
+
+        it('offers row promotion by the rules being installed, disabled until they land', async () => {
+            await open_row_marker_menu({
+                sheet_meta: header_meta(),
+                transform_state: sorted,
+                transform_pending: true,
+                pending_transform_target: unsorted,
+                can_promote_row_to_header: true,
+            });
+            expect(item('Use row as header')?.getAttribute('aria-disabled')).toBe('true');
+            const hide = item('Hide row')!;
+            expect(hide.getAttribute('aria-disabled')).toBe('true');
+            expect(hide.getAttribute('aria-description')).toBe('Wait for the current change to finish.');
+        });
+
+        it('omits row promotion when the rules being installed sort the rows', async () => {
+            await open_row_marker_menu({
+                sheet_meta: header_meta(),
+                transform_state: unsorted,
+                transform_pending: true,
+                pending_transform_target: sorted,
+                can_promote_row_to_header: true,
+            });
+            expect(item('Use row as header')).toBeUndefined();
+            expect(item('Hide row')?.getAttribute('aria-disabled')).toBe('true');
+        });
+
+        it('disables row promotion while another sheet\'s transform is in flight', async () => {
+            await open_row_marker_menu({
+                sheet_meta: header_meta(),
+                can_promote_row_to_header: true,
+                promote_row_to_header_waits: true,
+            });
+            expect(item('Use row as header')?.getAttribute('aria-disabled')).toBe('true');
+            expect(item('Hide row')?.getAttribute('aria-disabled')).toBeNull();
+        });
+
+        it('offers a column\'s sort items by the sort being installed', async () => {
+            await render_grid(props({ transform_sections: true, transform_state: unsorted, transform_pending: true, pending_transform_target: sorted }));
+            const on_header_context_menu = grid_mock.props!.onHeaderContextMenu as
+                (column: number, event: Record<string, unknown>) => void;
+            await act(async () => on_header_context_menu(0, {
+                preventDefault: vi.fn(),
+                bounds: { x: 0, y: 0, width: 100, height: 36 },
+                localEventX: 20,
+                localEventY: 10,
+            }));
+            expect(item('Clear sort on this column')?.getAttribute('aria-disabled')).toBe('true');
+            expect(item('Clear all sorts')?.getAttribute('aria-disabled')).toBe('true');
+        });
+    });
+
     it('preserves an inside multi-row marker selection and hides its coalesced intervals', async () => {
         const on_hide_rows = vi.fn();
         await render_grid(props({
