@@ -29,6 +29,8 @@ export interface CellContextMenuModelProps {
     /** Set when this cell's hyperlink is editable (editing session held, resolved source
      *  identity, a sheet whose format carries links). Opens the dialog. */
     on_edit_hyperlink?: () => void;
+    /** Shown but not yet admitted: the session the menu acquires is on its way. */
+    edit_hyperlink_disabled?: boolean;
     /** True when the cell already has a link, which only changes the wording:
      *  the dialog itself handles both adding and clearing. */
     has_hyperlink?: boolean;
@@ -164,6 +166,7 @@ export function cell_context_menu_items(props: CellContextMenuModelProps): MenuI
             {
                 label: props.has_hyperlink ? 'Edit hyperlink…' : 'Hyperlink…',
                 on_click: () => on_edit_hyperlink(),
+                ...(props.edit_hyperlink_disabled ? { disabled: true } : {}),
             },
         );
     }

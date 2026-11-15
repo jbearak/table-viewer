@@ -136,6 +136,7 @@ Hide >
 ## header menu, column B (Column actions for B name)
 Copy column
 Hide column
+Rename column…  [disabled: Only new columns can be renamed on this sheet.]
 ---
 Insert column left  [disabled: Wait for the current change to finish.]
 Insert column right  [disabled: Wait for the current change to finish.]
@@ -151,6 +152,7 @@ Filter…
 ## header menu, first column (Column actions for A name)
 Copy column
 Hide column
+Rename column…  [disabled: Only new columns can be renamed on this sheet.]
 ---
 Insert column left  [disabled: Wait for the current change to finish.]
 Insert column right  [disabled: Wait for the current change to finish.]
