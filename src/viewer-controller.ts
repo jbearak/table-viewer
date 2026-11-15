@@ -9023,14 +9023,21 @@ export function attach_viewer(
      */
     let header_settlement_waiter: {
         readonly requestId: string;
-        readonly sheetIndex: number;
+        /** The worksheet whose header changed: the reload may have moved it. */
+        readonly sheetName: string;
+        readonly worksheetId?: string;
         readonly error?: string;
     } | undefined;
 
-    function park_header_settlement(request_id: string, sheet_index: number, error?: string): void {
+    function park_header_settlement(
+        request_id: string,
+        sheet: { readonly name: string; readonly worksheetId?: string },
+        error?: string,
+    ): void {
         header_settlement_waiter = {
             requestId: request_id,
-            sheetIndex: sheet_index,
+            sheetName: sheet.name,
+            ...(sheet.worksheetId === undefined ? {} : { worksheetId: sheet.worksheetId }),
             ...(error === undefined ? {} : { error }),
         };
     }
@@ -9040,7 +9047,21 @@ export function attach_viewer(
         const waiter = header_settlement_waiter;
         if (waiter === undefined) return;
         header_settlement_waiter = undefined;
-        adopt_header_rebased_ledger((state as PerFileState).pendingEdits, waiter.sheetIndex);
+        // Found by identity in the adopted projection, never by the index the
+        // request named: a reload that reordered the workbook would otherwise
+        // move another worksheet's ledger. A worksheet that is gone moves none.
+        const sheets = source?.meta().sheets ?? [];
+        const sheet_index = sheets.findIndex((sheet) => (
+            waiter.worksheetId !== undefined && sheet.worksheetId !== undefined
+                ? sheet.worksheetId === waiter.worksheetId
+                : sheet.name === waiter.sheetName
+        ));
+        if (sheet_index >= 0) {
+            adopt_header_rebased_ledger(
+                normalize_host_state(state, sheets).pendingEdits,
+                sheet_index,
+            );
+        }
         session.retain_command_result({
             type: 'excelFirstRowHeader',
             requestId: waiter.requestId,
@@ -9220,7 +9241,7 @@ export function attach_viewer(
                     if (is_origin) {
                         park_header_settlement(
                             receipt.requestId,
-                            receipt.sheetIndex,
+                            { name: receipt.sheetName },
                             'The header setting was saved after rebuilding the workbook view.',
                         );
                     }
@@ -9230,7 +9251,7 @@ export function attach_viewer(
                     if (is_origin) {
                         park_header_settlement(
                             receipt.requestId,
-                            receipt.sheetIndex,
+                            { name: receipt.sheetName },
                             'The header setting was saved after rebuilding the workbook view.',
                         );
                     }
@@ -13381,6 +13402,7 @@ export function attach_viewer(
                 }
                 try {
                     const command_source = source;
+                    const command_sheet = command_source.meta().sheets[msg.sheetIndex];
                     const expected_physical_revision = source_authority.physicalRevision;
                     const expected_physical_digest = source_authority.physicalDigest;
                     const planning_input = command_source.planning_input();
@@ -13412,7 +13434,13 @@ export function attach_viewer(
                         // Whether the header was stored is settled by the recovery
                         // reload; the result rides that adoption, not an earlier
                         // snapshot of a projection that may be stale.
-                        park_header_settlement(msg.requestId, msg.sheetIndex, result.error);
+                        park_header_settlement(msg.requestId, {
+                            name: msg.sheetName,
+                            ...(command_sheet?.name !== msg.sheetName
+                                || command_sheet.worksheetId === undefined
+                                ? {}
+                                : { worksheetId: command_sheet.worksheetId }),
+                        }, result.error);
                     } else if (result.type === 'rejected' && !disposed) {
                         fail(result.error);
                         if (

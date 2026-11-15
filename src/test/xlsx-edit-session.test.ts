@@ -8345,6 +8345,143 @@ describe('xlsx edit sessions', () => {
         expect(state.get_state(file_path).pendingEdits?.[0]?.appendedRows)
             .toEqual([row]);
     });
+    it('moves the append ledger of the worksheet whose header changed when a fallback reload reorders the workbook', async () => {
+        // The header receipt can't be applied in place, so the header change
+        // settles on the reload's adoption. That reload sees the workbook
+        // reordered: People, whose header changed, now sits at index 1. Its
+        // ledger must take the committed append basis, or the next publication
+        // of that basis is refused as unauthorized.
+        const state = versioned_state_store({});
+        const base_profile = profile_for(file_path);
+        let builds = 0;
+        const panel = await open_ready_xlsx(file_path, state, {
+            ...base_profile,
+            async build_source(...args: Parameters<typeof base_profile.build_source>) {
+                const built = await base_profile.build_source(...args);
+                builds += 1;
+                if (builds === 1) {
+                    (built as unknown as { set_override(): boolean }).set_override = () => false;
+                }
+                return built;
+            },
+        });
+        await panel.__receive({ type: 'requestEditSession', requestId: 'edit', sheetIndex: 0 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+        await panel.__receive({
+            type: 'requestAppendRows',
+            requestId: 'append-before-header',
+            editSessionId: session,
+            worksheet: { sheetIndex: 0, sheetName: 'People', worksheetId: '1' },
+            sourceGeneration: latest_snapshot(panel).sourceGeneration,
+            count: 1,
+        });
+        const admission = panel.__messages.find((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { type?: unknown }).type === 'appendRowsResult'
+            && (message as { requestId?: unknown }).requestId === 'append-before-header'
+        )) as Extract<import('../types').HostMessage, { type: 'appendRowsResult' }>;
+        expect(admission.granted, admission.reason).toBe(true);
+        await panel.__receive({
+            type: 'settleRowAdmission',
+            requestId: 'append-before-header',
+            editSessionId: session,
+            accepted: true,
+        });
+        const appended_row = {
+            id: admission.rowIds![0],
+            cells: {},
+            formatTemplateId: admission.formatTemplate!.id,
+            createdOrder: 1,
+        };
+        await panel.__receive({
+            type: 'pendingChangesChanged',
+            sourceGeneration: latest_snapshot(panel).sourceGeneration,
+            editSessionId: session,
+            sequence: 1,
+            changes: {
+                sheetIndex: 0,
+                sheetName: 'People',
+                worksheetId: '1',
+                cells: {},
+                formatTemplates: [admission.formatTemplate!],
+                appendedRows: [appended_row],
+                tailRemovals: [],
+                appendBasis: admission.appendBasis!,
+                conflicts: [],
+            },
+        });
+        await controller_of(panel).drain();
+        expect(panel.__messages).toContainEqual({
+            type: 'pendingChangesAcknowledged',
+            editSessionId: session,
+            sequence: 1,
+        });
+        const before_header = latest_snapshot(panel);
+        await panel.__receive({
+            type: 'snapshotApplied',
+            identity: before_header.identity,
+            disposition: 'applied',
+        });
+        expect(before_header.meta.sheets[0].excelFirstRowHeader?.active).toBe(true);
+
+        bytes = swap_sheet_order(bytes);
+        await panel.__receive({
+            type: 'setExcelFirstRowHeader',
+            sheetIndex: 0,
+            sheetName: 'People',
+            enabled: false,
+            requestId: 'header-off',
+            generation: before_header.generation,
+            sourceGeneration: before_header.sourceGeneration,
+        });
+        await wait_for_observable(() => panel.__messages.some((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { type?: unknown }).type === 'workbookSnapshot'
+            && (message as { snapshot: { commandResult?: { requestId?: string; outcome?: string } } })
+                .snapshot.commandResult?.requestId === 'header-off'
+        )));
+        const recovered = latest_snapshot(panel) as ReturnType<typeof latest_snapshot> & {
+            commandResult?: { outcome?: string };
+        };
+        expect(recovered.commandResult?.outcome).toBe('recovered');
+        expect(sheet_names(panel)).toEqual(['Inventory', 'People']);
+        const committed = state.get_state(file_path).pendingEdits!
+            .find((slot) => slot?.sheetName === 'People')!;
+        expect(committed.appendBasis).toBeDefined();
+        expect(committed.appendBasis!.schemaFingerprint)
+            .not.toBe(admission.appendBasis!.schemaFingerprint);
+        await panel.__receive({
+            type: 'snapshotApplied',
+            identity: recovered.identity,
+            disposition: 'applied',
+        });
+
+        await panel.__receive({
+            type: 'pendingChangesChanged',
+            sourceGeneration: recovered.sourceGeneration,
+            editSessionId: session,
+            sequence: 2,
+            changes: {
+                sheetIndex: 1,
+                sheetName: 'People',
+                worksheetId: '1',
+                cells: { '1:0': { value: 'Alicia', base: 'Alice' } },
+                formatTemplates: [admission.formatTemplate!],
+                appendedRows: [appended_row],
+                tailRemovals: [],
+                appendBasis: committed.appendBasis!,
+                conflicts: [],
+            },
+        });
+        await controller_of(panel).drain();
+        expect(panel.__messages).toContainEqual({
+            type: 'pendingChangesAcknowledged',
+            editSessionId: session,
+            sequence: 2,
+        });
+    });
 });
 
 function rewrite_workbook_xml(
