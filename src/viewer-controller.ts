@@ -9289,7 +9289,12 @@ export function attach_viewer(
                     if (is_origin) {
                         park_header_settlement(
                             receipt.requestId,
-                            { name: receipt.sheetName },
+                            {
+                                name: receipt.sheetName,
+                                ...(receipt.worksheetId === undefined
+                                    ? {}
+                                    : { worksheetId: receipt.worksheetId }),
+                            },
                             'The header setting was saved after rebuilding the workbook view.',
                         );
                     }
@@ -9299,7 +9304,12 @@ export function attach_viewer(
                     if (is_origin) {
                         park_header_settlement(
                             receipt.requestId,
-                            { name: receipt.sheetName },
+                            {
+                                name: receipt.sheetName,
+                                ...(receipt.worksheetId === undefined
+                                    ? {}
+                                    : { worksheetId: receipt.worksheetId }),
+                            },
                             'The header setting was saved after rebuilding the workbook view.',
                         );
                     }
@@ -13451,6 +13461,9 @@ export function attach_viewer(
                 try {
                     const command_source = source;
                     const command_sheet = command_source.meta().sheets[msg.sheetIndex];
+                    const command_worksheet_id = command_sheet?.name === msg.sheetName
+                        ? command_sheet.worksheetId
+                        : undefined;
                     const expected_physical_revision = source_authority.physicalRevision;
                     const expected_physical_digest = source_authority.physicalDigest;
                     const planning_input = command_source.planning_input();
@@ -13468,6 +13481,9 @@ export function attach_viewer(
                         requestId: msg.requestId,
                         sheetIndex: msg.sheetIndex,
                         sheetName: msg.sheetName,
+                        ...(command_worksheet_id === undefined
+                            ? {}
+                            : { worksheetId: command_worksheet_id }),
                         override: msg.enabled ? 'on' : 'off',
                         originToken: excel_header_subscriber_token,
                         expectedPhysicalRevision: expected_physical_revision,
@@ -13484,10 +13500,9 @@ export function attach_viewer(
                         // snapshot of a projection that may be stale.
                         park_header_settlement(msg.requestId, {
                             name: msg.sheetName,
-                            ...(command_sheet?.name !== msg.sheetName
-                                || command_sheet.worksheetId === undefined
+                            ...(command_worksheet_id === undefined
                                 ? {}
-                                : { worksheetId: command_sheet.worksheetId }),
+                                : { worksheetId: command_worksheet_id }),
                         }, result.error);
                     } else if (result.type === 'rejected' && !disposed) {
                         // Admission is asked again at every commit step; a refusal

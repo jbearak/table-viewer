@@ -8345,13 +8345,20 @@ describe('xlsx edit sessions', () => {
         expect(state.get_state(file_path).pendingEdits?.[0]?.appendedRows)
             .toEqual([row]);
     });
-    it('moves the append ledger of the worksheet whose header changed when a fallback reload reorders the workbook', async () => {
-        // The header receipt can't be applied in place, so the header change
-        // settles on the reload's adoption. That reload sees the workbook
-        // reordered: People, whose header changed, now sits at index 1. Its
-        // ledger must take the committed append basis, or the next publication
-        // of that basis is refused as unauthorized.
-        const state = versioned_state_store({});
+
+    /**
+     * The header receipt can't be applied in place, so the header change
+     * settles on the reload's adoption. That reload sees `reshape`'s workbook,
+     * where People (worksheet 1), whose header changed, is `moved`. Its ledger
+     * must take the committed append basis, or the next publication of that
+     * basis is refused as unauthorized.
+     */
+    async function header_change_through_reshaping_reload(
+        reshape: (zip: Uint8Array) => Uint8Array,
+        moved: { sheetIndex: number; sheetName: string; sheetNames: string[] },
+        initial_state: PerFileState = {},
+    ) {
+        const state = versioned_state_store(initial_state);
         const base_profile = profile_for(file_path);
         let builds = 0;
         const panel = await open_ready_xlsx(file_path, state, {
@@ -8425,7 +8432,7 @@ describe('xlsx edit sessions', () => {
         });
         expect(before_header.meta.sheets[0].excelFirstRowHeader?.active).toBe(true);
 
-        bytes = swap_sheet_order(bytes);
+        bytes = reshape(bytes);
         await panel.__receive({
             type: 'setExcelFirstRowHeader',
             sheetIndex: 0,
@@ -8446,9 +8453,9 @@ describe('xlsx edit sessions', () => {
             commandResult?: { outcome?: string };
         };
         expect(recovered.commandResult?.outcome).toBe('recovered');
-        expect(sheet_names(panel)).toEqual(['Inventory', 'People']);
+        expect(sheet_names(panel)).toEqual(moved.sheetNames);
         const committed = state.get_state(file_path).pendingEdits!
-            .find((slot) => slot?.sheetName === 'People')!;
+            .find((slot) => slot?.worksheetId === '1')!;
         expect(committed.appendBasis).toBeDefined();
         expect(committed.appendBasis!.schemaFingerprint)
             .not.toBe(admission.appendBasis!.schemaFingerprint);
@@ -8464,8 +8471,8 @@ describe('xlsx edit sessions', () => {
             editSessionId: session,
             sequence: 2,
             changes: {
-                sheetIndex: 1,
-                sheetName: 'People',
+                sheetIndex: moved.sheetIndex,
+                sheetName: moved.sheetName,
                 worksheetId: '1',
                 cells: { '1:0': { value: 'Alicia', base: 'Alice' } },
                 formatTemplates: [admission.formatTemplate!],
@@ -8481,6 +8488,24 @@ describe('xlsx edit sessions', () => {
             editSessionId: session,
             sequence: 2,
         });
+    }
+
+    it('moves the append ledger of the worksheet whose header changed when a fallback reload reorders the workbook', async () => {
+        await header_change_through_reshaping_reload(swap_sheet_order, {
+            sheetIndex: 1,
+            sheetName: 'People',
+            sheetNames: ['Inventory', 'People'],
+        });
+    });
+
+    it('moves the append ledger of the worksheet whose header changed when a fallback reload renames it', async () => {
+        // Found by its worksheet ID, not by the name the request carried. The
+        // remembered override keeps the renamed sheet's header off.
+        await header_change_through_reshaping_reload(
+            (zip) => rewrite_workbook_xml(zip, (xml) => xml.replace('name="People"', 'name="Renamed"')),
+            { sheetIndex: 0, sheetName: 'Renamed', sheetNames: ['Renamed', 'Inventory'] },
+            { excelFirstRowHeaders: { Renamed: 'off' } },
+        );
     });
 
     it('marks a header change refused mid-commit, because edit-session work began, as transient', async () => {

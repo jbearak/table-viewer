@@ -112,6 +112,8 @@ export interface ExcelHeaderOperationReceipt extends ProjectionAuthorityCommitRe
     readonly requestId: string;
     readonly sheetIndex: number;
     readonly sheetName: string;
+    /** The worksheet's stable identity when it has one: a reload can rename or move it. */
+    readonly worksheetId?: string;
     readonly override: ExcelHeaderOverride;
     readonly originToken: symbol;
 }
@@ -125,6 +127,7 @@ export interface CommitExcelHeaderCommand {
     readonly requestId: string;
     readonly sheetIndex: number;
     readonly sheetName: string;
+    readonly worksheetId?: string;
     readonly override: ExcelHeaderOverride;
     readonly clearHiddenRows?: boolean;
     readonly headerSourceRow?: number;
@@ -1401,6 +1404,9 @@ export function acquire_file_coordinator(
                         requestId: command.requestId,
                         sheetIndex: command.sheetIndex,
                         sheetName: command.sheetName,
+                        ...(command.worksheetId === undefined
+                            ? {}
+                            : { worksheetId: command.worksheetId }),
                         override: command.override,
                         originToken: command.originToken,
                     });
