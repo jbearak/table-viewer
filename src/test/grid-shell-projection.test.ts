@@ -9686,12 +9686,30 @@ describe('row Insert in the row-gutter menu', () => {
         document.body.innerHTML = '';
         request.mockClear();
 
-        await render_grid({ ...armed, view_request_in_flight: true });
+        const GridShell = await render_grid({ ...armed, view_request_in_flight: true });
         await open_row_menu(1);
 
         expect(menu_button_labels()).toEqual(settled);
         expect(menu_item('Insert row above')!.getAttribute('aria-disabled')).toBe('true');
         expect(request).not.toHaveBeenCalled();
+
+        // The request lands with the menu still open: now the menu asks for
+        // the session, and the grant enables its items where they are.
+        await act(async () => {
+            root!.render(React.createElement(GridShell, { ...armed, view_request_in_flight: false }));
+        });
+        expect(request).toHaveBeenCalledTimes(1);
+        expect(menu_button_labels()).toEqual(settled);
+        await act(async () => {
+            root!.render(React.createElement(GridShell, {
+                ...armed,
+                editing_session_held: true,
+                edit_session_id: 'session',
+                on_request_edit_session: undefined,
+            }));
+        });
+        expect(menu_button_labels()).toEqual(settled);
+        expect(menu_item('Insert row above')!.getAttribute('aria-disabled')).toBeNull();
     });
 
     /** Install one inserted row after source row 0 through the grid's own gesture. */

@@ -7997,6 +7997,9 @@ export function App(): React.JSX.Element {
         const blocked = transform_sheet_index === undefined
             ? !edit_gestures_admitted()
             : transform_request_blocked();
+        // With nothing folded this refusal is silent, as it always was (a
+        // click behind a save or a replay in flight). After a fold it is not:
+        // the click did commit the edit, and only the gesture is left to repeat.
         if (blocked && fold === 'folded') show_warning(VIEW_GESTURE_WAIT_MESSAGE);
         return !blocked;
     }, [edit_gestures_admitted, fold_before_view_request, show_warning, transform_request_blocked]);
