@@ -9130,6 +9130,78 @@ describe('row Delete and Restore in the row-gutter menu', () => {
         expect(on_edit_session_idle).toHaveBeenCalled();
     });
 
+    /** A session request the test answers, and a rerender as App's grant causes. */
+    const quiet_session = async (overrides: Partial<GridShellProps> = {}) => {
+        let settle!: (granted: boolean) => void;
+        const request = vi.fn((_quiet?: boolean) => new Promise<boolean>((resolve) => { settle = resolve; }));
+        const editing_ref = React.createRef<EditingHandle | null>();
+        const on_edit_session_idle = vi.fn();
+        const initial = structure_props({
+            structural_support: supported,
+            editing_session_held: false,
+            edit_session_id: undefined,
+            editing_ref,
+            on_request_edit_session: request,
+            on_edit_session_idle,
+            ...overrides,
+        });
+        const GridShell = await render_grid(initial);
+        const grant = async () => {
+            await act(async () => settle(true));
+            await act(async () => {
+                root!.render(React.createElement(GridShell, {
+                    ...initial,
+                    editing_session_held: true,
+                    edit_session_id: 'session',
+                    on_request_edit_session: undefined,
+                }));
+            });
+            await act(async () => { await Promise.resolve(); });
+        };
+        return { request, editing_ref, on_edit_session_idle, grant };
+    };
+
+    it.each([
+        ['row', 'canMoveRows'],
+        ['column', 'canMoveColumns'],
+    ] as const)('lets go of the session a %s press acquired when the button came up before the grant', async (_kind, prop) => {
+        const { request, editing_ref, on_edit_session_idle, grant } = await quiet_session();
+
+        const can_move = grid_mock.props![prop] as (block: { start: number; end: number }) => boolean;
+        expect(can_move({ start: 1, end: 1 })).toBe(true);
+        expect(request).toHaveBeenCalledWith(true);
+        // A click: the button is up before the host answers.
+        on_edit_session_idle.mockClear();
+        window.dispatchEvent(new Event('mouseup'));
+        await vi.waitFor(() => expect(on_edit_session_idle).toHaveBeenCalled());
+        // App asked too early: the request was still in flight.
+        expect(editing_ref.current!.session_busy()).toBe(true);
+        on_edit_session_idle.mockClear();
+
+        await grant();
+        expect(editing_ref.current!.session_busy()).toBe(false);
+        expect(on_edit_session_idle).toHaveBeenCalled();
+    });
+
+    it('lets go of the session a menu acquired when it closed before the grant', async () => {
+        const { request, editing_ref, on_edit_session_idle, grant } = await quiet_session();
+
+        await open_row_menu(1);
+        expect(request).toHaveBeenCalledWith(true);
+        on_edit_session_idle.mockClear();
+        await act(async () => {
+            document.body.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+        });
+        expect(menu_button_labels()).toEqual([]);
+        await vi.waitFor(() => expect(on_edit_session_idle).toHaveBeenCalled());
+        expect(editing_ref.current!.session_busy()).toBe(true);
+        on_edit_session_idle.mockClear();
+
+        await grant();
+        expect(editing_ref.current!.session_busy()).toBe(false);
+        expect(on_edit_session_idle).toHaveBeenCalled();
+    });
+
     it('deletes a row with its cell edits as one action, shows it removed, and restores it', async () => {
         const cells = create_edit_session_store({ session_id: 'session' }, {
             '1:0': { value: 'edited', base: 'source-a' },

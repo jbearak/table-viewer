@@ -1049,3 +1049,97 @@ test('Escape closes a workbook row menu that gains "Use row as header" as it ope
     await expect(page.locator('.grid-shell-root')).toHaveAttribute('data-edit-session', 'none');
     await expect(page.getByRole('button', { name: 'Diff' })).toHaveCount(0);
 });
+
+/**
+ * Record, from the page, whether the grid holds the editing session at any
+ * moment from now on. A release that never comes cannot be told apart from a
+ * grant still on its way by polling for 'none' alone; seen held first, it can.
+ */
+async function watch_session_held(page: Page): Promise<void> {
+    await page.evaluate(() => {
+        const state = window as typeof window & { __session_held_seen?: boolean };
+        state.__session_held_seen = false;
+        const held = () => document.querySelector('.grid-shell-root[data-edit-session="held"]') !== null;
+        new MutationObserver((records) => {
+            if (held() || records.some((record) => record.oldValue === 'held')) state.__session_held_seen = true;
+        }).observe(document.body, {
+            subtree: true,
+            childList: true,
+            attributes: true,
+            attributeFilter: ['data-edit-session'],
+            attributeOldValue: true,
+        });
+        if (held()) state.__session_held_seen = true;
+    });
+}
+
+/** The session the gesture acquired was held, and has been let go. */
+async function expect_session_let_go(page: Page): Promise<void> {
+    await expect.poll(() => page.evaluate(
+        () => (window as typeof window & { __session_held_seen?: boolean }).__session_held_seen,
+    ), { timeout: 15_000 }).toBe(true);
+    await expect(page.locator('.grid-shell-root')).toHaveAttribute('data-edit-session', 'none');
+}
+
+test('a click on a selected row number or column header, released before the session arrives, is no edit', async () => {
+    const { file, page } = await open_file('fruit.csv', 'name,qty\napple,1\nbanana,2\n');
+    await wait_for_grid(page);
+    const root = page.locator('.grid-shell-root');
+    for (const [select, point] of [
+        [() => select_row(page, 1), () => row_marker_point(page, 1)],
+        [() => select_column(page, 1), () => header_point(page, 1)],
+    ] as const) {
+        await select();
+        await expect(root).toHaveAttribute('data-edit-session', 'none');
+        await watch_session_held(page);
+        // Pressed and released at once: the press may be a drag, so it asks
+        // for the session, and the button is up before the host answers.
+        const { x, y } = await point();
+        await page.mouse.click(x, y);
+        await expect_session_let_go(page);
+    }
+    await expect(save_button(page)).toBeDisabled();
+    expect(fs.readFileSync(file, 'utf8')).toBe('name,qty\napple,1\nbanana,2\n');
+});
+
+test('Escape the moment a context menu opens is no edit', async () => {
+    const { file, page } = await open_file('fruit.csv', 'name,qty\napple,1\nbanana,2\n');
+    await wait_for_grid(page);
+    const root = page.locator('.grid-shell-root');
+    for (const open of [
+        () => open_cell_menu(page, 0, 0),
+        () => open_column_menu(page, 1),
+        () => open_row_menu(page, 1),
+    ]) {
+        await expect(root).toHaveAttribute('data-edit-session', 'none');
+        await watch_session_held(page);
+        await open();
+        // No wait for the session the menu asked for: Escape closes the menu first.
+        await page.keyboard.press('Escape');
+        await expect(page.locator('[role="menu"]')).toHaveCount(0);
+        await expect_session_let_go(page);
+        // Escape gives focus back to the grid on a timer; wait it out, or it
+        // takes focus from the next menu.
+        await expect.poll(() => page.evaluate(
+            () => document.activeElement?.closest('.grid-shell-root') != null,
+        )).toBe(true);
+    }
+    await expect(save_button(page)).toBeDisabled();
+    expect(fs.readFileSync(file, 'utf8')).toBe('name,qty\napple,1\nbanana,2\n');
+});
+
+test('Enter on an unchanged column name closes the Rename column dialog', async () => {
+    const { page } = await open_file(
+        'basic.xlsx',
+        fs.readFileSync(path.join(repo_dir, 'src', 'test', 'fixtures', 'basic.xlsx')),
+    );
+    await wait_for_grid(page);
+    await choose(await open_column_menu(page, 1), 'Rename column…');
+    const dialog = page.getByRole('dialog', { name: 'Rename column' });
+    await expect(dialog.getByLabel('Column name')).toBeFocused();
+    await expect(dialog.getByRole('button', { name: 'Rename' })).toBeDisabled();
+    await page.keyboard.press('Enter');
+    await expect(dialog).toHaveCount(0);
+    await expect(page.locator('.grid-shell-root')).toHaveAttribute('data-edit-session', 'none');
+    await expect(save_button(page)).toBeDisabled();
+});
