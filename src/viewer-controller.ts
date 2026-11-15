@@ -17303,7 +17303,6 @@ export function attach_viewer(
         return false;
     }
 
-    /** Structural replay writes stay current and inside authority already issued. */
     /**
      * What the host holds for one replayed worksheet: the session's ledger,
      * a clone of it with the history-retained rows the replay asks for
@@ -17403,6 +17402,7 @@ export function attach_viewer(
         return Object.freeze(filled);
     }
 
+    /** Structural replay writes stay current and inside authority already issued. */
     async function replay_structures_are_authorized(
         structures: readonly ResolvedReplayStructure[],
         replay_source: DataSource,
