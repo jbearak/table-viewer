@@ -1179,6 +1179,35 @@ describe('Excel workbook snapshot controller', () => {
         });
     });
 
+    it('reports reload-required when the header reload stops at a declined file-size prompt', async () => {
+        // The receipt can't be applied in place, so the result waits for the
+        // reload's adoption. The file has grown past the size limit and the
+        // prompt is declined: nothing will be adopted, so the result must say
+        // so now rather than leave the renderer waiting on its guard timer.
+        const state = mutable_state_store();
+        const builds = { count: 0 };
+        const panel = open_excel(
+            '/header-size-declined.xlsx',
+            state.store,
+            excel_profile(builds, undefined, true),
+        );
+        const initial = await ready(panel);
+        vscode_mock.__setStatImplementation(async () => ({ size: 1024 * 1024 * 1024, mtime: 2 }));
+
+        await toggle(panel, initial, 'size-declined', false);
+        await vi.waitFor(() => expect(snapshots(panel).some((snapshot) => (
+            snapshot.commandResult?.requestId === 'size-declined'
+        ))).toBe(true));
+        expect(builds.count).toBe(1);
+        expect(snapshots(panel).find((snapshot) => (
+            snapshot.commandResult?.requestId === 'size-declined'
+        ))!.commandResult).toMatchObject({
+            requestId: 'size-declined',
+            outcome: 'recovered',
+            reloadRequired: true,
+        });
+    });
+
     it('broadcasts the latest projection to every tab but retains the result only at origin', async () => {
         const state = mutable_state_store();
         const builds_a = { count: 0 };

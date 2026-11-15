@@ -8457,7 +8457,15 @@ export function attach_viewer(
                 await host.ui.open_setting('maxFileSizeMiB');
                 if (!load_is_current(request.seq, request.refreshEvent)) return { type: 'stale' };
             }
-            if (initial) await options.requestClose?.();
+            if (initial) {
+                await options.requestClose?.();
+            } else {
+                // Nothing will be adopted, so a header result waiting on this
+                // reload is settled now, as a failed reload settles it.
+                settle_header_on_failure(
+                    'The file is larger than the file size limit, so Table Viewer did not reload it.',
+                );
+            }
             return { type: 'stopped' };
         }
     }
