@@ -130,6 +130,7 @@ import {
     transform_shortcut,
 } from './transform-ui-model';
 import {
+    copied_cell_text,
     format_selection_tsv,
     copy_truncation_message,
     display_row_indices,
@@ -8694,6 +8695,28 @@ export function GridShell({
     );
 
     /**
+     * Whether pasted text is what Copy writes for this source cell, so the
+     * paste puts back the value the cell already holds.
+     *
+     * Copy writes a cell's display text, and a paste reads it back as typed
+     * text: `6/1/23` in a date cell, `50%`, a rounded `3.14` or a formula's
+     * result would each replace the value it was copied from, as typing them
+     * would. A cell that shows exactly the pasted text, with no pending edit,
+     * keeps its value. Formula text is a formula decision even when it
+     * matches (see `formula_gesture`), so it still pastes.
+     */
+    const pasted_copy_of_cell = useCallback(
+        (source_row: number, source_column: number, text: string): boolean => {
+            const key = cell_key(source_row, source_column);
+            if (store.get(key) !== undefined || saved_edits_ref.current[key] !== undefined) return false;
+            if (edit_syntax === 'markdown' && xlsx_edit_writes_formula(text, undefined)) return false;
+            const cell = get_cell_for_source_ref.current(source_row, source_column);
+            return cell != null && copied_cell_text(cell, show_formatting) === text;
+        },
+        [edit_syntax, show_formatting, store],
+    );
+
+    /**
      * Every mutation Glide performs, as the batch it performed it in.
      *
      * Glide already assembles a paste, a fill, a multi-cell delete and a single
@@ -9054,6 +9077,11 @@ export function GridShell({
                     : value.kind === GridCellKind.Custom && is_rich_text_cell(value)
                         ? value.data.edit_value ?? ''
                         : '';
+                if (
+                    source === 'paste'
+                    && movedFrom === undefined
+                    && pasted_copy_of_cell(source_row, source_column, text)
+                ) continue;
                 const explicitly_ordered = move_gesture
                     || (
                         formula_gesture
@@ -9412,6 +9440,7 @@ export function GridShell({
             issue_value_edit_order,
             edit_syntax,
             history_capture,
+            pasted_copy_of_cell,
             pending_projection,
             pending_store,
             planned_auto_grow_height,

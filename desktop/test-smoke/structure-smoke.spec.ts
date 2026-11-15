@@ -1143,3 +1143,53 @@ test('Enter on an unchanged column name closes the Rename column dialog', async 
     await expect(page.locator('.grid-shell-root')).toHaveAttribute('data-edit-session', 'none');
     await expect(save_button(page)).toBeDisabled();
 });
+
+test('a workbook row copied with Copy and pasted onto itself is no edit', async () => {
+    const fixture = fs.readFileSync(path.join(repo_dir, 'src', 'test', 'fixtures', 'basic.xlsx'));
+    const { file, page } = await open_file('basic.xlsx', fixture);
+    await wait_for_grid(page);
+    // What the webview tells the host, as the main process receives it.
+    await app!.evaluate(({ ipcMain }) => {
+        const sent: string[] = [];
+        (globalThis as { webview_messages?: string[] }).webview_messages = sent;
+        ipcMain.on('tableViewer:webviewMessage', (_event, envelope: { message: { type: string } }) => {
+            sent.push(envelope.message.type);
+        });
+    });
+    const sent_types = () => app!.evaluate(() => (globalThis as { webview_messages?: string[] }).webview_messages!);
+
+    const marker = await row_marker_point(page, 1);
+    await page.mouse.click(marker.x, marker.y);
+    // The Edit menu's Copy, as it reaches the window. Other runs share the OS
+    // clipboard, so start it at a value of this test's own and wait for Copy
+    // to replace it.
+    const sentinel = `structure-smoke-${process.pid}-${Date.now()}`;
+    await app!.evaluate(({ clipboard }, text) => clipboard.writeText(text), sentinel);
+    await page.evaluate(() => window.postMessage({ type: 'editCommand', command: 'copy' }, '*'));
+    await expect.poll(() => app!.evaluate(({ clipboard }) => clipboard.readText())).not.toBe(sentinel);
+    // The Joined cell is a date, and Copy writes what it shows.
+    const copied = await app!.evaluate(({ clipboard }) => clipboard.readText());
+    expect(copied).toBe('Bob\t25\tFALSE\t6/1/23');
+
+    // Paste that text back, as Cmd/Ctrl+V delivers it, carried on the event
+    // so another run's copy cannot replace it first.
+    const before = (await sent_types()).length;
+    await page.evaluate((text) => {
+        const data = new DataTransfer();
+        data.setData('text/plain', text);
+        window.dispatchEvent(new ClipboardEvent('paste', { clipboardData: data, bubbles: true }));
+    }, copied);
+    // The paste has run once it lets go of the session it asked for, or once
+    // it left an edit, which keeps the session.
+    const paste_settled = async () => {
+        const types = (await sent_types()).slice(before);
+        const requested = types.indexOf('requestEditSession');
+        return (requested >= 0 && types.indexOf('releaseEditSession', requested) > requested)
+            || /has-unsaved/.test(await save_button(page).getAttribute('class') ?? '');
+    };
+    await expect.poll(paste_settled).toBe(true);
+    await expect(save_button(page)).not.toHaveClass(/has-unsaved/);
+    await expect(save_button(page)).toBeDisabled();
+    await expect(page.getByRole('button', { name: 'Diff' })).toHaveCount(0);
+    expect(fs.readFileSync(file).equals(fixture)).toBe(true);
+});
