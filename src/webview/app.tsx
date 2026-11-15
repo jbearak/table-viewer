@@ -3543,12 +3543,25 @@ export function App(): React.JSX.Element {
                         .current?.sourceBasis.physicalRevision;
                     const pending_basis_source_generation = source_generation_ref.current;
                     snapshot_identity_ref.current = snapshot.identity;
-                    const previous_sheets_by_name = new Map(
-                        previous_sheets.map((sheet) => [sheet.name, sheet]),
-                    );
+                    // Each sheet's predecessor, by worksheet ID when it has one:
+                    // a reload can rename a worksheet whose history and drafts
+                    // still address it by ID.
+                    const previous_sheet_index_for = worksheet_target_lookup(previous_sheets);
+                    const previous_sheet_for = (sheet: WorkbookMeta['sheets'][number], index: number) => {
+                        const previous_index = previous_sheet_index_for({
+                            sheetIndex: index,
+                            sheetName: sheet.name,
+                            ...(sheet.worksheetId === undefined
+                                ? {}
+                                : { worksheetId: sheet.worksheetId }),
+                        });
+                        return previous_index === undefined
+                            ? undefined
+                            : previous_sheets[previous_index];
+                    };
                     const header_changed = new Set<number>();
                     snapshot.meta.sheets.forEach((sheet, index) => {
-                        const previous = previous_sheets_by_name.get(sheet.name);
+                        const previous = previous_sheet_for(sheet, index);
                         if (
                             previous
                             && (
@@ -3567,7 +3580,7 @@ export function App(): React.JSX.Element {
                     // holdings follow here, whatever the snapshot's reason:
                     for (const index of header_changed) {
                         const sheet = snapshot.meta.sheets[index]!;
-                        const previous = previous_sheets_by_name.get(sheet.name)!;
+                        const previous = previous_sheet_for(sheet, index)!;
                         // Composer drafts are held under the sheet's schema, which
                         // names the columns; the columns themselves did not change.
                         const draft_key = worksheet_target_key({

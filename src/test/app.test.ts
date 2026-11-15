@@ -2640,6 +2640,43 @@ describe('Excel first-row header toggle', () => {
         ]);
     });
 
+    it('bars history across a header change that a reload delivers under a new sheet name', async () => {
+        // History addresses the worksheet by ID. A reload that renames it while
+        // turning the Header Row on must still find the predecessor, or a body
+        // edit on row 1 would replay into the new header row.
+        const { post_message } = await render_app();
+        const before = excel_meta(false, 'off');
+        before.sheets[0].worksheetId = 'ws-people';
+        await dispatch_host_message(initial_snapshot_message(before, { capabilities: EDITABLE }));
+        await acquire_editing_session(post_message);
+        const props = grid_shell_mock.latest_props as unknown as GridShellProps;
+        const worksheet = { sheetIndex: 0, sheetName: 'People', worksheetId: 'ws-people' };
+        const cell_delta = build_cell_history_delta({
+            worksheet,
+            sourceRow: 0,
+            sourceColumn: 0,
+            before: absent_overlay(),
+            after: value_only_overlay(history_value('edited'), history_value('Name')),
+            persistedValue: history_value('Name'),
+            persistedHyperlink: null,
+        });
+        const record = props.history_store!.stage_record({
+            label: 'Edit cell',
+            changes: [{ kind: 'cell' as const, delta: cell_delta! }],
+        });
+        expect(record.commit()).toBe(true);
+        record.notify();
+
+        const after = excel_meta(true, 'on');
+        after.sheets[0] = { ...after.sheets[0], name: 'Staff', worksheetId: 'ws-people' };
+        await dispatch_host_message(refresh_snapshot_message(after, {
+            capabilities: { ...EDITABLE, csvEditSessionId: 'test-edit-session' },
+        }));
+        const history = props.history_store!.snapshot();
+        expect(history.barrier?.reason).toBe('header-change');
+        expect(history.undoStack).toEqual([]);
+    });
+
     it('lets an append awaiting admission finish before the fence goes up', async () => {
         const { post_message } = await render_app();
         const meta = excel_meta(true);
