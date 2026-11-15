@@ -9263,8 +9263,14 @@ describe('row Delete and Restore in the row-gutter menu', () => {
             edit_session: create_edit_session_store({ session_id: 'session' }),
             pending_row_store: pending,
         }));
+        const caret = () => (grid_mock.props!.gridSelection as {
+            current?: { cell: [number, number] };
+        }).current?.cell;
         await open_row_menu(1);
         await act(async () => menu_item('Delete row')!.click());
+        // The first delete moves the caret a frame or more later; let it land,
+        // or it lands after the second delete and reads as that delete's move.
+        await vi.waitFor(() => expect(caret()).toEqual([0, 2]));
         const on_selection_change = grid_mock.props!.onGridSelectionChange as
             (selection: unknown) => void;
         await act(async () => on_selection_change({
@@ -9272,9 +9278,6 @@ describe('row Delete and Restore in the row-gutter menu', () => {
             rows: compact([1, 2]),
         }));
         await open_row_menu(2);
-        const caret = () => (grid_mock.props!.gridSelection as {
-            current?: { cell: [number, number] };
-        }).current?.cell;
         await act(async () => menu_item('Delete 2 rows')!.click());
         expect(pending.snapshot().rowLayout?.removedSourceRows).toEqual([{ start: 1, count: 2 }]);
         // Polling on the already-removed row 1 would land at once, against the
