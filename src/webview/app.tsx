@@ -380,6 +380,12 @@ interface PendingViewTransform {
     readonly requestId: string;
     /** The worksheet by identity: a reload can reorder or remove sheets. */
     readonly worksheet: WorksheetTarget;
+    /**
+     * The worksheet's columns when the request was composed. Its step names
+     * columns as they were then, and a reload that overtakes the request can
+     * bring other columns.
+     */
+    readonly schema: string;
     /** The rules this window held for the sheet when the request was composed. */
     readonly baseline: SheetTransformState | undefined;
     /** The rules requested. Absent for Hide rows: only the host knows its source rows. */
@@ -391,6 +397,8 @@ interface PendingViewTransform {
 interface PendingColumnWrite {
     readonly requestId: string;
     readonly worksheet: WorksheetTarget;
+    /** The worksheet's columns when the write was posted; see `PendingViewTransform.schema`. */
+    readonly schema: string;
     readonly sourceGeneration: number;
     readonly before: SheetColumnVisibilityState | undefined;
     readonly after: SheetColumnVisibilityState | undefined;
@@ -1564,13 +1572,16 @@ export function App(): React.JSX.Element {
                         sheetName: sheet.name,
                         ...(sheet.worksheetId === undefined ? {} : { worksheetId: sheet.worksheetId }),
                     },
-                    transform_schema_for_sheet(sheet),
+                    pending.schema,
                     hidden_source_columns(pending.before, sheet.columnCount),
                     hidden_source_columns(pending.after, sheet.columnCount),
                 ));
             }
             return;
         }
+        // Auto-fit, ended for the sheet when the write was posted, stays
+        // ended: its fitted widths were dropped then, and the person turns it
+        // back on with the toolbar.
         if (by === 'answer' && !pending.snapshotAdopted && index !== undefined) {
             const restored = [...(state_ref.current.columnVisibility ?? [])];
             restored[index] = pending.before;
@@ -1615,6 +1626,13 @@ export function App(): React.JSX.Element {
      *    entry stays and the person is told.
      *  - A column write landed if the sheet's adopted hidden columns are the
      *    ones it asked for.
+     *
+     * None of them landed if the refresh brought the worksheet other columns
+     * than the request was composed against. The host drops rules and hidden
+     * columns that named the old ones, so "nothing sorted" or "nothing
+     * hidden" can equal the target of a gesture that cleared something, and a
+     * step recorded from that would name old column positions among the new
+     * columns.
      */
     const settle_overtaken_view_requests = useCallback(() => {
         const { views, column } = overtaken_view_requests_ref.current;
@@ -1625,12 +1643,15 @@ export function App(): React.JSX.Element {
             const index = worksheet_target_index(sheets, pending.worksheet);
             const sheet = index === undefined ? undefined : sheets[index];
             const adopted = index === undefined ? undefined : state_ref.current.transforms?.[index];
+            const same_columns = sheet !== undefined
+                && transform_schema_for_sheet(sheet) === pending.schema;
             if (pending.replay !== undefined) {
                 if (sheet === undefined) {
                     const gone = history_refusal_warning('unavailable', pending.replay.direction, undefined);
                     if (gone !== null) host_bridge.postMessage({ type: 'showWarning', message: gone });
                 } else if (
-                    pending.target !== undefined
+                    same_columns
+                    && pending.target !== undefined
                     && transform_slices_equal(pending.replay.delta, pending.target, adopted)
                 ) {
                     land_view_replay(pending.replay, pending.worksheet, false);
@@ -1642,14 +1663,19 @@ export function App(): React.JSX.Element {
                 }
                 continue;
             }
-            if (sheet === undefined || index === undefined || pending.target === undefined) continue;
+            if (
+                sheet === undefined
+                || index === undefined
+                || pending.target === undefined
+                || !same_columns
+            ) continue;
             record_view_step(overtaken_transform_step(
                 {
                     sheetIndex: index,
                     sheetName: sheet.name,
                     ...(sheet.worksheetId === undefined ? {} : { worksheetId: sheet.worksheetId }),
                 },
-                transform_schema_for_sheet(sheet),
+                pending.schema,
                 pending.baseline,
                 pending.target,
                 adopted,
@@ -1658,9 +1684,12 @@ export function App(): React.JSX.Element {
         if (column !== null) {
             const index = worksheet_target_index(sheets, column.worksheet);
             const sheet = index === undefined ? undefined : sheets[index];
-            const landed = sheet !== undefined && index !== undefined && JSON.stringify(
-                hidden_source_columns(state_ref.current.columnVisibility?.[index], sheet.columnCount),
-            ) === JSON.stringify(hidden_source_columns(column.after, sheet.columnCount));
+            const landed = sheet !== undefined
+                && index !== undefined
+                && transform_schema_for_sheet(sheet) === column.schema
+                && JSON.stringify(
+                    hidden_source_columns(state_ref.current.columnVisibility?.[index], sheet.columnCount),
+                ) === JSON.stringify(hidden_source_columns(column.after, sheet.columnCount));
             settle_column_write(column, landed, 'snapshot');
         }
         // A settled replay renders nothing; a queued header change waits on it.
@@ -5731,15 +5760,12 @@ export function App(): React.JSX.Element {
                 // rules it was composed against to the rules installed. Hide
                 // rows learns its source rows here.
                 if (view_request !== undefined && view_request.replay === undefined) {
-                    const installed_sheet = meta_ref.current?.sheets[msg.sheetIndex];
-                    record_view_step(installed_sheet === undefined
-                        ? undefined
-                        : transform_view_step(
-                            view_request.worksheet,
-                            transform_schema_for_sheet(installed_sheet),
-                            view_request.baseline,
-                            msg.rules,
-                        ));
+                    record_view_step(transform_view_step(
+                        view_request.worksheet,
+                        view_request.schema,
+                        view_request.baseline,
+                        msg.rules,
+                    ));
                 }
                 // Only an advanced mapping changes the population sampled by
                 // auto-fit. A rules-only no-op install moves the core generation but
@@ -6553,6 +6579,7 @@ export function App(): React.JSX.Element {
             }
             request_transform(index, plan.target, 'user', 'history', {
                 worksheet,
+                schema,
                 baseline: live,
                 target: plan.target,
                 replay: { ...replay, delta },
@@ -7991,7 +8018,6 @@ export function App(): React.JSX.Element {
 
     const handle_transform_change = useCallback(
         (next_state: SheetTransformState, origin: TransformOrigin): boolean => {
-            if (!view_gesture_may_start(active_sheet_index)) return false;
             const schema = meta?.sheets[active_sheet_index]
                 ? transform_schema_for_sheet(meta.sheets[active_sheet_index])
                 : undefined;
@@ -8015,7 +8041,10 @@ export function App(): React.JSX.Element {
                 schema,
                 source_row_count,
             );
+            // A request that changes nothing is not a gesture: it folds no
+            // open editor and says nothing.
             if (transforms_semantically_equal(current, sanitized)) return false;
+            if (!view_gesture_may_start(active_sheet_index)) return false;
             if (
                 (sanitized.sort.length > 0
                     || sanitized.filters.some((filter) => filter.enabled)
@@ -8031,7 +8060,7 @@ export function App(): React.JSX.Element {
                 // never a pending request's target: a request this one
                 // replaces never answers here, and this one's install then
                 // carries both gestures, recorded as one step.
-                active_sheet === undefined ? undefined : {
+                active_sheet === undefined || schema === undefined ? undefined : {
                     worksheet: {
                         sheetIndex: active_sheet_index,
                         sheetName: active_sheet.name,
@@ -8039,6 +8068,7 @@ export function App(): React.JSX.Element {
                             ? {}
                             : { worksheetId: active_sheet.worksheetId }),
                     },
+                    schema,
                     baseline: state_ref.current.transforms?.[active_sheet_index],
                     target: sanitized,
                 },
@@ -8083,6 +8113,7 @@ export function App(): React.JSX.Element {
                         ? {}
                         : { worksheetId: hidden_sheet.worksheetId }),
                 },
+                schema: transform_schema_for_sheet(hidden_sheet),
                 baseline: state_ref.current.transforms?.[active_sheet_index],
             };
         sync_view_request_pending();
@@ -9287,6 +9318,7 @@ export function App(): React.JSX.Element {
                 sheetName: sheet.name,
                 ...(sheet.worksheetId === undefined ? {} : { worksheetId: sheet.worksheetId }),
             },
+            schema: transform_schema_for_sheet(sheet),
             sourceGeneration: source_generation_ref.current,
             before,
             after,
@@ -9311,7 +9343,6 @@ export function App(): React.JSX.Element {
     const update_column_visibility = useCallback((
         updater: ColumnVisibilityUpdater,
     ) => {
-        if (!view_gesture_may_start(undefined)) return;
         const sheet = meta?.sheets[active_sheet_index];
         if (!sheet || !snapshot_identity_ref.current) return;
         const schema = transform_schema_for_sheet(sheet);
@@ -9325,7 +9356,9 @@ export function App(): React.JSX.Element {
             sheet.columnCount,
             schema,
         );
+        // A gesture that changes nothing folds no open editor and says nothing.
         if (column_visibility_equal(current, next_sheet_visibility)) return;
+        if (!view_gesture_may_start(undefined)) return;
         post_column_visibility(active_sheet_index, current, next_sheet_visibility);
     }, [
         active_sheet_index,
@@ -10687,7 +10720,8 @@ export function App(): React.JSX.Element {
                 git_compare?.changedColumnNames[active_sheet_index]
             }
             edit_activation_id={edit_activation_id}
-            highlight_in_flight={highlight_request_pending || view_request_pending}
+            highlight_in_flight={highlight_request_pending}
+            view_request_in_flight={view_request_pending}
             edits_paused={header_fence}
             on_edit_paused_gesture={warn_edit_waits_for_header}
             append_in_flight={append_request_pending}

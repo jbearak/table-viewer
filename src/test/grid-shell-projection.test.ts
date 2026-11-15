@@ -9638,6 +9638,62 @@ describe('row Insert in the row-gutter menu', () => {
         expect(host.on_insert_rows).not.toHaveBeenCalled();
     });
 
+    // A sort, a filter, a hide, or a column change of this window that the
+    // host has not answered: no cell edits meanwhile, but a menu keeps the
+    // items it will have once the request lands, so nothing moves under the
+    // pointer when it does.
+    it('keeps a held session\'s editing items listed, disabled, while a view request is in flight', async () => {
+        const host = admission(['ins-a']);
+        const base = structure_props({
+            edit_session: create_edit_session_store({ session_id: 'session' }),
+            pending_row_store: create_pending_row_store({ session_id: 'session' }),
+            on_insert_rows: host.on_insert_rows,
+        });
+        const GridShell = await render_grid(base);
+        await open_row_menu(1);
+        const settled = menu_button_labels();
+        expect(settled).toEqual(expect.arrayContaining(['Insert row above', 'Delete row']));
+        expect(menu_item('Insert row above')!.getAttribute('aria-disabled')).toBeNull();
+
+        await act(async () => {
+            root!.render(React.createElement(GridShell, { ...base, view_request_in_flight: true }));
+        });
+
+        expect(menu_button_labels()).toEqual(settled);
+        const held = menu_item('Insert row above')!;
+        expect(held.getAttribute('aria-disabled')).toBe('true');
+        await act(async () => held.click());
+        expect(host.on_insert_rows).not.toHaveBeenCalled();
+    });
+
+    it('lists the same items with no session yet, and asks for none, while a view request is in flight', async () => {
+        const request = vi.fn(async () => false);
+        const armed = structure_props({
+            editing_session_held: false,
+            edit_session_id: undefined,
+            on_request_edit_session: request,
+        });
+        await render_grid(armed);
+        await open_row_menu(1);
+        const settled = menu_button_labels();
+        expect(settled).toEqual(expect.arrayContaining(['Insert row above', 'Delete row']));
+        // Opening the menu asks for the session its items need.
+        expect(request).toHaveBeenCalledTimes(1);
+        act(() => root?.unmount());
+        root = null;
+        container?.remove();
+        container = null;
+        document.body.innerHTML = '';
+        request.mockClear();
+
+        await render_grid({ ...armed, view_request_in_flight: true });
+        await open_row_menu(1);
+
+        expect(menu_button_labels()).toEqual(settled);
+        expect(menu_item('Insert row above')!.getAttribute('aria-disabled')).toBe('true');
+        expect(request).not.toHaveBeenCalled();
+    });
+
     /** Install one inserted row after source row 0 through the grid's own gesture. */
     const insert_after_first = async (
         overrides: Partial<GridShellProps> = {},
@@ -10398,6 +10454,23 @@ describe('columns: Insert, Delete, Restore, Move, rename, Pending Column cells, 
         await rerender({ editing_session_held: true, edit_session_id: 'session', on_request_edit_session: undefined });
 
         expect(menu_item('Insert column right')!.getAttribute('aria-disabled')).not.toBe('true');
+    });
+
+    it('keeps a column menu\'s editing items listed, disabled, while a view request is in flight', async () => {
+        const { on_insert_columns, rerender } = await render_columns();
+        await open_header_menu(0);
+        const settled = menu_button_labels();
+        expect(settled).toEqual(expect.arrayContaining(['Insert column right', 'Delete column']));
+        expect(menu_item('Insert column right')!.getAttribute('aria-disabled')).not.toBe('true');
+
+        // This window's own sort, hide, or column change goes out with the menu open.
+        await rerender({ view_request_in_flight: true });
+
+        expect(menu_button_labels()).toEqual(settled);
+        const held = menu_item('Insert column right')!;
+        expect(held.getAttribute('aria-disabled')).toBe('true');
+        await act(async () => held.click());
+        expect(on_insert_columns).not.toHaveBeenCalled();
     });
 
     it('inserts a named Pending Column through host admission, keyed by its identity', async () => {

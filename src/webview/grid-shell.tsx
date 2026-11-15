@@ -1586,6 +1586,20 @@ export interface GridShellProps {
      */
     highlight_in_flight?: boolean;
     /**
+     * A view request of this window is awaiting the host: a sort, filter, or
+     * hide the person made, a column visibility write, or a view step's
+     * replay. No cell opens an editor until it settles, for the reason above:
+     * its history step is recorded, or moved, only on the host's answer.
+     *
+     * Unlike a highlight in flight it can last as long as a sort takes, so a
+     * menu opened meanwhile lists the editing items it will list once the
+     * request lands, disabled. Unlisting them would move the rest of the menu
+     * under the pointer when it lands.
+     *
+     * The affordance only, as above; App's `gestures_admitted` is the barrier.
+     */
+    view_request_in_flight?: boolean;
+    /**
      * A Header Row change is being prepared or is in flight. Its Pending Changes
      * move with it in one durable write, so no editing affordance opens until
      * it lands: like a highlight in flight, but App's own fence.
@@ -1801,6 +1815,7 @@ export function GridShell({
     edit_activation_id,
     csv_editable = false,
     highlight_in_flight = false,
+    view_request_in_flight = false,
     edits_paused = false,
     on_edit_paused_gesture,
     append_in_flight = false,
@@ -3308,31 +3323,42 @@ export function GridShell({
     // Keep the underlying activation separate so the post-await fence can ignore
     // only this request's `append_in_flight` affordance, while still observing a
     // save, highlight, close barrier, or deactivated edit session.
-    const append_admission_active = editing_session_held
+    const append_admission_but_for_view = editing_session_held
         && csv_editable
         && !save_in_flight
         && !highlight_in_flight
         && !edits_paused
         && !close_barrier_active;
+    const append_admission_active = append_admission_but_for_view && !view_request_in_flight;
     const editable_cells = append_admission_active && !append_in_flight;
     // Editable, with no session behind it yet. Cells accept the same gestures
     // they do under a session; each one asks App for the session first and runs
     // on the grant. Nothing else about the grid changes, so a file that is only
     // being read costs exactly what a read-only one does.
-    const edit_armed = !editing_session_held
+    const edit_armed_but_for_view = !editing_session_held
         && on_request_edit_session !== undefined
         && !preview_mode
         && !save_in_flight
         && !highlight_in_flight
         && !edits_paused
         && !close_barrier_active;
+    const edit_armed = edit_armed_but_for_view && !view_request_in_flight;
     // Whether a cell answers an editing gesture at all, session or not.
     const cells_accept_edits = editable_cells || edit_armed;
+    // What a menu lists while a view request of this window is in flight: the
+    // editing items it lists once the request lands. Their being listed is
+    // all these two decide; each item is enabled from `editable_cells`, which
+    // the request holds false, and nothing acquires a session for them until
+    // it lands.
+    const menu_lists_editable_cells = editable_cells
+        || (view_request_in_flight && append_admission_but_for_view && !append_in_flight);
+    const menu_lists_edit_armed = edit_armed_but_for_view;
     // Cells would take edits but for `edits_paused`: an edit gesture is then
     // refused for App's reason, which App explains.
     const edits_held_by_pause = edits_paused
         && !save_in_flight
         && !highlight_in_flight
+        && !view_request_in_flight
         && !close_barrier_active
         && (editing_session_held
             ? csv_editable && !append_in_flight
@@ -3744,8 +3770,10 @@ export function GridShell({
     const structure_items_offered = structural_support !== undefined
         && ((editing_session_held && csv_editable && edit_session_id !== undefined)
             // Before a session exists the items are offered all the same; the
-            // menu, shortcut, or drag that reaches for one acquires it.
-            || edit_armed);
+            // menu, shortcut, or drag that reaches for one acquires it. While
+            // a view request is in flight they stay offered and none of those
+            // acts: each asks `editable_cells` or `edit_armed` first.
+            || menu_lists_edit_armed);
     const promoted_header_row = sheet_meta.excelFirstRowHeader?.active === true
         ? sheet_meta.excelFirstRowHeader.sourceRow ?? 0
         : undefined;
@@ -11059,8 +11087,8 @@ export function GridShell({
     // Its items are those the session permits, shown from the moment it opens:
     // an item the grant would add mid-menu moves the rest under the pointer.
     // Until the grant lands they are disabled; a refusal leaves them so.
-    const menu_session_coming = edit_armed && menu_offers_edits;
-    const menu_edits_shown = editable_cells || menu_session_coming;
+    const menu_session_coming = menu_lists_edit_armed && menu_offers_edits;
+    const menu_edits_shown = menu_lists_editable_cells || menu_session_coming;
     const transform_menu_sections = transform_sections || transform_waits_for_claim;
     // Which items a menu offers follows the rules a transform in flight will
     // install; its being in flight only disables them.

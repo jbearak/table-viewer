@@ -310,6 +310,9 @@ vi.mock('../webview/grid-shell', () => ({
                         .map((entry) => entry.action.label) ?? [],
                 ),
                 'data-highlight-in-flight': String(props.highlight_in_flight ?? false),
+                // A view request of this window awaiting the host: no cell
+                // opens an editor until it settles.
+                'data-view-request-in-flight': String(props.view_request_in_flight ?? false),
                 // Where App says an undo landed, and against which mapping. The
                 // real shell resolves this into a selection; the stub only has to
                 // show that App produced the right request and held it across the
@@ -14672,7 +14675,7 @@ describe('snapshots arriving during an in-flight transform', () => {
                 post_message.mock.calls.findIndex((call) => call[0] === request)
             ]);
         // And no cell opens until the sort lands.
-        expect(grid_shell_mock.latest_props?.highlight_in_flight).toBe(true);
+        expect(grid_shell_mock.latest_props?.view_request_in_flight).toBe(true);
 
         // The refresh those commits provoke: same rows, same generation, and the
         // host's authoritative projection of what it has just written.
@@ -14700,7 +14703,7 @@ describe('snapshots arriving during an in-flight transform', () => {
         expect(grid_stub().getAttribute('data-mount-id')).not.toBe(mount_id);
         // The install folded nothing: there was nothing open to fold.
         expect(grid_shell_mock.commit_live_edit).toHaveBeenCalledTimes(folds);
-        expect(grid_shell_mock.latest_props?.highlight_in_flight).toBe(false);
+        expect(grid_shell_mock.latest_props?.view_request_in_flight).toBe(false);
         // Both, under the source-row keys they were typed against. Display row 0
         // under this sort is not source row 0, so a display-keyed map would name
         // different cells here.
@@ -19756,7 +19759,7 @@ describe('view steps in history', () => {
     /** Whether a cell would open and an edit would be recorded right now. */
     function cells_editable() {
         return {
-            editor_offered: grid_stub().getAttribute('data-highlight-in-flight') === 'false',
+            editor_offered: grid_stub().getAttribute('data-view-request-in-flight') === 'false',
             edits_admitted: props().gestures_admitted?.() ?? true,
         };
     }
@@ -20559,7 +20562,7 @@ describe('view steps in history', () => {
             await ask(post_message, { sort: SORT_ASC, filters: [] });
             // What a paste, a fill, and the hyperlink dialog ask before recording.
             expect(props().gestures_admitted?.()).toBe(false);
-            expect(props().highlight_in_flight).toBe(true);
+            expect(props().view_request_in_flight).toBe(true);
 
             const second = await ask(post_message, { sort: [{ colIndex: 1, direction: 'desc' }], filters: [] });
             expect(second).toBeDefined();
@@ -21403,6 +21406,87 @@ describe('view steps in history', () => {
 
             await vi.waitUntil(() => posted(post_message, 'prepareHistoryReplay').length === 1);
             expect(warnings(post_message)).toEqual([]);
+        });
+    });
+
+    // The host drops rules and hidden columns that named columns a reload
+    // replaced, so "nothing sorted" and "nothing hidden" are what the reload
+    // shows whether or not the pending request landed. A step taken from that
+    // would name old column positions among the new columns.
+    describe('a reload that brings other columns while a request is pending', () => {
+        function other_columns(): WorkbookMeta {
+            const meta = table_meta();
+            meta.sheets[0].columnNames = ['Id', 'Amount', 'Notes'];
+            return meta;
+        }
+
+        it('records nothing for a pending Clear sort, though the reload shows no sort', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await change_view(post_message, { sort: SORT_ASC, filters: [] });
+            await ask(post_message, { sort: [], filters: [] });
+
+            await reload([undefined], other_columns());
+
+            expect(undo_labels()).toEqual(['Sort']);
+            expect(cells_editable()).toEqual(EDITABLE);
+        });
+
+        it('records nothing for a pending Show all, though the reload shows every column', async () => {
+            const { post_message } = await render_app();
+            await open(post_message, {
+                state: { columnVisibility: [{ hiddenColumns: [0, 1], schema: SCHEMA }] },
+            });
+            await open_columns();
+            await click_button('Show all');
+            expect(latest_column_write(post_message).state).toBeUndefined();
+
+            await reload([undefined], other_columns(), { state: { columnVisibility: [undefined] } });
+
+            expect(undo_labels()).toEqual([]);
+            expect(cells_editable()).toEqual(EDITABLE);
+        });
+
+        it('keeps the entry of a replay it overtook, with a message, and the next Undo skips it', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await change_view(post_message, { sort: SORT_ASC, filters: [] });
+            await undo();
+            expect(posted(post_message, 'setTransform')).toHaveLength(2);
+            post_message.mockClear();
+
+            await reload([undefined], other_columns());
+
+            expect(undo_labels()).toEqual(['Sort']);
+            expect(redo_labels()).toEqual([]);
+            expect(warnings(post_message)).toEqual([
+                'Undo did not run because the file was refreshing. Try again.',
+            ]);
+            post_message.mockClear();
+            await undo();
+            expect(warnings(post_message)).toEqual([
+                'Undo skipped “Sort”: the columns of this worksheet changed since then.',
+            ]);
+            expect(redo_labels()).toEqual(['Sort']);
+        });
+    });
+
+    describe('a gesture that changes nothing', () => {
+        it('does not fold the open editor: the same sort again, and Show all with nothing hidden', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await change_view(post_message, { sort: SORT_ASC, filters: [] });
+            grid_shell_mock.commit_live_edit.mockClear();
+            post_message.mockClear();
+
+            expect(await ask(post_message, { sort: SORT_ASC, filters: [] })).toBeUndefined();
+            await open_columns();
+            await click_button('Show all');
+
+            expect(grid_shell_mock.commit_live_edit).not.toHaveBeenCalled();
+            expect(posted(post_message, 'setColumnVisibility')).toEqual([]);
+            expect(warnings(post_message)).toEqual([]);
+            expect(undo_labels()).toEqual(['Sort']);
         });
     });
 });
