@@ -73,6 +73,8 @@ const grid_mock = vi.hoisted(() => ({
     source_row_for_display: null as null | ((display_row: number) => number | undefined),
     text_for_source_row: null as null | ((source_row: number) => readonly string[]),
     formula_for_source_cell: null as null | ((source_row: number, column: number) => string | undefined),
+    // A cell's display text when it differs from its raw value (a formatted date or number).
+    formatted_for_source_cell: null as null | ((source_row: number, column: number) => string | undefined),
 }));
 
 vi.mock('../webview/glide-data-grid', () => {
@@ -156,7 +158,7 @@ vi.mock('../webview/use-row-loader', () => ({
             if (source_row === undefined) return undefined;
             return source_row_text(source_row).map((raw, column) => ({
                 raw,
-                formatted: raw,
+                formatted: grid_mock.formatted_for_source_cell?.(source_row, column) ?? raw,
                 bold: false,
                 italic: false,
                 ...(grid_mock.formula_for_source_cell?.(source_row, column) === undefined
@@ -181,7 +183,7 @@ vi.mock('../webview/use-row-loader', () => ({
             const formula = grid_mock.formula_for_source_cell?.(source_row, col);
             return {
                 raw,
-                formatted: raw,
+                formatted: grid_mock.formatted_for_source_cell?.(source_row, col) ?? raw,
                 bold: false,
                 italic: false,
                 ...(formula === undefined ? {} : { formula }),
@@ -256,6 +258,7 @@ async function render_grid(
         initial_scroll_position?: { left: number; top: number };
         on_scroll_position_change?: (position: { left: number; top: number }) => void;
         edit_syntax?: 'plain' | 'markdown';
+        show_formatting?: boolean;
         value_edit_order_floor?: number;
         formula_move_retargeter?: (
             formula: string,
@@ -489,6 +492,7 @@ afterEach(() => {
     grid_mock.source_row_for_display = null;
     grid_mock.text_for_source_row = null;
     grid_mock.formula_for_source_cell = null;
+    grid_mock.formatted_for_source_cell = null;
     vi.unstubAllGlobals();
 });
 
@@ -1544,6 +1548,77 @@ describe('GridShell source-keyed save payloads', () => {
             formattingKnown: true,
             valueEditOrder: expect.any(Number),
         });
+    });
+});
+
+describe('GridShell paste of the text Copy wrote', () => {
+    // basic.xlsx row 1: Copy writes a date cell's display text, `6/1/23`, and
+    // typed text in a date cell is only a date when it is ISO, so the paste
+    // used to save the date as the string "6/1/23".
+    const DATE_RAW = '2023-06-01T00:00:00.000Z';
+    const paste = async (data: string) => {
+        await act(async () => {
+            grid_mock.props!.onCellsEdited!([
+                { location: [0, 0], value: { kind: 'text', data } },
+            ], 'paste');
+        });
+    };
+    const render_date_cell = async (
+        options: { show_formatting?: boolean; initial_edits?: Record<string, string> } = {},
+    ) => {
+        grid_mock.text_for_source_row = () => [DATE_RAW, '', ''];
+        grid_mock.formatted_for_source_cell = (_row, column) => (column === 0 ? '6/1/23' : undefined);
+        return render_grid(undefined, {
+            edit_syntax: 'markdown',
+            show_formatting: options.show_formatting ?? true,
+            ...(options.initial_edits === undefined ? {} : { initial_edits: options.initial_edits }),
+        });
+    };
+
+    it('leaves a cell alone when the paste is the text Copy writes for it', async () => {
+        const { edit_session } = await render_date_cell();
+        await paste('6/1/23');
+        expect(edit_session!.snapshot().size).toBe(0);
+    });
+
+    // formatted.xlsx: each display text, typed, would save as a string.
+    it.each([
+        ['currency', '1234.56', '$1,234.56'],
+        ['percent', '0.75', '75.00%'],
+    ])('leaves a %s cell alone when the paste is its display text', async (_kind, raw, shown) => {
+        grid_mock.text_for_source_row = () => [raw, '', ''];
+        grid_mock.formatted_for_source_cell = (_row, column) => (column === 0 ? shown : undefined);
+        const { edit_session } = await render_grid(undefined, { edit_syntax: 'markdown', show_formatting: true });
+        await paste(shown);
+        expect(edit_session!.snapshot().size).toBe(0);
+    });
+
+    it('still pastes other text over the cell', async () => {
+        const { edit_session } = await render_date_cell();
+        await paste('6/2/23');
+        expect(edit_session!.get('0:0')).toMatchObject({ value: '6/2/23', base: DATE_RAW });
+    });
+
+    it('compares with the raw text when Copy writes raw text', async () => {
+        const { edit_session } = await render_date_cell({ show_formatting: false });
+        await paste(DATE_RAW);
+        expect(edit_session!.snapshot().size).toBe(0);
+        // With Formatting off Copy never writes `6/1/23`, so it is new text.
+        await paste('6/1/23');
+        expect(edit_session!.get('0:0')).toMatchObject({ value: '6/1/23', base: DATE_RAW });
+    });
+
+    it('pastes the display text over a pending edit, which Copy would have written instead', async () => {
+        const { edit_session } = await render_date_cell({ initial_edits: { '0:0': 'typed' } });
+        await paste('6/1/23');
+        expect(edit_session!.get('0:0')).toMatchObject({ value: '6/1/23', base: DATE_RAW });
+    });
+
+    it('keeps a formula when the paste is the result Copy wrote for it', async () => {
+        grid_mock.formula_for_source_cell = (_row, column) => (column === 0 ? '=B1+1' : undefined);
+        const { edit_session } = await render_date_cell();
+        await paste('6/1/23');
+        expect(edit_session!.snapshot().size).toBe(0);
     });
 });
 

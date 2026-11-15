@@ -1,3 +1,4 @@
+import { get_raw_cell_text } from '../cell-display';
 import type { RenderedCell } from '../data-source/interface';
 import type { DisplayRowInterval } from '../types';
 import type { MergeIndex } from './merge-index';
@@ -107,6 +108,15 @@ export function copy_truncation_message(
 }
 
 /**
+ * The text Copy writes for a loaded cell: what it displays with Formatting on,
+ * its raw value with Formatting off. A paste compares against this to tell
+ * the cell's own copied text from a new value (see GridShell's paste path).
+ */
+export function copied_cell_text(cell: RenderedCell, show_formatting: boolean): string {
+    return show_formatting ? cell.formatted : get_raw_cell_text(cell.raw);
+}
+
+/**
  * Serializes selected display rows and an explicit ordered source-column list to
  * TSV. The source list may be non-contiguous; its order is the clipboard order.
  *
@@ -153,8 +163,7 @@ export function format_selection_tsv(
                 cells.push('');
                 continue;
             }
-            const text = show_formatting ? cell.formatted : cell.raw ?? '';
-            cells.push(text);
+            cells.push(copied_cell_text(cell, show_formatting));
         }
         lines.push(cells.join('\t'));
     }
