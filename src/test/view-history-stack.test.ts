@@ -151,7 +151,7 @@ describe('a view step in the stack', () => {
         expect(outcome.state.barrier).toEqual({ reason: 'action-too-large', label: 'Hide 5000 rows' });
     });
 
-    it('is carried unchanged through each rewrite a save makes', () => {
+    it('is carried unchanged when a save rebases the cells it wrote', () => {
         let state = recorded(empty_history_stack(), { label: 'Edit cell', changes: [cell_change(1, 'a')] });
         state = recorded(state, sort_action());
         state = recorded(state, hide_rows_action([3]));
@@ -171,8 +171,81 @@ describe('a view step in the stack', () => {
         expect(rebased.undoStack.map((entry) => entry.action.label))
             .toEqual(['Edit cell', 'Sort', 'Hide row']);
 
-        expect(views(rekey_saved_appended_row_history(state, []))).toEqual(before);
-        expect(views(rekey_committed_tail_removal_history(state, []))).toEqual(before);
+    });
+
+    it('is carried unchanged when a save gives an added row its place in the file', () => {
+        const pending = { id: 'pending-0', cells: {}, formatTemplateId: 'plain', createdOrder: 1 };
+        const added: HistoryAction = {
+            label: 'Add row',
+            changes: [{
+                kind: 'pendingRows',
+                delta: {
+                    worksheet: SHEET,
+                    before: { formatTemplates: [], appendedRows: [], tailRemovals: [], conflicts: [] },
+                    after: {
+                        formatTemplates: [{ id: 'plain', format: { kind: 'none' } }],
+                        appendedRows: [pending],
+                        tailRemovals: [],
+                        conflicts: [],
+                    },
+                },
+            }],
+        };
+        let state = recorded(empty_history_stack(), sort_action());
+        state = recorded(state, added);
+        state = recorded(state, hide_rows_action([3]));
+        const views = state.undoStack.filter((entry) => action_has_view_change(entry.action));
+
+        const rekeyed = rekey_saved_appended_row_history(state, [{
+            worksheet: SHEET,
+            pendingRowId: 'pending-0',
+            sourceRow: 4,
+            savedFingerprint: 'fingerprint',
+            savedRow: { cells: {}, format: { kind: 'none' } },
+        }]);
+
+        // The rewrite ran: the added row's entry now speaks of a row in the file.
+        expect(rekeyed).not.toBe(state);
+        expect(state.undoStack[1].action.changes.map((change) => change.kind)).toEqual(['pendingRows']);
+        expect(rekeyed.undoStack[1].action.changes.map((change) => change.kind)).toEqual(['tailRemoval']);
+        expect(rekeyed.undoStack.map((entry) => entry.action.label))
+            .toEqual(['Sort', 'Add row', 'Hide row']);
+        expect(rekeyed.undoStack.filter((entry) => action_has_view_change(entry.action))
+            .map((entry) => entry.action)).toEqual(views.map((entry) => entry.action));
+    });
+
+    it('is carried unchanged when a save commits the removal of a row at the end', () => {
+        const removal = {
+            appendHistoryId: 'saved-0',
+            sourceRow: 5,
+            savedFingerprint: 'fingerprint',
+            savedRow: { cells: {}, format: { kind: 'none' as const } },
+        };
+        const removed: HistoryAction = {
+            label: 'Delete row',
+            changes: [{
+                kind: 'pendingRows',
+                delta: {
+                    worksheet: SHEET,
+                    before: { formatTemplates: [], appendedRows: [], tailRemovals: [], conflicts: [] },
+                    after: { formatTemplates: [], appendedRows: [], tailRemovals: [removal], conflicts: [] },
+                },
+            }],
+        };
+        let state = recorded(empty_history_stack(), sort_action());
+        state = recorded(state, removed);
+        state = recorded(state, hide_rows_action([3]));
+        const views = state.undoStack.filter((entry) => action_has_view_change(entry.action));
+
+        const rekeyed = rekey_committed_tail_removal_history(state, [{ worksheet: SHEET, removal }]);
+
+        // The rewrite ran: the removal's entry is not the one recorded.
+        expect(rekeyed).not.toBe(state);
+        expect(rekeyed.undoStack[1].action).not.toEqual(state.undoStack[1].action);
+        expect(rekeyed.undoStack.map((entry) => entry.action.label))
+            .toEqual(['Sort', 'Delete row', 'Hide row']);
+        expect(rekeyed.undoStack.filter((entry) => action_has_view_change(entry.action))
+            .map((entry) => entry.action)).toEqual(views.map((entry) => entry.action));
     });
 
     it('is dropped with everything else by the structural-save barrier', () => {

@@ -1264,17 +1264,17 @@ export interface StructuralColumnInsertAdmission {
     readonly settle: (accepted: boolean) => void;
 }
 
-/**
- * Imperative editing actions GridShell exposes to {@link App} (the toolbar
- * toggle and file-change notice live in App's layout, but the dirty map lives here
- * next to the loader). Populated into a ref App provides.
- */
 /** How a fold of the open cell editor treats an exiting session's fence. */
 export interface LiveEditFoldOptions {
     /** Fenced with no changed overlay answers true (and dismisses) instead of false. */
     readonly fenced_empty_ok?: boolean;
 }
 
+/**
+ * Imperative editing actions GridShell exposes to {@link App} (the toolbar
+ * toggle and file-change notice live in App's layout, but the dirty map lives here
+ * next to the loader). Populated into a ref App provides.
+ */
 export interface EditingHandle {
     /** Fold this sheet's live editor, then ask App to atomically save the workbook. */
     request_save(): boolean;
