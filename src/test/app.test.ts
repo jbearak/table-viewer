@@ -2720,6 +2720,87 @@ describe('Excel first-row header toggle', () => {
         ]);
     });
 
+    it('sends a header change that waited on a refused row resize as soon as the refusal lands', async () => {
+        // A refused reply changes no state App renders from, so the queue
+        // must be woken by the reply itself.
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(excel_meta(true), {
+            capabilities: EDITABLE,
+            sourceGeneration: 1,
+        }));
+        const resize = grid_shell_mock.latest_props!.on_row_resize as (
+            rows: readonly { start: number; end: number }[],
+            height: number,
+            on_result?: (applied: boolean) => void,
+        ) => void;
+        const on_result = vi.fn();
+        await act(async () => { resize([{ start: 0, end: 1 }], 40, on_result); });
+        const request = post_message.mock.calls
+            .map(([message]) => message as { type?: string; requestId?: string })
+            .find((message) => message.type === 'setRowHeights');
+        expect(request?.requestId).toBeDefined();
+
+        await click_button('Header Row');
+        expect(header_requests(post_message)).toEqual([]);
+
+        await dispatch_host_message({
+            type: 'rowHeightsChanged',
+            requestId: request!.requestId!,
+            sheetIndex: 0,
+            applied: false,
+            sourceGeneration: 1,
+        });
+        expect(on_result).toHaveBeenCalledWith(false);
+        expect(header_requests(post_message)).toEqual([
+            expect.objectContaining({ sheetIndex: 0, enabled: false }),
+        ]);
+    });
+
+    it('sends a header change that waited on an undo as soon as the host refuses it', async () => {
+        // A refusal the user is not told about renders nothing, so the queue
+        // must be woken by the replay's end itself.
+        const { post_message } = await render_app();
+        const snapshot = initial_snapshot_message(excel_meta(true), { capabilities: EDITABLE });
+        await dispatch_host_message(snapshot);
+        await click_button('Highlight');
+        await click_button('Clear all highlights');
+        const clear = post_message.mock.calls
+            .map(([message]) => message as { type?: string; requestId?: string })
+            .find((message) => message.type === 'clearAllCellHighlights');
+        await dispatch_host_message({
+            type: 'cellHighlightsChanged',
+            requestId: clear!.requestId!,
+            stateRevision: snapshot.snapshot.identity.stateRevision + 1,
+            physicalRevision: snapshot.snapshot.identity.sourceBasis.physicalRevision,
+            state: undefined,
+            deltas: [{ sheetIndex: 0, sourceRow: 1, sourceColumn: 0, before: 'yellow', after: null }],
+            sourceGeneration: snapshot.snapshot.sourceGeneration,
+        });
+        await dispatch_host_message({ type: 'editCommand', command: 'undo' });
+        const prepare = post_message.mock.calls
+            .map(([message]) => message as {
+                type?: string;
+                request?: { requestId: string; replayId: string };
+            })
+            .find((message) => message.type === 'prepareHistoryReplay');
+        expect(prepare?.request).toBeDefined();
+
+        await click_button('Header Row');
+        expect(header_requests(post_message)).toEqual([]);
+
+        await dispatch_host_message({
+            type: 'historyReplayPrepareRefused',
+            refusal: {
+                requestId: prepare!.request!.requestId,
+                replayId: prepare!.request!.replayId,
+                reason: 'document-changed',
+            },
+        });
+        await vi.waitFor(() => expect(header_requests(post_message)).toEqual([
+            expect.objectContaining({ sheetIndex: 0, enabled: false }),
+        ]));
+    });
+
     it('lets an append awaiting admission finish before the fence goes up', async () => {
         const { post_message } = await render_app();
         const meta = excel_meta(true);

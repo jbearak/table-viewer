@@ -1630,6 +1630,13 @@ export function App(): React.JSX.Element {
     const [pending_transform_labels, set_pending_transform_labels] = useState<string[]>([]);
     const [pending_excel_header, set_pending_excel_header] = useState<string | null>(null);
     const [excel_header_status, set_excel_header_status] = useState('');
+    /**
+     * Wakes the header drain without polling: from an acknowledgement, a timer,
+     * or the settling of in-flight work it waits on whose settling renders
+     * nothing else.
+     */
+    const [, set_header_drain_tick] = useState(0);
+    const wake_header_drain = useCallback(() => set_header_drain_tick((tick) => tick + 1), []);
     const [filter_editor, set_filter_editor] = useState<{
         column_index: number;
         anchor: { left: number; top: number };
@@ -3326,6 +3333,8 @@ export function App(): React.JSX.Element {
                     && msg.sourceGeneration === pending.sourceGeneration
                     && msg.sourceGeneration === source_generation_ref.current,
                 );
+                // A refusal renders nothing; a queued header change waits on this.
+                wake_header_drain();
             }
 
             if (msg.type === 'filterHistogram') {
@@ -5274,6 +5283,7 @@ export function App(): React.JSX.Element {
         reset_save_projection,
         set_sheet_views,
         update_pending_auto_fit_sheets,
+        wake_header_drain,
     ]);
 
     useEffect(() => {
@@ -6171,12 +6181,15 @@ export function App(): React.JSX.Element {
                 }
                 pending_row_replay_busy_ref.current = false;
                 pending_row_replay_plan_ref.current = null;
+                // A refused replay renders nothing; a queued header change waits on it.
+                wake_header_drain();
             }
         }
         // Read BEFORE the replay: a `blocked` refusal is about the barrier that was
         // in the way, and the stack may move under the await.
         const barrier = history_store_ref.current?.snapshot().barrier;
         const outcome = await coordinator.begin(direction);
+        wake_header_drain();
         if (history_document_ref.current !== replay_document) return;
         if (outcome.kind !== 'refused') return;
         const warning = history_refusal_warning(
@@ -6186,7 +6199,7 @@ export function App(): React.JSX.Element {
             barrier?.reason,
         );
         if (warning !== null) host_bridge.postMessage({ type: 'showWarning', message: warning });
-    }, [active_sheet_index, handle_sheet_select]);
+    }, [active_sheet_index, handle_sheet_select, wake_header_drain]);
 
     /**
      * Undo and redo from the keyboard, for the VS Code webview.
@@ -6572,9 +6585,6 @@ export function App(): React.JSX.Element {
         readonly sheet: ExcelHeaderQueueSheet;
         readonly posted_snapshot: number;
     } | null>(null);
-    /** Wakes the drain from an acknowledgement or a timer without polling. */
-    const [, set_header_drain_tick] = useState(0);
-    const wake_header_drain = useCallback(() => set_header_drain_tick((tick) => tick + 1), []);
     const header_timer_refs = useRef<ReturnType<typeof setTimeout>[]>([]);
     const schedule_header_wake = useCallback((delay: number) => {
         header_timer_refs.current.push(setTimeout(wake_header_drain, Math.max(0, delay)));
