@@ -1,256 +1,255 @@
 # Table Viewer
 
-Review and compare spreadsheets, tables, and datasets, with editing for common formats.
+查看与对比电子表格、数据表及数据集，并支持常见格式的编辑功能。
 
-![Table Viewer comparing two recipe tables, with added, deleted, moved, and changed rows](docs/images/app-recipe-diff.png)
+![Table Viewer 对比两张食谱表，高亮显示新增、删除、移动和修改的行](docs/images/app-recipe-diff.png)
 
-Table Viewer supports editing modern Excel (`.xlsx`), `.csv`, and `.tsv` files, plus read-only viewing and diffing of legacy Excel (`.xls`) workbooks, Stata (`.dta`) datasets, and Parquet (`.parquet`) files. It is built for reviewing, exploring, comparing, and annotating tables. Available as a standalone desktop app and a VS Code extension.
+Table Viewer 支持编辑新版 Excel（`.xlsx`）、`.csv` 和 `.tsv` 文件，并支持对旧版 Excel（`.xls`）工作簿、Stata（`.dta`）数据集和 Parquet（`.parquet`）文件进行只读查看和差异对比。它专为审阅、探索、对比和标注表格数据而设计，提供独立桌面应用和 VS Code 扩展两种版本。
 
-What you do while reviewing a table — sorting, filtering, hiding columns, resizing, highlighting cells — is stored alongside the file rather than inside it, so the file on disk is untouched and your sorts, filters, and highlights are still there the next time you open it, even if the file was regenerated in the meantime. Table Viewer also reloads on its own when the file changes on disk.
+你在查看表格时所做的操作——排序、筛选、隐藏列、调整宽高、高亮单元格——都会保存在文件旁侧而非文件内部，因此磁盘上的原文件不会被改动；下次打开时，你的排序、筛选和高亮设置依然保留，即使原文件在此期间被重新生成也不受影响。当磁盘上的文件发生变化时，Table Viewer 也会自动重新加载。
 
-<img src="docs/images/app-column-header-menu-hero.png" alt="The Roast column's context menu in Table Viewer, with sorting, filtering, copying, and hiding actions" width="751">
+<img src="docs/images/app-column-header-menu-hero.png" alt="Table Viewer 中 Roast 列的右键菜单，包含排序、筛选、复制和隐藏等操作" width="751">
 
-Follow the [setup and 10-minute try-out guide](docs/setup-guide.md) to choose the standalone app or VS Code extension, install it, try two sample workbooks, and see Table Viewer preserve a saved view when a file is replaced.
+按照[安装与 10 分钟快速上手指南](docs/setup-guide.md)选择独立桌面应用或 VS Code 扩展，完成安装并体验两个示例工作簿，看看 Table Viewer 如何在文件被替换后依然保留已保存的视图。
 
-## Installation
+## 安装
 
-### Visual Studio Code extension
+### Visual Studio Code 扩展
 
-Install Table Viewer from the extension registry used by your editor:
+从编辑器对应的扩展市场安装 Table Viewer：
 
-- **Visual Studio Code:** open [Table Viewer in the Visual Studio Marketplace](https://marketplace.visualstudio.com/items?itemName=jbearak.table-viewer) and click **Install**.
-- **Editors that use Open VSX:** open [Table Viewer on Open VSX](https://open-vsx.org/extension/jbearak/table-viewer) and click **Install**.
+- **Visual Studio Code：** 打开 [Visual Studio Marketplace 上的 Table Viewer](https://marketplace.visualstudio.com/items?itemName=jbearak.table-viewer) 并点击 **Install**。
+- **使用 Open VSX 的编辑器：** 打开 [Open VSX 上的 Table Viewer](https://open-vsx.org/extension/jbearak/table-viewer) 并点击 **Install**。
 
-You can also open your editor's **Extensions** view and search for the exact extension ID `jbearak.table-viewer`. After installation, open an `.xlsx`, `.xls`, `.csv`, `.tsv`, `.dta`, or `.parquet` file; Table Viewer registers itself as an editor for those file types.
+你也可以打开编辑器的 **Extensions**（扩展）视图，直接搜索扩展 ID `jbearak.table-viewer`。安装完成后，打开任意 `.xlsx`、`.xls`、`.csv`、`.tsv`、`.dta` 或 `.parquet` 文件，Table Viewer 会自动注册为这些文件类型的编辑器。
 
-### macOS desktop app
+### macOS 桌面应用
 
-The desktop app requires an Apple Silicon Mac (M1 or newer) running macOS 12 or later. Install it with Homebrew:
+桌面应用需要搭载 Apple Silicon（M1 及以上）芯片并运行 macOS 12 或更高版本的 Mac。可通过 Homebrew 安装：
 
 ```sh
 brew install --cask jbearak/table-viewer/table-viewer
 ```
 
-Or install it from a disk image:
+或者通过磁盘映像（DMG）安装：
 
-1. Open the [latest release](https://github.com/jbearak/table-viewer/releases/latest) and expand **Assets**.
-2. Download `table-viewer-<version>-arm64.dmg`. This is the macOS installer; the similarly named `.zip` and `latest-mac.yml` files are used by the automatic updater.
-3. Open the DMG and drag **Table Viewer** into **Applications**, then launch it from Applications or Spotlight.
+1. 打开[最新发布页面](https://github.com/jbearak/table-viewer/releases/latest)并展开 **Assets**。
+2. 下载 `table-viewer-<version>-arm64.dmg`。这是 macOS 安装包；名称相近的 `.zip` 和 `latest-mac.yml` 文件供自动更新程序使用。
+3. 打开 DMG，将 **Table Viewer** 拖入 **Applications**（应用程序）文件夹，然后从应用程序或 Spotlight 启动。
 
-### Windows desktop app
+### Windows 桌面应用
 
-The desktop app requires Windows 10 or 11. Open the [latest release](https://github.com/jbearak/table-viewer/releases/latest), expand **Assets**, and download one of these four files. The no-install version is a single `.exe` that runs directly without an installer:
+桌面应用需要 Windows 10 或 11。打开[最新发布页面](https://github.com/jbearak/table-viewer/releases/latest)，展开 **Assets**，下载以下四个文件之一。免安装版（No-install version）为单个 `.exe` 文件，无需安装即可直接运行：
 
-| Your PC | Standard installer | No-install version |
+| 你的电脑架构 | 标准安装版 | 免安装版 |
 |---|---|---|
-| Most Intel or AMD PCs | `table-viewer-<version>-x64-setup.exe` | `table-viewer-<version>-x64-portable.exe` |
-| Arm-based PCs, such as Snapdragon laptops | `table-viewer-<version>-arm64-setup.exe` | `table-viewer-<version>-arm64-portable.exe` |
+| 大多数 Intel 或 AMD 电脑 | `table-viewer-<version>-x64-setup.exe` | `table-viewer-<version>-x64-portable.exe` |
+| Arm 架构电脑（如骁龙本） | `table-viewer-<version>-arm64-setup.exe` | `table-viewer-<version>-arm64-portable.exe` |
 
-Choose the `setup.exe` unless you specifically need the no-install version. The setup wizard creates a Start Menu entry, registers **Open with** handlers, and defaults to a per-user installation that does not require administrator access. The no-install `.exe` creates no Start Menu or uninstaller entry, although it does store your Table Viewer settings and register per-user **Open with** handlers. If you are unsure which architecture you have, open **Settings → System → About** and check **System type**.
+除非明确需要免安装版，否则建议选择 `setup.exe`。安装向导会创建开始菜单快捷方式、注册 **打开方式**（Open with）关联，并默认采用无需管理员权限的当前用户安装。免安装版 `.exe` 不会创建开始菜单项或卸载入口，但同样会保存 Table Viewer 设置并注册当前用户的 **打开方式** 关联。如果不确定电脑架构，可打开 **设置 → 系统 → 系统信息** 查看 **系统类型**。
 
-Run the downloaded `.exe`. Windows builds are unsigned, so SmartScreen may show **Windows protected your PC** the first time; click **More info**, confirm that the app is Table Viewer, then click **Run anyway**. The `.blockmap` and `.yml` assets on the release are updater metadata, not installers. The `.sha256` files are optional checksums for verifying downloads.
+运行下载的 `.exe` 文件。由于 Windows 构建版本未签名，首次运行时 SmartScreen 可能会显示 **Windows 已保护你的电脑**（Windows protected your PC）；点击 **更多信息**（More info），确认应用为 Table Viewer 后，点击 **仍要运行**（Run anyway）即可。发布页面中的 `.blockmap` 和 `.yml` 文件为更新元数据，并非安装程序；`.sha256` 文件为可选校验和，用于验证下载完整性。
 
-## Why
+## 为什么开发它
 
-When I make tables, I make them in code — R, Stata, Python — and refine them by rerunning the script. The rest of my time with tables is spent reading them: reviewing output that I or colleagues generate programmatically, or sheets someone sent me. Excel and Numbers are built for authoring spreadsheets by hand, and for both of these workflows they add friction at every step.
+平时制作表格时，我通常用代码生成——R、Stata、Python——并通过反复运行脚本来调整结果。其余与表格打交道的时间则主要用于阅读：审阅自己或同事用程序生成的输出，或是别人发来的表格。Excel 和 Numbers 是为手工编制电子表格而设计的，在这两种工作流下几乎每一步都会带来额外阻力。
 
-The original reason I created Table Viewer was to make iteration on a generated workbook less painful. In Excel or Numbers, every rerun means closing the file, reopening it, finding your place again, and redoing highlights, column widths, and the rest. Table Viewer opens fast, reloads the file automatically when it changes, and keeps your scroll position, column widths, hidden columns, sorts, filters, and active sheet across reloads and sessions.
+我最初创建 Table Viewer 的原因，就是为了减轻反复迭代生成工作簿时的痛苦。在 Excel 或 Numbers 中，每次重新运行脚本都意味着要关闭文件、重新打开、重新定位到刚才的位置，还要重新设置高亮、列宽等状态。Table Viewer 打开迅速，文件变更时会自动重载，并在跨重载和跨会话时保留你的滚动位置、列宽、隐藏列、排序、筛选以及当前活动工作表。
 
-It also removes other friction from reading tables:
+它还消除了阅读表格时的其他痛点：
 
-- **CSV and TSV files can exceed Excel's 1,048,576-row worksheet limit.** Table Viewer shows up to one million rows by default; when a file has more, you can raise the limit or choose **Load all rows** for that file. It indexes the file once and parses rows for the grid on demand.
-- **Sorting, filtering, and hiding modify the worksheet.** When you're reviewing output, the last thing you want is to change it. In Table Viewer these are view-only transforms: the file on disk is never touched, and there's no extra step to turn a range into a sortable/filterable list — every column already is one.
-- **Exported reports often put titles and notes above the real table.** Right-click the actual header row — even several rows down — and choose **Use row as header**. Table Viewer hides the preamble, promotes that row, remembers the choice, and handles common two-row vertically merged header labels.
-- **You can't easily control how files open.** Typeface, font size, colors — Table Viewer lets you set all of these in Preferences once, and every sheet you ever open respects them, so files are legible the moment they open.
-- **Formatting can obscure the value you're auditing.** Switch between the workbook's formatted display and the underlying raw cell values without changing the workbook.
-- **Overflowing cells mean resizing rows and columns**, often in ways that make the table awkward. Table Viewer shows the full displayed value in a tooltip on hover.
-- **Highlighting a cell takes a trip through formatting menus.** Here you right-click a cell and pick a color. Highlights are annotations, not formatting: they survive saves, reloads, and file replacement.
-- **Many-sheet workbooks are painful**: when tabs overflow Excel's bottom bar you can't even scroll — you click left/right buttons to expose tabs. Table Viewer's sheet tabs scroll, and can be laid out vertically.
-- **Remote files must be downloaded first.** As a VS Code extension, Table Viewer works the same over SSH as locally, and uses your editor's theme and font.
-- **Diffing a spreadsheet in Git shows you a wall of text.** Click a changed `.xlsx`, `.xls`, `.csv`, `.tsv`, `.dta`, or `.parquet` file in VS Code's Source Control or Timeline view and Table Viewer opens the comparison as a table: added and deleted rows banded, changed cells showing before and after in place. The desktop app also compares any two files.
-- **Comparing a Git LFS file shows you the pointer, not the table.** An LFS-tracked file is stored in Git as a small pointer naming the real object, so the version you want to compare against is often not on your machine at all. Table Viewer recognizes the pointer on either side of a comparison and offers to download the object.
+- **CSV 和 TSV 文件可能超过 Excel 的 1,048,576 行工作表限制。** Table Viewer 默认最多显示一百万行；当文件超过该限制时，你可以调高上限或为当前文件选择 **Load all rows**（加载所有行）。它会对文件建一次索引，并按需分页解析行数据供网格渲染。
+- **排序、筛选和隐藏会修改工作表本身。** 在审阅输出结果时，你最不希望的就是改动原数据。在 Table Viewer 中，这些都是纯视图层面的变换：磁盘上的文件永远不会被修改，也无需额外步骤将区域转换为可排序/筛选的列表——每一列天生就支持排序和筛选。
+- **导出的报表常常在真正的数据表上方带有标题和注释。** 右键点击实际的表头行——哪怕它位于好几行之后——选择 **Use row as header**（将此行设为表头）。Table Viewer 会隐藏上方的前导行，将该行提升为列标题，记住你的选择，并能处理常见的两行纵向合并表头标签。
+- **无法轻松控制文件打开时的呈现样式。** 字体、字号、配色——Table Viewer 允许你在偏好设置中一次性设定，之后打开的每一张表都会遵循这些设置，打开即清晰易读。
+- **单元格格式可能会遮盖需要审计的真实数值。** 无需修改工作簿，即可在工作簿的格式化显示与底层原始单元格值之间一键切换。
+- **内容溢出的单元格往往需要调整行高列宽**，而这常会让表格变得难看。在 Table Viewer 中，鼠标悬停即可通过提示框查看完整显示值。
+- **高亮单元格需要穿过层层格式菜单。** 在这里只需右键点击单元格并选择颜色即可。高亮属于标注而非格式：它们会在保存、重载和文件替换后依然保留。
+- **多工作表的工作簿很难操作：** 当底栏工作表标签溢出时，Excel 里甚至无法滚动——只能点击左右按钮翻找。Table Viewer 的工作表标签支持滚动，并且可以设为纵向排列。
+- **远程文件必须先下载到本地。** 作为 VS Code 扩展，Table Viewer 通过 SSH 远程打开文件与本地体验完全一致，并使用你编辑器的主题和字体。
+- **在 Git 中对比电子表格只能看到一堵文本墙。** 在 VS Code 的源代码管理（Source Control）或时间线（Timeline）视图中点击已修改的 `.xlsx`、`.xls`、`.csv`、`.tsv`、`.dta` 或 `.parquet` 文件，Table Viewer 会以表格形式打开对比视图：新增和删除的行带有色带标识，修改的单元格会在原地同时显示修改前后的值。桌面应用也支持任意两个文件的对比。
+- **对比 Git LFS 文件时只能看到指针，看不到表格。** 受 LFS 追踪的文件在 Git 中存为指向真实对象的小指针文件，因此要对比的版本往往并不在本地机器上。Table Viewer 能识别对比任意一侧的 LFS 指针，并提供下载真实对象的选项。
 
-**Limitations:** Table Viewer is *not* a full spreadsheet editor. You can't create files or sheets. You can insert, delete, and move rows and columns in `.xlsx`, CSV, and TSV worksheets, but an `.xlsx` sheet with an Excel table, a chart, notes, a PivotTable, or an array formula can't be restructured; see [Inserting, deleting, and moving rows and columns](docs/rows-and-columns.md). Formula editing and recalculation intentionally support a documented subset of Excel; see [Excel formula support](docs/excel-formulas.md).
+**局限性：** Table Viewer **并非**完整的电子表格编辑器。你无法新建文件或新建工作表。你可以在 `.xlsx`、CSV 和 TSV 工作表中插入、删除和移动行与列，但如果 `.xlsx` 工作表包含 Excel 表格（Excel table）、图表、批注（notes）、数据透视表或数组公式，则无法进行结构调整；详见[插入、删除和移动行与列](docs/rows-and-columns.md)。公式编辑与重算仅有意支持 Excel 公式的一个已文档化子集；详见[Excel 公式支持](docs/excel-formulas.md)。
 
-## Features
+## 功能特性
 
-**Viewing**
-- Opens `.xlsx`, `.xls`, `.csv`, `.tsv`, `.dta`, and `.parquet` files
-- Multi-sheet workbooks with horizontal or vertical tab orientation
-- Merged cells with colspan/rowspan rendering
-- `.xlsx` rich-text runs and whole-cell bold, italic, underline, and strikethrough styling
-- `.xlsx` hyperlinks, with destination information on hover and open/copy actions for external links
-- Conservatively detects Excel column-name rows, with remembered per-sheet controls for promoting the first non-hidden row or a chosen row, including column names inherited from simple two-row vertical merges
-- Uses an active Excel Header Row as a logical table for formulas such as `=SUM([Revenue])` and `=[@Revenue]*2`, without requiring an Excel table region
-- Hover briefly over horizontally truncated or vertically clipped cell content to see the displayed value in a tooltip
-- Hover over a Stata or Parquet column header to see the variable label, type, and value label set, and, for Parquet, the null count and range of values from the file's footer
-- Stable, multi-column sorting with missing values kept last
-- Per-column filters for text, comparisons, ranges, distinct-value checklists, and empty/non-empty values
+**查看**
+- 打开 `.xlsx`、`.xls`、`.csv`、`.tsv`、`.dta` 和 `.parquet` 文件
+- 多工作表工作簿支持横向或纵向标签页布局
+- 支持合并单元格的跨列/跨行（colspan/rowspan）渲染
+- 支持 `.xlsx` 富文本片段以及整格加粗、斜体、下划线和删除线样式
+- 支持 `.xlsx` 超链接，悬停显示目标地址信息，外部链接支持打开与复制操作
+- 保守自动检测 Excel 列名行，提供按工作表记忆的控件以将首行非隐藏行或指定行提升为表头，包括继承自简单两行纵向合并的列名
+- 将激活的 Excel 表头行用作逻辑表，支持诸如 `=SUM([Revenue])` 和 `=[@Revenue]*2` 的公式，无需事先定义 Excel 表区域
+- 鼠标短暂停留在水平截断或垂直裁剪的单元格内容上时，通过提示框显示完整的显示值
+- 鼠标悬停在 Stata 或 Parquet 列头上时，显示变量标签、类型和值标签集；对于 Parquet，还会显示来自文件 footer 的空值计数（null count）和取值范围
+- 稳定的多列排序，缺失值始终排在最后
+- 支持每列按文本、比较条件、范围、唯一值复选框列表以及空/非空值进行筛选
 
-**Auto-refresh**
-- Watches the file on disk and reloads automatically when it changes
-- Preserves column widths, row heights, scroll position, and active sheet across reloads
+**自动刷新**
+- 监听磁盘上的文件变化并在修改后自动重新加载
+- 跨重载保留列宽、行高、滚动位置和当前活动工作表
 
-**Layout**
-- Drag column and row borders to resize
-- Double-click a column border to auto-fit to content
-- Select contiguous or discontiguous rows by their row numbers, then drag a selected row boundary to resize them together
-- Select multiple columns to resize them together or auto-fit the selection
-- Use the searchable **Columns** menu to show, hide, restore, or hide all columns
-- Column visibility and sizing are persisted per file and sheet
+**布局**
+- 拖拽列边界与行边界以调整大小
+- 双击列边界以自适应内容宽度
+- 通过行号选中连续或不连续的多行，拖拽其中任一选中行的边界即可同步调整行高
+- 选中多列即可同步调整列宽或批量自适应宽度
+- 使用带搜索功能的 **Columns**（列）菜单显示、隐藏、恢复或隐藏全部列
+- 列的可见性与尺寸按文件和工作表维度持久化保存
 
-**Formatting toggle**
-- Switch between formatted and raw cell values with one click
-- Useful for inspecting the exact number behind a formatted display
+**格式化切换**
+- 一键在格式化显示值与原始单元格值之间切换
+- 便于核查格式化显示背后的精确数值
 
-**Table diffs**
-- Compare two Excel, Stata, Parquet, CSV, or TSV files in a read-only table view — neither file is modified
-- See added, deleted, moved, and changed rows, with before-and-after values highlighted within changed cells
-- Aligns inserted, deleted, and moved rows so one structural change does not make every later row look modified
-- An optional **Only changed rows** toggle hides rows that are the same in both files
-- In VS Code, click a changed table file in the Source Control or Timeline view to open the diff — unstaged, staged, and committed changes alike
-- In the desktop app, choose **File → Compare Files…** or reopen a comparison from the Recent list
-- Files stored in Git LFS but not yet downloaded are detected on either side of a comparison, with a banner naming the object's real size and a button to fetch it
+**表格差异对比（Diff）**
+- 在只读表格视图中对比两个 Excel、Stata、Parquet、CSV 或 TSV 文件——不会修改任一原文件
+- 清晰展示新增、删除、移动和修改的行，并在修改的单元格内高亮显示修改前后的值
+- 对齐插入、删除和移动的行，避免因单次结构变动导致后续所有行看起来都被修改
+- 可选的 **Only changed rows**（仅显示变更行）开关可隐藏两个文件中完全相同的行
+- 在 VS Code 中，点击源代码管理（Source Control）或时间线（Timeline）视图中发生变更的表格文件即可打开差异对比——未暂存、已暂存和已提交的变更均支持
+- 在桌面应用中，选择 **File → Compare Files…**（文件 → 对比文件…）或从最近记录（Recent）列表重新打开对比
+- 若对比任一侧的文件存储在 Git LFS 中且尚未下载，系统会自动识别并显示提示横幅，标明对象实际大小并提供拉取按钮
 
-**CSV/TSV modes**
-- **Open as Table**: opens the file in its own viewer tab
-- **Open Preview to the Side**: split view with the source editor on the left and the table on the right, with synchronized scrolling between them
-- Large files are indexed once and parsed in windows as the grid requests them
-- Files beyond the configured row limit show a banner for changing the limit or loading every row for that view
+**CSV/TSV 模式**
+- **Open as Table**（作为表格打开）：在独立的查看器标签页中打开文件
+- **Open Preview to the Side**（在侧边打开预览）：左侧为源码编辑器、右侧为表格的分栏视图，二者支持同步滚动
+- 大文件仅建一次索引，随网格请求按窗口分页解析
+- 超出配置行数上限的文件会显示横幅，支持修改上限或为当前视图加载所有行
 
-**Selection and copy**
-- Click, drag, or shift-click to select cells
-- Arrow keys to navigate. In read-only files (`.xls`, `.dta`, Parquet, comparisons, previews), `h`/`j`/`k`/`l` navigate too; in a file you can edit, typing a letter starts editing the selected cell
-- `Ctrl+C` / `Cmd+C` to copy selected cells as tab-separated text
-- Right-click context menus for copying, selecting or hiding rows and columns, and choosing an Excel row as the header
+**选择与复制**
+- 单击、拖拽或 Shift+单击选择单元格
+- 使用方向键导航。在只读文件（`.xls`、`.dta`、Parquet、差异对比、侧边预览）中，也支持 `h`/`j`/`k`/`l` 键导航；在可编辑文件中，直接输入字母即可开始编辑所选单元格
+- `Ctrl+C` / `Cmd+C` 将选中单元格复制为制表符分隔（TSV）文本
+- 右键上下文菜单支持复制、选择或隐藏行列，以及将某 Excel 行设为表头
 
-**Cell highlights**
-- Apply a semantic highlight color to selected cells as a positional annotation, identified by worksheet, source row, and source column
-- Highlights survive saves, reloads, file-content replacement, column-name changes, and first-row-header changes
-- Highlights at temporarily unavailable rows, columns, or worksheets remain stored and reappear when those positions return
-- Clear selection removes highlights only from the selected cells; Clear all removes every highlight for the file, including dormant highlights in unavailable rows, columns, or worksheets
-- Only these explicit user clear actions remove highlights
-- Unlike highlights, Sort and Filter are schema-bound view transforms and can be invalidated when their column schema is no longer meaningful
+**单元格高亮**
+- 为选中单元格应用语义高亮颜色作为位置标注，通过工作表、源行号和源列号进行标识
+- 高亮在保存、重载、文件内容替换、列名变更以及首行表头切换后依然保留
+- 位于暂时不可用行、列或工作表上的高亮仍会被保存，当对应位置恢复时重新出现
+- **Clear selection**（清除所选）仅移除所选单元格的高亮；**Clear all**（全部清除）会移除该文件的所有高亮，包括处于不可用行、列或工作表中的休眠高亮
+- 只有用户显式执行上述清除操作才会移除高亮
+- 与高亮不同，排序和筛选是绑定于表结构（schema）的视图变换，当其所依赖的列结构不再有效时会失效
 
-**Undo and redo**
-- `Ctrl+Z` / `Cmd+Z` undoes your last change; `Ctrl+Y` or `Cmd+Shift+Z` redoes it. In the desktop app the **Edit** menu carries both, named after what they would apply — "Undo Paste", "Redo Clear all highlights" — and greyed out when there is nothing left
-- Covers cell edits (values, line breaks, styling, hyperlinks), inserted, deleted, and moved rows and columns, cell highlights, and discards. **Discard** can be undone in full
-- One history per workbook, in the order you worked: undoing a change on another worksheet switches to it. The cursor moves to what changed and the region flashes briefly, so an undo you cannot see is still findable
-- Undo reaches back past a save, except a save that inserted, deleted, or moved rows or columns. The file then has unsaved changes again, and re-saving is yours to do
-- If a change is hidden by an active filter or a hidden column, it is still applied and you are told where it went rather than left watching a still cursor
-- Sorts, filters, and column visibility are not part of history — they are view state, with their own toolbar chips and **Columns** menu for undoing them
-- `Ctrl+Z` / `Cmd+Z` **inside** an open cell editor is ordinary text undo for what you are typing, and does not touch the workbook's history
-- History lives with the window: closing the tab, window, or app clears it. Unsaved edits are cached and survive that, so a reopened file can show edits that can no longer be undone
+**撤销与重做**
+- `Ctrl+Z` / `Cmd+Z` 撤销上一步更改；`Ctrl+Y` 或 `Cmd+Shift+Z` 重做。在桌面应用的 **Edit**（编辑）菜单中两者均会显示具体对应的操作名称——例如“Undo Paste”、“Redo Clear all highlights”——无可操作项时呈置灰状态
+- 覆盖范围包括单元格编辑（值、换行、样式、超链接）、插入/删除/移动行列、单元格高亮以及放弃更改（Discard）。**Discard**（放弃更改）也可完整撤销
+- 每个工作簿共用一条按操作顺序记录的历史栈：跨工作表撤销时会自动切换到对应工作表。光标会移动到变更处且区域会短暂闪烁，确保视野之外的撤销操作也清晰可寻
+- 撤销可跨过保存操作继续回退，但涉及插入、删除或移动行列的保存操作除外。回退后文件将重新变为未保存状态，需要时可再次保存
+- 若变更被当前生效的筛选器或隐藏列遮蔽，撤销/重做仍会正常生效并给出位置提示，避免只见光标静止而不知所踪
+- 排序、筛选和列可见性不计入编辑历史——它们属于视图状态，可通过各自的工具栏标签和 **Columns** 菜单进行还原
+- 在打开的单元格编辑器**内部**按 `Ctrl+Z` / `Cmd+Z` 执行的是常规文本输入撤销，不会影响工作簿的编辑历史
+- 历史记录随窗口存活：关闭标签页、窗口或应用会清空历史。未保存的编辑会被缓存并跨关闭保留，因此重新打开文件时可能会看到无法再撤销的挂起编辑
 
-**Find** — `Cmd+F` (macOS) or `Ctrl+F` (Windows, Linux), or **Edit → Find…** in the desktop app
-- Typing selects the first cell, from the selected cell onward, whose displayed text contains what you typed; case does not matter
-- `Enter` / `Shift+Enter` (or the arrow buttons) step to the next and previous match, wrapping around the sheet; `Escape` closes the bar and leaves the match selected
-- Searches the active worksheet as you see it: visible columns, rows left after filters, in the current sort order, including unsaved edits. The text matched is what each cell shows, so the **Formatting** toggle decides between formatted and raw values
-- Large files are read page by page until the next match turns up; the bar says **No matches** only after checking every cell
+**查找** — `Cmd+F`（macOS）或 `Ctrl+F`（Windows、Linux），或在桌面应用中点击 **Edit → Find…**
+- 输入内容后会从当前选中单元格开始，选中第一个显示文本包含搜索词的单元格；不区分大小写
+- `Enter` / `Shift+Enter`（或方向按钮）在工作表内循环跳转至下一个和上一个匹配项；`Escape` 关闭查找栏并保持匹配单元格处于选中状态
+- 搜索范围为当前所见的活动工作表：可见列、筛选后保留的行、当前排序顺序，且包含未保存的编辑。匹配基于单元格实际显示的文本，因此 **Formatting**（格式化）开关决定了匹配格式化值还是原始值
+- 大文件会逐页读取直至找到下一个匹配项；只有在检查完所有单元格后，查找栏才会显示 **No matches**（无匹配项）
 
-**Sorting and filtering** — the [filtering guide](docs/filtering.md) explains each filter condition and how to use them
-- Right-click a column header to sort ascending or descending, add a secondary sort, or open that column's filter editor
-- Sorted headers show direction arrows and multi-column priority badges; toolbar chips let you flip, reorder, remove, enable, disable, or edit active rules
-- Keyboard shortcuts operate on the focused column: `Shift+Alt+A` / `D` sort, `Shift+Alt+F` filters, `Shift+Alt+X` clears its filter, and `Shift+Alt+0` / `9` clear all sorts or filters
-- Multiple enabled filters are combined, while disabled filters remain available for later reuse
-- Sorts and filters are view-only, persist per file and sheet, and are recomputed after reloads
-- Sorting and filtering use raw cell values rather than formatted display text
-- Empty values sort last in both directions
-- When a sorted, filtered, or column-hidden sheet contains merged cells, the view temporarily shows them unmerged. Only the original top-left cell contains the merged value; covered cells remain empty. Restoring the natural rows and all columns restores the exact merge layout.
-- Sorting, filtering, and row-hiding work alongside editing in both directions: you can sort or filter with unsaved changes, and you can edit a sheet that is already sorted or filtered. Either way the displayed order stays put while changes are unsaved, so rows stay where you left them, and the view reflects your new values once you save and the file reloads. While one tab has unsaved changes to a file, it is the tab that can change that file's view; another tab showing the same file can change it again once those changes are saved or discarded. They are unavailable in synchronized preview panes, which always show rows in source order. Column visibility remains available in every mode
+**排序与筛选** — [筛选指南](docs/filtering.md)详细说明了各类筛选条件及其用法
+- 右键点击列头可进行升序或降序排序、添加次级排序或打开该列的筛选编辑器
+- 已排序列头会显示方向箭头和多列优先级徽章；通过工具栏标签可以反转方向、重排顺序、移除、启用、禁用或编辑已激活的规则
+- 针对当前聚焦列的快捷键：`Shift+Alt+A` / `D` 排序，`Shift+Alt+F` 打开筛选，`Shift+Alt+X` 清除该列筛选，`Shift+Alt+0` / `9` 清除全部排序或筛选
+- 多个已启用的筛选条件会组合生效，已禁用的筛选条件会保留以便后续重新启用
+- 排序和筛选仅作用于视图层，按文件和工作表持久化，并在文件重载后自动重新计算
+- 排序和筛选基于原始单元格值而非格式化显示文本进行计算
+- 无论升序还是降序，空值始终排在最后
+- 当已排序、筛选或隐藏列的工作表包含合并单元格时，视图会临时将其拆分为未合并状态显示。仅原左上角单元格保留合并值，被覆盖的单元格保持为空。恢复原始行序和全部列后，合并布局会精确还原
+- 排序、筛选和行隐藏可与编辑功能双向协同：你可以在有未保存更改时进行排序或筛选，也可以在已排序或已筛选的工作表上进行编辑。无论哪种方式，只要存在未保存更改，显示行序都会保持不变以便定位，待保存且文件重载后视图才会反映新值。当某个标签页持有文件的未保存更改时，只有该标签页可以修改该文件的视图；待更改保存或放弃后，展示同一文件的其他标签页即可再次修改视图。同步预览窗格中不支持排序和筛选，它始终按源顺序显示行数据。列可见性在所有模式下均可用
 
-**Editing (`.xlsx`, CSV, and TSV)**
-- There is no edit mode to switch on. Double-click a cell, press **Enter**, or just start typing to edit it. **Delete** clears the selected cells, and paste writes into them
-- The toolbar's **Save** button lights up when there are unsaved changes. **Discard** appears beside it and drops them all, and **Diff** shows each edited cell's old value next to its new one
-- Edit, copy, cut, and recalculate `.xlsx` formulas within the [documented Excel formula support](docs/excel-formulas.md)
-- Use the **+** button at the bottom of the row numbers to add rows. Pasting a block past the last row adds the whole block's row count as one undoable change
-- **Enter** confirms and moves to the cell below. When there is no next row, it appends one and continues in the same column. **Tab** moves row-major and appends from the final visible column of the final row
-- Pending rows keep their intended physical row numbers and use the existing added-row tint. Right-click a pending row number and choose **Delete row** to remove it; right-click a pending removal to cancel it
-- Right-click a row number or column header to insert, delete, restore, or move rows and columns. Right-clicking a cell offers Insert and Delete for its row and column too. `Alt+Shift+Arrow` moves selected rows or columns, and you can drag selected rows or column headers. New rows and columns are tinted green, deleted ones red, and moved ones purple until you save. The Save button's tooltip says what Save will do, and a notice under the grid warns only when it will break formulas or change a formula's range in a way Excel might not. Details, including what an `.xlsx` sheet must not contain, are in [Inserting, deleting, and moving rows and columns](docs/rows-and-columns.md)
-- Active sorts and filters leave pending rows in a separate section at the end. **Hide row** remains visible for those rows but is disabled
-- **Shift+Enter** or **Alt+Enter** inserts a line break within a cell
-- **Escape** cancels the current edit
-- **Ctrl+S** / **Cmd+S**, or the **Save** button, saves all changes back to the file
-- Edit `.xlsx` cell styling with Markdown syntax: `**bold**`, `*italic*`, `<u>underline</u>`, and `~~strikethrough~~`
-- Add, edit, or remove `.xlsx` hyperlinks to a web address or a place in the workbook from the cell context menu
-- An `.xlsx` append adds worksheet rows. It does not enlarge an OOXML Excel Table region. Inserting, deleting, and moving rows and columns is refused on a sheet with an Excel table
-- Edited cells are highlighted with a different background color until saved
-- Rows keep their position while you have unsaved changes, so a cell stays under your cursor while you work on it. You can start editing with a sort or filter already applied, and add or change one while editing; neither moves the rows you are working on. A row you edit so that it no longer matches an active filter stays visible until you save; the view reflects your new values once the file is saved and reloaded
-- Unsaved changes are cached, so you won't lose your work if you close the tab, window, or app
-- If a cell changes in the file while you have a pending edit for that cell, an informational banner appears and the cell gets a neutral blue highlight. **Review changes** shows the original file value, the current file value, and your pending edit. You can go to the cell, dismiss the notice without changing anything, or discard that pending edit individually
+**编辑（`.xlsx`、CSV 和 TSV）**
+- 无需切换任何编辑模式。双击单元格、按 **Enter** 或直接输入内容即可开始编辑。**Delete** 清空所选单元格，粘贴操作则向选区写入内容
+- 存在未保存更改时，工具栏上的 **Save**（保存）按钮会高亮。其旁会出现 **Discard**（放弃）按钮用于丢弃全部未保存更改，**Diff** 按钮则会把每个被编辑单元格的旧值与新值并排展示
+- 在[已文档化的 Excel 公式支持](docs/excel-formulas.md)范围内编辑、复制、剪切并重算 `.xlsx` 公式
+- 使用行号底部的 **+** 按钮追加行。向最后一行之后粘贴一块数据时，会自动按整块行数追加，并作为一次可撤销更改记录
+- **Enter** 确认编辑并移至下方单元格；若已无下一行，则在末尾追加一行并保持在当前列。**Tab** 按行优先顺序移动，并在最后一行的最后一列触发追加新行
+- 挂起的新增行会保留其预期的物理行号，并带有新增行背景色。右键点击挂起行号并选择 **Delete row**（删除行）可移除它；右键点击挂起的删除标记可取消删除
+- 右键点击行号或列头可插入、删除、恢复或移动行和列。右键点击单元格同样提供其所在行和列的插入与删除操作。使用 `Alt+Shift+方向键` 可移动选中的行或列，也可以直接拖拽选中的行或列头。在保存前，新增的行列呈绿色，删除的呈红色，移动的呈紫色。**Save** 按钮的悬停提示会说明保存将执行的操作；仅当操作会破坏公式或导致公式引用范围发生与 Excel 不一致的变动时，网格下方才会出现警告提示。详细规则及 `.xlsx` 工作表的限制条件见[插入、删除和移动行与列](docs/rows-and-columns.md)
+- 存在激活的排序和筛选时，挂起的新增行会停留在末尾的独立区域中。这些行的 **Hide row**（隐藏行）菜单项仍可见但处于禁用状态
+- `Shift+Enter` 或 `Alt+Enter` 在单元格内插入换行符
+- `Escape` 取消当前编辑
+- `Ctrl+S` / `Cmd+S` 或点击 **Save** 按钮将所有更改写回文件
+- 支持使用 Markdown 语法编辑 `.xlsx` 单元格样式：`**粗体**`、`*斜体*`、`<u>下划线</u>` 和 `~~删除线~~`
+- 可通过单元格右键菜单添加、编辑或移除指向网页地址或工作簿内部位置的 `.xlsx` 超链接
+- 对 `.xlsx` 追加行会增加工作表行，但不会扩大 OOXML Excel 表格（Excel Table）区域。包含 Excel 表格的工作表禁止执行插入、删除和移动行列操作
+- 已编辑的单元格在保存前会以不同背景色高亮提示
+- 存在未保存更改时，行会保持在当前位置，确保编辑过程中单元格不会从光标下跑掉。你可以先排序或筛选再开始编辑，也可以在编辑过程中添加或更改排序/筛选；两者都不会移动你正在操作的行。即使某行被修改到不再符合当前筛选条件，在保存前它仍保持可见；保存并重载文件后，视图才会更新为新值的结果
+- 未保存的更改会被缓存，因此关闭标签页、窗口或应用不会丢失进度
+- 如果在存在挂起编辑期间，磁盘文件中的对应单元格发生了变更，界面会弹出提示横幅并将该单元格标记为中性蓝色高亮。点击 **Review changes**（查看变更）可对比原始文件值、当前文件值与你的挂起编辑。你可以跳转到该单元格、忽略提示而不做改动，或者单独放弃该单元格的挂起编辑
 
-**Diffing**
+**差异对比（Diffing）**
 
-In the desktop app, choose **File → Compare Files…** and select an original (before) file and a modified (after) file. The comparison is read-only and neither file is changed.
+在桌面应用中，选择 **File → Compare Files…**（文件 → 对比文件…），然后分别选择原始（修改前）文件和修改后文件。对比视图为只读，不会改动任一文件。
 
-In VS Code, click a changed Excel, Stata, Parquet, CSV, or TSV file in the Source Control or Timeline view and Table Viewer opens the comparison.
+在 VS Code 中，点击源代码管理（Source Control）或时间线（Timeline）视图中发生变更的 Excel、Stata、Parquet、CSV 或 TSV 文件，Table Viewer 就会打开对比视图。
 
-Added rows are banded in green, deleted rows in red, and moved rows in purple. Within a changed row, each changed cell shows its original value in red and the new value in green. The green and red follow your theme's Git decoration colors, so they match the added and deleted files in the Source Control view.
+新增行以绿色色带标注，删除行以红色色带标注，移动行以紫色色带标注。在发生变更的行内，每个被修改的单元格会以红色显示原始值、以绿色显示新值。绿红配色遵循你当前主题的 Git 装饰颜色，与源代码管理视图中新增和删除文件的颜色保持一致。
 
-## Usage
+## 使用方法
 
-**Excel files** open automatically in Table Viewer when you open an `.xlsx` or `.xls` file. Modern `.xlsx` workbooks are editable; legacy `.xls` workbooks are read-only. When the first row strongly resembles column names, it is promoted automatically. Use the per-sheet **Header Row** toolbar toggle to override the detected choice; enabling it promotes the first non-hidden row.
+**Excel 文件：** 打开 `.xlsx` 或 `.xls` 文件时会自动在 Table Viewer 中打开。新版 `.xlsx` 工作簿支持编辑，旧版 `.xls` 工作簿为只读。当首行高度符合列名特征时，系统会自动将其提升为表头。使用按工作表记忆的工具栏 **Header Row**（表头行）开关可覆盖自动检测结果；启用该开关会将首行非隐藏行提升为表头。
 
-To choose a different header row, right-click its row number and select **Use row as header**. Table Viewer hides the rows above it, preserves any hidden rows below it, and promotes the chosen row to column names in one step. The action is available only when no sort or enabled filter is changing the displayed row order. Header choices and hidden rows are remembered for that file and worksheet.
+如需选择其他行作为表头，右键点击其行号并选择 **Use row as header**（将此行设为表头）。Table Viewer 会一步完成以下操作：隐藏其上方的行、保留其下方原有的隐藏行状态，并将所选行提升为列名。仅当没有排序或启用的筛选器改变当前行序时，该操作才可用。表头选择与隐藏行状态会按文件和工作表分别记住。
 
-**CSV/TSV files** open automatically in Table Viewer as an editable table. An **"Open in Text Editor"** button in the title bar takes you to VS Code's built-in text editor. When a CSV/TSV file is open there, two Table Viewer buttons appear in the editor title bar:
+**CSV/TSV 文件：** 打开时会自动在 Table Viewer 中作为可编辑表格打开。标题栏中的 **Open in Text Editor**（在文本编辑器中打开）按钮可切换到 VS Code 内置文本编辑器。当 CSV/TSV 文件在文本编辑器中打开时，编辑器标题栏会出现两个 Table Viewer 按钮：
 
-- The **preview icon** opens a read-only synced side-by-side preview (alt-click opens it in the same tab)
-- The **table icon** opens the file again as an editable table view
+- **预览图标** 打开与源码双向同步滚动的只读侧边预览（按住 Alt 点击可在同一标签页中打开）
+- **表格图标** 重新以可编辑表格视图打开该文件
 
-**Stata files** open automatically as single read-only tables. Hovering over a column header shows the variable's label, storage type, display format, and value label set.
+**Stata 文件：** 自动作为单张只读表格打开。鼠标悬停在列头上可查看变量的标签（label）、存储类型（storage type）、显示格式（display format）和值标签集（value label set）。
 
-**Parquet files** open automatically as single read-only tables, with dates, times, time zones, and 64-bit integers shown as they are stored. Columns Table Viewer cannot show, such as lists and structs, are left out with a warning naming them. See [Parquet files](docs/parquet-files.md).
+**Parquet 文件：** 自动作为单张只读表格打开，按原始存储形式显示日期、时间、时区和 64 位整数。Table Viewer 暂不支持显示的列（如 list 和 struct 类型）会被跳过，并在警告中列出这些列名。详见 [Parquet 文件说明](docs/parquet-files.md)。
 
-## Default editor behavior
+## 默认编辑器行为
 
-Table Viewer registers as the default editor for Excel (`.xlsx`, `.xls`), Stata (`.dta`), Parquet (`.parquet`), CSV, and TSV files. `.xlsx`, CSV, and TSV files are editable; legacy `.xls` workbooks, `.dta` datasets, and `.parquet` files are read-only. If another viewer is registered for one of these formats, VS Code may ask which editor you'd like to use.
+Table Viewer 会注册为 Excel（`.xlsx`、`.xls`）、Stata（`.dta`）、Parquet（`.parquet`）、CSV 和 TSV 文件的默认编辑器。`.xlsx`、CSV 和 TSV 文件支持编辑；旧版 `.xls` 工作簿、`.dta` 数据集和 `.parquet` 文件为只读。如果系统中还注册了其他查看这些格式的扩展，VS Code 可能会询问你要使用哪个编辑器。
 
-To open a CSV/TSV file as plain text, use **Open in Text Editor** in the table editor's title bar, or right-click its tab and choose **Reopen Editor With… → Text Editor**. To change the default for a file type, choose **Configure Default Editor** from the same editor picker.
+若要以纯文本形式打开 CSV/TSV 文件，可使用表格编辑器标题栏中的 **Open in Text Editor**，或右键点击文件标签页选择 **Reopen Editor With… → Text Editor**。如需更改某种文件类型的默认打开方式，可在同一编辑器选择菜单中点击 **Configure Default Editor**。
 
-## Settings
+## 设置项
 
-Table Viewer uses VS Code's editor font (`editor.fontFamily` and `editor.fontSize`) by default. Set `tableViewer.fontFamily` to a CSS font-family value such as `Hack, monospace`, or `tableViewer.fontSize` to a pixel size, if you want tables to differ from the editor.
+Table Viewer 默认沿用 VS Code 的编辑器字体（`editor.fontFamily` 和 `editor.fontSize`）。如果希望表格使用与编辑器不同的字体，可将 `tableViewer.fontFamily` 设为 CSS 字体族值（如 `Hack, monospace`），或将 `tableViewer.fontSize` 设为具体像素大小。
 
-| Setting | Default | Description |
-|---------|---------|-------------|
-| `tableViewer.fontFamily` | empty (editor font) | Font family used in table views. Leave empty to follow `editor.fontFamily`. |
-| `tableViewer.fontSize` | `0` (editor size) | Font size in pixels used in table views. Set to `0` to follow `editor.fontSize`. |
-| `tableViewer.tabOrientation` | `horizontal` | Default worksheet tab orientation (`horizontal` or `vertical`). Can be overridden per file. |
-| `tableViewer.diffOnByDefault` | `false` | Turn the **Diff** toggle on when you start editing, so each edited cell shows the file value it would replace beside the pending edit. If that cell changes in the file, Diff updates to the current file value. The setting can be overridden per viewer from the toolbar. |
-| `tableViewer.maxStoredFiles` | `10000` | Maximum number of files whose layout state is remembered. Least recently used entries are evicted first. |
-| `tableViewer.csvMaxRows` | `1000000` | Rows to display by default for CSV/TSV files. A banner on larger files lets you change the limit or load all rows for that view. |
-| `tableViewer.maxFileSizeMiB` | `256` | File-size threshold in MiB. Above it, Table Viewer asks before opening the file and offers **Open Anyway**. |
+| 设置项 | 默认值 | 说明 |
+|---|---|---|
+| `tableViewer.fontFamily` | 空（跟随编辑器字体） | 表格视图使用的字体族。留空则跟随 `editor.fontFamily`。 |
+| `tableViewer.fontSize` | `0`（跟随编辑器字号） | 表格视图使用的字号（像素）。设为 `0` 则跟随 `editor.fontSize`。 |
+| `tableViewer.tabOrientation` | `horizontal` | 工作表标签页的默认排列方向（`horizontal` 水平或 `vertical` 垂直）。可按文件单独覆盖。 |
+| `tableViewer.diffOnByDefault` | `false` | 开始编辑时自动开启 **Diff** 开关，使每个被编辑单元格在挂起编辑旁显示将被替换的文件原值。若文件内该单元格发生变化，Diff 会同步更新为最新文件值。可在各查看器的工具栏中单独覆盖。 |
+| `tableViewer.maxStoredFiles` | `10000` | 记住布局状态的文件数量上限。超过时按最近最少使用（LRU）原则淘汰旧记录。 |
+| `tableViewer.csvMaxRows` | `1000000` | CSV/TSV 文件默认显示的最大行数。超出时会在文件顶部显示横幅，支持修改上限或为当前视图加载所有行。 |
+| `tableViewer.maxFileSizeMiB` | `256` | 文件大小阈值（单位 MiB）。超过该大小的文件在打开前会弹窗询问，并提供 **Open Anyway**（仍然打开）选项。 |
 
-## Standalone desktop app
+## 独立桌面应用
 
-Table Viewer also runs as a standalone Electron desktop app that reuses the same viewer, grid, and persistence code — no VS Code required. See [desktop/README.md](desktop/README.md) for build, run, packaging, and testing instructions.
+Table Viewer 还可以作为独立的 Electron 桌面应用运行，它复用了相同的查看器、网格和持久化代码——无需安装 VS Code。构建、运行、打包和测试说明请参阅 [desktop/README.md](desktop/README.md)。
 
-See [Installation](#installation) above for the exact macOS and Windows downloads. The [desktop setup guide](docs/setup-guide-desktop-app.md) has a longer walkthrough, update behavior, checksum verification, and troubleshooting. Release maintainers can find the Homebrew tap and release plumbing in the [Homebrew tap guide](docs/homebrew-tap.md).
+macOS 和 Windows 的具体下载地址见上文[安装](#安装)部分。更详细的上手流程、更新机制、校验和验证及故障排查请参阅[桌面应用安装指南](docs/setup-guide-desktop-app.md)。发布维护者可在 [Homebrew tap 指南](docs/homebrew-tap.md)中查看 Homebrew tap 及发布流水线说明。
 
-## Development
+## 开发指南
 
-Clone the repo and run `npm install`.
+克隆仓库后运行 `npm install`。
 
-**VS Code extension** (unchanged flow):
+**VS Code 扩展**（常规流程）：
 
-- `npm run bundle && npm run bundle:webview` — build the extension and webview bundles
-- `npm test` — vitest unit tests
-- `npm run test:integration` — VS Code Extension Host integration tests
-- `npm run package` — build the `.vsix` with vsce
+- `npm run bundle && npm run bundle:webview` — 构建扩展端与 Webview 端打包产物
+- `npm test` — 运行 vitest 单元测试
+- `npm run test:integration` — 运行 VS Code Extension Host 集成测试
+- `npm run package` — 使用 vsce 打包生成 `.vsix`
 
-**Desktop app:**
+**桌面应用：**
 
-- `npm run desktop:dev` — build the bundles and launch the app with Electron
-- `npm run desktop:package` — unsigned local macOS build (dmg + zip, under `dist/desktop-packages/`)
-- `npm run desktop:package:win` — Windows build (setup + portable exe, x64 + arm64); must be run on Windows
-- `npm run test:desktop-smoke` — Playwright Electron smoke tests (separate from the vitest suite)
+- `npm run desktop:dev` — 构建产物并使用 Electron 启动应用
+- `npm run desktop:package` — 构建本地未签名的 macOS 安装包（dmg + zip，输出至 `dist/desktop-packages/`）
+- `npm run desktop:package:win` — 构建 Windows 安装包（setup + portable exe，包含 x64 + arm64）；必须在 Windows 上运行
+- `npm run test:desktop-smoke` — 运行 Playwright Electron 冒烟测试（独立于 vitest 测试套件）
 
-`./scripts/setup.sh` builds and installs both front ends locally in one go — the `.vsix` into every supported editor on `PATH`, and (on macOS) the desktop app into `/Applications`. See the [development guide](docs/development.md) for its flags and exact behavior.
+`./scripts/setup.sh` 可一次性在本地构建并安装两个前端——将 `.vsix` 安装到 `PATH` 中所有受支持的编辑器，以及（在 macOS 上）将桌面应用安装到 `/Applications`。其参数选项与具体行为详见[开发指南](docs/development.md)。
 
-## License
+## 许可证
 
 [GPL-3.0](LICENSE)
 
-Third-party attributions (the bundled color themes, and where to find the
-generated npm package notices): [NOTICE.md](NOTICE.md).
+第三方致谢（内嵌配色主题及生成后的 npm 包声明位置）请参阅 [NOTICE.md](NOTICE.md)。
