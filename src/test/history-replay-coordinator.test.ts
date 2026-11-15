@@ -7,7 +7,7 @@ import {
     value_only_overlay,
     type CellOverlayState,
 } from '../webview/history-cell-state-model';
-import { peek_history, type HistoryChange } from '../webview/history-stack-model';
+import { peek_history, type HistoryChange, type HistoryStackState } from '../webview/history-stack-model';
 import { create_history_store } from '../webview/history-store';
 import {
     create_history_replay_coordinator,
@@ -72,6 +72,8 @@ interface Harness {
     readonly invisible: Set<string>;
     /** Record another gesture into the same history, as a host reply would. */
     readonly record: (changes: readonly HistoryChange[]) => void;
+    /** The history the coordinator replays. */
+    readonly history: () => HistoryStackState;
     /** The session the coordinator acquires before preparing. */
     readonly session: {
         /** How many times a replay asked for one. */
@@ -93,6 +95,7 @@ interface Harness {
 function harness(
     changes: readonly HistoryChange[],
     direction: 'undo' | 'redo' = 'undo',
+    entry_for_replay?: ReplayCoordinatorHost['entry_for_replay'],
 ): Harness {
     const store = create_history_store();
     const record = store.stage_record({ label: 'Edit', changes });
@@ -136,12 +139,14 @@ function harness(
         },
         post: (message) => { posted.push(message); },
         next_id: (prefix) => `${prefix}-${++counter}`,
+        ...(entry_for_replay === undefined ? {} : { entry_for_replay }),
     };
     return {
         coordinator: create_history_replay_coordinator(host),
         posted,
         overlays,
         invisible,
+        history: () => store.snapshot(),
         record: (next) => {
             const staged = store.stage_record({ label: 'Highlight cells', changes: next });
             staged.commit();
@@ -660,6 +665,76 @@ describe('settling', () => {
             reason: 'conflict',
         });
         expect(coordinator.is_busy()).toBe(true);
+    });
+});
+
+describe('an entry re-expressed for the current Header Row', () => {
+    it('refuses an entry that cannot be replayed now, before acquiring a session', async () => {
+        const { coordinator, posted, session } = harness(
+            [cell_change(0, 0, 'typed')], 'undo', () => undefined,
+        );
+        await expect(coordinator.begin('undo')).resolves.toEqual({ kind: 'refused', reason: 'header-row' });
+        expect(session.calls).toBe(0);
+        expect(posted).toEqual([]);
+        expect(coordinator.is_busy()).toBe(false);
+    });
+
+    it('refuses, holding nothing, when the header moved while the session was being acquired', async () => {
+        let replayable = true;
+        const { coordinator, posted, session } = harness(
+            [cell_change(0, 0, 'typed')], 'undo', (entry) => (replayable ? entry : undefined),
+        );
+        session.gate = () => {};
+        const outcome = coordinator.begin('undo');
+        for (let index = 0; index < 5; index += 1) await Promise.resolve();
+        expect(session.calls).toBe(1);
+        replayable = false;
+        session.gate();
+        await expect(outcome).resolves.toEqual({ kind: 'refused', reason: 'header-row' });
+        expect(posted).toEqual([]);
+        expect(coordinator.is_busy()).toBe(false);
+    });
+
+    it('prepares and plans the re-expressed entry, and hands history the stored one', async () => {
+        // The re-expressed entry is the same gesture one row down.
+        const moved = cell_change(5, 0, 'typed');
+        const { coordinator, posted, overlays, history } = harness(
+            [cell_change(0, 0, 'typed')],
+            'undo',
+            (entry) => ({ ...entry, action: { label: entry.action.label, changes: [moved] } }),
+        );
+        if (moved.kind !== 'cell') throw new Error('not a cell');
+        overlays.set('5:0', moved.delta.afterOverlay);
+        const stored = peek_history(history(), 'undo');
+        const { outcome: pending } = await started(coordinator, 'undo');
+        const request = last_prepare(posted);
+        expect(request.cells.map((cell) => cell.sourceRow)).toEqual([5]);
+
+        coordinator.on_prepared(prepared_for(request));
+        const commit = last_commit(posted);
+        const accepted = coordinator.on_committed({
+            requestId: commit.requestId,
+            replayId: commit.replayId,
+            leaseId: commit.leaseId,
+            mutationId: commit.mutationId,
+            sourceGeneration: 7,
+            cells: commit.cells.map((cell) => ({
+                ordinal: cell.ordinal,
+                resolvedSheetIndex: 0,
+                key: '5:0',
+                entry: cell.entry,
+            })),
+            focusSheetIndex: 0,
+            focus: request.focus,
+            displayFocus: null,
+        });
+        expect((await pending).kind).toBe('committed');
+        // What history moves is the entry it holds, sides and stamp untouched:
+        // a re-expressed copy still carries the old body start, and adopting
+        // it would re-express it a second time.
+        if (stored.kind !== 'available') throw new Error('nothing stored');
+        expect(accepted?.entry).toBe(stored.entry);
+        expect(accepted?.entry.action.changes[0]).not.toBe(moved);
     });
 });
 

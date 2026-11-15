@@ -8,8 +8,8 @@
 
 import type { HistoryDirection } from './history-cell-state-model';
 import type { ReplayRefusalReason } from './history-replay-request-model';
+import type { HeaderWait } from './history-header-rebase';
 import {
-    HEADER_CHANGE_BARRIER_MESSAGE,
     STRUCTURAL_SAVE_BARRIER_MESSAGE,
     type HistoryBarrier,
 } from './history-stack-model';
@@ -39,10 +39,15 @@ export function replayed_verb(direction: HistoryDirection): string {
  *    once per repeat.
  *  - `nothing-to-replay` — the stack is empty. The menu item is already disabled,
  *    and in the webview there is nothing to say beyond "no".
- *  - `document-changed` — the document was replaced underneath. That replacement
- *    is itself the visible event, and history is cleared with it.
  *  - `malformed` — a protocol fault, not a user-actionable condition. Reporting
  *    it would ask the user to act on something only a bug report can fix.
+ *  - `header-row` — worded by `header_wait_warning`, which knows which rows.
+ *
+ * `document-changed` speaks. The caller has already returned for a document
+ * that really was replaced, so what arrives here is the same document whose
+ * host-side view moved under the replay — a refresh not yet acknowledged, a
+ * lease that expired — and saying nothing would leave a keypress that did
+ * nothing with no account of why.
  *
  * The protocol's own vocabulary — leases, proposals, overlays — never reaches
  * these strings. They describe what happened to the document.
@@ -56,12 +61,13 @@ export function history_refusal_warning(
     switch (reason) {
         case 'busy':
         case 'nothing-to-replay':
-        case 'document-changed':
         case 'malformed':
+        case 'header-row':
             return null;
+        case 'document-changed':
+            return `${verb(direction)} did not run because the file was refreshing. Try again.`;
         case 'blocked':
             if (barrier_reason === 'structural-save') return STRUCTURAL_SAVE_BARRIER_MESSAGE;
-            if (barrier_reason === 'header-change') return HEADER_CHANGE_BARRIER_MESSAGE;
             // Named where it can be: the user's question is which gesture cost
             // them their history, and the barrier is the only thing that knows.
             return barrier_label === undefined
@@ -74,4 +80,35 @@ export function history_refusal_warning(
             // actually keeps — it commits every cell or none.
             return `${verb(direction)} could not be completed because the workbook changed. No changes were applied.`;
     }
+}
+
+/**
+ * What to say about a change that cannot be replayed under the current Header
+ * Row. The change stays in history, so the message says which header row
+ * makes it replayable. Row numbers are the sheet's, 1-based.
+ */
+export function header_wait_warning(wait: HeaderWait, direction: HistoryDirection): string {
+    if (wait.reason === 'notice') {
+        return `Can't ${direction} this change until the row and column changes notice is resolved.`;
+    }
+    if (wait.reason === 'header-cell') {
+        // The cell's row is the Header Row at exactly one of the two body starts.
+        if (wait.row !== undefined && wait.row === wait.to - 1) {
+            return `Can't ${direction} this cell change while row ${wait.to} is the header row: `
+                + `it was made when row ${wait.to} was an ordinary row. `
+                + `Use another row as the header row, or turn the header row off, to ${direction} it.`;
+        }
+        return `Can't ${direction} this change while row ${wait.from} is not the header row: `
+            + `it changed a column name when row ${wait.from} was the header row. `
+            + `Use row ${wait.from} as the header row to ${direction} it.`;
+    }
+    const remedy = wait.from > 0
+        ? `Use row ${wait.from} as the header row`
+        : 'Turn the header row off';
+    if (wait.to === 0) {
+        return `Can't ${direction} this row change while the header row is off: `
+            + `it was made when row ${wait.from} was the header row. ${remedy} to ${direction} it.`;
+    }
+    return `Can't ${direction} this row change while row ${wait.to} is the header row: `
+        + `it changes rows that are now in or above the header. ${remedy} to ${direction} it.`;
 }

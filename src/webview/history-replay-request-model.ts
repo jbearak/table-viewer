@@ -70,7 +70,9 @@ export type ReplayRefusalReason =
     | 'conflict'
     | 'document-changed'
     | 'unavailable'
-    | 'malformed';
+    | 'malformed'
+    /** The entry cannot be expressed under the current Header Row; it stays. */
+    | 'header-row';
 
 /** What building a prepare request needs from the live webview. */
 export interface ReplayRequestSources {

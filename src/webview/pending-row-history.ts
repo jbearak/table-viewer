@@ -83,6 +83,18 @@ function without_column_widths(changes: PendingStructuralChanges): PendingStruct
     return { ...changes, pendingColumns: changes.pendingColumns!.map(without_column_width) };
 }
 
+/**
+ * A whole-slot snapshot as replay compares it: without column widths (view
+ * state) and without the append basis. The basis is the host's record of what
+ * it admitted, a high-water count and a schema fingerprint, not something the
+ * user changed; the host fills in the value a replay installs, so a recorded
+ * one that has since been advanced is not a difference.
+ */
+function comparable_snapshot(changes: PendingStructuralChanges): PendingStructuralChanges {
+    const { appendBasis: _basis, ...rest } = without_column_widths(changes);
+    return rest;
+}
+
 /** `desired` with every Pending Column `current` also holds at its current width. */
 function with_current_widths(
     desired: PendingStructuralChanges,
@@ -179,9 +191,13 @@ function with_layout_change(
         const desired = direction === 'undo' ? transition.before : transition.after;
         return { ok: true, value: desired ?? undefined };
     };
-    const append_basis = basis(delta.appendBasis, current.appendBasis);
+    // An append basis is the host's: its presence follows the recorded side,
+    // and the host fills in the value. Only the Structural Basis is compared.
+    const append_basis = delta.appendBasis === undefined
+        ? current.appendBasis
+        : (direction === 'undo' ? delta.appendBasis.before : delta.appendBasis.after) ?? undefined;
     const structural_basis = basis(delta.structuralBasis, current.structuralBasis);
-    if (!append_basis.ok || !structural_basis.ok) return undefined;
+    if (!structural_basis.ok) return undefined;
     const templates = new Map(current.formatTemplates.map((template) => [template.id, template]));
     for (const template of delta.formatTemplates) {
         if (!templates.has(template.id)) templates.set(template.id, template);
@@ -218,7 +234,7 @@ function with_layout_change(
             formatTemplates: [...templates.values()].filter((template) => used.has(template.id)),
             appendedRows: rows,
             conflicts,
-            ...(append_basis.value === undefined ? {} : { appendBasis: append_basis.value }),
+            ...(append_basis === undefined ? {} : { appendBasis: append_basis }),
             ...(rowLayout === undefined ? {} : { rowLayout }),
             ...(columnLayout === undefined ? {} : { columnLayout }),
             ...(columns.length === 0 ? {} : { pendingColumns: columns }),
@@ -359,7 +375,7 @@ export function plan_pending_row_history_replay(
         if (change.kind === 'pendingRows') {
             const expected = direction === 'undo' ? change.delta.after : change.delta.before;
             const desired = direction === 'undo' ? change.delta.before : change.delta.after;
-            if (!equal(without_column_widths(state.current), without_column_widths(expected))) {
+            if (!equal(comparable_snapshot(state.current), comparable_snapshot(expected))) {
                 return { kind: 'refused', reason: 'conflict' };
             }
             state.current = with_current_widths(desired, state.current);

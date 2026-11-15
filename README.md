@@ -137,6 +137,8 @@ It also removes other friction from reading tables:
 - Covers cell edits (values, line breaks, styling, hyperlinks), inserted, deleted, and moved rows and columns, cell highlights, and discards. **Discard** can be undone in full
 - One history per workbook, in the order you worked: undoing a change on another worksheet switches to it. The cursor moves to what changed and the region flashes briefly, so an undo you cannot see is still findable
 - Undo reaches back past a save, except a save that inserted, deleted, or moved rows or columns. The file then has unsaved changes again, and re-saving is yours to do
+- Undoing everything and then redoing it works: redo is still there after the last unsaved change is undone and **Save** goes quiet
+- Changing an Excel header row keeps undo and redo. A change made before it is undone or redone in the cell or row it was made in. Two kinds of change wait while the header row is somewhere they can't follow: a cell typed in a row that has since become the header row (or in a header row that is now an ordinary row), and a row change that names rows now in or above the header. Undo or redo then says which header row to use, and the change is still there when you get back to it
 - If a change is hidden by an active filter or a hidden column, it is still applied and you are told where it went rather than left watching a still cursor
 - Sorts, filters, and column visibility are not part of history — they are view state, with their own toolbar chips and **Columns** menu for undoing them
 - `Ctrl+Z` / `Cmd+Z` **inside** an open cell editor is ordinary text undo for what you are typing, and does not touch the workbook's history

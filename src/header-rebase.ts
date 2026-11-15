@@ -14,7 +14,7 @@
 // header and the rebased slot are stored together; the webview runs the
 // refusal half before it asks, so a refusal needs no round trip. It is a pure
 // leaf: no imports from the webview or the host.
-import type { PendingStructuralChanges } from './pending-changes';
+import type { PendingColumn, PendingStructuralChanges } from './pending-changes';
 import {
     canonical_row_layout,
     moved_source_rows,
@@ -233,4 +233,56 @@ export function header_rebase_slot_refusal(
     }
     if (live_pending_column_count(slot) > 0) return HEADER_REBASE_PENDING_COLUMN_MESSAGE;
     return undefined;
+}
+
+/** Whether `row` is the Header Row at exactly one of the two body starts. */
+export function row_switched_header_role(row: number, from: number, to: number): boolean {
+    return (row === from - 1) !== (row === to - 1);
+}
+
+/**
+ * A Pending Column as it reads once the body starts at `to`, or undefined when
+ * it cannot be carried.
+ *
+ * A Pending Column keys its cells and highlights by row: `s:<row>` inside the
+ * body, `f:<row>` above it, `p:<id>` on a Pending Row. Moving the body start
+ * moves rows across that line, so each `s:`/`f:` key is rewritten for where its
+ * row is now. `p:` keys and the header text do not depend on the body start:
+ * Save writes the header text at whatever the Header Row is.
+ *
+ * A cell on a row that is the Header Row at one body start and not at the
+ * other cannot be carried: there it would be a column name, here it is a cell.
+ * A highlight has no such meaning and always moves.
+ */
+export function rebase_pending_column_for_header(
+    column: PendingColumn,
+    from: number,
+    to: number,
+): PendingColumn | undefined {
+    if (from === to) return column;
+    const rekey = <T>(
+        entries: Readonly<Record<string, T>>,
+        refuse_role_switch: boolean,
+    ): Record<string, T> | undefined => {
+        const out: Record<string, T> = {};
+        for (const [key, value] of Object.entries(entries)) {
+            const kind = key.slice(0, 2);
+            const row = Number(key.slice(2));
+            if ((kind !== 's:' && kind !== 'f:') || !Number.isSafeInteger(row) || row < 0) {
+                out[key] = value;
+                continue;
+            }
+            if (refuse_role_switch && row_switched_header_role(row, from, to)) return undefined;
+            out[`${row < to ? 'f' : 's'}:${row}`] = value;
+        }
+        return out;
+    };
+    const cells = rekey(column.cells, true);
+    if (cells === undefined) return undefined;
+    const highlights = column.highlights === undefined ? undefined : rekey(column.highlights, false);
+    return Object.freeze({
+        ...column,
+        cells: Object.freeze(cells),
+        ...(highlights === undefined ? {} : { highlights: Object.freeze(highlights) }),
+    });
 }

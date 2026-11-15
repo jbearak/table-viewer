@@ -232,6 +232,21 @@ export interface HistoryEntry extends MeasuredAction {
      * count is a move that already happened, a higher one cannot have.
      */
     readonly moves: number;
+    /**
+     * The body start each worksheet had when this was recorded, by
+     * `worksheet_target_key`; a worksheet not listed was at 0 (no Header Row).
+     *
+     * A Worksheet Layout covers the body, and a cell in the Header Row is a
+     * column name, so what an entry's changes mean depends on where the body
+     * started. A Header Row change never rewrites an entry; replay re-expresses
+     * it from this body start to the current one (`entry_for_current_header`).
+     */
+    readonly bodyStarts?: Readonly<Record<string, number>>;
+}
+
+/** The entry's `bodyStarts`, as a spread, for code that rebuilds an entry. */
+function body_starts_of(entry: HistoryEntry): Pick<HistoryEntry, 'bodyStarts'> {
+    return entry.bodyStarts === undefined ? {} : { bodyStarts: entry.bodyStarts };
 }
 
 /**
@@ -247,10 +262,8 @@ export interface HistoryBarrier {
      * `action-too-large`: the gesture could not be recorded. `structural-save`:
      * a save wrote a row or column layout change, after which every recorded
      * source coordinate in the workbook may name different content.
-     * `header-change`: a Header Row change moved a worksheet's body under
-     * history that recorded row structure, or cells on rows that crossed it.
      */
-    readonly reason: 'action-too-large' | 'structural-save' | 'header-change';
+    readonly reason: 'action-too-large' | 'structural-save';
     /**
      * The gesture that forced it, for the message. Truncated to
      * `MAX_BARRIER_LABEL_LENGTH`: a label can be built from data, and retaining an
@@ -1687,6 +1700,7 @@ export function rekey_saved_appended_row_history(
                 id: entry.id,
                 moves: entry.moves,
                 epoch: entry.epoch,
+                ...body_starts_of(entry),
             });
         }
         return rekeyed;
@@ -1776,6 +1790,7 @@ export function rebase_saved_cell_history(
                 id: entry.id,
                 moves: entry.moves,
                 epoch: entry.epoch,
+                ...body_starts_of(entry),
             });
         }
         return rebased;
@@ -2298,6 +2313,7 @@ export function rekey_committed_tail_removal_history(
                 id: entry.id,
                 moves: entry.moves,
                 epoch: entry.epoch,
+                ...body_starts_of(entry),
             });
         }
         return rekeyed;
@@ -2411,6 +2427,7 @@ export function record_history_action(
     state: HistoryStackState,
     action: HistoryAction | HistoryActionSource,
     bounds: HistoryBounds = DEFAULT_HISTORY_BOUNDS,
+    body_start?: (worksheet: WorksheetTarget) => number,
 ): RecordOutcome {
     const label = barrier_label(String(action.label));
 
@@ -2440,13 +2457,41 @@ export function record_history_action(
     if (owned.action.changes.length === 0) return { kind: 'empty', state };
     if (owned.byteCost > bounds.hardMaxBytes) return refused(state, label, bounds.hardMaxBytes);
 
-    const entry: HistoryEntry = { ...owned, id: {}, moves: 0, epoch: state.epoch };
+    const entry: HistoryEntry = {
+        ...owned,
+        id: {},
+        moves: 0,
+        epoch: state.epoch,
+        ...recorded_body_starts(owned.action, body_start),
+    };
     const { kept, evicted } = evict_to_fit([...state.undoStack, entry], bounds);
     return {
         kind: 'recorded',
         state: { undoStack: kept, redoStack: [], barrier: state.barrier, epoch: state.epoch },
         evicted,
     };
+}
+
+/**
+ * The body start of each worksheet the owned action touches, read off the
+ * action history keeps rather than the caller's: a streamed gesture is walked
+ * once, by the bounded rebuild, and never again here.
+ */
+function recorded_body_starts(
+    action: HistoryAction,
+    body_start: ((worksheet: WorksheetTarget) => number) | undefined,
+): Pick<HistoryEntry, 'bodyStarts'> {
+    if (body_start === undefined) return {};
+    const starts: Record<string, number> = {};
+    const seen = new Set<string>();
+    for (const { delta } of action.changes) {
+        const key = worksheet_target_key(delta.worksheet);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        const start = body_start(delta.worksheet);
+        if (start > 0) starts[key] = start;
+    }
+    return Object.keys(starts).length === 0 ? {} : { bodyStarts: Object.freeze(starts) };
 }
 
 /**
@@ -2687,52 +2732,6 @@ export function install_structural_save_barrier(state: HistoryStackState): Histo
         undoStack: [],
         redoStack: [],
         barrier: { reason: 'structural-save', label: 'Save' },
-        epoch: state.epoch + 1,
-    };
-}
-
-/** What Undo says when it reaches the `header-change` barrier. */
-export const HEADER_CHANGE_BARRIER_MESSAGE =
-    "Can't undo past a header row change on a sheet with row changes.";
-
-/**
- * Whether history recorded anything a Header Row change on `worksheet` makes
- * unsafe to replay: any row or column structure of that worksheet (layouts,
- * Pending Rows and Columns, append bases authored at the old body start and
- * column names), or a cell or highlight on a source row in `[start, end)`, the
- * rows that crossed the body boundary. Replaying those would put a body value
- * into a header cell, or the reverse, or an edit onto a row now hidden above
- * the header. Cell history elsewhere is keyed by source row and stays valid.
- */
-export function history_needs_header_change_barrier(
-    state: HistoryStackState,
-    worksheet: WorksheetTarget,
-    crossing: { readonly start: number; readonly end: number },
-): boolean {
-    const key = worksheet_target_key(worksheet);
-    for (const entry of [...state.undoStack, ...state.redoStack]) {
-        for (const change of entry.action.changes) {
-            if (worksheet_target_key(change.delta.worksheet) !== key) continue;
-            if (change.kind === 'cell' || change.kind === 'highlight') {
-                const row = change.delta.sourceRow;
-                if (row >= crossing.start && row < crossing.end) return true;
-                continue;
-            }
-            return true;
-        }
-    }
-    return false;
-}
-
-/**
- * Install the workbook-wide `header-change` barrier. Like the structural-save
- * barrier it discards every recorded action and advances the epoch.
- */
-export function install_header_change_barrier(state: HistoryStackState): HistoryStackState {
-    return {
-        undoStack: [],
-        redoStack: [],
-        barrier: { reason: 'header-change', label: 'Header Row' },
         epoch: state.epoch + 1,
     };
 }

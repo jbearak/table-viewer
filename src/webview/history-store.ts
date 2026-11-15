@@ -29,7 +29,6 @@ import {
     rekey_saved_appended_row_history,
     rekey_committed_tail_removal_history,
     install_structural_save_barrier,
-    install_header_change_barrier,
     type CommitOutcome,
     type HistoryAction,
     type HistoryActionSource,
@@ -42,6 +41,7 @@ import {
     type SavedTailRemovalCommit,
 } from './history-stack-model';
 import type { HistoryDirection } from './history-cell-state-model';
+import type { WorksheetTarget } from '../types';
 import { stage_mutation, type StagedMutation } from './staged-mutation';
 
 /**
@@ -156,14 +156,21 @@ export interface HistoryStore {
      * inserted, deleted, or moved rows or columns. History before it is gone.
      */
     install_structural_save_barrier(): void;
-    /**
-     * Install the workbook-wide `header-change` barrier after a Header Row
-     * change that history could not replay across. History before it is gone.
-     */
-    install_header_change_barrier(): void;
 }
 
-export function create_history_store(initial?: HistoryStackState): HistoryStore {
+export interface HistoryStoreOptions {
+    /**
+     * A worksheet's body start now: the Header Row's 1-based number, or 0.
+     * Recorded on each entry, so replay can tell where the body started when
+     * the gesture was made. Omitted by a caller with no Header Row to move.
+     */
+    readonly body_start?: (worksheet: WorksheetTarget) => number;
+}
+
+export function create_history_store(
+    initial?: HistoryStackState,
+    options: HistoryStoreOptions = {},
+): HistoryStore {
     let state = initial ?? empty_history_stack();
     const listeners = new Set<() => void>();
 
@@ -184,7 +191,7 @@ export function create_history_store(initial?: HistoryStackState): HistoryStore 
             // onto a stack it never saw — which would drop whatever landed in
             // between, or resurrect a redo stack that recording should clear.
             const staged_from = state;
-            const outcome = record_history_action(staged_from, action, bounds);
+            const outcome = record_history_action(staged_from, action, bounds, options.body_start);
             const staged = stage_mutation(
                 () => state === staged_from,
                 () => {
@@ -262,11 +269,6 @@ export function create_history_store(initial?: HistoryStackState): HistoryStore 
 
         install_structural_save_barrier: () => {
             state = install_structural_save_barrier(state);
-            notify();
-        },
-
-        install_header_change_barrier: () => {
-            state = install_header_change_barrier(state);
             notify();
         },
 

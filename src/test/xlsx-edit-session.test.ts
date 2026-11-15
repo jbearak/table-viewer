@@ -7991,20 +7991,29 @@ describe('xlsx edit sessions', () => {
                 },
             },
         });
-        await wait_for_observable(() => panel.__messages.some((message) => (
+        // A slot with no Pending Rows holds no append basis, so replay drops the
+        // one this request names instead of leasing it: nothing a replay
+        // prepares can carry the unsettled restoration's authority.
+        const basis_only_prepared = () => panel.__messages.find((message) => (
             typeof message === 'object'
             && message !== null
-            && (message as { type?: unknown }).type === 'historyReplayPrepareRefused'
-            && (message as { refusal?: { replayId?: unknown } }).refusal?.replayId
+            && (message as { type?: unknown }).type === 'historyReplayPrepared'
+            && (message as { prepared?: { replayId?: unknown } }).prepared?.replayId
                 === 'replay-unsettled-restoration-basis'
-        )));
-        expect(panel.__messages).toContainEqual(expect.objectContaining({
-            type: 'historyReplayPrepareRefused',
-            refusal: expect.objectContaining({
-                replayId: 'replay-unsettled-restoration-basis',
-                reason: 'conflict',
-            }),
-        }));
+        )) as Extract<import('../types').HostMessage, { type: 'historyReplayPrepared' }> | undefined;
+        await wait_for_observable(() => basis_only_prepared() !== undefined);
+        const normalized = basis_only_prepared()!.prepared;
+        expect(normalized.structures).toHaveLength(1);
+        expect(normalized.structures![0].desired.appendBasis).toBeUndefined();
+        expect(normalized.structures![0].desired.appendedRows).toEqual([]);
+        await panel.__receive({
+            type: 'abandonHistoryReplay',
+            request: {
+                requestId: normalized.requestId,
+                replayId: normalized.replayId,
+                leaseId: normalized.leaseId,
+            },
+        });
         const restored_templates = assignments.map((assignment) => {
             const format = assignment.savedRow!.format;
             return {
@@ -8747,6 +8756,477 @@ describe('xlsx edit sessions', () => {
         // The failed operation, still holding the old append basis, no longer
         // stands for the session.
         expect(snapshot.capabilities.csvSaveLifecycle?.state).toBe('idle');
+    });
+
+    describe('undo and redo of added rows', () => {
+        type Panel = Awaited<ReturnType<typeof open_ready_xlsx>>;
+        type Slot = import('../pending-changes').PendingStructuralChanges;
+        type Admission = Extract<import('../types').HostMessage, { type: 'appendRowsResult' }>;
+        type Prepared = Extract<import('../types').HostMessage, { type: 'historyReplayPrepared' }>;
+        type Committed = Extract<import('../types').HostMessage, { type: 'historyReplayCommitted' }>;
+        const PEOPLE = { sheetIndex: 0, sheetName: 'People', worksheetId: '1' };
+        const INVENTORY = { sheetIndex: 1, sheetName: 'Inventory', worksheetId: '2' };
+        const EMPTY: Slot = { formatTemplates: [], appendedRows: [], tailRemovals: [], conflicts: [] };
+
+        function reply<T extends { type: string }>(
+            panel: Panel,
+            type: T['type'],
+            matches: (message: T) => boolean,
+        ): T | undefined {
+            return panel.__messages.find((message) => (
+                typeof message === 'object'
+                && message !== null
+                && (message as { type?: unknown }).type === type
+                && matches(message as T)
+            )) as T | undefined;
+        }
+
+        /** Ask the host for one more row at the end of `worksheet`, and keep it. */
+        async function admit_row(
+            panel: Panel,
+            session: string,
+            worksheet: typeof PEOPLE,
+            request_id: string,
+        ): Promise<Admission> {
+            await panel.__receive({
+                type: 'requestAppendRows',
+                requestId: request_id,
+                editSessionId: session,
+                worksheet,
+                sourceGeneration: latest_snapshot(panel).sourceGeneration,
+                count: 1,
+            });
+            const admission = reply<Admission>(panel, 'appendRowsResult',
+                (message) => message.requestId === request_id)!;
+            expect(admission.granted, admission.reason).toBe(true);
+            await panel.__receive({
+                type: 'settleRowAdmission',
+                requestId: request_id,
+                editSessionId: session,
+                accepted: true,
+            });
+            return admission;
+        }
+
+        function appended_row(admission: Admission, created_order = 1) {
+            return {
+                id: admission.rowIds![0],
+                cells: {},
+                formatTemplateId: admission.formatTemplate!.id,
+                createdOrder: created_order,
+            };
+        }
+
+        /** Publish `slot` for `worksheet`; whether the host accepted it. */
+        async function publish(
+            panel: Panel,
+            session: string,
+            sequence: number,
+            worksheet: typeof PEOPLE,
+            slot: Slot,
+            cells: Record<string, unknown> = {},
+        ): Promise<boolean> {
+            await panel.__receive({
+                type: 'pendingChangesChanged',
+                sourceGeneration: latest_snapshot(panel).sourceGeneration,
+                editSessionId: session,
+                sequence,
+                changes: { ...worksheet, cells, ...slot },
+            });
+            await controller_of(panel).drain();
+            return panel.__messages.some((message) => (
+                typeof message === 'object'
+                && message !== null
+                && (message as { type?: unknown }).type === 'pendingChangesAcknowledged'
+                && (message as { editSessionId?: unknown }).editSessionId === session
+                && (message as { sequence?: unknown }).sequence === sequence
+            ));
+        }
+
+        /** History still reaches these unsaved rows. */
+        async function retain(panel: Panel, worksheet: typeof PEOPLE, row_ids: readonly string[]) {
+            await panel.__receive({
+                type: 'retainedSavedAppendAuthoritiesChanged',
+                authorities: [{ ...worksheet, appendHistoryIds: [], pendingRowIds: row_ids }],
+            });
+        }
+
+        async function prepare(
+            panel: Panel,
+            replay_id: string,
+            worksheet: typeof PEOPLE,
+            expected: Slot,
+            desired: Slot,
+        ): Promise<{ prepared?: Prepared['prepared']; refused?: string }> {
+            await panel.__receive({
+                type: 'prepareHistoryReplay',
+                request: {
+                    requestId: `${replay_id}-prepare`,
+                    replayId: replay_id,
+                    cells: [],
+                    highlights: [],
+                    structures: [{ ordinal: 0, worksheet, expected, desired }],
+                    focus: {
+                        worksheet,
+                        sourceRowStart: 1,
+                        sourceRowEnd: 1,
+                        sourceColumnStart: 0,
+                        sourceColumnEnd: 0,
+                    },
+                },
+            });
+            type Refused = Extract<import('../types').HostMessage, { type: 'historyReplayPrepareRefused' }>;
+            const prepared = () => reply<Prepared>(panel, 'historyReplayPrepared',
+                (message) => message.prepared.replayId === replay_id);
+            const refused = () => reply<Refused>(panel, 'historyReplayPrepareRefused',
+                (message) => message.refusal.replayId === replay_id);
+            await wait_for_observable(() => prepared() !== undefined || refused() !== undefined);
+            const granted = prepared();
+            return granted === undefined
+                ? { refused: refused()!.refusal.reason }
+                : { prepared: granted.prepared };
+        }
+
+        async function commit(
+            panel: Panel,
+            prepared: Prepared['prepared'],
+        ): Promise<{ committed?: Committed['committed']; refused?: string }> {
+            await panel.__receive({
+                type: 'commitHistoryReplay',
+                request: {
+                    requestId: prepared.requestId,
+                    replayId: prepared.replayId,
+                    leaseId: prepared.leaseId,
+                    mutationId: `${prepared.replayId}-mutation`,
+                    cells: [],
+                    highlights: [],
+                    structures: [{ ordinal: 0 }],
+                },
+            });
+            type Refused = Extract<import('../types').HostMessage, { type: 'historyReplayCommitRefused' }>;
+            const committed = () => reply<Committed>(panel, 'historyReplayCommitted',
+                (message) => message.committed.replayId === prepared.replayId);
+            const refused = () => reply<Refused>(panel, 'historyReplayCommitRefused',
+                (message) => message.refusal.replayId === prepared.replayId);
+            await wait_for_observable(() => committed() !== undefined || refused() !== undefined);
+            const landed = committed();
+            return landed === undefined
+                ? { refused: refused()!.refusal.reason }
+                : { committed: landed.committed };
+        }
+
+        /** Prepare and commit; the slot the host installed, or why it refused. */
+        async function replay(
+            panel: Panel,
+            replay_id: string,
+            worksheet: typeof PEOPLE,
+            expected: Slot,
+            desired: Slot,
+        ): Promise<{ installed?: Slot; refused?: string }> {
+            const prepared = await prepare(panel, replay_id, worksheet, expected, desired);
+            if (prepared.prepared === undefined) return { refused: `prepare: ${prepared.refused}` };
+            const committed = await commit(panel, prepared.prepared);
+            if (committed.committed === undefined) return { refused: `commit: ${committed.refused}` };
+            return { installed: prepared.prepared.structures![0].desired as Slot };
+        }
+
+        /** Undo everything, so the session is released clean; then acquire a new one on People. */
+        async function release_and_reacquire(panel: Panel, session: string): Promise<string> {
+            await panel.__receive({ type: 'releaseEditSession', editSessionId: session });
+            const next = await request_edit_session_when_available(panel, 'again');
+            expect(next).not.toBe(session);
+            return next;
+        }
+
+        function slot_with(admissions: readonly Admission[], basis = admissions.at(-1)!.appendBasis!): Slot {
+            return {
+                formatTemplates: [admissions[0].formatTemplate!],
+                appendedRows: admissions.map((admission, index) => appended_row(admission, index + 1)),
+                tailRemovals: [],
+                appendBasis: basis,
+                conflicts: [],
+            };
+        }
+
+        it('redoes a row added on another worksheet than the one the new session was acquired on', async () => {
+            const state = versioned_state_store({});
+            const panel = await open_ready_xlsx(file_path, state);
+            const first = await request_edit_session_when_available(panel, 'first');
+            const admission = await admit_row(panel, first, INVENTORY, 'append-inventory');
+            const appended = slot_with([admission]);
+            expect(await publish(panel, first, 1, INVENTORY, appended)).toBe(true);
+            await retain(panel, INVENTORY, admission.rowIds!);
+            expect((await replay(panel, 'undo-append', INVENTORY, appended, EMPTY)).installed).toEqual(EMPTY);
+            expect(state.get_state(file_path).pendingEdits).toBeUndefined();
+
+            // Everything is undone: the session ends, and redo acquires a new
+            // one on the first worksheet. It holds nothing for Inventory.
+            const second = await release_and_reacquire(panel, first);
+            const redone = await replay(panel, 'redo-append', INVENTORY, EMPTY, appended);
+            expect(redone.refused).toBeUndefined();
+            expect(redone.installed).toEqual(appended);
+            expect(state.get_state(file_path).pendingEdits?.[1]?.appendedRows)
+                .toEqual(appended.appendedRows);
+            // The session now answers for the row: publishing it is accepted,
+            expect(await publish(panel, second, 1, INVENTORY, redone.installed!)).toBe(true);
+            // and the next row asked for comes after it.
+            const next = await admit_row(panel, second, INVENTORY, 'append-after-redo');
+            expect(next.appendBasis!.provisionalRowCount).toBe(2);
+        });
+
+        it('leaves no row authority behind a replay that is refused or abandoned', async () => {
+            const state = versioned_state_store({});
+            const panel = await open_ready_xlsx(file_path, state);
+            const first = await request_edit_session_when_available(panel, 'first');
+            const admission = await admit_row(panel, first, INVENTORY, 'append-inventory');
+            const appended = slot_with([admission]);
+            expect(await publish(panel, first, 1, INVENTORY, appended)).toBe(true);
+            await retain(panel, INVENTORY, admission.rowIds!);
+            expect((await replay(panel, 'undo-append', INVENTORY, appended, EMPTY)).installed).toEqual(EMPTY);
+            const second = await release_and_reacquire(panel, first);
+
+            // A basis the host never accepted: another width, another row style.
+            for (const [name, basis] of [
+                ['width', { ...admission.appendBasis!, columnCount: admission.appendBasis!.columnCount + 1 }],
+                ['style', { ...admission.appendBasis!, styleFingerprint: 'sha256:other' }],
+                ['rows', {
+                    ...admission.appendBasis!,
+                    sourceRowCount: admission.appendBasis!.sourceRowCount + 1,
+                    provisionalStartRow: admission.appendBasis!.provisionalStartRow! + 1,
+                }],
+            ] as const) {
+                expect(
+                    await replay(panel, `redo-wrong-${name}`, INVENTORY, EMPTY, slot_with([admission], basis)),
+                    name,
+                ).toEqual({ refused: 'prepare: conflict' });
+            }
+            // A replay prepared and then abandoned.
+            const abandoned = await prepare(panel, 'redo-abandoned', INVENTORY, EMPTY, appended);
+            await panel.__receive({
+                type: 'abandonHistoryReplay',
+                request: {
+                    requestId: abandoned.prepared!.requestId,
+                    replayId: abandoned.prepared!.replayId,
+                    leaseId: abandoned.prepared!.leaseId,
+                },
+            });
+            // Neither registered anything: the row cannot be published in a
+            // session that never admitted it and never replayed it.
+            expect(await publish(panel, second, 1, INVENTORY, appended)).toBe(false);
+            expect(state.get_state(file_path).pendingEdits).toBeUndefined();
+        });
+
+        it('undoes the second of two rows added one after the other, then the first', async () => {
+            const state = versioned_state_store({});
+            const panel = await open_ready_xlsx(file_path, state);
+            const session = await request_edit_session_when_available(panel, 'first');
+            const first = await admit_row(panel, session, PEOPLE, 'append-one');
+            const one = slot_with([first]);
+            expect(await publish(panel, session, 1, PEOPLE, one)).toBe(true);
+            const second = await admit_row(panel, session, PEOPLE, 'append-two');
+            expect(second.appendBasis!.provisionalRowCount).toBe(2);
+            const two = slot_with([first, second]);
+            expect(await publish(panel, session, 2, PEOPLE, two)).toBe(true);
+            await retain(panel, PEOPLE, [...first.rowIds!, ...second.rowIds!]);
+
+            // History recorded the first row's slot when the host had admitted
+            // one row. The host has admitted two since and never counts down.
+            const undone = await replay(panel, 'undo-second', PEOPLE, two, one);
+            expect(undone.refused).toBeUndefined();
+            expect(undone.installed).toEqual({ ...one, appendBasis: second.appendBasis });
+            expect(state.get_state(file_path).pendingEdits?.[0]?.appendBasis).toEqual(second.appendBasis);
+            expect(await publish(panel, session, 3, PEOPLE, undone.installed!)).toBe(true);
+
+            // Undoing the only row left leaves no basis at all.
+            const cleared = await replay(panel, 'undo-first', PEOPLE, undone.installed!, EMPTY);
+            expect(cleared.installed).toEqual(EMPTY);
+            expect(state.get_state(file_path).pendingEdits).toBeUndefined();
+
+            // And both come back, in order, in the same session.
+            const redone_one = await replay(panel, 'redo-first', PEOPLE, EMPTY, one);
+            expect(redone_one.installed).toEqual({ ...one, appendBasis: second.appendBasis });
+            const redone_two = await replay(panel, 'redo-second', PEOPLE, redone_one.installed!, two);
+            expect(redone_two.installed).toEqual(two);
+            expect(await publish(panel, session, 4, PEOPLE, two)).toBe(true);
+        });
+
+        /** Change People's Header Row; the outcome the adopted snapshot reports. */
+        async function set_header(panel: Panel, request_id: string, enabled: boolean): Promise<string | undefined> {
+            const before = latest_snapshot(panel);
+            await panel.__receive({
+                type: 'setExcelFirstRowHeader',
+                sheetIndex: 0,
+                sheetName: 'People',
+                enabled,
+                requestId: request_id,
+                generation: before.generation,
+                sourceGeneration: before.sourceGeneration,
+            });
+            type Result = { commandResult?: { requestId?: string; outcome?: string } };
+            const adopted = () => panel.__messages.flatMap((message) => {
+                if ((message as { type?: unknown }).type !== 'workbookSnapshot') return [];
+                const snapshot = (message as { snapshot: Result & { identity: unknown } }).snapshot;
+                return snapshot.commandResult?.requestId === request_id ? [snapshot] : [];
+            }).at(-1);
+            await wait_for_observable(() => adopted() !== undefined);
+            await panel.__receive({
+                type: 'snapshotApplied',
+                identity: adopted()!.identity,
+                disposition: 'applied',
+            });
+            return adopted()!.commandResult?.outcome;
+        }
+
+        /** Add a row on People, undo it, and end the session: redo is all that is left. */
+        async function undone_row_after_release(panel: Panel): Promise<{ appended: Slot; admission: Admission }> {
+            const first = await request_edit_session_when_available(panel, 'first');
+            const admission = await admit_row(panel, first, PEOPLE, 'append-people');
+            const appended = slot_with([admission]);
+            expect(await publish(panel, first, 1, PEOPLE, appended)).toBe(true);
+            await retain(panel, PEOPLE, admission.rowIds!);
+            expect((await replay(panel, 'undo-append', PEOPLE, appended, EMPTY)).installed).toEqual(EMPTY);
+            await panel.__receive({ type: 'releaseEditSession', editSessionId: first });
+            return { appended, admission };
+        }
+
+        /** Rename People's first column in the file, as another program would. */
+        async function rename_first_column(panel: Panel): Promise<void> {
+            const file = CFB.read(bytes, { type: 'buffer' });
+            const strings = CFB.find(file, '/xl/sharedStrings.xml')!;
+            const before = Buffer.from(strings.content as Uint8Array).toString('utf8');
+            const header = latest_snapshot(panel).meta.sheets[0];
+            const after = before.replace('<t>Name</t>', '<t>Full name</t>');
+            expect(after, before).not.toBe(before);
+            strings.content = Buffer.from(after, 'utf8');
+            strings.size = strings.content.length;
+            const written = CFB.write(file, { type: 'buffer', fileType: 'zip', compression: true });
+            bytes = written instanceof Uint8Array ? written : new Uint8Array(written as ArrayBufferLike);
+            const generation = latest_snapshot(panel).sourceGeneration;
+            await vscode_mock.__getActiveWatchers()[0].__fireChange();
+            await wait_for_observable(() => latest_snapshot(panel).sourceGeneration !== generation);
+            expect(header.name).toBe('People');
+        }
+
+        it('redoes an added row after the Header Row changed, under the column names there are now', async () => {
+            const state = versioned_state_store({});
+            const panel = await open_ready_xlsx(file_path, state);
+            const { appended, admission } = await undone_row_after_release(panel);
+
+            expect(await set_header(panel, 'header-off', false)).toBe('applied');
+            const second = await request_edit_session_when_available(panel, 'again');
+            // History still holds the basis it recorded, named for the old columns.
+            const redone = await replay(panel, 'redo-append', PEOPLE, EMPTY, appended);
+            expect(redone.refused).toBeUndefined();
+            expect(redone.installed!.appendedRows).toEqual(appended.appendedRows);
+            expect(redone.installed!.appendBasis).toEqual({
+                ...admission.appendBasis!,
+                schemaFingerprint: redone.installed!.appendBasis!.schemaFingerprint,
+            });
+            expect(redone.installed!.appendBasis!.schemaFingerprint)
+                .not.toBe(admission.appendBasis!.schemaFingerprint);
+            expect(await publish(panel, second, 1, PEOPLE, redone.installed!)).toBe(true);
+
+            // And again after the header comes back, in the session that holds the row.
+            const undone = await replay(panel, 'undo-again', PEOPLE, redone.installed!, EMPTY);
+            expect(undone.installed).toEqual(EMPTY);
+            expect(await set_header(panel, 'header-on', true)).toBe('applied');
+            const again = await replay(panel, 'redo-again', PEOPLE, EMPTY, appended);
+            expect(again.installed).toEqual(appended);
+        });
+
+        it('redoes an added row after a Header Row change that settled on a reload', async () => {
+            const state = versioned_state_store({});
+            const base_profile = profile_for(file_path);
+            let builds = 0;
+            const panel = await open_ready_xlsx(file_path, state, {
+                ...base_profile,
+                async build_source(...args: Parameters<typeof base_profile.build_source>) {
+                    const built = await base_profile.build_source(...args);
+                    builds += 1;
+                    // The receipt cannot be applied in place: the change is
+                    // adopted by the reload that follows.
+                    if (builds === 1) {
+                        (built as unknown as { set_override(): boolean }).set_override = () => false;
+                    }
+                    return built;
+                },
+            });
+            const { appended, admission } = await undone_row_after_release(panel);
+
+            expect(await set_header(panel, 'header-off', false)).toBe('recovered');
+            await request_edit_session_when_available(panel, 'again');
+            const redone = await replay(panel, 'redo-append', PEOPLE, EMPTY, appended);
+            expect(redone.refused).toBeUndefined();
+            expect(redone.installed!.appendBasis!.schemaFingerprint)
+                .not.toBe(admission.appendBasis!.schemaFingerprint);
+        });
+
+        it('still refuses a row whose columns another program renamed, with or without a Header Row change after', async () => {
+            const state = versioned_state_store({});
+            const panel = await open_ready_xlsx(file_path, state);
+            const { appended } = await undone_row_after_release(panel);
+            await rename_first_column(panel);
+
+            await request_edit_session_when_available(panel, 'again');
+            expect(await replay(panel, 'redo-renamed', PEOPLE, EMPTY, appended))
+                .toEqual({ refused: 'prepare: conflict' });
+            // A Header Row change re-projects the same bytes. The authority
+            // was already stale against them, so it does not follow.
+            await panel.__receive({ type: 'releaseEditSession', editSessionId: latest_edit_session(panel)!.editSessionId! });
+            expect(await set_header(panel, 'header-off', false)).toBe('applied');
+            await request_edit_session_when_available(panel, 'once-more');
+            expect(await replay(panel, 'redo-renamed-header-off', PEOPLE, EMPTY, appended))
+                .toEqual({ refused: 'prepare: conflict' });
+            expect(state.get_state(file_path).pendingEdits).toBeUndefined();
+        });
+
+        it('still refuses, in a session that continued, a row whose columns another program renamed before a Header Row change', async () => {
+            const state = versioned_state_store({});
+            const panel = await open_ready_xlsx(file_path, state);
+            const session = await request_edit_session_when_available(panel, 'first');
+            const admission = await admit_row(panel, session, PEOPLE, 'append-people');
+            const appended = slot_with([admission]);
+            // An edit on the other worksheet keeps the session once the row is undone.
+            const kept = { '1:0': { value: 'kept', base: 'Widget' } };
+            expect(await publish(panel, session, 1, PEOPLE, appended)).toBe(true);
+            expect(await publish(panel, session, 2, INVENTORY, EMPTY, kept)).toBe(true);
+            await retain(panel, PEOPLE, admission.rowIds!);
+            expect((await replay(panel, 'undo-append', PEOPLE, appended, EMPTY)).installed).toEqual(EMPTY);
+
+            await rename_first_column(panel);
+            expect(latest_snapshot(panel).capabilities.csvEditSessionId).toBe(session);
+            expect(await set_header(panel, 'header-off', false)).toBe('applied');
+            expect(await replay(panel, 'redo-renamed', PEOPLE, EMPTY, appended))
+                .toEqual({ refused: 'prepare: conflict' });
+        });
+
+        it('refuses a commit when the rows the host admitted moved on after the prepare', async () => {
+            const state = versioned_state_store({});
+            const panel = await open_ready_xlsx(file_path, state);
+            const session = await request_edit_session_when_available(panel, 'first');
+            const first = await admit_row(panel, session, PEOPLE, 'append-one');
+            expect(await publish(panel, session, 1, PEOPLE, slot_with([first]))).toBe(true);
+            const second = await admit_row(panel, session, PEOPLE, 'append-two');
+            const one = slot_with([first], second.appendBasis!);
+            const two = slot_with([first, second]);
+            expect(await publish(panel, session, 2, PEOPLE, two)).toBe(true);
+            await retain(panel, PEOPLE, [...first.rowIds!, ...second.rowIds!]);
+            expect((await replay(panel, 'undo', PEOPLE, two, one)).installed).toEqual(one);
+
+            const prepared = await prepare(panel, 'redo', PEOPLE, one, two);
+            expect(prepared.prepared?.structures![0].desired.appendBasis).toEqual(second.appendBasis);
+            // Rows are admitted while the lease is out, until the host's count
+            // passes the one the lease was filled with.
+            const leased = second.appendBasis!.provisionalRowCount!;
+            let count = leased;
+            for (let index = 0; index < 4 && count === leased; index += 1) {
+                count = (await admit_row(panel, session, PEOPLE, `append-during-replay-${index}`))
+                    .appendBasis!.provisionalRowCount!;
+            }
+            expect(count).toBeGreaterThan(leased);
+            expect(await commit(panel, prepared.prepared!)).toEqual({ refused: 'conflict' });
+            expect(state.get_state(file_path).pendingEdits?.[0]?.appendedRows).toEqual(one.appendedRows);
+        });
     });
 });
 
