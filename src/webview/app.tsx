@@ -6200,9 +6200,10 @@ export function App(): React.JSX.Element {
         if (outcome.kind === 'rows-hidden' || outcome.kind === 'columns-hidden') {
             // Said out loud, because the replay DID land: the durable state
             // changed and the cursor did not move, and silence would read as
-            // nothing having happened. The filters are deliberately left alone —
-            // they are not part of history, and clearing one to expose the row
-            // would make undo mutate view state the user never asked about.
+            // nothing having happened. The filters are deliberately left alone:
+            // undoing an edit keeps the view as it is. A filter is its own step
+            // in history, and clearing one here to expose the row would make
+            // this undo change view state the person never asked about.
             host_bridge.postMessage({
                 type: 'showWarning',
                 message: `The change was ${replayed_verb(answered.direction)}, but the affected cells are hidden by the current view.`,
