@@ -337,6 +337,13 @@ interface ExcelHeaderQueue {
     readonly retry_after_snapshot?: number;
     /** ...or for this time, whichever comes first. */
     readonly retry_not_before?: number;
+    /**
+     * The header fence is up for this request. It goes up only once work
+     * admitted before the request (an append or insert awaiting its host
+     * admission, a replay, a highlight, a resize, a discard, a save) has
+     * finished into its stores: raising it earlier would cancel that work.
+     */
+    readonly fenced: boolean;
     /** Every store was published for this request. */
     readonly flushed: boolean;
     readonly ack_wait_started?: number;
@@ -347,6 +354,8 @@ const HEADER_ACK_WAIT_MS = 15_000;
 /** After this long without a result, the person is told to reload. */
 const HEADER_RESULT_GUARD_MS = 60_000;
 const HEADER_RETRY_DELAY_MS = 250;
+/** How soon a header change waiting on typed keys looks again. */
+const HEADER_TYPING_WAKE_MS = 50;
 const HEADER_TRANSIENT_RETRIES = 3;
 type FilterHistogramState = FilterHistogramStatus;
 
@@ -6553,12 +6562,33 @@ export function App(): React.JSX.Element {
             || pending_append_requests_ref.current.size > 0
             || discard_cleanup_ref.current !== undefined
         ) return;
+        if (!queue.fenced) {
+            // Keys typed while an appended row waited for admission open in
+            // its cell once the grid has rendered the answer; let them land.
+            if (editing_ref.current?.typing_pending() === true) {
+                schedule_header_wake(HEADER_TYPING_WAKE_MS);
+                return;
+            }
+            // Fold an open editor while gestures are still admitted, so its
+            // text commits, then raise the fence.
+            if (
+                editing_session_held_ref.current
+                && editing_ref.current?.commit_live_edit() === false
+            ) {
+                set_excel_header_status('Header row was not updated.');
+                replace_excel_header_queue(null);
+                return;
+            }
+            header_fence_ref.current = true;
+            set_header_fence(true);
+            replace_excel_header_queue({ ...queue, fenced: true });
+        }
         const session = csv_edit_session_id_ref.current;
         if (session !== undefined && editing_session_held_ref.current) {
-            let current = queue;
-            if (!queue.flushed) {
+            let current = excel_header_queue_ref.current!;
+            if (!current.flushed) {
                 publish_every_store_truth(session, false);
-                current = { ...queue, flushed: true, ack_wait_started: now };
+                current = { ...current, flushed: true, ack_wait_started: now };
                 replace_excel_header_queue(current);
                 schedule_header_wake(HEADER_ACK_WAIT_MS);
             }
@@ -6654,10 +6684,9 @@ export function App(): React.JSX.Element {
     };
 
     /**
-     * Ask for a Header Row change. Folds an open editor while gestures are
-     * still admitted, so its text commits; checks what the worksheet's Pending
-     * Changes can't carry; then raises the header fence and queues the request
-     * for the drain.
+     * Ask for a Header Row change: check what the worksheet's Pending Changes
+     * can't carry, then queue the request. The drain folds an open editor and
+     * raises the header fence once earlier admitted work has finished.
      */
     const enqueue_excel_header_change = useCallback((request: {
         readonly enabled: boolean;
@@ -6690,12 +6719,6 @@ export function App(): React.JSX.Element {
                 return false;
             }
         }
-        if (
-            editing_session_held_ref.current
-            && editing_ref.current?.commit_live_edit() === false
-        ) return false;
-        header_fence_ref.current = true;
-        set_header_fence(true);
         replace_excel_header_queue({
             enabled: request.enabled,
             unhide_all: request.unhide_all === true,
@@ -6706,6 +6729,7 @@ export function App(): React.JSX.Element {
                 : { grid_focus_sheet_index: request.grid_focus_sheet_index }),
             generation: generation_ref.current,
             retries: 0,
+            fenced: false,
             flushed: false,
         });
         return true;
@@ -9040,6 +9064,7 @@ export function App(): React.JSX.Element {
                     label: `Use first row as header on ${all_sheets}`,
                     disabled: pending_excel_header !== null
                         || header_fence
+                        || excel_header_queue !== null
                         || pending_transforms.some(Boolean)
                         || header_capable_sheets.every((sheet) =>
                             sheet.excelFirstRowHeader!.mode === 'on'
@@ -9050,6 +9075,7 @@ export function App(): React.JSX.Element {
                     label: `Show first row as data on ${all_sheets}`,
                     disabled: pending_excel_header !== null
                         || header_fence
+                        || excel_header_queue !== null
                         || pending_transforms.some(Boolean)
                         || header_capable_sheets.every((sheet) =>
                             !(sheet.excelFirstRowHeader!.mode === 'on'
@@ -9129,7 +9155,9 @@ export function App(): React.JSX.Element {
     // session's Pending Changes to the new header in the same write, and the
     // header queue makes sure it holds all of them first. Only a header change
     // or a transform already in flight holds the controls back.
-    const excel_header_change_pending = excel_header_pending || header_fence;
+    const excel_header_change_pending = excel_header_pending
+        || header_fence
+        || excel_header_queue !== null;
     const excel_header_disabled = !!excel_header && (
         (!excel_header_candidate_available
             && !excel_header.active

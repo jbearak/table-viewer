@@ -261,6 +261,7 @@ vi.mock('../webview/grid-shell', () => ({
                 has_uncommitted_changes: () => grid_shell_mock.has_uncommitted_changes,
                 session_busy: () => grid_shell_mock.session_busy,
                 typing_held: () => grid_shell_mock.typing_held,
+                typing_pending: () => grid_shell_mock.typing_held,
             };
         }
         // Mirror the real GridShell: publish a measure function into the ref so
@@ -2607,6 +2608,53 @@ describe('Excel first-row header toggle', () => {
         expect(grid_shell_mock.latest_props?.edits_paused).toBe(false);
         expect(edits_admitted()).toBe(true);
         expect(document.querySelector('[role="status"]')?.textContent).toBe('Column names updated.');
+    });
+
+    it('lets an append awaiting admission finish before the fence goes up', async () => {
+        const { post_message } = await render_app();
+        const meta = excel_meta(true);
+        await dispatch_host_message(initial_snapshot_message(meta, { capabilities: EDITABLE }));
+        await acquire_editing_session(post_message);
+        const request_append = grid_shell_mock.latest_props!.on_append_rows as
+            (count: number) => Promise<unknown>;
+        let completion!: Promise<unknown>;
+        await act(async () => { completion = request_append(1); });
+        await vi.waitUntil(() => post_message.mock.calls.some(
+            ([message]) => message?.type === 'requestAppendRows',
+        ));
+        const request = post_message.mock.calls
+            .map(([message]) => message)
+            .find((message) => message?.type === 'requestAppendRows');
+        grid_shell_mock.commit_live_edit.mockClear();
+
+        await click_button('Header Row');
+        // Raising the fence now would refuse the admission's reply and drop
+        // whatever was typed while it waited.
+        expect(grid_shell_mock.latest_props?.edits_paused).toBe(false);
+        expect(grid_shell_mock.latest_props?.append_in_flight).toBe(true);
+        expect(header_requests(post_message)).toEqual([]);
+        expect(get_button('Header Row').getAttribute('aria-disabled')).toBe('true');
+
+        await dispatch_host_message({
+            type: 'appendRowsResult',
+            requestId: request.requestId,
+            sourceGeneration: 1,
+            granted: true,
+            rowIds: ['pending-a'],
+            formatTemplate: { id: 'plain', format: { kind: 'none' } },
+            appendBasis: {
+                sourceRowCount: 3,
+                provisionalStartRow: 3,
+                columnCount: 2,
+                schemaFingerprint: transform_schema_for_sheet(meta.sheets[0]),
+            },
+        });
+        const admission = await completion as AppendRowsAdmission;
+        expect(admission.rowIds).toEqual(['pending-a']);
+        await act(async () => { admission.settle(true); });
+        // Now the open editor is folded and the fence goes up.
+        expect(grid_shell_mock.commit_live_edit).toHaveBeenCalled();
+        expect(grid_shell_mock.latest_props?.edits_paused).toBe(true);
     });
 
     it('lifts the fence on a refusal, so editing goes on', async () => {

@@ -1320,6 +1320,12 @@ export interface EditingHandle {
      * its text, never the workbook.
      */
     typing_held(): boolean;
+    /**
+     * True while typed keys have yet to land in an editor: held for a session
+     * or an appended row, or opening one. A Header Row change waits for them,
+     * then folds that editor, so its text commits before edits pause.
+     */
+    typing_pending(): boolean;
 }
 
 /** Imperative focus bridge used by App after generation-keyed remounts. */
@@ -7529,6 +7535,8 @@ export function GridShell({
                 || overlay_mounted_ref.current
                 || session_surface_open_ref.current,
             typing_held: () => overlay_intent_ref.current !== null,
+            typing_pending: () => overlay_intent_ref.current !== null
+                || overlay_opening_ref.current,
         };
         return () => {
             editing_ref.current = null;

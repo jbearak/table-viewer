@@ -12,6 +12,7 @@ import * as path from 'path';
 import { expect, test } from '@playwright/test';
 import type { ElectronApplication, Page } from '@playwright/test';
 import { build_fixture_xlsx, cell, row } from '../../src/test/helpers/xlsx-structure-fixture';
+import { CHANNEL_HOST_MESSAGE } from '../shared/ipc';
 import { isolated_user_data, read_workbook } from './smoke-helpers';
 import {
     choose,
@@ -36,6 +37,8 @@ test.beforeEach(() => {
 });
 
 test.afterEach(async () => {
+    // A test that failed holding the host's messages would hold up the quit.
+    if (app) await release_host_messages().catch(() => {});
     if (app) await exit_app(app);
     app = undefined;
     fs.rmSync(test_root, { recursive: true, force: true });
@@ -83,6 +86,48 @@ async function removed_rows(page: Page): Promise<string[]> {
     return (await grid_rows(page))
         .filter((line) => line.startsWith('Row removed'))
         .map((line) => line.split('|').slice(1).join('|'));
+}
+
+/** Hold everything the host sends the page from now on, until `release_host_messages`. */
+async function hold_host_messages(): Promise<void> {
+    await app!.evaluate(({ webContents }, channel) => {
+        const main = globalThis as typeof globalThis & {
+            __held_host_messages?: { type?: string; replay: () => void }[];
+            __host_send_wrapped?: WeakSet<object>;
+        };
+        main.__held_host_messages = [];
+        main.__host_send_wrapped ??= new WeakSet();
+        for (const contents of webContents.getAllWebContents()) {
+            if (main.__host_send_wrapped.has(contents)) continue;
+            main.__host_send_wrapped.add(contents);
+            const send = contents.send.bind(contents);
+            contents.send = (sent_channel: string, ...args: unknown[]) => {
+                const held = main.__held_host_messages;
+                if (sent_channel !== channel || held === undefined) return send(sent_channel, ...args);
+                held.push({
+                    type: (args[0] as { message?: { type?: string } }).message?.type,
+                    replay: () => send(sent_channel, ...args),
+                });
+            };
+        }
+    }, CHANNEL_HOST_MESSAGE);
+}
+
+async function expect_host_message_held(type: string): Promise<void> {
+    await expect.poll(() => app!.evaluate((_electron, wanted) => (globalThis as typeof globalThis & {
+        __held_host_messages?: { type?: string }[];
+    }).__held_host_messages?.some((message) => message.type === wanted) ?? false, type)).toBe(true);
+}
+
+async function release_host_messages(): Promise<void> {
+    await app!.evaluate(() => {
+        const main = globalThis as typeof globalThis & {
+            __held_host_messages?: { replay: () => void }[];
+        };
+        const held = main.__held_host_messages ?? [];
+        main.__held_host_messages = undefined;
+        for (const message of held) message.replay();
+    });
 }
 
 function header_row_button(page: Page) {
@@ -202,4 +247,41 @@ test('an appended row and text left open in the cell editor survive choosing a h
         while (kept.length > 0 && kept[kept.length - 1] === '') kept.pop();
         return kept.join('|');
     })).toEqual(['1|2', 'name|qty', 'pear|10', 'kiwi']);
+});
+
+test('text typed while an appended row waits for admission survives a header change asked for meanwhile', async () => {
+    const { file, page } = await open_file('pending-append.xlsx', workbook([
+        ['name', 'qty'], ['apple', 10], ['banana', 20],
+    ]));
+    await wait_for_grid(page);
+    await expect.poll(() => headers(page)).toEqual(['name', 'qty']);
+    // Hold an editing session with an edit, so the keys below go straight in.
+    await type_into_cell(page, 2, 0, '11');
+
+    // Typing on the last row and pressing Enter asks the host for a new row.
+    // Its answer is held back; the keys typed after the Enter wait for it.
+    const cell = page.locator('#glide-cell-1-1');
+    await cell.focus();
+    await expect.poll(() => cell.getAttribute('aria-selected')).toBe('true');
+    await hold_host_messages();
+    await Promise.all(['p', 'e', 'a', 'r', 'Enter', 'k', 'i', 'w', 'i']
+        .map((key) => page.keyboard.press(key)));
+    await expect_host_message_held('appendRowsResult');
+    // Ask for the header change meanwhile, without moving focus off the grid.
+    await page.evaluate(() => {
+        const button = [...document.querySelectorAll('button')]
+            .find((candidate) => candidate.textContent?.trim() === 'Header Row');
+        button?.click();
+    });
+    await release_host_messages();
+
+    // The keys open in the new row's cell, the header change folds them in,
+    // and only then does it go ahead.
+    await expect.poll(() => body(page)).toEqual(['name|qty', 'apple|11', 'pear|20', 'kiwi|']);
+    await save_changes(page);
+    await expect.poll(async () => (await saved_rows(file))?.map((cells) => {
+        const kept = [...cells];
+        while (kept.length > 0 && kept[kept.length - 1] === '') kept.pop();
+        return kept.join('|');
+    })).toEqual(['name|qty', 'apple|11', 'pear|20', 'kiwi']);
 });
