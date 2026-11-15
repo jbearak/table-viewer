@@ -9486,7 +9486,6 @@ export function App(): React.JSX.Element {
                         : 'Wait for sorting and filtering to finish.'
                 }
                 editable={csv_editing_supported}
-                editing={editing_session_held}
                 diff_mode={diff_mode}
                 on_toggle_diff_mode={handle_toggle_diff_mode}
                 is_dirty={is_dirty}

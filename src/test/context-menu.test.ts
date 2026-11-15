@@ -110,6 +110,68 @@ describe('ContextMenu keyboard behavior', () => {
         expect(restore_focus).toHaveBeenCalledOnce();
     });
 
+    // The row menu drops "Use row as header" and "Hide row" while it asks for
+    // the editing session, and offers them again once the session arrives.
+    function row_menu_items(with_session_items: boolean) {
+        return [
+            ...(with_session_items ? [{ label: 'Use row as header', on_click: vi.fn() }] : []),
+            { label: 'Insert row above', on_click: vi.fn() },
+            { kind: 'separator' as const },
+            ...(with_session_items ? [{ label: 'Hide row', on_click: vi.fn() }] : []),
+            { label: 'Copy row', on_click: vi.fn() },
+        ];
+    }
+
+    function rerender_menu(items: React.ComponentProps<typeof ContextMenu>['items'], on_dismiss: () => void) {
+        act(() => root!.render(React.createElement(
+            ContextMenu,
+            { x: 10, y: 10, items, on_dismiss, restore_focus: vi.fn() },
+        )));
+    }
+
+    function press(key: string) {
+        act(() => document.activeElement?.dispatchEvent(new KeyboardEvent('keydown', {
+            key, bubbles: true,
+        })));
+    }
+
+    it('keeps focus on the first item, and Escape, while items come and go before a key is pressed', () => {
+        const { on_dismiss } = render_menu(row_menu_items(true));
+        expect(document.activeElement?.textContent).toContain('Use row as header');
+        rerender_menu(row_menu_items(false), on_dismiss);
+        expect(document.activeElement?.textContent).toContain('Insert row above');
+        rerender_menu(row_menu_items(true), on_dismiss);
+        expect(document.activeElement?.textContent).toContain('Use row as header');
+        expect((document.activeElement as HTMLElement).tabIndex).toBe(0);
+        press('Escape');
+        expect(on_dismiss).toHaveBeenCalledOnce();
+    });
+
+    it('keeps the item a person moved to when items are added above it, or the next one when it goes', () => {
+        const { on_dismiss } = render_menu(row_menu_items(false));
+        press('ArrowDown');
+        expect(document.activeElement?.textContent).toContain('Copy row');
+        rerender_menu(row_menu_items(true), on_dismiss);
+        expect(document.activeElement?.textContent).toContain('Copy row');
+        expect((document.activeElement as HTMLElement).tabIndex).toBe(0);
+        press('ArrowUp');
+        expect(document.activeElement?.textContent).toContain('Hide row');
+        rerender_menu(row_menu_items(false), on_dismiss);
+        expect(document.activeElement?.textContent).toContain('Copy row');
+        press('Escape');
+        expect(on_dismiss).toHaveBeenCalledOnce();
+    });
+
+    it('closes on Escape when focus has fallen to the page', () => {
+        const { on_dismiss } = render_menu(row_menu_items(true));
+        act(() => (document.activeElement as HTMLElement).blur());
+        expect(document.activeElement).toBe(document.body);
+        act(() => document.body.dispatchEvent(new KeyboardEvent('keydown', {
+            key: 'Escape', bubbles: true,
+        })));
+        expect(on_dismiss).toHaveBeenCalledOnce();
+    });
+
     it('uses roving tabIndex and dismisses on Tab without restoring focus', () => {
         const { on_dismiss, restore_focus } = render_menu([
             { label: 'First', on_click: vi.fn() },

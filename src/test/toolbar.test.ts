@@ -52,7 +52,6 @@ function render_toolbar(props?: Partial<React.ComponentProps<typeof Toolbar>>) {
         auto_fit_active: false,
         on_toggle_auto_fit: vi.fn(),
         editable: false,
-        editing: false,
         diff_mode: false,
         on_toggle_diff_mode: vi.fn(),
         is_dirty: false,
@@ -261,7 +260,7 @@ describe('Toolbar', () => {
     });
 
     it('offers no Save, Discard, or Diff for a file that cannot be edited', () => {
-        const { container } = render_toolbar({ editing: true, is_dirty: true });
+        const { container } = render_toolbar({ is_dirty: true });
         const labels = get_action_labels(container);
         for (const label of ['Save', 'Discard', 'Diff']) {
             expect(labels).not.toContain(label);
@@ -287,7 +286,7 @@ describe('Toolbar', () => {
 
     it('saves through its handler once there are unsaved changes', () => {
         const on_save = vi.fn();
-        render_toolbar({ editable: true, editing: true, is_dirty: true, on_save });
+        render_toolbar({ editable: true, is_dirty: true, on_save });
         const save = get_button('Save');
         expect(save.getAttribute('aria-disabled')).toBeNull();
         expect(save.classList.contains('has-unsaved')).toBe(true);
@@ -300,7 +299,6 @@ describe('Toolbar', () => {
     it('shows Diff and Discard to the left of Save only beside unsaved changes', () => {
         const { container } = render_toolbar({
             editable: true,
-            editing: true,
             is_dirty: true,
         });
         expect(get_action_labels(container)).toEqual([
@@ -323,7 +321,7 @@ describe('Toolbar', () => {
 
     it('discards through its handler', () => {
         const on_discard = vi.fn();
-        render_toolbar({ editable: true, editing: true, is_dirty: true, on_discard });
+        render_toolbar({ editable: true, is_dirty: true, on_discard });
         act(() => get_button('Discard').click());
         expect(on_discard).toHaveBeenCalledTimes(1);
     });
@@ -333,7 +331,6 @@ describe('Toolbar', () => {
         const on_discard = vi.fn();
         render_toolbar({
             editable: true,
-            editing: true,
             is_dirty: true,
             save_busy: true,
             on_save,
@@ -351,7 +348,7 @@ describe('Toolbar', () => {
         const on_toggle_diff_mode = vi.fn();
         render_toolbar({
             editable: true,
-            editing: true,
+            is_dirty: true,
             diff_mode: true,
             on_toggle_diff_mode,
         });
