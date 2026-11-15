@@ -11,6 +11,7 @@ import * as path from 'path';
 import { test, expect } from '@playwright/test';
 import type { ElectronApplication, Page } from '@playwright/test';
 import { isolated_user_data, launch_app, repo_dir } from './smoke-helpers';
+import { build_fixture_xlsx } from '../../src/test/helpers/xlsx-structure-fixture';
 
 const GRID_CANVAS = '[data-testid="data-grid-canvas"]';
 const VIEWER_URL_PREFIX = 'tv-app://viewer';
@@ -346,6 +347,47 @@ test('an editor opened and cancelled leaves nothing behind, and the next edit ju
     await expect(cell(2, 1)).toHaveText('');
     await expect(save()).toHaveClass(/has-unsaved/);
 });
+
+// A textarea holds CRLF as LF. Reading that back as the cell's text would
+// make an untouched cell an edit.
+for (const extension of ['csv', 'xlsx']) {
+    test(`an unchanged ${extension} cell with CRLF line breaks opened and committed leaves nothing behind`, async () => {
+        const text = 'first\r\nsecond';
+        const bytes = extension === 'xlsx'
+            ? Buffer.from(build_fixture_xlsx({ sheets: [{
+                name: 'Lines',
+                body: '<sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>Name</t></is></c></row>'
+                    + '<row r="2"><c r="A2" t="inlineStr"><is><t>first&#13;&#10;second</t></is></c></row>'
+                    + '<row r="3"><c r="A3" t="inlineStr"><is><t>other</t></is></c></row></sheetData>',
+            }] }))
+            : Buffer.from(`Name\r\n"${text}"\r\nother\r\n`);
+        const file = path.join(root, `lines.${extension}`);
+        fs.writeFileSync(file, bytes);
+        await app!.close();
+        app = await launch_app(isolated_user_data('tv-edit-without-mode-data-'), [file]);
+        await expect.poll(
+            () => app!.windows().filter((candidate) => candidate.url().startsWith(VIEWER_URL_PREFIX)).length,
+            { timeout: 30_000 },
+        ).toBe(1);
+        page = app.windows().find((candidate) => candidate.url().startsWith(VIEWER_URL_PREFIX))!;
+        await page.locator('#glide-cell-1-0').waitFor({ state: 'attached' });
+
+        // This one-column XLSX opens without a Header Row.
+        const row = extension === 'xlsx' ? 1 : 0;
+        await select_cell(1, row);
+        await page.keyboard.press('Enter');
+        await expect(editor()).toHaveValue('first\nsecond');
+        await expect_nothing_unsaved();
+        await page.keyboard.press('Enter');
+        await expect(editor()).toHaveCount(0);
+        await expect(cell(1, row + 1)).toHaveAttribute('aria-selected', 'true');
+
+        await expect_nothing_unsaved();
+        expect(await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()
+            .some((window) => window.isDocumentEdited()))).toBe(false);
+        expect(fs.readFileSync(file)).toEqual(bytes);
+    });
+}
 
 test('Discard drops every unsaved change at once, and undo brings them back the first time', async () => {
     await select_cell(2, 1);

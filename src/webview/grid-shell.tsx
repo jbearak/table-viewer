@@ -179,7 +179,7 @@ import {
 } from './cell-overflow-model';
 import { header_tooltip_size, header_tooltip_text } from './header-tooltip';
 import { browserIsOSX } from './glide-data-grid/common/browser-detect.js';
-import { count_lines, has_line_break } from './line-breaks';
+import { count_lines, editor_cell_text, has_line_break } from './line-breaks';
 import {
     use_editing,
     type CellValueEdit,
@@ -6833,7 +6833,8 @@ export function GridShell({
 
     // Read the value + location of an open Glide overlay editor. Glide owns the
     // overlay (our hook's editing_cell stays null), so the location comes from the
-    // selected cell and the live text from the portalled .gdg-clip-region input.
+    // selected cell and the live text from the portalled .gdg-clip-region input,
+    // read as the cell text it stands for (`editor_cell_text`).
     const read_live_edit = useCallback((): LiveEdit | null => {
         const value = read_overlay_editor_value(document);
         if (value === null) return null;
@@ -6859,7 +6860,7 @@ export function GridShell({
                 kind: 'pendingColumn',
                 pendingColumnId: target.pendingColumnId,
                 rowKey: target.rowKey,
-                value,
+                value: editor_cell_text(value, original),
                 original,
             };
         }
@@ -6884,7 +6885,7 @@ export function GridShell({
                 kind: 'pending',
                 pendingRowId: projected_row.row.id,
                 sourceColumn: source_column,
-                value,
+                value: editor_cell_text(value, original),
                 original,
             };
         }
@@ -6921,7 +6922,7 @@ export function GridShell({
         } else {
             original = get_cell_raw(source_row, source_column) ?? '';
         }
-        return { kind: 'source', key, value, original };
+        return { kind: 'source', key, value: editor_cell_text(value, original), original };
     }, [
         commit_source_row,
         edit_syntax,

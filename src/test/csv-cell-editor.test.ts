@@ -175,6 +175,26 @@ describe('CsvCellEditor', () => {
         expect(on_finished).not.toHaveBeenCalled();
     });
 
+    // A textarea turns CRLF and a bare CR into LF; an untouched value still
+    // commits as the cell's own text, or the edit would be a phantom change.
+    it.each(['first\r\nsecond', 'first\rsecond'])(
+        'commits unchanged %j as the text it opened with',
+        async (text) => {
+            const { on_change, on_finished } = await render_editor(text);
+            const textarea = container!.querySelector('textarea')!;
+            expect(textarea.value).toBe('first\nsecond');
+            expect(on_change).not.toHaveBeenCalled();
+            await act(async () => {
+                textarea.dispatchEvent(new KeyboardEvent('keydown', {
+                    key: 'Enter',
+                    bubbles: true,
+                    cancelable: true,
+                }));
+            });
+            expect(on_finished).toHaveBeenCalledWith(expect.objectContaining({ data: text }), [0, 0]);
+        },
+    );
+
     describe('with keys the browser moves the caret for', () => {
         // jsdom has no Selection.modify. This one acts on the focused input,
         // as Chromium's does, for the two moves these tests use.

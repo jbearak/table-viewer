@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
     count_lines,
+    editor_cell_text,
     has_line_break,
     normalize_line_breaks,
     split_lines,
@@ -61,5 +62,18 @@ describe('normalize_line_breaks', () => {
         const text = 'a\nb';
         expect(normalize_line_breaks(text)).toBe(text);
         expect(normalize_line_breaks('plain')).toBe('plain');
+    });
+});
+
+describe('editor_cell_text', () => {
+    it('keeps the original when the editor only turned its CRLF or CR into LF', () => {
+        expect(editor_cell_text('a\nb', 'a\r\nb')).toBe('a\r\nb');
+        expect(editor_cell_text('a\nb', 'a\rb')).toBe('a\rb');
+        expect(editor_cell_text('a\nb', 'a\nb')).toBe('a\nb');
+    });
+
+    it('keeps a changed text as typed', () => {
+        expect(editor_cell_text('a\nbc', 'a\r\nb')).toBe('a\nbc');
+        expect(editor_cell_text('', 'a\r\nb')).toBe('');
     });
 });
