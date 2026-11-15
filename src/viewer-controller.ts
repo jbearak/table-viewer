@@ -9568,8 +9568,14 @@ export function attach_viewer(
         }
     }
 
-    function candidate_matches_acknowledged_source(candidate: SourceCandidate): boolean {
-        return candidate.observation.digest === session.acknowledged_physical_digest()
+    /**
+     * Whether a refresh may keep the adopted source because the file has not
+     * changed. Not while a header result is parked: the header lives in file
+     * state, not in the bytes compared here, and only an adoption settles it.
+     */
+    function may_keep_acknowledged_source(candidate: SourceCandidate): boolean {
+        return header_settlement_waiter === undefined
+            && candidate.observation.digest === session.acknowledged_physical_digest()
             && candidate.observation.comparisonDigest
                 === source_observation?.comparisonDigest;
     }
@@ -9676,7 +9682,7 @@ export function attach_viewer(
                         : new Error('The file changed while it was being refreshed.');
                 } else if (
                     !force
-                    && candidate_matches_acknowledged_source(candidate)
+                    && may_keep_acknowledged_source(candidate)
                 ) {
                     const deduplicated = await commit_physical_candidate(
                         candidate,
@@ -9869,7 +9875,7 @@ export function attach_viewer(
                 }
                 return false;
             }
-            if (!force && candidate_matches_acknowledged_source(candidate)) {
+            if (!force && may_keep_acknowledged_source(candidate)) {
                 const deduplicated = await commit_physical_candidate(
                     candidate, request.seq, expected_authority, true,
                 );

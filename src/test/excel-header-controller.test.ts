@@ -1179,6 +1179,41 @@ describe('Excel workbook snapshot controller', () => {
         });
     });
 
+    it('settles a header result whose rebuild a same-bytes watcher refresh superseded', async () => {
+        // The header lives in file state, not in the workbook's bytes, so the
+        // watcher's rebuild finds the digest it already holds. Taking that as
+        // "nothing changed" would keep the old header and never answer.
+        const state = mutable_state_store();
+        const builds = { count: 0 };
+        let release_recovery!: () => void;
+        const recovery_gate = new Promise<void>((resolve) => { release_recovery = resolve; });
+        const base_profile = excel_profile(builds, undefined, true);
+        const panel = open_excel('/header-superseded-recovery.xlsx', state.store, {
+            ...base_profile,
+            async build_source(raw, path, file_state) {
+                const built = await base_profile.build_source(raw, path, file_state);
+                if (builds.count === 2) await recovery_gate;
+                return built;
+            },
+        });
+        const initial = await ready(panel);
+
+        await toggle(panel, initial, 'superseded-recovery', false);
+        await vi.waitFor(() => expect(builds.count).toBe(2));
+        void vscode_mock.__getWatchers()[0].__fireChange();
+        await vi.waitFor(() => expect(builds.count).toBe(3));
+        release_recovery();
+
+        await vi.waitFor(() => expect(snapshots(panel).some((snapshot) => (
+            snapshot.commandResult?.requestId === 'superseded-recovery'
+        ))).toBe(true));
+        const settled = snapshots(panel).find((snapshot) => (
+            snapshot.commandResult?.requestId === 'superseded-recovery'
+        ))!;
+        expect(settled.meta.sheets[0].excelFirstRowHeader?.active).toBe(false);
+        expect(settled.commandResult).toMatchObject({ outcome: 'recovered' });
+    });
+
     it('reports reload-required when the header reload stops at a declined file-size prompt', async () => {
         // The receipt can't be applied in place, so the result waits for the
         // reload's adoption. The file has grown past the size limit and the
