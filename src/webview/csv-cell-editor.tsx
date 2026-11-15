@@ -9,7 +9,7 @@ import {
     type EditorPlatform,
     type HeldKeysTarget,
 } from './csv-cell-editor-model';
-import { count_lines, has_line_break } from './line-breaks';
+import { count_lines, editor_cell_text, has_line_break } from './line-breaks';
 import type { RichCellData } from './rich-text-layout';
 
 /** Glide movement delta: `[deltaCol, deltaRow]`, each clamped to -1/0/+1. */
@@ -125,6 +125,9 @@ export function CsvCellEditor({
     const cursor_pos_ref = useRef<number | null>(null);
     // Held keys not yet applied, or null once the editor has applied them.
     const held_ref = useRef<readonly EditorKeyEvent[] | null>(heldKeys && heldKeys.length > 0 ? heldKeys : null);
+    // The text the cell gets from the editor's, which a textarea holds with
+    // its line breaks as LF.
+    const cell_text_of = (live: string) => editor_cell_text(live, initial);
 
     // A layout effect, so the held keys are applied before the grid that
     // opened this editor looks at it again, as it does to commit a held Enter.
@@ -170,11 +173,12 @@ export function CsvCellEditor({
         held_ref.current = null;
         if (el.value !== text) set_text(el.value);
         // Glide commits its own copy of the value on a click away.
-        if (el.value !== initial) onChange(with_text(value, el.value));
+        const live = cell_text_of(el.value);
+        if (live !== initial) onChange(with_text(value, live));
     }, [is_multiline]);
 
     const commit = (navigation: EditorCommitNavigation) => {
-        const live = input_ref.current?.value ?? text;
+        const live = cell_text_of(input_ref.current?.value ?? text);
         // GridShell owns post-commit selection, including row wrapping. Glide only
         // commits the value and closes its overlay.
         if (onFinishedEditing(with_text(value, live), [0, 0]) === false) return;
@@ -241,7 +245,7 @@ export function CsvCellEditor({
         e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>,
     ) => {
         set_text(e.target.value);
-        onChange(with_text(value, e.target.value));
+        onChange(with_text(value, cell_text_of(e.target.value)));
     };
 
     const shared = {

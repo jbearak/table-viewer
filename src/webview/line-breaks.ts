@@ -41,3 +41,12 @@ export function normalize_line_breaks(text: string): string {
     if (!text.includes('\r')) return text;
     return text.replace(LINE_BREAK_RE_GLOBAL, '\n');
 }
+
+/**
+ * The cell text an editor's `text` stands for. An HTML textarea turns CRLF
+ * and a bare CR into LF, so an untouched `original` with either reads back
+ * changed; that is still `original`. Any real change is kept as typed.
+ */
+export function editor_cell_text(text: string, original: string): string {
+    return text === normalize_line_breaks(original) ? original : text;
+}
