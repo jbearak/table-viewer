@@ -200,13 +200,22 @@ describe('hold_key', () => {
         expect(hold('a', '{Enter}{Enter}x')!.edits[1]).toEqual({ initial: undefined, keys: keys('x') });
     });
 
+    it('starts the next edit after a commit with a character typed on any layout', () => {
+        expect(hold('a', '{Enter}жé{Tab}')!.edits[1]).toEqual({ initial: 'ж', keys: keys('é'), commit: 'next' });
+        expect(hold_key(hold('a', '{Enter}')!, ev('Ü', { shiftKey: true }))!.edits[1]).toEqual({ initial: 'Ü', keys: [] });
+        // One character outside the Basic Multilingual Plane is still one key.
+        expect(hold('a', '{Enter}𝔸')!.edits[1]).toEqual({ initial: '𝔸', keys: [] });
+    });
+
     it('replays nothing after a commit once a key only the grid acts on is typed', () => {
-        for (const key of ['ArrowDown', 'Tab', 'Backspace', 'Delete', 'Home', 'F2', 'é']) {
+        for (const key of ['ArrowDown', 'Tab', 'Backspace', 'Delete', 'Home', 'F2']) {
             const typing = hold('a', `{Enter}{${key}}bc`);
             expect(typing).toEqual({ edits: [{ initial: 'a', keys: [], commit: 'below' }], dropping: true });
         }
         expect(hold_key(hold('a', '{Enter}')!, ev(' ', { shiftKey: true }))!.dropping).toBe(true);
         expect(hold_key(hold('a', '{Enter}')!, ev('b', { altKey: true }))!.dropping).toBe(true);
+        // Option+Shift+A on macOS types Å, and is a shortcut on the grid.
+        expect(hold_key(hold('a', '{Enter}')!, ev('Å', { altKey: true, shiftKey: true }))!.dropping).toBe(true);
         expect(hold('a', '{Enter}bc{ArrowLeft}d')!.dropping).toBeUndefined();
     });
 

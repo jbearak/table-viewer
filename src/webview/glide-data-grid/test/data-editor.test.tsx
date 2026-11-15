@@ -1979,6 +1979,34 @@ a new line char ""more quotes"" plus a tab  ."	https://google.com`)
         expect(document.body.contains(screen.getByDisplayValue("jk"))).toBe(true);
     });
 
+    test("A key that types a character on any layout starts an edit, but not with Alt outside ASCII", async () => {
+        vi.useFakeTimers();
+        const request = vi.fn(() => true);
+        render(<DataEditor {...basicProps} onOverlayOpenRequest={request} />, {
+            wrapper: Context,
+        });
+        prep();
+
+        const canvas = screen.getByTestId("data-grid-canvas");
+        sendClick(canvas, {
+            clientX: 300, // Col B
+            clientY: 36 + 32 + 16, // Row 1 (0 indexed)
+        });
+        // Option+Shift+A on macOS types Å, and is a shortcut; Dead and
+        // Process belong to a character still being composed.
+        fireEvent.keyDown(canvas, { keyCode: 65, key: "Å", altKey: true, shiftKey: true });
+        fireEvent.keyDown(canvas, { keyCode: 69, key: "Dead", altKey: true });
+        fireEvent.keyDown(canvas, { keyCode: 229, key: "Process" });
+        expect(request).not.toHaveBeenCalled();
+
+        for (const key of ["ж", "é", "Ü"]) fireEvent.keyDown(canvas, { key, shiftKey: key === "Ü" });
+        expect(request.mock.calls).toEqual([
+            [[1, 1], "ж"],
+            [[1, 1], "é"],
+            [[1, 1], "Ü"],
+        ]);
+    });
+
     test("openOverlay has the editor mounted when it returns, called outside any event", async () => {
         vi.useFakeTimers();
         const ref = React.createRef<DataEditorRef>();

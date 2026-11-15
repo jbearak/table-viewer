@@ -151,6 +151,61 @@ test('arrows typed before the session is granted move the caret, as in the open 
     await expect(cell(1, 0)).toHaveAttribute('aria-selected', 'true');
 });
 
+/**
+ * Type `keys` as a non-US layout sends them, a key down and up for each
+ * character such as ж or é, all at once as `press_at_once` does. Playwright
+ * cannot press a key its US layout lacks, so this goes through CDP.
+ */
+async function type_on_layout(keys: readonly string[]): Promise<void> {
+    const cdp = await page.context().newCDPSession(page);
+    try {
+        await Promise.all(keys.flatMap((key) => {
+            const text = key === 'Enter' ? '\r' : key;
+            const code = key === 'Enter' ? 'Enter' : undefined;
+            const windowsVirtualKeyCode = key === 'Enter' ? 13 : undefined;
+            return [
+                cdp.send('Input.dispatchKeyEvent', {
+                    type: 'keyDown', key, code, windowsVirtualKeyCode, text, unmodifiedText: text,
+                }),
+                cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key, code, windowsVirtualKeyCode }),
+            ];
+        }));
+    } finally {
+        await cdp.detach();
+    }
+}
+
+for (const session of ['before the session is granted', 'under a session']) {
+    test(`a character typed on a non-US layout starts an edit ${session}`, async () => {
+        if (session === 'under a session') {
+            // A change elsewhere keeps the session held.
+            await select_cell(3, 2);
+            await page.keyboard.press('Delete');
+            await expect(cell(3, 2)).toHaveText('');
+            await expect(save()).toHaveClass(/has-unsaved/);
+        }
+        await select_cell(1, 0);
+        // ж starts the edit, Enter commits it and selects the cell below, and
+        // ü starts the next edit there. Before the grant every key lands at
+        // once. Under a session the test waits for Enter to move the
+        // selection first, which a key sent in the same task can overtake.
+        if (session === 'under a session') {
+            await type_on_layout(['ж', 'é', 'Enter']);
+            await expect(cell(1, 1)).toHaveAttribute('aria-selected', 'true');
+            await type_on_layout(['ü', 'ß']);
+        } else {
+            await type_on_layout(['ж', 'é', 'Enter', 'ü', 'ß']);
+        }
+        await expect(cell(1, 1)).toHaveAttribute('aria-selected', 'true');
+        await expect(editor()).toBeVisible();
+        await expect(editor()).toHaveValue('üß');
+        await expect(cell(1, 0)).toHaveText('жé');
+        await page.keyboard.press('Enter');
+        await expect(editor()).toBeHidden();
+        await expect(cell(1, 1)).toHaveText('üß');
+    });
+}
+
 test('an editor opened and cancelled leaves nothing behind, and the next edit just works', async () => {
     await select_cell(2, 0);
     await page.keyboard.press('Enter');
