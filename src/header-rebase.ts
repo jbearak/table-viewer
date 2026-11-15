@@ -201,7 +201,10 @@ export function rebase_pending_edits_for_header<T extends HeaderRebaseSlot>(
 
     const next = { ...slot } as Record<string, unknown>;
     if (row_layout !== undefined) next.rowLayout = row_layout;
-    if (basis?.kind === 'xlsx') next.structuralBasis = Object.freeze({ ...basis, bodyStart: to });
+    if (basis?.kind === 'xlsx') next.structuralBasis = Object.freeze({
+        ...basis,
+        ...(basis.bodyStart === undefined ? {} : { bodyStart: to }),
+    });
     if (slot.appendBasis !== undefined && context.appendSchemaFingerprint !== undefined) {
         next.appendBasis = Object.freeze({
             ...slot.appendBasis,

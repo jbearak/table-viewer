@@ -106,6 +106,20 @@ describe('rebase_pending_edits_for_header', () => {
         expect(rebased.structuralBasis).toMatchObject({ bodyStart: 4 });
     });
 
+    it('leaves a legacy basis\'s unknown body start unknown, rather than claiming the new one', () => {
+        // Save treats an absent body start as unknown and lets the digests
+        // decide; stamping `to` would vouch for a body start never checked.
+        const { bodyStart: _unknown, ...legacy } = xlsx_basis(1) as Extract<
+            NonNullable<PendingStructuralChanges['structuralBasis']>,
+            { kind: 'xlsx' }
+        >;
+        const rebased = assert_valid_at(rebase_pending_edits_for_header(slot({
+            rowLayout: deleted(1, 6),
+            structuralBasis: legacy,
+        }), { from: 1, to: 4, sourceRowCount: ROWS }), 4);
+        expect(rebased.structuralBasis).toEqual(legacy);
+    });
+
     it('keeps an inserted row and a moved row below the rows that leave the body', () => {
         const inserted = layout_ok(insert_rows(
             source_row_layout(1, ROWS - 1),
