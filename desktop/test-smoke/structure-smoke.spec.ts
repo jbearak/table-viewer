@@ -13,8 +13,9 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { expect, test } from '@playwright/test';
-import type { ElectronApplication, Page } from '@playwright/test';
+import type { ElectronApplication, Locator, Page } from '@playwright/test';
 import { parse_xlsx } from '../../src/parse-xlsx';
+import { CHANNEL_HOST_MESSAGE } from '../shared/ipc';
 import { build_fixture_xlsx, cell, row } from '../../src/test/helpers/xlsx-structure-fixture';
 import { isolated_user_data, read_workbook, repo_dir, state_database_path } from './smoke-helpers';
 import {
@@ -1192,4 +1193,162 @@ test('a workbook row copied with Copy and pasted onto itself is no edit', async 
     await expect(save_button(page)).toBeDisabled();
     await expect(page.getByRole('button', { name: 'Diff' })).toHaveCount(0);
     expect(fs.readFileSync(file).equals(fixture)).toBe(true);
+});
+
+/**
+ * Record, from the page, every list of items a context menu shows from now
+ * on, and where each item sat the first time it was shown. Installed before
+ * the right-click, so the first list the menu renders is caught too.
+ */
+async function watch_menu_items(page: Page): Promise<void> {
+    await page.evaluate(() => {
+        type Watch = { lists: string[][]; first_rects: Record<string, number> };
+        const state = window as typeof window & { __menu_watch?: Watch; __menu_observer?: MutationObserver };
+        state.__menu_observer?.disconnect();
+        const watch: Watch = { lists: [], first_rects: {} };
+        state.__menu_watch = watch;
+        const record = () => {
+            const menu = document.querySelector('[role="menu"]');
+            if (menu === null) return;
+            const items = [...menu.querySelectorAll('.context-menu-item')];
+            const labels = items.map((item) => item.querySelector('.context-menu-label')?.textContent ?? '');
+            const last = watch.lists.at(-1);
+            if (last !== undefined && last.join('\n') === labels.join('\n')) return;
+            watch.lists.push(labels);
+            items.forEach((item, index) => {
+                const label = labels[index]!;
+                if (!(label in watch.first_rects)) watch.first_rects[label] = item.getBoundingClientRect().top;
+            });
+        };
+        state.__menu_observer = new MutationObserver(record);
+        state.__menu_observer.observe(document.body, { subtree: true, childList: true, characterData: true });
+    });
+}
+
+async function menu_watch(page: Page): Promise<{ lists: string[][]; first_rects: Record<string, number> }> {
+    return page.evaluate(() => (window as typeof window & {
+        __menu_watch?: { lists: string[][]; first_rects: Record<string, number> };
+    }).__menu_watch!);
+}
+
+/**
+ * Open each menu with the session not yet held, wait for the session the menu
+ * acquires, and check the menu showed one list of items throughout: none
+ * appears, vanishes, or moves as the session arrives.
+ */
+async function expect_menus_steady(
+    page: Page,
+    menus: readonly { name: string; open: () => Promise<Locator>; expect_item: string }[],
+): Promise<void> {
+    const root = page.locator('.grid-shell-root');
+    for (const { name, open, expect_item } of menus) {
+        await expect(root).toHaveAttribute('data-edit-session', 'none');
+        await watch_menu_items(page);
+        const menu = await open();
+        await expect(root).toHaveAttribute('data-edit-session', 'held');
+        // Enabled once the session is held: the menu has settled.
+        const settled_item = menu.locator('.context-menu-item').filter({
+            has: page.locator('.context-menu-label').getByText(expect_item, { exact: true }),
+        });
+        await expect(settled_item).toBeVisible();
+        await expect(settled_item).not.toHaveAttribute('aria-disabled', 'true');
+        const { lists, first_rects } = await menu_watch(page);
+        expect(lists, `${name} showed one list of items`).toHaveLength(1);
+        // Where each item was first drawn is where a click aimed at it lands.
+        const items = menu.locator('.context-menu-item');
+        for (let index = 0; index < await items.count(); index += 1) {
+            const item = items.nth(index);
+            const label = await item.locator('.context-menu-label').textContent() ?? '';
+            const top = await item.evaluate((element) => element.getBoundingClientRect().top);
+            expect(top, `${name}: "${label}" stayed where it was first drawn`).toBe(first_rects[label]);
+        }
+        await page.keyboard.press('Escape');
+        await expect(page.locator('[role="menu"]')).toHaveCount(0);
+        await expect(root).toHaveAttribute('data-edit-session', 'none');
+        await expect.poll(() => page.evaluate(
+            () => document.activeElement?.closest('.grid-shell-root') != null,
+        )).toBe(true);
+    }
+}
+
+test('a CSV menu shows its items from the moment it opens, not as the session arrives', async () => {
+    const { page } = await open_file('fruit.csv', 'name,qty\napple,1\nbanana,2\n');
+    await wait_for_grid(page);
+    await expect_menus_steady(page, [
+        { name: 'the column menu', open: () => open_column_menu(page, 1), expect_item: 'Sort ascending' },
+        { name: 'the row menu', open: () => open_row_menu(page, 1), expect_item: 'Hide row' },
+        { name: 'the cell menu', open: () => open_cell_menu(page, 0, 0), expect_item: 'Copy cell' },
+    ]);
+});
+
+test('a workbook menu shows its items from the moment it opens, not as the session arrives', async () => {
+    const { page } = await open_file(
+        'basic.xlsx',
+        fs.readFileSync(path.join(repo_dir, 'src', 'test', 'fixtures', 'basic.xlsx')),
+    );
+    await wait_for_grid(page);
+    await expect_menus_steady(page, [
+        { name: 'the row menu', open: () => open_row_menu(page, 0), expect_item: 'Use row as header' },
+        { name: 'the column menu', open: () => open_column_menu(page, 1), expect_item: 'Filter…' },
+        { name: 'the cell menu', open: () => open_cell_menu(page, 0, 0), expect_item: 'Copy cell' },
+    ]);
+});
+
+test('a click on a workbook row menu item as first drawn, before the session arrives, lands on that item', async () => {
+    const { page } = await open_file(
+        'basic.xlsx',
+        fs.readFileSync(path.join(repo_dir, 'src', 'test', 'fixtures', 'basic.xlsx')),
+    );
+    await wait_for_grid(page);
+    await watch_menu_items(page);
+    // Hold everything the host says from here on, the answer to the menu's
+    // session request among it, so the click is sure to come while the
+    // session is on its way.
+    await app!.evaluate(({ webContents }, channel) => {
+        const main = globalThis as typeof globalThis & {
+            __held_host_messages?: { type?: string; replay: () => void }[];
+        };
+        main.__held_host_messages = [];
+        for (const contents of webContents.getAllWebContents()) {
+            const send = contents.send.bind(contents);
+            contents.send = (sent_channel: string, ...args: unknown[]) => {
+                const held = main.__held_host_messages;
+                if (sent_channel !== channel || held === undefined) return send(sent_channel, ...args);
+                held.push({
+                    type: (args[0] as { message?: { type?: string } }).message?.type,
+                    replay: () => send(sent_channel, ...args),
+                });
+            };
+        }
+    }, CHANNEL_HOST_MESSAGE);
+    const menu = await open_row_menu(page, 0);
+    await expect.poll(() => app!.evaluate(() => (globalThis as typeof globalThis & {
+        __held_host_messages?: { type?: string }[];
+    }).__held_host_messages!.some((message) => message.type === 'editSessionResult'))).toBe(true);
+    await expect(page.locator('.grid-shell-root')).toHaveAttribute('data-edit-session', 'none');
+    // Aimed at "Move rows down" where the menu first drew it.
+    const { first_rects } = await menu_watch(page);
+    const target = first_rects['Move rows down']!;
+    const box = (await menu.boundingBox())!;
+    await page.mouse.click(box.x + box.width / 2, target + 4);
+    // Moving waits for the session, so the click does nothing: no other item
+    // ran in its place, and the menu is still open.
+    await expect(menu).toBeVisible();
+    await expect(save_button(page)).toBeDisabled();
+    await app!.evaluate(() => {
+        const main = globalThis as typeof globalThis & {
+            __held_host_messages?: { replay: () => void }[];
+        };
+        const held = main.__held_host_messages!;
+        main.__held_host_messages = undefined;
+        for (const message of held) message.replay();
+    });
+    await expect(page.locator('.grid-shell-root')).toHaveAttribute('data-edit-session', 'held');
+    await expect(menu.locator('.context-menu-item').filter({
+        has: page.locator('.context-menu-label').getByText('Move rows down', { exact: true }),
+    })).not.toHaveAttribute('aria-disabled', 'true');
+    await page.keyboard.press('Escape');
+    await expect(page.locator('[role="menu"]')).toHaveCount(0);
+    await expect(page.locator('.grid-shell-root')).toHaveAttribute('data-edit-session', 'none');
+    await expect(save_button(page)).toBeDisabled();
 });

@@ -8890,6 +8890,13 @@ export function App(): React.JSX.Element {
         || edit_session_pending
         || preview_mode
         || excel_header_pending;
+    // Transforms held back by nothing but a session claim in flight. A context
+    // menu makes one as it opens, so it shows its transform items disabled
+    // through the claim rather than dropping them under the pointer.
+    const transform_waits_for_claim = edit_session_pending
+        && !save_ui_fenced
+        && !preview_mode
+        && !excel_header_pending;
 
     // Stale-view banner: derived from the rules actually *installed* in the grid, not
     // the requested ones, because the statement is about the order the user is
@@ -9295,6 +9302,7 @@ export function App(): React.JSX.Element {
             }}
             transform_state={visible_transform}
             transform_sections={!transform_ui_blocked}
+            transform_waits_for_claim={transform_waits_for_claim}
             transform_pending={transform_pending}
             on_transform_change={handle_grid_transform_change}
             on_open_filter={open_grid_filter_editor}

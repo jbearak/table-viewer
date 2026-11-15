@@ -1680,6 +1680,12 @@ export interface GridShellProps {
     on_scroll_position_change?: (position: ScrollPosition) => void;
     transform_state?: SheetTransformState;
     transform_sections?: boolean;
+    /**
+     * Transforms are refused only while a session claim is in flight. Menus
+     * show their transform items through it, disabled, so a menu that acquires
+     * the session as it opens keeps the same items while the grant lands.
+     */
+    transform_waits_for_claim?: boolean;
     transform_pending?: boolean;
     on_transform_change?: (state: SheetTransformState) => void;
     on_open_filter?: (
@@ -1789,6 +1795,7 @@ export function GridShell({
     on_scroll_position_change = () => {},
     transform_state = EMPTY_TRANSFORM,
     transform_sections = false,
+    transform_waits_for_claim = false,
     transform_pending = false,
     on_transform_change = () => {},
     on_open_filter = () => {},
@@ -10873,6 +10880,12 @@ export function GridShell({
     // user asked for a menu, and a refusal only leaves the items unavailable.
     const menu_open = context_menu !== null;
     const menu_offers_edits = structural_support !== undefined || edit_syntax === 'markdown';
+    // Its items are those the session permits, shown from the moment it opens:
+    // an item the grant would add mid-menu moves the rest under the pointer.
+    // Until the grant lands they are disabled; a refusal leaves them so.
+    const menu_session_coming = edit_armed && menu_offers_edits;
+    const menu_edits_shown = editable_cells || menu_session_coming;
+    const transform_menu_sections = transform_sections || transform_waits_for_claim;
     // Asked again when a sort or filter settles: one in flight is refused.
     useEffect(() => {
         if (menu_open && edit_armed && menu_offers_edits && !transform_pending) {
@@ -11672,7 +11685,7 @@ export function GridShell({
         // markdown (Excel), never on CSV/TSV, and only where the cell is
         // actually editable and its source identity resolved — the same gate
         // the commit path needs to have a durable key.
-        const may_edit_hyperlink = editable_cells
+        const may_edit_hyperlink = menu_edits_shown
             && edit_syntax === 'markdown'
             && source_col !== undefined
             && menu_projected_row?.kind !== 'removal'
@@ -11690,6 +11703,7 @@ export function GridShell({
                 ? {
                     on_edit_hyperlink: () =>
                         open_hyperlink_dialog(row, display_col, source_col),
+                    edit_hyperlink_disabled: !editable_cells,
                     has_hyperlink: cell_hyperlink(display_col, row) !== undefined,
                 }
                 : {}),
@@ -11714,7 +11728,9 @@ export function GridShell({
                 && !selection_has_structural_rows
                 && !inserted_rows_lock,
             show_disabled_hide_rows: selection_has_structural_rows
-                || (inserted_rows_lock && !!selected_rows && transform_sections),
+                || (!!selected_rows
+                    && transform_menu_sections
+                    && (inserted_rows_lock || (!transform_pending && !preview_mode))),
             ...(inserted_rows_lock ? { hide_rows_disabled_reason: INSERTED_ROWS_TRANSFORM_MESSAGE } : {}),
             selected_row_count,
             selected_column_count: hide_column_targets.length,
@@ -12050,7 +12066,8 @@ export function GridShell({
                                 && !has_structural_rows
                                 && !inserted_rows_lock,
                             show_disabled_hide_rows: has_structural_rows
-                                || (inserted_rows_lock && transform_sections),
+                                || (transform_menu_sections
+                                    && (inserted_rows_lock || (!transform_pending && !preview_mode))),
                             ...(inserted_rows_lock
                                 ? { hide_rows_disabled_reason: INSERTED_ROWS_TRANSFORM_MESSAGE }
                                 : {}),
@@ -12062,11 +12079,12 @@ export function GridShell({
                             // locks the header row is App's to say: this menu
                             // holds one itself while it is open.
                             can_promote_row_to_header: can_promote_row_to_header
-                                && transform_sections
+                                && transform_menu_sections
                                 && !transform_pending
                                 && !preview_mode
                                 && transform_state.sort.length === 0
                                 && !transform_state.filters.some((filter) => filter.enabled),
+                            promote_row_disabled: !transform_sections,
                             on_hide_rows: () => on_hide_rows(row_menu.source_display_rows),
                             ...(only_pending ? {
                                 pending_row_count: selected_pending_ids.size,
@@ -12138,8 +12156,8 @@ export function GridShell({
                     x={context_menu.x}
                     y={context_menu.y}
                     column_count={context_menu.display_cols.length}
-                    transform_sections={transform_sections}
-                    transform_disabled={transform_pending || inserted_rows_lock || has_pending}
+                    transform_sections={transform_menu_sections}
+                    transform_disabled={!transform_sections || transform_pending || inserted_rows_lock || has_pending}
                     {...(inserted_rows_lock
                         ? { transform_disabled_reason: INSERTED_ROWS_TRANSFORM_MESSAGE }
                         : has_pending
@@ -12172,7 +12190,7 @@ export function GridShell({
                         x={context_menu.x}
                         y={context_menu.y}
                         column_name={columns[context_menu.display_col]?.title ?? 'New column'}
-                        transform_sections={transform_sections}
+                        transform_sections={transform_menu_sections}
                         transform_disabled
                         transform_disabled_reason={PENDING_COLUMN_TRANSFORM_MESSAGE}
                         active_direction={null}
@@ -12188,12 +12206,13 @@ export function GridShell({
                         }, true)}
                         on_hide={() => {}}
                         hide_disabled_reason={PENDING_COLUMN_HIDE_MESSAGE}
-                        {...(editable_cells && column_structure_offered
+                        {...(menu_edits_shown && column_structure_offered
                             ? {
                                 on_rename: () => {
                                     suppress_menu_restore_ref.current = true;
                                     open_pending_column_rename(context_menu.display_col);
                                 },
+                                rename_disabled: !editable_cells,
                             }
                             : {})}
                         {...(pending_structure === undefined ? {} : { structure: pending_structure })}
@@ -12222,7 +12241,7 @@ export function GridShell({
                 // A column with a structure change other than a removal renames
                 // only as a Pending Column does; renaming a source column's
                 // header stays the `.xlsx` header edit it was.
-                const source_rename_offered = editable_cells
+                const source_rename_offered = menu_edits_shown
                     && edit_syntax === 'markdown'
                     && sheet_meta.excelFirstRowHeader?.active === true;
                 return (
@@ -12231,8 +12250,8 @@ export function GridShell({
                         y={context_menu.y}
                         column_name={columns[context_menu.display_col]?.title
                             ?? `Column ${source_column + 1}`}
-                        transform_sections={transform_sections}
-                        transform_disabled={transform_pending || inserted_rows_lock}
+                        transform_sections={transform_menu_sections}
+                        transform_disabled={!transform_sections || transform_pending || inserted_rows_lock}
                         {...(inserted_rows_lock
                             ? { transform_disabled_reason: INSERTED_ROWS_TRANSFORM_MESSAGE }
                             : {})}
@@ -12250,7 +12269,7 @@ export function GridShell({
                             height: row_count,
                         }, true)}
                         on_hide={() => hide_source_column(source_column)}
-                        {...(!source_rename_offered && editable_cells && column_structure_offered
+                        {...(!source_rename_offered && menu_edits_shown && column_structure_offered
                             ? {
                                 // CSV and TSV rename only new columns.
                                 on_rename: () => {},
@@ -12260,7 +12279,7 @@ export function GridShell({
                             : {})}
                         {...(source_rename_offered
                             ? {
-                                rename_disabled: !header_column_can_be_renamed(
+                                rename_disabled: !editable_cells || !header_column_can_be_renamed(
                                     sheet_meta,
                                     source_column,
                                 ),

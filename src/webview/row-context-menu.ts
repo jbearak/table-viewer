@@ -14,6 +14,8 @@ export interface RowContextMenuModelProps {
     /** Why "Hide row(s)" is disabled, when it is shown disabled. */
     hide_rows_disabled_reason?: string;
     can_promote_row_to_header: boolean;
+    /** Shown but not yet admitted: the session the menu acquires is on its way. */
+    promote_row_disabled?: boolean;
     on_hide_rows: () => void;
     on_promote_row_to_header: () => void;
     on_copy_rows: () => void;
@@ -53,6 +55,7 @@ export function row_context_menu_items(props: RowContextMenuModelProps): MenuIte
         items.push({
             label: 'Use row as header',
             on_click: () => props.on_promote_row_to_header(),
+            ...(props.promote_row_disabled ? { disabled: true } : {}),
         });
     }
     const { structure } = props;
