@@ -14,12 +14,15 @@ import type {
 } from './types';
 import {
     MAX_PERSISTED_HIDDEN_ROWS,
+    pending_changes_for_sheet,
     sanitize_excel_header_active,
     sanitize_excel_header_overrides,
     transform_has_entries,
     transform_schema_for_sheet,
 } from './types';
 import { normalize_complete_per_file_state } from './viewer-snapshot';
+import { rebase_pending_edits_for_header } from './header-rebase';
+import { header_body_start } from './worksheet-layout';
 
 export interface ExcelCandidateStatePlan {
     state: PerFileState;
@@ -33,6 +36,12 @@ export interface ExcelOverrideStatePlan {
     state: PerFileState;
     oldSheet: SheetMeta;
     newSheet: SheetMeta;
+    /**
+     * Why the change cannot carry the worksheet's Pending Changes to the new
+     * Header Row (see `rebase_pending_edits_for_header`). When set, `state` is
+     * not to be written.
+     */
+    refusal?: string;
 }
 
 /** Pure legacy/current state normalization shared by every planning retry. */
@@ -323,6 +332,11 @@ export function plan_excel_override_state(
         clearHiddenRows?: boolean;
         headerSourceRow?: number;
         targetInput?: ExcelHeaderPlanningInput;
+        /**
+         * The append schema fingerprint of a projected sheet, for the rebased
+         * `appendBasis`. Host-only: it hashes with node's crypto.
+         */
+        appendSchemaFingerprint?: (sheet: SheetMeta) => string;
     },
 ): ExcelOverrideStatePlan | undefined {
     if (
@@ -422,11 +436,46 @@ export function plan_excel_override_state(
         transforms[sheet_index] = transform_has_entries(retained) ? retained : undefined;
     }
 
+    // The worksheet's Pending Changes move with its body start, in this same
+    // write: the header and the slot that matches it are stored together.
+    let pendingEdits = current.pendingEdits;
+    const slot = pending_changes_for_sheet(
+        current.pendingEdits,
+        sheet_index,
+        sheet_name,
+        planning_sheet.worksheetId,
+    );
+    if (slot !== undefined) {
+        const rebased = rebase_pending_edits_for_header(slot, {
+            from: header_body_start(old_sheet.excelFirstRowHeader),
+            to: header_body_start(new_sheet.excelFirstRowHeader),
+            sourceRowCount: planning_sheet.sourceRowCount,
+            hiddenBefore: current.transforms?.[sheet_index]?.hiddenRows,
+            hiddenAfter: transforms?.[sheet_index]?.hiddenRows,
+            ...(options?.appendSchemaFingerprint === undefined
+                ? {}
+                : { appendSchemaFingerprint: options.appendSchemaFingerprint(new_sheet) }),
+        });
+        if (!rebased.ok) {
+            return {
+                oldSheet: old_sheet,
+                newSheet: new_sheet,
+                state: current,
+                refusal: rebased.message,
+            };
+        }
+        if (rebased.slot !== slot) {
+            pendingEdits = [...(current.pendingEdits ?? [])];
+            pendingEdits[sheet_index] = rebased.slot;
+        }
+    }
+
     return {
         oldSheet: old_sheet,
         newSheet: new_sheet,
         state: {
             ...current,
+            ...(pendingEdits === current.pendingEdits ? {} : { pendingEdits }),
             excelFirstRowHeaders,
             excelFirstRowHeaderActive,
             excelFirstRowHeaderVersion: 1,

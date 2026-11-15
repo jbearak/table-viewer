@@ -465,11 +465,29 @@ type Placement =
     | { readonly kind: 'past'; readonly number: number; readonly edge: boolean }
     | { readonly kind: 'unknown' };
 
-function place<Identity>(
+/**
+ * A fixed row the body now holds, as the identity anchoring it now would
+ * record. A row is fixed when it is at or above the Header Row; turning the
+ * Header Row off, or choosing one higher up, moves rows below it into the
+ * body, where they follow inserts, deletes, and moves like every body row.
+ * The mirror of `place`'s rule for an identity at or above the Header Row.
+ */
+function body_anchor_of_fixed<Identity>(
     axis: Axis<Identity>,
     view: AnchorAxisView<Identity>,
     anchor: AxisAnchor,
+): AxisAnchor {
+    if (anchor.kind !== 'fixed' || axis.source_number === undefined) return anchor;
+    if (anchor.row <= view.fixedCount) return anchor;
+    return axis.identity_anchor(axis.source_identity(anchor.row));
+}
+
+function place<Identity>(
+    axis: Axis<Identity>,
+    view: AnchorAxisView<Identity>,
+    given: AxisAnchor,
 ): Placement {
+    const anchor = body_anchor_of_fixed(axis, view, given);
     switch (anchor.kind) {
         case 'fixed':
             return { kind: 'fixed', number: anchor.row };
@@ -818,7 +836,7 @@ function axis_flags<Identity>(
         reasons.push('tombstoneCorner');
     }
     if (anchors.some((anchor) => {
-        const identity = axis.identity_of(anchor);
+        const identity = axis.identity_of(body_anchor_of_fixed(axis, view, anchor));
         return identity !== undefined
             && (identity as { readonly kind: string }).kind === 'source'
             && view.position_of(identity) !== undefined
@@ -913,7 +931,7 @@ function deleted_corners<Identity>(
     for (const anchor of anchors) {
         const placement = place(axis, view, anchor);
         if (placement.kind !== 'body' || placement.live) continue;
-        const identity = axis.identity_of(anchor);
+        const identity = axis.identity_of(body_anchor_of_fixed(axis, view, anchor));
         const key = JSON.stringify(identity);
         if (identity === undefined || seen.has(key)) continue;
         seen.add(key);

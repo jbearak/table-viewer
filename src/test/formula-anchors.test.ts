@@ -219,6 +219,24 @@ describe('rendering implicit anchors', () => {
     });
 });
 
+describe('anchors across a Header Row change', () => {
+    it('lets a stored reference to the old Header Row follow rows inserted above it once the header is off', () => {
+        // Authored under a header in row 1, with a row inserted in the body so
+        // the anchors are stored: A1 is a fixed row, A2 a body row.
+        const header_on = [sheet('Sheet1', insert_before(axis_model(1, 4), 3, ['q']))];
+        // The header is turned off, so row 1 joins the body, and a row is
+        // inserted above it.
+        const header_off = [sheet('Sheet1', insert_before(insert_before(axis_model(0, 5), 3, ['q']), 1, ['p']))];
+        expect(committed('=A1+A2', header_on, header_off)).toBe('=A2+A3');
+    });
+
+    it('keeps a stored reference fixed above a header chosen further down', () => {
+        const header_off = [sheet('Sheet1', insert_before(axis_model(0, 5), 5, ['q']))];
+        const promoted = [sheet('Sheet1', insert_before(insert_before(axis_model(3, 2), 5, ['q']), 4, ['p']))];
+        expect(committed('=A2+A4', header_off, promoted)).toBe('=A2+A5');
+    });
+});
+
 describe('trailing and edge anchors', () => {
     const ten = axis_model(0, 10);
 

@@ -619,6 +619,101 @@ describe('pure Excel header state planning', () => {
         });
     });
 
+    describe('carries the worksheet\'s Pending Changes in the same write', () => {
+        const rows = [
+            [text('Report'), text('')],
+            [text('Name'), text('Age')],
+            [text('Alice'), number(30)],
+            [text('Bob'), number(25)],
+            [text('Cara'), number(41)],
+        ];
+        const basis = {
+            kind: 'xlsx' as const,
+            worksheetPartDigest: 'part',
+            sharedStringsDigest: null,
+            stylesDigest: null,
+            workbookDigest: 'book',
+            sourceRowCount: 5,
+            sourceColumnCount: 2,
+            bodyStart: 0,
+        };
+        const pending = (body_start: number, removed: number) => ({
+            sheetName: 'People',
+            cells: { '2:0': { value: 'Alicia', base: 'Alice' } },
+            rowLayout: {
+                runs: [{ kind: 'source' as const, start: body_start, count: 5 - body_start }],
+                removedSourceRows: [{ start: removed, count: 1 }],
+                discardedPendingRows: [],
+            },
+            structuralBasis: { ...basis, bodyStart: body_start },
+            appendBasis: { sourceRowCount: 5, columnCount: 2, schemaFingerprint: 'old' },
+        });
+
+        it('moves the layout and its basis to a promoted row, and re-stamps the append basis', () => {
+            const ds = source('off', rows);
+            const plan = plan_excel_override_state({
+                excelFirstRowHeaders: { People: 'off' },
+                pendingEdits: [pending(0, 3)],
+            }, ds.planning_input(), 0, 'People', 'on', {
+                headerSourceRow: 1,
+                targetInput: ds.planning_input_for_header_source('People', 1),
+                appendSchemaFingerprint: (sheet) => `names:${sheet.columnNames?.join(',')}`,
+            })!;
+            expect(plan.refusal).toBeUndefined();
+            expect(plan.state.pendingEdits?.[0]).toMatchObject({
+                cells: { '2:0': { value: 'Alicia', base: 'Alice' } },
+                rowLayout: {
+                    runs: [{ kind: 'source', start: 2, count: 3 }],
+                    removedSourceRows: [{ start: 3, count: 1 }],
+                },
+                structuralBasis: { bodyStart: 2 },
+                appendBasis: { schemaFingerprint: 'names:Name,Age' },
+            });
+            expect(plan.state.transforms?.[0]?.hiddenRows).toEqual([0]);
+        });
+
+        it('puts the old header row back in the body when the header is turned off', () => {
+            const ds = source('on', rows, [[0]]);
+            const plan = plan_excel_override_state({
+                excelFirstRowHeaders: { People: 'on' },
+                transforms: [{ sort: [], filters: [], hiddenRows: [0] }],
+                pendingEdits: [pending(2, 3)],
+            }, ds.planning_input(), 0, 'People', 'off')!;
+            expect(plan.refusal).toBeUndefined();
+            expect(plan.state.pendingEdits?.[0]).toMatchObject({
+                rowLayout: { runs: [{ kind: 'source', start: 0, count: 5 }] },
+                structuralBasis: { bodyStart: 0 },
+            });
+        });
+
+        it('refuses, and writes nothing, when an edit sits on the row that would become the header', () => {
+            const ds = source('off', rows);
+            const current: PerFileState = {
+                excelFirstRowHeaders: { People: 'off' },
+                pendingEdits: [{ sheetName: 'People', cells: { '1:1': { value: 'Years', base: 'Age' } } }],
+            };
+            const plan = plan_excel_override_state(current, ds.planning_input(), 0, 'People', 'on', {
+                headerSourceRow: 1,
+                targetInput: ds.planning_input_for_header_source('People', 1),
+            })!;
+            expect(plan.refusal).toBe('Save first: the row that would become the header row has unsaved changes.');
+            expect(plan.state).toBe(current);
+        });
+
+        it('leaves another worksheet\'s slot alone', () => {
+            const ds = source('off', rows);
+            const sibling = { sheetName: 'Other', cells: { '0:0': 'x' } };
+            const plan = plan_excel_override_state({
+                excelFirstRowHeaders: { People: 'off' },
+                pendingEdits: [undefined, sibling],
+            }, ds.planning_input(), 0, 'People', 'on', {
+                headerSourceRow: 1,
+                targetInput: ds.planning_input_for_header_source('People', 1),
+            })!;
+            expect(plan.state.pendingEdits?.[1]).toBe(sibling);
+        });
+    });
+
     it('rejects promotion when the selected source row became hidden', () => {
         const ds = source('off', undefined, [[0]]);
         expect(plan_excel_override_state({

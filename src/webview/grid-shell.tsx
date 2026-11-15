@@ -139,6 +139,7 @@ import {
 import {
     resolve_nav,
     is_copy_key,
+    is_edit_key,
     move_sequential_cell,
     sequential_append_target_column,
 } from './grid-nav-model';
@@ -1320,6 +1321,12 @@ export interface EditingHandle {
      * its text, never the workbook.
      */
     typing_held(): boolean;
+    /**
+     * True while typed keys have yet to land in an editor: held for a session
+     * or an appended row, or opening one. A Header Row change waits for them,
+     * then folds that editor, so its text commits before edits pause.
+     */
+    typing_pending(): boolean;
 }
 
 /** Imperative focus bridge used by App after generation-keyed remounts. */
@@ -1557,6 +1564,18 @@ export interface GridShellProps {
      * without consulting any editability flag here.
      */
     highlight_in_flight?: boolean;
+    /**
+     * A Header Row change is being prepared or is in flight. Its Pending Changes
+     * move with it in one durable write, so no editing affordance opens until
+     * it lands: like a highlight in flight, but App's own fence.
+     */
+    edits_paused?: boolean;
+    /**
+     * An edit gesture (a typed key, Delete, Enter, paste, cut, double-click)
+     * met a cell that `edits_paused` alone keeps from taking it, so App can
+     * say why nothing happened.
+     */
+    on_edit_paused_gesture?: () => void;
     /** A host-backed append reservation is outstanding; all edits are fenced. */
     append_in_flight?: boolean;
     /**
@@ -1761,6 +1780,8 @@ export function GridShell({
     edit_activation_id,
     csv_editable = false,
     highlight_in_flight = false,
+    edits_paused = false,
+    on_edit_paused_gesture,
     append_in_flight = false,
     append_row_ceiling = MAX_SHEET_ROWS,
     structural_support,
@@ -3270,6 +3291,7 @@ export function GridShell({
         && csv_editable
         && !save_in_flight
         && !highlight_in_flight
+        && !edits_paused
         && !close_barrier_active;
     const editable_cells = append_admission_active && !append_in_flight;
     // Editable, with no session behind it yet. Cells accept the same gestures
@@ -3281,9 +3303,19 @@ export function GridShell({
         && !preview_mode
         && !save_in_flight
         && !highlight_in_flight
+        && !edits_paused
         && !close_barrier_active;
     // Whether a cell answers an editing gesture at all, session or not.
     const cells_accept_edits = editable_cells || edit_armed;
+    // Cells would take edits but for `edits_paused`: an edit gesture is then
+    // refused for App's reason, which App explains.
+    const edits_held_by_pause = edits_paused
+        && !save_in_flight
+        && !highlight_in_flight
+        && !close_barrier_active
+        && (editing_session_held
+            ? csv_editable && !append_in_flight
+            : on_request_edit_session !== undefined && !preview_mode);
     // Stable row identities let cuts survive harmless sort/filter/projection
     // changes. Numeric fallback coordinates retain a separate generation guard.
     const clipboard_source = sheet_meta.worksheetId
@@ -7520,6 +7552,8 @@ export function GridShell({
                 || overlay_mounted_ref.current
                 || session_surface_open_ref.current,
             typing_held: () => overlay_intent_ref.current !== null,
+            typing_pending: () => overlay_intent_ref.current !== null
+                || overlay_opening_ref.current,
         };
         return () => {
             editing_ref.current = null;
@@ -9659,7 +9693,10 @@ export function GridShell({
      * current layouts (the cell is read-only); activating it says why.
      */
     const on_cell_activated = useCallback((cell: Item) => {
-        if (!editable_cells) return;
+        if (!editable_cells) {
+            if (edits_held_by_pause) on_edit_paused_gesture?.();
+            return;
+        }
         const [display_column, row] = cell;
         const source_column = source_column_for_display(display_column);
         if (source_column === undefined) return;
@@ -9688,8 +9725,10 @@ export function GridShell({
     }, [
         commit_source_row,
         editable_cells,
+        edits_held_by_pause,
         formula_display_for,
         get_row,
+        on_edit_paused_gesture,
         pending_projection,
         pending_rendered_rows,
         refuse_formula,
@@ -11192,14 +11231,26 @@ export function GridShell({
                 }
                 return;
             }
-            const decision = resolve_nav({
+            const keys = {
                 key: args.key,
                 shift: args.shiftKey,
                 ctrl: args.ctrlKey,
                 meta: args.metaKey,
                 alt: args.altKey,
-                // Typing edits wherever a cell would accept it, session or not.
-                editable: cells_accept_edits,
+            };
+            if (
+                edits_held_by_pause
+                && grid_selection_ref.current.current !== undefined
+                && !is_editable_target(args.rawEvent?.target ?? null)
+                && is_edit_key(keys)
+            ) {
+                on_edit_paused_gesture?.();
+            }
+            const decision = resolve_nav({
+                ...keys,
+                // Typing edits wherever a cell would accept it, session or not;
+                // a pause doesn't turn letters into vim navigation.
+                editable: cells_accept_edits || edits_held_by_pause,
             });
             if (!decision) return;
             const cur = grid_selection_ref.current.current?.cell;
@@ -11257,9 +11308,11 @@ export function GridShell({
             display_column_count,
             display_column_for_source,
             cells_accept_edits,
+            edits_held_by_pause,
             inserted_rows_lock,
             merge_index,
             merges,
+            on_edit_paused_gesture,
             on_open_filter,
             on_transform_change,
             row_count,
@@ -12188,9 +12241,14 @@ export function GridShell({
                             // is reordering the view. Whether a held session
                             // locks the header row is App's to say: this menu
                             // holds one itself while it is open.
+                            // Only a file row can become the header: a Pending Row
+                            // has no row in the file to name, and its grid row is
+                            // not a host display row.
                             can_promote_row_to_header: can_promote_row_to_header
                                 && transform_menu_sections
                                 && !preview_mode
+                                && row_menu.source_display_rows.length > 0
+                                && selected_pending_ids.size === 0
                                 && menu_transform_state.sort.length === 0
                                 && !menu_transform_state.filters.some((filter) => filter.enabled),
                             promote_row_disabled: !transform_sections
@@ -12217,11 +12275,10 @@ export function GridShell({
                                     ));
                                 },
                             } : {}),
-                            on_promote_row_to_header: () =>
-                                on_promote_row_to_header(
-                                    row_menu.source_display_rows[0]?.start
-                                        ?? row_menu.row,
-                                ),
+                            on_promote_row_to_header: () => {
+                                const display_row = row_menu.source_display_rows[0]?.start;
+                                if (display_row !== undefined) on_promote_row_to_header(display_row);
+                            },
                             on_copy_rows: () => {
                                 const resolved_rows = new Set<number>();
                                 {

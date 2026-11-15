@@ -775,15 +775,67 @@ describe('file coordinator reservations', () => {
                 };
             },
         };
+        // Reconciliation proves nothing was written: a refusal the panel
+        // can correlate, never an exception that leaves its request open.
         await expect(coordinator.commit_excel_header(
             header_command(store, 'failure', 'off'),
-        )).rejects.toThrow('finalize failed');
+        )).resolves.toEqual({
+            type: 'rejected',
+            error: 'The header setting could not be saved.',
+        });
 
         const next = begin_physical(coordinator, 'digest-b');
         const requested = await coordinator.request_commit_turn(next);
         expect(requested.type).toBe('granted');
         if (requested.type === 'granted') coordinator.release_commit_turn(requested.turn);
         coordinator.cancel(next);
+        coordinator.dispose();
+    });
+
+    it('refuses a header command whose admission is lost mid-commit, with the reason, before finalizing', async () => {
+        const path = `/tmp/header-admission-${Math.random()}.xlsx`;
+        const base = mapped_state_store();
+        const coordinator = acquire_file_coordinator(path, base.store);
+        await establish(coordinator, 'digest-a', base.store);
+        let reads = 0;
+        let admitted = true;
+        const finalize = vi.fn(base.store.finalize_authority_transaction);
+        const store: AuthorityFileStateStore = {
+            ...base.store,
+            async read(file_path) {
+                reads += 1;
+                // Another panel becomes the editing owner while the header
+                // state is being read.
+                admitted = false;
+                return base.store.read(file_path);
+            },
+            finalize_authority_transaction: finalize,
+        };
+        const result = await coordinator.commit_excel_header({
+            ...header_command(store, 'lost-admission', 'off'),
+            admissionRefusal: () => admitted ? undefined : 'Another panel is editing this file.',
+        });
+        expect(reads).toBe(1);
+        expect(result).toEqual({ type: 'rejected', error: 'Another panel is editing this file.' });
+        expect(finalize).not.toHaveBeenCalled();
+        coordinator.dispose();
+    });
+
+    it('returns a refusal, not an exception, when the header state cannot be read', async () => {
+        const path = `/tmp/header-read-failure-${Math.random()}.xlsx`;
+        const base = mapped_state_store();
+        const coordinator = acquire_file_coordinator(path, base.store);
+        await establish(coordinator, 'digest-a', base.store);
+        const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+        const store: AuthorityFileStateStore = {
+            ...base.store,
+            async read() {
+                throw new Error('EIO: /private/path/state.db');
+            },
+        };
+        await expect(coordinator.commit_excel_header(header_command(store, 'read-failure', 'off')))
+            .resolves.toEqual({ type: 'rejected', error: 'The header setting could not be saved.' });
+        error.mockRestore();
         coordinator.dispose();
     });
 

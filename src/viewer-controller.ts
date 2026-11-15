@@ -1,4 +1,5 @@
-import { createHash, randomUUID } from 'crypto';
+import { randomUUID } from 'crypto';
+import { worksheet_append_schema_fingerprint } from './append-schema-fingerprint';
 import { CsvDataSource } from './data-source/csv-source';
 import {
     build_source_from_buffer,
@@ -387,6 +388,9 @@ function conflicts_after_publication(
         : durable.filter((conflict) =>
             conflict.reason !== 'structuralBasisChanged' && conflict.reason !== 'unsupportedStructure');
 }
+
+/** Admission's refusal for an edit-session phase that ends on its own. */
+const EDIT_SESSION_WORK_FINISHING_MESSAGE = 'Finishing edit-session work; try again in a moment.';
 
 const UNRESOLVED_STRUCTURAL_SAVE_EDIT_MESSAGE =
     "Choose whether your last save finished before editing this file.";
@@ -809,12 +813,6 @@ function sanitized_insert_column_anchor(anchor: unknown): ColumnIdentity | undef
     return undefined;
 }
 
-function worksheet_append_schema_fingerprint(sheet: SheetMeta): string {
-    return `sha256:${createHash('sha256').update(JSON.stringify({
-        columnCount: sheet.columnCount,
-        columnNames: sheet.columnNames ?? null,
-    })).digest('hex')}`;
-}
 
 /**
  * Log only a bounded machine code from host/storage failures. Native filesystem
@@ -4414,6 +4412,51 @@ export function attach_viewer(
             append_admission_ledgers.set(key, ledger);
         }
     };
+    /**
+     * After a Header Row change is adopted for `sheet_index`: the committed slot
+     * carries the rebased Structural Basis and append basis
+     * (`plan_excel_override_state`), and this session's ledger judges later
+     * publications and admissions against what it recorded, so it takes the
+     * same values. A ledger basis the slot no longer carries moves the same way:
+     * only the body start and the column names changed. Other worksheets are
+     * left alone; a layout conflicted by an external change must stay
+     * publishable at the body start it was authored at.
+     */
+    const adopt_header_rebased_ledger = (
+        slots: PerFileState['pendingEdits'],
+        sheet_index: number,
+    ): void => {
+        const edit_session_id = active_edit_session_id;
+        const sheet = source?.meta().sheets[sheet_index];
+        if (edit_session_id === undefined || sheet === undefined) return;
+        const target: WorksheetTarget = {
+            sheetIndex: sheet_index,
+            sheetName: sheet.name,
+            ...(sheet.worksheetId === undefined ? {} : { worksheetId: sheet.worksheetId }),
+        };
+        const ledger = append_admission_ledgers.get(append_ledger_key(edit_session_id, target));
+        if (ledger === undefined) return;
+        const slot = pending_changes_for_sheet(slots, sheet_index, sheet.name, sheet.worksheetId);
+        const body_start = header_body_start(sheet.excelFirstRowHeader);
+        if (slot?.structuralBasis !== undefined) {
+            ledger.structuralBasis = slot.structuralBasis;
+        } else if (
+            ledger.structuralBasis?.kind === 'xlsx'
+            && ledger.structuralBasis.bodyStart !== undefined
+            && ledger.structuralBasis.bodyStart !== body_start
+        ) {
+            ledger.structuralBasis = Object.freeze({ ...ledger.structuralBasis, bodyStart: body_start });
+        }
+        const fingerprint = worksheet_append_schema_fingerprint(sheet);
+        if (slot?.appendBasis !== undefined) {
+            ledger.appendBasis = slot.appendBasis;
+        } else if (
+            ledger.appendBasis !== undefined
+            && ledger.appendBasis.schemaFingerprint !== fingerprint
+        ) {
+            ledger.appendBasis = Object.freeze({ ...ledger.appendBasis, schemaFingerprint: fingerprint });
+        }
+    };
     // The worksheet currently shown in edit mode and worksheets with a pending
     // publication that has not crossed the durable state boundary. Neither is
     // ownership — the grant remains workbook-scoped. Together they are the
@@ -6170,36 +6213,34 @@ export function attach_viewer(
                 // A claim is mid-flight across state I/O. Admitting here lets a
                 // transform overtake the very reservation `reserve_edit_claim`
                 // exists to serialize.
-                return 'Finishing edit-session work; try again in a moment.';
+                return EDIT_SESSION_WORK_FINISHING_MESSAGE;
             case 'releasing':
                 // `release_edit_session` is still awaiting `pending_edit_writes`;
                 // durable pending edits may yet be written.
-                return 'Finishing edit-session work; try again in a moment.';
+                return EDIT_SESSION_WORK_FINISHING_MESSAGE;
             case 'cleanupPending':
                 // A post-write state clear is in flight and
                 // `clearedStateRevision` is not yet recorded, so a transform
                 // write would race the CAS clear.
-                return 'Finishing edit-session work; try again in a moment.';
+                return EDIT_SESSION_WORK_FINISHING_MESSAGE;
             case 'uncertain':
                 // Durable pending-edit state may or may not exist. Never admit
                 // under unknown durable state.
-                return 'Finishing edit-session work; try again in a moment.';
+                return EDIT_SESSION_WORK_FINISHING_MESSAGE;
         }
         const exhaustive: never = phase;
         void exhaustive;
         console.error('Unhandled CSV edit phase in transform admission');
-        return 'Finishing edit-session work; try again in a moment.';
+        return EDIT_SESSION_WORK_FINISHING_MESSAGE;
     }
 
-    function begin_transform_admission(): TransformAdmission {
+    function begin_transform_admission(
+        save_refusal = 'Wait for the save to finish before sorting, filtering, or hiding rows.',
+    ): TransformAdmission {
         // No shared edit state means no edit session can exist for this file, so
         // there is nothing to serialize against.
         if (!file_edit_state) return { operation: Symbol(file_key) };
-        if (save_blocks_transform()) {
-            return {
-                refusal: 'Wait for the save to finish before sorting, filtering, or hiding rows.',
-            };
-        }
+        if (save_blocks_transform()) return { refusal: save_refusal };
         const refusal = admit_transform_for_phase(file_edit_state.phase);
         if (refusal !== undefined) return { refusal };
         const operation = Symbol(file_key);
@@ -6965,6 +7006,44 @@ export function attach_viewer(
             tailRemovals: [],
             conflicts: [],
         });
+    }
+
+    /** Has `committed` moved on from `operation`: does any of its worksheets no longer echo it? */
+    function operation_superseded_by(
+        operation: CsvSaveOperation,
+        committed: PerFileState,
+    ): boolean {
+        return operation.worksheets.some((worksheet) => {
+            const operation_index = operation_sheet_index(
+                worksheet,
+                undefined,
+                committed.pendingEdits,
+            );
+            if (operation_index === undefined) return false;
+            return !pending_changes_echo_operation(
+                pending_changes_for_sheet(
+                    committed.pendingEdits,
+                    operation_index,
+                    worksheet.sheetName,
+                    worksheet.worksheetId,
+                ),
+                worksheet,
+            );
+        });
+    }
+
+    /**
+     * A header change writes the session's Pending Changes moved to the new
+     * body start (`plan_excel_override_state`). A failed save's operation still
+     * holds them as they were, and while it stands every snapshot in its session
+     * restores them from it. Once the committed state no longer echoes it, it
+     * stops standing, as when a publication moves on from it.
+     */
+    function retire_failed_save_superseded_by(state: Readonly<FileStateSnapshot>['state']): void {
+        if (save_lifecycle.state !== 'failed' || !('operation' in save_lifecycle)) return;
+        if (operation_superseded_by(save_lifecycle.operation, state as PerFileState)) {
+            retire_save_lifecycle(undefined, 'failed');
+        }
     }
 
     /**
@@ -8416,7 +8495,15 @@ export function attach_viewer(
                 await host.ui.open_setting('maxFileSizeMiB');
                 if (!load_is_current(request.seq, request.refreshEvent)) return { type: 'stale' };
             }
-            if (initial) await options.requestClose?.();
+            if (initial) {
+                await options.requestClose?.();
+            } else {
+                // Nothing will be adopted, so a header result waiting on this
+                // reload is settled now, as a failed reload settles it.
+                settle_header_on_failure(
+                    'The file is larger than the file size limit, so Table Viewer did not reload it.',
+                );
+            }
             return { type: 'stopped' };
         }
     }
@@ -8924,6 +9011,9 @@ export function attach_viewer(
                     // must stay recoverable by a lost acknowledgement.
                     replay_leases.invalidate();
                     sync_active_transform_panel();
+                    // The reconciled state this adoption delivers, so the ledger
+                    // judges the renderer's next publication against what it holds.
+                    settle_header_on_adoption(adoption_state.state);
                     session.replace_adoption(adoption, () => {
                         confirm_transfer();
                         source_observation = candidate.observation;
@@ -8967,6 +9057,79 @@ export function attach_viewer(
         }
         profile.on_source_adopted?.(adopted);
         return adopted;
+    }
+
+    /**
+     * A header command whose result can't ride the fast receipt adoption: an
+     * indeterminate commit, or a receipt this panel could not apply in place.
+     * Whether the header was stored is settled by the next reload's adoption,
+     * so the result is retained only then, inside that adoption's snapshot,
+     * never on a snapshot of the projection that may be stale. A reload that
+     * is superseded or adopts nothing leaves it waiting; one that fails reports
+     * `reloadRequired`, which keeps the panel's edits paused until the window
+     * reloads and reads durable state back in one consistent piece.
+     */
+    let header_settlement_waiter: {
+        readonly requestId: string;
+        /** The worksheet whose header changed: the reload may have moved it. */
+        readonly sheetName: string;
+        readonly worksheetId?: string;
+        readonly error?: string;
+    } | undefined;
+
+    function park_header_settlement(
+        request_id: string,
+        sheet: { readonly name: string; readonly worksheetId?: string },
+        error?: string,
+    ): void {
+        header_settlement_waiter = {
+            requestId: request_id,
+            sheetName: sheet.name,
+            ...(sheet.worksheetId === undefined ? {} : { worksheetId: sheet.worksheetId }),
+            ...(error === undefined ? {} : { error }),
+        };
+    }
+
+    /** At an adoption, immediately before `replace_adoption`, so its snapshot carries the result. */
+    function settle_header_on_adoption(state: Readonly<FileStateSnapshot>['state']): void {
+        const waiter = header_settlement_waiter;
+        if (waiter === undefined) return;
+        header_settlement_waiter = undefined;
+        // Found by identity in the adopted projection, never by the index the
+        // request named: a reload that reordered the workbook would otherwise
+        // move another worksheet's ledger. A worksheet that is gone moves none.
+        const sheets = source?.meta().sheets ?? [];
+        const sheet_index = sheets.findIndex((sheet) => (
+            waiter.worksheetId !== undefined && sheet.worksheetId !== undefined
+                ? sheet.worksheetId === waiter.worksheetId
+                : sheet.name === waiter.sheetName
+        ));
+        if (sheet_index >= 0) {
+            adopt_header_rebased_ledger(
+                normalize_host_state(state, sheets).pendingEdits,
+                sheet_index,
+            );
+        }
+        retire_failed_save_superseded_by(state);
+        session.retain_command_result({
+            type: 'excelFirstRowHeader',
+            requestId: waiter.requestId,
+            outcome: 'recovered',
+            ...(waiter.error === undefined ? {} : { error: waiter.error }),
+        }, { deliver: false });
+    }
+
+    function settle_header_on_failure(message: string): void {
+        const waiter = header_settlement_waiter;
+        if (waiter === undefined) return;
+        header_settlement_waiter = undefined;
+        session.retain_command_result({
+            type: 'excelFirstRowHeader',
+            requestId: waiter.requestId,
+            outcome: 'recovered',
+            reloadRequired: true,
+            error: waiter.error ?? message,
+        });
     }
 
     function schedule_header_refresh(): void {
@@ -9065,7 +9228,13 @@ export function attach_viewer(
                         if (projection_adoption.type !== 'refused') {
                             core = projection_adoption.core;
                             source_authority = receipt.resultingBasis;
+                            adopt_header_rebased_ledger(
+                                receipt_state.pendingEdits,
+                                receipt.sheetIndex,
+                            );
+                            settle_header_on_adoption(receipt.stateSnapshot.state);
                             if (is_origin) {
+                                retire_failed_save_superseded_by(receipt.stateSnapshot.state);
                                 session.retain_command_result({
                                     type: 'excelFirstRowHeader',
                                     requestId: receipt.requestId,
@@ -9120,23 +9289,31 @@ export function attach_viewer(
                         }
                     }
                     if (is_origin) {
-                        session.retain_command_result({
-                            type: 'excelFirstRowHeader',
-                            requestId: receipt.requestId,
-                            outcome: 'recovered',
-                            error: 'The header setting was saved after rebuilding the workbook view.',
-                        }, { deliver: false });
+                        park_header_settlement(
+                            receipt.requestId,
+                            {
+                                name: receipt.sheetName,
+                                ...(receipt.worksheetId === undefined
+                                    ? {}
+                                    : { worksheetId: receipt.worksheetId }),
+                            },
+                            'The header setting was saved after rebuilding the workbook view.',
+                        );
                     }
                     schedule_header_refresh();
                 } catch (error) {
                     log_sanitized_failure('Failed to apply an Excel header receipt', error);
                     if (is_origin) {
-                        session.retain_command_result({
-                            type: 'excelFirstRowHeader',
-                            requestId: receipt.requestId,
-                            outcome: 'recovered',
-                            error: 'The header setting was saved after rebuilding the workbook view.',
-                        }, { deliver: false });
+                        park_header_settlement(
+                            receipt.requestId,
+                            {
+                                name: receipt.sheetName,
+                                ...(receipt.worksheetId === undefined
+                                    ? {}
+                                    : { worksheetId: receipt.worksheetId }),
+                            },
+                            'The header setting was saved after rebuilding the workbook view.',
+                        );
                     }
                     schedule_header_refresh();
                 }
@@ -9380,6 +9557,9 @@ export function attach_viewer(
         const message = is_file_not_found_error(error)
             ? 'The file was deleted or moved, so Table Viewer could not reload it.'
             : `Failed to reload: ${error instanceof Error ? error.message : String(error)}`;
+        if (load_is_current(request.seq, request.refreshEvent)) {
+            settle_header_on_failure(message);
+        }
         if (post_save) {
             host.ui.show_warning(
                 `The file was saved, but Table Viewer could not refresh the table view. ${message}`);
@@ -9388,8 +9568,14 @@ export function attach_viewer(
         }
     }
 
-    function candidate_matches_acknowledged_source(candidate: SourceCandidate): boolean {
-        return candidate.observation.digest === session.acknowledged_physical_digest()
+    /**
+     * Whether a refresh may keep the adopted source because the file has not
+     * changed. Not while a header result is parked: the header lives in file
+     * state, not in the bytes compared here, and only an adoption settles it.
+     */
+    function may_keep_acknowledged_source(candidate: SourceCandidate): boolean {
+        return header_settlement_waiter === undefined
+            && candidate.observation.digest === session.acknowledged_physical_digest()
             && candidate.observation.comparisonDigest
                 === source_observation?.comparisonDigest;
     }
@@ -9496,7 +9682,7 @@ export function attach_viewer(
                         : new Error('The file changed while it was being refreshed.');
                 } else if (
                     !force
-                    && candidate_matches_acknowledged_source(candidate)
+                    && may_keep_acknowledged_source(candidate)
                 ) {
                     const deduplicated = await commit_physical_candidate(
                         candidate,
@@ -9689,7 +9875,7 @@ export function attach_viewer(
                 }
                 return false;
             }
-            if (!force && candidate_matches_acknowledged_source(candidate)) {
+            if (!force && may_keep_acknowledged_source(candidate)) {
                 const deduplicated = await commit_physical_candidate(
                     candidate, request.seq, expected_authority, true,
                 );
@@ -13144,12 +13330,13 @@ export function attach_viewer(
                 return;
             }
             case 'setExcelFirstRowHeader': {
-                const fail = (error: string) => {
+                const fail = (error: string, transient = false) => {
                     session.retain_command_result({
                         type: 'excelFirstRowHeader',
                         requestId: msg.requestId,
                         outcome: 'rejected',
                         error,
+                        ...(transient ? { transient: true as const } : {}),
                     });
                 };
                 if (
@@ -13167,7 +13354,9 @@ export function attach_viewer(
                     || msg.generation !== core.generation
                     || msg.sourceGeneration !== core.source_generation
                 ) {
-                    fail('The worksheet changed before the header request arrived.');
+                    // Usually a refresh the panel has not acknowledged yet: it
+                    // retries once that lands, re-reading the generation.
+                    fail('The worksheet changed before the header request arrived.', true);
                     return;
                 }
                 const sheet = source.meta().sheets[msg.sheetIndex];
@@ -13254,53 +13443,102 @@ export function attach_viewer(
                     return;
                 }
 
-                const command_source = source;
-                const expected_physical_revision = source_authority.physicalRevision;
-                const expected_physical_digest = source_authority.physicalDigest;
-                const planning_input = command_source.planning_input();
-                const result = await file_coordinator.commit_excel_header({
-                    requestId: msg.requestId,
-                    sheetIndex: msg.sheetIndex,
-                    sheetName: msg.sheetName,
-                    override: msg.enabled ? 'on' : 'off',
-                    originToken: excel_header_subscriber_token,
-                    expectedPhysicalRevision: expected_physical_revision,
-                    expectedPhysicalDigest: expected_physical_digest,
-                    planningInput: planning_input,
-                    clearHiddenRows: msg.unhideAll === true,
-                    headerSourceRow: header_source_row,
-                    targetPlanningInput: target_planning_input,
-                    stateStore: durable_state_store,
-                });
-                if (result.type === 'indeterminate' && !disposed) {
-                    session.retain_command_result({
-                        type: 'excelFirstRowHeader',
+                // A rebuilt worksheet whose structural save is unresolved has
+                // source-keyed state mid-rekey; its Pending Changes can't move.
+                if (unresolved_structural_sheet(msg.sheetIndex)) {
+                    fail(UNRESOLVED_STRUCTURAL_SAVE_EDIT_MESSAGE);
+                    return;
+                }
+                // A header change re-projects the worksheet, as a sort or a
+                // filter does, and is admitted the same way: refused during a
+                // save or another panel's session, and holding off every other
+                // panel's edit claim until it is done. Its Pending Changes move
+                // with it, in the same durable write (`plan_excel_override_state`).
+                const header_admission: TransformAdmission = editing_supported
+                    ? begin_transform_admission(
+                        'Wait for the save to finish before changing the header row.',
+                    )
+                    : { operation: Symbol(file_key) };
+                if ('refusal' in header_admission) {
+                    fail(
+                        header_admission.refusal,
+                        header_admission.refusal === EDIT_SESSION_WORK_FINISHING_MESSAGE,
+                    );
+                    return;
+                }
+                try {
+                    const command_source = source;
+                    const command_sheet = command_source.meta().sheets[msg.sheetIndex];
+                    const command_worksheet_id = command_sheet?.name === msg.sheetName
+                        ? command_sheet.worksheetId
+                        : undefined;
+                    const expected_physical_revision = source_authority.physicalRevision;
+                    const expected_physical_digest = source_authority.physicalDigest;
+                    const planning_input = command_source.planning_input();
+                    const result = await file_coordinator.commit_excel_header({
+                        // A durable restore can make another panel the owner while
+                        // the header write is in flight; ask again at every step.
+                        admissionRefusal: () => {
+                            if (!editing_supported) return undefined;
+                            if (unresolved_structural_sheet(msg.sheetIndex)) {
+                                return UNRESOLVED_STRUCTURAL_SAVE_EDIT_MESSAGE;
+                            }
+                            return transform_commit_admission_refusal();
+                        },
+                        appendSchemaFingerprint: worksheet_append_schema_fingerprint,
                         requestId: msg.requestId,
-                        outcome: 'recovered',
-                        error: result.error,
+                        sheetIndex: msg.sheetIndex,
+                        sheetName: msg.sheetName,
+                        ...(command_worksheet_id === undefined
+                            ? {}
+                            : { worksheetId: command_worksheet_id }),
+                        override: msg.enabled ? 'on' : 'off',
+                        originToken: excel_header_subscriber_token,
+                        expectedPhysicalRevision: expected_physical_revision,
+                        expectedPhysicalDigest: expected_physical_digest,
+                        planningInput: planning_input,
+                        clearHiddenRows: msg.unhideAll === true,
+                        headerSourceRow: header_source_row,
+                        targetPlanningInput: target_planning_input,
+                        stateStore: durable_state_store,
                     });
-                } else if (result.type === 'rejected' && !disposed) {
-                    fail(result.error);
-                    if (
-                        result.error
-                            === 'The selected worksheet no longer matches this request.'
-                    ) {
-                        const planning_sheet = planning_input.sheets[msg.sheetIndex];
-                        console.warn('Excel header planning rejected a current request', {
-                            requestId: msg.requestId,
-                            sheetIndex: msg.sheetIndex,
-                            requestedMode: msg.enabled ? 'on' : 'off',
-                            requestedHeaderRow: msg.headerRow ?? null,
-                            clearHiddenRows: msg.unhideAll === true,
-                            installedTransform: installed_transform !== undefined,
-                            installedHiddenRowCount:
-                                installed_transform?.hiddenRows?.length ?? null,
-                            plannedManualHeaderSourceRow:
-                                planning_sheet?.manualHeaderSourceRow ?? null,
-                            activeHeaderSourceRow: header.sourceRow ?? null,
-                        });
-                        schedule_header_refresh();
+                    if (result.type === 'indeterminate' && !disposed) {
+                        // Whether the header was stored is settled by the recovery
+                        // reload; the result rides that adoption, not an earlier
+                        // snapshot of a projection that may be stale.
+                        park_header_settlement(msg.requestId, {
+                            name: msg.sheetName,
+                            ...(command_worksheet_id === undefined
+                                ? {}
+                                : { worksheetId: command_worksheet_id }),
+                        }, result.error);
+                    } else if (result.type === 'rejected' && !disposed) {
+                        // Admission is asked again at every commit step; a refusal
+                        // there for edit-session work is as transient as at entry.
+                        fail(result.error, result.error === EDIT_SESSION_WORK_FINISHING_MESSAGE);
+                        if (
+                            result.error
+                                === 'The selected worksheet no longer matches this request.'
+                        ) {
+                            const planning_sheet = planning_input.sheets[msg.sheetIndex];
+                            console.warn('Excel header planning rejected a current request', {
+                                requestId: msg.requestId,
+                                sheetIndex: msg.sheetIndex,
+                                requestedMode: msg.enabled ? 'on' : 'off',
+                                requestedHeaderRow: msg.headerRow ?? null,
+                                clearHiddenRows: msg.unhideAll === true,
+                                installedTransform: installed_transform !== undefined,
+                                installedHiddenRowCount:
+                                    installed_transform?.hiddenRows?.length ?? null,
+                                plannedManualHeaderSourceRow:
+                                    planning_sheet?.manualHeaderSourceRow ?? null,
+                                activeHeaderSourceRow: header.sourceRow ?? null,
+                            });
+                            schedule_header_refresh();
+                        }
                     }
+                } finally {
+                    if (editing_supported) finish_transform_admission(header_admission.operation);
                 }
                 return;
             }
@@ -15238,24 +15476,9 @@ export function attach_viewer(
                     }
                     retire_pending_edit_target(edit_session_id, posted_target, sequence);
                     const committed = result.snapshot.state as PerFileState;
-                    const supersedes = (operation: CsvSaveOperation) => operation.worksheets
-                        .some((worksheet) => {
-                            const operation_index = operation_sheet_index(
-                                worksheet,
-                                undefined,
-                                committed.pendingEdits,
-                            );
-                            if (operation_index === undefined) return false;
-                            return !pending_changes_echo_operation(
-                                pending_changes_for_sheet(
-                                    committed.pendingEdits,
-                                    operation_index,
-                                    worksheet.sheetName,
-                                    worksheet.worksheetId,
-                                ),
-                                worksheet,
-                            );
-                        });
+                    const supersedes = (operation: CsvSaveOperation) => (
+                        operation_superseded_by(operation, committed)
+                    );
                     const tombstone = file_edit_state?.failedSaveTombstone;
                     if (
                         file_edit_state

@@ -471,6 +471,115 @@ describe('Excel workbook snapshot controller', () => {
         expect(state.value().transforms?.[0]?.hiddenRows).toEqual([0, 1]);
     });
 
+    it('moves a pending row layout to the promoted header row in the write that commits it', async () => {
+        const rows = [
+            [text('Report'), text('')],
+            [text('Name'), text('Age')],
+            [text('Alice'), number(30)],
+            [text('Bob'), number(25)],
+            [text('Cara'), number(41)],
+        ];
+        const state = mutable_state_store({
+            excelFirstRowHeaders: { People: 'off' },
+            pendingEdits: [{
+                sheetName: 'People',
+                cells: { '2:0': { value: 'Alicia', base: 'Alice' } },
+                rowLayout: {
+                    runs: [{ kind: 'source', start: 0, count: 5 }],
+                    removedSourceRows: [{ start: 3, count: 1 }],
+                    discardedPendingRows: [],
+                },
+            }],
+        });
+        const panel = open_excel(
+            '/pending-promote.xlsx',
+            state.store,
+            excel_profile({ count: 0 }, () => new PhysicalExcelSource(rows)),
+        );
+        const initial = await ready(panel);
+        await panel.__receive({
+            type: 'setExcelFirstRowHeader',
+            sheetIndex: 0,
+            sheetName: 'People',
+            enabled: true,
+            headerRow: 1,
+            requestId: 'pending-promote',
+            generation: initial.generation,
+            sourceGeneration: initial.sourceGeneration,
+        });
+        await vi.waitFor(() => expect(snapshots(panel).at(-1)?.commandResult)
+            .toMatchObject({ requestId: 'pending-promote', outcome: 'applied' }));
+        expect(state.value().excelFirstRowHeaders).toEqual({ People: 'on' });
+        expect(state.value().pendingEdits?.[0]).toMatchObject({
+            cells: { '2:0': { value: 'Alicia', base: 'Alice' } },
+            rowLayout: {
+                runs: [{ kind: 'source', start: 2, count: 3 }],
+                removedSourceRows: [{ start: 3, count: 1 }],
+            },
+        });
+    });
+
+    it('refuses a header change its pending edits cannot follow, and stores nothing', async () => {
+        const rows = [
+            [text('Report'), text('')],
+            [text('Name'), text('Age')],
+            [text('Alice'), number(30)],
+        ];
+        const initial_state: PerFileState = {
+            excelFirstRowHeaders: { People: 'off' },
+            pendingEdits: [{
+                sheetName: 'People',
+                cells: { '1:1': { value: 'Years', base: 'Age' } },
+            }],
+        };
+        const state = mutable_state_store(initial_state);
+        const panel = open_excel(
+            '/pending-refuse.xlsx',
+            state.store,
+            excel_profile({ count: 0 }, () => new PhysicalExcelSource(rows)),
+        );
+        const initial = await ready(panel);
+        await panel.__receive({
+            type: 'setExcelFirstRowHeader',
+            sheetIndex: 0,
+            sheetName: 'People',
+            enabled: true,
+            headerRow: 1,
+            requestId: 'pending-refuse',
+            generation: initial.generation,
+            sourceGeneration: initial.sourceGeneration,
+        });
+        await vi.waitFor(() => expect(snapshots(panel).at(-1)?.commandResult).toMatchObject({
+            requestId: 'pending-refuse',
+            outcome: 'rejected',
+            error: 'Save first: the row that would become the header row has unsaved changes.',
+        }));
+        expect(state.value().excelFirstRowHeaders).toEqual({ People: 'off' });
+        expect(state.value().pendingEdits).toEqual(initial_state.pendingEdits);
+    });
+
+    it('marks a refusal for an unacknowledged refresh as transient', async () => {
+        const state = mutable_state_store();
+        const panel = open_excel('/transient-header.xlsx', state.store, excel_profile({ count: 0 }));
+        const initial = await ready(panel);
+        await panel.__receive({
+            type: 'setExcelFirstRowHeader',
+            sheetIndex: 0,
+            sheetName: 'People',
+            enabled: false,
+            requestId: 'stale-header',
+            generation: initial.generation + 1,
+            sourceGeneration: initial.sourceGeneration,
+        });
+        await vi.waitFor(() => expect(snapshots(panel).at(-1)?.commandResult).toEqual({
+            type: 'excelFirstRowHeader',
+            requestId: 'stale-header',
+            outcome: 'rejected',
+            error: 'The worksheet changed before the header request arrived.',
+            transient: true,
+        }));
+    });
+
     it('turns off every header after manual row-nine promotions in the survey workbook', async () => {
         const bytes = new Uint8Array(readFileSync(join(
             __dirname,
@@ -1067,6 +1176,70 @@ describe('Excel workbook snapshot controller', () => {
         expect(recovered.commandResult).toMatchObject({
             requestId: 'recovered',
             outcome: 'recovered',
+        });
+    });
+
+    it('settles a header result whose rebuild a same-bytes watcher refresh superseded', async () => {
+        // The header lives in file state, not in the workbook's bytes, so the
+        // watcher's rebuild finds the digest it already holds. Taking that as
+        // "nothing changed" would keep the old header and never answer.
+        const state = mutable_state_store();
+        const builds = { count: 0 };
+        let release_recovery!: () => void;
+        const recovery_gate = new Promise<void>((resolve) => { release_recovery = resolve; });
+        const base_profile = excel_profile(builds, undefined, true);
+        const panel = open_excel('/header-superseded-recovery.xlsx', state.store, {
+            ...base_profile,
+            async build_source(raw, path, file_state) {
+                const built = await base_profile.build_source(raw, path, file_state);
+                if (builds.count === 2) await recovery_gate;
+                return built;
+            },
+        });
+        const initial = await ready(panel);
+
+        await toggle(panel, initial, 'superseded-recovery', false);
+        await vi.waitFor(() => expect(builds.count).toBe(2));
+        void vscode_mock.__getWatchers()[0].__fireChange();
+        await vi.waitFor(() => expect(builds.count).toBe(3));
+        release_recovery();
+
+        await vi.waitFor(() => expect(snapshots(panel).some((snapshot) => (
+            snapshot.commandResult?.requestId === 'superseded-recovery'
+        ))).toBe(true));
+        const settled = snapshots(panel).find((snapshot) => (
+            snapshot.commandResult?.requestId === 'superseded-recovery'
+        ))!;
+        expect(settled.meta.sheets[0].excelFirstRowHeader?.active).toBe(false);
+        expect(settled.commandResult).toMatchObject({ outcome: 'recovered' });
+    });
+
+    it('reports reload-required when the header reload stops at a declined file-size prompt', async () => {
+        // The receipt can't be applied in place, so the result waits for the
+        // reload's adoption. The file has grown past the size limit and the
+        // prompt is declined: nothing will be adopted, so the result must say
+        // so now rather than leave the renderer waiting on its guard timer.
+        const state = mutable_state_store();
+        const builds = { count: 0 };
+        const panel = open_excel(
+            '/header-size-declined.xlsx',
+            state.store,
+            excel_profile(builds, undefined, true),
+        );
+        const initial = await ready(panel);
+        vscode_mock.__setStatImplementation(async () => ({ size: 1024 * 1024 * 1024, mtime: 2 }));
+
+        await toggle(panel, initial, 'size-declined', false);
+        await vi.waitFor(() => expect(snapshots(panel).some((snapshot) => (
+            snapshot.commandResult?.requestId === 'size-declined'
+        ))).toBe(true));
+        expect(builds.count).toBe(1);
+        expect(snapshots(panel).find((snapshot) => (
+            snapshot.commandResult?.requestId === 'size-declined'
+        ))!.commandResult).toMatchObject({
+            requestId: 'size-declined',
+            outcome: 'recovered',
+            reloadRequired: true,
         });
     });
 

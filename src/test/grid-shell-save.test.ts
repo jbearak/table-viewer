@@ -2602,6 +2602,72 @@ describe('GridShell editing with no session held yet', () => {
         expect(editing_ref.current!.session_busy()).toBe(false);
         expect(on_edit_session_idle).toHaveBeenCalled();
     });
+
+    it('reports an edit gesture the header fence refuses, and nothing else', async () => {
+        const { request } = session_request();
+        const on_edit_paused_gesture = vi.fn();
+        for (const held of [true, false]) {
+            const { rerender, edit_session } = await render_grid(three_columns, held
+                ? {}
+                : { ...no_session, on_request_edit_session: request });
+            await rerender({ edits_paused: true, on_edit_paused_gesture });
+            await select_cell([1, 0]);
+
+            // Navigating and copying are not edits.
+            on_edit_paused_gesture.mockClear();
+            grid_key('ArrowRight');
+            grid_key('c', { metaKey: true });
+            grid_key('Escape');
+            expect(on_edit_paused_gesture).not.toHaveBeenCalled();
+
+            // Typing, deleting, Enter, paste, cut and a double-click are.
+            for (const [key, mods] of [
+                ['x', {}],
+                ['h', {}],
+                ['Delete', {}],
+                ['Backspace', {}],
+                ['Enter', {}],
+                ['v', { metaKey: true }],
+                ['x', { ctrlKey: true }],
+            ] as const) {
+                on_edit_paused_gesture.mockClear();
+                grid_key(key, mods);
+                expect(on_edit_paused_gesture, key).toHaveBeenCalledTimes(1);
+            }
+            on_edit_paused_gesture.mockClear();
+            await act(async () => { (grid_mock.props as any).onCellActivated([1, 0]); });
+            expect(on_edit_paused_gesture).toHaveBeenCalledTimes(1);
+            // `h` types into an editable grid; the fence doesn't make it move
+            // the selection the way it would on a read-only one.
+            expect(selected_cell()).toEqual([1, 0]);
+            // Nothing reached the store or an editor, and no session was asked for.
+            expect([...(edit_session?.snapshot() ?? [])]).toEqual([]);
+            expect(grid_mock.open_overlay).not.toHaveBeenCalled();
+            expect(request).not.toHaveBeenCalled();
+            await act(async () => { root?.unmount(); });
+            root = null;
+            container?.remove();
+        }
+
+        // Other pauses, and files that take no edits, are not the fence's to explain.
+        for (const overrides of [
+            { highlight_in_flight: true },
+            { csv_editable: false },
+            { editing_session_held: false, edit_session_id: undefined, on_request_edit_session: undefined },
+        ]) {
+            const { rerender } = await render_grid();
+            await rerender({ edits_paused: true, on_edit_paused_gesture, ...overrides });
+            await select_cell([0, 0]);
+            on_edit_paused_gesture.mockClear();
+            grid_key('x');
+            grid_key('v', { metaKey: true });
+            await act(async () => { (grid_mock.props as any).onCellActivated([0, 0]); });
+            expect(on_edit_paused_gesture, JSON.stringify(overrides)).not.toHaveBeenCalled();
+            await act(async () => { root?.unmount(); });
+            root = null;
+            container?.remove();
+        }
+    });
 });
 
 describe('GridShell row heights handed to the grid', () => {

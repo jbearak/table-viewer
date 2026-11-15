@@ -1,5 +1,5 @@
 import type { ExcelHeaderPlanningInput } from './data-source/excel-header-source';
-import type { WorkbookMeta } from './data-source/interface';
+import type { SheetMeta, WorkbookMeta } from './data-source/interface';
 import {
     plan_cell_highlight_mutation,
     type CellHighlightCommandInput,
@@ -112,6 +112,8 @@ export interface ExcelHeaderOperationReceipt extends ProjectionAuthorityCommitRe
     readonly requestId: string;
     readonly sheetIndex: number;
     readonly sheetName: string;
+    /** The worksheet's stable identity when it has one: a reload can rename or move it. */
+    readonly worksheetId?: string;
     readonly override: ExcelHeaderOverride;
     readonly originToken: symbol;
 }
@@ -125,6 +127,7 @@ export interface CommitExcelHeaderCommand {
     readonly requestId: string;
     readonly sheetIndex: number;
     readonly sheetName: string;
+    readonly worksheetId?: string;
     readonly override: ExcelHeaderOverride;
     readonly clearHiddenRows?: boolean;
     readonly headerSourceRow?: number;
@@ -134,6 +137,14 @@ export interface CommitExcelHeaderCommand {
     readonly expectedPhysicalDigest?: string;
     readonly planningInput: ExcelHeaderPlanningInput;
     readonly stateStore: AuthorityFileStateStore;
+    /**
+     * Asked again at every planning boundary, through finalization: why the
+     * command may no longer commit (another panel became the editing owner
+     * mid-commit), or undefined while it may.
+     */
+    readonly admissionRefusal?: () => string | undefined;
+    /** The append schema fingerprint of a projected sheet; see `plan_excel_override_state`. */
+    readonly appendSchemaFingerprint?: (sheet: SheetMeta) => string;
 }
 
 export type ExcelHeaderSubscriber = (receipt: ExcelHeaderOperationReceipt) => void | Promise<void>;
@@ -1085,6 +1096,9 @@ export function acquire_file_coordinator(
             let token: AuthorityOperationToken<'projection'> | undefined;
             let receipt: ExcelHeaderOperationReceipt | undefined;
             let recovery_required = false;
+            // Past this point a failure may have written the header, so it is
+            // indeterminate rather than refused.
+            let finalization_started = false;
             const indeterminate = (error: string): ExcelHeaderCommitResult => {
                 recovery_required = true;
                 return { type: 'indeterminate', error };
@@ -1119,7 +1133,13 @@ export function acquire_file_coordinator(
                     token !== undefined
                     && attachment.operation_is_current(token)
                     && physical_basis_is_current()
+                    && command.admissionRefusal?.() === undefined
                 );
+                const stale = (): ExcelHeaderCommitResult => ({
+                    type: 'rejected',
+                    error: command.admissionRefusal?.()
+                        ?? 'The worksheet changed before the header setting could be saved.',
+                });
                 let conflicts = 0;
                 const retry_or_reject = (): ExcelHeaderCommitResult | undefined => {
                     if (conflicts >= 3) {
@@ -1168,11 +1188,11 @@ export function acquire_file_coordinator(
 
                 for (;;) {
                     if (!planning_is_current()) {
-                        return { type: 'rejected', error: 'The worksheet changed before the header setting could be saved.' };
+                        return stale();
                     }
                     const state_snapshot = await command.stateStore.read(entry.statePath);
                     if (!planning_is_current()) {
-                        return { type: 'rejected', error: 'The worksheet changed before the header setting could be saved.' };
+                        return stale();
                     }
                     const plan = plan_excel_override_state(
                         normalize_host_state(
@@ -1187,13 +1207,19 @@ export function acquire_file_coordinator(
                             clearHiddenRows: command.clearHiddenRows,
                             headerSourceRow: command.headerSourceRow,
                             targetInput: command.targetPlanningInput,
+                            ...(command.appendSchemaFingerprint === undefined
+                                ? {}
+                                : { appendSchemaFingerprint: command.appendSchemaFingerprint }),
                         },
                     );
                     if (!plan) {
                         return { type: 'rejected', error: 'The selected worksheet no longer matches this request.' };
                     }
+                    if (plan.refusal !== undefined) {
+                        return { type: 'rejected', error: plan.refusal };
+                    }
                     if (!planning_is_current()) {
-                        return { type: 'rejected', error: 'The worksheet changed before the header setting could be saved.' };
+                        return stale();
                     }
                     const stage_basis = attachment.authority();
                     const stage = await stage_authority(
@@ -1209,7 +1235,7 @@ export function acquire_file_coordinator(
                         },
                     );
                     if (!planning_is_current()) {
-                        return { type: 'rejected', error: 'The worksheet changed before the header setting could be saved.' };
+                        return stale();
                     }
                     if (stage.type === 'conflict') {
                         const relation = compare_authority(stage.authority, attachment.authority());
@@ -1223,7 +1249,7 @@ export function acquire_file_coordinator(
                     const requested = await attachment.request_commit_turn(token);
                     if (requested.type === 'rejected' || !planning_is_current()) {
                         if (requested.type === 'granted') attachment.release_commit_turn(requested.turn);
-                        return { type: 'rejected', error: 'The worksheet changed before the header setting could be saved.' };
+                        return stale();
                     }
                     const finalizationBasis = attachment.authority();
                     const descriptor = {
@@ -1236,9 +1262,10 @@ export function acquire_file_coordinator(
                     };
                     if (!planning_is_current()) {
                         attachment.release_commit_turn(requested.turn);
-                        return { type: 'rejected', error: 'The worksheet changed before the header setting could be saved.' };
+                        return stale();
                     }
                     attachment.start_finalization(requested.turn);
+                    finalization_started = true;
                     let finalized: Awaited<ReturnType<typeof finalize_authority>>;
                     try {
                         finalized = await finalize_authority(
@@ -1277,9 +1304,11 @@ export function acquire_file_coordinator(
                                 'The header setting may have been saved before the durable workbook advanced.',
                             );
                         } else {
+                            // Reconciliation proved the header was not written.
+                            console.error('Excel header finalization failed', error instanceof Error ? error.name : typeof error);
                             attachment.release_commit_turn(requested.turn);
                             void discard_authority(command.stateStore, entry.statePath, token.id);
-                            throw error;
+                            return { type: 'rejected', error: 'The header setting could not be saved.' };
                         }
                     }
                     if (finalized.type === 'conflict') {
@@ -1375,6 +1404,9 @@ export function acquire_file_coordinator(
                         requestId: command.requestId,
                         sheetIndex: command.sheetIndex,
                         sheetName: command.sheetName,
+                        ...(command.worksheetId === undefined
+                            ? {}
+                            : { worksheetId: command.worksheetId }),
                         override: command.override,
                         originToken: command.originToken,
                     });
@@ -1384,7 +1416,15 @@ export function acquire_file_coordinator(
                 if (token && entry.activeTurn?.token === token) {
                     attachment.release_commit_turn(entry.activeTurn);
                 }
-                throw error;
+                // Every command ends in a result the panel can correlate: a
+                // failure before finalization wrote nothing; one after it may
+                // have, and recovery decides.
+                // Storage errors can carry paths; say what failed, not why.
+                console.error('Excel header commit failed', error instanceof Error ? error.name : typeof error);
+                const message = 'The header setting could not be saved.';
+                return finalization_started
+                    ? indeterminate(message)
+                    : { type: 'rejected', error: message };
             } finally {
                 if (token) {
                     if (entry.states.has(token)) finish(entry, token);
