@@ -4514,7 +4514,13 @@ export function attach_viewer(
      * admits are recorded under the column names it shows, and the reload
      * that finally brings the header finds no request waiting. Only
      * worksheets whose fingerprint moved are touched, so a layout another
-     * worksheet holds in conflict stays as it was authored.
+     * worksheet holds in conflict stays as it was authored. The fingerprint
+     * hashes the column names, as for the retained authorities above: a
+     * header change that leaves every name as it was (a header row spelling
+     * the generated names) is not seen here, and a ledger Structural Basis
+     * the slot no longer carries then keeps its old body start. A layout
+     * replayed or published at the current one is still accepted, as the
+     * current file's (`structural_basis_authorized`).
      */
     const follow_reprojected_ledgers = (
         state: Readonly<FileStateSnapshot>['state'],
