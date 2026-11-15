@@ -3373,6 +3373,19 @@ export function GridShell({
     const notify_session_idle = useCallback(() => {
         queueMicrotask(() => on_edit_session_idle_ref.current?.());
     }, []);
+    /**
+     * Admit a paste. The session is held until the paste has run, not just
+     * until it is granted: a paste that changes nothing, or is dropped, leaves
+     * no store change to prompt App's idle check, so this asks for it.
+     */
+    const admit_paste = useCallback((pasted: Promise<void>) => {
+        session_requests_ref.current += 1;
+        void pasted.then(() => {
+            session_requests_ref.current -= 1;
+            notify_session_idle();
+        });
+        return ensure_edit_session();
+    }, [ensure_edit_session, notify_session_idle]);
     const acquire_session_for_drag = useCallback(() => {
         if (drag_holds_session_ref.current) return;
         drag_holds_session_ref.current = true;
@@ -11817,7 +11830,7 @@ export function GridShell({
                     : false}
                 // A paste before a session exists waits here for one, and is
                 // then assembled against the grid that holds it.
-                onPasteAdmission={edit_armed ? ensure_edit_session : undefined}
+                onPasteAdmission={edit_armed ? admit_paste : undefined}
                 onOverlayOpenRequest={edit_armed ? on_overlay_open_request : undefined}
                 onPasteRowsNeeded={can_request_append_rows
                     ? append_rows_for_paste

@@ -3275,9 +3275,15 @@ a new line char ""more quotes"" plus a tab  ."	https://google.com`)
             clipboard: { read: undefined, readText: vi.fn(async () => "pasted") },
         });
         let admit!: () => void;
-        const admission = vi.fn(() => new Promise<void>((resolve) => {
-            admit = resolve;
-        }));
+        let pastedSettled = false;
+        const admission = vi.fn((pasted: Promise<void>) => {
+            void pasted.then(() => {
+                pastedSettled = true;
+            });
+            return new Promise<void>((resolve) => {
+                admit = resolve;
+            });
+        });
         const editSpy = vi.fn(() => true);
         // Not pasteable yet: the host makes the grid editable while it waits.
         const rendered = render(
@@ -3300,6 +3306,7 @@ a new line char ""more quotes"" plus a tab  ."	https://google.com`)
         await drainEventLoop();
         expect(navigator.clipboard.readText).not.toHaveBeenCalled();
         expect(editSpy).not.toHaveBeenCalled();
+        expect(pastedSettled).toBe(false);
 
         rendered.rerender(
             <EventedDataEditor {...basicProps} onPaste={true} onCellsEdited={editSpy} />
@@ -3310,6 +3317,9 @@ a new line char ""more quotes"" plus a tab  ."	https://google.com`)
         const [, source] = editSpy.mock.calls[0] as unknown as [readonly EditListItem[], string];
         expect(source).toBe("paste");
         expect(navigator.clipboard.readText).toHaveBeenCalledTimes(1);
+        // The host is told the paste has run, so it can let go of a session
+        // the paste did not change.
+        await vi.waitFor(() => expect(pastedSettled).toBe(true));
     });
 
     test("a paste whose admission is refused is dropped", async () => {
@@ -3317,7 +3327,13 @@ a new line char ""more quotes"" plus a tab  ."	https://google.com`)
         Object.assign(navigator, {
             clipboard: { read: undefined, readText: vi.fn(async () => "pasted") },
         });
-        const admission = vi.fn(async () => false);
+        let pastedSettled = false;
+        const admission = vi.fn(async (pasted: Promise<void>) => {
+            void pasted.then(() => {
+                pastedSettled = true;
+            });
+            return false;
+        });
         const editSpy = vi.fn(() => true);
         render(
             <EventedDataEditor
@@ -3340,6 +3356,7 @@ a new line char ""more quotes"" plus a tab  ."	https://google.com`)
 
         expect(navigator.clipboard.readText).not.toHaveBeenCalled();
         expect(editSpy).not.toHaveBeenCalled();
+        expect(pastedSettled).toBe(true);
     });
 
     test("a paste aimed elsewhere asks for no admission", async () => {

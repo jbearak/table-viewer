@@ -670,9 +670,10 @@ export interface DataEditorProps extends Props, Pick<DataGridSearchProps, "image
      * Fork addition: asked before a paste into the focused grid reads its target.
      * The paste waits for the returned promise, then runs against the props of
      * the render committed by then, so a host can make the grid editable first.
-     * A promise that resolves `false` drops the paste.
+     * A promise that resolves `false` drops the paste. `pasted` settles once
+     * the paste has run, been dropped, or failed.
      */
-    readonly onPasteAdmission?: () => Promise<unknown> | undefined;
+    readonly onPasteAdmission?: (pasted: Promise<void>) => Promise<unknown> | undefined;
     /**
      * Fork addition: asked before an overlay editor opens on an activatable cell.
      * Returning true means the host took the request and will call
@@ -4099,10 +4100,14 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
     const onPasteInternal = React.useCallback((e?: ClipboardEvent) => {
         // Fork addition: only a paste aimed at the grid asks for admission, and
         // it asks now, while the event that carries the user's intent is live.
+        let settlePasted!: () => void;
+        const pasted = new Promise<void>(resolve => {
+            settlePasted = resolve;
+        });
         const admission =
             scrollRef.current?.contains(document.activeElement) === true ||
             canvasRef.current?.contains(document.activeElement) === true
-                ? onPasteAdmissionRef.current?.()
+                ? onPasteAdmissionRef.current?.(pasted)
                 : undefined;
         let captured: { html?: string; text?: string } | undefined;
         if (e?.clipboardData !== null && e?.clipboardData !== undefined) {
@@ -4124,6 +4129,7 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
                 const execution = pasteExecutionRef.current;
                 return execution.perform(e, captured, execution.topologyKey);
             });
+        void queued.then(settlePasted, settlePasted);
         pasteTailRef.current = queued;
         return queued;
     }, []);
