@@ -83,6 +83,13 @@ function durable_appended_rows_present(user_data_dir: string): boolean {
     }
 }
 
+/** Whether the viewer window says it holds unsaved work: the dot in the
+ *  macOS close button, a `•` before the title elsewhere. */
+function window_marked_edited(app: ElectronApplication): Promise<boolean> {
+    return app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()
+        .some((window) => window.isDocumentEdited() || window.getTitle().startsWith('• ')));
+}
+
 async function force_terminate(app: ElectronApplication): Promise<void> {
     const process_handle = app.process();
     process_handle.kill('SIGKILL');
@@ -116,6 +123,9 @@ test('a window with force-quit-surviving pending rows closes cleanly after relau
             await page.getByRole('button', { name: 'Add rows' }).click();
             await page.getByRole('button', { name: 'Add row', exact: true }).click();
             await expect(rows).toHaveCount(before + 1);
+            // A staged row is unsaved work, so the window says so.
+            await expect.poll(() => window_marked_edited(first), { timeout: 15_000 })
+                .toBe(true);
 
             // The staged row is durable once its id reaches the database; the
             // grid showing it only proves the renderer's word.
@@ -137,6 +147,8 @@ test('a window with force-quit-surviving pending rows closes cleanly after relau
             // The pending row hydrated: the window opens with it unsaved.
             const save = page.getByRole('button', { name: 'Save' });
             await expect(save).toHaveClass(/has-unsaved/, { timeout: 30_000 });
+            await expect.poll(() => window_marked_edited(second), { timeout: 15_000 })
+                .toBe(true);
             await install_dialog_capture(second);
 
             // Native close, exactly as the traffic-light button would.

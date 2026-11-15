@@ -15,10 +15,32 @@
 //     something to report.
 //
 // Pure module (no electron import) so it is unit-testable.
-import type { HostMessage, PerFileState, WebviewMessage } from '../../src/types';
+import { has_pending_structural_changes } from '../../src/pending-changes';
+import type {
+    HostMessage,
+    PerFileState,
+    WebviewMessage,
+    WorksheetPendingEdits,
+} from '../../src/types';
 
 function has_edits(edits: object | null | undefined): boolean {
     return !!edits && Object.keys(edits).length > 0;
+}
+
+/**
+ * One worksheet's draft: edited cells, or structural work — an added row, a new
+ * column, a reorder. The same test the webview's Save button uses, so the
+ * window and the toolbar agree.
+ */
+function worksheet_has_draft(slot: WorksheetPendingEdits): boolean {
+    return has_edits(slot.cells) || has_pending_structural_changes({
+        appendedRows: slot.appendedRows ?? [],
+        tailRemovals: slot.tailRemovals ?? [],
+        conflicts: slot.conflicts ?? [],
+        rowLayout: slot.rowLayout,
+        columnLayout: slot.columnLayout,
+        pendingColumns: slot.pendingColumns,
+    });
 }
 
 /**
@@ -28,7 +50,7 @@ function has_edits(edits: object | null | undefined): boolean {
  * draft survives. The window's dot is workbook-wide: one dirty sheet marks it.
  */
 function has_sheet_edits(pending: PerFileState['pendingEdits']): boolean {
-    return !!pending && pending.some((slot) => has_edits(slot?.cells));
+    return !!pending && pending.some((slot) => !!slot && worksheet_has_draft(slot));
 }
 
 /**

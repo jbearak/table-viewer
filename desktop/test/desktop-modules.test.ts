@@ -521,6 +521,23 @@ describe('unsaved-edit indicator', () => {
         expect(dirty_from_host_message(snapshot({}, 2))).toBe(false);
     });
 
+    // Structural work lives beside the cells, not in them: a window whose only
+    // draft is an added row is as unsaved as one with an edited cell.
+    it('reads a structural draft from the snapshot', () => {
+        const structural = (slot: object) => ({
+            type: 'workbookSnapshot' as const,
+            snapshot: { state: { pendingEdits: [undefined, { cells: {}, ...slot }] } },
+        } as unknown as HostMessage);
+        expect(dirty_from_host_message(structural({
+            appendedRows: [{ id: 'append-row:a', cells: {}, formatTemplateId: 't', createdOrder: 1 }],
+        }))).toBe(true);
+        expect(dirty_from_host_message(structural({
+            pendingColumns: [{ id: 'column-a' }],
+        }))).toBe(true);
+        expect(dirty_from_host_message(structural({ rowLayout: { rows: [] } }))).toBe(true);
+        expect(dirty_from_host_message(structural({ appendedRows: [] }))).toBe(false);
+    });
+
     it('keeps the window marked when another worksheet still holds a draft', () => {
         // Sheet 0 has a draft; sheet 1 is granted a clean session and then saved.
         // Neither worksheet-local message may clear the workbook-wide indicator.
