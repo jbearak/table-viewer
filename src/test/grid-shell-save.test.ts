@@ -53,7 +53,7 @@ const grid_mock = vi.hoisted(() => ({
         scrollOffsetX?: number;
         scrollOffsetY?: number;
         onOverlayOpenRequest?: (cell: [number, number], initial: string | undefined) => boolean;
-        onPasteAdmission?: () => Promise<unknown> | undefined;
+        onPasteAdmission?: (pasted: Promise<void>) => Promise<unknown> | undefined;
         rowHeight?: number | ((row: number) => number);
         gridSelection?: { current?: { cell: [number, number] } };
     },
@@ -2467,7 +2467,7 @@ describe('GridShell editing with no session held yet', () => {
         });
 
         let admitted = false;
-        void Promise.resolve(grid_mock.props!.onPasteAdmission!()).then(() => { admitted = true; });
+        void Promise.resolve(grid_mock.props!.onPasteAdmission!(new Promise(() => {}))).then(() => { admitted = true; });
         await flush();
         expect(request).toHaveBeenCalledTimes(1);
         expect(admitted).toBe(false);
@@ -2480,6 +2480,52 @@ describe('GridShell editing with no session held yet', () => {
         expect(admitted).toBe(true);
         // And the grid it resumes against accepts the paste.
         expect(grid_mock.props!.onPaste).not.toBe(false);
+    });
+
+    it('holds the session until a paste has run, then says it is not in use', async () => {
+        const { request, grant } = session_request();
+        const on_edit_session_idle = vi.fn();
+        const { rerender, editing_ref } = await render_grid(undefined, {
+            ...no_session,
+            on_request_edit_session: request,
+            on_edit_session_idle,
+        });
+
+        let settle_paste!: () => void;
+        void grid_mock.props!.onPasteAdmission!(new Promise((resolve) => { settle_paste = resolve; }));
+        await grant_session(grant, rerender);
+        // Granted, but the paste has yet to run: releasing now would race it.
+        expect(editing_ref.current!.session_busy()).toBe(true);
+        on_edit_session_idle.mockClear();
+
+        // A paste of what the cells already hold changes no store, so nothing
+        // else would ask App to release the session it was granted.
+        settle_paste();
+        await flush();
+        expect(editing_ref.current!.session_busy()).toBe(false);
+        expect(on_edit_session_idle).toHaveBeenCalled();
+    });
+
+    it('says the session is not in use after a paste the host refused', async () => {
+        const { request, refuse } = session_request();
+        const on_edit_session_idle = vi.fn();
+        const { editing_ref } = await render_grid(undefined, {
+            ...no_session,
+            on_request_edit_session: request,
+            on_edit_session_idle,
+        });
+
+        let settle_paste!: () => void;
+        void grid_mock.props!.onPasteAdmission!(new Promise((resolve) => { settle_paste = resolve; }));
+        refuse();
+        await flush();
+        expect(editing_ref.current!.session_busy()).toBe(true);
+        on_edit_session_idle.mockClear();
+
+        settle_paste();
+        await flush();
+        expect(editing_ref.current!.session_busy()).toBe(false);
+        expect(on_edit_session_idle).toHaveBeenCalled();
     });
 });
 

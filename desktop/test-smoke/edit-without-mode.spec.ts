@@ -398,6 +398,32 @@ test('a paste is the first edit, and Cmd/Ctrl+S saves it', async () => {
     await expect_nothing_unsaved();
 });
 
+test('a paste of what the cell already holds lets its session go', async () => {
+    // What the webview tells the host, as the main process receives it.
+    await app!.evaluate(({ ipcMain }) => {
+        const sent: { type: string }[] = [];
+        (globalThis as { webview_messages?: typeof sent }).webview_messages = sent;
+        ipcMain.on('tableViewer:webviewMessage', (_event, envelope: { message: { type: string } }) => {
+            sent.push(envelope.message);
+        });
+    });
+    const sent_types = () => app!.evaluate(() =>
+        (globalThis as { webview_messages?: { type: string }[] }).webview_messages!.map(({ type }) => type));
+    await select_cell(1, 0);
+
+    // The paste event itself, carrying its data, so the OS clipboard is not shared.
+    await page.evaluate(() => {
+        const data = new DataTransfer();
+        data.setData('text/plain', 'Alice');
+        window.dispatchEvent(new ClipboardEvent('paste', { clipboardData: data, bubbles: true }));
+    });
+    await expect.poll(sent_types).toContain('requestEditSession');
+    await expect.poll(sent_types).toContain('releaseEditSession');
+    await expect(cell(1, 0)).toHaveText('Alice');
+    await expect_nothing_unsaved();
+    expect(fs.readFileSync(csv, 'utf8')).toBe(fixture_text);
+});
+
 test('the add-row launcher is there from the start and its first use adds a row', async () => {
     const rows = page.locator('tbody tr');
     await expect(rows).toHaveCount(3);
