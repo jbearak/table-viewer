@@ -7869,6 +7869,9 @@ export function App(): React.JSX.Element {
                 if (pending !== undefined && pending.session === msg.editSessionId) {
                     discard_cleanup_ref.current = undefined;
                     pending.settle(msg.cleared);
+                    // The header queue waits on this cleanup, and the snapshot
+                    // that preceded this answer has already rendered.
+                    wake_header_drain();
                 }
             } else if (msg.type === 'editSessionRevoked') {
                 apply_save_lifecycle(msg.lifecycle);

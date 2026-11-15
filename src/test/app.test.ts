@@ -2691,6 +2691,35 @@ describe('Excel first-row header toggle', () => {
         expect(history.undoStack).toEqual([]);
     });
 
+    it('sends a header change that waited on a discard as soon as the discard settles', async () => {
+        // The host's cleanup answer arrives after its snapshot, and nothing
+        // else renders after it, so the queue must be woken by the answer.
+        grid_shell_mock.has_uncommitted_changes = true;
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(excel_meta(true), {
+            capabilities: EDITABLE,
+        }));
+        await acquire_editing_session(post_message);
+        seed_mounted_store();
+        await click_button('Discard');
+        const discard = post_message.mock.calls
+            .map(([message]) => message as { type?: string; editSessionId?: string })
+            .find((message) => message.type === 'discardEditSession');
+        expect(discard?.editSessionId).toBeDefined();
+
+        await click_button('Header Row');
+        expect(header_requests(post_message)).toEqual([]);
+
+        await dispatch_host_message({
+            type: 'discardEditSessionResult',
+            editSessionId: discard!.editSessionId!,
+            cleared: true,
+        });
+        expect(header_requests(post_message)).toEqual([
+            expect.objectContaining({ sheetIndex: 0, enabled: false }),
+        ]);
+    });
+
     it('lets an append awaiting admission finish before the fence goes up', async () => {
         const { post_message } = await render_app();
         const meta = excel_meta(true);
