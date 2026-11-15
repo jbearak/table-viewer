@@ -9161,6 +9161,23 @@ describe('xlsx edit sessions', () => {
                 .not.toBe(admission.appendBasis!.schemaFingerprint);
         });
 
+        it('refuses the commit of a redo prepared before the Header Row moved', async () => {
+            const state = versioned_state_store({});
+            const panel = await open_ready_xlsx(file_path, state);
+            const { appended } = await undone_row_after_release(panel);
+            await request_edit_session_when_available(panel, 'again');
+            const prepared = await prepare(panel, 'redo-append', PEOPLE, EMPTY, appended);
+            expect(prepared.prepared).toBeDefined();
+
+            // The lease was filled in for the column names there were then.
+            expect(await set_header(panel, 'header-off', false)).toBe('applied');
+            expect(await commit(panel, prepared.prepared!)).toEqual({ refused: 'conflict' });
+            expect(state.get_state(file_path).pendingEdits).toBeUndefined();
+            // Asked again, it is filled in for the names there are now, and lands.
+            expect((await replay(panel, 'redo-again', PEOPLE, EMPTY, appended)).installed?.appendedRows)
+                .toEqual(appended.appendedRows);
+        });
+
         it('still refuses a row whose columns another program renamed, with or without a Header Row change after', async () => {
             const state = versioned_state_store({});
             const panel = await open_ready_xlsx(file_path, state);
