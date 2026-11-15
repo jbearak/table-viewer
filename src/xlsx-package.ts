@@ -672,6 +672,7 @@ function strip_style_elements(inner: string): string {
 
 interface StyleWriteContext {
     readonly is_date_style: (xf_index: number, serial: number) => boolean;
+    readonly number_format_code: (xf_index: number) => string | undefined;
     readonly cell_font_style: (xf_index: number) => CellTextStyle | undefined;
     readonly run_font_base: (xf_index: number) => string;
 }
@@ -681,6 +682,7 @@ function read_style_write_context(zip: ZipPackage): StyleWriteContext {
     if (!xml) {
         return {
             is_date_style: () => false,
+            number_format_code: () => undefined,
             cell_font_style: () => undefined,
             run_font_base: () => '',
         };
@@ -728,6 +730,7 @@ function read_style_write_context(zip: ZipPackage): StyleWriteContext {
 
     return {
         is_date_style,
+        number_format_code: (xf_index) => number_format_for(xf_index)?.code,
         cell_font_style: (xf_index) => font_to_style(get_style(xf_index, xfs, fonts)),
         run_font_base: (xf_index) => {
             const idx = font_index(xf_index);
@@ -1321,7 +1324,9 @@ export function write_xlsx_workbook_cell_edits(
         sheet.push({ row: invalidation.row, column: invalidation.column });
         formula_invalidations_by_sheet.set(invalidation.sheetIndex, sheet);
     }
-    const { is_date_style, cell_font_style, run_font_base } = read_style_write_context(zip);
+    const {
+        is_date_style, number_format_code, cell_font_style, run_font_base,
+    } = read_style_write_context(zip);
     const datemode = read_datemode(zip);
     // Restructuring moves formula cells, so the calculation chain no longer
     // describes them (Coverage: `calcChain.xml`, remove).
@@ -1390,6 +1395,7 @@ export function write_xlsx_workbook_cell_edits(
                 write_options: {
                     datemode,
                     is_date_style,
+                    number_format_code,
                     cell_font_style,
                     run_font_base,
                     sheet_name: part.name,

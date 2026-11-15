@@ -690,6 +690,35 @@ describe('xlsx edit sessions', () => {
         expect(after.data.sheets[0].rows[1][0]?.raw).toBe(people_before);
     });
 
+    it('saves a date typed the way an m/d/yy cell shows it as that date', async () => {
+        const panel = await open_ready_xlsx(file_path);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 0 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+        // D3 holds 45078 (2023-06-01) under built-in format 14, `m/d/yy`, so
+        // the grid shows "6/1/23"; typing the next day the same way must keep a date.
+        const before = await parse_xlsx(bytes);
+        expect(before.data.sheets[0].rows[2][3]?.formatted).toBe('6/1/23');
+
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: workbook_request(session, 'typed-display-date', save_worksheet({
+                edits: { '2:3': '6/2/23' },
+                dirtyEdits: { '2:3': { value: '6/2/23', base: '2023-06-01T00:00:00.000Z' } },
+            })),
+        });
+        await wait_for_observable(() => save_results(panel).length > 0);
+
+        expect(save_results(panel).at(-1)).toMatchObject({ success: true });
+        expect(read_part(bytes, 'xl/worksheets/sheet1.xml')!.toString('utf8'))
+            .toContain('<c r="D3" s="1"><v>45079</v></c>');
+        const after = await parse_xlsx(bytes);
+        expect(after.data.sheets[0].rows[2][3]).toMatchObject({
+            raw: '2023-06-02T00:00:00.000Z',
+            rawType: 'date',
+            formatted: '6/2/23',
+        });
+    });
+
     it('renames a promoted header through its canonical source coordinate', async () => {
         const panel = await open_ready_xlsx(file_path);
         await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 0 });

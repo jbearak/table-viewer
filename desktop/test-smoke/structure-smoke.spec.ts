@@ -1352,3 +1352,18 @@ test('a click on a workbook row menu item as first drawn, before the session arr
     await expect(page.locator('.grid-shell-root')).toHaveAttribute('data-edit-session', 'none');
     await expect(save_button(page)).toBeDisabled();
 });
+
+test('a date typed into an .xlsx date cell the way the cell shows dates saves as a date', async () => {
+    const fixture = fs.readFileSync(path.join(repo_dir, 'src', 'test', 'fixtures', 'basic.xlsx'));
+    const { file, page } = await open_file('basic.xlsx', fixture);
+    await wait_for_grid(page);
+    const joined = async () => (await read_workbook(file))?.data.sheets[0].rows[2][3];
+    // Bob's Joined cell holds 2023-06-01 under `m/d/yy`, so it shows 6/1/23.
+    expect(await joined()).toMatchObject({ formatted: '6/1/23', rawType: 'date' });
+
+    await type_into_cell(page, 4, 1, '6/2/23');
+    await save_changes(page);
+
+    await expect.poll(async () => (await joined())?.formatted).toBe('6/2/23');
+    expect(await joined()).toMatchObject({ raw: '2023-06-02T00:00:00.000Z', rawType: 'date' });
+});
