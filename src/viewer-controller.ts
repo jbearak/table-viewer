@@ -4505,6 +4505,35 @@ export function attach_viewer(
             }
         }
     };
+    /**
+     * The same for this session's own ledgers, at a refresh adoption that no
+     * header request is waiting on (`settle_header_on_adoption` moves only
+     * the waiting request's worksheet). A window can go on showing the old
+     * Header Row after another window changed it, when the reload for that
+     * change is overtaken by one that keeps the source it has. Rows it then
+     * admits are recorded under the column names it shows, and the reload
+     * that finally brings the header finds no request waiting. Only
+     * worksheets whose fingerprint moved are touched, so a layout another
+     * worksheet holds in conflict stays as it was authored.
+     */
+    const follow_reprojected_ledgers = (
+        state: Readonly<FileStateSnapshot>['state'],
+        fingerprints_before: ReadonlyMap<string, string>,
+    ): void => {
+        if (active_edit_session_id === undefined) return;
+        const sheets = source?.meta().sheets ?? [];
+        let slots: PerFileState['pendingEdits'] | undefined;
+        sheets.forEach((sheet, sheet_index) => {
+            const from = fingerprints_before.get(worksheet_target_key({
+                sheetIndex: sheet_index,
+                sheetName: sheet.name,
+                ...(sheet.worksheetId === undefined ? {} : { worksheetId: sheet.worksheetId }),
+            }));
+            if (from === undefined || from === worksheet_append_schema_fingerprint(sheet)) return;
+            slots ??= normalize_host_state(state, sheets).pendingEdits;
+            adopt_header_rebased_ledger(slots, sheet_index, fingerprints_before);
+        });
+    };
     // The worksheet currently shown in edit mode and worksheets with a pending
     // publication that has not crossed the durable state boundary. Neither is
     // ownership — the grant remains workbook-scoped. Together they are the
@@ -9077,6 +9106,9 @@ export function attach_viewer(
                     sync_active_transform_panel();
                     // The reconciled state this adoption delivers, so the ledger
                     // judges the renderer's next publication against what it holds.
+                    if (fingerprints_before !== undefined) {
+                        follow_reprojected_ledgers(adoption_state.state, fingerprints_before);
+                    }
                     settle_header_on_adoption(adoption_state.state, fingerprints_before);
                     session.replace_adoption(adoption, () => {
                         confirm_transfer();

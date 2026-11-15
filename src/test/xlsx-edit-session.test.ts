@@ -9277,6 +9277,83 @@ describe('xlsx edit sessions', () => {
             expect(await publish(peer, second, 1, PEOPLE, redone.installed!)).toBe(true);
         });
 
+        it('redoes an added row in a session that was still on the old Header Row when a reload brought the new one', async () => {
+            const state = versioned_state_store({});
+            const base_profile = profile_for(file_path);
+            let peer_builds = 0;
+            let finish_reload!: () => void;
+            const reload_held = new Promise<void>((resolve) => { finish_reload = resolve; });
+            const origin = await open_ready_xlsx(file_path, state);
+            const peer = await open_ready_xlsx(file_path, state, {
+                ...base_profile,
+                async build_source(...args: Parameters<typeof base_profile.build_source>) {
+                    peer_builds += 1;
+                    const build = peer_builds;
+                    // The reload for the header change waits here.
+                    if (build === 2) await reload_held;
+                    const built = await base_profile.build_source(...args);
+                    if (build === 1) {
+                        (built as unknown as { set_override(): boolean }).set_override = () => false;
+                    }
+                    return built;
+                },
+            });
+            const names = () => latest_snapshot(peer).meta.sheets[0].excelFirstRowHeader?.active;
+
+            // Another window turns the header off. This one cannot take the
+            // change in place, and its reload is overtaken by a file event for
+            // the same bytes, which keeps the view it has: it goes on showing
+            // the old column names, with nothing waiting to correct it.
+            expect(await set_header(origin, 'header-off', false)).toBe('applied');
+            await wait_for_observable(() => peer_builds === 2);
+            await vscode_mock.__getActiveWatchers()[0].__fireChange();
+            await wait_for_observable(() => peer_builds === 3);
+            await controller_of(peer).drain();
+            finish_reload();
+            await controller_of(peer).drain();
+            expect(names()).toBe(true);
+
+            // A row is added and undone under those names. An edit on the
+            // other worksheet keeps the session.
+            const session = await request_edit_session_when_available(peer, 'first');
+            const admission = await admit_row(peer, session, PEOPLE, 'append-people');
+            const appended = slot_with([admission]);
+            const kept = { '1:0': { value: 'kept', base: 'Widget' } };
+            expect(await publish(peer, session, 1, PEOPLE, appended)).toBe(true);
+            expect(await publish(peer, session, 2, INVENTORY, EMPTY, kept)).toBe(true);
+            await retain(peer, PEOPLE, admission.rowIds!);
+            expect((await replay(peer, 'undo-append', PEOPLE, appended, EMPTY)).installed).toEqual(EMPTY);
+
+            // The renderer answers a delivery as stale, so the host rebuilds
+            // this window's view. No header request is waiting on that reload.
+            const auto = peer as unknown as { __autoAckSnapshots: boolean };
+            auto.__autoAckSnapshots = false;
+            const delivered = latest_snapshot(peer).identity;
+            const kept_again = { '1:0': { value: 'kept again', base: 'Widget' } };
+            expect(await publish(peer, session, 3, INVENTORY, EMPTY, kept_again)).toBe(true);
+            await wait_for_observable(() => latest_snapshot(peer).identity !== delivered);
+            await peer.__receive({
+                type: 'snapshotApplied',
+                identity: latest_snapshot(peer).identity,
+                disposition: 'stale',
+            });
+            auto.__autoAckSnapshots = true;
+            await header_off_adopted(peer);
+            expect(latest_snapshot(peer).capabilities.csvEditSessionId).toBe(session);
+
+            // The session's record of the row follows the column names, as
+            // the record of a released session does.
+            const redone = await replay(peer, 'redo-append', PEOPLE, EMPTY, appended);
+            expect(redone.refused).toBeUndefined();
+            expect(redone.installed!.appendedRows).toEqual(appended.appendedRows);
+            expect(redone.installed!.appendBasis!.schemaFingerprint)
+                .not.toBe(admission.appendBasis!.schemaFingerprint);
+            expect(await publish(peer, session, 4, PEOPLE, redone.installed!)).toBe(true);
+            // And the next row asked for comes after it.
+            const next = await admit_row(peer, session, PEOPLE, 'append-after-redo');
+            expect(next.appendBasis!.provisionalRowCount).toBe(2);
+        });
+
         it('refuses the commit of a redo prepared before the Header Row moved', async () => {
             const state = versioned_state_store({});
             const panel = await open_ready_xlsx(file_path, state);
