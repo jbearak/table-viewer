@@ -323,14 +323,44 @@ type ColumnVisibilityUpdater = (
 
 type TransformOrigin = 'grid' | 'toolbar' | 'restore';
 
+/**
+ * A sheet the header queue still owes a change, by identity: a refresh while
+ * the request waits can reorder the workbook, and an index would then name
+ * another worksheet.
+ */
+interface ExcelHeaderQueueSheet {
+    readonly name: string;
+    readonly worksheet_id?: string;
+}
+
+function excel_header_queue_sheet(
+    sheet: { readonly name: string; readonly worksheetId?: string },
+): ExcelHeaderQueueSheet {
+    return sheet.worksheetId === undefined
+        ? { name: sheet.name }
+        : { name: sheet.name, worksheet_id: sheet.worksheetId };
+}
+
+/** Where the queued sheet is now, or -1 once it is gone. */
+function excel_header_queue_sheet_index(
+    sheets: readonly { readonly name: string; readonly worksheetId?: string }[],
+    target: ExcelHeaderQueueSheet,
+): number {
+    return sheets.findIndex((sheet) => (
+        target.worksheet_id !== undefined && sheet.worksheetId !== undefined
+            ? sheet.worksheetId === target.worksheet_id
+            : sheet.name === target.name
+    ));
+}
+
 /** Header Row changes still owed, one sheet per host request. See `drain_excel_header_queue`. */
 interface ExcelHeaderQueue {
     readonly enabled: boolean;
     readonly unhide_all: boolean;
     /** The host display row to promote; display-keyed, so bound to `generation`. */
     readonly header_row?: number;
-    readonly sheets: readonly number[];
-    readonly grid_focus_sheet_index?: number;
+    readonly sheets: readonly ExcelHeaderQueueSheet[];
+    readonly grid_focus_sheet?: ExcelHeaderQueueSheet;
     readonly generation: number;
     readonly retries: number;
     /** A transient rejection waits for a snapshot applied after this count... */
@@ -6498,7 +6528,7 @@ export function App(): React.JSX.Element {
     /** The request posted for the queue's head sheet, until its result arrives. */
     const header_in_flight_ref = useRef<{
         readonly queue: ExcelHeaderQueue;
-        readonly sheet_index: number;
+        readonly sheet: ExcelHeaderQueueSheet;
         readonly posted_snapshot: number;
     } | null>(null);
     /** Wakes the drain from an acknowledgement or a timer without polling. */
@@ -6537,6 +6567,13 @@ export function App(): React.JSX.Element {
         const [next_sheet] = queue.sheets;
         if (next_sheet === undefined) {
             lower_header_fence();
+            return;
+        }
+        const current_sheets = meta_ref.current?.sheets ?? [];
+        const next_sheet_index = excel_header_queue_sheet_index(current_sheets, next_sheet);
+        if (next_sheet_index < 0) {
+            // The worksheet left the workbook while the request waited.
+            replace_excel_header_queue({ ...queue, sheets: queue.sheets.slice(1) });
             return;
         }
         if (queue.header_row !== undefined && generation_ref.current !== queue.generation) {
@@ -6605,12 +6642,17 @@ export function App(): React.JSX.Element {
             }
         }
         const current = excel_header_queue_ref.current!;
+        const grid_focus_sheet_index = current.grid_focus_sheet === undefined
+            ? undefined
+            : excel_header_queue_sheet_index(current_sheets, current.grid_focus_sheet);
         const result = request_excel_header(
             current.enabled,
             current.unhide_all,
             current.header_row,
-            next_sheet,
-            current.grid_focus_sheet_index,
+            next_sheet_index,
+            grid_focus_sheet_index === undefined || grid_focus_sheet_index < 0
+                ? undefined
+                : grid_focus_sheet_index,
         );
         if (result === 'wait') return;
         if (result === 'skip') {
@@ -6619,7 +6661,7 @@ export function App(): React.JSX.Element {
         }
         header_in_flight_ref.current = {
             queue: current,
-            sheet_index: next_sheet,
+            sheet: next_sheet,
             posted_snapshot: snapshot_applied_seq_ref.current,
         };
         replace_excel_header_queue({ ...current, sheets: current.sheets.slice(1) });
@@ -6667,7 +6709,7 @@ export function App(): React.JSX.Element {
             const remaining = excel_header_queue_ref.current?.sheets ?? [];
             replace_excel_header_queue({
                 ...in_flight.queue,
-                sheets: [in_flight.sheet_index, ...remaining],
+                sheets: [in_flight.sheet, ...remaining],
                 retries: in_flight.queue.retries + 1,
                 retry_after_snapshot: in_flight.posted_snapshot,
                 retry_not_before: Date.now() + HEADER_RETRY_DELAY_MS,
@@ -6719,14 +6761,20 @@ export function App(): React.JSX.Element {
                 return false;
             }
         }
+        const grid_focus_sheet = request.grid_focus_sheet_index === undefined
+            ? undefined
+            : sheets[request.grid_focus_sheet_index];
         replace_excel_header_queue({
             enabled: request.enabled,
             unhide_all: request.unhide_all === true,
             ...(request.header_row === undefined ? {} : { header_row: request.header_row }),
-            sheets: request.sheets,
-            ...(request.grid_focus_sheet_index === undefined
+            sheets: request.sheets.flatMap((sheet_index) => {
+                const sheet = sheets[sheet_index];
+                return sheet === undefined ? [] : [excel_header_queue_sheet(sheet)];
+            }),
+            ...(grid_focus_sheet === undefined
                 ? {}
-                : { grid_focus_sheet_index: request.grid_focus_sheet_index }),
+                : { grid_focus_sheet: excel_header_queue_sheet(grid_focus_sheet) }),
             generation: generation_ref.current,
             retries: 0,
             fenced: false,

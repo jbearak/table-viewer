@@ -2610,6 +2610,36 @@ describe('Excel first-row header toggle', () => {
         expect(document.querySelector('[role="status"]')?.textContent).toBe('Column names updated.');
     });
 
+    it('sends a queued header change to its worksheet after a refresh reorders the workbook', async () => {
+        // The toggle waits for the host to hold the session's edits. A reload
+        // in that window lists the worksheets the other way round; the change
+        // still belongs to S1, now at index 1, not to whatever sits at index 0.
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(excel_meta_multi([true, true]), {
+            capabilities: EDITABLE,
+        }));
+        await acquire_editing_session(post_message);
+        seed_mounted_store({ '1:0': { value: 'Alicia', base: 'Alice' } });
+
+        await click_button('Header Row');
+        expect(header_requests(post_message)).toEqual([]);
+        const reordered = excel_meta_multi([true, true]);
+        reordered.sheets.reverse();
+        await dispatch_host_message(refresh_snapshot_message(reordered, {
+            capabilities: { ...EDITABLE, csvEditSessionId: 'test-edit-session' },
+        }));
+        expect(header_requests(post_message)).toEqual([]);
+        await dispatch_host_message({
+            type: 'pendingEditsAcknowledged',
+            editSessionId: 'test-edit-session',
+            sequence: last_publication_sequence(post_message),
+        });
+        await vi.waitUntil(() => header_requests(post_message).length > 0);
+        expect(header_requests(post_message)).toEqual([
+            expect.objectContaining({ sheetIndex: 1, sheetName: 'S1', enabled: false }),
+        ]);
+    });
+
     it('lets an append awaiting admission finish before the fence goes up', async () => {
         const { post_message } = await render_app();
         const meta = excel_meta(true);
