@@ -1311,6 +1311,12 @@ export interface EditingHandle {
      * editor, menu, dialog, or append surface.
      */
     session_busy(): boolean;
+    /**
+     * True while keys typed for an editor are held for the session it waits
+     * on. Undo and redo then do nothing: in the open editor they would undo
+     * its text, never the workbook.
+     */
+    typing_held(): boolean;
 }
 
 /** Imperative focus bridge used by App after generation-keyed remounts. */
@@ -7450,6 +7456,7 @@ export function GridShell({
                 || overlay_opening_ref.current
                 || overlay_mounted_ref.current
                 || session_surface_open_ref.current,
+            typing_held: () => overlay_intent_ref.current !== null,
         };
         return () => {
             editing_ref.current = null;
@@ -9703,6 +9710,12 @@ export function GridShell({
         };
         overlay_intent_ref.current = intent;
         void ensure_edit_session().then((granted) => {
+            // Escape cancelled every edit held, so nothing opens, and the
+            // session goes back unless a later gesture is using it.
+            if (intent.typing.edits.length === 0) {
+                notify_session_idle();
+                return;
+            }
             if (overlay_intent_ref.current !== intent) return;
             overlay_intent_ref.current = null;
             if (!granted || !open_held_edits(intent.cell, intent.typing)) notify_session_idle();
@@ -10886,6 +10899,9 @@ export function GridShell({
                 const typing = hold_key(waiting.typing, args);
                 if (typing !== undefined) {
                     waiting.typing = typing;
+                    // Escape cancelled the edit before it opened. The grid
+                    // takes the next key as it would after the editor closed.
+                    if (typing.edits.length === 0) overlay_intent_ref.current = null;
                     args.cancel();
                     args.preventDefault();
                     return;

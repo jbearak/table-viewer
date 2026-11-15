@@ -42,6 +42,7 @@ const grid_shell_mock = vi.hoisted(() => ({
     // says otherwise, so a session a test acquires stays held while clean, the
     // way one does behind an open editor or menu.
     session_busy: true,
+    typing_held: false,
     mount_count: 0,
     on_editing_change: null as null | ((status: { is_dirty: boolean; has_live_uncommitted: boolean; save_in_flight: boolean; edits: Record<string, CsvDirtyEntry>; conflicted: string[] }) => void),
     request_save: vi.fn(() => false),
@@ -259,6 +260,7 @@ vi.mock('../webview/grid-shell', () => ({
                 flush_live_edit: grid_shell_mock.flush_live_edit,
                 has_uncommitted_changes: () => grid_shell_mock.has_uncommitted_changes,
                 session_busy: () => grid_shell_mock.session_busy,
+                typing_held: () => grid_shell_mock.typing_held,
             };
         }
         // Mirror the real GridShell: publish a measure function into the ref so
@@ -17198,6 +17200,33 @@ describe('undo and redo, from the keyboard and the desktop menu', () => {
         // undo above emptied the undo stack.
         post_message.mockClear();
         await press('z', { shiftKey: true });
+        expect(sent(post_message, 'prepareHistoryReplay')).toBeDefined();
+    });
+
+    it('leaves the workbook alone while keys are held for an editor not open yet', async () => {
+        // In the open editor, Cmd/Ctrl+Z would undo its text, not the workbook.
+        const { post_message } = await render_app();
+        await record_highlight(post_message);
+        grid_shell_mock.typing_held = true;
+        try {
+            await undo_via_menu();
+            let prevented = false;
+            await act(async () => {
+                const event = new KeyboardEvent('keydown', {
+                    key: 'z', bubbles: true, cancelable: true, metaKey: true,
+                });
+                window.dispatchEvent(event);
+                prevented = event.defaultPrevented;
+            });
+            // Kept from VS Code too, which would undo the workbook.
+            expect(prevented).toBe(true);
+            expect(sent(post_message, 'prepareHistoryReplay')).toBeUndefined();
+            expect(JSON.parse(grid_stub().getAttribute('data-undo-labels')!))
+                .toEqual(['Clear all highlights']);
+        } finally {
+            grid_shell_mock.typing_held = false;
+        }
+        await undo_via_menu();
         expect(sent(post_message, 'prepareHistoryReplay')).toBeDefined();
     });
 

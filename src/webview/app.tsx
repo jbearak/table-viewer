@@ -6016,6 +6016,8 @@ export function App(): React.JSX.Element {
             if (edit_command_target(target) === 'text') return;
             event.preventDefault();
             event.stopPropagation();
+            // Typed for an editor not open yet, where it would undo text.
+            if (editing_ref.current?.typing_held()) return;
             void run_history_command(command);
         };
         window.addEventListener('keydown', handler, true);
@@ -6190,6 +6192,8 @@ export function App(): React.JSX.Element {
             return;
         }
         if (command === 'undo' || command === 'redo') {
+            // Typed for an editor not open yet, where it would undo text.
+            if (editing_ref.current?.typing_held()) return;
             void run_history_command(command);
             return;
         }

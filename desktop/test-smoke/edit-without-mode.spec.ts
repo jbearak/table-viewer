@@ -206,6 +206,139 @@ for (const session of ['before the session is granted', 'under a session']) {
     });
 }
 
+// The Cocoa editing command each chord sends on macOS, as Playwright's own
+// keyboard sends them. The open editor moves its caret by these.
+const MAC_COMMANDS: Record<string, string> = {
+    ArrowLeft: 'moveLeft', ArrowRight: 'moveRight', ArrowUp: 'moveUp', ArrowDown: 'moveDown',
+    Home: 'scrollToBeginningOfDocument', End: 'scrollToEndOfDocument',
+    Backspace: 'deleteBackward', Escape: 'cancelOperation',
+    'Shift+ArrowLeft': 'moveLeftAndModifySelection', 'Shift+ArrowRight': 'moveRightAndModifySelection',
+    'Alt+ArrowLeft': 'moveWordLeft', 'Alt+ArrowRight': 'moveWordRight',
+    'Alt+Shift+ArrowLeft': 'moveWordLeftAndModifySelection',
+    'Alt+Shift+ArrowRight': 'moveWordRightAndModifySelection',
+    'Alt+Backspace': 'deleteWordBackward',
+    'Meta+ArrowLeft': 'moveToLeftEndOfLine', 'Meta+ArrowRight': 'moveToRightEndOfLine',
+    'Meta+ArrowUp': 'moveToBeginningOfDocument', 'Meta+ArrowDown': 'moveToEndOfDocument',
+    'Meta+Shift+ArrowLeft': 'moveToLeftEndOfLineAndModifySelection',
+};
+const KEY_CODES: Record<string, [code: string, key_code: number]> = {
+    ArrowLeft: ['ArrowLeft', 37], ArrowUp: ['ArrowUp', 38], ArrowRight: ['ArrowRight', 39],
+    ArrowDown: ['ArrowDown', 40], Home: ['Home', 36], End: ['End', 35], Enter: ['Enter', 13],
+    Escape: ['Escape', 27], Backspace: ['Backspace', 8], ' ': ['Space', 32],
+};
+const MODIFIER_BITS: Record<string, number> = { Alt: 1, Control: 2, Meta: 4, Shift: 8 };
+
+/**
+ * `press_at_once` for chords, such as `Meta+ArrowLeft`. Playwright's own
+ * presses share one modifier state, so chords sent at once would hold their
+ * modifiers down over the keys around them; these go straight to the page,
+ * each with its own modifiers, without waiting for one to be handled before
+ * sending the next. Letters, digits, and the keys in KEY_CODES only.
+ */
+async function press_chords_at_once(chords: readonly string[]): Promise<void> {
+    const session = await page.context().newCDPSession(page);
+    const sent: Promise<unknown>[] = [];
+    for (const chord of chords) {
+        const parts = chord.split('+');
+        const key = parts.pop()!;
+        const modifiers = parts.reduce((bits, part) => bits | MODIFIER_BITS[part]!, 0);
+        const shift = (modifiers & MODIFIER_BITS.Shift!) !== 0;
+        const [code, key_code] = KEY_CODES[key]
+            ?? [/\d/.test(key) ? `Digit${key}` : `Key${key.toUpperCase()}`, key.toUpperCase().charCodeAt(0)];
+        const text = key === 'Enter' ? '\r' : key.length === 1 && (modifiers & ~MODIFIER_BITS.Shift!) === 0
+            ? (shift ? key.toUpperCase() : key)
+            : undefined;
+        const name = ['Alt', 'Meta', 'Shift'].filter((part) => parts.includes(part)).concat(key).join('+');
+        const commands = process.platform === 'darwin' && MAC_COMMANDS[name] ? [MAC_COMMANDS[name]] : [];
+        const event = { key: text && key.length === 1 ? text : key, code, windowsVirtualKeyCode: key_code, modifiers };
+        sent.push(session.send('Input.dispatchKeyEvent', {
+            ...event, type: text ? 'keyDown' : 'rawKeyDown', text, unmodifiedText: text, commands,
+        }));
+        sent.push(session.send('Input.dispatchKeyEvent', { ...event, type: 'keyUp' }));
+    }
+    await Promise.all(sent);
+    await session.detach();
+}
+
+test('Escape typed before the session is granted cancels the edit, as in the open editor', async () => {
+    await select_cell(1, 0);
+    // In the open editor Escape discards "ab" and leaves the cell selected,
+    // where "x" starts a new edit.
+    await press_at_once(['a', 'b', 'Escape', 'x']);
+    await expect(editor()).toBeVisible();
+    await expect(editor()).toHaveValue('x');
+    await expect(cell(1, 0)).toHaveAttribute('aria-selected', 'true');
+    await page.keyboard.press('Escape');
+    await expect(editor()).toBeHidden();
+    await expect(cell(1, 0)).toHaveText('Alice');
+    // Nothing was committed, and the session went back.
+    await expect_nothing_unsaved();
+    expect(fs.readFileSync(csv, 'utf8')).toBe(fixture_text);
+});
+
+test('Escape after an Enter typed before the session is granted cancels only the next edit', async () => {
+    await select_cell(1, 0);
+    // Enter commits "ab" and selects the cell below. Escape discards "cd"
+    // there, and "e" starts a new edit in the same cell.
+    await press_at_once(['a', 'b', 'Enter', 'c', 'd', 'Escape', 'e']);
+    await expect(editor()).toBeVisible();
+    await expect(editor()).toHaveValue('e');
+    await expect(cell(1, 1)).toHaveAttribute('aria-selected', 'true');
+    await expect(cell(1, 0)).toHaveText('ab');
+    await page.keyboard.press('Escape');
+    await expect(editor()).toBeHidden();
+    await expect(cell(1, 1)).toHaveText('Bob');
+});
+
+test('Cmd+arrows typed before the session is granted move the caret, as in the open editor', async () => {
+    test.skip(process.platform !== 'darwin', 'macOS key bindings');
+    await select_cell(1, 0);
+    // In the open editor Cmd+Left and Cmd+Up go to the start, and Cmd+Right
+    // and Cmd+Down to the end. On the grid they would jump to the edge of
+    // the data, out from under the edit.
+    await press_chords_at_once([
+        'a', 'b', 'c', 'Meta+ArrowLeft', 'x', 'Meta+ArrowRight', 'y',
+        'Meta+ArrowUp', '1', 'Meta+ArrowDown', '2',
+    ]);
+    await expect(editor()).toBeVisible();
+    await expect(editor()).toHaveValue('1xabcy2');
+    await expect(cell(1, 0)).toHaveAttribute('aria-selected', 'true');
+});
+
+test('Shift and Alt arrows typed before the session is granted select and move by word, as in the open editor', async () => {
+    test.skip(process.platform !== 'darwin', 'macOS key bindings');
+    await select_cell(1, 0);
+    // "one two three": Alt+Left goes to the start of "three", Alt+Left again
+    // to the start of "two", Alt+Shift+Right selects "two", and "2" replaces
+    // it. Shift+Left twice then selects " 2", which "E" replaces. At the end,
+    // Alt+Backspace deletes "three".
+    await press_chords_at_once([
+        'o', 'n', 'e', ' ', 't', 'w', 'o', ' ', 't', 'h', 'r', 'e', 'e',
+        'Alt+ArrowLeft', 'Alt+ArrowLeft', 'Alt+Shift+ArrowRight', '2',
+        'Shift+ArrowLeft', 'Shift+ArrowLeft', 'E', 'Meta+ArrowRight', 'Alt+Backspace',
+    ]);
+    await expect(editor()).toBeVisible();
+    await expect(editor()).toHaveValue('oneE ');
+});
+
+test('Up, Down, Home, and End in lines of text typed before the session is granted go by line, as in the open editor', async () => {
+    test.skip(process.platform !== 'darwin', 'macOS key bindings');
+    await select_cell(1, 0);
+    // Shift+Enter starts a second line. Up goes to the same place on the
+    // first line, End to its end, Down back to the second, and Home to its
+    // start. Cmd+Down goes to the end, for a third line.
+    await press_chords_at_once([
+        'a', 'b', 'c', 'Shift+Enter', 'd', 'e', 'ArrowUp', '1', 'End', '2', 'ArrowDown', 'Home', '3',
+        // A third line, and Home in it.
+        'Meta+ArrowDown', 'Shift+Enter', 'f', 'g', 'Home', '4',
+    ]);
+    await expect(editor()).toBeVisible();
+    await expect(editor()).toHaveValue('ab1c2\n3de\n4fg');
+    await page.keyboard.press('Enter');
+    await expect(editor()).toBeHidden();
+    await expect(cell(1, 0)).toHaveText('ab1c2 3de 4fg');
+});
+
 test('an editor opened and cancelled leaves nothing behind, and the next edit just works', async () => {
     await select_cell(2, 0);
     await page.keyboard.press('Enter');
