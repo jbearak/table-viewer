@@ -5315,9 +5315,17 @@ describe('editing without an edit mode', () => {
         expect(grid_stub().getAttribute('data-editing-session-held')).toBe('true');
         expect(grid_shell_mock.latest_props?.edit_session_id).toBe('granted-session');
         expect(offered_request()).toBeUndefined();
-        // Diff has a session to compare against; Discard still has nothing to drop.
-        expect(get_button('Diff')).toBeDefined();
+        // A session with nothing in it is no edit: Diff has nothing to compare
+        // and Discard nothing to drop. A context menu holds one this way.
+        expect(find_button((text) => text === 'Diff')).toBeUndefined();
         expect(find_button((text) => text === 'Discard')).toBeUndefined();
+        expect(get_button('Save').getAttribute('aria-disabled')).toBe('true');
+
+        // The first unsaved change brings Diff, with Discard and Save.
+        seed_mounted_store();
+        expect(get_button('Diff')).toBeDefined();
+        expect(get_button('Discard')).toBeDefined();
+        expect(get_button('Save').getAttribute('aria-disabled')).not.toBe('true');
     });
 
     it('resolves the request false when the host refuses, and keeps offering one', async () => {
@@ -5420,7 +5428,7 @@ describe('editing without an edit mode', () => {
 
         // The grid stops needing the session and says nothing; any render will do.
         grid_shell_mock.session_busy = false;
-        await click_button('Diff');
+        await report_grid_editing(false);
 
         expect(posted(post_message, 'releaseEditSession')).toEqual([{
             type: 'releaseEditSession',
@@ -5520,6 +5528,7 @@ describe('editing session save and release', () => {
 
         expect(container!.textContent).not.toContain('Diff');
         await acquire_editing_session(post_message);
+        seed_mounted_store();
 
         expect(get_button('Diff').getAttribute('aria-pressed')).toBe('false');
         expect(grid_stub().getAttribute('data-diff-mode')).toBe('false');
@@ -5537,6 +5546,7 @@ describe('editing session save and release', () => {
         // The host samples configuration for the grant, so a setting changed after
         // the viewer opened still controls the first grant.
         await acquire_editing_session(post_message, 'test-edit-session', true);
+        seed_mounted_store();
 
         expect(get_button('Diff').getAttribute('aria-pressed')).toBe('true');
         expect(grid_stub().getAttribute('data-diff-mode')).toBe('true');
@@ -5550,8 +5560,10 @@ describe('editing session save and release', () => {
             capabilities: { csvEditable: true, csvEditingSupported: true },
         }));
         await acquire_editing_session(post_message, 'same-session');
+        seed_mounted_store();
         await click_button('Diff');
         expect(grid_stub().getAttribute('data-diff-mode')).toBe('false');
+        seed_mounted_store({});
 
         await dispatch_host_message(refresh_snapshot_message(meta, {
             configuration: { diffOnByDefault: true },
@@ -5561,13 +5573,14 @@ describe('editing session save and release', () => {
                 csvEditSessionId: 'same-session',
             },
         }));
-        expect(get_button('Diff').getAttribute('aria-pressed')).toBe('false');
+        expect(grid_stub().getAttribute('data-diff-mode')).toBe('false');
 
         await release_idle_edit_session();
         expect(grid_stub().getAttribute('data-editing-session-held')).toBe('false');
         await acquire_editing_session(post_message, 'same-session');
-        expect(get_button('Diff').getAttribute('aria-pressed')).toBe('false');
         expect(grid_stub().getAttribute('data-diff-mode')).toBe('false');
+        seed_mounted_store();
+        expect(get_button('Diff').getAttribute('aria-pressed')).toBe('false');
     });
 
     it('uses the configured Diff default for a restored editing session', async () => {
@@ -5584,8 +5597,9 @@ describe('editing session save and release', () => {
         );
 
         expect(grid_stub().getAttribute('data-editing-session-held')).toBe('true');
-        expect(get_button('Diff').getAttribute('aria-pressed')).toBe('true');
         expect(grid_stub().getAttribute('data-diff-mode')).toBe('true');
+        seed_mounted_store();
+        expect(get_button('Diff').getAttribute('aria-pressed')).toBe('true');
     });
 
     it('keeps compatible composer drafts through a remount and clears stale ones', async () => {

@@ -287,7 +287,7 @@ test('a row drag and a column drag are the first edits to a file', async () => {
     await page.mouse.move(from.x, from.y - 10, { steps: 5 });
     await page.mouse.move(to.x, to.y - 8, { steps: 5 });
     // A drop is judged against the session, which a scripted drag can outrun.
-    await expect(page.getByRole('button', { name: 'Diff' })).toBeVisible();
+    await expect(page.locator('.grid-shell-root')).toHaveAttribute('data-edit-session', 'held');
     await page.mouse.up();
     await expect_undo_label('Move row');
     await save_changes(page);
@@ -301,7 +301,7 @@ test('a row drag and a column drag are the first edits to a file', async () => {
     await page.mouse.down();
     await page.mouse.move(header_from.x - 10, header_from.y, { steps: 5 });
     await page.mouse.move(header_to.x - 40, header_to.y, { steps: 5 });
-    await expect(page.getByRole('button', { name: 'Diff' })).toBeVisible();
+    await expect(page.locator('.grid-shell-root')).toHaveAttribute('data-edit-session', 'held');
     await page.mouse.up();
     await expect_undo_label('Move column');
     await save_changes(page);
@@ -997,4 +997,55 @@ test('a conflict notice counts a formula that catches the #REF! a salvage action
     await expect(review).toContainText(`Discard row and column changes on Data: 1 formula ${counts}`);
     await expect(review).toContainText(`Keep new rows at the end: 1 formula ${counts}`);
     await expect(review).not.toContainText('2 formulas will show #REF!');
+});
+
+test('a context menu opened and dismissed is no edit', async () => {
+    const { file, page } = await open_file('fruit.csv', 'name,qty\napple,1\nbanana,2\n');
+    await wait_for_grid(page);
+    const root = page.locator('.grid-shell-root');
+    const menus = page.locator('[role="menu"]');
+    for (const open of [
+        () => open_cell_menu(page, 0, 0),
+        () => open_column_menu(page, 1),
+        () => open_row_menu(page, 1),
+    ]) {
+        await open();
+        // The menu holds the session so its Insert and Delete act on the first
+        // click, and the session alone is no edit: nothing offers to save it,
+        // drop it, or show a before and after.
+        await expect(root).toHaveAttribute('data-edit-session', 'held');
+        await expect(save_button(page)).toBeDisabled();
+        await expect(page.getByRole('button', { name: 'Diff' })).toHaveCount(0);
+        await expect(page.getByRole('button', { name: 'Discard' })).toHaveCount(0);
+        const label = await menus.getAttribute('aria-label');
+        await page.keyboard.press('Escape');
+        await expect(menus, `Escape closes ${label}`).toHaveCount(0);
+        await expect(root).toHaveAttribute('data-edit-session', 'none');
+        // Escape gives focus back to the grid on a timer, which a background
+        // window can hold back past the next right-click; wait it out, or it
+        // takes focus from the next menu.
+        await expect.poll(() => page.evaluate(
+            () => document.activeElement?.closest('.grid-shell-root') != null,
+        )).toBe(true);
+    }
+    await expect(save_button(page)).toBeDisabled();
+    expect(fs.readFileSync(file, 'utf8')).toBe('name,qty\napple,1\nbanana,2\n');
+});
+
+test('Escape closes a workbook row menu that gains "Use row as header" as it opens', async () => {
+    const { page } = await open_file(
+        'basic.xlsx',
+        fs.readFileSync(path.join(repo_dir, 'src', 'test', 'fixtures', 'basic.xlsx')),
+    );
+    await wait_for_grid(page);
+    const menu = await open_row_menu(page, 0);
+    // Offered once the session arrives, above the item the menu focused on opening.
+    await expect(menu.getByRole('menuitem', { name: 'Use row as header', exact: true })).toBeVisible();
+    await expect.poll(() => page.evaluate(
+        () => document.activeElement?.closest('[role="menu"]') != null,
+    )).toBe(true);
+    await page.keyboard.press('Escape');
+    await expect(page.locator('[role="menu"]')).toHaveCount(0);
+    await expect(page.locator('.grid-shell-root')).toHaveAttribute('data-edit-session', 'none');
+    await expect(page.getByRole('button', { name: 'Diff' })).toHaveCount(0);
 });

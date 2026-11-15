@@ -77,6 +77,44 @@ function MenuLevel({
         if (auto_focus && active_index >= 0) focus_index(active_index);
     }, []);
 
+    /** A key for each item that stays the same when items are added before it. */
+    const item_keys = items_keys(items);
+    // Whether focus is on one of this level's items, kept through the item's
+    // removal (which moves focus to the body) but not through focus moving on.
+    const holds_focus_ref = useRef(false);
+    // Focus is still where the menu put it on opening: no key or pointer has
+    // moved it since.
+    const focus_is_initial_ref = useRef(auto_focus);
+
+    // Items can come and go while the menu is open: the row menu drops "Use row
+    // as header" and "Hide row" while it asks for the editing session, and
+    // offers them again once it arrives. Each button is keyed by its label, so
+    // a focused one that stays keeps focus; follow it to its new index, so the
+    // roving tabIndex and the arrow keys start from it. A focused one that goes
+    // would leave focus on the body, where Escape and the arrow keys reach no
+    // menu, so focus the item that took its place. Until the person moves it,
+    // focus stays on the first item, as the menu opened.
+    useLayoutEffect(() => {
+        const menu = menu_ref.current;
+        const focused = document.activeElement;
+        const in_menu = focused instanceof HTMLElement && focused.parentElement === menu && menu !== null;
+        if (focus_is_initial_ref.current && (in_menu || (holds_focus_ref.current
+            && (focused === null || focused === document.body)))) {
+            const first = focusable_indexes[0];
+            if (first !== undefined && trigger_refs.current.get(first) !== focused) focus_index(first);
+            return;
+        }
+        if (in_menu) {
+            const index = Number((focused as HTMLElement).dataset.menuIndex);
+            if (Number.isInteger(index)) set_active_index(index);
+            return;
+        }
+        if (!holds_focus_ref.current || (focused !== null && focused !== document.body)) return;
+        const next = focusable_indexes.find((index) => index >= active_index)
+            ?? focusable_indexes[focusable_indexes.length - 1];
+        if (next !== undefined) focus_index(next);
+    }, [items]);
+
     useLayoutEffect(() => {
         if (open_submenu_index === null) return;
         const trigger = trigger_refs.current.get(open_submenu_index);
@@ -126,6 +164,7 @@ function MenuLevel({
     };
 
     const hover_item = (index: number) => {
+        focus_is_initial_ref.current = false;
         if (!focusable_indexes.includes(index)) {
             set_open_submenu_index(null);
             return;
@@ -136,6 +175,7 @@ function MenuLevel({
     };
 
     const on_key_down = (event: React.KeyboardEvent<HTMLDivElement>) => {
+        focus_is_initial_ref.current = false;
         const item = items[active_index];
         if (event.key === 'Escape') {
             event.preventDefault();
@@ -183,6 +223,16 @@ function MenuLevel({
             role="menu"
             aria-label={aria_label}
             onKeyDown={on_key_down}
+            onFocus={(event) => {
+                if ((event.target as HTMLElement).parentElement === menu_ref.current) {
+                    holds_focus_ref.current = true;
+                }
+            }}
+            onBlur={(event) => {
+                // A null relatedTarget is the item going away or the window
+                // losing focus; neither moves focus to anything else.
+                if (event.relatedTarget !== null) holds_focus_ref.current = false;
+            }}
         >
             {items.map((item, index) => {
                 if (item.kind === 'separator') {
@@ -192,7 +242,7 @@ function MenuLevel({
                     const is_open = open_submenu_index === index;
                     const submenu_id = `${submenu_id_prefix}-${index}`;
                     return (
-                        <React.Fragment key={`${item.label}-${index}`}>
+                        <React.Fragment key={item_keys[index]}>
                             <button
                                 ref={(element) => {
                                     if (element) trigger_refs.current.set(index, element);
@@ -240,7 +290,7 @@ function MenuLevel({
                             if (element) trigger_refs.current.set(index, element);
                             else trigger_refs.current.delete(index);
                         }}
-                        key={`${item.label}-${index}`}
+                        key={item_keys[index]}
                         data-menu-index={index}
                         type="button"
                         className={`context-menu-item${item.checked ? ' active' : ''}`}
@@ -301,6 +351,20 @@ export function ContextMenu({ x, y, items, on_dismiss, restore_focus, aria_label
             : { left, top });
     }, [x, y]);
 
+    // Escape closes the menu even when focus has fallen to the page, as it does
+    // when the window gives focus back with no item to return it to.
+    useEffect(() => {
+        const handle_key = (event: KeyboardEvent) => {
+            if (event.key !== 'Escape') return;
+            if (event.target !== document.body && event.target !== document.documentElement) return;
+            event.preventDefault();
+            event.stopPropagation();
+            dismiss('escape');
+        };
+        document.addEventListener('keydown', handle_key, true);
+        return () => document.removeEventListener('keydown', handle_key, true);
+    }, [dismiss]);
+
     useEffect(() => {
         const handle_pointer = (event: PointerEvent) => {
             if (!root_ref.current?.contains(event.target as Node)) dismiss('outside');
@@ -330,4 +394,15 @@ export function ContextMenu({ x, y, items, on_dismiss, restore_focus, aria_label
             />
         </div>
     );
+}
+
+/** Each item's label, with a count after a repeated one; separators by position. */
+function items_keys(items: readonly MenuItem[]): string[] {
+    const seen = new Map<string, number>();
+    return items.map((item, index) => {
+        if (item.kind === 'separator') return `separator-${index}`;
+        const count = seen.get(item.label) ?? 0;
+        seen.set(item.label, count + 1);
+        return count === 0 ? `item:${item.label}` : `item:${item.label}#${count}`;
+    });
 }

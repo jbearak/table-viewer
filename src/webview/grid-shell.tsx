@@ -11755,6 +11755,9 @@ export function GridShell({
         <div
             ref={grid_root_ref}
             className="grid-shell-root"
+            // Whether the editing session is held. Nothing shows it, by design,
+            // so a test that must wait for it reads it here.
+            data-edit-session={editing_session_held ? 'held' : 'none'}
             onPointerDownCapture={row_markers.on_pointer_down_capture}
         >
             <DataEditor
