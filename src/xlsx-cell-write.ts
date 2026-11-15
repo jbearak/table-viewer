@@ -56,6 +56,7 @@ import {
     create_workbook_budget,
     type WorkbookBudget,
 } from './spreadsheet-safety';
+import { display_date_to_serial } from './spreadsheet-format';
 
 export { iso_to_serial } from './xlsx-cell-value';
 
@@ -135,6 +136,12 @@ export interface XlsxWriteOptions {
      * serial (keeping the cell's date format) or a plain string.
      */
     readonly is_date_style: (xf_index: number, serial: number) => boolean;
+    /**
+     * The number format code behind an `s=` index, so a date typed the way the
+     * cell shows dates (`6/1/23` under `m/d/yy`) is saved as a date. Absent
+     * reads as "no format": only ISO dates are recognised.
+     */
+    readonly number_format_code?: (xf_index: number) => string | undefined;
     /**
      * The four style flags of the cell font behind an `s=` index, as the reader
      * resolves them. Rich edits consult this for the uniform-style reduction
@@ -299,6 +306,10 @@ function build_cell_xml(
     const classified = classify_xlsx_cell_value(value, {
         datemode: options.datemode,
         is_date_style: (serial) => options.is_date_style(xf_index ?? 0, serial),
+        display_date_serial: (text) => {
+            const code = options.number_format_code?.(xf_index ?? 0);
+            return code === undefined ? null : display_date_to_serial(text, code, options.datemode);
+        },
         was_boolean,
         was_iso_date,
     });

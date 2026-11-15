@@ -1,5 +1,5 @@
 import SSF from 'ssf';
-import { classify_xlsx_cell_value } from './xlsx-cell-value';
+import { classify_xlsx_cell_value, iso_to_serial } from './xlsx-cell-value';
 
 export interface FontEntry {
     bold: boolean;
@@ -311,6 +311,169 @@ export function format_value(
     return format_number_value(raw, format);
 }
 
+type DatePart = 'y' | 'm' | 'd';
+
+interface DisplayDatePattern {
+    readonly re: RegExp;
+    readonly order: readonly DatePart[];
+}
+
+const MONTH_NAMES = [
+    'january', 'february', 'march', 'april', 'may', 'june',
+    'july', 'august', 'september', 'october', 'november', 'december',
+];
+
+const display_date_patterns = new Map<string, DisplayDatePattern | null>();
+
+/**
+ * The text one format section shows for a date, as a pattern: day, month, and
+ * year in the section's order with its separators between them. A time before
+ * or after them is left off, so the date alone is accepted. Anything else
+ * (weekday names, literal text, a missing part) gives null.
+ */
+function display_date_pattern(section: string): DisplayDatePattern | null {
+    const cached = display_date_patterns.get(section);
+    if (cached !== undefined) return cached;
+    // `kind` is a lowercased format letter, 'ampm', 'lit' for literal text,
+    // or 'other' for anything that cannot be part of a plain date.
+    type Token = { kind: string; len: number; text: string };
+    const tokens: Token[] = [];
+    const literal = (text: string) => {
+        const last = tokens[tokens.length - 1];
+        if (last?.kind === 'lit') last.text += text;
+        else tokens.push({ kind: 'lit', len: 0, text });
+    };
+    let i = 0;
+    while (i < section.length) {
+        const ch = section[i];
+        const lower = ch.toLowerCase();
+        const ampm = /^(am\/pm|a\/p)/i.exec(section.slice(i));
+        if (ch === '"') {
+            const end = section.indexOf('"', i + 1);
+            if (end < 0) break;
+            literal(section.slice(i + 1, end));
+            i = end + 1;
+        } else if (ch === '\\') {
+            literal(section[i + 1] ?? '');
+            i += 2;
+        } else if (ch === '[') {
+            const end = section.indexOf(']', i);
+            if (end < 0) break;
+            i = end + 1;
+        } else if (ampm) {
+            tokens.push({ kind: 'ampm', len: ampm[0].length, text: '' });
+            i += ampm[0].length;
+        } else if ('ymdhs'.includes(lower)) {
+            let len = 1;
+            while (section[i + len]?.toLowerCase() === lower) len += 1;
+            tokens.push({ kind: lower, len, text: '' });
+            i += len;
+        } else if (/[A-Za-z0-9#?@_*]/.test(ch)) {
+            tokens.push({ kind: 'other', len: 1, text: '' });
+            i += 1;
+        } else {
+            literal(ch);
+            i += 1;
+        }
+    }
+    // `m` beside an hour or second is minutes; fractional-second digits follow `s`.
+    const fields = tokens.filter((token) => token.kind !== 'lit');
+    const time = new Set<Token>();
+    fields.forEach((token, at) => {
+        const before = fields[at - 1];
+        if (
+            token.kind === 'h' || token.kind === 's' || token.kind === 'ampm'
+            || (token.kind === 'm' && (before?.kind === 'h' || fields[at + 1]?.kind === 's'))
+            || (token.kind === 'other' && (before?.kind === 's' || (before?.kind === 'other' && time.has(before))))
+        ) time.add(token);
+    });
+    const is_time = (token: Token) => time.has(token);
+    const is_date_field = (token: Token) => 'ymd'.includes(token.kind) && !is_time(token);
+    const first = tokens.findIndex(is_date_field);
+    let last = -1;
+    tokens.forEach((token, index) => { if (is_date_field(token)) last = index; });
+    const date = first < 0 ? [] : tokens.slice(first, last + 1);
+    const outside = [...tokens.slice(0, Math.max(first, 0)), ...tokens.slice(last + 1)];
+    // A time beside the date must be set apart from it by a space.
+    const apart = (token: Token | undefined) => token === undefined || /\s/.test(token.text);
+    let valid = date.length === 5
+        && outside.every((token) => token.kind === 'lit' || is_time(token))
+        && apart(first > 0 ? tokens[first - 1] : undefined)
+        && apart(tokens[last + 1]);
+
+    const order: DatePart[] = [];
+    let source = '';
+    date.forEach((token, index) => {
+        if (!valid) return;
+        const { kind, len, text } = token;
+        if (index % 2 === 1) {
+            if (kind !== 'lit' || /[A-Za-z0-9]/.test(text)) valid = false;
+            else source += text.replace(/[.*+?^${}()|[\]\\/-]/g, '\\$&');
+            return;
+        }
+        if ((kind !== 'y' && kind !== 'm' && kind !== 'd') || order.includes(kind)) {
+            valid = false;
+            return;
+        }
+        if (kind === 'y') source += '(\\d{2}|\\d{4})';
+        else if (len <= 2) source += '(\\d{1,2})';
+        else if (kind === 'm' && len <= 4) source += '([A-Za-z]{3,9})';
+        else valid = false;
+        order.push(kind);
+    });
+    const pattern = valid ? { re: new RegExp(`^${source}$`, 'i'), order } : null;
+    display_date_patterns.set(section, pattern);
+    return pattern;
+}
+
+function display_date_match_to_serial(
+    pattern: DisplayDatePattern,
+    match: RegExpExecArray,
+    datemode: DateMode,
+): number | null {
+    let year = 0, month = 0, day = 0;
+    for (const [index, part] of pattern.order.entries()) {
+        const field = match[index + 1];
+        if (part === 'y') {
+            year = Number(field);
+            if (field.length === 2) year += year < 30 ? 2000 : 1900;
+        } else if (part === 'd') {
+            day = Number(field);
+        } else if (/^\d+$/.test(field)) {
+            month = Number(field);
+        } else {
+            const name = field.toLowerCase();
+            month = MONTH_NAMES.findIndex((full) => full === name || full.slice(0, 3) === name) + 1;
+        }
+    }
+    const pad = (n: number, width: number) => String(n).padStart(width, '0');
+    return iso_to_serial(`${pad(year, 4)}-${pad(month, 2)}-${pad(day, 2)}`, datemode);
+}
+
+/**
+ * Convert text written the way a date format shows dates (`6/1/23` under
+ * `m/d/yy`) to an Excel serial, or null. Each section is tried, and a date read
+ * by one counts only if that section is the one that shows it. Two-digit years
+ * follow Excel: 00–29 are 2000–2029, 30–99 are 1930–1999.
+ */
+export function display_date_to_serial(
+    text: string,
+    code: string,
+    datemode: DateMode,
+): number | null {
+    const trimmed = text.trim();
+    for (const section of format_sections(code)) {
+        const pattern = display_date_pattern(section);
+        const match = pattern?.re.exec(trimmed);
+        if (!pattern || !match) continue;
+        const serial = display_date_match_to_serial(pattern, match, datemode);
+        if (serial !== null && serial >= 0 && number_format_section_for_value(code, serial) === section) {
+            return serial;
+        }
+    }
+    return null;
+}
+
 export interface XlsxEditPreviewOptions {
     readonly was_boolean?: boolean;
     readonly was_iso_date?: boolean;
@@ -328,6 +491,7 @@ export function format_xlsx_edit_preview(
     const classified = classify_xlsx_cell_value(value, {
         datemode: format.date1904 ? 1 : 0,
         is_date_style: (serial) => number_format_is_date(format, serial),
+        display_date_serial: (text) => display_date_to_serial(text, format.code, format.date1904 ? 1 : 0),
         was_boolean: options.was_boolean,
         was_iso_date: options.was_iso_date,
     });

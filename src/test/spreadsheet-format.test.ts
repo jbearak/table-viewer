@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import {
+    display_date_to_serial,
     format_xlsx_edit_preview,
     is_valid_excel_date_serial,
     number_format_is_date,
@@ -7,6 +8,7 @@ import {
     resolve_number_format,
     serial_to_iso,
 } from '../spreadsheet-format';
+import { classify_xlsx_cell_value } from '../xlsx-cell-value';
 
 const MS_PER_DAY = 86400000;
 const MIN_JS_DATE_MS = Date.UTC(-271821, 3, 20);
@@ -159,6 +161,86 @@ describe('dirty XLSX number-format preview', () => {
         expect(number_format_section_for_value(format.code, 45306))
             .toBe('0_;yyyy-mm-dd');
         expect(number_format_is_date(format, 45306)).toBe(true);
+    });
+});
+
+describe('dates typed the way a date format shows them', () => {
+    const typed = (value: string, code: string, date1904 = false) => classify_xlsx_cell_value(value, {
+        datemode: date1904 ? 1 : 0,
+        is_date_style: (serial) => number_format_is_date({ code }, serial),
+        display_date_serial: (text) => display_date_to_serial(text, code, date1904 ? 1 : 0),
+    });
+    // 2023-06-02.
+    const june_2 = { kind: 'number', text: '45079' };
+
+    it('reads month/day/year in the order and separators of the format', () => {
+        for (const value of ['6/2/23', '06/02/23', '6/2/2023', ' 06/02/2023 ']) {
+            expect(typed(value, 'm/d/yy')).toEqual(june_2);
+            expect(typed(value, 'mm/dd/yyyy')).toEqual(june_2);
+        }
+        expect(typed('2/6/23', 'd/m/yyyy')).toEqual(june_2);
+        expect(typed('2.6.2023', 'dd.mm.yyyy')).toEqual(june_2);
+        expect(typed('6-2-23', 'mm\\-dd\\-yy')).toEqual(june_2);
+        expect(typed('6/2/23', '[$-409]m/d/yy')).toEqual(june_2);
+        // Built-in 14 as a cell resolves it.
+        expect(format_xlsx_edit_preview('6/2/2023', { code: 'm/d/yy' })).toBe('6/2/23');
+    });
+
+    it('reads English month names where the format shows them', () => {
+        expect(typed('2-Jun-23', 'd-mmm-yy')).toEqual(june_2);
+        expect(typed('2-june-2023', 'd-mmm-yy')).toEqual(june_2);
+        expect(typed('June 2, 2023', 'mmmm d, yyyy')).toEqual(june_2);
+        expect(typed('2-6-23', 'd-mmm-yy')).toEqual({ kind: 'string', text: '2-6-23' });
+        expect(typed('2-Jux-23', 'd-mmm-yy')).toEqual({ kind: 'string', text: '2-Jux-23' });
+    });
+
+    it('takes two-digit years as Excel does', () => {
+        expect(typed('1/1/29', 'm/d/yy')).toEqual({ kind: 'number', text: '47119' });
+        expect(typed('1/1/30', 'm/d/yy')).toEqual({ kind: 'number', text: '10959' });
+    });
+
+    it('accepts the date alone in a format that also shows a time', () => {
+        expect(typed('6/2/23', 'm/d/yy h:mm')).toEqual(june_2);
+        expect(typed('6/2/23', 'm/d/yyyy h:mm AM/PM')).toEqual(june_2);
+        expect(typed('6/2/23', 'hh:mm m/d/yy')).toEqual(june_2);
+        expect(typed('6/2/23', 'm/d/yy h:mm:ss.000')).toEqual(june_2);
+        expect(typed('6/2/23 13:45', 'm/d/yy h:mm'))
+            .toEqual({ kind: 'string', text: '6/2/23 13:45' });
+    });
+
+    it('reads a date only through the section that will show it', () => {
+        // 2023-06-02 is below 50000, so the second section shows it.
+        const code = '[>=50000]m/d/yy;d/m/yyyy';
+        expect(typed('2/6/2023', code)).toEqual(june_2);
+        expect(typed('6/2/2023', code)).toEqual({ kind: 'number', text: '44963' });
+        expect(typed('1/1/2040', code)).toEqual({ kind: 'number', text: '51136' });
+        expect(typed('6/2/23', '[>=50000]m/d/yy;0')).toEqual({ kind: 'string', text: '6/2/23' });
+    });
+
+    it('uses the workbook date system', () => {
+        expect(typed('6/2/23', 'm/d/yy', true)).toEqual({ kind: 'number', text: '43617' });
+    });
+
+    it('leaves invalid dates, other orders, and other formats as text', () => {
+        for (const [value, code] of [
+            ['6/31/23', 'm/d/yy'],
+            ['13/1/23', 'm/d/yy'],
+            ['6/2/3', 'm/d/yy'],
+            ['6-2-23', 'm/d/yy'],
+            ['2023/6/2', 'm/d/yy'],
+            ['6/2/23', 'mmm-yy'],
+            ['6/2/23', 'dddd, m/d/yy'],
+            ['6/2/23', '0.00'],
+            ['6/2/23', 'General'],
+            ['12:30', 'h:mm'],
+        ]) {
+            expect(typed(value, code)).toEqual({ kind: 'string', text: value });
+        }
+    });
+
+    it('still reads ISO dates the same way', () => {
+        expect(typed('2023-06-02', 'm/d/yy')).toEqual(june_2);
+        expect(typed('2023-06-02', 'General')).toEqual({ kind: 'string', text: '2023-06-02' });
     });
 });
 

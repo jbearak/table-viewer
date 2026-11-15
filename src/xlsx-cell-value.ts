@@ -86,6 +86,11 @@ export function xlsx_runs_require_inline_string(
 export interface XlsxValueClassificationContext {
     readonly datemode: DateMode;
     readonly is_date_style: (serial: number) => boolean;
+    /**
+     * The serial of text written the way the cell's date format shows dates
+     * (`6/1/23` under `m/d/yy`), or null. Absent: only ISO dates are read.
+     */
+    readonly display_date_serial?: (text: string) => number | null;
     readonly was_boolean?: boolean;
     readonly was_iso_date?: boolean;
 }
@@ -116,6 +121,11 @@ export function classify_xlsx_cell_value(
 
     if (serial !== null && serial >= 0 && context.is_date_style(serial)) {
         return { kind: 'number', text: String(serial) };
+    }
+
+    const shown = serial === null ? context.display_date_serial?.(value) ?? null : null;
+    if (shown !== null && shown >= 0 && context.is_date_style(shown)) {
+        return { kind: 'number', text: String(shown) };
     }
 
     const trimmed = value.trim();
