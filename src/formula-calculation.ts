@@ -10,7 +10,7 @@ import {
     is_xlsx_formula_text,
     structured_formula_reference_at,
 } from './xlsx-formula';
-import { display_date_to_serial, number_format_is_date } from './spreadsheet-format';
+import { cell_date_serial, display_date_to_serial, number_format_is_date } from './spreadsheet-format';
 import {
     classify_xlsx_cell_value,
     fits_excel_number_precision,
@@ -348,7 +348,9 @@ function scalar_from_edit(
             && number_format_is_date(cell.numberFormat, serial),
         display_date_serial: (text) => cell?.numberFormat === undefined
             ? null
-            : display_date_to_serial(text, cell.numberFormat.code, date_mode),
+            : display_date_to_serial(text, cell.numberFormat.code, date_mode, {
+                current_serial: cell_date_serial(cell),
+            }),
     });
     if (classified.kind === 'empty') return BLANK;
     if (classified.kind === 'boolean') {

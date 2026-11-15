@@ -44,6 +44,7 @@ import {
 } from './xlsx-formula';
 import {
     classify_xlsx_cell_value,
+    iso_to_serial,
     xlsx_edit_writes_formula,
     xlsx_runs_require_inline_string,
 } from './xlsx-cell-value';
@@ -268,6 +269,7 @@ function build_cell_xml(
     was_iso_date = false,
     formula_result?: string,
     namespace_prefix = '',
+    current_date_serial?: number,
 ): string {
     const { value } = edit;
     const ref = `${col_index_to_letter(col)}${row + 1}`;
@@ -308,7 +310,9 @@ function build_cell_xml(
         is_date_style: (serial) => options.is_date_style(xf_index ?? 0, serial),
         display_date_serial: (text) => {
             const code = options.number_format_code?.(xf_index ?? 0);
-            return code === undefined ? null : display_date_to_serial(text, code, options.datemode);
+            return code === undefined
+                ? null
+                : display_date_to_serial(text, code, options.datemode, { current_serial: current_date_serial });
         },
         was_boolean,
         was_iso_date,
@@ -327,6 +331,28 @@ function build_cell_xml(
         case 'string':
             return `<${q('c')} r="${ref}"${style_attr} t="inlineStr"><${q('is')}><${q('t')} xml:space="preserve">${encode_xml(classified.text)}</${q('t')}></${q('is')}></${q('c')}>`;
     }
+}
+
+/**
+ * The date an existing cell holds, as a serial, as the reader would show it:
+ * a number under a date format, or an ISO date. Undefined when it holds none.
+ */
+function existing_date_serial(
+    xml: Uint8Array,
+    cell: Span,
+    type: string | null,
+    xf_index: number | null,
+    options: XlsxWriteOptions,
+): number | undefined {
+    const v = find_first_element(xml, 'v', cell.inner_start, cell.inner_end);
+    if (!v) return undefined;
+    const text = decode_xml(Buffer.from(xml.subarray(v.inner_start, v.inner_end)).toString('utf8')).trim();
+    if (type === 'd') return iso_to_serial(text, options.datemode) ?? undefined;
+    if (type !== null && type !== 'n') return undefined;
+    const serial = Number(text);
+    return text !== '' && Number.isFinite(serial) && options.is_date_style(xf_index ?? 0, serial)
+        ? serial
+        : undefined;
 }
 
 function build_grouped_formula_cell_xml(
@@ -2059,6 +2085,9 @@ function apply_cell_edits_bytes(
             : new Set(options.formula_result_invalidations.map(
                 ({ row, column }) => `${row}:${column}`,
             ));
+        // An edited cell's element is replaced whole below, which reads the date
+        // it holds now to fill a typed date's missing parts: leave its cache be.
+        for (const edit of edits) direct_invalidated_formula_keys.delete(`${edit.row}:${edit.col}`);
         for (const key of grouped_formula_edit_keys) direct_invalidated_formula_keys.add(key);
         const calculated_formula_results = new Map(
             (options.formula_result_updates ?? []).map(
@@ -2222,6 +2251,7 @@ function apply_cell_edits_bytes(
                         existing_type === 'd',
                         calculated_formula_results.get(`${e.row}:${e.col}`),
                         namespace_prefix,
+                        existing_date_serial(xml, cell_span, existing_type, xf, options),
                     ),
                 });
             } else {

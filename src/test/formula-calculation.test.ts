@@ -465,6 +465,24 @@ describe('calculate_workbook_formulas', () => {
         })).toEqual([{ ...target(0, 0, 1), value: '45308' }]);
     });
 
+    it('fills the day a date format leaves out from the edited cell\'s date', () => {
+        const source = workbook([{ name: 'Sheet1', rows: [[
+            cell('2023-06-15T00:00:00.000Z', {
+                rawType: 'date',
+                numericRaw: 45_092,
+                numberFormat: { code: 'mmm-yy' },
+            }),
+            cell('0', { formula: '=A1' }),
+        ]] }]);
+        const result = (value: string) => calculate_workbook_formulas(source, {
+            edits: [{ ...target(0, 0, 0), value, writesFormula: false }],
+            targets: [target(0, 0, 1)],
+        });
+
+        expect(result('Jun-23')).toEqual([{ ...target(0, 0, 1), value: '45092' }]);
+        expect(result('Jul-23')).toEqual([{ ...target(0, 0, 1), value: '45122' }]);
+    });
+
     it('infers the 1904 epoch for dirty native ISO date cells without a style', () => {
         const source = workbook([{ name: 'Sheet1', rows: [[
             cell('2024-01-15T00:00:00.000Z', {

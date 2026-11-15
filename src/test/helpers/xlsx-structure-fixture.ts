@@ -30,6 +30,8 @@ export interface FixtureWorkbook {
     readonly sharedStrings?: readonly string[];
     /** Include `xl/calcChain.xml` listing these cells (`Sheet index`, `A1` ref). */
     readonly calcChain?: readonly { readonly sheet: number; readonly ref: string }[];
+    /** Number format codes for further cell formats, from index 4 on. */
+    readonly numberFormats?: readonly string[];
 }
 
 /** Four cell formats: 0 default, 1 bold, 2 percent, 3 fill. */
@@ -84,7 +86,15 @@ export function build_fixture_xlsx(spec: FixtureWorkbook): Uint8Array {
 <workbook xmlns="${MAIN_NS}" xmlns:r="${REL_NS}"><bookViews><workbookView/></bookViews><sheets>${
     spec.sheets.map((sheet, index) => `<sheet name="${sheet.name}" sheetId="${index + 1}" r:id="rId${index + 1}"/>`).join('')
 }</sheets>${spec.definedNames === undefined ? '' : `<definedNames>${spec.definedNames}</definedNames>`}<calcPr calcId="191029"/></workbook>`);
-    add('xl/styles.xml', FIXTURE_STYLES);
+    const formats = spec.numberFormats ?? [];
+    add('xl/styles.xml', formats.length === 0 ? FIXTURE_STYLES : FIXTURE_STYLES
+        .replace('<numFmts count="0"/>', `<numFmts count="${formats.length}">${
+            formats.map((code, index) => `<numFmt numFmtId="${164 + index}" formatCode="${xml_text(code).replace(/"/g, '&quot;')}"/>`).join('')
+        }</numFmts>`)
+        .replace('<cellXfs count="4">', `<cellXfs count="${4 + formats.length}">`)
+        .replace('</cellXfs>', `${
+            formats.map((_, index) => `<xf numFmtId="${164 + index}" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>`).join('')
+        }</cellXfs>`));
     if (spec.sharedStrings !== undefined) {
         add('xl/sharedStrings.xml', `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <sst xmlns="${MAIN_NS}" count="${spec.sharedStrings.length}" uniqueCount="${spec.sharedStrings.length}">${
