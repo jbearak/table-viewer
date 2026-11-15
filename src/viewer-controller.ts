@@ -13442,7 +13442,9 @@ export function attach_viewer(
                                 : { worksheetId: command_sheet.worksheetId }),
                         }, result.error);
                     } else if (result.type === 'rejected' && !disposed) {
-                        fail(result.error);
+                        // Admission is asked again at every commit step; a refusal
+                        // there for edit-session work is as transient as at entry.
+                        fail(result.error, result.error === EDIT_SESSION_WORK_FINISHING_MESSAGE);
                         if (
                             result.error
                                 === 'The selected worksheet no longer matches this request.'

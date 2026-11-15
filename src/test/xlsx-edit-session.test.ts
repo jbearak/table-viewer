@@ -8482,6 +8482,116 @@ describe('xlsx edit sessions', () => {
             sequence: 2,
         });
     });
+
+    it('marks a header change refused mid-commit, because edit-session work began, as transient', async () => {
+        // Entry admission passed. While the header write is in flight a discard
+        // begins its cleanup, so the commit-time admission check refuses with
+        // "Finishing edit-session work". That refusal is about timing, exactly
+        // as it is at entry, so the renderer must be told it may retry.
+        const state = versioned_state_store({});
+        const base_store = state.store;
+        let release_cleanup: (() => void) | undefined;
+        let block_next_write: (() => void) | undefined;
+        const gated_store: typeof base_store = {
+            ...base_store,
+            async compare_and_set(...args: Parameters<typeof base_store.compare_and_set>) {
+                const started = block_next_write;
+                if (started) {
+                    block_next_write = undefined;
+                    started();
+                    await new Promise<void>((resolve) => { release_cleanup = resolve; });
+                }
+                return base_store.compare_and_set(...args);
+            },
+        };
+        const authority_store = with_in_memory_authority_transactions(gated_store);
+        let session = '';
+        let discard_during_header: Promise<void> | undefined;
+        const store: typeof authority_store = {
+            ...authority_store,
+            async stage_authority_transaction(file, transaction) {
+                if (transaction.id.startsWith('projection:') && discard_during_header === undefined) {
+                    discard_during_header = new Promise<void>((resolve) => {
+                        block_next_write = resolve;
+                    });
+                    void panel.__receive({ type: 'discardEditSession', editSessionId: session });
+                    await discard_during_header;
+                    // The discard's cleanup write now holds the state lock, so a
+                    // real stage would wait on it. The commit checks admission
+                    // again before it reads the stage result; this result is
+                    // never used.
+                    return { type: 'staged' };
+                }
+                return authority_store.stage_authority_transaction(file, transaction);
+            },
+        };
+        const panel = vscode_mock.window.createWebviewPanel('tableViewer.editor', 'table');
+        const controller = attach_viewer(
+            panel as unknown as Parameters<typeof attach_viewer>[0],
+            uri(file_path),
+            store,
+            profile_for(file_path),
+            fake_viewer_host,
+        );
+        panel.onDidDispose(() => controller.dispose());
+        await panel.__receive({ type: 'ready' });
+        await wait_for_observable(() => has_snapshot(panel));
+        await panel.__receive({ type: 'requestEditSession', requestId: 'edit', sheetIndex: 0 });
+        session = latest_edit_session(panel)!.editSessionId!;
+        await panel.__receive({
+            type: 'pendingChangesChanged',
+            sourceGeneration: latest_snapshot(panel).sourceGeneration,
+            editSessionId: session,
+            sequence: 1,
+            changes: {
+                sheetIndex: 0,
+                sheetName: 'People',
+                worksheetId: '1',
+                cells: { '1:0': { value: 'Alicia', base: 'Alice' } },
+                formatTemplates: [],
+                appendedRows: [],
+                tailRemovals: [],
+                conflicts: [],
+            },
+        });
+        await controller.drain();
+        const before_header = latest_snapshot(panel);
+        await panel.__receive({
+            type: 'snapshotApplied',
+            identity: before_header.identity,
+            disposition: 'applied',
+        });
+
+        await panel.__receive({
+            type: 'setExcelFirstRowHeader',
+            sheetIndex: 0,
+            sheetName: 'People',
+            enabled: false,
+            requestId: 'header-during-cleanup',
+            generation: before_header.generation,
+            sourceGeneration: before_header.sourceGeneration,
+        });
+        const header_result = () => panel.__messages.flatMap((message) => {
+            const result = (message as {
+                type?: string;
+                snapshot?: { commandResult?: { requestId?: string } };
+            }).type === 'workbookSnapshot'
+                ? (message as { snapshot: { commandResult?: { requestId?: string } } })
+                    .snapshot.commandResult
+                : undefined;
+            return result?.requestId === 'header-during-cleanup' ? [result] : [];
+        }).at(-1);
+        await wait_for_observable(() => header_result() !== undefined);
+        release_cleanup?.();
+        await controller.drain();
+        expect(header_result()).toEqual({
+            type: 'excelFirstRowHeader',
+            requestId: 'header-during-cleanup',
+            outcome: 'rejected',
+            error: 'Finishing edit-session work; try again in a moment.',
+            transient: true,
+        });
+    });
 });
 
 function rewrite_workbook_xml(
