@@ -2902,7 +2902,9 @@ describe('Excel first-row header toggle', () => {
         const button = get_button('Header Row');
         expect(button.disabled).toBe(false);
         expect(button.getAttribute('aria-disabled')).toBe('true');
-        expect(grid_shell_mock.latest_props?.can_promote_row_to_header).toBe(false);
+        // Offered by the rules the restore will install, disabled until it lands.
+        expect(grid_shell_mock.latest_props?.can_promote_row_to_header).toBe(true);
+        expect(grid_shell_mock.latest_props?.promote_row_to_header_waits).toBe(true);
 
         await open_scope_menu('Header row scope');
         expect(Array.from(
@@ -2922,6 +2924,7 @@ describe('Excel first-row header toggle', () => {
             .some((message) => message.type === 'setExcelFirstRowHeader')).toBe(false);
         await acknowledge_transform(sheet_three_restore, 4);
         expect(grid_shell_mock.latest_props?.can_promote_row_to_header).toBe(true);
+        expect(grid_shell_mock.latest_props?.promote_row_to_header_waits).toBe(false);
         post_message.mockClear();
         await act(async () => {
             const promote = grid_shell_mock.latest_props?.on_promote_row_to_header as

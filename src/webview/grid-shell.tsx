@@ -617,6 +617,7 @@ import {
     row_move_block_refusal,
     row_move_item_model,
     row_structure_label,
+    STRUCTURE_BUSY_MESSAGE,
     merge_ranges_of,
     structure_auto_filter,
     type RowStructurePlan,
@@ -1688,6 +1689,12 @@ export interface GridShellProps {
      */
     transform_waits_for_claim?: boolean;
     transform_pending?: boolean;
+    /**
+     * The rules the transform in flight will install. Menus offer their items
+     * by these, and `transform_pending` only disables them, so an item does not
+     * appear or vanish under the pointer when the transform lands.
+     */
+    pending_transform_target?: SheetTransformState;
     on_transform_change?: (state: SheetTransformState) => void;
     on_open_filter?: (
         source_column: number,
@@ -1698,6 +1705,8 @@ export interface GridShellProps {
     on_hide_columns?: (source_columns: number[]) => void;
     on_hide_rows?: (display_rows: DisplayRowInterval[]) => void;
     can_promote_row_to_header?: boolean;
+    /** A transform is in flight on some sheet: "Use row as header" is shown disabled. */
+    promote_row_to_header_waits?: boolean;
     on_promote_row_to_header?: (display_row: number) => void;
     /** Focus recovery target when hiding the final visible header removes Glide. */
     on_focus_columns?: () => void;
@@ -1798,12 +1807,14 @@ export function GridShell({
     transform_sections = false,
     transform_waits_for_claim = false,
     transform_pending = false,
+    pending_transform_target,
     on_transform_change = () => {},
     on_open_filter = () => {},
     on_hide_column = () => {},
     on_hide_columns = () => {},
     on_hide_rows = () => {},
     can_promote_row_to_header = false,
+    promote_row_to_header_waits = false,
     on_promote_row_to_header = () => {},
     on_focus_columns = () => {},
     cell_highlights,
@@ -10974,6 +10985,14 @@ export function GridShell({
     const menu_session_coming = edit_armed && menu_offers_edits;
     const menu_edits_shown = editable_cells || menu_session_coming;
     const transform_menu_sections = transform_sections || transform_waits_for_claim;
+    // Which items a menu offers follows the rules a transform in flight will
+    // install; its being in flight only disables them.
+    const menu_transform_state = transform_pending
+        ? pending_transform_target ?? transform_state
+        : transform_state;
+    const hide_rows_disabled_reason = inserted_rows_lock
+        ? INSERTED_ROWS_TRANSFORM_MESSAGE
+        : transform_pending ? STRUCTURE_BUSY_MESSAGE : undefined;
     // Asked again when a sort or filter settles: one in flight is refused.
     useEffect(() => {
         if (menu_open && edit_armed && menu_offers_edits && !transform_pending) {
@@ -11821,8 +11840,8 @@ export function GridShell({
             show_disabled_hide_rows: selection_has_structural_rows
                 || (!!selected_rows
                     && transform_menu_sections
-                    && (inserted_rows_lock || (!transform_pending && !preview_mode))),
-            ...(inserted_rows_lock ? { hide_rows_disabled_reason: INSERTED_ROWS_TRANSFORM_MESSAGE } : {}),
+                    && (inserted_rows_lock || !preview_mode)),
+            ...(hide_rows_disabled_reason === undefined ? {} : { hide_rows_disabled_reason }),
             selected_row_count,
             selected_column_count: hide_column_targets.length,
             ...(hide_spans_pending_column
@@ -12158,10 +12177,10 @@ export function GridShell({
                                 && !inserted_rows_lock,
                             show_disabled_hide_rows: has_structural_rows
                                 || (transform_menu_sections
-                                    && (inserted_rows_lock || (!transform_pending && !preview_mode))),
-                            ...(inserted_rows_lock
-                                ? { hide_rows_disabled_reason: INSERTED_ROWS_TRANSFORM_MESSAGE }
-                                : {}),
+                                    && (inserted_rows_lock || !preview_mode)),
+                            ...(hide_rows_disabled_reason === undefined
+                                ? {}
+                                : { hide_rows_disabled_reason }),
                             // The sort/filter restriction is about row order —
                             // promoting a row hides the rows above it, which only
                             // means anything in natural order — and README
@@ -12171,11 +12190,12 @@ export function GridShell({
                             // holds one itself while it is open.
                             can_promote_row_to_header: can_promote_row_to_header
                                 && transform_menu_sections
-                                && !transform_pending
                                 && !preview_mode
-                                && transform_state.sort.length === 0
-                                && !transform_state.filters.some((filter) => filter.enabled),
-                            promote_row_disabled: !transform_sections,
+                                && menu_transform_state.sort.length === 0
+                                && !menu_transform_state.filters.some((filter) => filter.enabled),
+                            promote_row_disabled: !transform_sections
+                                || transform_pending
+                                || promote_row_to_header_waits,
                             on_hide_rows: () => on_hide_rows(row_menu.source_display_rows),
                             ...(only_pending ? {
                                 pending_row_count: selected_pending_ids.size,
@@ -12324,9 +12344,9 @@ export function GridShell({
             })()}
             {context_menu?.kind === 'header' && context_menu.source_col !== undefined && (() => {
                 const source_column = context_menu.source_col;
-                const active_sort = transform_state.sort.find((key) =>
+                const active_sort = menu_transform_state.sort.find((key) =>
                     key.colIndex === source_column);
-                const existing_filter = transform_state.filters.find((entry) =>
+                const existing_filter = menu_transform_state.filters.find((entry) =>
                     entry.colIndex === source_column);
                 const structure = structure_items({ axis: 'columns', selection: context_menu.structure });
                 // A column with a structure change other than a removal renames
@@ -12348,11 +12368,11 @@ export function GridShell({
                             : {})}
                         {...(structure === undefined ? {} : { structure })}
                         active_direction={active_sort?.direction ?? null}
-                        any_sorted={transform_state.sort.length > 0}
-                        other_columns_sorted={transform_state.sort.some((key) =>
+                        any_sorted={menu_transform_state.sort.length > 0}
+                        other_columns_sorted={menu_transform_state.sort.some((key) =>
                             key.colIndex !== source_column)}
                         has_filter={existing_filter !== undefined}
-                        any_filtered={transform_state.filters.length > 0}
+                        any_filtered={menu_transform_state.filters.length > 0}
                         on_copy={() => copy_rect({
                             x: context_menu.display_col,
                             y: 0,

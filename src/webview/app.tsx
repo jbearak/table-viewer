@@ -6244,14 +6244,19 @@ export function App(): React.JSX.Element {
      * target sheet's durable rules are installed: `headerRow` is display-keyed, so
      * sending it against the natural view while a hidden-row restore is still owed
      * names a different source row at the host.
+     *
+     * `count_in_flight` false asks only about the rules installed now, for the
+     * row menu, which shows a transform in flight as disabled rather than absent.
      */
     const header_waits_for_transform = useCallback((
         target_sheet_index: number,
         display_keyed: boolean,
+        count_in_flight = true,
     ) => {
         if (
-            pending_transform_request_ids_ref.current.some(Boolean)
-            || pending_transforms.some(Boolean)
+            count_in_flight
+            && (pending_transform_request_ids_ref.current.some(Boolean)
+                || pending_transforms.some(Boolean))
         ) return true;
         if (!display_keyed) return false;
         const sheet = meta?.sheets[target_sheet_index];
@@ -8807,13 +8812,20 @@ export function App(): React.JSX.Element {
     );
     // Promotion is offered from the row menu, which holds a session of its own
     // while open: only a session with unsaved work locks the header row there.
+    // A transform in flight only disables it (see the prop below).
     const promote_row_blocked = !!excel_header && (
         (editing_session_held
             && (edit_session_registry_ref.current!.has_dirty_entries()
                 || editing_status?.has_live_uncommitted === true))
-        || any_transform_pending
         || excel_header_pending
     );
+    // While this sheet's sort, filter, or Hide rows is in flight, the menus
+    // offer items by the rules it will install, so nothing appears or vanishes
+    // under the pointer when it lands. Hide rows requests no rules: those on
+    // screen stay.
+    const pending_transform_target = transform_pending && !preview_mode
+        ? pending_transform_states_ref.current[active_sheet_index] ?? visible_transform
+        : undefined;
     const excel_header_disabled_reason = !excel_header_candidate_available
         && !excel_header?.active
         ? 'This sheet has no first row to use as column names.'
@@ -9304,6 +9316,7 @@ export function App(): React.JSX.Element {
             transform_sections={!transform_ui_blocked}
             transform_waits_for_claim={transform_waits_for_claim}
             transform_pending={transform_pending}
+            {...(pending_transform_target === undefined ? {} : { pending_transform_target })}
             on_transform_change={handle_grid_transform_change}
             on_open_filter={open_grid_filter_editor}
             on_hide_column={handle_toggle_column}
@@ -9311,8 +9324,11 @@ export function App(): React.JSX.Element {
             on_hide_rows={handle_hide_rows}
             can_promote_row_to_header={
                 excel_header !== undefined && !promote_row_blocked && !preview_mode
-                    && !header_waits_for_transform(active_sheet_index, true)
+                    // In flight here, GridShell asks the rules it will install.
+                    && (transform_pending
+                        || !header_waits_for_transform(active_sheet_index, true, false))
             }
+            promote_row_to_header_waits={any_transform_pending}
             on_promote_row_to_header={handle_promote_row_to_header}
             on_focus_columns={focus_columns_trigger}
             cell_highlights={cell_highlights?.sheets[active_sheet_index]}
