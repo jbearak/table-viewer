@@ -7008,6 +7008,44 @@ export function attach_viewer(
         });
     }
 
+    /** Has `committed` moved on from `operation`: does any of its worksheets no longer echo it? */
+    function operation_superseded_by(
+        operation: CsvSaveOperation,
+        committed: PerFileState,
+    ): boolean {
+        return operation.worksheets.some((worksheet) => {
+            const operation_index = operation_sheet_index(
+                worksheet,
+                undefined,
+                committed.pendingEdits,
+            );
+            if (operation_index === undefined) return false;
+            return !pending_changes_echo_operation(
+                pending_changes_for_sheet(
+                    committed.pendingEdits,
+                    operation_index,
+                    worksheet.sheetName,
+                    worksheet.worksheetId,
+                ),
+                worksheet,
+            );
+        });
+    }
+
+    /**
+     * A header change writes the session's Pending Changes moved to the new
+     * body start (`plan_excel_override_state`). A failed save's operation still
+     * holds them as they were, and while it stands every snapshot in its session
+     * restores them from it. Once the committed state no longer echoes it, it
+     * stops standing, as when a publication moves on from it.
+     */
+    function retire_failed_save_superseded_by(state: Readonly<FileStateSnapshot>['state']): void {
+        if (save_lifecycle.state !== 'failed' || !('operation' in save_lifecycle)) return;
+        if (operation_superseded_by(save_lifecycle.operation, state as PerFileState)) {
+            retire_save_lifecycle(undefined, 'failed');
+        }
+    }
+
     /**
      * `scope` names the worksheet whose cells these are, when the caller knows.
      * A save lifecycle and a tombstone each belong to one worksheet, so their
@@ -9070,6 +9108,7 @@ export function attach_viewer(
                 sheet_index,
             );
         }
+        retire_failed_save_superseded_by(state);
         session.retain_command_result({
             type: 'excelFirstRowHeader',
             requestId: waiter.requestId,
@@ -9193,6 +9232,7 @@ export function attach_viewer(
                             );
                             settle_header_on_adoption(receipt.stateSnapshot.state);
                             if (is_origin) {
+                                retire_failed_save_superseded_by(receipt.stateSnapshot.state);
                                 session.retain_command_result({
                                     type: 'excelFirstRowHeader',
                                     requestId: receipt.requestId,
@@ -15413,24 +15453,9 @@ export function attach_viewer(
                     }
                     retire_pending_edit_target(edit_session_id, posted_target, sequence);
                     const committed = result.snapshot.state as PerFileState;
-                    const supersedes = (operation: CsvSaveOperation) => operation.worksheets
-                        .some((worksheet) => {
-                            const operation_index = operation_sheet_index(
-                                worksheet,
-                                undefined,
-                                committed.pendingEdits,
-                            );
-                            if (operation_index === undefined) return false;
-                            return !pending_changes_echo_operation(
-                                pending_changes_for_sheet(
-                                    committed.pendingEdits,
-                                    operation_index,
-                                    worksheet.sheetName,
-                                    worksheet.worksheetId,
-                                ),
-                                worksheet,
-                            );
-                        });
+                    const supersedes = (operation: CsvSaveOperation) => (
+                        operation_superseded_by(operation, committed)
+                    );
                     const tombstone = file_edit_state?.failedSaveTombstone;
                     if (
                         file_edit_state

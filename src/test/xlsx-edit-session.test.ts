@@ -8592,6 +8592,124 @@ describe('xlsx edit sessions', () => {
             transient: true,
         });
     });
+    it('stops a failed save from standing for the session once a header change moves its pending rows', async () => {
+        // The failed save keeps the session, and every snapshot in that session
+        // hydrates the failed operation's structure (csv-save-lifecycle.ts).
+        // The header change writes the Pending Changes moved to the new body
+        // start; the operation still holds the old append basis. Adopting the
+        // header must not hand the renderer that operation as its truth.
+        const state = versioned_state_store({});
+        const panel = await open_ready_xlsx(file_path, state);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'edit', sheetIndex: 0 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+        await panel.__receive({
+            type: 'requestAppendRows',
+            requestId: 'append-before-failed-save',
+            editSessionId: session,
+            worksheet: { sheetIndex: 0, sheetName: 'People', worksheetId: '1' },
+            sourceGeneration: latest_snapshot(panel).sourceGeneration,
+            count: 1,
+        });
+        const admission = panel.__messages.find((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { type?: unknown }).type === 'appendRowsResult'
+            && (message as { requestId?: unknown }).requestId === 'append-before-failed-save'
+        )) as Extract<import('../types').HostMessage, { type: 'appendRowsResult' }>;
+        expect(admission.granted, admission.reason).toBe(true);
+        await panel.__receive({
+            type: 'settleRowAdmission',
+            requestId: 'append-before-failed-save',
+            editSessionId: session,
+            accepted: true,
+        });
+        // The base the renderer captured no longer matches the file, so the
+        // save fails while the session goes on.
+        const cells = { '1:0': { value: 'Alicia', base: 'Someone else' } };
+        const structural = {
+            formatTemplates: [admission.formatTemplate!],
+            appendedRows: [{
+                id: admission.rowIds![0],
+                cells: {},
+                formatTemplateId: admission.formatTemplate!.id,
+                createdOrder: 1,
+            }],
+            tailRemovals: [],
+            appendBasis: admission.appendBasis!,
+            conflicts: [],
+        };
+        await panel.__receive({
+            type: 'pendingChangesChanged',
+            sourceGeneration: latest_snapshot(panel).sourceGeneration,
+            editSessionId: session,
+            sequence: 1,
+            changes: {
+                sheetIndex: 0,
+                sheetName: 'People',
+                worksheetId: '1',
+                cells,
+                ...structural,
+            },
+        });
+        await controller_of(panel).drain();
+        expect(panel.__messages).toContainEqual({
+            type: 'pendingChangesAcknowledged',
+            editSessionId: session,
+            sequence: 1,
+        });
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: workbook_request(session, 'failing-save', save_worksheet({
+                edits: { '1:0': 'Alicia' },
+                dirtyEdits: cells,
+                structuralChanges: structural,
+            })),
+        });
+        await wait_for_observable(() => save_results(panel).length > 0);
+        expect(save_results(panel).at(-1)).toMatchObject({
+            success: false,
+            lifecycle: { state: 'failed', operation: { editSessionId: session } },
+        });
+        await controller_of(panel).drain();
+        const before_header = latest_snapshot(panel);
+        await panel.__receive({
+            type: 'snapshotApplied',
+            identity: before_header.identity,
+            disposition: 'applied',
+        });
+
+        await panel.__receive({
+            type: 'setExcelFirstRowHeader',
+            sheetIndex: 0,
+            sheetName: 'People',
+            enabled: false,
+            requestId: 'header-after-failed-save',
+            generation: before_header.generation,
+            sourceGeneration: before_header.sourceGeneration,
+        });
+        type HeaderSnapshot = ReturnType<typeof latest_snapshot> & {
+            commandResult?: { requestId?: string; outcome?: string };
+            capabilities: {
+                csvEditSessionId?: string;
+                csvSaveLifecycle?: { state: string };
+            };
+        };
+        const adopted = (): HeaderSnapshot | undefined => panel.__messages.flatMap((message) => {
+            if ((message as { type?: unknown }).type !== 'workbookSnapshot') return [];
+            const snapshot = (message as { snapshot: HeaderSnapshot }).snapshot;
+            return snapshot.commandResult?.requestId === 'header-after-failed-save' ? [snapshot] : [];
+        }).at(-1);
+        await wait_for_observable(() => adopted() !== undefined);
+        const snapshot = adopted()!;
+        expect(snapshot.commandResult?.outcome).toBe('applied');
+        expect(snapshot.capabilities.csvEditSessionId).toBe(session);
+        const committed = snapshot.state!.pendingEdits![0]!;
+        expect(committed.appendBasis!.schemaFingerprint)
+            .not.toBe(admission.appendBasis!.schemaFingerprint);
+        // The failed operation, still holding the old append basis, no longer
+        // stands for the session.
+        expect(snapshot.capabilities.csvSaveLifecycle?.state).toBe('idle');
+    });
 });
 
 function rewrite_workbook_xml(
