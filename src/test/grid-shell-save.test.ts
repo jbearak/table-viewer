@@ -2102,6 +2102,32 @@ describe('GridShell editing with no session held yet', () => {
         await overlay.unmount();
     });
 
+    it('renders the cell a Tab moves to before the next task, so a key typed at once edits there', async () => {
+        const overlay = open_editors_as_glide_does();
+        await render_grid(three_columns);
+        await select_cell([0, 0]);
+        await act(async () => { grid_mock.open_overlay([0, 0], 'a'); });
+        const input = overlay.input()!;
+        expect(input.value).toBe('a');
+
+        // Outside act, as a key reaches the page: React renders a key's own
+        // updates in a microtask, and anything else in a later task, after
+        // which the next key may already have arrived. Glide opens the editor
+        // for that key at the cell it last rendered as selected.
+        const act_environment = globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean };
+        act_environment.IS_REACT_ACT_ENVIRONMENT = false;
+        try {
+            input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Tab', bubbles: true, cancelable: true }));
+            for (let i = 0; i < 10; i += 1) await Promise.resolve();
+            expect(overlay.finished).toEqual(['a']);
+            expect(selected_cell()).toEqual([1, 0]);
+        } finally {
+            act_environment.IS_REACT_ACT_ENVIRONMENT = true;
+        }
+        await flush();
+        await overlay.unmount();
+    });
+
     it('replays every edit a run of Tabs and Spaces leads to before the grant', async () => {
         const { request, grant } = session_request();
         const overlay = open_editors_as_glide_does();

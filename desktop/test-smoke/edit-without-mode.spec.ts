@@ -186,16 +186,8 @@ for (const session of ['before the session is granted', 'under a session']) {
         }
         await select_cell(1, 0);
         // ж starts the edit, Enter commits it and selects the cell below, and
-        // ü starts the next edit there. Before the grant every key lands at
-        // once. Under a session the test waits for Enter to move the
-        // selection first, which a key sent in the same task can overtake.
-        if (session === 'under a session') {
-            await type_on_layout(['ж', 'é', 'Enter']);
-            await expect(cell(1, 1)).toHaveAttribute('aria-selected', 'true');
-            await type_on_layout(['ü', 'ß']);
-        } else {
-            await type_on_layout(['ж', 'é', 'Enter', 'ü', 'ß']);
-        }
+        // ü starts the next edit there. Every key lands at once.
+        await type_on_layout(['ж', 'é', 'Enter', 'ü', 'ß']);
         await expect(cell(1, 1)).toHaveAttribute('aria-selected', 'true');
         await expect(editor()).toBeVisible();
         await expect(editor()).toHaveValue('üß');
@@ -471,4 +463,78 @@ test('undo after Save takes a saved appended row back out on the first press', a
     await expect.poll(() => fs.readFileSync(csv, 'utf8')).toBe(fixture_text);
     await expect(rows).toHaveCount(3);
     await expect_nothing_unsaved();
+});
+
+/**
+ * Send `keys` through CDP, a key down and up for each, without waiting for
+ * one to be handled before sending the next. They reach the app in order and
+ * as fast as a barcode scanner, a text expander, or key repeat sends them:
+ * faster than Playwright's `press`, and often before the render that follows
+ * the key before. `\n` is Enter and `\t` is Tab.
+ */
+async function type_fast(keys: string): Promise<void> {
+    const special: Record<string, { key: string; code: string; windowsVirtualKeyCode: number; text?: string }> = {
+        '\n': { key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, text: '\r' },
+        '\t': { key: 'Tab', code: 'Tab', windowsVirtualKeyCode: 9 },
+    };
+    const cdp = await page.context().newCDPSession(page);
+    try {
+        await Promise.all([...keys].flatMap((character) => {
+            const named = special[character];
+            const key = named === undefined ? { key: character } : {
+                key: named.key,
+                code: named.code,
+                windowsVirtualKeyCode: named.windowsVirtualKeyCode,
+            };
+            const text = named === undefined ? character : named.text;
+            return [
+                cdp.send('Input.dispatchKeyEvent', text === undefined
+                    ? { ...key, type: 'rawKeyDown' }
+                    : { ...key, type: 'keyDown', text, unmodifiedText: text }),
+                cdp.send('Input.dispatchKeyEvent', { ...key, type: 'keyUp' }),
+            ];
+        }));
+    } finally {
+        await cdp.detach();
+    }
+}
+
+/** Make an edit elsewhere, so that the session stays held. */
+async function hold_session(): Promise<void> {
+    await select_cell(3, 2);
+    await page.keyboard.press('Delete');
+    await expect(cell(3, 2)).toHaveText('');
+    await expect(save()).toHaveClass(/has-unsaved/);
+}
+
+test('keys typed fast under a session after an Enter or Tab start the next edit at the next cell', async () => {
+    await hold_session();
+    // Enter commits "ab" and selects the cell below, where "cd" starts the
+    // next edit, however soon after the Enter it comes. The second Enter
+    // commits it there.
+    await select_cell(1, 0);
+    await type_fast('ab\ncd\n');
+    await expect(cell(1, 2)).toHaveAttribute('aria-selected', 'true');
+    await expect(editor()).toBeHidden();
+    await expect(cell(1, 0)).toHaveText('ab');
+    await expect(cell(1, 1)).toHaveText('cd');
+
+    // Tab commits and selects the cell to the right.
+    await select_cell(1, 2);
+    await type_fast('ef\tgh\t');
+    await expect(cell(3, 2)).toHaveAttribute('aria-selected', 'true');
+    await expect(editor()).toBeHidden();
+    await expect(cell(1, 2)).toHaveText('ef');
+    await expect(cell(2, 2)).toHaveText('gh');
+});
+
+test('a barcode scan under a session fills one cell per scan, each ending with Enter', async () => {
+    await hold_session();
+    await select_cell(2, 0);
+    await type_fast('12345\n67890\n');
+    await expect(cell(2, 2)).toHaveAttribute('aria-selected', 'true');
+    await expect(editor()).toBeHidden();
+    await expect(cell(2, 0)).toHaveText('12345');
+    await expect(cell(2, 1)).toHaveText('67890');
+    await expect(cell(2, 2)).toHaveText('35');
 });
