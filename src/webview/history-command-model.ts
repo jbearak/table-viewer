@@ -85,30 +85,40 @@ export function history_refusal_warning(
 /**
  * What to say about a change that cannot be replayed under the current Header
  * Row. The change stays in history, so the message says which header row
- * makes it replayable. Row numbers are the sheet's, 1-based.
+ * makes it replayable: the one it was made under always does. Row numbers are
+ * the sheet's, 1-based. `sheet_name` is given when the workbook has more than
+ * one worksheet: the refusal comes before replay would switch to the change's
+ * worksheet, so "row 3" alone could be read as the one on screen.
  */
-export function header_wait_warning(wait: HeaderWait, direction: HistoryDirection): string {
-    if (wait.reason === 'notice') {
-        return `Can't ${direction} this change until the row and column changes notice is resolved.`;
-    }
-    if (wait.reason === 'header-cell') {
-        // The cell's row is the Header Row at exactly one of the two body starts.
-        if (wait.row !== undefined && wait.row === wait.to - 1) {
-            return `Can't ${direction} this cell change while row ${wait.to} is the header row: `
-                + `it was made when row ${wait.to} was an ordinary row. `
-                + `Use another row as the header row, or turn the header row off, to ${direction} it.`;
-        }
-        return `Can't ${direction} this change while row ${wait.from} is not the header row: `
-            + `it changed a column name when row ${wait.from} was the header row. `
-            + `Use row ${wait.from} as the header row to ${direction} it.`;
-    }
+export function header_wait_warning(
+    wait: HeaderWait,
+    direction: HistoryDirection,
+    sheet_name?: string,
+): string {
+    const sheet = sheet_name === undefined ? '' : `Sheet “${sheet_name}”: `;
     const remedy = wait.from > 0
         ? `Use row ${wait.from} as the header row`
         : 'Turn the header row off';
-    if (wait.to === 0) {
-        return `Can't ${direction} this row change while the header row is off: `
-            + `it was made when row ${wait.from} was the header row. ${remedy} to ${direction} it.`;
+    if (wait.reason === 'header-cell') {
+        // The cell's row is the Header Row at exactly one of the two body starts.
+        if (wait.row !== undefined && wait.row === wait.to - 1) {
+            return `${sheet}Can't ${direction} this cell change while row ${wait.to} is the header row: `
+                + `it was made when row ${wait.to} was an ordinary row. `
+                + `Use another row as the header row, or turn the header row off, to ${direction} it.`;
+        }
+        return `${sheet}Can't ${direction} this change while row ${wait.from} is not the header row: `
+            + `it changed a column name when row ${wait.from} was the header row. `
+            + `${remedy} to ${direction} it.`;
     }
-    return `Can't ${direction} this row change while row ${wait.to} is the header row: `
-        + `it changes rows that are now in or above the header. ${remedy} to ${direction} it.`;
+    if (wait.reason === 'rows' && wait.to > 0) {
+        return `${sheet}Can't ${direction} this row change while row ${wait.to} is the header row: `
+            + `it changes rows that are now in or above the header. ${remedy} to ${direction} it.`;
+    }
+    // A recorded side that cannot be carried for another reason (it holds a
+    // layout conflict, or the worksheet lost rows). Under the header it was
+    // made with, nothing has to be carried.
+    const now = wait.to > 0 ? `row ${wait.to} is the header row` : 'the header row is off';
+    const then = wait.from > 0 ? `row ${wait.from} was the header row` : 'the header row was off';
+    return `${sheet}Can't ${direction} this change while ${now}: it was made when ${then}. `
+        + `${remedy} to ${direction} it.`;
 }

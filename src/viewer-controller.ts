@@ -9044,7 +9044,11 @@ export function attach_viewer(
                     }
                     // Read off the source being replaced, and only when the
                     // adopted one is another projection of the same bytes: a
-                    // Header Row change adopted through a refresh.
+                    // Header Row change adopted through a refresh. Every
+                    // physical adoption records its digest, so both are known
+                    // once a source is installed; one that is not known cannot
+                    // vouch for the bytes, and row authority then stays where
+                    // it is (a redo is refused, never relabelled).
                     const previous_digest = source_authority.physicalDigest;
                     const fingerprints_before = source !== undefined
                         && previous_digest !== undefined

@@ -9161,6 +9161,122 @@ describe('xlsx edit sessions', () => {
                 .not.toBe(admission.appendBasis!.schemaFingerprint);
         });
 
+        /** Wait for `panel` to show People's header off, and acknowledge that snapshot. */
+        async function header_off_adopted(panel: Panel): Promise<void> {
+            await wait_for_observable(() => (
+                latest_snapshot(panel).meta.sheets[0].excelFirstRowHeader?.active === false
+            ));
+            await panel.__receive({
+                type: 'snapshotApplied',
+                identity: latest_snapshot(panel).identity,
+                disposition: 'applied',
+            });
+        }
+
+        it('redoes an added row when the Header Row change failed after the worksheet had already taken it', async () => {
+            const state = versioned_state_store({});
+            const base_profile = profile_for(file_path);
+            let builds = 0;
+            let reads_after_override: number | undefined;
+            let failed_after_override = false;
+            const panel = await open_ready_xlsx(file_path, state, {
+                ...base_profile,
+                async build_source(...args: Parameters<typeof base_profile.build_source>) {
+                    const built = await base_profile.build_source(...args);
+                    builds += 1;
+                    if (builds === 1) {
+                        // The override lands on the source. Its meta is then
+                        // read once to move the row authority; the read after
+                        // that, on the way to the adoption, throws.
+                        const target = built as unknown as {
+                            set_override(name: string, override: unknown): boolean;
+                            meta(): unknown;
+                        };
+                        const set_override = target.set_override.bind(target);
+                        const meta = target.meta.bind(target);
+                        target.set_override = (name, override) => {
+                            const applied = set_override(name, override);
+                            if (applied) reads_after_override = 0;
+                            return applied;
+                        };
+                        target.meta = () => {
+                            if (reads_after_override !== undefined) {
+                                reads_after_override += 1;
+                                if (reads_after_override === 2) {
+                                    reads_after_override = undefined;
+                                    failed_after_override = true;
+                                    throw new Error('failed after the override');
+                                }
+                            }
+                            return meta();
+                        };
+                    }
+                    return built;
+                },
+            });
+            const { appended, admission } = await undone_row_after_release(panel);
+
+            // The reload that recovers finds the worksheet already showing the
+            // new header: nothing is left for it to compare, so the authority
+            // has to have moved when the override did.
+            expect(await set_header(panel, 'header-off', false)).toBe('recovered');
+            expect(failed_after_override).toBe(true);
+            expect(builds).toBeGreaterThan(1);
+            const second = await request_edit_session_when_available(panel, 'again');
+            const redone = await replay(panel, 'redo-append', PEOPLE, EMPTY, appended);
+            expect(redone.refused).toBeUndefined();
+            expect(redone.installed!.appendBasis!.schemaFingerprint)
+                .not.toBe(admission.appendBasis!.schemaFingerprint);
+            expect(await publish(panel, second, 1, PEOPLE, redone.installed!)).toBe(true);
+        });
+
+        it('redoes an added row after another window changed the Header Row', async () => {
+            const state = versioned_state_store({});
+            const origin = await open_ready_xlsx(file_path, state);
+            const peer = await open_ready_xlsx(file_path, state);
+            const { appended, admission } = await undone_row_after_release(peer);
+
+            expect(await set_header(origin, 'header-off', false)).toBe('applied');
+            await header_off_adopted(peer);
+            const second = await request_edit_session_when_available(peer, 'again');
+            const redone = await replay(peer, 'redo-append', PEOPLE, EMPTY, appended);
+            expect(redone.refused).toBeUndefined();
+            expect(redone.installed!.appendBasis!.schemaFingerprint)
+                .not.toBe(admission.appendBasis!.schemaFingerprint);
+            expect(await publish(peer, second, 1, PEOPLE, redone.installed!)).toBe(true);
+        });
+
+        it('redoes an added row after another window changed the Header Row and this one had to reload for it', async () => {
+            const state = versioned_state_store({});
+            const base_profile = profile_for(file_path);
+            let peer_builds = 0;
+            const origin = await open_ready_xlsx(file_path, state);
+            const peer = await open_ready_xlsx(file_path, state, {
+                ...base_profile,
+                async build_source(...args: Parameters<typeof base_profile.build_source>) {
+                    const built = await base_profile.build_source(...args);
+                    peer_builds += 1;
+                    if (peer_builds === 1) {
+                        (built as unknown as { set_override(): boolean }).set_override = () => false;
+                    }
+                    return built;
+                },
+            });
+            const { appended, admission } = await undone_row_after_release(peer);
+
+            // No header request is waiting in this window: the reload alone
+            // has to carry the row authority to the new column names.
+            expect(await set_header(origin, 'header-off', false)).toBe('applied');
+            await header_off_adopted(peer);
+            expect(peer_builds).toBeGreaterThan(1);
+            const second = await request_edit_session_when_available(peer, 'again');
+            const redone = await replay(peer, 'redo-append', PEOPLE, EMPTY, appended);
+            expect(redone.refused).toBeUndefined();
+            expect(redone.installed!.appendBasis!.schemaFingerprint)
+                .not.toBe(admission.appendBasis!.schemaFingerprint);
+            expect(await publish(peer, second, 1, PEOPLE, redone.installed!)).toBe(true);
+        });
+
         it('refuses the commit of a redo prepared before the Header Row moved', async () => {
             const state = versioned_state_store({});
             const panel = await open_ready_xlsx(file_path, state);

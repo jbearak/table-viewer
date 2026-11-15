@@ -1246,6 +1246,7 @@ export function App(): React.JSX.Element {
         return undefined;
     };
     const entry_for_replay_ref = useRef(entry_for_replay);
+    entry_for_replay_ref.current = entry_for_replay;
 
     /**
      * The layout-conflict notice's "Discard row and column changes on <sheet>": drop the
@@ -5946,9 +5947,16 @@ export function App(): React.JSX.Element {
         const warn_header_wait = () => {
             const wait = header_wait_ref.current;
             if (wait === null) return;
+            // Replay refuses before it would switch to the change's worksheet,
+            // so in a workbook with several the message says which one.
+            const sheets = meta_ref.current?.sheets ?? [];
+            const index = worksheet_target_index(sheets, wait.worksheet);
+            const sheet_name = sheets.length > 1
+                ? (index === undefined ? undefined : sheets[index]?.name) ?? wait.worksheet.sheetName
+                : undefined;
             host_bridge.postMessage({
                 type: 'showWarning',
-                message: header_wait_warning(wait, direction),
+                message: header_wait_warning(wait, direction, sheet_name),
             });
         };
         const initial = peek_history(history_store_ref.current!.snapshot(), direction);

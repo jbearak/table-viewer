@@ -25,6 +25,7 @@ import {
 import type { FormulaAnchors } from '../formula-anchors';
 import { append_source_rows_to_layout, type ColumnLayout, type RowLayout } from '../worksheet-layout';
 import {
+    same_worksheet_target,
     worksheet_target_key,
     worksheet_target_matches,
     type CellHighlightColor,
@@ -2484,7 +2485,10 @@ function recorded_body_starts(
     if (body_start === undefined) return {};
     const starts: Record<string, number> = {};
     const seen = new Set<string>();
+    let last: WorksheetTarget | undefined;
     for (const { delta } of action.changes) {
+        if (last !== undefined && same_worksheet_target(last, delta.worksheet)) continue;
+        last = delta.worksheet;
         const key = worksheet_target_key(delta.worksheet);
         if (seen.has(key)) continue;
         seen.add(key);

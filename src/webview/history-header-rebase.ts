@@ -35,7 +35,7 @@ import {
     type PendingStructuralChanges,
     type StructuralBasis,
 } from '../pending-changes';
-import { worksheet_target_key, type WorksheetTarget } from '../types';
+import { same_worksheet_target, worksheet_target_key, type WorksheetTarget } from '../types';
 import type { RowLayout } from '../worksheet-layout';
 import type {
     BasisTransition,
@@ -265,17 +265,25 @@ export function entry_for_current_header(
 ): EntryForHeader {
     let changes: HistoryChange[] | undefined;
     const moves = new Map<string, Move | null>();
+    // A gesture's changes come in runs on one worksheet, often thousands of
+    // cells: the key is built once per run, not once per change.
+    let last: WorksheetTarget | undefined;
+    let move: Move | null = null;
     for (const [index, change] of entry.action.changes.entries()) {
         const { worksheet } = change.delta;
-        const key = worksheet_target_key(worksheet);
-        let move = moves.get(key);
-        if (move === undefined) {
-            const current = sheet(worksheet);
-            const from = entry.bodyStarts?.[key] ?? 0;
-            move = current === undefined || current.bodyStart === from
-                ? null
-                : { from, to: current.bodyStart, sourceRowCount: current.sourceRowCount };
-            moves.set(key, move);
+        if (last === undefined || !same_worksheet_target(last, worksheet)) {
+            last = worksheet;
+            const key = worksheet_target_key(worksheet);
+            let known = moves.get(key);
+            if (known === undefined) {
+                const current = sheet(worksheet);
+                const from = entry.bodyStarts?.[key] ?? 0;
+                known = current === undefined || current.bodyStart === from
+                    ? null
+                    : { from, to: current.bodyStart, sourceRowCount: current.sourceRowCount };
+                moves.set(key, known);
+            }
+            move = known;
         }
         if (move === null) continue;
         let result: Carried<HistoryChange>;

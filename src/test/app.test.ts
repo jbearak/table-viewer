@@ -2790,6 +2790,47 @@ describe('Excel first-row header toggle', () => {
         expect(posted_since_clear(post_message, 'requestEditSession')).toEqual([]);
     });
 
+    it('names the worksheet when the change that waits is on another one', async () => {
+        // Replay refuses before it would switch worksheets, so "row 1" alone
+        // would read as the row on screen.
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(excel_meta_multi([true, false]), {
+            capabilities: EDITABLE,
+        }));
+        const props = grid_shell_mock.latest_props as unknown as GridShellProps;
+        const record = props.history_store!.stage_record({
+            label: 'Edit cell',
+            changes: [{
+                kind: 'cell',
+                delta: build_cell_history_delta({
+                    worksheet: { sheetIndex: 1, sheetName: 'S2' },
+                    sourceRow: 0,
+                    sourceColumn: 0,
+                    before: absent_overlay(),
+                    after: value_only_overlay(history_value('edited'), history_value('Name')),
+                    persistedValue: history_value('Name'),
+                    persistedHyperlink: null,
+                })!,
+            }],
+        });
+        expect(record.commit()).toBe(true);
+        record.notify();
+        await dispatch_host_message(refresh_snapshot_message(excel_meta_multi([true, true]), {
+            capabilities: EDITABLE,
+        }));
+        expect(grid_stub().getAttribute('data-sheet-index')).toBe('0');
+        post_message.mockClear();
+
+        await dispatch_host_message({ type: 'editCommand', command: 'undo' });
+        expect(posted_since_clear(post_message, 'showWarning')).toEqual([{
+            type: 'showWarning',
+            message: "Sheet “S2”: Can't undo this cell change while row 1 is the header row: "
+                + 'it was made when row 1 was an ordinary row. '
+                + 'Use another row as the header row, or turn the header row off, to undo it.',
+        }]);
+        expect(grid_stub().getAttribute('data-sheet-index')).toBe('0');
+    });
+
     it('undoes a row delete made before a header change, at the body start there is now', async () => {
         const { post_message } = await render_app();
         await dispatch_host_message(initial_snapshot_message(six_row_meta(true), { capabilities: EDITABLE }));

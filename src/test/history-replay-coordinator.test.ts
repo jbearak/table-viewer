@@ -686,7 +686,7 @@ describe('an entry re-expressed for the current Header Row', () => {
         );
         session.gate = () => {};
         const outcome = coordinator.begin('undo');
-        for (let index = 0; index < 5; index += 1) await Promise.resolve();
+        // Asked for synchronously, and held open by the gate.
         expect(session.calls).toBe(1);
         replayable = false;
         session.gate();

@@ -53,13 +53,36 @@ describe('header_wait_warning', () => {
                 + 'it changes rows that are now in or above the header. '
                 + 'Turn the header row off to undo it.');
         expect(header_wait_warning({ reason: 'rows', worksheet, from: 2, to: 0 }, 'undo'))
-            .toBe("Can't undo this row change while the header row is off: "
+            .toBe("Can't undo this change while the header row is off: "
                 + 'it was made when row 2 was the header row. '
                 + 'Use row 2 as the header row to undo it.');
     });
 
-    it('points at the notice when that is what blocks', () => {
+    it('names the header row a change was made under when it cannot be carried for another reason', () => {
         expect(header_wait_warning({ reason: 'notice', worksheet, from: 1, to: 2 }, 'undo'))
-            .toBe("Can't undo this change until the row and column changes notice is resolved.");
+            .toBe("Can't undo this change while row 2 is the header row: "
+                + 'it was made when row 1 was the header row. '
+                + 'Use row 1 as the header row to undo it.');
+        expect(header_wait_warning({ reason: 'notice', worksheet, from: 0, to: 2 }, 'redo'))
+            .toBe("Can't redo this change while row 2 is the header row: "
+                + 'it was made when the header row was off. '
+                + 'Turn the header row off to redo it.');
+    });
+
+    it('says which worksheet when the workbook has more than one', () => {
+        expect(header_wait_warning(
+            { reason: 'header-cell', worksheet, from: 1, to: 3, row: 2 }, 'undo', 'Second',
+        )).toBe("Sheet “Second”: Can't undo this cell change while row 3 is the header row: "
+            + 'it was made when row 3 was an ordinary row. '
+            + 'Use another row as the header row, or turn the header row off, to undo it.');
+        for (const wait of [
+            { reason: 'header-cell' as const, worksheet, from: 1, to: 0, row: 0 },
+            { reason: 'rows' as const, worksheet, from: 1, to: 3 },
+            { reason: 'rows' as const, worksheet, from: 2, to: 0 },
+            { reason: 'notice' as const, worksheet, from: 1, to: 2 },
+        ]) {
+            expect(header_wait_warning(wait, 'redo', 'Second'))
+                .toBe(`Sheet “Second”: ${header_wait_warning(wait, 'redo')}`);
+        }
     });
 });
