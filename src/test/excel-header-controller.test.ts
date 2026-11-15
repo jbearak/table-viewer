@@ -471,6 +471,115 @@ describe('Excel workbook snapshot controller', () => {
         expect(state.value().transforms?.[0]?.hiddenRows).toEqual([0, 1]);
     });
 
+    it('moves a pending row layout to the promoted header row in the write that commits it', async () => {
+        const rows = [
+            [text('Report'), text('')],
+            [text('Name'), text('Age')],
+            [text('Alice'), number(30)],
+            [text('Bob'), number(25)],
+            [text('Cara'), number(41)],
+        ];
+        const state = mutable_state_store({
+            excelFirstRowHeaders: { People: 'off' },
+            pendingEdits: [{
+                sheetName: 'People',
+                cells: { '2:0': { value: 'Alicia', base: 'Alice' } },
+                rowLayout: {
+                    runs: [{ kind: 'source', start: 0, count: 5 }],
+                    removedSourceRows: [{ start: 3, count: 1 }],
+                    discardedPendingRows: [],
+                },
+            }],
+        });
+        const panel = open_excel(
+            '/pending-promote.xlsx',
+            state.store,
+            excel_profile({ count: 0 }, () => new PhysicalExcelSource(rows)),
+        );
+        const initial = await ready(panel);
+        await panel.__receive({
+            type: 'setExcelFirstRowHeader',
+            sheetIndex: 0,
+            sheetName: 'People',
+            enabled: true,
+            headerRow: 1,
+            requestId: 'pending-promote',
+            generation: initial.generation,
+            sourceGeneration: initial.sourceGeneration,
+        });
+        await vi.waitFor(() => expect(snapshots(panel).at(-1)?.commandResult)
+            .toMatchObject({ requestId: 'pending-promote', outcome: 'applied' }));
+        expect(state.value().excelFirstRowHeaders).toEqual({ People: 'on' });
+        expect(state.value().pendingEdits?.[0]).toMatchObject({
+            cells: { '2:0': { value: 'Alicia', base: 'Alice' } },
+            rowLayout: {
+                runs: [{ kind: 'source', start: 2, count: 3 }],
+                removedSourceRows: [{ start: 3, count: 1 }],
+            },
+        });
+    });
+
+    it('refuses a header change its pending edits cannot follow, and stores nothing', async () => {
+        const rows = [
+            [text('Report'), text('')],
+            [text('Name'), text('Age')],
+            [text('Alice'), number(30)],
+        ];
+        const initial_state: PerFileState = {
+            excelFirstRowHeaders: { People: 'off' },
+            pendingEdits: [{
+                sheetName: 'People',
+                cells: { '1:1': { value: 'Years', base: 'Age' } },
+            }],
+        };
+        const state = mutable_state_store(initial_state);
+        const panel = open_excel(
+            '/pending-refuse.xlsx',
+            state.store,
+            excel_profile({ count: 0 }, () => new PhysicalExcelSource(rows)),
+        );
+        const initial = await ready(panel);
+        await panel.__receive({
+            type: 'setExcelFirstRowHeader',
+            sheetIndex: 0,
+            sheetName: 'People',
+            enabled: true,
+            headerRow: 1,
+            requestId: 'pending-refuse',
+            generation: initial.generation,
+            sourceGeneration: initial.sourceGeneration,
+        });
+        await vi.waitFor(() => expect(snapshots(panel).at(-1)?.commandResult).toMatchObject({
+            requestId: 'pending-refuse',
+            outcome: 'rejected',
+            error: 'Save first: the row that would become the header row has unsaved changes.',
+        }));
+        expect(state.value().excelFirstRowHeaders).toEqual({ People: 'off' });
+        expect(state.value().pendingEdits).toEqual(initial_state.pendingEdits);
+    });
+
+    it('marks a refusal for an unacknowledged refresh as transient', async () => {
+        const state = mutable_state_store();
+        const panel = open_excel('/transient-header.xlsx', state.store, excel_profile({ count: 0 }));
+        const initial = await ready(panel);
+        await panel.__receive({
+            type: 'setExcelFirstRowHeader',
+            sheetIndex: 0,
+            sheetName: 'People',
+            enabled: false,
+            requestId: 'stale-header',
+            generation: initial.generation + 1,
+            sourceGeneration: initial.sourceGeneration,
+        });
+        await vi.waitFor(() => expect(snapshots(panel).at(-1)?.commandResult).toEqual({
+            type: 'excelFirstRowHeader',
+            requestId: 'stale-header',
+            outcome: 'rejected',
+            error: 'The worksheet changed before the header request arrived.',
+            transient: true,
+        }));
+    });
+
     it('turns off every header after manual row-nine promotions in the survey workbook', async () => {
         const bytes = new Uint8Array(readFileSync(join(
             __dirname,

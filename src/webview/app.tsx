@@ -60,6 +60,7 @@ import {
 } from '../types';
 import type { WorkbookMeta } from '../data-source/interface';
 import { header_body_start } from '../worksheet-layout';
+import { header_rebase_slot_refusal } from '../header-rebase';
 import {
     advance_pending_append_basis,
     assert_pending_changes_encoded_bound,
@@ -135,6 +136,7 @@ import {
     classify_snapshot,
     normalize_complete_per_file_state,
     normalize_workbook_snapshot_state,
+    type ExcelHeaderSnapshotResult,
     type RetainedSnapshotCommandResult,
     type StructuralEditingCapability,
     type UnresolvedLfsObject,
@@ -240,6 +242,7 @@ import {
     type HistoryDirection,
 } from './history-cell-state-model';
 import {
+    history_needs_header_change_barrier,
     peek_history,
     retained_pending_row_authorities,
     is_structural_history_change,
@@ -319,6 +322,32 @@ type ColumnVisibilityUpdater = (
 ) => SheetColumnVisibilityState | undefined;
 
 type TransformOrigin = 'grid' | 'toolbar' | 'restore';
+
+/** Header Row changes still owed, one sheet per host request. See `drain_excel_header_queue`. */
+interface ExcelHeaderQueue {
+    readonly enabled: boolean;
+    readonly unhide_all: boolean;
+    /** The host display row to promote; display-keyed, so bound to `generation`. */
+    readonly header_row?: number;
+    readonly sheets: readonly number[];
+    readonly grid_focus_sheet_index?: number;
+    readonly generation: number;
+    readonly retries: number;
+    /** A transient rejection waits for a snapshot applied after this count... */
+    readonly retry_after_snapshot?: number;
+    /** ...or for this time, whichever comes first. */
+    readonly retry_not_before?: number;
+    /** Every store was published for this request. */
+    readonly flushed: boolean;
+    readonly ack_wait_started?: number;
+}
+
+/** How long a header change waits for the host to acknowledge the session's publications. */
+const HEADER_ACK_WAIT_MS = 15_000;
+/** After this long without a result, the person is told to reload. */
+const HEADER_RESULT_GUARD_MS = 60_000;
+const HEADER_RETRY_DELAY_MS = 250;
+const HEADER_TRANSIENT_RETRIES = 3;
 type FilterHistogramState = FilterHistogramStatus;
 
 const GRID_FOCUS_RESTORE_MAX_ATTEMPTS = 8;
@@ -1842,6 +1871,19 @@ export function App(): React.JSX.Element {
             value.toString(36)).join('-'),
     );
     const pending_excel_header_ref = useRef<string | null>(null);
+    // The header fence (see `lower_header_fence`): raised by the gesture that
+    // asks for a Header Row change, lowered by its last result. A ref for the
+    // gesture gates, which read it synchronously; the state re-renders.
+    const header_fence_ref = useRef(false);
+    const lower_header_fence_ref = useRef<() => void>(() => {});
+    const [header_fence, set_header_fence] = useState(false);
+    // The header queue's verdict on a header result; see `drain_excel_header_queue`.
+    const header_result_handler_ref = useRef<
+        (result: ExcelHeaderSnapshotResult) => 'report' | 'retry' | 'handled'
+    >(() => 'report');
+    // Counts `snapshotApplied` acknowledgements, so a retried header request
+    // can wait for the refresh its rejection was about to be acknowledged.
+    const snapshot_applied_seq_ref = useRef(0);
     // Toolbar-originated Header Row actions can remount the grid when their
     // authoritative snapshot advances the generation. Remember which grid owned
     // keyboard focus so the acknowledgement can restore the newly mounted one.
@@ -2336,6 +2378,93 @@ export function App(): React.JSX.Element {
         snapshot_identity_ref,
     );
 
+    /**
+     * Publish each worksheet store's current truth — content or explicit null —
+     * for the session, synchronously, and return the highest sequence produced.
+     * Shared by the close/reload flush and by a Header Row change, which must
+     * not post until the host holds everything the user sees. Leaves edit
+     * admission alone; callers fence it as they need.
+     */
+    const publish_every_store_truth = (
+        edit_session_id: string,
+        // The close boundary re-sends an unacknowledged payload under a new
+        // sequence; a header change only needs what changed since.
+        resend_unacknowledged = true,
+    ): number => {
+        let highest = pending_changes_durability.snapshot(edit_session_id).highestProducedSequence;
+        // The session is workbook-scoped: any sheet's store may hold edits
+        // the host has not durably acknowledged, not just the sheet the
+        // edit pointer names. Publish each store's current truth — content
+        // or explicit null — so the host's slots match what the user sees
+        // when the document comes back.
+        const entries = new Map<string, {
+            target: WorksheetTarget;
+            cellStore?: ReturnType<EditSessionRegistry['for_sheet']>;
+            pendingStore?: ReturnType<EditSessionRegistry['pending_rows_for_sheet']>;
+            parked: boolean;
+        }>();
+        for (const { target, store, parked } of
+            edit_session_registry_ref.current!.publication_entries(
+                meta_ref.current?.sheets ?? [],
+            )) {
+            entries.set(worksheet_target_key(target), {
+                target,
+                cellStore: store,
+                parked,
+            });
+        }
+        for (const { target, store, parked } of
+            edit_session_registry_ref.current!.pending_publication_entries(
+                meta_ref.current?.sheets ?? [],
+            )) {
+            const key = worksheet_target_key(target);
+            entries.set(key, {
+                ...entries.get(key),
+                target,
+                pendingStore: store,
+                parked: parked || entries.get(key)?.parked === true,
+            });
+        }
+        for (const { target, cellStore, pendingStore, parked } of entries.values()) {
+            const snapshot = cellStore?.snapshot() ?? new Map();
+            const structural = pendingStore?.snapshot()
+                ?? EMPTY_PENDING_STRUCTURAL_CHANGES;
+            if (
+                !parked
+                && snapshot.size === 0
+                && pending_rows(structural).length === 0
+                && !pending_changes_carry_layout(structural)
+                && structural.tailRemovals.length === 0
+                && structural.conflicts.length === 0
+                && !pending_changes_durability.has_publication(
+                    edit_session_id,
+                    target.sheetIndex,
+                    target.sheetName,
+                    target.worksheetId,
+                )
+            ) continue;
+            highest = Math.max(
+                highest,
+                pending_changes_durability.publish(
+                    edit_session_id,
+                    Object.freeze({
+                        ...target,
+                        cells: Object.freeze(Object.fromEntries(snapshot)),
+                        ...structural,
+                    }),
+                    source_generation_ref.current,
+                    resend_unacknowledged && pending_changes_durability.has_unacknowledged_payload(
+                        edit_session_id,
+                        target.sheetIndex,
+                        target.sheetName,
+                        target.worksheetId,
+                    ),
+                ),
+            );
+        }
+        return highest;
+    };
+
     useLayoutEffect(() => install_pending_edit_flush_responder(async () => {
         const edit_session_id = csv_edit_session_id_ref.current;
         if (!edit_session_id) return { highestProducedSequence: 0 };
@@ -2355,76 +2484,10 @@ export function App(): React.JSX.Element {
             === edit_session_id;
         let highest_produced_sequence = durability.highestProducedSequence;
         if (!save_in_flight_ref.current && !publication_fenced) {
-            // The session is workbook-scoped: any sheet's store may hold edits
-            // the host has not durably acknowledged, not just the sheet the
-            // edit pointer names. Publish each store's current truth — content
-            // or explicit null — so the host's slots match what the user sees
-            // when the document comes back.
-            const entries = new Map<string, {
-                target: WorksheetTarget;
-                cellStore?: ReturnType<EditSessionRegistry['for_sheet']>;
-                pendingStore?: ReturnType<EditSessionRegistry['pending_rows_for_sheet']>;
-                parked: boolean;
-            }>();
-            for (const { target, store, parked } of
-                edit_session_registry_ref.current!.publication_entries(
-                    meta_ref.current?.sheets ?? [],
-                )) {
-                entries.set(worksheet_target_key(target), {
-                    target,
-                    cellStore: store,
-                    parked,
-                });
-            }
-            for (const { target, store, parked } of
-                edit_session_registry_ref.current!.pending_publication_entries(
-                    meta_ref.current?.sheets ?? [],
-                )) {
-                const key = worksheet_target_key(target);
-                entries.set(key, {
-                    ...entries.get(key),
-                    target,
-                    pendingStore: store,
-                    parked: parked || entries.get(key)?.parked === true,
-                });
-            }
-            for (const { target, cellStore, pendingStore, parked } of entries.values()) {
-                const snapshot = cellStore?.snapshot() ?? new Map();
-                const structural = pendingStore?.snapshot()
-                    ?? EMPTY_PENDING_STRUCTURAL_CHANGES;
-                if (
-                    !parked
-                    && snapshot.size === 0
-                    && pending_rows(structural).length === 0
-                    && !pending_changes_carry_layout(structural)
-                    && structural.tailRemovals.length === 0
-                    && structural.conflicts.length === 0
-                    && !pending_changes_durability.has_publication(
-                        edit_session_id,
-                        target.sheetIndex,
-                        target.sheetName,
-                        target.worksheetId,
-                    )
-                ) continue;
-                highest_produced_sequence = Math.max(
-                    highest_produced_sequence,
-                    pending_changes_durability.publish(
-                        edit_session_id,
-                        Object.freeze({
-                            ...target,
-                            cells: Object.freeze(Object.fromEntries(snapshot)),
-                            ...structural,
-                        }),
-                        source_generation_ref.current,
-                        pending_changes_durability.has_unacknowledged_payload(
-                            edit_session_id,
-                            target.sheetIndex,
-                            target.sheetName,
-                            target.worksheetId,
-                        ),
-                    ),
-                );
-            }
+            highest_produced_sequence = Math.max(
+                highest_produced_sequence,
+                publish_every_store_truth(edit_session_id),
+            );
         }
         return {
             editSessionId: edit_session_id,
@@ -2544,7 +2607,9 @@ export function App(): React.JSX.Element {
         if (!edit_gestures_admitted()) {
             host_bridge.postMessage({
                 type: 'showWarning',
-                message: 'An undo is still being applied. Try discarding again in a moment.',
+                message: header_fence_ref.current
+                    ? 'Wait for the header row change to finish, then discard.'
+                    : 'An undo is still being applied. Try discarding again in a moment.',
             });
             return;
         }
@@ -2600,6 +2665,9 @@ export function App(): React.JSX.Element {
             ? new Set([...current].filter((key) => !is_conflict_dismissal(key)))
             : current);
         if (!csv_edit_session_id || save_projection_ref.current.operation) return undefined;
+        // A Header Row change carries the session's Pending Changes to the new
+        // header in its own durable write; Save waits until it has landed.
+        if (header_fence_ref.current) return undefined;
         const sheets = meta_ref.current?.sheets ?? [];
         const preflight = edit_session_registry_ref.current!
             .collect_dirty_worksheets(sheets);
@@ -3248,6 +3316,9 @@ export function App(): React.JSX.Element {
                     pending_excel_header_promote_ref.current = false;
                     set_pending_excel_header(null);
                     set_excel_header_status('');
+                    // Header work owed to the previous file ends with it, and so
+                    // does the fence it raised.
+                    lower_header_fence_ref.current();
                     // A warning dismissed in one file says nothing about another.
                     set_dismissed_notices(new Set());
                 }
@@ -3287,6 +3358,8 @@ export function App(): React.JSX.Element {
                     pending_excel_header_unhide_ref.current = false;
                     pending_excel_header_promote_ref.current = false;
                     set_pending_excel_header(null);
+                    const queue_verdict = header_result_handler_ref.current(result);
+                    if (queue_verdict !== 'report') return;
                     if (result.outcome === 'rejected') {
                         set_excel_header_status(restoring_rows
                             ? 'Rows were not restored.'
@@ -3449,6 +3522,46 @@ export function App(): React.JSX.Element {
                             header_changed.add(index);
                         }
                     });
+                    // A Header Row change carries what the session holds for its
+                    // worksheet (the host moved the Pending Changes in the same
+                    // write; the reconcile below adopts them). Two webview-only
+                    // holdings follow here, whatever the snapshot's reason:
+                    for (const index of header_changed) {
+                        const sheet = snapshot.meta.sheets[index]!;
+                        const previous = previous_sheets_by_name.get(sheet.name)!;
+                        // Composer drafts are held under the sheet's schema, which
+                        // names the columns; the columns themselves did not change.
+                        const draft_key = worksheet_target_key({
+                            sheetIndex: index,
+                            sheetName: sheet.name,
+                            worksheetId: sheet.worksheetId,
+                        });
+                        const draft = append_composer_drafts_ref.current.get(draft_key);
+                        if (draft?.schema === transform_schema_for_sheet(previous)) {
+                            append_composer_drafts_ref.current.set(draft_key, {
+                                ...draft,
+                                schema: transform_schema_for_sheet(sheet),
+                            });
+                        }
+                        // History authored at the old body start can't replay at
+                        // the new one when it records row structure, or cells on
+                        // the rows that crossed it.
+                        const from = header_body_start(previous.excelFirstRowHeader);
+                        const to = header_body_start(sheet.excelFirstRowHeader);
+                        if (from !== to && history_needs_header_change_barrier(
+                            history_store_ref.current!.snapshot(),
+                            {
+                                sheetIndex: index,
+                                sheetName: sheet.name,
+                                ...(sheet.worksheetId === undefined
+                                    ? {}
+                                    : { worksheetId: sheet.worksheetId }),
+                            },
+                            { start: Math.max(0, Math.min(from, to) - 1), end: Math.max(from, to) },
+                        )) {
+                            history_store_ref.current!.install_header_change_barrier();
+                        }
+                    }
                     // Capture authoritative edits before generation/source updates
                     // can remount the grid.
                     const refresh_authoritative_state =
@@ -4302,7 +4415,7 @@ export function App(): React.JSX.Element {
                         // Header work owed to the *previous* document is keyed by bare
                         // sheet index, so it cannot cross this boundary. Pending auto-fit
                         // was already cleared with the changed row basis above.
-                        set_excel_header_queue(null);
+                        lower_header_fence_ref.current();
                         set_column_visibility(normalized.columnVisibility);
                         set_transforms(normalized.transforms);
                         const tab_orient = normalized.tabOrientation;
@@ -4703,6 +4816,7 @@ export function App(): React.JSX.Element {
 
                     // Acknowledge the exact delivered identity before an optional
                     // corrective CAS write.
+                    snapshot_applied_seq_ref.current += 1;
                     host_bridge.postMessage({
                         type: 'snapshotApplied',
                         identity: snapshot.identity,
@@ -4710,6 +4824,7 @@ export function App(): React.JSX.Element {
                     });
                     if (correction_required) persist_immediate();
                 } else {
+                    snapshot_applied_seq_ref.current += 1;
                     host_bridge.postMessage({
                         type: 'snapshotApplied',
                         identity: snapshot.identity,
@@ -5345,7 +5460,8 @@ export function App(): React.JSX.Element {
      * Both reservations therefore live in refs.
      */
     const edit_gestures_admitted = useCallback(
-        () => !(replay_coordinator_ref.current?.is_busy() ?? false)
+        () => !header_fence_ref.current
+            && !(replay_coordinator_ref.current?.is_busy() ?? false)
             && !pending_row_replay_busy_ref.current
             && pending_highlight_request_ref.current === null
             && pending_row_resize_requests_ref.current.size === 0
@@ -6294,21 +6410,19 @@ export function App(): React.JSX.Element {
         // The sheet whose grid should regain focus after an authoritative remount.
         // Undefined for grid- and state-strip-originated header commands.
         grid_focus_sheet_index?: number,
-        // The held session has nothing unsaved and no open editor, so nothing
-        // of it can reach the host ahead of this command.
-        session_is_empty = false,
     ) => {
         const sheet = meta?.sheets[target_sheet_index];
         const header = sheet?.excelFirstRowHeader;
-        // Every header affordance funnels through here: the primary toggle, row
-        // promotion, Unhide all for a promoted header, and the all-sheets queue.
-        // An editing session can commit an open cell and refresh the worksheet before this
-        // command reaches the host, invalidating the generation it was posted with.
-        // Keep this guard at the shared command boundary as well as disabling each
-        // visible affordance, so a stale callback or a queue cannot bypass it.
+        // Every header affordance funnels through here, from the header queue's
+        // drain: the primary toggle, row promotion, Unhide all for a promoted
+        // header, and the all-sheets queue. Under an editing session the drain
+        // has raised the header fence, published every store, and waited for
+        // the host to hold it all, so the host can carry the session's Pending
+        // Changes to the new Header Row in the same write. Keep the fence check
+        // at this shared boundary too, so a stale callback cannot bypass it.
         if (!sheet || !header) return 'skip';
         if (
-            (!session_is_empty && (editing_session_held || editing_session_held_ref.current))
+            ((editing_session_held || editing_session_held_ref.current) && !header_fence_ref.current)
             || (
                 header_row !== undefined
                 && (preview_mode || preview_mode_ref.current)
@@ -6359,53 +6473,257 @@ export function App(): React.JSX.Element {
         preview_mode,
     ]);
 
+    /**
+     * Header Row changes still owed, and the state to put each sheet in.
+     *
+     * The host takes one at a time, so "all sheets" is a queue drained one sheet
+     * per result rather than a burst. Sheets already in the target state never
+     * enter it. The ref is the truth the drain reads; the state re-renders.
+     */
+    const [excel_header_queue, set_excel_header_queue] = useState<ExcelHeaderQueue | null>(null);
+    const excel_header_queue_ref = useRef<ExcelHeaderQueue | null>(null);
+    const replace_excel_header_queue = useCallback((next: ExcelHeaderQueue | null) => {
+        excel_header_queue_ref.current = next;
+        set_excel_header_queue(next);
+    }, []);
+    /** The request posted for the queue's head sheet, until its result arrives. */
+    const header_in_flight_ref = useRef<{
+        readonly queue: ExcelHeaderQueue;
+        readonly sheet_index: number;
+        readonly posted_snapshot: number;
+    } | null>(null);
+    /** Wakes the drain from an acknowledgement or a timer without polling. */
+    const [, set_header_drain_tick] = useState(0);
+    const wake_header_drain = useCallback(() => set_header_drain_tick((tick) => tick + 1), []);
+    const header_timer_refs = useRef<ReturnType<typeof setTimeout>[]>([]);
+    const schedule_header_wake = useCallback((delay: number) => {
+        header_timer_refs.current.push(setTimeout(wake_header_drain, Math.max(0, delay)));
+    }, [wake_header_drain]);
+    useEffect(() => pending_changes_durability.on_acknowledged(wake_header_drain), [wake_header_drain]);
+    useEffect(() => () => {
+        for (const timer of header_timer_refs.current) clearTimeout(timer);
+    }, []);
+
+    /**
+     * The header fence: from the gesture that asks for a Header Row change until
+     * its last result, no edit gesture is admitted and no cell editor opens. The
+     * host moves the session's Pending Changes with the header in one write, so
+     * nothing may be authored against the old Header Row once the drain has
+     * published every store; and the drain may not post until the host holds
+     * all of it. Reversible and separate from the close barrier's latch.
+     */
+    const lower_header_fence = useCallback(() => {
+        header_fence_ref.current = false;
+        set_header_fence(false);
+        header_in_flight_ref.current = null;
+        for (const timer of header_timer_refs.current) clearTimeout(timer);
+        header_timer_refs.current = [];
+        replace_excel_header_queue(null);
+    }, [replace_excel_header_queue]);
+    lower_header_fence_ref.current = lower_header_fence;
+
+    const drain_excel_header_queue = () => {
+        const queue = excel_header_queue_ref.current;
+        if (queue === null || pending_excel_header_ref.current !== null) return;
+        const [next_sheet] = queue.sheets;
+        if (next_sheet === undefined) {
+            lower_header_fence();
+            return;
+        }
+        if (queue.header_row !== undefined && generation_ref.current !== queue.generation) {
+            // The display row it names belongs to a view that has since changed.
+            set_excel_header_status('Header row was not updated.');
+            lower_header_fence();
+            return;
+        }
+        const now = Date.now();
+        if (
+            queue.retry_after_snapshot !== undefined
+            && snapshot_applied_seq_ref.current <= queue.retry_after_snapshot
+            && now < (queue.retry_not_before ?? 0)
+        ) return;
+        // Work admitted before the fence finishes into its stores first.
+        if (
+            save_in_flight_ref.current
+            || save_projection_ref.current.operation !== undefined
+            || (replay_coordinator_ref.current?.is_busy() ?? false)
+            || pending_row_replay_busy_ref.current
+            || pending_highlight_request_ref.current !== null
+            || pending_row_resize_requests_ref.current.size > 0
+            || pending_append_requests_ref.current.size > 0
+            || discard_cleanup_ref.current !== undefined
+        ) return;
+        const session = csv_edit_session_id_ref.current;
+        if (session !== undefined && editing_session_held_ref.current) {
+            let current = queue;
+            if (!queue.flushed) {
+                publish_every_store_truth(session, false);
+                current = { ...queue, flushed: true, ack_wait_started: now };
+                replace_excel_header_queue(current);
+                schedule_header_wake(HEADER_ACK_WAIT_MS);
+            }
+            if (pending_changes_durability.has_unacknowledged(session)) {
+                if (now - (current.ack_wait_started ?? now) >= HEADER_ACK_WAIT_MS) {
+                    host_bridge.postMessage({
+                        type: 'showWarning',
+                        message: 'Could not change the header row: unsaved changes are still being stored. Try again.',
+                    });
+                    set_excel_header_status('Header row was not updated.');
+                    lower_header_fence();
+                }
+                return;
+            }
+        }
+        const current = excel_header_queue_ref.current!;
+        const result = request_excel_header(
+            current.enabled,
+            current.unhide_all,
+            current.header_row,
+            next_sheet,
+            current.grid_focus_sheet_index,
+        );
+        if (result === 'wait') return;
+        if (result === 'skip') {
+            replace_excel_header_queue({ ...current, sheets: current.sheets.slice(1) });
+            return;
+        }
+        header_in_flight_ref.current = {
+            queue: current,
+            sheet_index: next_sheet,
+            posted_snapshot: snapshot_applied_seq_ref.current,
+        };
+        replace_excel_header_queue({ ...current, sheets: current.sheets.slice(1) });
+        const posted = pending_excel_header_ref.current;
+        header_timer_refs.current.push(setTimeout(() => {
+            if (pending_excel_header_ref.current !== posted || posted === null) return;
+            host_bridge.postMessage({
+                type: 'showWarning',
+                message: 'The header row change has not finished. Reload this window to keep editing this file.',
+            });
+        }, HEADER_RESULT_GUARD_MS));
+    };
+    useEffect(() => {
+        drain_excel_header_queue();
+    });
+
+    /**
+     * What the queue does with a header result. A transient rejection (an
+     * unacknowledged refresh, edit-session work finishing) goes back to the head
+     * of the queue and is re-sent after the next applied snapshot or a short
+     * wait; a result that needs a reload keeps the fence up; anything else ends
+     * the request, and a refusal ends the whole queue.
+     */
+    header_result_handler_ref.current = (result) => {
+        const in_flight = header_in_flight_ref.current;
+        header_in_flight_ref.current = null;
+        if (in_flight === null) return 'report';
+        if (result.reloadRequired === true) {
+            replace_excel_header_queue(null);
+            set_excel_header_status('Reload this window to finish the header row change.');
+            host_bridge.postMessage({
+                type: 'showWarning',
+                message: `Reload this window to keep editing this file.${
+                    result.error ? ` ${result.error}` : ''}`,
+            });
+            return 'handled';
+        }
+        if (
+            result.outcome === 'rejected'
+            && result.transient === true
+            && in_flight.queue.retries < HEADER_TRANSIENT_RETRIES
+            && (in_flight.queue.header_row === undefined
+                || generation_ref.current === in_flight.queue.generation)
+        ) {
+            const remaining = excel_header_queue_ref.current?.sheets ?? [];
+            replace_excel_header_queue({
+                ...in_flight.queue,
+                sheets: [in_flight.sheet_index, ...remaining],
+                retries: in_flight.queue.retries + 1,
+                retry_after_snapshot: in_flight.posted_snapshot,
+                retry_not_before: Date.now() + HEADER_RETRY_DELAY_MS,
+            });
+            schedule_header_wake(HEADER_RETRY_DELAY_MS);
+            return 'retry';
+        }
+        if (result.outcome === 'rejected') {
+            lower_header_fence();
+            return 'report';
+        }
+        if ((excel_header_queue_ref.current?.sheets.length ?? 0) === 0) lower_header_fence();
+        return 'report';
+    };
+
+    /**
+     * Ask for a Header Row change. Folds an open editor while gestures are
+     * still admitted, so its text commits; checks what the worksheet's Pending
+     * Changes can't carry; then raises the header fence and queues the request
+     * for the drain.
+     */
+    const enqueue_excel_header_change = useCallback((request: {
+        readonly enabled: boolean;
+        readonly unhide_all?: boolean;
+        readonly header_row?: number;
+        readonly sheets: readonly number[];
+        readonly grid_focus_sheet_index?: number;
+    }): boolean => {
+        if (
+            excel_header_queue_ref.current !== null
+            || pending_excel_header_ref.current !== null
+            || header_fence_ref.current
+        ) return false;
+        const sheets = meta_ref.current?.sheets ?? [];
+        for (const sheet_index of request.sheets) {
+            const sheet = sheets[sheet_index];
+            if (sheet === undefined) continue;
+            const refusal = header_rebase_slot_refusal(
+                {
+                    cells: {},
+                    ...edit_session_registry_ref.current!.pending_rows_for_sheet(sheet_index).snapshot(),
+                },
+                header_body_start(sheet.excelFirstRowHeader),
+            );
+            if (refusal !== undefined) {
+                host_bridge.postMessage({
+                    type: 'showWarning',
+                    message: `Could not change the header row: ${refusal}`,
+                });
+                return false;
+            }
+        }
+        if (
+            editing_session_held_ref.current
+            && editing_ref.current?.commit_live_edit() === false
+        ) return false;
+        header_fence_ref.current = true;
+        set_header_fence(true);
+        replace_excel_header_queue({
+            enabled: request.enabled,
+            unhide_all: request.unhide_all === true,
+            ...(request.header_row === undefined ? {} : { header_row: request.header_row }),
+            sheets: request.sheets,
+            ...(request.grid_focus_sheet_index === undefined
+                ? {}
+                : { grid_focus_sheet_index: request.grid_focus_sheet_index }),
+            generation: generation_ref.current,
+            retries: 0,
+            flushed: false,
+        });
+        return true;
+    }, [replace_excel_header_queue]);
+
     const handle_toggle_excel_header = useCallback(() => {
         const header = meta?.sheets[active_sheet_index]?.excelFirstRowHeader;
         if (!header) return;
-        request_excel_header(
-            !(header.mode === 'on' || header.active),
-            false,
-            undefined,
-            active_sheet_index,
-            active_sheet_index,
-        );
-    }, [active_sheet_index, meta, request_excel_header]);
-
-    /**
-     * Sheets still owed a header-row change, and the state to put them in.
-     *
-     * The host takes one of these at a time — `request_excel_header` refuses while a
-     * request is in flight — so "all sheets" is a queue drained by the effect below
-     * rather than a burst. Sheets already in the target state never enter it.
-     */
-    const [excel_header_queue, set_excel_header_queue] = useState<{
-        enabled: boolean;
-        sheets: readonly number[];
-        grid_focus_sheet_index: number;
-    } | null>(null);
-
-    useEffect(() => {
-        if (!excel_header_queue || pending_excel_header !== null) return;
-        const [next_sheet, ...rest] = excel_header_queue.sheets;
-        if (next_sheet === undefined) return set_excel_header_queue(null);
-        const result = request_excel_header(
-            excel_header_queue.enabled,
-            false,
-            undefined,
-            next_sheet,
-            excel_header_queue.grid_focus_sheet_index,
-        );
-        if (result !== 'wait') {
-            set_excel_header_queue({ ...excel_header_queue, sheets: rest });
-        }
-    }, [excel_header_queue, pending_excel_header, request_excel_header]);
+        enqueue_excel_header_change({
+            enabled: !(header.mode === 'on' || header.active),
+            sheets: [active_sheet_index],
+            grid_focus_sheet_index: active_sheet_index,
+        });
+    }, [active_sheet_index, enqueue_excel_header_change, meta]);
 
     /** Queue every sheet that is not already in `enabled`, for the chevron menu. */
     const set_excel_header_all_sheets = useCallback((enabled: boolean) => {
-        if (
-            editing_session_held_ref.current
-            || header_waits_for_transform(active_sheet_index, false)
-        ) return;
+        if (header_waits_for_transform(active_sheet_index, false)) return;
         const sheets = (meta?.sheets ?? [])
             .map((sheet, index) => ({ sheet, index }))
             .filter(({ sheet }) => {
@@ -6415,26 +6733,21 @@ export function App(): React.JSX.Element {
             })
             .map(({ index }) => index);
         if (sheets.length > 0) {
-            set_excel_header_queue({
+            enqueue_excel_header_change({
                 enabled,
                 sheets,
                 grid_focus_sheet_index: active_sheet_index,
             });
         }
-    }, [active_sheet_index, header_waits_for_transform, meta]);
+    }, [active_sheet_index, enqueue_excel_header_change, header_waits_for_transform, meta]);
 
     const handle_promote_row_to_header = useCallback((display_row: number) => {
-        // The row menu acquires the session for its editing items, so one is
-        // held here even when nothing was edited. Empty, it locks nothing: the
-        // request goes ahead of the release the closing menu causes.
-        const session_is_empty = editing_session_held_ref.current
-            && !edit_session_registry_ref.current!.has_dirty_entries()
-            && editing_ref.current?.has_uncommitted_changes() === false
-            // Text typed into the append composer is unsaved work too.
-            && ![...append_composer_drafts_ref.current.values()].some(({ draft }) =>
-                draft.some((row) => Object.values(row).some((value) => value !== '')));
-        request_excel_header(true, false, display_row, undefined, undefined, session_is_empty);
-    }, [active_sheet_index, request_excel_header]);
+        enqueue_excel_header_change({
+            enabled: true,
+            header_row: display_row,
+            sheets: [active_sheet_index],
+        });
+    }, [active_sheet_index, enqueue_excel_header_change]);
 
     /**
      * The discard whose host-side cleanup has not been acknowledged yet.
@@ -6901,7 +7214,13 @@ export function App(): React.JSX.Element {
     const handle_unhide_all_rows = useCallback(() => {
         const header = meta?.sheets[active_sheet_index]?.excelFirstRowHeader;
         if (header?.mode === 'on' && header.sourceRow !== 0) {
-            request_excel_header(false, true);
+            // Turns the promoted header off as it restores the rows above it,
+            // so it moves the body start like any Header Row change.
+            enqueue_excel_header_change({
+                enabled: false,
+                unhide_all: true,
+                sheets: [active_sheet_index],
+            });
             return;
         }
         const current = state_ref.current.transforms?.[active_sheet_index]
@@ -6911,9 +7230,9 @@ export function App(): React.JSX.Element {
         handle_transform_change(next, 'toolbar');
     }, [
         active_sheet_index,
+        enqueue_excel_header_change,
         handle_transform_change,
         meta,
-        request_excel_header,
         transforms,
     ]);
 
@@ -7118,6 +7437,8 @@ export function App(): React.JSX.Element {
     const request_save_or_remain_dirty = useCallback(() => {
         const editing = editing_ref.current;
         if (!editing) return false;
+        // See `begin_save_operation`: nothing is saved across a header change.
+        if (header_fence_ref.current) return true;
         // request_save() has side effects, so it is evaluated first. If workbook
         // preflight blocks, the active sheet may be clean while a sibling store is
         // still dirty; keep the session open from the registry-wide truth.
@@ -8717,7 +9038,8 @@ export function App(): React.JSX.Element {
             items: [
                 {
                     label: `Use first row as header on ${all_sheets}`,
-                    disabled: editing_session_held
+                    disabled: pending_excel_header !== null
+                        || header_fence
                         || pending_transforms.some(Boolean)
                         || header_capable_sheets.every((sheet) =>
                             sheet.excelFirstRowHeader!.mode === 'on'
@@ -8726,7 +9048,8 @@ export function App(): React.JSX.Element {
                 },
                 {
                     label: `Show first row as data on ${all_sheets}`,
-                    disabled: editing_session_held
+                    disabled: pending_excel_header !== null
+                        || header_fence
                         || pending_transforms.some(Boolean)
                         || header_capable_sheets.every((sheet) =>
                             !(sheet.excelFirstRowHeader!.mode === 'on'
@@ -8802,23 +9125,20 @@ export function App(): React.JSX.Element {
     const excel_header_candidate_available = current_sheet.columnCount > 0
         && hidden_row_count < current_sheet.sourceRowCount;
     const excel_header_pending = pending_excel_header !== null;
+    // A Header Row change works under unsaved changes: the host moves the
+    // session's Pending Changes to the new header in the same write, and the
+    // header queue makes sure it holds all of them first. Only a header change
+    // or a transform already in flight holds the controls back.
+    const excel_header_change_pending = excel_header_pending || header_fence;
     const excel_header_disabled = !!excel_header && (
         (!excel_header_candidate_available
             && !excel_header.active
             && excel_header.mode !== 'on')
-        || editing_session_held
         || any_transform_pending
-        || excel_header_pending
+        || excel_header_change_pending
     );
-    // Promotion is offered from the row menu, which holds a session of its own
-    // while open: only a session with unsaved work locks the header row there.
-    // A transform in flight only disables it (see the prop below).
-    const promote_row_blocked = !!excel_header && (
-        (editing_session_held
-            && (edit_session_registry_ref.current!.has_dirty_entries()
-                || editing_status?.has_live_uncommitted === true))
-        || excel_header_pending
-    );
+    // A transform in flight only disables promotion (see the prop below).
+    const promote_row_blocked = !!excel_header && excel_header_change_pending;
     // While this sheet's sort, filter, or Hide rows is in flight, the menus
     // offer items by the rules it will install, so nothing appears or vanishes
     // under the pointer when it lands. Hide rows requests no rules: those on
@@ -8835,8 +9155,8 @@ export function App(): React.JSX.Element {
             : pending_excel_header_promote_ref.current
             ? 'Making row header…'
             : 'Updating column names…'
-        : editing_session_held
-        ? 'Save or discard your changes before changing the header row.'
+        : header_fence
+        ? 'Saving your changes before changing the header row…'
         : 'Wait for sorting and filtering to finish.';
     const effective_row_count = installed_view?.rowCount ?? current_sheet.rowCount;
     const visibility_reset_key = [
@@ -9265,6 +9585,7 @@ export function App(): React.JSX.Element {
             }
             edit_activation_id={edit_activation_id}
             highlight_in_flight={highlight_request_pending}
+            edits_paused={header_fence}
             append_in_flight={append_request_pending}
             csv_editable={csv_editable}
             append_row_ceiling={append_row_ceiling}
@@ -9405,7 +9726,9 @@ export function App(): React.JSX.Element {
                 hidden_rows={{
                     count: hidden_row_count,
                     pending: transform_pending,
-                    disabled: editing_session_held
+                    // For a promoted header it is a Header Row change, so it
+                    // waits like one; see `excel_header_change_pending`.
+                    disabled: excel_header_change_pending
                         && excel_header?.mode === 'on'
                         && excel_header.sourceRow !== 0,
                     on_unhide_all: handle_unhide_all_rows,

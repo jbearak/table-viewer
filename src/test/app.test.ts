@@ -2494,7 +2494,37 @@ describe('Excel first-row header toggle', () => {
         expect(grid_shell_mock.focus_grid).toHaveBeenCalledTimes(2);
     });
 
-    it('blocks every header-row command path while an editing session is held', async () => {
+    function header_requests(post_message: ReturnType<typeof vi.fn>) {
+        return post_message.mock.calls
+            .map((call) => call[0] as WebviewMessage)
+            .filter((message): message is Extract<
+                WebviewMessage,
+                { type: 'setExcelFirstRowHeader' }
+            > => message.type === 'setExcelFirstRowHeader');
+    }
+
+    function last_publication_sequence(post_message: ReturnType<typeof vi.fn>): number {
+        const published = post_message.mock.calls
+            .map((call) => call[0] as WebviewMessage)
+            .filter((message): message is Extract<
+                WebviewMessage,
+                { type: 'pendingEditsChanged' | 'pendingChangesChanged' }
+            > => message.type === 'pendingEditsChanged'
+                || message.type === 'pendingChangesChanged');
+        expect(published.length, 'no pending-changes publication was posted').toBeGreaterThan(0);
+        return published.at(-1)!.sequence;
+    }
+
+    function edits_admitted(): boolean {
+        return (grid_shell_mock.latest_props?.gestures_admitted as () => boolean)();
+    }
+
+    const EDITABLE = {
+        csvEditable: true,
+        csvEditingSupported: true,
+    } as const;
+
+    it('offers every header-row command path while an editing session holds unsaved edits', async () => {
         const { post_message } = await render_app();
         const meta = excel_meta_multi([true, false]);
         meta.sheets[0].sourceRowCount = 4;
@@ -2510,46 +2540,235 @@ describe('Excel first-row header toggle', () => {
             schema: '["S1",2,null]',
         };
         await dispatch_host_message(initial_snapshot_message(meta, {
-            capabilities: {
-                csvEditable: true,
-                csvEditingSupported: true,
-            },
+            capabilities: EDITABLE,
             state: { transforms: [transform] },
         }));
         await acknowledge_transform(latest_transform_request(post_message), 2);
         await acquire_editing_session(post_message);
-        post_message.mockClear();
+        seed_mounted_store({ '3:0': { value: 'dirty', base: 'base' } });
+        await report_grid_editing(true);
 
-        const button = get_button('Header Row');
-        expect(button.getAttribute('aria-disabled')).toBe('true');
-        await click_button('Header Row');
-
+        expect(get_button('Header Row').getAttribute('aria-disabled')).toBeNull();
         await open_scope_menu('Header row scope');
         const scope_items = Array.from(
             document.querySelectorAll<HTMLButtonElement>('[role="menuitem"]'),
         );
         expect(scope_items).toHaveLength(2);
         expect(scope_items.every(
-            (item) => item.getAttribute('aria-disabled') === 'true',
+            (item) => item.getAttribute('aria-disabled') !== 'true',
         )).toBe(true);
-        await click_menu_item('Show first row as data on all 2 sheets');
-
-        const unhide = get_button('Unhide all');
-        expect(unhide.disabled).toBe(true);
-        await click_button('Unhide all');
-
-        // An empty session yields to row promotion; one holding an edit does not.
-        await report_grid_editing(false, true);
-        expect(grid_shell_mock.latest_props?.can_promote_row_to_header).toBe(false);
         await act(async () => {
-            const promote = grid_shell_mock.latest_props?.on_promote_row_to_header as
-                ((display_row: number) => void);
-            promote(2);
+            document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
         });
+        expect(get_button('Unhide all').disabled).toBe(false);
+        // An open editor no longer hides "Use row as header" either.
+        await report_grid_editing(false, true);
+        expect(grid_shell_mock.latest_props?.can_promote_row_to_header).toBe(true);
+    });
 
+    it('publishes unsaved edits, waits for the host to hold them, then changes the header', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(excel_meta(true), {
+            capabilities: EDITABLE,
+        }));
+        await acquire_editing_session(post_message);
+        seed_mounted_store({ '1:0': { value: 'Alicia', base: 'Alice' } });
+        grid_shell_mock.commit_live_edit.mockClear();
+
+        await click_button('Header Row');
+        // The open editor is folded first, while gestures are still admitted.
+        expect(grid_shell_mock.commit_live_edit).toHaveBeenCalled();
+        // Then the fence is up, the edit is published, and the request waits.
+        expect(grid_shell_mock.latest_props?.edits_paused).toBe(true);
+        expect(edits_admitted()).toBe(false);
+        expect(header_requests(post_message)).toEqual([]);
+        // Save waits for the header change too.
+        const save = grid_shell_mock.latest_props?.on_save_request as () => unknown;
+        expect(save()).toBeUndefined();
+
+        await dispatch_host_message({
+            type: 'pendingEditsAcknowledged',
+            editSessionId: 'test-edit-session',
+            sequence: last_publication_sequence(post_message),
+        });
+        const [request] = header_requests(post_message);
+        expect(request).toMatchObject({ sheetIndex: 0, enabled: false });
+        expect(grid_shell_mock.latest_props?.edits_paused).toBe(true);
+
+        await dispatch_host_message(refresh_snapshot_message(excel_meta(false, 'off'), {
+            reason: 'excelHeader',
+            commandResult: {
+                type: 'excelFirstRowHeader',
+                requestId: request.requestId,
+                outcome: 'applied',
+            },
+            capabilities: { ...EDITABLE, csvEditSessionId: 'test-edit-session' },
+        }));
+        expect(grid_shell_mock.latest_props?.edits_paused).toBe(false);
+        expect(edits_admitted()).toBe(true);
+        expect(document.querySelector('[role="status"]')?.textContent).toBe('Column names updated.');
+    });
+
+    it('lifts the fence on a refusal, so editing goes on', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(excel_meta(true), {
+            capabilities: EDITABLE,
+        }));
+        await acquire_editing_session(post_message);
+        await click_button('Header Row');
+        const [request] = header_requests(post_message);
+        expect(edits_admitted()).toBe(false);
+        await dispatch_host_message(refresh_snapshot_message(excel_meta(true), {
+            reason: 'excelHeader',
+            commandResult: {
+                type: 'excelFirstRowHeader',
+                requestId: request.requestId,
+                outcome: 'rejected',
+                error: 'Save first: the header row has unsaved changes, and it would stop being the header row.',
+            },
+            capabilities: { ...EDITABLE, csvEditSessionId: 'test-edit-session' },
+        }));
+        expect(edits_admitted()).toBe(true);
+        expect(grid_shell_mock.latest_props?.edits_paused).toBe(false);
+        expect(post_message).toHaveBeenCalledWith({
+            type: 'showWarning',
+            message: 'Could not change the header row: Save first: the header row has unsaved changes, '
+                + 'and it would stop being the header row.',
+        });
+    });
+
+    it('retries a transient refusal quietly once the refresh it raced is applied', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(excel_meta(true), {
+            capabilities: EDITABLE,
+        }));
+        await click_button('Header Row');
+        const [first] = header_requests(post_message);
+        await dispatch_host_message(refresh_snapshot_message(excel_meta(true), {
+            reason: 'excelHeader',
+            commandResult: {
+                type: 'excelFirstRowHeader',
+                requestId: first.requestId,
+                outcome: 'rejected',
+                error: 'The worksheet changed before the header request arrived.',
+                transient: true,
+            },
+        }));
+        const requests = header_requests(post_message);
+        expect(requests).toHaveLength(2);
+        expect(requests[1].requestId).not.toBe(first.requestId);
+        expect(requests[1].generation).toBe(2);
         expect(post_message.mock.calls
             .map((call) => call[0] as WebviewMessage)
-            .some((message) => message.type === 'setExcelFirstRowHeader')).toBe(false);
+            .filter((message) => message.type === 'showWarning')).toEqual([]);
+    });
+
+    it('keeps edits paused and asks for a reload when the header change could not be confirmed', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(excel_meta(true), {
+            capabilities: EDITABLE,
+        }));
+        await acquire_editing_session(post_message);
+        await click_button('Header Row');
+        const [request] = header_requests(post_message);
+        await dispatch_host_message(refresh_snapshot_message(excel_meta(true), {
+            reason: 'excelHeader',
+            commandResult: {
+                type: 'excelFirstRowHeader',
+                requestId: request.requestId,
+                outcome: 'recovered',
+                reloadRequired: true,
+                error: 'Failed to reload: disk unavailable',
+            },
+            capabilities: { ...EDITABLE, csvEditSessionId: 'test-edit-session' },
+        }));
+        expect(edits_admitted()).toBe(false);
+        expect(grid_shell_mock.latest_props?.edits_paused).toBe(true);
+        expect(post_message).toHaveBeenCalledWith({
+            type: 'showWarning',
+            message: 'Reload this window to keep editing this file. Failed to reload: disk unavailable',
+        });
+    });
+
+    it('drops a queued promotion when the view changes before it can be sent', async () => {
+        const { post_message } = await render_app();
+        const meta = excel_meta(false, 'off');
+        meta.sheets[0].sourceRowCount = 4;
+        await dispatch_host_message(initial_snapshot_message(meta, { capabilities: EDITABLE }));
+        await acquire_editing_session(post_message);
+        seed_mounted_store({ '3:0': { value: 'x', base: 'y' } });
+        await act(async () => {
+            (grid_shell_mock.latest_props?.on_promote_row_to_header as (row: number) => void)(2);
+        });
+        expect(header_requests(post_message)).toEqual([]);
+        await dispatch_host_message(refresh_snapshot_message(meta, {
+            generation: 3,
+            sourceGeneration: 3,
+            capabilities: { ...EDITABLE, csvEditSessionId: 'test-edit-session' },
+        }));
+        await dispatch_host_message({
+            type: 'pendingEditsAcknowledged',
+            editSessionId: 'test-edit-session',
+            sequence: last_publication_sequence(post_message),
+        });
+        expect(header_requests(post_message)).toEqual([]);
+        expect(edits_admitted()).toBe(true);
+        expect(document.querySelector('[role="status"]')?.textContent)
+            .toBe('Header row was not updated.');
+    });
+
+    it('refuses before asking when the worksheet\'s row changes are already in conflict', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(excel_meta(true), {
+            capabilities: EDITABLE,
+        }));
+        await acquire_editing_session(post_message);
+        const store = (grid_shell_mock.latest_props as unknown as GridShellProps).pending_row_store!;
+        act(() => {
+            expect(store.reconcile({ session_id: 'test-edit-session' }, {
+                formatTemplates: [],
+                appendedRows: [],
+                tailRemovals: [],
+                conflicts: [{ reason: 'structuralBasisChanged', pendingRowIds: [], tailRemovalIds: [] }],
+            })).toBe(true);
+        });
+        await click_button('Header Row');
+        expect(header_requests(post_message)).toEqual([]);
+        expect(edits_admitted()).toBe(true);
+        expect(post_message).toHaveBeenCalledWith({
+            type: 'showWarning',
+            message: 'Could not change the header row: '
+                + 'Resolve the row and column changes notice before changing the header row.',
+        });
+    });
+
+    it('routes Unhide all for a promoted header through the same wait for unsaved edits', async () => {
+        const { post_message } = await render_app();
+        const meta = excel_meta(true, 'on');
+        meta.sheets[0].sourceRowCount = 4;
+        meta.sheets[0].excelFirstRowHeader = {
+            ...meta.sheets[0].excelFirstRowHeader!,
+            sourceRow: 2,
+        };
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: EDITABLE,
+            state: {
+                transforms: [{ sort: [], filters: [], hiddenRows: [0, 1], schema: '["People",2,null]' }],
+            },
+        }));
+        await acknowledge_transform(latest_transform_request(post_message), 2);
+        await acquire_editing_session(post_message);
+        seed_mounted_store({ '3:0': { value: 'x', base: 'y' } });
+        await click_button('Unhide all');
+        expect(header_requests(post_message)).toEqual([]);
+        await dispatch_host_message({
+            type: 'pendingEditsAcknowledged',
+            editSessionId: 'test-edit-session',
+            sequence: last_publication_sequence(post_message),
+        });
+        expect(header_requests(post_message)).toEqual([
+            expect.objectContaining({ enabled: false, unhideAll: true }),
+        ]);
     });
 
     it('promotes a row under the empty session its menu acquired', async () => {
@@ -3083,22 +3302,29 @@ describe('Excel first-row header toggle', () => {
             .map((message) => message.sheetIndex)).toEqual([0, 1]);
     });
 
-    it('resumes a retained all-sheets header queue after the editing session is released', async () => {
+    it('runs an all-sheets header queue under an editing session, one sheet per result', async () => {
         const { post_message } = await render_app();
         await dispatch_host_message(initial_snapshot_message(
             excel_meta_multi([false, false]),
             { capabilities: { csvEditable: true, csvEditingSupported: true } },
         ));
+        await acquire_editing_session(post_message);
         await open_scope_menu('Header row scope');
         await click_menu_item('Use first row as header on all 2 sheets');
+        const header_sheets = () => post_message.mock.calls
+            .map((call) => call[0] as WebviewMessage)
+            .filter((message) => message.type === 'setExcelFirstRowHeader')
+            .map((message) => message.sheetIndex);
+        expect(header_sheets()).toEqual([0]);
         const first_header = post_message.mock.calls
             .map((call) => call[0] as WebviewMessage)
             .find((message): message is Extract<
                 WebviewMessage,
                 { type: 'setExcelFirstRowHeader' }
             > => message.type === 'setExcelFirstRowHeader')!;
+        // One fence for the whole queue: nothing opens between sheets.
+        expect(grid_shell_mock.latest_props?.edits_paused).toBe(true);
 
-        await acquire_editing_session(post_message);
         await dispatch_host_message(refresh_snapshot_message(
             excel_meta_multi([true, false]),
             {
@@ -3115,14 +3341,8 @@ describe('Excel first-row header toggle', () => {
                 },
             },
         ));
-        const header_sheets = () => post_message.mock.calls
-            .map((call) => call[0] as WebviewMessage)
-            .filter((message) => message.type === 'setExcelFirstRowHeader')
-            .map((message) => message.sheetIndex);
-        expect(header_sheets()).toEqual([0]);
-
-        await release_idle_edit_session();
         expect(header_sheets()).toEqual([0, 1]);
+        expect(grid_shell_mock.latest_props?.edits_paused).toBe(true);
     });
 
     it('restores a saved transform after a header-changing snapshot', async () => {

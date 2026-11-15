@@ -8,7 +8,11 @@
 
 import type { HistoryDirection } from './history-cell-state-model';
 import type { ReplayRefusalReason } from './history-replay-request-model';
-import { STRUCTURAL_SAVE_BARRIER_MESSAGE, type HistoryBarrier } from './history-stack-model';
+import {
+    HEADER_CHANGE_BARRIER_MESSAGE,
+    STRUCTURAL_SAVE_BARRIER_MESSAGE,
+    type HistoryBarrier,
+} from './history-stack-model';
 
 function verb(direction: HistoryDirection): string {
     return direction === 'undo' ? 'Undo' : 'Redo';
@@ -57,6 +61,7 @@ export function history_refusal_warning(
             return null;
         case 'blocked':
             if (barrier_reason === 'structural-save') return STRUCTURAL_SAVE_BARRIER_MESSAGE;
+            if (barrier_reason === 'header-change') return HEADER_CHANGE_BARRIER_MESSAGE;
             // Named where it can be: the user's question is which gesture cost
             // them their history, and the barrier is the only thing that knows.
             return barrier_label === undefined

@@ -1557,6 +1557,12 @@ export interface GridShellProps {
      * without consulting any editability flag here.
      */
     highlight_in_flight?: boolean;
+    /**
+     * A Header Row change is being prepared or is in flight. Its Pending Changes
+     * move with it in one durable write, so no editing affordance opens until
+     * it lands: like a highlight in flight, but App's own fence.
+     */
+    edits_paused?: boolean;
     /** A host-backed append reservation is outstanding; all edits are fenced. */
     append_in_flight?: boolean;
     /**
@@ -1761,6 +1767,7 @@ export function GridShell({
     edit_activation_id,
     csv_editable = false,
     highlight_in_flight = false,
+    edits_paused = false,
     append_in_flight = false,
     append_row_ceiling = MAX_SHEET_ROWS,
     structural_support,
@@ -3270,6 +3277,7 @@ export function GridShell({
         && csv_editable
         && !save_in_flight
         && !highlight_in_flight
+        && !edits_paused
         && !close_barrier_active;
     const editable_cells = append_admission_active && !append_in_flight;
     // Editable, with no session behind it yet. Cells accept the same gestures
@@ -3281,6 +3289,7 @@ export function GridShell({
         && !preview_mode
         && !save_in_flight
         && !highlight_in_flight
+        && !edits_paused
         && !close_barrier_active;
     // Whether a cell answers an editing gesture at all, session or not.
     const cells_accept_edits = editable_cells || edit_armed;
@@ -12188,9 +12197,14 @@ export function GridShell({
                             // is reordering the view. Whether a held session
                             // locks the header row is App's to say: this menu
                             // holds one itself while it is open.
+                            // Only a file row can become the header: a Pending Row
+                            // has no row in the file to name, and its grid row is
+                            // not a host display row.
                             can_promote_row_to_header: can_promote_row_to_header
                                 && transform_menu_sections
                                 && !preview_mode
+                                && row_menu.source_display_rows.length > 0
+                                && selected_pending_ids.size === 0
                                 && menu_transform_state.sort.length === 0
                                 && !menu_transform_state.filters.some((filter) => filter.enabled),
                             promote_row_disabled: !transform_sections
@@ -12217,11 +12231,10 @@ export function GridShell({
                                     ));
                                 },
                             } : {}),
-                            on_promote_row_to_header: () =>
-                                on_promote_row_to_header(
-                                    row_menu.source_display_rows[0]?.start
-                                        ?? row_menu.row,
-                                ),
+                            on_promote_row_to_header: () => {
+                                const display_row = row_menu.source_display_rows[0]?.start;
+                                if (display_row !== undefined) on_promote_row_to_header(display_row);
+                            },
                             on_copy_rows: () => {
                                 const resolved_rows = new Set<number>();
                                 {

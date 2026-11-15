@@ -65,6 +65,17 @@ export interface ExcelHeaderSnapshotResult {
     readonly requestId: string;
     readonly outcome: 'applied' | 'recovered' | 'rejected';
     readonly error?: string;
+    /**
+     * A rejection that ends on its own (an unacknowledged refresh, edit-session
+     * work finishing), so the panel retries instead of reporting it.
+     */
+    readonly transient?: true;
+    /**
+     * The header change may or may not have been stored, and the panel could
+     * not reload the workbook to find out. Edits stay paused until the window
+     * reloads, which reads durable state back in one consistent piece.
+     */
+    readonly reloadRequired?: true;
 }
 
 export type RetainedSnapshotCommandResult = ExcelHeaderSnapshotResult;

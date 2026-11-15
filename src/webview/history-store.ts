@@ -29,6 +29,7 @@ import {
     rekey_saved_appended_row_history,
     rekey_committed_tail_removal_history,
     install_structural_save_barrier,
+    install_header_change_barrier,
     type CommitOutcome,
     type HistoryAction,
     type HistoryActionSource,
@@ -155,6 +156,11 @@ export interface HistoryStore {
      * inserted, deleted, or moved rows or columns. History before it is gone.
      */
     install_structural_save_barrier(): void;
+    /**
+     * Install the workbook-wide `header-change` barrier after a Header Row
+     * change that history could not replay across. History before it is gone.
+     */
+    install_header_change_barrier(): void;
 }
 
 export function create_history_store(initial?: HistoryStackState): HistoryStore {
@@ -256,6 +262,11 @@ export function create_history_store(initial?: HistoryStackState): HistoryStore 
 
         install_structural_save_barrier: () => {
             state = install_structural_save_barrier(state);
+            notify();
+        },
+
+        install_header_change_barrier: () => {
+            state = install_header_change_barrier(state);
             notify();
         },
 

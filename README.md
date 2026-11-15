@@ -193,6 +193,8 @@ Added rows are banded in green, deleted rows in red, and moved rows in purple. W
 
 To choose a different header row, right-click its row number and select **Use row as header**. Table Viewer hides the rows above it, preserves any hidden rows below it, and promotes the chosen row to column names in one step. The action is available only when no sort or enabled filter is changing the displayed row order. Header choices and hidden rows are remembered for that file and worksheet.
 
+You can change the header row while you have unsaved changes. Your edits stay in their cells, deleted rows stay deleted, and appended rows stay at the end. Table Viewer won't change it while the row that would become the header, or the row that is the header now, has unsaved edits, while new columns are unsaved, or while inserted or moved rows would end up under hidden rows. In those cases it says so, and nothing changes until you save.
+
 **CSV/TSV files** open automatically in Table Viewer as an editable table. An **"Open in Text Editor"** button in the title bar takes you to VS Code's built-in text editor. When a CSV/TSV file is open there, two Table Viewer buttons appear in the editor title bar:
 
 - The **preview icon** opens a read-only synced side-by-side preview (alt-click opens it in the same tab)

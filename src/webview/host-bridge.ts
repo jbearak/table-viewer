@@ -213,6 +213,8 @@ function latest_pending_edit_publication(
     );
 }
 
+const pending_ack_listeners = new Set<() => void>();
+
 export const pending_edit_durability = {
     publish(
         editSessionId: string,
@@ -320,23 +322,48 @@ export const pending_edit_durability = {
             && publication.payload === pending_edit_payload(authoritativeEdits)
             && publication.payload === pending_edit_payload(currentEdits);
     },
+    /**
+     * Whether any publication of the session, cell or structural, is still
+     * waiting for the host's acknowledgement. A superseded publication leaves
+     * the set when its successor is posted, so only the latest per worksheet
+     * counts. An unknown session has nothing outstanding.
+     */
+    has_unacknowledged(editSessionId: string): boolean {
+        return (pending_edit_channels.get(editSessionId)?.unacknowledgedSequences.size ?? 0) > 0;
+    },
+    /** Called after every acknowledgement, so a waiter can re-check without polling. */
+    on_acknowledged(listener: () => void): () => void {
+        pending_ack_listeners.add(listener);
+        return () => { pending_ack_listeners.delete(listener); };
+    },
     acknowledge(editSessionId: string, sequence: number): void {
         const channel = pending_edit_channels.get(editSessionId);
         if (!channel || sequence > channel.nextSequence - 1) return;
-        channel.unacknowledgedSequences.delete(sequence);
-        // The host writes publications in sequence order, so every
-        // superseded one at or before this sequence has landed: no later
-        // refresh can carry it as the host's current truth.
-        for (const [key, superseded] of channel.supersededStructuralBySheet) {
-            const remaining = superseded.filter((entry) => entry.sequence > sequence);
-            if (remaining.length === 0) channel.supersededStructuralBySheet.delete(key);
-            else channel.supersededStructuralBySheet.set(key, remaining);
+        try {
+            acknowledge_channel(channel, sequence);
+        } finally {
+            for (const listener of [...pending_ack_listeners]) listener();
         }
     },
     retire(editSessionId: string): void {
         pending_edit_channels.delete(editSessionId);
     },
 };
+
+function acknowledge_channel(
+    channel: NonNullable<ReturnType<typeof pending_edit_channels.get>>,
+    sequence: number,
+): void {
+    channel.unacknowledgedSequences.delete(sequence);
+    // The host writes publications in sequence order, so every
+    // superseded one at or before this sequence has landed: no later
+    // refresh can carry it as the host's current truth.
+    for (const [key, superseded] of channel.supersededStructuralBySheet) {
+        const remaining = superseded.filter((entry) => entry.sequence > sequence);
+        if (remaining.length === 0) channel.supersededStructuralBySheet.delete(key);
+        else channel.supersededStructuralBySheet.set(key, remaining);
+    }
+}
 
 /** Full Pending Changes publisher. It intentionally shares the legacy channel. */
 export const pending_changes_durability = {
@@ -506,6 +533,8 @@ export const pending_changes_durability = {
             && publication.payload === pending_changes_channel_payload(currentChanges);
     },
     acknowledge: pending_edit_durability.acknowledge,
+    has_unacknowledged: pending_edit_durability.has_unacknowledged,
+    on_acknowledged: pending_edit_durability.on_acknowledged,
     retire: pending_edit_durability.retire,
 };
 

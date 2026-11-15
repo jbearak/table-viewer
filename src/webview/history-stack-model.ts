@@ -247,8 +247,10 @@ export interface HistoryBarrier {
      * `action-too-large`: the gesture could not be recorded. `structural-save`:
      * a save wrote a row or column layout change, after which every recorded
      * source coordinate in the workbook may name different content.
+     * `header-change`: a Header Row change moved a worksheet's body under
+     * history that recorded row structure, or cells on rows that crossed it.
      */
-    readonly reason: 'action-too-large' | 'structural-save';
+    readonly reason: 'action-too-large' | 'structural-save' | 'header-change';
     /**
      * The gesture that forced it, for the message. Truncated to
      * `MAX_BARRIER_LABEL_LENGTH`: a label can be built from data, and retaining an
@@ -2685,6 +2687,52 @@ export function install_structural_save_barrier(state: HistoryStackState): Histo
         undoStack: [],
         redoStack: [],
         barrier: { reason: 'structural-save', label: 'Save' },
+        epoch: state.epoch + 1,
+    };
+}
+
+/** What Undo says when it reaches the `header-change` barrier. */
+export const HEADER_CHANGE_BARRIER_MESSAGE =
+    "Can't undo past a header row change on a sheet with row changes.";
+
+/**
+ * Whether history recorded anything a Header Row change on `worksheet` makes
+ * unsafe to replay: any row or column structure of that worksheet (layouts,
+ * Pending Rows and Columns, append bases authored at the old body start and
+ * column names), or a cell or highlight on a source row in `[start, end)`, the
+ * rows that crossed the body boundary. Replaying those would put a body value
+ * into a header cell, or the reverse, or an edit onto a row now hidden above
+ * the header. Cell history elsewhere is keyed by source row and stays valid.
+ */
+export function history_needs_header_change_barrier(
+    state: HistoryStackState,
+    worksheet: WorksheetTarget,
+    crossing: { readonly start: number; readonly end: number },
+): boolean {
+    const key = worksheet_target_key(worksheet);
+    for (const entry of [...state.undoStack, ...state.redoStack]) {
+        for (const change of entry.action.changes) {
+            if (worksheet_target_key(change.delta.worksheet) !== key) continue;
+            if (change.kind === 'cell' || change.kind === 'highlight') {
+                const row = change.delta.sourceRow;
+                if (row >= crossing.start && row < crossing.end) return true;
+                continue;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * Install the workbook-wide `header-change` barrier. Like the structural-save
+ * barrier it discards every recorded action and advances the epoch.
+ */
+export function install_header_change_barrier(state: HistoryStackState): HistoryStackState {
+    return {
+        undoStack: [],
+        redoStack: [],
+        barrier: { reason: 'header-change', label: 'Header Row' },
         epoch: state.epoch + 1,
     };
 }
