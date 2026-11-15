@@ -719,6 +719,74 @@ describe('xlsx edit sessions', () => {
         });
     });
 
+    /** basic.xlsx with D3 (2023-06-01 in the fixture) holding `serial` under `code`. */
+    function with_date_format(code: string, serial: number): void {
+        const file = CFB.read(bytes, { type: 'buffer' });
+        const patch = (part: string, edit: (text: string) => string) => {
+            const entry = CFB.find(file, part)!;
+            const before = Buffer.from(entry.content as Uint8Array).toString('utf8');
+            const after = edit(before);
+            expect(after).not.toBe(before);
+            entry.content = Buffer.from(after, 'utf8');
+            entry.size = entry.content.length;
+        };
+        patch('/xl/styles.xml', (text) => text
+            .replace('<fonts', `<numFmts count="1"><numFmt numFmtId="164" formatCode="${code}"/></numFmts><fonts`)
+            .replace('<xf numFmtId="14"', '<xf numFmtId="164"'));
+        if (serial !== 45078) {
+            patch('/xl/worksheets/sheet1.xml', (text) => text
+                .replace('<c r="D3" s="1"><v>45078</v></c>', `<c r="D3" s="1"><v>${serial}</v></c>`));
+        }
+        const written = CFB.write(file, { type: 'buffer', fileType: 'zip', compression: true });
+        bytes = written instanceof Uint8Array ? written : new Uint8Array(written as ArrayBufferLike);
+    }
+
+    async function save_typed_d3(value: string, base: string): Promise<string | undefined> {
+        const panel = await open_ready_xlsx(file_path);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 0 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: workbook_request(session, 'typed-display-date', save_worksheet({
+                edits: { '2:3': value },
+                dirtyEdits: { '2:3': { value, base } },
+            })),
+        });
+        await wait_for_observable(() => save_results(panel).length > 0);
+        expect(save_results(panel).at(-1)).toMatchObject({ success: true });
+        return read_part(bytes, 'xl/worksheets/sheet1.xml')!.toString('utf8')
+            .match(/<c r="D3"[^>]*>[\s\S]*?<\/c>/)?.[0];
+    }
+
+    it.each([
+        // Retyping what the cell shows keeps the 15th: no change.
+        ['Jun-23', 45092],
+        ['Jul-23', 45122],
+    ])('keeps the day of a date when %s is typed into an mmm-yy cell holding 2023-06-15', async (value, serial) => {
+        with_date_format('mmm-yy', 45092);
+        const before = await parse_xlsx(bytes);
+        expect(before.data.sheets[0].rows[2][3]).toMatchObject({ formatted: 'Jun-23', rawType: 'date' });
+
+        expect(await save_typed_d3(value, '2023-06-15T00:00:00.000Z'))
+            .toBe(`<c r="D3" s="1"><v>${serial}</v></c>`);
+        const after = await parse_xlsx(bytes);
+        expect(after.data.sheets[0].rows[2][3]).toMatchObject({ rawType: 'date', formatted: value });
+    });
+
+    it.each([
+        ['Friday, June 2, 2023', 45079, 'Friday, June 2, 2023'],
+        ['June 3, 2023', 45080, 'Saturday, June 3, 2023'],
+    ])('saves %s typed into a dddd, mmmm d, yyyy cell as a date', async (value, serial, shown) => {
+        with_date_format('dddd, mmmm d, yyyy', 45078);
+        const before = await parse_xlsx(bytes);
+        expect(before.data.sheets[0].rows[2][3]?.formatted).toBe('Thursday, June 1, 2023');
+
+        expect(await save_typed_d3(value, '2023-06-01T00:00:00.000Z'))
+            .toBe(`<c r="D3" s="1"><v>${serial}</v></c>`);
+        const after = await parse_xlsx(bytes);
+        expect(after.data.sheets[0].rows[2][3]?.formatted).toBe(shown);
+    });
+
     it('renames a promoted header through its canonical source coordinate', async () => {
         const panel = await open_ready_xlsx(file_path);
         await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 0 });

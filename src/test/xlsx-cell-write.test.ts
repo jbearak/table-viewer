@@ -338,6 +338,16 @@ describe('apply_cell_edits', () => {
         expect(out).toContain('<c r="A1" s="4"><v>9</v></c>');
     });
 
+    it('fills a typed date from the cached date of a formula it replaces, even when an edit invalidates the cache', () => {
+        // A1 = B1, cached as 2023-06-15 under `mmm-yy`; B1 is edited in the same save.
+        const out = apply_cell_edits(
+            doc('<row r="1"><c r="A1" s="1"><f>B1</f><v>45092</v></c><c r="B1"><v>45092</v></c></row>'),
+            [{ row: 0, col: 0, value: 'Jul-23' }, { row: 0, col: 1, value: '1' }],
+            { ...OPTS, is_date_style: (xf) => xf === 1, number_format_code: () => 'mmm-yy' },
+        );
+        expect(out).toContain('<c r="A1" s="1"><v>45122</v></c>');
+    });
+
     it('refuses a shared-formula cell rather than breaking the group', () => {
         // The master defines the formula its followers reference by `si`. Dropping
         // it leaves them pointing at a definition that no longer exists.

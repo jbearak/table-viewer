@@ -1367,3 +1367,21 @@ test('a date typed into an .xlsx date cell the way the cell shows dates saves as
     await expect.poll(async () => (await joined())?.formatted).toBe('6/2/23');
     expect(await joined()).toMatchObject({ raw: '2023-06-02T00:00:00.000Z', rawType: 'date' });
 });
+
+test('a month typed into an .xlsx mmm-yy date cell keeps the day the cell held', async () => {
+    // A1 holds 2023-06-15 under `mmm-yy`, so it shows Jun-23.
+    const book = Buffer.from(build_fixture_xlsx({
+        numberFormats: ['mmm-yy'],
+        sheets: [{ name: 'Data', body: `<sheetData>${row(1, [cell('A1', 45092, 4)])}</sheetData>` }],
+    }));
+    const { file, page } = await open_file('months.xlsx', book);
+    await wait_for_grid(page);
+    const month = async () => (await read_workbook(file))?.data.sheets[0].rows[0][0];
+    expect(await month()).toMatchObject({ formatted: 'Jun-23', rawType: 'date' });
+
+    await type_into_cell(page, 1, 0, 'Jul-23');
+    await save_changes(page);
+
+    await expect.poll(async () => (await month())?.formatted).toBe('Jul-23');
+    expect(await month()).toMatchObject({ raw: '2023-07-15T00:00:00.000Z', rawType: 'date' });
+});

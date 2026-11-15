@@ -190,7 +190,6 @@ describe('dates typed the way a date format shows them', () => {
         expect(typed('2-Jun-23', 'd-mmm-yy')).toEqual(june_2);
         expect(typed('2-june-2023', 'd-mmm-yy')).toEqual(june_2);
         expect(typed('June 2, 2023', 'mmmm d, yyyy')).toEqual(june_2);
-        expect(typed('2-6-23', 'd-mmm-yy')).toEqual({ kind: 'string', text: '2-6-23' });
         expect(typed('2-Jux-23', 'd-mmm-yy')).toEqual({ kind: 'string', text: '2-Jux-23' });
     });
 
@@ -229,7 +228,6 @@ describe('dates typed the way a date format shows them', () => {
             ['6-2-23', 'm/d/yy'],
             ['2023/6/2', 'm/d/yy'],
             ['6/2/23', 'mmm-yy'],
-            ['6/2/23', 'dddd, m/d/yy'],
             ['6/2/23', '0.00'],
             ['6/2/23', 'General'],
             ['12:30', 'h:mm'],
@@ -241,6 +239,115 @@ describe('dates typed the way a date format shows them', () => {
     it('still reads ISO dates the same way', () => {
         expect(typed('2023-06-02', 'm/d/yy')).toEqual(june_2);
         expect(typed('2023-06-02', 'General')).toEqual({ kind: 'string', text: '2023-06-02' });
+    });
+});
+
+describe('dates typed into more kinds of date format', () => {
+    // 2023-06-01, a Thursday, unless a test says otherwise.
+    const june_1 = 45078;
+    const read = (
+        value: string,
+        code: string,
+        current: { current_serial?: number; current_year?: number } = {},
+    ) => display_date_to_serial(value, code, 0, { current_year: 2023, ...current });
+
+    it('reads a date with or without the weekday a format shows', () => {
+        const code = 'dddd, mmmm d, yyyy';
+        for (const value of [
+            'Thursday, June 1, 2023',
+            'thu, JUNE 1, 2023',
+            'June 1, 2023',
+            // The weekday is not checked: the day, month and year decide.
+            'Friday, June 1, 2023',
+        ]) expect(read(value, code)).toBe(june_1);
+        expect(read('Thursday, June 1, 2023', '[$-F800]dddd, mmmm dd, yyyy')).toBe(june_1);
+        expect(read('6/1/23', 'dddd, m/d/yy')).toBe(june_1);
+        expect(read('6/1/23 (Thu)', 'm/d/yy (ddd)')).toBe(june_1);
+        expect(read('6/1/23', 'm/d/yy (ddd)')).toBe(june_1);
+        expect(read('Thursdays, June 1, 2023', code)).toBeNull();
+        expect(read('Thursday June 1, 2023', code)).toBeNull();
+    });
+
+    it('reads a month number or name where a format shows one letter of the month', () => {
+        for (const value of ['1-6-23', '1-06-23', '1-Jun-23', '1-june-23']) {
+            expect(read(value, 'd-mmmmm-yy')).toBe(june_1);
+        }
+        expect(read('1-J-23', 'd-mmmmm-yy')).toBeNull();
+    });
+
+    it('reads a month number where a format shows a month name', () => {
+        expect(read('1-6-23', 'd-mmm-yy')).toBe(june_1);
+        expect(read('June 1, 2023', 'mmmm d, yyyy')).toBe(june_1);
+        expect(read('6 1, 2023', 'mmmm d, yyyy')).toBe(june_1);
+        expect(read('1-13-23', 'd-mmm-yy')).toBeNull();
+    });
+
+    it('fills the parts a format leaves out from the cell\'s date', () => {
+        // 2023-06-15: retyping what the cell shows keeps the 15th.
+        expect(read('Jun-23', 'mmm-yy', { current_serial: 45092 })).toBe(45092);
+        expect(read('Jul-23', 'mmm-yy', { current_serial: 45092 })).toBe(45122);
+        expect(read('1-Jun', 'd-mmm', { current_serial: 43895 })).toBe(43983);
+        // 2023-01-31 has no February counterpart, so the day stops at the 28th.
+        expect(read('Feb-23', 'mmm-yy', { current_serial: 44957 })).toBe(44985);
+        // A time of day on the cell's date is not kept.
+        expect(read('Jun-23', 'mmm-yy', { current_serial: 45092.5 })).toBe(45092);
+    });
+
+    it('fills a missing day with 1 and a missing year with this year otherwise', () => {
+        expect(read('Jun-23', 'mmm-yy')).toBe(june_1);
+        expect(read('6/23', 'm/yy')).toBe(june_1);
+        expect(read('June 2023', 'mmmm yyyy')).toBe(june_1);
+        expect(read('1-Jun', 'd-mmm')).toBe(june_1);
+        expect(read('1-Jun', 'd-mmm', { current_year: 2024 })).toBe(45444);
+        expect(read('06/01', 'mm/dd')).toBe(june_1);
+        expect(read('2/29', 'm/d')).toBeNull();
+        expect(read('2/29', 'm/d', { current_year: 2024 })).toBe(45351);
+    });
+
+    it('defaults the year to the year it is now', () => {
+        const year = new Date().getFullYear();
+        const serial = display_date_to_serial('1-Jun', 'd-mmm', 0);
+        expect(serial).toBe(display_date_to_serial(`1-Jun-${year}`, 'd-mmm-yyyy', 0));
+    });
+
+    it('leaves a format that shows only one of day, month and year as text', () => {
+        for (const [value, code] of [
+            ['2023', 'yyyy'],
+            ['June', 'mmmm'],
+            ['Thursday 1', 'dddd d'],
+            ['1', 'd'],
+            ['12:30', 'h:mm'],
+            ['0623', 'mmyy'],
+        ]) expect(read(value, code)).toBeNull();
+    });
+
+    it('reads words a format shows between the parts of a date', () => {
+        for (const code of ['yyyy"年"m"月"d"日"', 'yyyy\\年m\\月d\\日', 'yyyy年m月d日']) {
+            expect(read('2023年6月1日', code)).toBe(june_1);
+        }
+        expect(read('2023年6月1日', 'yyyy"年"m"月"d"日" h:mm')).toBe(june_1);
+        expect(read('1 of June 2023', 'd "of" mmmm yyyy')).toBe(june_1);
+        expect(read('1 OF june   2023', 'd "of" mmmm yyyy')).toBe(june_1);
+        expect(read('1 of June 2023', 'd "of"  mmmm yyyy')).toBe(june_1);
+        expect(read('Due 6/1/23', '"Due "m/d/yy')).toBe(june_1);
+        expect(read('6/1/23', '"Due "m/d/yy')).toBe(june_1);
+        expect(read('6/1/23 (est.)', 'm/d/yy" (est.)"')).toBe(june_1);
+        expect(read('6/1/23 (estimated date)', 'm/d/yy" (estimated date)" h:mm')).toBe(june_1);
+        expect(read('on 6/1/23', 'h:mm" on "m/d/yy')).toBe(june_1);
+        expect(read('6/1/23', 'm/d/yy"T"h:mm')).toBeNull();
+        expect(read('1 off June 2023', 'd "of" mmmm yyyy')).toBeNull();
+        expect(read('1 June 2023', 'd "of" mmmm yyyy')).toBeNull();
+        // Only English month names are read.
+        expect(read('1 de junio de 2023', 'd "de" mmmm "de" yyyy')).toBeNull();
+    });
+
+    it('previews a date filled from the cell\'s date', () => {
+        // 2020-03-05 puts June 1 in 2020, a Monday; this year it is a Thursday.
+        const code = 'dddd, mmmm d';
+        expect(format_xlsx_edit_preview('June 1', { code }, { current_date_serial: 43895 }))
+            .toBe('Monday, June 1');
+        expect(format_xlsx_edit_preview('June 1', { code }, { current_date_serial: 45092 }))
+            .toBe('Thursday, June 1');
     });
 });
 

@@ -323,13 +323,27 @@ const MONTH_NAMES = [
     'july', 'august', 'september', 'october', 'november', 'december',
 ];
 
+const WEEKDAY_NAMES = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
+const WEEKDAY_SOURCE = `(?:${WEEKDAY_NAMES.flatMap((name) => [name, name.slice(0, 3)]).join('|')})`;
+
+/** Literal format text as a pattern: exact, with any run of whitespace matching any other. */
+function literal_source(text: string): string {
+    return text
+        .split(/\s+/)
+        .map((word) => word.replace(/[.*+?^${}()|[\]\\/-]/g, '\\$&'))
+        .join('\\s+');
+}
+
 const display_date_patterns = new Map<string, DisplayDatePattern | null>();
 
 /**
- * The text one format section shows for a date, as a pattern: day, month, and
- * year in the section's order with its separators between them. A time before
- * or after them is left off, so the date alone is accepted. Anything else
- * (weekday names, literal text, a missing part) gives null.
+ * The text one format section shows for a date, as a pattern: the day, month,
+ * and year it shows (at least two of them) in the section's order, with the
+ * literal text between them. A weekday may be typed or left out, with the
+ * separator after it, and is not checked. Where the section shows a month
+ * name, a month number is read too. Literal text before or after the date
+ * (`日` in `yyyy"年"m"月"d"日"`) may be typed or left out, and so may a time
+ * before or after it. Anything else gives null.
  */
 function display_date_pattern(section: string): DisplayDatePattern | null {
     const cached = display_date_patterns.get(section);
@@ -393,58 +407,103 @@ function display_date_pattern(section: string): DisplayDatePattern | null {
     let last = -1;
     tokens.forEach((token, index) => { if (is_date_field(token)) last = index; });
     const date = first < 0 ? [] : tokens.slice(first, last + 1);
-    const outside = [...tokens.slice(0, Math.max(first, 0)), ...tokens.slice(last + 1)];
-    // A time beside the date must be set apart from it by a space.
-    const apart = (token: Token | undefined) => token === undefined || /\s/.test(token.text);
-    let valid = date.length === 5
-        && outside.every((token) => token.kind === 'lit' || is_time(token))
-        && apart(first > 0 ? tokens[first - 1] : undefined)
-        && apart(tokens[last + 1]);
+    const before = tokens.slice(0, Math.max(first, 0));
+    const after = tokens.slice(last + 1);
+    // Literal text before or after the date, up to a time, which must be set
+    // apart from the date by a space.
+    const attached = (outside: Token[], next: Token | undefined, side: 'prefix' | 'suffix') => {
+        const timed = outside.some(is_time);
+        if (next?.kind !== 'lit') return timed ? null : '';
+        const text = side === 'prefix' ? next.text.trimStart() : next.text.trimEnd();
+        return timed && text === next.text ? null : text;
+    };
+    const prefix = attached(before, before[before.length - 1], 'prefix');
+    const suffix = attached(after, after[0], 'suffix');
+    let valid = date.length > 0
+        && [...before, ...after].every((token) => token.kind === 'lit' || is_time(token))
+        && prefix !== null && suffix !== null;
 
     const order: DatePart[] = [];
-    let source = '';
+    const seen = new Set<string>();
+    const pieces: string[] = [];
+    const weekdays: number[] = [];
     date.forEach((token, index) => {
         if (!valid) return;
         const { kind, len, text } = token;
         if (index % 2 === 1) {
-            if (kind !== 'lit' || /[A-Za-z0-9]/.test(text)) valid = false;
-            else source += text.replace(/[.*+?^${}()|[\]\\/-]/g, '\\$&');
+            if (kind !== 'lit' || text === '') valid = false;
+            else pieces.push(literal_source(text));
             return;
         }
-        if ((kind !== 'y' && kind !== 'm' && kind !== 'd') || order.includes(kind)) {
+        const weekday = kind === 'd' && len >= 3;
+        const part = weekday ? 'w' : kind;
+        if ((kind !== 'y' && kind !== 'm' && kind !== 'd') || seen.has(part)) {
             valid = false;
             return;
         }
-        if (kind === 'y') source += '(\\d{2}|\\d{4})';
-        else if (len <= 2) source += '(\\d{1,2})';
-        else if (kind === 'm' && len <= 4) source += '([A-Za-z]{3,9})';
-        else valid = false;
+        seen.add(part);
+        if (weekday) {
+            weekdays.push(index);
+            pieces.push(WEEKDAY_SOURCE);
+            return;
+        }
+        if (kind === 'y') pieces.push('(\\d{2}|\\d{4})');
+        else if (kind === 'm' && len >= 3) pieces.push('(\\d{1,2}|[A-Za-z]{3,9})');
+        else pieces.push('(\\d{1,2})');
         order.push(kind);
     });
-    const pattern = valid ? { re: new RegExp(`^${source}$`, 'i'), order } : null;
+    // A weekday may be left out, with the separator after it (or before it, last).
+    for (const at of weekdays) {
+        const [from, to] = at + 1 < pieces.length ? [at, at + 1] : [at - 1, at];
+        if (from < 0) continue;
+        pieces[from] = `(?:${pieces[from]}${pieces[to]})?`;
+        pieces[to] = '';
+    }
+    const source = `(?:${literal_source(prefix ?? '')})?${pieces.join('')}(?:${literal_source(suffix ?? '')})?`;
+    const pattern = valid && order.length >= 2 ? { re: new RegExp(`^${source}$`, 'i'), order } : null;
     display_date_patterns.set(section, pattern);
     return pattern;
+}
+
+/** What fills the parts of a date a format leaves out. */
+export interface DisplayDateDefaults {
+    /** The date the cell holds now, as a serial: its parts fill the missing ones. */
+    readonly current_serial?: number;
+    /** The year when the cell holds no date. Default: this year. */
+    readonly current_year?: number;
 }
 
 function display_date_match_to_serial(
     pattern: DisplayDatePattern,
     match: RegExpExecArray,
     datemode: DateMode,
+    defaults: DisplayDateDefaults,
 ): number | null {
-    let year = 0, month = 0, day = 0;
+    const typed: Partial<Record<DatePart, number>> = {};
     for (const [index, part] of pattern.order.entries()) {
         const field = match[index + 1];
         if (part === 'y') {
-            year = Number(field);
-            if (field.length === 2) year += year < 30 ? 2000 : 1900;
-        } else if (part === 'd') {
-            day = Number(field);
-        } else if (/^\d+$/.test(field)) {
-            month = Number(field);
+            typed.y = Number(field);
+            if (field.length === 2) typed.y += typed.y < 30 ? 2000 : 1900;
+        } else if (part === 'd' || /^\d+$/.test(field)) {
+            typed[part] = Number(field);
         } else {
             const name = field.toLowerCase();
-            month = MONTH_NAMES.findIndex((full) => full === name || full.slice(0, 3) === name) + 1;
+            typed.m = MONTH_NAMES.findIndex((full) => full === name || full.slice(0, 3) === name) + 1;
         }
+    }
+    const serial = defaults.current_serial;
+    const current = serial !== undefined && is_valid_excel_date_serial(serial, datemode)
+        ? /^(\d{4})-(\d{2})-(\d{2})/.exec(serial_to_iso(Math.floor(serial), datemode))
+        : null;
+    const year = typed.y ?? (current ? Number(current[1]) : defaults.current_year ?? new Date().getFullYear());
+    const month = typed.m ?? (current ? Number(current[2]) : 1);
+    let day = typed.d ?? (current ? Number(current[3]) : 1);
+    if (typed.d === undefined) {
+        // The cell's 31st in a shorter month is that month's last day.
+        const end = new Date(0);
+        end.setUTCFullYear(year, month, 0);
+        day = Math.min(day, end.getUTCDate());
     }
     const pad = (n: number, width: number) => String(n).padStart(width, '0');
     return iso_to_serial(`${pad(year, 4)}-${pad(month, 2)}-${pad(day, 2)}`, datemode);
@@ -454,19 +513,22 @@ function display_date_match_to_serial(
  * Convert text written the way a date format shows dates (`6/1/23` under
  * `m/d/yy`) to an Excel serial, or null. Each section is tried, and a date read
  * by one counts only if that section is the one that shows it. Two-digit years
- * follow Excel: 00–29 are 2000–2029, 30–99 are 1930–1999.
+ * follow Excel: 00–29 are 2000–2029, 30–99 are 1930–1999. Parts the format
+ * leaves out come from the cell's current date, or else are day 1, January,
+ * and this year.
  */
 export function display_date_to_serial(
     text: string,
     code: string,
     datemode: DateMode,
+    defaults: DisplayDateDefaults = {},
 ): number | null {
     const trimmed = text.trim();
     for (const section of format_sections(code)) {
         const pattern = display_date_pattern(section);
         const match = pattern?.re.exec(trimmed);
         if (!pattern || !match) continue;
-        const serial = display_date_match_to_serial(pattern, match, datemode);
+        const serial = display_date_match_to_serial(pattern, match, datemode, defaults);
         if (serial !== null && serial >= 0 && number_format_section_for_value(code, serial) === section) {
             return serial;
         }
@@ -474,11 +536,20 @@ export function display_date_to_serial(
     return null;
 }
 
+/** The date a loaded cell holds, as a serial, or undefined when it holds none. */
+export function cell_date_serial(
+    cell: { readonly rawType?: string; readonly numericRaw?: number } | null | undefined,
+): number | undefined {
+    return cell?.rawType === 'date' ? cell.numericRaw : undefined;
+}
+
 export interface XlsxEditPreviewOptions {
     readonly was_boolean?: boolean;
     readonly was_iso_date?: boolean;
     /** Rich/styled edits are saved as text and must not receive numeric formatting. */
     readonly force_text?: boolean;
+    /** The date the cell holds now, which fills the parts a typed date leaves out. */
+    readonly current_date_serial?: number;
 }
 
 /** Format a dirty XLSX value exactly as its scalar save result will be displayed. */
@@ -491,7 +562,9 @@ export function format_xlsx_edit_preview(
     const classified = classify_xlsx_cell_value(value, {
         datemode: format.date1904 ? 1 : 0,
         is_date_style: (serial) => number_format_is_date(format, serial),
-        display_date_serial: (text) => display_date_to_serial(text, format.code, format.date1904 ? 1 : 0),
+        display_date_serial: (text) => display_date_to_serial(
+            text, format.code, format.date1904 ? 1 : 0, { current_serial: options.current_date_serial },
+        ),
         was_boolean: options.was_boolean,
         was_iso_date: options.was_iso_date,
     });

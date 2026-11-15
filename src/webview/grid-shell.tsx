@@ -198,7 +198,7 @@ import {
     parse_cell_edit,
     type EditSyntax,
 } from '../cell-edit-model';
-import { format_xlsx_edit_preview, type XlsxNumberFormat } from '../spreadsheet-format';
+import { cell_date_serial, format_xlsx_edit_preview, type XlsxNumberFormat } from '../spreadsheet-format';
 import { MAX_SHEET_ROWS } from '../spreadsheet-safety';
 import {
     xlsx_edit_writes_formula,
@@ -406,6 +406,7 @@ function cached_dirty_presentation(
             was_boolean: cell.rawType === 'boolean',
             was_iso_date: cell.xlsxIsoDate,
             force_text: requires_rich,
+            current_date_serial: cell_date_serial(cell),
         })
         : undefined;
     const presentation = {
