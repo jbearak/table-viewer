@@ -9603,30 +9603,29 @@ export function attach_viewer(
                 const receipt = header_receipt_queue.shift()!;
                 const is_origin = receipt.originToken === excel_header_subscriber_token;
                 try {
-                    if (same_file_authority_basis(
+                    // This panel already shows the receipt's projection, or a
+                    // newer one: a refresh adopted it before the receipt was
+                    // processed. Nothing is left to apply. The write was
+                    // committed either way, so the answer says what it changed.
+                    const already_there = same_file_authority_basis(
                         source_authority,
                         receipt.resultingBasis,
-                    )) {
-                        if (is_origin) {
-                            session.retain_command_result({
-                                type: 'excelFirstRowHeader',
-                                requestId: receipt.requestId,
-                                outcome: 'applied',
-                                change: receipt.change,
-                            });
-                        }
-                        continue;
-                    }
+                    );
                     if (
-                        compare_authority(receipt.resultingBasis, source_authority)
+                        already_there
+                        || compare_authority(receipt.resultingBasis, source_authority)
                             === 'dominated'
                     ) {
                         if (is_origin) {
                             session.retain_command_result({
                                 type: 'excelFirstRowHeader',
                                 requestId: receipt.requestId,
-                                outcome: 'recovered',
-                                error: 'A newer workbook projection was already active.',
+                                ...(already_there
+                                    ? { outcome: 'applied' as const }
+                                    : {
+                                        outcome: 'recovered' as const,
+                                        error: 'A newer workbook projection was already active.',
+                                    }),
                                 change: receipt.change,
                             });
                         }

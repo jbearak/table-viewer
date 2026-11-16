@@ -24687,6 +24687,54 @@ describe('the header row as a step in history', () => {
                 expect(edits_admitted()).toBe(true);
             });
 
+            it('records the sheets that changed before the host stops saying it holds the unsaved changes', async () => {
+                const { post_message } = await render_app();
+                await open(post_message, book([AUTO, AUTO, AUTO]));
+                await acquire_editing_session(post_message);
+                seed_mounted_store({ '3:0': { value: 'x', base: 'y' } });
+                const acknowledge = () => dispatch_host_message({
+                    type: 'pendingEditsAcknowledged',
+                    editSessionId: 'test-edit-session',
+                    sequence: last_publication_sequence(post_message),
+                });
+                vi.useFakeTimers();
+                try {
+                    await open_scope_menu('Header row scope');
+                    await click_menu_item('Show first row as data on all 3 sheets');
+                    // The stores are published, and the host holds them.
+                    await acknowledge();
+                    const first = requests(post_message).at(-1)!;
+                    expect(first.sheetIndex).toBe(0);
+                    await answer(first, book([OFF, AUTO, AUTO]), { change: TURNED_OFF }, { capabilities: HELD });
+                    const second = requests(post_message).at(-1)!;
+                    expect(second.sheetIndex).toBe(1);
+                    // A publication the host never acknowledges, made while
+                    // the second request is out: the host asks the window to
+                    // flush what it holds, as it does at a close or reload.
+                    const published = posted(post_message, 'pendingChangesChanged').length
+                        + posted(post_message, 'pendingEditsChanged').length;
+                    seed_mounted_store({ '3:0': { value: 'z', base: 'y' } });
+                    await dispatch_host_message({ type: 'requestPendingEditsFlush', requestId: 'flush-1' });
+                    expect(
+                        posted(post_message, 'pendingChangesChanged').length
+                        + posted(post_message, 'pendingEditsChanged').length,
+                    ).toBeGreaterThan(published);
+                    await answer(second, book([OFF, OFF, AUTO]), { change: TURNED_OFF }, { capabilities: HELD });
+                    expect(requests(post_message)).toHaveLength(2);
+                    expect(recorded()).toEqual([]);
+                    await act(async () => { vi.advanceTimersByTime(15_000); });
+
+                    expect(requests(post_message)).toHaveLength(2);
+                    expect(warnings(post_message)).toEqual([
+                        'Could not change the header row: unsaved changes are still being stored. Try again.',
+                    ]);
+                    expect(recorded()).toEqual([['Show first row as data on all sheets', [0, 1]]]);
+                    expect(edits_admitted()).toBe(true);
+                } finally {
+                    vi.useRealTimers();
+                }
+            });
+
             it('records the sheets that changed before a result that needs a reload', async () => {
                 const { post_message } = await render_app();
                 const third = await turn_off_all(post_message);

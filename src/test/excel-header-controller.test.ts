@@ -1236,6 +1236,51 @@ describe('Excel workbook snapshot controller', () => {
         expect(settled.commandResult).toMatchObject({ outcome: 'recovered' });
     });
 
+    it('says what the write changed when the panel is already past the receipt\'s projection', async () => {
+        // The branch that answers a receipt this panel has nothing left to
+        // apply for. A receipt is processed one microtask after its commit,
+        // ahead of any refresh's adoption, so the asking panel does not get
+        // here by itself; the microtask is held to put a refresh's newer
+        // authority in first. What is pinned is the answer: the write was
+        // committed, so it says what it changed.
+        const state = mutable_state_store();
+        const builds = { count: 0 };
+        const panel = open_excel('/header-receipt-after-refresh.xlsx', state.store, excel_profile(builds));
+        const initial = await ready(panel);
+        const run_now = globalThis.queueMicrotask;
+        const held: (() => void)[] = [];
+        let holding = true;
+        vi.stubGlobal('queueMicrotask', (callback: () => void) => {
+            if (holding && callback.name === 'process_excel_header_receipts') held.push(callback);
+            else run_now(callback);
+        });
+        try {
+            await toggle(panel, initial, 'receipt-after-refresh', false);
+            await vi.waitFor(() => expect(held.length).toBeGreaterThan(0));
+            await vscode_mock.__getWatchers()[0].__fireChange();
+            expect(builds.count).toBe(2);
+            expect(snapshots(panel).some((snapshot) => snapshot.commandResult !== undefined)).toBe(false);
+            holding = false;
+            for (const callback of held.splice(0)) run_now(callback);
+
+            await vi.waitFor(() => expect(snapshots(panel).some((snapshot) => (
+                snapshot.commandResult?.requestId === 'receipt-after-refresh'
+            ))).toBe(true));
+            const settled = snapshots(panel).find((snapshot) => (
+                snapshot.commandResult?.requestId === 'receipt-after-refresh'
+            ))!;
+            expect(settled.commandResult).toEqual({
+                type: 'excelFirstRowHeader',
+                requestId: 'receipt-after-refresh',
+                outcome: 'recovered',
+                error: 'A newer workbook projection was already active.',
+                change: { before: { mode: 'auto', row: 0 }, after: { mode: 'off' }, hidden: [], shown: [] },
+            });
+        } finally {
+            vi.unstubAllGlobals();
+        }
+    });
+
     it('reports reload-required when the header reload stops at a declined file-size prompt', async () => {
         // The receipt can't be applied in place, so the result waits for the
         // reload's adoption. The file has grown past the size limit and the
