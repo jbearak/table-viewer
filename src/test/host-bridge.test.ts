@@ -477,15 +477,16 @@ describe('host-bridge', () => {
                 await import('../webview/host-bridge');
             const acknowledged = pending_changes_durability.publish('session:v', changes('b'), 1);
             pending_changes_durability.acknowledge('session:v', acknowledged);
-            // Two the host dropped (a replay commit was running): the second
-            // supersedes the first on the same sheet before either answers.
+            // Two more on the same sheet, the second superseding the first
+            // before either answers: the host takes one (2) and drops the
+            // other (3, a replay commit was running).
             pending_changes_durability.publish('session:v', changes('c'), 1);
             const latest = pending_changes_durability.publish('session:v', changes('d'), 1);
             expect(latest).toBe(3);
 
             publication_fence.raise();
             expect(pending_changes_durability.snapshot('session:v')).toEqual({ highestProducedSequence: 1 });
-            // One the host did take, acknowledged late, is vouched for.
+            // The one the host took, acknowledged late, is vouched for.
             pending_changes_durability.acknowledge('session:v', 2);
             expect(pending_changes_durability.snapshot('session:v')).toEqual({ highestProducedSequence: 2 });
             // A session with no channel answers zero and gets none.

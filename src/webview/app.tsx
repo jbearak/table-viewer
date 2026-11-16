@@ -1900,7 +1900,7 @@ export function App(): React.JSX.Element {
         say_history(REOPEN_REQUIRED_MESSAGE);
         return true;
     }, [say_history]);
-    refused_for_reopen_ref.current = refused_for_reopen;
+    useLayoutEffect(() => { refused_for_reopen_ref.current = refused_for_reopen; }, [refused_for_reopen]);
 
     /**
      * This window has said it no longer matches its file. From here it sends
@@ -2837,7 +2837,7 @@ export function App(): React.JSX.Element {
         // Whatever a header change waits for, a held press may wait for too.
         wake_history_press();
     }, [wake_history_press]);
-    wake_header_drain_ref.current = wake_header_drain;
+    useLayoutEffect(() => { wake_header_drain_ref.current = wake_header_drain; }, [wake_header_drain]);
     const [filter_editor, set_filter_editor] = useState<{
         column_index: number;
         anchor: { left: number; top: number };
@@ -4062,13 +4062,13 @@ export function App(): React.JSX.Element {
             host_bridge.postMessage({ type: 'showWarning', message: REOPEN_REQUIRED_SAVE_MESSAGE });
             return undefined;
         }
-        if (!csv_edit_session_id || save_projection_ref.current.operation) return undefined;
         // A Header Row change carries the session's Pending Changes to the new
         // header in its own durable write; Save waits until it has landed.
         if (header_fence_ref.current) {
             warn_save_waits_for_header();
             return undefined;
         }
+        if (!csv_edit_session_id || save_projection_ref.current.operation) return undefined;
         // A conflict notice's dismissal is occurrence-scoped: Save is the
         // user's explicit request to see whether the condition still blocks
         // persistence. Dismissed formula warnings stay dismissed.
@@ -9556,11 +9556,14 @@ export function App(): React.JSX.Element {
         const run = header_run_ref.current;
         if (reopen_required_ref.current) {
             // Queued before this window said it no longer matches its file
-            // (behind the replay it could not follow): not sent. A replay's
-            // own run never gets here, since the press gate refuses it first.
+            // (behind the replay it could not follow): not sent. Ended as a
+            // result that needs a reload ends it, saying only this. (A
+            // replay's run would end the same way, its entry left where it
+            // is; the press gate refuses one before it is queued.)
+            if (run !== null) run.failed = { silent: true };
             set_excel_header_status('Header row was not updated.');
             say_history(REOPEN_REQUIRED_MESSAGE);
-            finish_header_queue({ reason: REOPEN_REQUIRED_MESSAGE });
+            finish_header_queue();
             return;
         }
         if (next_sheet === undefined) {
@@ -10858,14 +10861,14 @@ export function App(): React.JSX.Element {
     ]);
 
     const request_save_or_remain_dirty = useCallback(() => {
-        const editing = editing_ref.current;
-        if (!editing) return false;
         // See `begin_save_operation`: nothing is saved from a window that must
         // be reopened, or across a header change.
         if (reopen_required_ref.current) {
             show_warning(REOPEN_REQUIRED_SAVE_MESSAGE);
             return true;
         }
+        const editing = editing_ref.current;
+        if (!editing) return false;
         if (header_fence_ref.current) {
             warn_save_waits_for_header();
             return true;

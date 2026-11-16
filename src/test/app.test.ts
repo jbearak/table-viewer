@@ -3443,6 +3443,24 @@ describe('Excel first-row header toggle', () => {
         expect(grid_shell_mock.latest_props?.edits_paused).toBe(true);
     });
 
+    it('says why Save waits for a header change made with no editing session', async () => {
+        // Cmd+S reaches App while the fence pauses edits; there is no session
+        // to save, but the key is taken, so it says why.
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(excel_meta(true), {
+            capabilities: EDITABLE,
+        }));
+        await click_button('Header Row');
+        expect(header_requests(post_message)).toHaveLength(1);
+        expect(grid_shell_mock.latest_props?.edit_session_id).toBeUndefined();
+        post_message.mockClear();
+        act(() => { (grid_shell_mock.latest_props?.on_save_request as () => unknown)(); });
+        expect(post_message).toHaveBeenCalledWith({
+            type: 'showWarning',
+            message: 'Wait for the header row change to finish, then save.',
+        });
+    });
+
     it('lifts the fence on a refusal, so editing goes on', async () => {
         const { post_message } = await render_app();
         await dispatch_host_message(initial_snapshot_message(excel_meta(true), {
