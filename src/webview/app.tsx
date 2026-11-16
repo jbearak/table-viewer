@@ -5910,6 +5910,7 @@ export function App(): React.JSX.Element {
 
                     let correction_required = false;
                     if (snapshot.presentation === 'initial') {
+                        note_grid_replaced();
                         set_load_epoch((n) => n + 1);
                         const normalized = initial_normalized_state!;
                         const base = normalize_complete_per_file_state(
@@ -5925,6 +5926,7 @@ export function App(): React.JSX.Element {
                             columnVisibility: normalized.columnVisibility,
                             cellHighlights: normalized.cellHighlights,
                         });
+                        note_grid_replaced(normalized.activeSheetIndex);
                         set_active_sheet_index(normalized.activeSheetIndex);
                         set_column_widths(normalized.columnWidths);
                         set_show_formatting_by_sheet(normalized.showFormatting ?? []);
@@ -6116,6 +6118,7 @@ export function App(): React.JSX.Element {
                         });
                         set_transforms(next_transforms);
                         set_column_visibility(next_column_visibility);
+                        note_grid_replaced(next_active_sheet_index);
                         set_active_sheet_index(next_active_sheet_index);
                         state_ref.current = {
                             ...state_ref.current,
@@ -7167,6 +7170,19 @@ export function App(): React.JSX.Element {
     useLayoutEffect(() => {
         sheet_visit_ref.current += 1;
     }, [active_sheet_index]);
+    /**
+     * Counted at once where the grid is replaced, not only when React has
+     * committed it (the layout effects above): a gesture's wait resumes in a
+     * microtask, before that commit. An extra count only ends a waiting
+     * gesture, silently.
+     */
+    const note_grid_replaced = useCallback((next_sheet_index?: number) => {
+        if (next_sheet_index !== undefined) {
+            if (next_sheet_index === active_sheet_index_for_focus_ref.current) return;
+            sheet_visit_ref.current += 1;
+        }
+        grid_instance_ref.current += 1;
+    }, []);
 
     const handle_sheet_select = useCallback(
         (sheet_index: number) => {
@@ -7185,6 +7201,7 @@ export function App(): React.JSX.Element {
             cancel_external_change_navigation();
             set_open_external_change_occurrence(null);
             set_external_change_navigation_status('');
+            note_grid_replaced(sheet_index);
             set_active_sheet_index(sheet_index);
             state_ref.current = {
                 ...state_ref.current,
@@ -9712,6 +9729,14 @@ export function App(): React.JSX.Element {
             const generation = generation_ref.current;
             const visit = sheet_visit_ref.current;
             const grid = grid_instance_ref.current;
+            // The sheet the gesture is on, by identity: a snapshot that puts
+            // another worksheet at its index replaces the grid too.
+            const sheet_index = active_sheet_index_for_focus_ref.current;
+            const sheet_identity = () => {
+                const sheet = meta_ref.current?.sheets[sheet_index];
+                return sheet?.worksheetId ?? sheet?.name;
+            };
+            const identity = sheet_identity();
             const deadline = Date.now() + HISTORY_PRESS_HOLD_MS;
             const restoring = (sheet_index: number) => pending_transform_origins_ref.current[sheet_index] === 'restore';
             for (;;) {
@@ -9722,7 +9747,7 @@ export function App(): React.JSX.Element {
                 // the grid that held the gesture is gone, and the gesture with
                 // it. Nothing is said; they left it. Asked first, so a view that
                 // also moved meanwhile does not speak for a gesture left behind.
-                if (sheet_visit_ref.current !== visit) return false;
+                if (sheet_visit_ref.current !== visit || sheet_identity() !== identity) return false;
                 // The view moved under it: said below.
                 if (generation_ref.current !== generation) break;
                 // Another grid on the same sheet (the document loaded again):
