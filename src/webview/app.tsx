@@ -13752,9 +13752,11 @@ export function App(): React.JSX.Element {
                 return;
             }
             case 'removePendingRows':
+                if (refused_for_reopen()) return;
                 editing_ref.current?.remove_pending_rows(intent.pendingRowIds);
                 return;
             case 'cancelTailRemovals':
+                if (refused_for_reopen()) return;
                 editing_ref.current?.cancel_tail_removals(intent.tailRemovalIds);
                 return;
         }

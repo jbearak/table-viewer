@@ -7125,6 +7125,102 @@ describe('editing session save and release', () => {
         }));
     });
 
+    it('refuses the row-review actions with the reopen message once the view could not follow a replay', async () => {
+        const { post_message } = await render_app();
+        const snapshot = initial_snapshot_message(make_meta(['Sheet1'], false), {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        });
+        await dispatch_host_message(snapshot);
+        await request_edit_session();
+        await dispatch_host_message({
+            type: 'editSessionResult',
+            granted: true,
+            editSessionId: 'conflict-session',
+            sheetIndex: 0,
+            pendingChanges: {
+                sheetIndex: 0,
+                sheetName: 'Sheet1',
+                cells: {},
+                formatTemplates: [{ id: 'plain', format: { kind: 'none' } }],
+                appendedRows: [{ id: 'pending-row-1', cells: {}, formatTemplateId: 'plain', createdOrder: 1 }],
+                tailRemovals: [{
+                    appendHistoryId: 'saved-append-1',
+                    sourceRow: 0,
+                    savedFingerprint: 'fingerprint',
+                    savedRow: { cells: {}, format: { kind: 'none' } },
+                }],
+                appendBasis: { sourceRowCount: 1, columnCount: 1, schemaFingerprint: 'old-schema' },
+                conflicts: [{
+                    reason: 'ambiguousColumns',
+                    pendingRowIds: ['pending-row-1'],
+                    tailRemovalIds: ['saved-append-1'],
+                }],
+            },
+        });
+        // A step to undo, whose answer this view then cannot land.
+        await click_button('Highlight');
+        await click_button('Clear all highlights');
+        const last = (type: string) => [...post_message.mock.calls].reverse()
+            .map(([message]) => message).find((message) => message?.type === type);
+        await dispatch_host_message({
+            type: 'cellHighlightsChanged',
+            requestId: last('clearAllCellHighlights').requestId,
+            stateRevision: snapshot.snapshot.identity.stateRevision + 1,
+            physicalRevision: snapshot.snapshot.identity.sourceBasis.physicalRevision,
+            state: undefined,
+            deltas: [{ sheetIndex: 0, sourceRow: 0, sourceColumn: 0, before: 'yellow', after: null }],
+            sourceGeneration: snapshot.snapshot.sourceGeneration,
+        });
+        await dispatch_host_message({ type: 'editCommand', command: 'undo' });
+        const prepare = last('prepareHistoryReplay');
+        await dispatch_host_message({
+            type: 'historyReplayPrepared',
+            prepared: {
+                requestId: prepare.request.requestId,
+                replayId: prepare.request.replayId,
+                leaseId: 'lease-1',
+                focusSheetIndex: 0,
+                focus: prepare.request.focus,
+                cells: [],
+            },
+        });
+        const commit = last('commitHistoryReplay');
+        (grid_shell_mock.latest_props!.edit_session as EditSessionStore).install({ session_id: 'moved-on' });
+        await dispatch_host_message({
+            type: 'historyReplayCommitted',
+            committed: {
+                requestId: commit.request.requestId,
+                replayId: commit.request.replayId,
+                leaseId: commit.request.leaseId,
+                mutationId: commit.request.mutationId,
+                sourceGeneration: snapshot.snapshot.sourceGeneration,
+                cells: [{ ordinal: 0, resolvedSheetIndex: 0, key: '0:0', entry: null }],
+                focusSheetIndex: 0,
+                focus: prepare.request.focus,
+                displayFocus: null,
+            },
+        });
+        expect(last('showWarning').message).toContain('could not be updated');
+
+        let now = Date.now();
+        const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+        try {
+            for (const label of ['Remove affected pending rows', 'Cancel affected row removals']) {
+                now += 2_001;
+                post_message.mockClear();
+                await click_button(label);
+                expect(post_message, label).toHaveBeenCalledWith({
+                    type: 'showWarning',
+                    message: 'This view no longer matches the file. Reopen the file to keep editing.',
+                });
+            }
+        } finally {
+            clock.mockRestore();
+        }
+        expect(grid_shell_mock.remove_pending_rows).not.toHaveBeenCalled();
+        expect(grid_shell_mock.cancel_tail_removals).not.toHaveBeenCalled();
+    });
+
     it('offers tail-removal recovery and resurfaces a dismissed notice on Save', async () => {
         await render_app();
         await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1'], false), {

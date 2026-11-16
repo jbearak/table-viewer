@@ -505,12 +505,16 @@ describe('host-bridge', () => {
                 .__tableViewerHostBridge = injected;
             const { pending_changes_durability, publication_fence } =
                 await import('../webview/host-bridge');
-            pending_changes_durability.publish('session:r', changes('b'), 1);
-            pending_changes_durability.publish('session:r', {
-                ...changes('c'),
+            const structural = (value: string) => ({
+                ...changes(value),
                 rowLayout: { runs: [{ kind: 'source' as const, start: 0, count: 1 }], removedSourceRows: [], discardedPendingRows: [] },
-            }, 1);
+            });
+            // Two structural publications, the first superseded by the second
+            // before either is acknowledged.
+            pending_changes_durability.publish('session:r', structural('b'), 1);
+            pending_changes_durability.publish('session:r', structural('c'), 1);
             expect(pending_changes_durability.has_unacknowledged('session:r')).toBe(true);
+            expect(pending_changes_durability.superseded_structural_payloads('session:r', 0, 'Sheet1')).toHaveLength(1);
 
             publication_fence.raise();
             publication_fence.forget_outstanding();
