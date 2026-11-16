@@ -22,7 +22,7 @@ import { expect, test } from '@playwright/test';
 import type { ElectronApplication, Page } from '@playwright/test';
 import { build_fixture_xlsx, cell, row } from '../../src/test/helpers/xlsx-structure-fixture';
 import { history_menu_item, type HistoryMenuState } from '../main/history-menu-model';
-import { isolated_user_data, state_database_path } from './smoke-helpers';
+import { hot_journal_present, isolated_user_data, state_database_path } from './smoke-helpers';
 import {
     canvas_box,
     choose,
@@ -212,10 +212,23 @@ interface Stored {
     heights: number[];
 }
 
-/** What the state database holds for the file, or undefined while it cannot be read. */
+/**
+ * What the state database holds for the file, or undefined while it cannot be
+ * read.
+ *
+ * Read from a copy, never in place: the app expects to be the database's only
+ * user, and a reader's lock at the moment it commits makes its write fail
+ * (the resize is then refused as "the file was refreshing"). A copy taken
+ * while the app is inside a write is not read: under `journal_mode = DELETE`
+ * the journal file exists for exactly that long.
+ */
 function stored(file: string): Stored | undefined {
     try {
-        const database = new DatabaseSync(state_database_path(user_data_dir()), { readOnly: true });
+        const copy = path.join(test_root, 'file-state-copy.sqlite3');
+        if (hot_journal_present(user_data_dir())) return undefined;
+        fs.copyFileSync(state_database_path(user_data_dir()), copy);
+        if (hot_journal_present(user_data_dir())) return undefined;
+        const database = new DatabaseSync(copy, { readOnly: true });
         try {
             const entries = database.prepare('SELECT path, state_json FROM entries').all() as
                 { path: string; state_json: string }[];
@@ -233,7 +246,7 @@ function stored(file: string): Stored | undefined {
             database.close();
         }
     } catch {
-        // The app is writing: read again.
+        // Not there yet, or copied mid-write: read again.
         return undefined;
     }
 }
@@ -494,20 +507,20 @@ test('Reset row height is a step, undone and redone', async () => {
     const taller = { stored: { widths: {}, heights: [54] }, shown: layout([], [24, 54]) };
     await expect_sizes(page, file, { ...taller, undo: 'Undo Resize row', redo: 'Redo' });
 
-    // A row at the default height is offered nothing to reset.
-    const plain = await open_row_menu(page, 0);
-    await expect(plain.getByRole('menuitem', { name: 'Reset row height', exact: true })).toHaveCount(0);
-    await page.keyboard.press('Escape');
-    await expect(plain).toHaveCount(0);
-
     await choose(await open_row_menu(page, 1), 'Reset row height');
-    last_probe = undefined;
     await expect_sizes(page, file, { stored: NOTHING, shown: layout(), undo: 'Undo Reset row height', redo: 'Redo' });
 
     await history(page, 'undo');
     await expect_sizes(page, file, { ...taller, undo: 'Undo Resize row', redo: 'Redo Reset row height' });
     await history(page, 'redo');
     await expect_sizes(page, file, { stored: NOTHING, shown: layout(), undo: 'Undo Reset row height', redo: 'Redo' });
+
+    // The row is at the default height again, and is offered nothing to reset.
+    const plain = await open_row_menu(page, 1);
+    await expect(plain.getByRole('menuitem', { name: 'Hide row', exact: true })).toBeVisible();
+    await expect(plain.getByRole('menuitem', { name: 'Reset row height', exact: true })).toHaveCount(0);
+    await page.keyboard.press('Escape');
+    await expect(plain).toHaveCount(0);
 });
 
 test('an edit, a column resize, a sort, and a row resize are undone and redone in order', async () => {
