@@ -6966,6 +6966,8 @@ export function App(): React.JSX.Element {
     // ends, the two things the restore effect waits out; neither need render
     // by itself.
     const [restore_wake, set_restore_wake] = useState(0);
+    // The restore effect stepped aside for a replay: the attempt's end wakes it.
+    const restore_waits_for_replay_ref = useRef(false);
     useEffect(() => {
         set_restore_blocker_epoch((n) => n + 1);
     }, [csv_editable, save_in_flight]);
@@ -6982,7 +6984,10 @@ export function App(): React.JSX.Element {
         // install under the replay's lease. `restore_wake` runs this again
         // when either ends.
         if (edit_session_pending || pending_edit_request_ref.current !== null) return;
-        if (replay_coordinator_ref.current?.is_busy() || pending_row_replay_busy_ref.current) return;
+        if (replay_coordinator_ref.current?.is_busy() || pending_row_replay_busy_ref.current) {
+            restore_waits_for_replay_ref.current = true;
+            return;
+        }
         const sheet = meta.sheets[active_sheet_index];
         if (!sheet) return;
         if (
@@ -8477,8 +8482,12 @@ export function App(): React.JSX.Element {
             answer_refusal(outcome, barrier, replayed.kind === 'available' ? replayed.entry : undefined);
         } finally {
             window.clearTimeout(watch);
-            // A restore of the saved view waits for the attempt to end.
-            set_restore_wake((wake) => wake + 1);
+            // A restore of the saved view that stepped aside for the attempt
+            // is asked about again.
+            if (restore_waits_for_replay_ref.current) {
+                restore_waits_for_replay_ref.current = false;
+                set_restore_wake((wake) => wake + 1);
+            }
             // An attempt that ended renders nothing by itself; a press held
             // behind it, and a queued header change, wait on it.
             wake_header_drain();

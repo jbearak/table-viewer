@@ -3144,14 +3144,18 @@ export function attach_viewer(
      * renderer knows, done, and a session request waits it out rather than
      * being refused for it.
      */
-    function note_snapshot_posted(snapshot: { readonly generation: number; readonly sourceGeneration: number }): void {
+    function note_snapshot_posted(snapshot: { readonly generation: number; readonly sourceGeneration: number }): () => void {
+        const view = { generation: snapshot.generation, sourceGeneration: snapshot.sourceGeneration };
         const moved = last_posted_view !== undefined && (
-            last_posted_view.generation !== snapshot.generation
-            || last_posted_view.sourceGeneration !== snapshot.sourceGeneration
+            last_posted_view.generation !== view.generation
+            || last_posted_view.sourceGeneration !== view.sourceGeneration
         );
-        last_posted_view = { generation: snapshot.generation, sourceGeneration: snapshot.sourceGeneration };
-        if (!moved) return;
-        for (const authority of transform_authorities.values()) answered_transform_authorities.add(authority);
+        if (moved) {
+            for (const authority of transform_authorities.values()) answered_transform_authorities.add(authority);
+        }
+        // The baseline moves only once the renderer has the snapshot: a post
+        // that fails is retried, and the retry must still count as a move.
+        return () => { last_posted_view = view; };
     }
 
     /**
@@ -4738,10 +4742,17 @@ export function attach_viewer(
             || (receiver_epoch !== undefined
                 && receiver_epoch !== session.current_receiver_epoch)
         ) return Promise.resolve(false);
-        if (message.type === 'workbookSnapshot') note_snapshot_posted(message.snapshot);
+        const delivered = message.type === 'workbookSnapshot'
+            ? note_snapshot_posted(message.snapshot)
+            : undefined;
         try {
             options.integrationTestPort?.on_host_message(message);
-            return Promise.resolve(webview.postMessage(message)).catch(() => false);
+            return Promise.resolve(webview.postMessage(message))
+                .then((accepted) => {
+                    if (accepted) delivered?.();
+                    return accepted;
+                })
+                .catch(() => false);
         } catch {
             return Promise.resolve(false);
         }
