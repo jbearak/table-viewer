@@ -7442,11 +7442,16 @@ export function App(): React.JSX.Element {
             if (mapped.has(index)) return mapped.get(index);
             const then = sent.sheets[index];
             if (then === undefined) return undefined;
-            const now = sheets.findIndex((sheet) => (
+            const same = (sheet: { readonly name: string; readonly worksheetId?: string }) => (
                 then.worksheetId !== undefined && sheet.worksheetId !== undefined
                     ? sheet.worksheetId === then.worksheetId
                     : sheet.name === then.name
-            ));
+            );
+            // Where it was, when it is still there: a search could find
+            // another sheet of the same name first.
+            const now = sheets[index] !== undefined && same(sheets[index])
+                ? index
+                : sheets.findIndex(same);
             if (now < 0) return undefined;
             mapped.set(index, now);
             return now;

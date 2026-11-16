@@ -6883,6 +6883,45 @@ describe('GridShell edit-admission lifetime', () => {
         expect(undo.kind === 'available' ? undo.entry.action.label : undo.kind).toBe('Paste');
     });
 
+    it('ends a paste waiting on App\'s answer quietly when its grid goes away, taking its rows back', async () => {
+        const pending = create_pending_row_store({ session_id: 'session-1' });
+        let settle_admission!: (result: AppendRowsAdmission | undefined) => void;
+        const on_append_rows = vi.fn(() => new Promise<
+            AppendRowsAdmission | undefined
+        >((resolve) => { settle_admission = resolve; }));
+        const initial = editable({ pending_row_store: pending, on_append_rows });
+        const GridShell = await render_grid(initial);
+        const admit_for_paste = grid_mock.props!.onPasteRowsNeeded as (
+            count: number,
+            topology_key: unknown,
+        ) => Promise<unknown>;
+        let admitted: unknown;
+        void admit_for_paste(1, grid_mock.props!.pasteTopologyKey).then((result) => { admitted = result; });
+        await vi.waitUntil(() => on_append_rows.mock.calls.length === 1);
+        await act(async () => {
+            root!.render(React.createElement(GridShell, { ...initial, append_in_flight: true }));
+        });
+        await act(async () => {
+            settle_admission({
+                rowIds: ['host-row-1'],
+                formatTemplate: { id: 'plain', format: { kind: 'none' } },
+                appendBasis: {
+                    sourceRowCount: 1,
+                    provisionalStartRow: 1,
+                    columnCount: 3,
+                    schemaFingerprint: 'schema',
+                },
+                settle: vi.fn(),
+            });
+        });
+        await vi.waitUntil(() => grid_mock.props!.rows === 2);
+
+        await act(async () => root!.unmount());
+        root = null;
+        await vi.waitFor(() => expect(admitted).toBe(false));
+        expect(pending.snapshot().appendedRows).toEqual([]);
+    });
+
     it('keeps an edit admission fenced across an ordinary rerender', async () => {
         // A failed close/reload remains fenced. The boundary is a real new
         // activation, not "some render happened after stop_edit_admission".

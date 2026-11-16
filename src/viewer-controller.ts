@@ -17826,6 +17826,9 @@ export function attach_viewer(
         // the window's history offering a step the file has already taken.
         // A view that moved after the write is said (`viewMoved`), and the
         // window lands the answer as any other.
+        // Read before the admissions are accepted below: accepting them is
+        // itself something `isCurrent` sees (a restoration lease checks its
+        // reservations are still unsettled), and would read as a moved view.
         const view_moved_after_write = written !== undefined && !payload.isCurrent();
         if (written !== undefined) {
             // The rows are durable, so each admission that can still be

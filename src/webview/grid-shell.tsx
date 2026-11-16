@@ -3621,7 +3621,10 @@ export function GridShell({
         append_answered_ref.current = null;
         answered?.settle(editable_cells);
     }, [append_in_flight, editable_cells]);
+    /** Set when this grid goes away, for what was waiting on it. */
+    const grid_unmounted_ref = useRef(false);
     useEffect(() => () => {
+        grid_unmounted_ref.current = true;
         // A gesture still waiting when this grid goes away is told no.
         const committed = editable_commit_ref.current;
         editable_commit_ref.current = null;
@@ -6763,11 +6766,20 @@ export function GridShell({
                     // request is, and until it is the grid takes no edit:
                     // the paste would be refused as busy. Wait for that
                     // commit; whatever it leaves closed refuses the paste
-                    // there, and Glide rolls the rows back and says so.
+                    // there, and Glide rolls the rows back and says so. A
+                    // grid that went away meanwhile (another sheet, the
+                    // session over) ends the paste with it, quietly.
                     if (append_in_flight_ref.current) {
                         const answered = append_answered_ref.current ?? pending_signal<boolean>();
                         append_answered_ref.current = answered;
-                        void answered.settled.then(() => resolve(admission));
+                        void answered.settled.then((open) => {
+                            if (!open && grid_unmounted_ref.current) {
+                                admission.rollback();
+                                resolve(false);
+                                return;
+                            }
+                            resolve(admission);
+                        });
                         return;
                     }
                     resolve(admission);
