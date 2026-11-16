@@ -7155,9 +7155,12 @@ export function App(): React.JSX.Element {
         [history_free],
     );
 
+    // Every part of the grid's key: a change to any one mounts a new grid.
+    const grid_sheet_identity = meta?.sheets[active_sheet_index]?.worksheetId
+        ?? meta?.sheets[active_sheet_index]?.name;
     useLayoutEffect(() => {
         grid_instance_ref.current += 1;
-    }, [active_sheet_index, grid_mount_epoch]);
+    }, [active_sheet_index, grid_sheet_identity, load_epoch, grid_mount_epoch]);
 
     const handle_sheet_select = useCallback(
         (sheet_index: number) => {
@@ -9701,6 +9704,7 @@ export function App(): React.JSX.Element {
         if (!quiet && pending_edit_request_ref.current === null) {
             const document = history_document_ref.current;
             const generation = generation_ref.current;
+            const sheet = active_sheet_index_for_focus_ref.current;
             const grid = grid_instance_ref.current;
             const deadline = Date.now() + HISTORY_PRESS_HOLD_MS;
             const restoring = (sheet_index: number) => pending_transform_origins_ref.current[sheet_index] === 'restore';
@@ -9708,11 +9712,16 @@ export function App(): React.JSX.Element {
                 const wait = next_window_transform_wait(restoring, deadline, document);
                 if (wait === 'clear' || wait === 'past-bound') break;
                 if (await wait === 'replaced') return false;
-                // The view moved: said below.
+                // The person is on another sheet: the grid that held the
+                // gesture is gone, and the gesture with it. Nothing is said;
+                // they left it. Asked first, so a view that also moved
+                // meanwhile does not speak for a gesture left behind.
+                if (active_sheet_index_for_focus_ref.current !== sheet) return false;
+                // The view moved under it: said below.
                 if (generation_ref.current !== generation) break;
-                // Another grid is shown (the person moved to another sheet,
-                // even if they came back): the grid that held the gesture is
-                // gone, and the gesture with it. Nothing is said; they left it.
+                // Another grid on the same sheet (they left and came back, or
+                // the document was loaded again): the gesture's keys went with
+                // the old one, and again nothing is said.
                 if (grid_instance_ref.current !== grid) return false;
                 if (held()) return true;
             }

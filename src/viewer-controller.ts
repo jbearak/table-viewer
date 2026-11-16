@@ -3130,14 +3130,8 @@ export function attach_viewer(
     // Transform work whose answer the renderer already has, still reconciling
     // durable state and holding the transform admission until it ends.
     const answered_transform_authorities = new Set<TransformAuthority>();
-    /**
-     * The renderer is being told the answer to `request_id` on `sheet_index`:
-     * that transform is done as far as the renderer knows. Marked before the
-     * post settles, because the renderer may ask for a session as soon as the
-     * answer arrives. (Work it superseded or that went stale is no longer
-     * current, which a session request also waits out; see below.)
-     */
-    // The view the renderer was last sent, to tell when a snapshot moves it.
+    // The view the renderer was last sent (by snapshot or install), to tell
+    // when a snapshot moves it.
     let last_posted_view: { readonly generation: number; readonly sourceGeneration: number } | undefined;
     /**
      * A snapshot is being posted. One that moves the view (a new generation
@@ -3157,11 +3151,30 @@ export function attach_viewer(
         for (const authority of transform_authorities.values()) answered_transform_authorities.add(authority);
     }
 
-    function note_transform_answered(sheet_index: number, request_id: string): void {
+    /**
+     * The renderer is being told the answer to `request_id` on `sheet_index`:
+     * that transform is done as far as the renderer knows. Marked before the
+     * post settles, because the renderer may ask for a session as soon as the
+     * answer arrives. (Work it superseded or that went stale is no longer
+     * current, which a session request also waits out; see below.) An install
+     * also moves the view the renderer holds, which is what a later snapshot
+     * is compared with.
+     */
+    function note_transform_answered(
+        sheet_index: number,
+        request_id: string,
+        installed_view?: { readonly generation: number; readonly sourceGeneration: number },
+    ): void {
         for (const [message, authority] of transform_authorities) {
             if (message.sheetIndex === sheet_index && message.requestId === request_id) {
                 answered_transform_authorities.add(authority);
             }
+        }
+        if (installed_view !== undefined) {
+            last_posted_view = {
+                generation: installed_view.generation,
+                sourceGeneration: installed_view.sourceGeneration,
+            };
         }
     }
     const transform_commit_barriers = new Set<TransformAuthority>();

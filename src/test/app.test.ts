@@ -18692,6 +18692,39 @@ describe('undo and redo, from the keyboard and the desktop menu', () => {
         expect(sent(post_message, 'showWarning')).toBeUndefined();
     });
 
+    it('drops an edit, saying nothing, when the person moved to another sheet and the restore it waited for moved the view', async () => {
+        const { post_message } = await render_app();
+        const meta = make_meta(['Sheet1', 'Sheet2'], false);
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        await dispatch_host_message(refresh_snapshot_message(meta, {
+            state: { transforms: [{
+                sort: [{ colIndex: 0, direction: 'asc' }],
+                filters: [],
+                schema: transform_schema_for_sheet(meta.sheets[0]),
+            }] },
+            generation: 2,
+            sourceGeneration: 2,
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        const restore = latest_transform_request(post_message);
+        expect(restore.intent).toBe('restore');
+        post_message.mockClear();
+
+        const props = grid_shell_mock.latest_props as unknown as GridShellProps;
+        let granted: boolean | undefined;
+        let asked!: Promise<void>;
+        await act(async () => { asked = props.on_request_edit_session!().then((value) => { granted = value; }); });
+        await click_sheet_tab('Sheet2');
+        // The restore moves the view too: the gesture was left all the same.
+        await acknowledge_transform(restore, 3);
+        await act(async () => { await asked; });
+        expect(granted).toBe(false);
+        expect(sent(post_message, 'requestEditSession')).toBeUndefined();
+        expect(sent(post_message, 'showWarning')).toBeUndefined();
+    });
+
     it('drops an edit, saying nothing, whose restore wait ended after the person left its sheet and came back', async () => {
         const { post_message } = await render_app();
         const meta = make_meta(['Sheet1', 'Sheet2'], false);
