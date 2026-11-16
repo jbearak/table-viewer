@@ -7029,9 +7029,11 @@ describe('GridShell stable rows during an edit session', () => {
         // Exactly once, for the same reason as the forced-commit case below: one commit
         // must produce one durable host write, and `auto_grow_row_for_text` now has two
         // callers between which a double post is the plausible regression.
+        // Not a resize the person made: it is no step in undo history.
         expect(on_row_resize).toHaveBeenCalledExactlyOnceWith(
             [{ start: 0, end: 0 }],
             expected_grown_height,
+            { gesture: false },
         );
     });
 
@@ -7058,9 +7060,11 @@ describe('GridShell stable rows during an edit session', () => {
         const on_row_resize = vi.fn();
         await commit_multiline(false, on_row_resize);
 
+        // Not a resize the person made: it is no step in undo history.
         expect(on_row_resize).toHaveBeenCalledExactlyOnceWith(
             [{ start: 0, end: 0 }],
             expected_grown_height,
+            { gesture: false },
         );
     });
 
@@ -7142,6 +7146,7 @@ describe('GridShell stable rows during an edit session', () => {
         expect(on_row_resize).toHaveBeenCalledExactlyOnceWith(
             [{ start: 1, end: 1 }],
             expected_grown_height,
+            { gesture: false },
         );
     });
 
@@ -7190,6 +7195,7 @@ describe('GridShell stable rows during an edit session', () => {
         expect(from_default).toHaveBeenCalledWith(
             [{ start: 0, end: 0 }],
             MAX_ROW_HEIGHT_PX,
+            { gesture: false },
         );
 
         const already_capped = vi.fn();
@@ -7253,9 +7259,11 @@ describe('GridShell row resizing', () => {
         act(() => on_resize_end(3, 52));
         expect(on_row_resize).toHaveBeenCalledOnce();
         // Coalesced into display-row intervals: 1 alone, then 3–4.
+        // A drag is a gesture: it is answered and becomes a step.
         expect(on_row_resize).toHaveBeenCalledWith(
             [{ start: 1, end: 1 }, { start: 3, end: 4 }],
             52,
+            { gesture: true },
         );
     });
 
@@ -7328,7 +7336,7 @@ describe('GridShell row resizing', () => {
         expect(on_row_resize).not.toHaveBeenCalled();
         act(() => on_resize_end(2, 48));
         expect(on_row_resize).toHaveBeenCalledOnce();
-        expect(on_row_resize).toHaveBeenCalledWith([{ start: 2, end: 2 }], 48);
+        expect(on_row_resize).toHaveBeenCalledWith([{ start: 2, end: 2 }], 48, { gesture: true });
         expect(grid_mock.update_cells).not.toHaveBeenCalled();
     });
 

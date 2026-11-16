@@ -9771,6 +9771,10 @@ export function App(): React.JSX.Element {
         const meta_sheets = meta_ref.current?.sheets;
         if (meta_sheets === undefined || sheets.length === 0) return false;
         if (sheets.some((entry) => meta_sheets[entry.sheet_index] === undefined)) return false;
+        // One at a time. Every caller is admitted first (a gesture by
+        // `size_gesture_may_start`, a replay by `history_free`); this keeps a
+        // second write from displacing the record the first one's answer settles.
+        if (pending_width_write_ref.current !== null) return false;
         const widths = [...(state_ref.current.columnWidths ?? [])];
         const pending_sheets: PendingWidthSheet[] = [];
         for (const entry of sheets) {
@@ -10480,6 +10484,16 @@ export function App(): React.JSX.Element {
         applied_snapshot_count,
         try_apply_pending_auto_fit,
     ]);
+
+    /**
+     * The grid's last reason to stay busy has ended (an editor or menu closed
+     * without a change): an idle session may go, and a fit owed to this
+     * worksheet, which waits for exactly that, may land.
+     */
+    const handle_grid_idle = useCallback(() => {
+        release_edit_session_if_idle();
+        try_apply_pending_auto_fit();
+    }, [release_edit_session_if_idle, try_apply_pending_auto_fit]);
 
     const handle_auto_fit_all_sheets = useCallback(() => {
         // Asked first: refused, no sheet is owed a fit.
@@ -11502,7 +11516,7 @@ export function App(): React.JSX.Element {
                     ? request_edit_session
                     : undefined
             }
-            on_edit_session_idle={release_edit_session_if_idle}
+            on_edit_session_idle={handle_grid_idle}
             diff_mode={diff_mode}
             git_compare={git_compare !== undefined}
             compare_changed_column_names={
