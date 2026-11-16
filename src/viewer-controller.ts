@@ -3140,8 +3140,14 @@ export function attach_viewer(
     function note_transform_answered(sheet_index: number, request_id: string): void {
         const on_sheet = [...transform_authorities].filter(([message]) => message.sheetIndex === sheet_index);
         const answered_at = on_sheet.findIndex(([message]) => message.requestId === request_id);
-        const answered = answered_at < 0 ? on_sheet : on_sheet.slice(0, answered_at + 1);
-        for (const [, authority] of answered) answered_transform_authorities.add(authority);
+        // An answer to a request that was refused before it was admitted marks
+        // nothing: what is still running on the sheet was not superseded by
+        // work that ran, and a session waiting for it could wait out a whole
+        // sort. The refusal below then stands, as it always has.
+        if (answered_at < 0) return;
+        for (const [, authority] of on_sheet.slice(0, answered_at + 1)) {
+            answered_transform_authorities.add(authority);
+        }
     }
     const transform_commit_barriers = new Set<TransformAuthority>();
     let load_seq = 0;
@@ -14400,7 +14406,10 @@ export function attach_viewer(
                 // replay or an edit the renderer held back for it) waits for that
                 // instead of being refused for a sort nobody is waiting on. Work
                 // not yet answered still refuses, as below. Asked again after
-                // each wait: another may have been answered meanwhile.
+                // each wait: another may have been answered meanwhile. Each
+                // wait ends with that transform's reconciliation, a bounded
+                // number of state reads (`READY_STATE_REBASE_COUNT`), so the
+                // loop needs no bound of its own beyond the state store's.
                 while (answered_transform_authorities.size > 0) {
                     await Promise.all([...answered_transform_authorities].map((authority) => authority.completion));
                     if (!request_is_current()) return;

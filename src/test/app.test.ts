@@ -18646,6 +18646,26 @@ describe('undo and redo, from the keyboard and the desktop menu', () => {
         expect(sent(post_message, 'showWarning')).toBeUndefined();
     });
 
+    it('waits for the answer to a restore a new row basis dropped before asking for an Undo\'s session', async () => {
+        const { post_message, restore } = await saved_edit_with_restore_pending();
+        const meta = make_meta(['Sheet1'], false);
+        // The rows change under the restore: the window drops its request,
+        // and the host is still computing it.
+        await dispatch_host_message(refresh_snapshot_message(meta, {
+            generation: 3,
+            sourceGeneration: 3,
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        post_message.mockClear();
+
+        await undo_via_menu();
+        expect(sent(post_message, 'requestEditSession')).toBeUndefined();
+        // The host's answer to the dropped request (stale here) ends the wait.
+        await acknowledge_transform(restore, 2);
+        await vi.waitUntil(() => sent(post_message, 'requestEditSession') !== undefined);
+        expect(sent(post_message, 'showWarning')).toBeUndefined();
+    });
+
     it('lets an edit wait for a restore of the saved view instead of refusing it', async () => {
         const { post_message, restore } = await saved_edit_with_restore_pending();
         const props = grid_shell_mock.latest_props as unknown as GridShellProps;

@@ -3053,6 +3053,23 @@ export function App(): React.JSX.Element {
     const transform_settled_ref = useRef<PendingSignal<void> | null>(null);
     // Replays in `ensure_replay_session` waiting for those transforms.
     const replay_waiting_for_transforms_ref = useRef(0);
+    // Transforms this window dropped on a row-basis change before the host
+    // answered them (by id, with sheet and origin). The host still holds its
+    // transform admission until it does, so a session request waits for those
+    // answers too. Forgotten when answered, with the document, and after
+    // `HISTORY_PRESS_HOLD_MS` (a request the host drops unanswered would
+    // otherwise hold every later session request to the bound).
+    const dropped_transform_requests_ref = useRef(new Map<string, {
+        readonly sheet_index: number;
+        readonly origin: TransformOrigin | undefined;
+        readonly dropped_at: number;
+    }>());
+    const settle_dropped_transform = useCallback((request_id: string) => {
+        if (!dropped_transform_requests_ref.current.delete(request_id)) return;
+        const settled = transform_settled_ref.current;
+        transform_settled_ref.current = null;
+        settled?.settle();
+    }, []);
     const notify_transform_settled = useCallback(() => {
         const settled = transform_settled_ref.current;
         transform_settled_ref.current = null;
@@ -3069,12 +3086,20 @@ export function App(): React.JSX.Element {
      * was replaced meanwhile; the caller asks again.
      */
     const next_window_transform_wait = useCallback((
-        which: (sheet_index: number) => boolean,
+        which: (sheet_index: number, origin?: TransformOrigin) => boolean,
         deadline: number,
         document: number,
     ): 'clear' | 'past-bound' | Promise<'again' | 'replaced'> => {
+        const now = Date.now();
+        for (const [request_id, dropped] of dropped_transform_requests_ref.current) {
+            if (now - dropped.dropped_at >= HISTORY_PRESS_HOLD_MS) {
+                dropped_transform_requests_ref.current.delete(request_id);
+            }
+        }
         const pending = pending_transform_request_ids_ref.current
-            .some((id, sheet_index) => id !== undefined && which(sheet_index));
+            .some((id, sheet_index) => id !== undefined && which(sheet_index))
+            || [...dropped_transform_requests_ref.current.values()]
+                .some((dropped) => which(dropped.sheet_index, dropped.origin));
         if (!pending) return 'clear';
         const remaining = deadline - Date.now();
         if (remaining <= 0) return 'past-bound';
@@ -5879,6 +5904,20 @@ export function App(): React.JSX.Element {
                     if (row_basis_changed) {
                         set_pending_transforms([]);
                         set_pending_transform_labels([]);
+                        // Still being answered by the host, which refuses an
+                        // editing session until it has (not across a new document).
+                        if (snapshot.presentation !== 'initial') {
+                            pending_transform_request_ids_ref.current.forEach((id, sheet_index) => {
+                                if (id === undefined) return;
+                                dropped_transform_requests_ref.current.set(id, {
+                                    sheet_index,
+                                    origin: pending_transform_origins_ref.current[sheet_index],
+                                    dropped_at: Date.now(),
+                                });
+                            });
+                        } else {
+                            dropped_transform_requests_ref.current.clear();
+                        }
                         pending_transform_request_ids_ref.current = [];
                         pending_transform_states_ref.current = [];
                         pending_transform_origins_ref.current = [];
@@ -6395,6 +6434,7 @@ export function App(): React.JSX.Element {
                     pending_transform_request_ids_ref.current[msg.sheetIndex]
                     !== msg.requestId
                 ) {
+                    settle_dropped_transform(msg.requestId);
                     return;
                 }
                 // A refusal means the host changed nothing, and this arm of
@@ -6527,6 +6567,7 @@ export function App(): React.JSX.Element {
                     pending_transform_request_ids_ref.current[msg.sheetIndex]
                     !== msg.requestId
                 ) {
+                    settle_dropped_transform(msg.requestId);
                     return;
                 }
                 const view = msg.view;
@@ -9683,11 +9724,14 @@ export function App(): React.JSX.Element {
         // A restore of the saved view this window posted (after a Save, say)
         // is waited for: the person did not ask for it, and an edit refused
         // for it would read as a sort of theirs in the way. Not for a quiet
-        // request (a menu opening), which is refused quietly as before.
-        if (!quiet) {
+        // request (a menu opening), which is refused quietly as before, nor
+        // for one that joins a request already out.
+        if (!quiet && pending_edit_request_ref.current === null) {
             const document = history_document_ref.current;
             const deadline = Date.now() + HISTORY_PRESS_HOLD_MS;
-            const restoring = (sheet_index: number) => pending_transform_origins_ref.current[sheet_index] === 'restore';
+            const restoring = (sheet_index: number, origin?: TransformOrigin) => (
+                origin ?? pending_transform_origins_ref.current[sheet_index]
+            ) === 'restore';
             for (;;) {
                 const wait = next_window_transform_wait(restoring, deadline, document);
                 if (wait === 'clear' || wait === 'past-bound') break;
