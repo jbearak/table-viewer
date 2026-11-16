@@ -18408,7 +18408,7 @@ describe('undo and redo, from the keyboard and the desktop menu', () => {
         expect(sent(post_message, 'showWarning')).toBeUndefined();
     });
 
-    it('posts the restore a refresh after a Save asks for only once the Undo\'s session is granted', async () => {
+    it('posts the restore a refresh after a Save asks for only once the Undo\'s replay has ended', async () => {
         // The press is let through with nothing in flight and asks for its
         // session; the refresh the save brought wants a restore. The host may
         // still be settling the session the save let go, and a transform it
@@ -18464,10 +18464,175 @@ describe('undo and redo, from the keyboard and the desktop menu', () => {
             .filter((message) => message.type === 'setTransform');
         expect(transforms()).toEqual([]);
 
-        await grant_replay_session(meta, 'undo-session');
+        // Granted, with the rules the file keeps: the replay is out, and the
+        // restore would install under its lease. It goes once the replay has ended.
+        await dispatch_host_message({ type: 'editSessionResult', granted: true, editSessionId: 'undo-session' });
+        await dispatch_host_message(workbook_snapshot_message(meta, {
+            presentation: 'refresh',
+            reason: 'other',
+            generation: 2,
+            sourceGeneration: 2,
+            state: { transforms: [{
+                sort: [{ colIndex: 0, direction: 'asc' }],
+                filters: [],
+                schema: transform_schema_for_sheet(meta.sheets[0]),
+            }] },
+            capabilities: { csvEditable: true, csvEditingSupported: true, csvEditSessionId: 'undo-session' },
+        }));
+        await vi.waitUntil(() => sent(post_message, 'prepareHistoryReplay') !== undefined);
+        expect(transforms()).toEqual([]);
+        const prepare = sent(post_message, 'prepareHistoryReplay');
+        await dispatch_host_message({
+            type: 'historyReplayPrepared',
+            prepared: {
+                requestId: prepare.request.requestId,
+                replayId: prepare.request.replayId,
+                leaseId: 'lease-1',
+                focusSheetIndex: 0,
+                focus: prepare.request.focus,
+                cells: [{
+                    ordinal: 0,
+                    worksheet: { sheetIndex: 0, sheetName: 'Sheet1' },
+                    resolvedSheetIndex: 0,
+                    sourceRow: 0,
+                    sourceColumn: 0,
+                    overlay: { kind: 'absent' },
+                    persisted: { text: 'edited' },
+                    persistedHyperlink: null,
+                }],
+            },
+        });
+        const commit = sent(post_message, 'commitHistoryReplay');
+        expect(commit).toBeDefined();
+        expect(transforms()).toEqual([]);
+        await dispatch_host_message({
+            type: 'historyReplayCommitted',
+            committed: {
+                requestId: commit.request.requestId,
+                replayId: commit.request.replayId,
+                leaseId: commit.request.leaseId,
+                mutationId: commit.request.mutationId,
+                sourceGeneration: 2,
+                cells: [],
+                focusSheetIndex: 0,
+                focus: prepare.request.focus,
+                displayFocus: null,
+            },
+        });
+        // The Undo landed (the cell is out of sight under the sort, which is
+        // what the one message says), and only then is the restore posted.
+        expect(props.history_store!.snapshot().redoStack).toHaveLength(1);
         await vi.waitUntil(() => transforms().length > 0);
         expect(latest_transform_request(post_message).intent).toBe('restore');
+        expect(post_message.mock.calls.map((call) => call[0] as WebviewMessage)
+            .filter((message) => message.type === 'showWarning')
+            .map((message) => (message as { message: string }).message))
+            .toEqual(['The change was undone, but the affected cells are hidden by the current view.']);
+    });
+
+    /**
+     * A saved edit, and then the refresh after the save asking for a restore
+     * of the saved view, still pending. Posts cleared.
+     */
+    async function saved_edit_with_restore_pending() {
+        const { post_message } = await render_app();
+        const meta = make_meta(['Sheet1'], false);
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        await acquire_editing_session(post_message, 'saved-edit-session');
+        const props = grid_shell_mock.latest_props as unknown as GridShellProps;
+        props.edit_session!.commit('saved-edit-session', '0:0', { value: 'edited', base: 'Alice' });
+        record_cell_edit(props.history_store!, 'edited', 'Alice');
+        const operation: CsvSaveOperation = {
+            editSessionId: 'saved-edit-session',
+            saveRequestId: 'save-1',
+            worksheets: [{
+                sheetIndex: 0,
+                sheetName: 'Sheet1',
+                edits: { '0:0': 'edited' },
+                dirtyEdits: { '0:0': { value: 'edited', base: 'Alice' } },
+            }],
+        };
+        await dispatch_host_message({
+            type: 'saveOperationStarted',
+            lifecycle: { revision: 1, state: 'active', operation },
+        });
+        await dispatch_host_message({
+            type: 'saveResult',
+            success: true,
+            lifecycle: { revision: 2, state: 'succeeded', operation },
+        });
+        post_message.mockClear();
+        await dispatch_host_message(refresh_snapshot_message(meta, {
+            state: { transforms: [{
+                sort: [{ colIndex: 0, direction: 'asc' }],
+                filters: [],
+                schema: transform_schema_for_sheet(meta.sheets[0]),
+            }] },
+            generation: 2,
+            sourceGeneration: 2,
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        const restore = latest_transform_request(post_message);
+        expect(restore.intent).toBe('restore');
+        post_message.mockClear();
+        return { post_message, props, restore };
+    }
+
+    it('asks for an Undo\'s session once a restore it waited for is refused', async () => {
+        const { post_message, restore } = await saved_edit_with_restore_pending();
+        await undo_via_menu();
+        expect(sent(post_message, 'requestEditSession')).toBeUndefined();
+        await dispatch_host_message({
+            type: 'transformRefused',
+            sheetIndex: restore.sheetIndex,
+            requestId: restore.requestId,
+            intent: restore.intent,
+            reason: 'A save is in progress.',
+            terminal: false,
+        });
+        await vi.waitUntil(() => sent(post_message, 'requestEditSession') !== undefined);
+    });
+
+    it('asks for an Undo\'s session after five seconds when a restore it waits for is never answered', async () => {
+        const { post_message } = await saved_edit_with_restore_pending();
+        vi.useFakeTimers();
+        try {
+            await undo_via_menu();
+            await act(async () => { vi.advanceTimersByTime(4_999); });
+            expect(sent(post_message, 'requestEditSession')).toBeUndefined();
+            await act(async () => { vi.advanceTimersByTime(1); });
+            expect(sent(post_message, 'requestEditSession')).toBeDefined();
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
+    it('ends an Undo\'s wait for a restore, asking for nothing and saying nothing, when the document is replaced', async () => {
+        const { post_message } = await saved_edit_with_restore_pending();
+        await undo_via_menu();
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Other']), {
+            generation: 5,
+            sourceGeneration: 5,
+        }));
+        await act(async () => { await Promise.resolve(); });
+        expect(sent(post_message, 'requestEditSession')).toBeUndefined();
+        expect(sent(post_message, 'prepareHistoryReplay')).toBeUndefined();
         expect(sent(post_message, 'showWarning')).toBeUndefined();
+    });
+
+    it('lets an edit wait for a restore of the saved view instead of refusing it', async () => {
+        const { post_message, restore } = await saved_edit_with_restore_pending();
+        const props = grid_shell_mock.latest_props as unknown as GridShellProps;
+        let granted: Promise<boolean> | undefined;
+        await act(async () => { granted = props.on_request_edit_session!(); });
+        expect(sent(post_message, 'requestEditSession')).toBeUndefined();
+        expect(sent(post_message, 'showWarning')).toBeUndefined();
+        await acknowledge_transform(restore, 3);
+        await vi.waitUntil(() => sent(post_message, 'requestEditSession') !== undefined);
+        expect(sent(post_message, 'showWarning')).toBeUndefined();
+        void granted;
     });
 
     it('reports a refusal on the press that had to acquire a session', async () => {

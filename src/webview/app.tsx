@@ -3056,6 +3056,33 @@ export function App(): React.JSX.Element {
         transform_settled_ref.current = null;
         settled?.settle();
     }, []);
+    /**
+     * Wait until no transform of this window that `which` names is pending:
+     * the host starts no editing session while one installs. True to go on;
+     * false if the document was replaced meanwhile. Bounded: a transform that
+     * is never answered leaves the request to the host after the bound, which
+     * answers as it would have.
+     */
+    const await_window_transforms = useCallback(async (which: (sheet_index: number) => boolean): Promise<boolean> => {
+        const document = history_document_ref.current;
+        const deadline = Date.now() + HISTORY_PRESS_HOLD_MS;
+        const pending = () => pending_transform_request_ids_ref.current
+            .some((id, sheet_index) => id !== undefined && which(sheet_index));
+        while (pending()) {
+            const remaining = deadline - Date.now();
+            if (remaining <= 0) return true;
+            const settled = transform_settled_ref.current ?? pending_signal<void>();
+            transform_settled_ref.current = settled;
+            let timer: number | undefined;
+            await Promise.race([
+                settled.settled,
+                new Promise<void>((resolve) => { timer = window.setTimeout(resolve, remaining); }),
+            ]);
+            window.clearTimeout(timer);
+            if (history_document_ref.current !== document) return false;
+        }
+        return true;
+    }, []);
     const pending_transform_states_ref = useRef<(SheetTransformState | undefined)[]>([]);
     const pending_transform_origins_ref = useRef<(TransformOrigin | undefined)[]>([]);
     /**
@@ -6920,6 +6947,10 @@ export function App(): React.JSX.Element {
     // restore request and compared on the next run: see
     // `restore_request_blockers_ref`.
     const [restore_blocker_epoch, set_restore_blocker_epoch] = useState(0);
+    // Bumped when a session request is answered and when a replay attempt
+    // ends, the two things the restore effect waits out; neither need render
+    // by itself.
+    const [restore_wake, set_restore_wake] = useState(0);
     useEffect(() => {
         set_restore_blocker_epoch((n) => n + 1);
     }, [csv_editable, save_in_flight]);
@@ -6932,8 +6963,11 @@ export function App(): React.JSX.Element {
         // session ("Wait for sorting and filtering to finish before editing."),
         // and with it the edit or the Undo that asked. The restore goes once
         // the request is answered. (The ref is the request as posted, before
-        // the render that shows it; the state re-runs this when it ends.)
+        // the render that shows it.) Nor while a replay is out: it would
+        // install under the replay's lease. `restore_wake` runs this again
+        // when either ends.
         if (edit_session_pending || pending_edit_request_ref.current !== null) return;
+        if (replay_coordinator_ref.current?.is_busy() || pending_row_replay_busy_ref.current) return;
         const sheet = meta.sheets[active_sheet_index];
         if (!sheet) return;
         if (
@@ -7026,6 +7060,7 @@ export function App(): React.JSX.Element {
         request_transform,
         save_in_flight,
         edit_session_pending,
+        restore_wake,
         restore_blocker_epoch,
     ]);
 
@@ -8395,6 +8430,8 @@ export function App(): React.JSX.Element {
             answer_refusal(outcome, barrier, replayed.kind === 'available' ? replayed.entry : undefined);
         } finally {
             window.clearTimeout(watch);
+            // A restore of the saved view waits for the attempt to end.
+            set_restore_wake((wake) => wake + 1);
             // An attempt that ended renders nothing by itself; a press held
             // behind it, and a queued header change, wait on it.
             wake_header_drain();
@@ -9547,13 +9584,13 @@ export function App(): React.JSX.Element {
         // posted after the press was let through, say): the host refuses a
         // session until it has, so the request waits for it instead of being
         // refused. A replaced document ends the wait, and the replay with it.
-        const document = history_document_ref.current;
-        while (pending_transform_request_ids_ref.current.some((id) => id !== undefined)) {
-            const settled = transform_settled_ref.current ?? pending_signal<void>();
-            transform_settled_ref.current = settled;
-            await settled.settled;
-            if (history_document_ref.current !== document) return false;
-        }
+        if (!await await_window_transforms(() => true)) return false;
+        const discarding_now = discard_cleanup_ref.current;
+        if (
+            discarding_now !== undefined
+            && discarding_now !== discarding
+            && !await discarding_now.settled
+        ) return false;
         if (editing_session_held_ref.current && csv_edit_session_id_ref.current !== undefined) return true;
         // A request already in flight — an editing gesture made a moment ago —
         // is joined rather than duplicated: the host answers one request, and a
@@ -9584,7 +9621,7 @@ export function App(): React.JSX.Element {
             });
         }
         return grant.settled;
-    }, []);
+    }, [await_window_transforms]);
     // In an effect, not the render body: a render-phase write is a side effect,
     // and StrictMode's double render makes that a rule with teeth. A layout effect
     // is early enough — nothing calls this before the user asks for a replay.
@@ -9613,6 +9650,13 @@ export function App(): React.JSX.Element {
         if (held()) return true;
         const discarding = discard_cleanup_ref.current;
         if (discarding !== undefined && !await discarding.settled) return false;
+        if (held()) return true;
+        // A restore of the saved view this window posted (after a Save, say)
+        // is waited for: the person did not ask for it, and an edit refused
+        // for it would read as a sort of theirs in the way.
+        if (!await await_window_transforms(
+            (sheet_index) => pending_transform_origins_ref.current[sheet_index] === 'restore',
+        )) return false;
         if (held()) return true;
         if (pending_edit_request_ref.current === null) {
             // Only work in flight, and only because the host refuses it: warning
@@ -9651,7 +9695,7 @@ export function App(): React.JSX.Element {
         const grant = session_grant_ref.current ?? pending_signal<boolean>();
         session_grant_ref.current = grant;
         return grant.settled;
-    }, []);
+    }, [await_window_transforms]);
 
     /**
      * Release a session that holds nothing: no unsaved change on any worksheet,
@@ -10409,6 +10453,7 @@ export function App(): React.JSX.Element {
                 if (pending_edit_request_ref.current !== msg.requestId) return;
                 pending_edit_request_ref.current = null;
                 set_edit_session_pending(false);
+                set_restore_wake((wake) => wake + 1);
                 if (msg.granted && msg.editSessionId) {
                     if (!diff_mode_initialized_ref.current) {
                         set_diff_mode(msg.diffOnByDefault ?? diff_on_by_default_ref.current);
