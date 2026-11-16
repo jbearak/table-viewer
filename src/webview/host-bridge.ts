@@ -225,9 +225,11 @@ export const publication_fence = {
      * panel's file id is fixed. Before that only a first snapshot superseded
      * before its acknowledgement can be followed by another initial one, and
      * in that narrow gap an edit would have to be published and this fence
-     * raised. So in practice a reopen is a new renderer whose memory starts
-     * empty; forgetting it here would post an echo of the hydrated stores,
-     * which the failed-save guard in GridShell exists to prevent.
+     * raised. So in practice a reopen is a new renderer (a new window, or a
+     * rebuilt or reloaded webview, each a new JS context that posts `ready`)
+     * whose memory starts empty; forgetting it here would post an echo of the
+     * hydrated stores, which the failed-save guard in GridShell exists to
+     * prevent.
      */
     forget_outstanding(): void {
         for (const channel of pending_edit_channels.values()) {
