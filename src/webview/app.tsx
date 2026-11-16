@@ -3175,6 +3175,11 @@ export function App(): React.JSX.Element {
         if (refused_for_reopen()) return;
         warn_edit_waits_for_header();
     }, [refused_for_reopen, warn_edit_waits_for_header]);
+    /** Say why Cmd/Ctrl+S saves nothing while edits are paused; starts nothing. */
+    const warn_save_paused = useCallback(() => {
+        if (reopen_required_ref.current) say_history(REOPEN_REQUIRED_SAVE_MESSAGE);
+        else if (header_fence_ref.current) warn_save_waits_for_header();
+    }, [say_history]);
     const [header_fence, set_header_fence] = useState(false);
     // The header queue's verdict on a header result; see `drain_excel_header_queue`.
     const header_result_handler_ref = useRef<
@@ -9564,15 +9569,16 @@ export function App(): React.JSX.Element {
         if (reopen_required_ref.current) {
             // Queued before this window said it no longer matches its file
             // (behind the replay it could not follow): not sent. Ended as a
-            // result that needs a reload ends it, saying only this. (A
+            // result that needs a reload ends it. (A
             // replay's run would end the same way, its entry left where it
             // is; the press gate refuses one before it is queued.) Never with
             // a header result that needs a reload: that result empties the
             // queue, and nothing is queued under its fence, so lowering the
             // header fence here cannot clear it.
+            // The window has just said to reopen the file; the status line
+            // says the rest.
             if (run !== null) run.failed = { silent: true };
             set_excel_header_status('Header row was not updated.');
-            say_history(REOPEN_REQUIRED_MESSAGE);
             finish_header_queue();
             return;
         }
@@ -10832,7 +10838,9 @@ export function App(): React.JSX.Element {
         // original in-flight response would stop matching and the webview would sit
         // on a stale generation. That is why a cancel asks the same question every
         // other transform request asks — see `transform_request_blocked` — on
-        // the terms `cancel_blocked` keeps.
+        // the terms `cancel_blocked` keeps. A window that must be reopened
+        // cancels nothing either: a sort already on its way when it said so
+        // lands, and stays until the reopen.
         if (refused_for_reopen()) return;
         if (cancel_blocked()) return;
         const previous = transform_rollback_baseline(
@@ -13634,6 +13642,7 @@ export function App(): React.JSX.Element {
             view_request_in_flight={view_request_pending}
             edits_paused={header_fence || reopen_required}
             on_edit_paused_gesture={warn_edit_paused}
+            on_save_paused={warn_save_paused}
             append_in_flight={append_request_pending}
             csv_editable={csv_editable}
             append_row_ceiling={append_row_ceiling}

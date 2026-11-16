@@ -3311,11 +3311,15 @@ describe('Excel first-row header toggle', () => {
         // A render later, as the drain would run.
         await dispatch_host_message({ type: 'fontChanged', fontFamily: 'serif', fontSize: 12 });
         expect(header_requests(post_message)).toEqual([]);
+        // The window has said to reopen; the status line says the rest.
         const said = post_message.mock.calls
             .map(([message]) => message as WebviewMessage)
             .filter((message): message is Extract<WebviewMessage, { type: 'showWarning' }> => message.type === 'showWarning')
             .map((message) => message.message);
-        expect(said).toContain('This view no longer matches the file. Reopen the file to keep editing.');
+        expect(said).toEqual([
+            'The change was undone in the file, but this view could not be updated. Reopen the file to resynchronize.',
+        ]);
+        expect(document.querySelector('[role="status"]')?.textContent).toBe('Header row was not updated.');
 
         // A Header Row gesture made now is refused outright, and says so.
         const clock = vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 2_001);
@@ -3453,12 +3457,14 @@ describe('Excel first-row header toggle', () => {
         await click_button('Header Row');
         expect(header_requests(post_message)).toHaveLength(1);
         expect(grid_shell_mock.latest_props?.edit_session_id).toBeUndefined();
-        post_message.mockClear();
-        act(() => { (grid_shell_mock.latest_props?.on_save_request as () => unknown)(); });
-        expect(post_message).toHaveBeenCalledWith({
-            type: 'showWarning',
-            message: 'Wait for the header row change to finish, then save.',
-        });
+        for (const save of ['on_save_paused', 'on_save_request'] as const) {
+            post_message.mockClear();
+            act(() => { (grid_shell_mock.latest_props?.[save] as () => unknown)(); });
+            expect(post_message, save).toHaveBeenCalledWith({
+                type: 'showWarning',
+                message: 'Wait for the header row change to finish, then save.',
+            });
+        }
     });
 
     it('lifts the fence on a refusal, so editing goes on', async () => {
@@ -20475,15 +20481,22 @@ describe('undo and redo, from the keyboard and the desktop menu', () => {
         await release_idle_edit_session();
         expect(sent(post_message, 'releaseEditSession')).toBeDefined();
         // The session gone, Cmd+S (which the grid hands to App while edits are
-        // paused) still says why nothing is saved.
+        // paused) and App's Save both still say why nothing is saved.
         await dispatch_host_message(refresh_snapshot_message(make_meta(['Sheet1', 'Sheet2']), {
             capabilities: { csvEditable: true, csvEditingSupported: true },
         }));
         expect(grid_shell_mock.latest_props!.edit_session_id).toBeUndefined();
-        post_message.mockClear();
-        act(() => { (grid_shell_mock.latest_props!.on_save_request as () => unknown)(); });
-        expect(sent(post_message, 'showWarning')?.message)
-            .toBe('This view no longer matches the file. Reopen the file, then save.');
+        let later = Date.now();
+        for (const save of ['on_save_paused', 'on_save_request'] as const) {
+            // Past the repeat window of the message before.
+            later += 2_001;
+            const clock = vi.spyOn(Date, 'now').mockReturnValue(later);
+            post_message.mockClear();
+            act(() => { (grid_shell_mock.latest_props![save] as () => unknown)(); });
+            clock.mockRestore();
+            expect(sent(post_message, 'showWarning')?.message, save)
+                .toBe('This view no longer matches the file. Reopen the file, then save.');
+        }
     });
 
     it('says why for each change it refuses after it could not follow, and keeps a dirty session', async () => {

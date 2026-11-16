@@ -1684,6 +1684,11 @@ export interface GridShellProps {
      * say why nothing happened.
      */
     on_edit_paused_gesture?: () => void;
+    /**
+     * Cmd/Ctrl+S met cells App alone keeps from taking edits: App says why
+     * nothing is saved. Refusal only; a Save is never started from here.
+     */
+    on_save_paused?: () => void;
     /** A host-backed append reservation is outstanding; all edits are fenced. */
     append_in_flight?: boolean;
     /**
@@ -1926,6 +1931,7 @@ export function GridShell({
     view_request_in_flight = false,
     edits_paused = false,
     on_edit_paused_gesture,
+    on_save_paused,
     append_in_flight = false,
     append_row_ceiling = MAX_SHEET_ROWS,
     structural_support,
@@ -8025,20 +8031,20 @@ export function GridShell({
     // Cmd/Ctrl+S saves while editing. The custom editor lets this bubble; here we
     // catch it at the window so it works whether or not an overlay is focused.
     // While App alone pauses edits (a header change, a window that must be
-    // reopened) it goes to App, which says why nothing is saved; there is no
-    // editor open to fold.
+    // reopened) App says why nothing is saved; nothing is started from here,
+    // even if the pause has just ended and this render has not caught up.
     useEffect(() => {
         if (!editable_cells && !edits_held_by_pause) return;
         const handler = (e: KeyboardEvent) => {
             if ((e.metaKey || e.ctrlKey) && (e.key === 's' || e.key === 'S')) {
                 e.preventDefault();
                 if (editable_cells) request_save();
-                else on_save_request();
+                else on_save_paused?.();
             }
         };
         window.addEventListener('keydown', handler);
         return () => window.removeEventListener('keydown', handler);
-    }, [editable_cells, edits_held_by_pause, on_save_request, request_save]);
+    }, [editable_cells, edits_held_by_pause, on_save_paused, request_save]);
 
     const guarded_clear_dirty = useCallback(() => {
         if (edit_admission_is_fenced() || save_in_flight_ref.current) return;

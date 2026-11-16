@@ -2816,14 +2816,16 @@ describe('GridShell when App pauses edits, or its publications are fenced', () =
         expect([...(edit_session?.snapshot() ?? [])]).toEqual([]);
     });
 
-    it('hands Cmd+S to App, which says why nothing is saved', async () => {
+    it('hands Cmd+S to App, which says why nothing is saved, and starts no Save', async () => {
         const on_save_request = vi.fn(() => undefined);
+        const on_save_paused = vi.fn();
         const { rerender } = await render_grid(undefined, { on_save_request });
-        await rerender({ edits_paused: true, on_edit_paused_gesture: vi.fn(), on_save_request });
+        await rerender({ edits_paused: true, on_edit_paused_gesture: vi.fn(), on_save_request, on_save_paused });
         await act(async () => {
             window.dispatchEvent(new KeyboardEvent('keydown', { key: 's', metaKey: true, cancelable: true }));
         });
-        expect(on_save_request).toHaveBeenCalledTimes(1);
+        expect(on_save_paused).toHaveBeenCalledTimes(1);
+        expect(on_save_request).not.toHaveBeenCalled();
     });
 });
 
