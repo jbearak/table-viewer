@@ -442,10 +442,6 @@ interface PendingWidthSheet {
 }
 
 /**
- * The one column-width write awaiting `columnWidthsChanged`: a resize, a fit,
- * a restore, or a width step's replay.
- */
-/**
  * What Auto-fit keeps beside the widths and the toolbar: the worksheets still
  * owed a fit, and each worksheet's Pending Column widths from before its fit.
  */
@@ -454,6 +450,10 @@ interface AutoFitExtras {
     readonly pendingColumnSnapshots: readonly (Record<string, number | undefined> | undefined)[];
 }
 
+/**
+ * The one column-width write awaiting `columnWidthsChanged`: a resize, a fit,
+ * a restore, or a width step's replay.
+ */
 interface PendingWidthWrite {
     readonly requestId: string;
     readonly sourceGeneration: number;
@@ -1713,16 +1713,16 @@ export function App(): React.JSX.Element {
         }
     }, [land_view_replay, record_view_step]);
 
-    /**
-     * View requests a refresh of the same document overtook: their pending
-     * records, taken where the snapshot handler drops them and settled once it
-     * has adopted the snapshot's state.
-     */
     /** `settle_width_write`, which is declared with the width gestures further down. */
     const settle_width_write_ref = useRef<(
         pending: PendingWidthWrite,
         outcome: WidthWriteOutcome,
     ) => void>(() => {});
+    /**
+     * View requests a refresh of the same document overtook: their pending
+     * records, taken where the snapshot handler drops them and settled once it
+     * has adopted the snapshot's state.
+     */
     const overtaken_view_requests_ref = useRef<{
         views: PendingViewTransform[];
         column: PendingColumnWrite | null;
@@ -10275,11 +10275,12 @@ export function App(): React.JSX.Element {
             // drag ends, which is the truth.
             //
             // The same cap applied to the *accumulated* durable map is a refusal this
-            // panel cannot predict — it never holds that map, and the projection is not a
-            // proxy for its size — so that one does leave a layer with nothing behind it
-            // until the generation next moves. The user is told (the host warns, naming
-            // the limit); the stale rectangle is accepted rather than bought off with a
-            // refusal message on the hot path of every drag. Reasoning in full at
+            // panel cannot predict: it never holds that map, and the projection is not a
+            // proxy for its size. The user is told (the host warns, naming the limit).
+            // For a resize that is answered, which is every one a person makes, the
+            // answer retires the layer painted below and the row springs back. Only
+            // the unanswered write, the row a committed edit grows, leaves its layer
+            // with nothing behind it until the generation next moves; reasoning at
             // `row_height_layers_for_delivery`.
             //
             // A reset paints nothing ahead of the host either: which rows hold a

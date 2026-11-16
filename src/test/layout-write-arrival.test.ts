@@ -304,6 +304,36 @@ describe('what a queued layout change is a difference from', () => {
             .toEqual([{ top: 0, left: 0 }]));
     });
 
+    it('delivers a waiting change that another window had stored by the time its turn came', async () => {
+        // The change waits; a delivery from before it arrives; another window
+        // stores the very same scroll and formatting. The write then finds
+        // nothing to change and commits nothing, but the window is still on
+        // the delivery that lacks them, and has to be brought to what is stored.
+        const context = await open_with_held_layout_write();
+        const { panel, versioned, layout, first, release, ready } = context;
+        const waiting = panel.__receive(layout(WAITING));
+        await deliver_from_outside(panel, ready, 'between');
+        const delivered = messages_of(panel, 'workbookSnapshot').length;
+        const stored = await versioned.store.read(file_path);
+        const peer = await versioned.store.compare_and_set(file_path, stored.revision, {
+            ...(stored.state as PerFileState),
+            ...WAITING,
+        });
+        expect(peer.type).toBe('committed');
+        const revision = versioned.revision(file_path);
+
+        release();
+        await Promise.all([first, waiting]);
+
+        // Nothing was written for it.
+        expect(versioned.revision(file_path)).toBe(revision);
+        await vi.waitFor(() => {
+            expect(messages_of(panel, 'workbookSnapshot').length).toBeGreaterThan(delivered);
+            expect(latest_snapshot(panel).state.scrollPosition).toEqual([{ top: 77, left: 0 }]);
+            expect(latest_snapshot(panel).state.showFormatting).toEqual([false]);
+        });
+    });
+
     it('does not write again what an earlier change of the same snapshot already stored', async () => {
         const versioned = versioned_state_store();
         const panel = open_csv(with_in_memory_authority_transactions(versioned.store));

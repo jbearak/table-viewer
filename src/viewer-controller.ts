@@ -309,6 +309,7 @@ import {
 import {
     apply_layout_state_patch,
     derive_layout_state_patch,
+    layout_state_patch_is_empty,
 } from './layout-state-patch';
 import {
     sanitized_abandon_history_replay_request,
@@ -7846,12 +7847,31 @@ export function attach_viewer(
         // its next message is a difference of. Bring it back to what is
         // durable. Last on this write's turn of the tail, so a write waiting
         // behind is not affected: what it needed was read when it arrived.
-        if (committed !== undefined && !disposed) {
+        //
+        // The same when the write found nothing left to change because
+        // another window had stored the same values: they are durable, the
+        // delivery that intervened may not carry them, and no commit here
+        // installed them in what this session delivers. They are read first.
+        const already_durable = committed === undefined
+            && reconciled
+            && !layout_state_patch_is_empty(patch)
+            && may_apply();
+        if ((committed !== undefined || already_durable) && !disposed) {
             const acknowledged = session.acknowledged_identity();
             if (
                 acknowledged === undefined
                 || !same_snapshot_identity(message.snapshotIdentity, acknowledged)
-            ) session.deliver_current_material();
+            ) {
+                if (already_durable) {
+                    try {
+                        const fresh = await read_file_state(false);
+                        if (!disposed && may_apply()) update_session_state_material(fresh, false);
+                    } catch (error) {
+                        log_sanitized_failure('Failed to read the state a layout change found stored', error);
+                    }
+                }
+                if (!disposed) session.deliver_current_material();
+            }
         }
     }
 
