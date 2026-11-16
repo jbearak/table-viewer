@@ -4664,6 +4664,10 @@ describe('CSV edit sessions', () => {
             await first_committed.promise;
             const second = panel.__receive(layout(77));
             const visibility = panel.__receive(write(ready));
+            // The columns are written while the first layout write still holds
+            // the tail.
+            await vi.waitFor(() => expect(versioned.get_state(file_path).columnVisibility)
+                .toEqual([hidden]));
             await flush_promises();
             // The delivery clears the identity the queued layout write names,
             // so it waits its turn behind that write.
