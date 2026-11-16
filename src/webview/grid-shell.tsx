@@ -11942,9 +11942,12 @@ export function GridShell({
                     {
                         display_column: gesture.press.display_column,
                         // A drag discarded because the columns moved under it
-                        // was still a drag, not a click: it is no half of a
-                        // double-click.
-                        dragged: gesture.moved || gesture.discarded,
+                        // was still a drag, not a click, and a press with the
+                        // columns moved under it was on the column that stood
+                        // there before: neither is half of a double-click.
+                        dragged: gesture.moved
+                            || gesture.discarded
+                            || !column_resize_keys_unchanged(gesture),
                         ordinal: gesture.press.ordinal,
                     },
                     ...border_presses_ref.current.slice(0, 1),
