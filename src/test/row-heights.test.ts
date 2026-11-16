@@ -5,6 +5,7 @@ import {
     MAX_ROW_HEIGHT_PX,
     MIN_ROW_HEIGHT_PX,
     clamp_row_height,
+    display_rows_have_custom_height,
     mapped_row_height_overlays,
     natural_row_height,
     resolved_row_height,
@@ -12,6 +13,7 @@ import {
     row_height,
     row_height_layers_for_delivery,
     row_height_layers_with,
+    row_height_layers_without_request,
     set_row_height,
     span_height,
     type RowHeightLayer,
@@ -517,5 +519,45 @@ describe('the optimistic row-height overlay', () => {
             const previous = [overlay(4), undefined];
             expect(mapped_row_height_overlays(previous, (entry) => entry)).toBe(previous);
         });
+    });
+});
+
+describe('a layer and the answer to its request', () => {
+    const layers: RowHeightLayer[] = [
+        { rows: [{ start: 0, end: 2 }], height: 60, requestId: 'first' },
+        { rows: [{ start: 5, end: 5 }], height: 40 },
+        { rows: [{ start: 1, end: 1 }], height: 80, requestId: 'second' },
+    ];
+
+    it('retires the layer painted for the request, and only that one', () => {
+        expect(row_height_layers_without_request(layers, 'first')).toEqual([layers[1], layers[2]]);
+        expect(row_height_layers_without_request(layers, 'second')).toEqual([layers[0], layers[1]]);
+    });
+
+    it('returns the same layers when none was painted for the request', () => {
+        expect(row_height_layers_without_request(layers, 'unknown')).toBe(layers);
+        expect(row_height_layers_without_request([], 'first')).toEqual([]);
+    });
+});
+
+describe('whether rows show a custom height (what offers Reset row height)', () => {
+    it('is true for a height the projection names inside the interval', () => {
+        expect(display_rows_have_custom_height({ 4: 60 }, undefined, { start: 4, end: 4 })).toBe(true);
+        expect(display_rows_have_custom_height({ 4: 60 }, undefined, { start: 0, end: 9 })).toBe(true);
+        expect(display_rows_have_custom_height({ 4: 60 }, [], { start: 5, end: 9 })).toBe(false);
+        expect(display_rows_have_custom_height({}, undefined, { start: 0, end: 9 })).toBe(false);
+    });
+
+    it('is true for a height an unanswered resize paints over the interval', () => {
+        const layers: RowHeightLayer[] = [{ rows: [{ start: 3, end: 6 }], height: 60, requestId: 'drag' }];
+        expect(display_rows_have_custom_height({}, layers, { start: 6, end: 8 })).toBe(true);
+        expect(display_rows_have_custom_height({}, layers, { start: 0, end: 3 })).toBe(true);
+        expect(display_rows_have_custom_height({}, layers, { start: 7, end: 8 })).toBe(false);
+    });
+
+    it('does not walk a select-all interval', () => {
+        // Would not return in a test's time if it visited every row.
+        expect(display_rows_have_custom_height({ 12: 60 }, undefined, { start: 0, end: 2 ** 40 })).toBe(true);
+        expect(display_rows_have_custom_height({}, undefined, { start: 0, end: 2 ** 40 })).toBe(false);
     });
 });
