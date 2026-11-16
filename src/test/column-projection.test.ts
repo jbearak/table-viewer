@@ -211,4 +211,65 @@ describe('create_layout_column_projection', () => {
         expect(projection.display_column_for_identity(pending('gone'))).toBeUndefined();
         expect(projection.display_column_for_key('s:3')).toBe(4);
     });
+
+    describe('only_changed_columns projection filtering', () => {
+        it('overlays temporary changed column visibility on top of manual hiddenColumns', () => {
+            // Table with 5 columns (0..4).
+            // User manually hid column 1.
+            // Changed columns are [1, 2, 4].
+            // Column 1 was manually hidden, so it MUST stay hidden.
+            // Column 0 and 3 are not in changed columns, so they are filtered out.
+            // Only columns 2 and 4 should be displayed!
+            const projection = create_column_projection(5, {
+                hiddenColumns: [1],
+                schema: SCHEMA,
+            }, SCHEMA, [1, 2, 4]);
+
+            expect(projection.visible_to_source).toEqual([2, 4]);
+            expect(projection.source_to_visible).toEqual([
+                undefined,
+                undefined,
+                0,
+                undefined,
+                1,
+            ]);
+            expect(projection.hidden_count).toBe(3);
+        });
+
+        it('restores previous column visibility layout when only_changed_columns is turned off', () => {
+            const manual_visibility = {
+                hiddenColumns: [1],
+                schema: SCHEMA,
+            };
+
+            // When filter is ON
+            const filtered = create_column_projection(5, manual_visibility, SCHEMA, [2, 4]);
+            expect(filtered.visible_to_source).toEqual([2, 4]);
+
+            // When filter is turned OFF (only_changed_columns is undefined)
+            const restored = create_column_projection(5, manual_visibility, SCHEMA, undefined);
+            expect(restored.visible_to_source).toEqual([0, 2, 3, 4]);
+            expect(restored.source_to_visible).toEqual([0, undefined, 1, 2, 3]);
+            expect(restored.hidden_count).toBe(1);
+        });
+
+        it('produces an all-hidden projection when only_changed_columns is empty', () => {
+            const projection = create_column_projection(5, undefined, SCHEMA, []);
+            expect(projection.visible_to_source).toEqual([]);
+            expect(projection.source_to_visible[0]).toBeUndefined();
+            expect(projection.source_to_visible[4]).toBeUndefined();
+            expect(projection.hidden_count).toBe(5);
+        });
+
+        it('preserves correct display-to-source mapping for noncontiguous changed columns', () => {
+            const projection = create_column_projection(6, undefined, undefined, [0, 3, 5]);
+            expect(projection.visible_to_source).toEqual([0, 3, 5]);
+            expect(projection.source_to_visible[0]).toBe(0);
+            expect(projection.source_to_visible[1]).toBeUndefined();
+            expect(projection.source_to_visible[2]).toBeUndefined();
+            expect(projection.source_to_visible[3]).toBe(1);
+            expect(projection.source_to_visible[4]).toBeUndefined();
+            expect(projection.source_to_visible[5]).toBe(2);
+        });
+    });
 });

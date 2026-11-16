@@ -407,6 +407,7 @@ export class CompareDataSource implements DataSource {
      *  derived row indexes share one byte-bounded LRU so visiting many sheets
      *  cannot retain one full-sheet projection apiece until close. */
     private readonly changed_grid_rows_cache = new Map<number, readonly number[]>();
+    private readonly changed_columns_cache = new Map<number, readonly number[] | undefined>();
     /** Deleted rows' grid rows per sheet, in canonical-number order. Built only
      *  when canonical mapping needs them and retained through the shared LRU. */
     private readonly deleted_grid_rows = new Map<number, Uint32Array>();
@@ -661,6 +662,88 @@ export class CompareDataSource implements DataSource {
             changed_row_index_bytes(computed),
             this.changed_grid_rows_cache,
         );
+    }
+
+    /**
+     * Source columns that have changes, in source column order — the column set
+     * behind the "only changed columns" filter.
+     *
+     * Returns:
+     * - `undefined` when the sheet is degraded or alignment is not available
+     *   ("cannot determine changed columns").
+     * - An array of column indices for a matched or one-sided sheet.
+     * - An empty array `[]` when there are definitively no changed columns.
+     */
+    changed_columns(sheet_index: number): readonly number[] | undefined {
+        if (sheet_index < 0 || sheet_index >= this.padded_meta.sheets.length) return undefined;
+        if (this.changed_columns_cache.has(sheet_index)) {
+            return this.changed_columns_cache.get(sheet_index);
+        }
+        const computed = this.compute_changed_columns(sheet_index);
+        this.changed_columns_cache.set(sheet_index, computed);
+        return computed;
+    }
+
+    changed_columns_all_sheets(): readonly (readonly number[] | undefined)[] {
+        return this.padded_meta.sheets.map((_, index) => this.changed_columns(index));
+    }
+
+    private compute_changed_columns(sheet_index: number): readonly number[] | undefined {
+        const sheet = this.padded_meta.sheets[sheet_index];
+        if (!sheet) return undefined;
+        const status = this.sheetStatuses[sheet_index];
+        if (status === 'added' || status === 'deleted') {
+            return Array.from({ length: sheet.columnCount }, (_, i) => i);
+        }
+
+        const pairing = this.matched_by_modified_index.get(sheet_index);
+        if (!pairing) return undefined;
+
+        const alignment = this.alignments.get(sheet_index);
+        if (this.degraded || !alignment || alignment.degraded || !this.supplied_alignment_sheets.has(sheet_index)) {
+            return undefined;
+        }
+
+        const original_sheet = this.original_meta.sheets[pairing.originalIndex];
+        const modified_sheet = this.modified_meta.sheets[sheet_index];
+        const column_count = Math.max(original_sheet.columnCount, modified_sheet.columnCount);
+
+        const cols = new Set<number>();
+
+        // Conservative rule for whole-row additions and deletions:
+        // Retain all columns belonging to the side of that row.
+        if (alignment.addedRows > 0) {
+            for (let c = 0; c < modified_sheet.columnCount; c++) cols.add(c);
+        }
+        if (alignment.deletedRows > 0) {
+            for (let c = 0; c < original_sheet.columnCount; c++) cols.add(c);
+        }
+
+        // Columns that exist only on one side (including empty structural columns):
+        if (original_sheet.columnCount !== modified_sheet.columnCount) {
+            for (let c = Math.min(original_sheet.columnCount, modified_sheet.columnCount); c < column_count; c++) {
+                cols.add(c);
+            }
+        }
+
+        // Header name changes:
+        const header_diffs = this.changedColumnNames[sheet_index];
+        if (header_diffs) {
+            for (const { col } of header_diffs) {
+                if (col < column_count) cols.add(col);
+            }
+        }
+
+        // Cell changes in paired rows (including moved-and-edited rows):
+        if (alignment.changedColumnIndices) {
+            for (const col of alignment.changedColumnIndices) {
+                if (col < column_count) cols.add(col);
+            }
+        } else if (alignment.changedCells > 0) {
+            for (let c = 0; c < column_count; c++) cols.add(c);
+        }
+
+        return [...cols].sort((left, right) => left - right);
     }
 
     /** Moved grid rows, kept in the alignment's ascending compact array. */
@@ -1617,6 +1700,7 @@ export class CompareDataSource implements DataSource {
         this.deleted_grid_rows.clear();
         this.grid_row_by_modified_cache.clear();
         this.changed_grid_rows_cache.clear();
+        this.changed_columns_cache.clear();
         this.derived_row_index_lru.clear();
         this.derived_row_index_cache_bytes = 0;
         try {

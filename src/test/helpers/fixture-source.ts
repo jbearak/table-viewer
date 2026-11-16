@@ -25,6 +25,7 @@ export interface FixtureSheet {
     /** Merged ranges in this sheet's own row space, for compare projection tests. */
     merges?: MergeRange[];
     hasFormatting?: boolean;
+    columnNames?: string[];
     /** Reported the way an ExcelHeaderDataSource sheet reports it, so the
      *  compare wrapper's withholding of the capability can be observed. */
     excelFirstRowHeader?: SheetMeta['excelFirstRowHeader'];
@@ -47,6 +48,9 @@ export class FixtureSource implements DataSource {
                 ...(sheet.unnamedSingleSheet ? { unnamedSingleSheet: true } : {}),
                 ...(sheet.excelFirstRowHeader !== undefined
                     ? { excelFirstRowHeader: sheet.excelFirstRowHeader }
+                    : {}),
+                ...(sheet.columnNames !== undefined
+                    ? { columnNames: sheet.columnNames }
                     : {}),
                 rowCount: sheet.rows.length,
                 sourceRowCount: sheet.rows.length,

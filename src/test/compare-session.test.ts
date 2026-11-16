@@ -1865,4 +1865,161 @@ describe('CompareDataSource with a content alignment', () => {
             expect(sheet.excelFirstRowHeader).toBeUndefined();
         }
     });
+
+    describe('changed_columns', () => {
+        it('isolates only the changed columns when few columns differ across multiple rows', async () => {
+            const original = [
+                ['a', 'b', 'c', 'd'],
+                ['e', 'f', 'g', 'h'],
+                ['i', 'j', 'k', 'l'],
+            ];
+            const modified = [
+                ['a', 'b', 'c', 'd'],
+                ['e', 'f_edited', 'g', 'h'],
+                ['i', 'j', 'k_edited', 'l'],
+            ];
+            const source = await aligned(original, modified);
+            expect(source.changed_columns(0)).toEqual([1, 2]);
+        });
+
+        it('identifies off-screen changes in unread/late pages', async () => {
+            const original = Array.from({ length: 150 }, (_, i) => [`a${i}`, `b${i}`, `c${i}`]);
+            const modified = Array.from({ length: 150 }, (_, i) => [`a${i}`, `b${i}`, `c${i}`]);
+            modified[140] = ['a140', 'b140_edited', 'c140'];
+            const source = await aligned(original, modified);
+            expect(source.changed_columns(0)).toEqual([1]);
+        });
+
+        it('retains column with header change alone even when data cells are identical', async () => {
+            const modified = new FixtureSource([{
+                name: 'S',
+                columnNames: ['Id', 'NewName', 'Age'],
+                rows: [['1', 'Alice', '30'], ['2', 'Bob', '25']],
+            }]);
+            const original = new FixtureSource([{
+                name: 'S',
+                columnNames: ['Id', 'OldName', 'Age'],
+                rows: [['1', 'Alice', '30'], ['2', 'Bob', '25']],
+            }]);
+            const source = new CompareDataSource(
+                modified,
+                original,
+                await align_workbook(modified, original),
+            );
+            expect(source.changed_columns(0)).toEqual([1]);
+        });
+
+        it('retains structural added and deleted columns, including empty columns', async () => {
+            // Modified has an added third column (empty cells)
+            const added_col_source = await aligned(
+                [['a', 'b']],
+                [['a', 'b', '']],
+            );
+            expect(added_col_source.changed_columns(0)).toEqual([2]);
+
+            // Modified has a deleted third column
+            const del_col_source = await aligned(
+                [['a', 'b', 'c']],
+                [['a', 'b']],
+            );
+            expect(del_col_source.changed_columns(0)).toEqual([2]);
+        });
+
+        it('conservatively retains all columns of the side with whole added or deleted rows', async () => {
+            // Added whole row in modified
+            const added_row_source = await aligned(
+                [['a', 'b', 'c']],
+                [['a', 'b', 'c'], ['new1', 'new2', 'new3']],
+            );
+            expect(added_row_source.changed_columns(0)).toEqual([0, 1, 2]);
+
+            // Deleted whole row in original
+            const del_row_source = await aligned(
+                [['a', 'b', 'c'], ['old1', 'old2', 'old3']],
+                [['a', 'b', 'c']],
+            );
+            expect(del_row_source.changed_columns(0)).toEqual([0, 1, 2]);
+        });
+
+        it('does not treat purely moved rows as changed columns', async () => {
+            const source = await aligned(
+                [['r1_a', 'r1_b'], ['r2_a', 'r2_b']],
+                [['r2_a', 'r2_b'], ['r1_a', 'r1_b']],
+            );
+            // Pure move has changed rows (for row filter) but NO changed columns
+            expect(source.changed_grid_rows(0)).toEqual([1]);
+            expect(source.changed_columns(0)).toEqual([]);
+        });
+
+        it('retains edited columns for rows that were both moved and edited', async () => {
+            const source = await aligned(
+                [['Al', 'Eng', '10'], ['Bo', 'Ops', '20'], ['Cy', 'Fin', '30']],
+                [['Al', 'Eng', '10'], ['Cy', 'Fin', '30'], ['Bo', 'Ops', '99']],
+            );
+            expect(source.changed_columns(0)).toEqual([2]);
+        });
+
+        it('handles identical files, empty tables, and one-sided sheets correctly', async () => {
+            // Identical files
+            const identical = await aligned([['a', 'b']], [['a', 'b']]);
+            expect(identical.changed_columns(0)).toEqual([]);
+
+            // Empty tables
+            const empty = await aligned([], []);
+            expect(empty.changed_columns(0)).toEqual([]);
+
+            // One-sided sheets
+            const modified = new FixtureSource([
+                { name: 'Same', rows: [['a']] },
+                { name: 'Fresh', rows: [['x', 'y', 'z']] },
+            ]);
+            const original = new FixtureSource([
+                { name: 'Same', rows: [['a']] },
+                { name: 'Old', rows: [['p', 'q']] },
+            ]);
+            const source = new CompareDataSource(
+                modified,
+                original,
+                await align_workbook(modified, original),
+            );
+            expect(source.changed_columns(0)).toEqual([]);
+            expect(source.changed_columns(1)).toEqual([0, 1, 2]); // Added sheet Fresh
+            expect(source.changed_columns(2)).toEqual([0, 1]); // Deleted sheet Old
+        });
+
+        it('returns undefined when comparison result is degraded or unaligned', async () => {
+            const modified = new FixtureSource([{ name: 'S', rows: [['a'], ['b']] }]);
+            const original = new FixtureSource([{ name: 'S', rows: [['x'], ['y']] }]);
+            // Unaligned CompareDataSource defaults to degraded: true
+            const unaligned_source = new CompareDataSource(modified, original);
+            expect(unaligned_source.degraded).toBe(true);
+            expect(unaligned_source.changed_columns(0)).toBeUndefined();
+        });
+
+        it('isolates cache per sheet and clears cache on close', async () => {
+            const modified = new FixtureSource([
+                { name: 'S1', rows: [['a', 'b', 'c'], ['edit1', 'b', 'c']] },
+                { name: 'S2', rows: [['x', 'y', 'z'], ['x', 'y', 'edit2']] },
+            ]);
+            const original = new FixtureSource([
+                { name: 'S1', rows: [['a', 'b', 'c'], ['old1', 'b', 'c']] },
+                { name: 'S2', rows: [['x', 'y', 'z'], ['x', 'y', 'old2']] },
+            ]);
+            const source = new CompareDataSource(
+                modified,
+                original,
+                await align_workbook(modified, original),
+            );
+            expect(source.changed_columns(0)).toEqual([0]);
+            expect(source.changed_columns(1)).toEqual([2]);
+            expect(source.changed_columns_all_sheets()).toEqual([[0], [2]]);
+
+            const internals = source as unknown as {
+                changed_columns_cache: Map<number, readonly number[] | undefined>;
+            };
+            expect(internals.changed_columns_cache.size).toBe(2);
+            source.close();
+            expect(internals.changed_columns_cache.size).toBe(0);
+        });
+    });
 });

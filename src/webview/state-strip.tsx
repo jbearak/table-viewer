@@ -19,6 +19,8 @@ export interface StateStripProps {
     on_transform_change: (state: SheetTransformState) => void;
     on_edit_filter: (entry: FilterEntry, trigger: HTMLElement) => void;
     on_cancel_transform: () => void;
+    only_changed_columns?: boolean;
+    on_clear_only_changed_columns?: () => void;
 }
 
 /**
@@ -50,15 +52,17 @@ export function StateStrip(props: StateStripProps): React.JSX.Element | null {
     } = props;
     const hidden_count = props.hidden_rows?.count ?? 0;
     const only_changed_rows = transform.onlyChangedRows === true;
-    // "Only changed rows" counts as state. Leaving it out made the strip mount
-    // for the duration of the toggle's own transform and unmount the moment it
-    // landed, so switching the filter on flashed a band of chrome and shoved
+    const only_changed_columns = props.only_changed_columns === true;
+    // "Only changed rows" and "Only changed columns" count as state. Leaving them out made
+    // the strip mount for the duration of the toggle's own transform and unmount the moment
+    // it landed, so switching the filter on flashed a band of chrome and shoved
     // the grid down and back — and left an installed filter with no
     // representation anywhere below the tabs.
     const has_state = transform.sort.length > 0
         || transform.filters.length > 0
         || hidden_count > 0
         || only_changed_rows
+        || only_changed_columns
         || props.transform_pending
         || props.merges_flattened;
     if (!has_state) return null;
@@ -109,6 +113,19 @@ export function StateStrip(props: StateStripProps): React.JSX.Element | null {
                             ...transform,
                             onlyChangedRows: false,
                         })}
+                        disabled={controls_disabled}
+                    >
+                        Show all
+                    </button>
+                </div>
+            )}
+            {only_changed_columns && (
+                <div className="filter-chip">
+                    <span className="filter-chip-body">Only changed columns</span>
+                    <button
+                        type="button"
+                        className="toolbar-cancel"
+                        onClick={props.on_clear_only_changed_columns}
                         disabled={controls_disabled}
                     >
                         Show all

@@ -1718,6 +1718,9 @@ export interface GridShellProps {
     ) => void;
     on_highlight_selection_available_change?: (available: boolean) => void;
     highlight_ref?: MutableRefObject<HighlightSelectionHandle | null>;
+    only_changed_columns?: boolean;
+    on_clear_only_changed_columns?: () => void;
+    has_changed_columns?: boolean;
 }
 
 /**
@@ -1821,6 +1824,9 @@ export function GridShell({
     on_highlight_selection = () => {},
     on_highlight_selection_available_change,
     highlight_ref,
+    only_changed_columns = false,
+    on_clear_only_changed_columns,
+    has_changed_columns = true,
 }: GridShellProps): React.JSX.Element {
     // The Worksheet Layout's columns: display columns follow column identity
     // (`s:<n>`, `p:<id>`), so widths, sorts, filters, selection, and find
@@ -11918,7 +11924,37 @@ export function GridShell({
                 <div className="all-columns-hidden" role="status">
                     {sheet_meta.columnCount === 0
                         ? 'This sheet contains no columns.'
-                        : 'All columns are hidden. Show one or more columns to resume the table.'}
+                        : only_changed_columns
+                            ? (has_changed_columns === false
+                                ? (
+                                    <>
+                                        <div>There are no changed columns in this sheet.</div>
+                                        {on_clear_only_changed_columns && (
+                                            <button
+                                                type="button"
+                                                className="toolbar-cancel"
+                                                onClick={on_clear_only_changed_columns}
+                                            >
+                                                Show all columns
+                                            </button>
+                                        )}
+                                    </>
+                                )
+                                : (
+                                    <>
+                                        <div>All changed columns are hidden. Show one or more columns to resume the table.</div>
+                                        {on_clear_only_changed_columns && (
+                                            <button
+                                                type="button"
+                                                className="toolbar-cancel"
+                                                onClick={on_clear_only_changed_columns}
+                                            >
+                                                Show all columns
+                                            </button>
+                                        )}
+                                    </>
+                                ))
+                            : 'All columns are hidden. Show one or more columns to resume the table.'}
                 </div>
             </div>
         );

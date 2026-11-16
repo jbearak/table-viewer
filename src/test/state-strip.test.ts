@@ -107,6 +107,54 @@ describe('StateStrip', () => {
         );
     });
 
+    it('renders "Only changed columns" chip and clears it on click', () => {
+        const on_clear_only_changed_columns = vi.fn();
+        const { container } = render_strip({
+            only_changed_columns: true,
+            on_clear_only_changed_columns,
+        });
+        expect(container.querySelector('.state-strip')).not.toBeNull();
+        expect(container.textContent).toContain('Only changed columns');
+
+        act(() => {
+            get_button('Show all').dispatchEvent(
+                new MouseEvent('click', { bubbles: true }),
+            );
+        });
+        expect(on_clear_only_changed_columns).toHaveBeenCalledOnce();
+    });
+
+    it('renders both row and column compare filter chips independently', () => {
+        const on_transform_change = vi.fn();
+        const on_clear_only_changed_columns = vi.fn();
+        const { container } = render_strip({
+            transform: { sort: [], filters: [], onlyChangedRows: true },
+            only_changed_columns: true,
+            on_transform_change,
+            on_clear_only_changed_columns,
+        });
+
+        expect(container.textContent).toContain('Only changed rows');
+        expect(container.textContent).toContain('Only changed columns');
+
+        const show_all_buttons = Array.from(document.querySelectorAll('button'))
+            .filter((candidate) => candidate.textContent === 'Show all');
+        expect(show_all_buttons).toHaveLength(2);
+
+        act(() => {
+            show_all_buttons[0].dispatchEvent(new MouseEvent('click', { bubbles: true }));
+        });
+        expect(on_transform_change).toHaveBeenCalledWith(
+            expect.objectContaining({ onlyChangedRows: false }),
+        );
+        expect(on_clear_only_changed_columns).not.toHaveBeenCalled();
+
+        act(() => {
+            show_all_buttons[1].dispatchEvent(new MouseEvent('click', { bubbles: true }));
+        });
+        expect(on_clear_only_changed_columns).toHaveBeenCalledOnce();
+    });
+
     it('appears for a sort alone, and for a filter alone', () => {
         const { container, rerender } = render_strip({
             transform: { sort: [{ colIndex: 1, direction: 'asc' }], filters: [] },

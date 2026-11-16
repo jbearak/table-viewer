@@ -2150,6 +2150,28 @@ describe('GridShell git compare painting', () => {
         expect(plain.data).toBe('source-c');
     });
 
+    it('maps displayed columns to canonical source columns for diff highlights', async () => {
+        grid_mock.compare_base = { '0:2': 'before-c' };
+        await render_grid(props({
+            git_compare: true,
+            column_projection: {
+                visible_to_source: [0, 2],
+                source_to_visible: [0, undefined, 1],
+                hidden_count: 1,
+            },
+        }));
+
+        const get_cell_content = grid_mock.props!.getCellContent as (
+            cell: [number, number],
+        ) => {
+            data: { kind: string; lines: { text: string }[][] };
+        };
+        const cell = get_cell_content([1, 0]);
+        expect(cell.data).toMatchObject({ kind: 'rich-text' });
+        const diff_texts = cell.data.lines.flat().map((run) => run.text);
+        expect(diff_texts).toContain('before-c');
+    });
+
     it('strikes deleted-row cells whole instead of diffing them', async () => {
         grid_mock.compare_status = { 0: 'deleted', 1: 'added' };
         await render_grid(props({ git_compare: true }));
@@ -4671,6 +4693,52 @@ describe('GridShell column projection', () => {
         expect(grid_mock.loader_enabled.at(-1)).toBe(true);
         expect(grid_mock.ensure_row_intervals).toHaveBeenCalledWith([{ start: 0, end: 0 }]);
         expect(editing_ref.current?.has_uncommitted_changes()).toBe(true);
+    });
+
+    it('renders informative message and restore button when only_changed_columns produces no visible columns', async () => {
+        const on_clear_only_changed_columns = vi.fn();
+        await render_grid(props({
+            only_changed_columns: true,
+            has_changed_columns: false,
+            on_clear_only_changed_columns,
+            column_projection: {
+                visible_to_source: [],
+                source_to_visible: [undefined, undefined],
+                hidden_count: 2,
+            },
+        }));
+
+        const banner = container!.querySelector('[role="status"]');
+        expect(banner?.textContent).toContain('There are no changed columns in this sheet.');
+        const button = banner?.querySelector('button');
+        expect(button?.textContent).toBe('Show all columns');
+        await act(async () => {
+            button?.click();
+        });
+        expect(on_clear_only_changed_columns).toHaveBeenCalledOnce();
+    });
+
+    it('renders informative message when all changed columns are manually hidden', async () => {
+        const on_clear_only_changed_columns = vi.fn();
+        await render_grid(props({
+            only_changed_columns: true,
+            has_changed_columns: true,
+            on_clear_only_changed_columns,
+            column_projection: {
+                visible_to_source: [],
+                source_to_visible: [undefined, undefined],
+                hidden_count: 2,
+            },
+        }));
+
+        const banner = container!.querySelector('[role="status"]');
+        expect(banner?.textContent).toContain('All changed columns are hidden. Show one or more columns to resume the table.');
+        const button = banner?.querySelector('button');
+        expect(button?.textContent).toBe('Show all columns');
+        await act(async () => {
+            button?.click();
+        });
+        expect(on_clear_only_changed_columns).toHaveBeenCalledOnce();
     });
 });
 

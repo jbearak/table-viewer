@@ -31,6 +31,10 @@ export interface CompareStripProps {
     readonly other_differences?: boolean;
     readonly only_changed_rows: boolean;
     readonly on_toggle_only_changed_rows: (next: boolean) => void;
+    readonly only_changed_columns?: boolean;
+    readonly on_toggle_only_changed_columns?: (next: boolean) => void;
+    readonly changed_columns_available?: boolean;
+    readonly has_changed_columns?: boolean;
     /** Filtering is a transform, so it waits like any other. */
     readonly filter_pending?: boolean;
 }
@@ -56,6 +60,10 @@ export function CompareStrip({
     other_differences = false,
     only_changed_rows,
     on_toggle_only_changed_rows,
+    only_changed_columns = false,
+    on_toggle_only_changed_columns = () => {},
+    changed_columns_available = true,
+    has_changed_columns = true,
     filter_pending = false,
 }: CompareStripProps): React.JSX.Element {
     // Moved rows count. A file whose only change is reordering would otherwise
@@ -136,7 +144,7 @@ export function CompareStrip({
                     // a bespoke copy had drifted from it in five ways, the
                     // worst being an unscoped :hover that replaced the active
                     // fill while keeping the light-on-dark foreground.
-                    className={`toggle compare-strip-toggle${only_changed_rows ? ' active' : ''}`}
+                    className={`toggle compare-strip-toggle compare-strip-toggle-rows${only_changed_rows ? ' active' : ''}`}
                     aria-pressed={only_changed_rows}
                     // Nothing to filter down to when the rows could not be
                     // matched up, or when no row or cell differs.
@@ -149,6 +157,23 @@ export function CompareStrip({
                     onClick={() => on_toggle_only_changed_rows(!only_changed_rows)}
                 >
                     Only changed rows
+                </button>
+                <button
+                    type="button"
+                    className={`toggle compare-strip-toggle compare-strip-toggle-columns${only_changed_columns ? ' active' : ''}`}
+                    aria-pressed={only_changed_columns}
+                    disabled={
+                        filter_pending
+                        || (!only_changed_columns && (degraded || changed_columns_available === false || has_changed_columns === false))
+                    }
+                    title={degraded || changed_columns_available === false
+                        ? 'The rows could not be matched up, so changed columns cannot be singled out.'
+                        : has_changed_columns === false
+                            ? 'There are no changed columns to show.'
+                            : 'Hide columns that are the same in both files.'}
+                    onClick={() => on_toggle_only_changed_columns(!only_changed_columns)}
+                >
+                    Only changed columns
                 </button>
                 {/*
                   * A polite status, so a screen reader hears the outcome: the

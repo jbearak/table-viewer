@@ -102,6 +102,7 @@ export function create_column_projection(
     column_count: number,
     value?: unknown,
     expected_schema?: string,
+    only_changed_columns?: readonly number[],
 ): SourceColumnProjection {
     const safe_column_count = Number.isInteger(column_count) && column_count > 0
         ? column_count
@@ -114,16 +115,23 @@ export function create_column_projection(
     const source_to_visible: (number | undefined)[] = [];
     let visible_to_source: number[];
 
+    const changed_set = only_changed_columns !== undefined
+        ? new Set(only_changed_columns)
+        : undefined;
+
     if (state?.visibleColumns) {
-        visible_to_source = [...state.visibleColumns];
-        for (const [visible_column, source_column] of visible_to_source.entries()) {
-            source_to_visible[source_column] = visible_column;
+        visible_to_source = [];
+        for (const source_column of state.visibleColumns) {
+            if (changed_set !== undefined && !changed_set.has(source_column)) continue;
+            source_to_visible[source_column] = visible_to_source.length;
+            visible_to_source.push(source_column);
         }
     } else {
         const hidden_columns = new Set(state?.hiddenColumns ?? []);
         visible_to_source = [];
         for (let source_column = 0; source_column < safe_column_count; source_column++) {
             if (hidden_columns.has(source_column)) continue;
+            if (changed_set !== undefined && !changed_set.has(source_column)) continue;
             source_to_visible[source_column] = visible_to_source.length;
             visible_to_source.push(source_column);
         }

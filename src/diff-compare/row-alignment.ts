@@ -50,6 +50,12 @@ export interface SheetAlignment {
     /** Differing cells across all paired rows. */
     readonly changedCells: number;
     /**
+     * Source columns across all paired rows that differ, ascending. Recorded
+     * during the same pass that counts the cells, so the "only changed columns"
+     * filter costs no extra reads.
+     */
+    readonly changedColumnIndices?: readonly number[];
+    /**
      * Indexes into `rows` of rows the move pass paired, ascending. These are
      * ordinary two-index rows in every other respect — a moved-and-edited row
      * also appears in `changedRowIndices` — so this is purely the "how did it
@@ -982,7 +988,7 @@ export async function align_sheet(
 
 function changes_without_collision(counted: CountedChanges): Pick<
     SheetAlignment,
-    'addedRows' | 'deletedRows' | 'changedCells' | 'changedRowIndices'
+    'addedRows' | 'deletedRows' | 'changedCells' | 'changedRowIndices' | 'changedColumnIndices'
 > {
     const { hashCollision: _hash_collision, ...changes } = counted;
     return changes;
@@ -1107,7 +1113,7 @@ async function build_rows(
 
 interface CountedChanges extends Pick<
     SheetAlignment,
-    'addedRows' | 'deletedRows' | 'changedCells' | 'changedRowIndices'
+    'addedRows' | 'deletedRows' | 'changedCells' | 'changedRowIndices' | 'changedColumnIndices'
 > {
     /** A paired row selected as equal by this attempt's hash differed exactly. */
     readonly hashCollision: boolean;
@@ -1139,6 +1145,7 @@ async function count_changes(
     let changed_cells = 0;
     let hash_collision = false;
     const changed_row_indices: number[] = [];
+    const changed_column_indices = new Set<number>();
     const column_count = Math.max(original_sheet.columnCount, modified_sheet.columnCount);
     const checkpoint = rows_per_checkpoint(options.rowsPerCheckpoint);
     const is_cancelled = options.isCancelled ?? NEVER_CANCELLED;
@@ -1197,6 +1204,7 @@ async function count_changes(
                     if (!exactly_equal) {
                         changed_cells++;
                         row_changed = true;
+                        changed_column_indices.add(col);
                     }
                     cells_since_checkpoint += 1;
                     if (cells_since_checkpoint >= CHANGE_CELLS_PER_CHECKPOINT) {
@@ -1228,6 +1236,7 @@ async function count_changes(
         deletedRows: deleted,
         changedCells: changed_cells,
         changedRowIndices: changed_row_indices,
+        changedColumnIndices: [...changed_column_indices].sort((left, right) => left - right),
         hashCollision: hash_collision,
     };
 }

@@ -114,7 +114,7 @@ test('the comparison counts an inserted row as one addition', async () => {
 
 test('Only changed rows hides the rows that did not change', async () => {
     const page = await comparison_window();
-    const toggle = page.locator('.compare-strip-toggle');
+    const toggle = page.locator('.compare-strip-toggle-rows');
     // Unchanged rows exist to hide: North and East match on both sides.
     await expect(page.locator('#glide-cell-1-3')).toBeAttached();
 
@@ -127,4 +127,17 @@ test('Only changed rows hides the rows that did not change', async () => {
     await toggle.click();
     await expect(toggle).toHaveAttribute('aria-pressed', 'false');
     await expect(page.locator('#glide-cell-1-3')).toBeAttached();
+});
+
+test('Only changed columns button is rendered next to Only changed rows and toggles', async () => {
+    const page = await comparison_window();
+    const cols_toggle = page.locator('.compare-strip-toggle-columns');
+    await expect(cols_toggle).toBeVisible();
+    await expect(cols_toggle).toHaveAttribute('aria-pressed', 'false');
+
+    await cols_toggle.click();
+    await expect(cols_toggle).toHaveAttribute('aria-pressed', 'true');
+
+    await cols_toggle.click();
+    await expect(cols_toggle).toHaveAttribute('aria-pressed', 'false');
 });

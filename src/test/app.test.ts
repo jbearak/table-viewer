@@ -1195,6 +1195,383 @@ describe('git compare mode', () => {
             [{ col: 0, base: 'old name' }],
         );
     });
+
+    it('handles unavailable changedColumns after JSON transmission without throwing or hiding columns', async () => {
+        await render_app();
+        const meta: WorkbookMeta = {
+            hasFormatting: false,
+            sheets: [{
+                name: 'Sheet1',
+                rowCount: 5,
+                sourceRowCount: 5,
+                columnCount: 3,
+                columnNames: ['A', 'B', 'C'],
+                merges: [],
+                hasFormatting: false,
+            }],
+        };
+        // 1. Degraded comparison snapshot where changedColumns would serialize [undefined] -> [null]
+        const raw_msg = initial_snapshot_message(meta, {
+            configuration: {
+                gitCompare: {
+                    pairings: [],
+                    sheetStatuses: ['matched'],
+                    changedColumnNames: [[]],
+                    changedColumns: [null],
+                    counts: { addedRows: 0, deletedRows: 0, movedRows: 0, changedCells: 0 },
+                    degraded: true,
+                    moveSearchTruncated: false,
+                },
+            },
+        });
+        const json_msg = JSON.parse(JSON.stringify(raw_msg));
+        await dispatch_host_message(json_msg);
+
+        // App renders normally without throwing, grid exists
+        expect(container?.querySelector('.grid-shell-stub')).not.toBeNull();
+        // Visible columns are not hidden
+        const projection = grid_shell_mock.latest_props?.column_projection as { visible_to_source: number[] };
+        expect(projection.visible_to_source).toEqual([0, 1, 2]);
+
+        // "Only changed columns" toggle button is disabled with explanatory title
+        const col_btn = get_button('Only changed columns');
+        expect(col_btn.disabled).toBe(true);
+        expect(col_btn.title).toContain('The rows could not be matched up');
+
+        // Test missing changedColumns field
+        const missing_field_msg = JSON.parse(JSON.stringify(initial_snapshot_message(meta, {
+            configuration: {
+                gitCompare: {
+                    pairings: [],
+                    sheetStatuses: ['matched'],
+                    changedColumnNames: [[]],
+                    counts: { addedRows: 0, deletedRows: 0, movedRows: 0, changedCells: 0 },
+                    degraded: false,
+                    moveSearchTruncated: false,
+                },
+            },
+        })));
+        await dispatch_host_message(missing_field_msg);
+        expect(get_button('Only changed columns').disabled).toBe(true);
+
+        // Test empty array changedColumns [[]] (definitively no changes)
+        const empty_changes_msg = JSON.parse(JSON.stringify(initial_snapshot_message(meta, {
+            configuration: {
+                gitCompare: {
+                    pairings: [],
+                    sheetStatuses: ['matched'],
+                    changedColumnNames: [[]],
+                    changedColumns: [[]],
+                    counts: { addedRows: 0, deletedRows: 0, movedRows: 0, changedCells: 0 },
+                    degraded: false,
+                    moveSearchTruncated: false,
+                },
+            },
+        })));
+        await dispatch_host_message(empty_changes_msg);
+        expect(get_button('Only changed columns').disabled).toBe(true);
+        expect(get_button('Only changed columns').title).toBe('There are no changed columns to show.');
+
+        // Test valid changedColumns [[1]]
+        const valid_changes_msg = JSON.parse(JSON.stringify(initial_snapshot_message(meta, {
+            configuration: {
+                gitCompare: {
+                    pairings: [],
+                    sheetStatuses: ['matched'],
+                    changedColumnNames: [[]],
+                    changedColumns: [[1]],
+                    counts: { addedRows: 0, deletedRows: 0, movedRows: 0, changedCells: 1 },
+                    degraded: false,
+                    moveSearchTruncated: false,
+                },
+            },
+        })));
+        await dispatch_host_message(valid_changes_msg);
+        expect(get_button('Only changed columns').disabled).toBe(false);
+    });
+
+    it('keeps Columns menu checkboxes and actions consistent with manual visibility when auto-filter is active', async () => {
+        const { post_message } = await render_app();
+        const meta: WorkbookMeta = {
+            hasFormatting: false,
+            sheets: [{
+                name: 'Sheet1',
+                rowCount: 5,
+                sourceRowCount: 5,
+                columnCount: 3,
+                columnNames: ['Name', 'Value', 'Notes'],
+                merges: [],
+                hasFormatting: false,
+            }],
+        };
+        // Initial state: only Value (col 1) has changes, no columns manually hidden
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            configuration: {
+                gitCompare: {
+                    pairings: [],
+                    sheetStatuses: ['matched'],
+                    changedColumnNames: [[]],
+                    changedColumns: [[1]],
+                    counts: { addedRows: 0, deletedRows: 0, movedRows: 0, changedCells: 1 },
+                    degraded: false,
+                    moveSearchTruncated: false,
+                },
+            },
+        }));
+
+        // Initial grid shows all 3 columns
+        expect((grid_shell_mock.latest_props?.column_projection as { visible_to_source: number[] }).visible_to_source)
+            .toEqual([0, 1, 2]);
+
+        // 1. Turn on "Only changed columns"
+        post_message.mockClear();
+        await act(async () => {
+            get_button('Only changed columns').click();
+        });
+
+        // Grid now only displays Value (col 1)
+        expect((grid_shell_mock.latest_props?.column_projection as { visible_to_source: number[] }).visible_to_source)
+            .toEqual([1]);
+        // Toggling auto-filter MUST NOT post setColumnVisibility
+        expect(post_message.mock.calls.some((c) => c[0]?.type === 'setColumnVisibility')).toBe(false);
+
+        // 2. Open Columns menu
+        const columns_btn = get_button('Columns');
+        await act(async () => {
+            columns_btn.click();
+        });
+
+        // In Columns menu, all three columns are CHECKED (because none are manually hidden)
+        const items = Array.from(document.querySelectorAll<HTMLInputElement>('.column-visibility-item input'));
+        expect(items).toHaveLength(3);
+        expect(items[0].checked).toBe(true);
+        expect(items[0].getAttribute('aria-label')).toBe('Hide Name');
+        expect(items[1].checked).toBe(true);
+        expect(items[1].getAttribute('aria-label')).toBe('Hide Value');
+        expect(items[2].checked).toBe(true);
+        expect(items[2].getAttribute('aria-label')).toBe('Hide Notes');
+
+        // Verify active notice is shown in the popover
+        const notice = document.querySelector('.column-visibility-notice');
+        expect(notice).not.toBeNull();
+        expect(notice?.textContent).toContain('Only changed columns is active');
+
+        // Close popover
+        await act(async () => {
+            columns_btn.click();
+        });
+
+        // 3. Turn off "Only changed columns"
+        await act(async () => {
+            get_button('Only changed columns').click();
+        });
+
+        // All 3 columns restored in grid
+        expect((grid_shell_mock.latest_props?.column_projection as { visible_to_source: number[] }).visible_to_source)
+            .toEqual([0, 1, 2]);
+        // Still no setColumnVisibility sent
+        expect(post_message.mock.calls.some((c) => c[0]?.type === 'setColumnVisibility')).toBe(false);
+    });
+
+    it('preserves manual hide actions performed during auto-filter and restores them properly on turn-off', async () => {
+        const { post_message } = await render_app();
+        const meta: WorkbookMeta = {
+            hasFormatting: false,
+            sheets: [{
+                name: 'Sheet1',
+                rowCount: 5,
+                sourceRowCount: 5,
+                columnCount: 3,
+                columnNames: ['Name', 'Value', 'Notes'],
+                merges: [],
+                hasFormatting: false,
+            }],
+        };
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            configuration: {
+                gitCompare: {
+                    pairings: [],
+                    sheetStatuses: ['matched'],
+                    changedColumnNames: [[]],
+                    changedColumns: [[1]],
+                    counts: { addedRows: 0, deletedRows: 0, movedRows: 0, changedCells: 1 },
+                    degraded: false,
+                    moveSearchTruncated: false,
+                },
+            },
+        }));
+
+        // Turn on "Only changed columns"
+        await act(async () => {
+            get_button('Only changed columns').click();
+        });
+        expect((grid_shell_mock.latest_props?.column_projection as { visible_to_source: number[] }).visible_to_source)
+            .toEqual([1]);
+
+        // Open Columns menu and explicitly hide Name (col 0)
+        post_message.mockClear();
+        await act(async () => {
+            get_button('Columns').click();
+        });
+        const items = Array.from(document.querySelectorAll<HTMLInputElement>('.column-visibility-item input'));
+        expect(items[0].getAttribute('aria-label')).toBe('Hide Name');
+        await act(async () => {
+            items[0].click();
+        });
+
+        // Sent setColumnVisibility containing hiddenColumns: [0]
+        const visibility_call = post_message.mock.calls.find((c) => c[0]?.type === 'setColumnVisibility');
+        expect(visibility_call).toBeDefined();
+        expect(visibility_call![0].state.hiddenColumns).toEqual([0]);
+
+        // Turn off "Only changed columns"
+        await act(async () => {
+            get_button('Only changed columns').click();
+        });
+
+        // Name (col 0) remains hidden because user manually hid it; Value (1) and Notes (2) are visible!
+        expect((grid_shell_mock.latest_props?.column_projection as { visible_to_source: number[] }).visible_to_source)
+            .toEqual([1, 2]);
+    });
+
+    it('executes Show all and Hide all as manual visibility modifications without altering auto-filter state', async () => {
+        const { post_message } = await render_app();
+        const meta: WorkbookMeta = {
+            hasFormatting: false,
+            sheets: [{
+                name: 'Sheet1',
+                rowCount: 5,
+                sourceRowCount: 5,
+                columnCount: 3,
+                columnNames: ['Name', 'Value', 'Notes'],
+                merges: [],
+                hasFormatting: false,
+            }],
+        };
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            configuration: {
+                gitCompare: {
+                    pairings: [],
+                    sheetStatuses: ['matched'],
+                    changedColumnNames: [[]],
+                    changedColumns: [[1]],
+                    counts: { addedRows: 0, deletedRows: 0, movedRows: 0, changedCells: 1 },
+                    degraded: false,
+                    moveSearchTruncated: false,
+                },
+            },
+        }));
+
+        // Turn on "Only changed columns"
+        await act(async () => {
+            get_button('Only changed columns').click();
+        });
+        expect(get_button('Only changed columns').getAttribute('aria-pressed')).toBe('true');
+
+        // Open Columns menu and click Hide all
+        post_message.mockClear();
+        await act(async () => {
+            get_button('Columns').click();
+        });
+        const hide_all_btn = Array.from(document.querySelectorAll<HTMLButtonElement>('.column-visibility-action'))
+            .find((b) => b.textContent === 'Hide all')!;
+        await act(async () => {
+            hide_all_btn.click();
+        });
+
+        // Dispatches setColumnVisibility hiding all columns
+        const hide_call = post_message.mock.calls.find((c) => c[0]?.type === 'setColumnVisibility');
+        expect(hide_call).toBeDefined();
+        expect(hide_call![0].state).toEqual(expect.objectContaining({ visibleColumns: [] }));
+
+        // Auto-filter remains ON
+        expect(get_button('Only changed columns').getAttribute('aria-pressed')).toBe('true');
+
+        // Click Show all
+        post_message.mockClear();
+        const show_all_btn = Array.from(document.querySelectorAll<HTMLButtonElement>('.column-visibility-action'))
+            .find((b) => b.textContent === 'Show all')!;
+        await act(async () => {
+            show_all_btn.click();
+        });
+        const show_call = post_message.mock.calls.find((c) => c[0]?.type === 'setColumnVisibility');
+        expect(show_call).toBeDefined();
+        expect(show_call![0].state).toBeUndefined();
+
+        // Auto-filter remains ON and grid displays Value (col 1)
+        expect(get_button('Only changed columns').getAttribute('aria-pressed')).toBe('true');
+        expect((grid_shell_mock.latest_props?.column_projection as { visible_to_source: number[] }).visible_to_source)
+            .toEqual([1]);
+    });
+
+    it('safely handles comparison refresh to unavailable without crashing or hiding all columns', async () => {
+        const { post_message } = await render_app();
+        const meta: WorkbookMeta = {
+            hasFormatting: false,
+            sheets: [{
+                name: 'Sheet1',
+                rowCount: 5,
+                sourceRowCount: 5,
+                columnCount: 3,
+                columnNames: ['Name', 'Value', 'Notes'],
+                merges: [],
+                hasFormatting: false,
+            }],
+        };
+        // Initial compare with valid changed column 1
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            configuration: {
+                gitCompare: {
+                    pairings: [],
+                    sheetStatuses: ['matched'],
+                    changedColumnNames: [[]],
+                    changedColumns: [[1]],
+                    counts: { addedRows: 0, deletedRows: 0, movedRows: 0, changedCells: 1 },
+                    degraded: false,
+                    moveSearchTruncated: false,
+                },
+            },
+        }));
+
+        // User turns on "Only changed columns"
+        await act(async () => {
+            get_button('Only changed columns').click();
+        });
+        expect((grid_shell_mock.latest_props?.column_projection as { visible_to_source: number[] }).visible_to_source)
+            .toEqual([1]);
+
+        // Now refresh snapshot where comparison becomes degraded (e.g. files changed and alignment failed)
+        post_message.mockClear();
+        await dispatch_host_message(refresh_snapshot_message(meta, {
+            configuration: {
+                gitCompare: {
+                    pairings: [],
+                    sheetStatuses: ['matched'],
+                    changedColumnNames: [[]],
+                    changedColumns: [null],
+                    counts: { addedRows: 0, deletedRows: 0, movedRows: 0, changedCells: 0 },
+                    degraded: true,
+                    moveSearchTruncated: false,
+                },
+            },
+        }));
+
+        // 1. Did not crash
+        expect(container?.querySelector('.grid-shell-stub')).not.toBeNull();
+        // 2. Did not hide all columns using empty set; kept original columns
+        expect((grid_shell_mock.latest_props?.column_projection as { visible_to_source: number[] }).visible_to_source)
+            .toEqual([0, 1, 2]);
+        // 3. Did not post setColumnVisibility
+        expect(post_message.mock.calls.some((c) => c[0]?.type === 'setColumnVisibility')).toBe(false);
+
+        // 4. User can click to turn off the filter
+        const toggle_btn = get_button('Only changed columns');
+        expect(toggle_btn.disabled).toBe(false);
+        await act(async () => {
+            toggle_btn.click();
+        });
+        expect(toggle_btn.getAttribute('aria-pressed')).toBe('false');
+    });
 });
 
 describe('cell highlight clear-all wiring', () => {

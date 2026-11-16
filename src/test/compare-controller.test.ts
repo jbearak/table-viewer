@@ -16,6 +16,7 @@ import {
 } from '../viewer-controller';
 import { transform_schema_for_sheet } from '../types';
 import { read_source_raw_columns } from '../data-source/interface';
+import * as compare_session from '../diff-compare/compare-session';
 import { CompareDataSource } from '../diff-compare/compare-session';
 import { with_in_memory_authority_transactions } from '../state-authority';
 import { versioned_state_store } from './helpers/versioned-state-store';
@@ -90,7 +91,7 @@ describe('compare mode controller', () => {
         await panel.__receive({ type: 'ready' });
         await vi.waitFor(() => expect(posted(panel, 'workbookSnapshot').length).toBeGreaterThan(0));
         const snapshot = posted(panel, 'workbookSnapshot')[0].snapshot as {
-            configuration: { gitCompare?: { pairings: unknown[] } };
+            configuration: { gitCompare?: { pairings: unknown[]; changedColumns?: (readonly number[] | undefined)[] } };
             capabilities: { csvEditingSupported: boolean; csvEditable: boolean };
         };
         expect(snapshot.capabilities.csvEditingSupported).toBe(false);
@@ -98,6 +99,28 @@ describe('compare mode controller', () => {
         expect(snapshot.configuration.gitCompare?.pairings).toEqual([
             { status: 'matched', name: 'Sheet1', modifiedIndex: 0, originalIndex: 0 },
         ]);
+        expect(snapshot.configuration.gitCompare?.changedColumns).toEqual([[0]]);
+    });
+
+    it('sends explicit null in changedColumns when comparison is degraded, surviving JSON round-trip', async () => {
+        const orig_align = compare_session.align_workbook;
+        vi.spyOn(compare_session, 'align_workbook').mockImplementation(async (mod, orig, opts) => {
+            return orig_align(mod, orig, { ...opts, maxEditDistance: 0 });
+        });
+
+        const panel = open_compare_table();
+        await panel.__receive({ type: 'ready' });
+        await vi.waitFor(() => expect(posted(panel, 'workbookSnapshot').length).toBeGreaterThan(0));
+
+        const raw_snapshot = posted(panel, 'workbookSnapshot')[0].snapshot as {
+            configuration: { gitCompare?: { degraded: boolean; changedColumns?: (readonly number[] | null)[] } };
+        };
+        expect(raw_snapshot.configuration.gitCompare?.degraded).toBe(true);
+        expect(raw_snapshot.configuration.gitCompare?.changedColumns).toEqual([null]);
+
+        // Verify JSON round-trip contract
+        const round_trip = JSON.parse(JSON.stringify(raw_snapshot));
+        expect(round_trip.configuration.gitCompare?.changedColumns).toEqual([null]);
     });
 
     it('parses each side with its own format', async () => {
@@ -553,6 +576,7 @@ describe('compare mode controller', () => {
         // The rest of the transform is genuinely saved view state and stays.
         expect(stored.hiddenRows).toEqual([1]);
         expect(stored.onlyChangedRows).toBeUndefined();
+        expect((stored as Record<string, unknown>).onlyChangedColumns).toBeUndefined();
     });
 
     it('reports alignment progress before the snapshot exists', async () => {

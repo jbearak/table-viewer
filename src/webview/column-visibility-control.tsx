@@ -27,6 +27,7 @@ export interface ColumnVisibilityControlProps {
     on_show_all: () => void;
     on_hide_all: () => void;
     disabled?: boolean;
+    only_changed_columns_active?: boolean;
 }
 
 const VIEWPORT_MARGIN_PX = 8;
@@ -49,6 +50,7 @@ export const ColumnVisibilityControl = forwardRef<
     on_show_all,
     on_hide_all,
     disabled = false,
+    only_changed_columns_active = false,
 }, focus_ref): React.JSX.Element {
     const [open, set_open] = useState(false);
     const [filter, set_filter] = useState('');
@@ -299,6 +301,11 @@ export const ColumnVisibilityControl = forwardRef<
                             Hide all
                         </button>
                     </div>
+                    {only_changed_columns_active && (
+                        <div className="column-visibility-notice" role="status">
+                            Only changed columns is active. Unchanged columns remain hidden even when selected here.
+                        </div>
+                    )}
                     <div className="column-visibility-list">
                         {rendered_options.map((option) => {
                             const visible = option_is_visible(option.source_index);

@@ -1079,6 +1079,10 @@ export function App(): React.JSX.Element {
     // the git original, read-only. Snapshot-delivered like the capabilities.
     const [git_compare, set_git_compare] =
         useState<WorkbookSnapshotCompare | undefined>(undefined);
+    // Which sheets have "Only changed columns" enabled, keyed by sheet index.
+    // Compare-session state: isolated per worksheet and never persisted durably.
+    const [only_changed_columns_by_sheet, set_only_changed_columns_by_sheet] =
+        useState<Record<number, boolean>>({});
     // A side of this panel is an unfetched Git LFS object. Snapshot-delivered
     // beside `git_compare` because it is the same kind of fact: host-owned
     // state about what this panel is showing, not about the grid's contents.
@@ -4075,6 +4079,9 @@ export function App(): React.JSX.Element {
                     }
                     preview_mode_ref.current = snapshot.configuration.previewMode;
                     set_preview_mode(snapshot.configuration.previewMode);
+                    if (!snapshot.configuration.gitCompare) {
+                        set_only_changed_columns_by_sheet({});
+                    }
                     set_git_compare(snapshot.configuration.gitCompare);
                     // Deliberately NOT the end of a resolve: a snapshot says
                     // what the panel shows, and an unrelated refresh can land
@@ -6954,6 +6961,16 @@ export function App(): React.JSX.Element {
         [handle_transform_change, active_sheet_index],
     );
 
+    const handle_toggle_only_changed_columns = useCallback(
+        (next: boolean) => {
+            set_only_changed_columns_by_sheet((prev) => ({
+                ...prev,
+                [active_sheet_index]: next,
+            }));
+        },
+        [active_sheet_index],
+    );
+
     const open_filter_editor = useCallback((
         column_index: number,
         anchor: { left: number; top: number },
@@ -8340,13 +8357,35 @@ export function App(): React.JSX.Element {
     // Columns that hold typed values or formulas.
     const active_column_values_lost = (active_pending_changes.pendingColumns ?? []).filter((column) =>
         Object.values(column.cells).some((cell) => cell.value !== '')).length;
-    const current_column_projection = useMemo(
+    const only_changed_columns = only_changed_columns_by_sheet[active_sheet_index] ?? false;
+    const raw_sheet_changed_columns = git_compare?.changedColumns?.[active_sheet_index];
+    const sheet_changed_columns = Array.isArray(raw_sheet_changed_columns)
+        ? raw_sheet_changed_columns
+        : undefined;
+    const changed_columns_available = git_compare !== undefined
+        && !git_compare.degraded
+        && Array.isArray(raw_sheet_changed_columns);
+    const has_changed_columns = Array.isArray(raw_sheet_changed_columns)
+        && raw_sheet_changed_columns.length > 0;
+    const effective_only_changed_columns = only_changed_columns && changed_columns_available
+        ? sheet_changed_columns
+        : undefined;
+    const manual_column_projection = useMemo(
         () => create_column_projection(
             current_sheet?.columnCount ?? 0,
             column_visibility[active_sheet_index],
             current_sheet ? transform_schema_for_sheet(current_sheet) : undefined,
         ),
         [current_sheet, column_visibility, active_sheet_index],
+    );
+    const current_column_projection = useMemo(
+        () => create_column_projection(
+            current_sheet?.columnCount ?? 0,
+            column_visibility[active_sheet_index],
+            current_sheet ? transform_schema_for_sheet(current_sheet) : undefined,
+            effective_only_changed_columns,
+        ),
+        [current_sheet, column_visibility, active_sheet_index, effective_only_changed_columns],
     );
     const current_schema = current_sheet
         ? transform_schema_for_sheet(current_sheet)
@@ -9263,6 +9302,9 @@ export function App(): React.JSX.Element {
             compare_changed_column_names={
                 git_compare?.changedColumnNames[active_sheet_index]
             }
+            only_changed_columns={only_changed_columns && changed_columns_available}
+            on_clear_only_changed_columns={() => handle_toggle_only_changed_columns(false)}
+            has_changed_columns={has_changed_columns}
             edit_activation_id={edit_activation_id}
             highlight_in_flight={highlight_request_pending}
             append_in_flight={append_request_pending}
@@ -9353,6 +9395,10 @@ export function App(): React.JSX.Element {
                 }
                 only_changed_rows={visible_transform.onlyChangedRows === true}
                 on_toggle_only_changed_rows={handle_toggle_only_changed_rows}
+                only_changed_columns={only_changed_columns}
+                on_toggle_only_changed_columns={handle_toggle_only_changed_columns}
+                changed_columns_available={changed_columns_available}
+                has_changed_columns={has_changed_columns}
                 filter_pending={transform_pending}
             />
         )
@@ -9426,6 +9472,8 @@ export function App(): React.JSX.Element {
                     );
                 }}
                 on_cancel_transform={handle_cancel_transform}
+                only_changed_columns={only_changed_columns && changed_columns_available}
+                on_clear_only_changed_columns={() => handle_toggle_only_changed_columns(false)}
             />
             {grid}
             {notices.length > 0 && (
@@ -9490,13 +9538,14 @@ export function App(): React.JSX.Element {
                     get_column_name,
                     duplicate_names: duplicate_column_names,
                     is_visible: (source_index) =>
-                        current_column_projection.source_to_visible[source_index] !== undefined,
-                    hidden_count: current_column_projection.hidden_count,
+                        manual_column_projection.source_to_visible[source_index] !== undefined,
+                    hidden_count: manual_column_projection.hidden_count,
                     reset_key: visibility_reset_key,
                     on_toggle: handle_toggle_column,
                     on_show_all: handle_show_all_columns,
                     on_hide_all: handle_hide_all_columns,
                     disabled: current_sheet.columnCount === 0,
+                    only_changed_columns_active: effective_only_changed_columns !== undefined,
                 }}
                 auto_fit_active={auto_fit_active[active_sheet_index] ?? false}
                 on_toggle_auto_fit={handle_toggle_auto_fit}

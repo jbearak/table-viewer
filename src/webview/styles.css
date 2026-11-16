@@ -363,6 +363,14 @@ body {
     line-height: 1.35;
 }
 
+.column-visibility-notice {
+    padding: 6px 10px;
+    color: var(--vscode-descriptionForeground, inherit);
+    border-bottom: 1px solid var(--vscode-panel-border, #444);
+    font-size: var(--tv-font-size-sm);
+    line-height: 1.35;
+}
+
 .highlight-trigger {
     display: inline-flex;
     align-items: center;

@@ -80,6 +80,10 @@ export interface WorkbookSnapshotCompare {
     /** Changed promoted column headers per modified sheet, positionally
      *  matching `meta.sheets`; empty for sheets without header changes. */
     readonly changedColumnNames: readonly (readonly { col: number; base: string }[])[];
+    /** Source columns that have changes per sheet, positionally matching
+     *  `meta.sheets`. `null` when the sheet is degraded or row comparison
+     *  could not determine changed columns. */
+    readonly changedColumns?: readonly (readonly number[] | null)[];
     /**
      * The two sides, for display. Paths rather than names: two files being
      * compared often share a basename (the same report from two quarters), and

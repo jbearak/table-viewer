@@ -346,4 +346,16 @@ describe('ColumnVisibilityControl', () => {
             value: original_height,
         });
     });
+
+    it('shows notice when only_changed_columns is active', () => {
+        const { rerender } = render_control({ only_changed_columns_active: false });
+        act(() => trigger().click());
+        expect(document.querySelector('.column-visibility-notice')).toBeNull();
+
+        rerender({ only_changed_columns_active: true });
+        const notice = document.querySelector('.column-visibility-notice');
+        expect(notice).not.toBeNull();
+        expect(notice?.textContent).toContain('Only changed columns is active');
+        expect(notice?.textContent).toContain('Unchanged columns remain hidden even when selected here');
+    });
 });

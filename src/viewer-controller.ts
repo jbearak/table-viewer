@@ -8258,6 +8258,7 @@ export function attach_viewer(
                 pairings: adopted.pairings,
                 sheetStatuses: adopted.sheetStatuses,
                 changedColumnNames: adopted.changedColumnNames,
+                changedColumns: adopted.changed_columns_all_sheets().map((sheet) => sheet ?? null),
                 ...(compare_original_uri
                     ? {
                         sides: {

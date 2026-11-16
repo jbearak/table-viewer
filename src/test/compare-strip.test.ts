@@ -35,6 +35,9 @@ async function strip(props: Partial<CompareStripProps> = {}): Promise<void> {
 const toggle = (): HTMLButtonElement =>
     container!.querySelector('.compare-strip-toggle') as HTMLButtonElement;
 
+const toggle_columns = (): HTMLButtonElement =>
+    container!.querySelector('.compare-strip-toggle-columns') as HTMLButtonElement;
+
 const text = (): string => container!.textContent ?? '';
 
 describe('CompareStrip', () => {
@@ -233,5 +236,95 @@ describe('CompareStrip', () => {
     it('has no show-changes toggle: the diff is the document', async () => {
         await strip();
         expect(text().toLowerCase()).not.toContain('show changes');
+    });
+
+    describe('Only changed columns toggle', () => {
+        it('renders the Only changed columns button next to Only changed rows', async () => {
+            await strip();
+            const buttons = container!.querySelectorAll('.compare-strip-toggle');
+            expect(buttons).toHaveLength(2);
+            expect(buttons[0].textContent?.trim()).toBe('Only changed rows');
+            expect(buttons[1].textContent?.trim()).toBe('Only changed columns');
+        });
+
+        it('toggles column filter independently with accessible pressed state', async () => {
+            const on_toggle = vi.fn();
+            await strip({
+                only_changed_columns: false,
+                on_toggle_only_changed_columns: on_toggle,
+            });
+            const btn = toggle_columns();
+            expect(btn.getAttribute('aria-pressed')).toBe('false');
+            expect(btn.classList.contains('active')).toBe(false);
+
+            await act(async () => btn.click());
+            expect(on_toggle).toHaveBeenCalledWith(true);
+        });
+
+        it('allows turning off the column filter when it is active', async () => {
+            const on_toggle = vi.fn();
+            await strip({
+                only_changed_columns: true,
+                on_toggle_only_changed_columns: on_toggle,
+            });
+            const btn = toggle_columns();
+            expect(btn.getAttribute('aria-pressed')).toBe('true');
+            expect(btn.classList.contains('active')).toBe(true);
+
+            await act(async () => btn.click());
+            expect(on_toggle).toHaveBeenCalledWith(false);
+        });
+
+        it('disables the column toggle when there are no changed columns, but allows turn-off if active', async () => {
+            // Inactive + no changed columns: disabled
+            await strip({
+                has_changed_columns: false,
+                only_changed_columns: false,
+            });
+            expect(toggle_columns().disabled).toBe(true);
+            expect(toggle_columns().title).toContain('no changed columns');
+
+            // Active + no changed columns: NOT disabled so user can exit
+            const on_toggle = vi.fn();
+            await strip({
+                has_changed_columns: false,
+                only_changed_columns: true,
+                on_toggle_only_changed_columns: on_toggle,
+            });
+            expect(toggle_columns().disabled).toBe(false);
+            await act(async () => toggle_columns().click());
+            expect(on_toggle).toHaveBeenCalledWith(false);
+        });
+
+        it('disables the column toggle when degraded, but allows turn-off if active', async () => {
+            // Degraded + inactive: disabled
+            await strip({
+                degraded: true,
+                only_changed_columns: false,
+            });
+            expect(toggle_columns().disabled).toBe(true);
+            expect(toggle_columns().title).toMatch(/could not be matched up/u);
+
+            // Degraded + active: NOT disabled so user can exit
+            const on_toggle = vi.fn();
+            await strip({
+                degraded: true,
+                only_changed_columns: true,
+                on_toggle_only_changed_columns: on_toggle,
+            });
+            expect(toggle_columns().disabled).toBe(false);
+            await act(async () => toggle_columns().click());
+            expect(on_toggle).toHaveBeenCalledWith(false);
+        });
+
+        it('disables toggles while transform / filter is pending', async () => {
+            await strip({
+                filter_pending: true,
+                only_changed_rows: false,
+                only_changed_columns: false,
+            });
+            expect(toggle().disabled).toBe(true);
+            expect(toggle_columns().disabled).toBe(true);
+        });
     });
 });
