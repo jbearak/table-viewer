@@ -7727,8 +7727,8 @@ export function attach_viewer(
                             ? Promise.resolve()
                             : replay.then(() => undefined, () => undefined))
                             .then(async () => {
-                                // The wait can outlast the panel: a disposed
-                                // one reads and touches nothing.
+                                // The wait can outlast the panel: one closed
+                                // by now reads nothing back.
                                 if (disposed) return;
                                 await refresh_session_state_material();
                             })
