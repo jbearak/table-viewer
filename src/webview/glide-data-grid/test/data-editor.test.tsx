@@ -5030,6 +5030,62 @@ a new line char ""more quotes"" plus a tab  ."	https://google.com`)
         expect(spy).toBeCalledWith({ icon: "headerCode", title: "B", width: 160 }, 200, 1, 200);
     });
 
+    // Fork change: the columns can change while a border is held (a column
+    // insert undone from the keyboard). A held column that is no longer there
+    // still gets its end call, with the column as it was pressed, so the
+    // consumer can close its gesture; nothing reads a column that is gone.
+    test("Resize column whose column is gone while its border is held", async () => {
+        const resize = vi.fn();
+        const resizeEnd = vi.fn();
+        vi.useFakeTimers();
+        const props = { ...basicProps, onColumnResize: resize, onColumnResizeEnd: resizeEnd };
+        const rendered = render(<EventedDataEditor {...props} />, { wrapper: Context });
+        prep();
+        const canvas = screen.getByTestId("data-grid-canvas");
+
+        fireEvent.mouseDown(canvas, { clientX: 310, clientY: 16 }); // Col B right edge
+        fireEvent.mouseMove(canvas, { clientX: 330, clientY: 16, buttons: 1 });
+        expect(resize).toHaveBeenLastCalledWith({ icon: "headerCode", title: "B", width: 160 }, 180, 1, 180);
+
+        rendered.rerender(<EventedDataEditor {...props} columns={basicProps.columns.slice(0, 1)} />);
+        expect(() => {
+            fireEvent.mouseMove(canvas, { clientX: 350, clientY: 16, buttons: 1 });
+            fireEvent.mouseUp(canvas, { clientX: 350, clientY: 16 });
+        }).not.toThrow();
+        expect(resizeEnd).toHaveBeenCalledTimes(1);
+        expect(resizeEnd).toHaveBeenCalledWith({ icon: "headerCode", title: "B", width: 160 }, 200, 1, 200);
+    });
+
+    test("Resize column whose selected neighbours are gone while its border is held", async () => {
+        const resize = vi.fn();
+        const resizeEnd = vi.fn();
+        vi.useFakeTimers();
+        const props = {
+            ...basicProps,
+            gridSelection: {
+                columns: CompactSelection.fromSingleSelection([0, 3]),
+                rows: CompactSelection.empty(),
+                current: undefined,
+            },
+            onColumnResize: resize,
+            onColumnResizeEnd: resizeEnd,
+        };
+        const rendered = render(<EventedDataEditor {...props} />, { wrapper: Context });
+        prep();
+        const canvas = screen.getByTestId("data-grid-canvas");
+
+        fireEvent.mouseDown(canvas, { clientX: 150, clientY: 16 }); // Col A right edge
+        rendered.rerender(<EventedDataEditor {...props} columns={basicProps.columns.slice(0, 1)} />);
+        expect(() => {
+            fireEvent.mouseMove(canvas, { clientX: 170, clientY: 16, buttons: 1 });
+            fireEvent.mouseUp(canvas, { clientX: 170, clientY: 16 });
+        }).not.toThrow();
+        // Only the column still there is named: the move's call, and none
+        // for the selection's other columns, which are gone.
+        expect(resize.mock.calls.map(call => call[2])).toEqual([0]);
+        expect(resizeEnd.mock.calls.map(call => call[2])).toEqual([0]);
+    });
+
     test("Resize Multiple Column", async () => {
         const spy = vi.fn();
         vi.useFakeTimers();

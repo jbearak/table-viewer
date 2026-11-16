@@ -2409,6 +2409,29 @@ describe('GridShell column projection', () => {
             expect(shown_widths()).toEqual([['s:0', 100], ['s:2', 200], ['s:1', 150]]);
         });
 
+        it('commits nothing when the held column is no longer there', async () => {
+            const on_columns_resized = vi.fn();
+            const initial = props({ on_columns_resized, column_projection: all_columns });
+            const GridShell = await render_grid(initial);
+            await act(async () => {
+                callbacks().start({}, 200, 2);
+                callbacks().resize({}, 230, 2);
+            });
+            // The last column goes while its border is held.
+            await act(async () => {
+                root!.render(React.createElement(GridShell, {
+                    ...initial,
+                    column_projection: { visible_to_source: [0, 1], source_to_visible: [0, 1, undefined], hidden_count: 1 },
+                }));
+            });
+            await act(async () => {
+                callbacks().resize({}, 250, 2);
+                callbacks().end({}, 250, 2);
+            });
+            expect(on_columns_resized).not.toHaveBeenCalled();
+            expect(shown_widths()).toEqual([['s:0', 100], ['s:1', 150]]);
+        });
+
         it('still commits a drag when a render in the middle leaves the columns where they were', async () => {
             const on_columns_resized = vi.fn();
             const initial = props({ on_columns_resized, column_projection: all_columns });

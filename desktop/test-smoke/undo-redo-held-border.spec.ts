@@ -265,6 +265,29 @@ for (const moved of [true, false]) {
     });
 }
 
+test('the border of a new last column held while its insert is undone resizes nothing, and nothing breaks', async () => {
+    const page = await open_file('last-column.csv', CSV);
+    const errors: string[] = [];
+    page.on('pageerror', (error) => errors.push(error.message));
+    await choose(await open_column_menu(page, 2), 'Insert column right');
+    await expect_shown(page, { headers: ['Name', 'Age', 'City', 'New column'], undo: 'Undo Insert column' });
+
+    // Hold the new column's right border, and undo the insert with it held.
+    const box = await canvas_box(page);
+    const x = box.x + ROW_MARKER_WIDTH_PX + 4 * COLUMN_WIDTH_PX - 2;
+    const y = box.y + HEADER_HEIGHT_PX / 2;
+    await page.mouse.move(x, y);
+    await page.mouse.down();
+    await page.mouse.move(x + 20, y, { steps: 4 });
+    await history(page, 'undo');
+    await expect_shown(page, { headers: ['Name', 'Age', 'City'], undo: 'Undo', redo: 'Redo Insert column' });
+    await page.mouse.move(x + 50, y, { steps: 4 });
+    await page.mouse.up();
+
+    await expect_no_step_recorded(page, { headers: ['Name', 'Age', 'City'], body: NATURAL });
+    expect(errors).toEqual([]);
+});
+
 test('a row border held while a row insert is undone resizes nothing', async () => {
     const page = await open_file('row-border.csv', CSV);
     await choose(await open_row_menu(page, 1), 'Insert row above');
