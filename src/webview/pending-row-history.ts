@@ -114,10 +114,10 @@ function without_row_heights(changes: PendingStructuralChanges): PendingStructur
 
 /**
  * A whole-slot snapshot as replay compares it: without column widths and row
- * heights (view state) and without the append basis. The basis is the host's record of what
- * it admitted, a high-water count and a schema fingerprint, not something the
- * user changed; the host fills in the value a replay installs, so a recorded
- * one that has since been advanced is not a difference.
+ * heights (view state) and without the append basis. The basis is the host's
+ * record of what it admitted, a high-water count and a schema fingerprint, not
+ * something the user changed; the host fills in the value a replay installs,
+ * so a recorded one that has since been advanced is not a difference.
  */
 function comparable_snapshot(changes: PendingStructuralChanges): PendingStructuralChanges {
     const { appendBasis: _basis, ...rest } = without_row_heights(without_column_widths(changes));

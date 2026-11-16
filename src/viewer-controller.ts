@@ -14063,9 +14063,10 @@ export function attach_viewer(
                         }
                     }
                 } finally {
-                    if (editing_supported) finish_transform_admission(header_admission.operation);
+                    // First, so nothing below can leave the shutdown drain waiting.
                     header_commits.delete(header_commit);
                     finish_header_commit();
+                    if (editing_supported) finish_transform_admission(header_admission.operation);
                 }
                 return;
             }
