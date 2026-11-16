@@ -10166,6 +10166,40 @@ describe('row Insert in the row-gutter menu', () => {
         expect(on_row_resize).toHaveBeenCalledExactlyOnceWith([{ start: 1, end: 3 }], null, { gesture: true });
     });
 
+    it('resets the rows the menu was opened on when an inserted row sits above them', async () => {
+        // Display rows 0 (source 0), 1 (inserted), 2 (source 1), 3 (source 2).
+        // The host knows nothing of the inserted row: to it source row 1 is
+        // display row 1, and that is the row whose height it holds.
+        const on_row_resize = vi.fn();
+        await insert_after_first({ on_row_resize, row_heights: { 1: 60 } });
+
+        // The row under the inserted one is the one with the custom height.
+        const get_row_height = grid_mock.props!.rowHeight as (row: number) => number;
+        expect([0, 2, 3].map(get_row_height)).toEqual([24, 60, 24]);
+        await open_row_menu(3);
+        expect(menu_item('Reset row height')).toBeUndefined();
+        await act(async () => { document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' })); });
+
+        await open_row_menu(2);
+        await act(async () => menu_item('Reset row height')!.click());
+
+        expect(on_row_resize).toHaveBeenCalledExactlyOnceWith([{ start: 1, end: 1 }], null, { gesture: true });
+    });
+
+    it('resets every saved row of a selection that spans an inserted row, and leaves the inserted row alone', async () => {
+        const on_row_resize = vi.fn();
+        const { pending } = await insert_after_first({ on_row_resize, row_heights: { 0: 50, 1: 60 } });
+        const on_selection_change = grid_mock.props!.onGridSelectionChange as (selection: unknown) => void;
+        await act(async () => on_selection_change({ columns: compact([]), rows: compact([0, 1, 2]) }));
+
+        await open_row_menu(2);
+        await act(async () => menu_item('Reset 2 row heights')!.click());
+
+        // Source rows 0 and 1 are the host's display rows 0 and 1.
+        expect(on_row_resize).toHaveBeenCalledExactlyOnceWith([{ start: 0, end: 1 }], null, { gesture: true });
+        expect(pending.snapshot().appendedRows[0]?.viewerRowHeight).toBeUndefined();
+    });
+
     it('does not post a reset that is not admitted', async () => {
         const on_row_resize = vi.fn();
         await render_grid(structure_props({

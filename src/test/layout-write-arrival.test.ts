@@ -39,14 +39,6 @@ function deferred() {
     return { promise, resolve };
 }
 
-async function settle(panel: Panel): Promise<void> {
-    for (let idle = 0; idle < 5;) {
-        const seen = panel.__messages.length;
-        await new Promise((done) => { setImmediate(done); });
-        idle = panel.__messages.length === seen ? idle + 1 : 0;
-    }
-}
-
 function open_csv(store: AuthorityStore): Panel {
     const panel = vscode_mock.window.createWebviewPanel('tableViewer.editor', 'table');
     const controller = attach_viewer(
@@ -62,6 +54,15 @@ function open_csv(store: AuthorityStore): Panel {
 
 const latest_snapshot = (panel: Panel): WorkbookSnapshot =>
     messages_of(panel, 'workbookSnapshot').at(-1)!.snapshot;
+
+/** Bring the panel up and acknowledge its snapshot: a layout change is refused until then. */
+async function ready_and_acknowledged(panel: Panel): Promise<WorkbookSnapshot> {
+    await panel.__receive({ type: 'ready' });
+    await vi.waitFor(() => expect(messages_of(panel, 'workbookSnapshot').length).toBeGreaterThan(0));
+    const snapshot = latest_snapshot(panel);
+    await panel.__receive({ type: 'snapshotApplied', identity: snapshot.identity, disposition: 'applied' });
+    return snapshot;
+}
 
 const snapshots_since = (panel: Panel, from: number): WorkbookSnapshot[] =>
     messages_of({ __messages: panel.__messages.slice(from) }, 'workbookSnapshot')
@@ -109,9 +110,7 @@ function holding_store(
 async function open_with_held_layout_write(initial: PerFileState = {}, after_commit?: AfterCommit) {
     const held = holding_store(initial, (next) => next.scrollPosition?.[0]?.top === 50, after_commit);
     const panel = open_csv(held.store);
-    await panel.__receive({ type: 'ready' });
-    await settle(panel);
-    const ready = latest_snapshot(panel);
+    const ready = await ready_and_acknowledged(panel);
     const layout = (state: PerFileState) => ({
         type: 'stateChanged',
         sourceGeneration: ready.sourceGeneration,
@@ -148,15 +147,17 @@ async function expect_waiting_change_survives(
     expect(latest_snapshot(panel).state.showFormatting).not.toEqual([false]);
 
     release();
+    // Both handlers have run to their end once these resolve.
     await Promise.all([first, second]);
-    await settle(panel);
 
     const durable = versioned.get_state(file_path) as PerFileState;
     expect(durable.scrollPosition).toEqual([{ top: 77, left: 0 }]);
     expect(durable.showFormatting).toEqual([false]);
-    expect(snapshots_since(panel, from).length).toBeGreaterThan(intervening);
-    expect(latest_snapshot(panel).state.scrollPosition).toEqual([{ top: 77, left: 0 }]);
-    expect(latest_snapshot(panel).state.showFormatting).toEqual([false]);
+    await vi.waitFor(() => {
+        expect(snapshots_since(panel, from).length).toBeGreaterThan(intervening);
+        expect(latest_snapshot(panel).state.scrollPosition).toEqual([{ top: 77, left: 0 }]);
+        expect(latest_snapshot(panel).state.showFormatting).toEqual([false]);
+    });
 }
 
 beforeEach(() => {
@@ -297,18 +298,16 @@ describe('what a queued layout change is a difference from', () => {
 
         release();
         await Promise.all([first, a, b]);
-        await settle(panel);
 
         expect((versioned.get_state(file_path) as PerFileState).scrollPosition).toEqual([{ top: 0, left: 0 }]);
-        expect(latest_snapshot(panel).state.scrollPosition).toEqual([{ top: 0, left: 0 }]);
+        await vi.waitFor(() => expect(latest_snapshot(panel).state.scrollPosition)
+            .toEqual([{ top: 0, left: 0 }]));
     });
 
     it('does not write again what an earlier change of the same snapshot already stored', async () => {
         const versioned = versioned_state_store();
         const panel = open_csv(with_in_memory_authority_transactions(versioned.store));
-        await panel.__receive({ type: 'ready' });
-        await settle(panel);
-        const ready = latest_snapshot(panel);
+        const ready = await ready_and_acknowledged(panel);
         const layout = (state: PerFileState) => panel.__receive({
             type: 'stateChanged',
             sourceGeneration: ready.sourceGeneration,
@@ -354,9 +353,7 @@ describe('what a queued layout change is a difference from', () => {
                 return queued.compare_and_set(path, expected, next, validate, basis);
             },
         });
-        await panel.__receive({ type: 'ready' });
-        await settle(panel);
-        const ready = latest_snapshot(panel);
+        const ready = await ready_and_acknowledged(panel);
         const layout = (state: PerFileState) => panel.__receive({
             type: 'stateChanged',
             sourceGeneration: ready.sourceGeneration,
@@ -369,7 +366,6 @@ describe('what a queued layout change is a difference from', () => {
         const b = layout({ showFormatting: [false], scrollPosition: [{ top: 9, left: 0 }] });
         fail.resolve();
         await Promise.all([a, b]);
-        await settle(panel);
 
         const durable = versioned.get_state(file_path) as PerFileState;
         expect(durable.showFormatting).toEqual([false]);
@@ -391,8 +387,8 @@ describe('what a queued layout change is a difference from', () => {
             .not.toBe(ready.sourceGeneration));
 
         release();
+        // Both handlers have run to their end: nothing is still to be written.
         await Promise.all([first, waiting]);
-        await settle(panel);
 
         const durable = versioned.get_state(file_path) as PerFileState;
         expect(durable.scrollPosition).toEqual([{ top: 50, left: 0 }]);

@@ -14848,9 +14848,11 @@ export function attach_viewer(
              *
              * A request that carries an id is answered on every exit, a throw included:
              * the window holds its other gestures until the answer, and records the
-             * resize in undo history from it. `applied` is decided by the write alone. The display→source mapping and
-             * the generation pair guarding it are `hideRows`'s, because the request names
-             * rows in a coordinate space only one specific permutation defines.
+             * resize in undo history from it. `applied` is decided by the write alone.
+             *
+             * The display→source mapping and the generation pair guarding it are
+             * `hideRows`'s, because the request names rows in a coordinate space only
+             * one specific permutation defines.
              *
              * Currency is the generation pair *plus the authority half* of
              * `layout_write_is_current`, and deliberately not that predicate whole. The
@@ -14884,13 +14886,12 @@ export function attach_viewer(
              * one tail keeps them from trading CAS retries with each other.
              *
              * A stale generation shows no warning, and that is a decision (an answered
-             * request is told `applied: false`). There is deliberately no deferred replay
-             * — replaying a resize
-             * against a moved view resizes whatever rows now sit at those display
-             * positions. Nor is a message needed: the delivery that moved the generation
-             * is what makes the webview's generation differ from the one it posted, so the
-             * optimistic overlay tagged with that generation is discarded and the row
-             * visibly springs back. The user's next drag is the retry. "Stale" is scoped to
+             * request is told `applied: false`). There is deliberately no deferred
+             * replay: replaying a resize against a moved view resizes whatever rows now
+             * sit at those display positions. Nor is a message needed: the delivery that
+             * moved the generation is what makes the webview's generation differ from the
+             * one it posted, so the optimistic overlay tagged with that generation is
+             * discarded and the row visibly springs back. The user's next drag is the retry. "Stale" is scoped to
              * the sheet the request names, not to the core-wide generation — see
              * `mapping_generation` in the predicate below — and the webview's overlay
              * lifecycle is scoped the same way, so the two halves agree about which

@@ -740,9 +740,10 @@ describe('a failed download explained while a layout change waits', () => {
             identity: unknown;
             state: PerFileState;
         };
-        // The delivery is acknowledged by a microtask; let it land.
-        await new Promise((done) => { setImmediate(done); });
+        // Acknowledged here, not left to the mock panel's own turn: a layout
+        // change is refused until the snapshot it names is acknowledged.
         const ready = latest();
+        await panel.__receive({ type: 'snapshotApplied', identity: ready.identity, disposition: 'applied' });
         const layout = (state: PerFileState) => panel.__receive({
             type: 'stateChanged',
             sourceGeneration: ready.sourceGeneration,

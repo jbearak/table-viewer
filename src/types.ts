@@ -3582,7 +3582,6 @@ export type HostMessage =
      * built by diffing would revert that other window's highlight.
      */
     | { type: 'cellHighlightsChanged'; sheetIndex?: number; requestId?: string; stateRevision: number; physicalRevision: number; state: CellHighlightState | undefined; deltas?: readonly HighlightCellDelta[]; sourceGeneration: number; error?: string }
-    /** Correlated only for a mixed source/pending resize that must commit atomically. */
     /**
      * The answer to a `setRowHeights` or `setSourceRowHeights` that carried a
      * request id. `applied` says the durable state holds what was asked,

@@ -2626,8 +2626,7 @@ export function GridShell({
     }, [history_capture]);
     const apply_row_resize = useCallback((
         intervals: readonly DisplayRowInterval[],
-        /** `null` resets the saved rows; Pending Rows keep their height. */
-        height: number | null,
+        height: number,
         source: 'gesture' | 'auto-grow',
     ) => {
         // A gesture asks App, which folds the open editor first, before
@@ -2672,7 +2671,7 @@ export function GridShell({
         const source_intervals = projection.source_display_intervals(
             compressed_source_intervals,
         );
-        if (pending_ids.size === 0 || height === null) {
+        if (pending_ids.size === 0) {
             if (source_intervals.length > 0) on_row_resize(source_intervals, height, { gesture });
             return;
         }
@@ -12531,11 +12530,15 @@ export function GridShell({
                                         (count, interval) => count + interval.end - interval.start + 1,
                                         0,
                                     ),
-                                    on_reset_row_heights: () => apply_row_resize(
-                                        row_menu.source_display_rows,
-                                        null,
-                                        'gesture',
-                                    ),
+                                    // The menu's rows are the host's display
+                                    // rows already, as Hide rows posts them.
+                                    on_reset_row_heights: () => {
+                                        if (
+                                            size_gesture_may_start !== undefined
+                                            && !size_gesture_may_start()
+                                        ) return;
+                                        on_row_resize(row_menu.source_display_rows, null, { gesture: true });
+                                    },
                                 }
                                 : {}),
                             ...(only_pending ? {

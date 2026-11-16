@@ -122,9 +122,11 @@ function posts_since(panel: { __messages: unknown[] }, from: number): string[] {
 async function ready(panel: Panel): Promise<WorkbookSnapshot> {
     await panel.__receive({ type: 'ready' });
     await vi.waitFor(() => expect(messages_of(panel, 'workbookSnapshot').length).toBeGreaterThan(0));
-    // The delivery is acknowledged by a microtask; let it land.
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    return messages_of(panel, 'workbookSnapshot').at(-1)!.snapshot;
+    // Acknowledged here, not left to the mock panel's own turn: a
+    // `stateChanged` is refused until the snapshot it names is acknowledged.
+    const snapshot = messages_of(panel, 'workbookSnapshot').at(-1)!.snapshot;
+    await panel.__receive({ type: 'snapshotApplied', identity: snapshot.identity, disposition: 'applied' });
+    return snapshot;
 }
 
 const latest_snapshot = (panel: Panel) => messages_of(panel, 'workbookSnapshot').at(-1)!.snapshot;

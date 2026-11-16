@@ -3192,20 +3192,22 @@ function own_view_history_delta(
         shown: numbers(transition.shown),
     });
     const worksheet = owner.own_worksheet_target(delta.worksheet);
-    // A size holds `null` for "no stored width" and "no custom height", which
-    // `Number(…)` would turn into 0: its own copy, charged at the same rate.
-    let sizes_copied = 0;
+    // A size step's numbers, each charged as it is copied, at the same rate
+    // as the lists above. A size holds `null` for "no stored width" and "no
+    // custom height", which `Number(…)` would turn into 0.
+    let size_numbers_copied = 0;
     const size = (value: number | null): number | null => {
-        if (sizes_copied % VIEW_NUMBERS_PER_RUN === 0) owner.charge_run();
-        sizes_copied += 1;
+        if (size_numbers_copied % VIEW_NUMBERS_PER_RUN === 0) owner.charge_run();
+        size_numbers_copied += 1;
         return value === null ? null : Number(value);
     };
+    const index = (value: number): number => size(value) ?? 0;
     if (delta.slice === 'columnWidths') {
         return Object.freeze({
             worksheet,
             slice: 'columnWidths',
             columns: Object.freeze(delta.columns.map((entry) => Object.freeze({
-                column: Number(entry.column),
+                column: index(entry.column),
                 before: size(entry.before),
                 after: size(entry.after),
             }))),
@@ -3218,10 +3220,10 @@ function own_view_history_delta(
         return Object.freeze({
             worksheet,
             slice: 'rowHeights',
-            after: delta.after === null ? null : Number(delta.after),
+            after: size(delta.after),
             before: Object.freeze(delta.before.map((run) => Object.freeze({
-                start: Number(run.start),
-                end: Number(run.end),
+                start: index(run.start),
+                end: index(run.end),
                 height: size(run.height),
             }))),
         });
