@@ -80,12 +80,11 @@ export type HistoryPressGate =
 /**
  * The first thing a press is asked, whatever is on top of the stack.
  *
- * The order is the order of the answers a person would want: a window that
+ * The order is the order of the answers a person would want. A window that
  * must be reopened, or a fence that needs a reload, is said, because nothing
- * will clear it; a header change and a
- * replay come before the gestures, so the wait names the older work; a save is
- * last, so a press behind a save that is itself behind a sort waits for the
- * sort by name.
+ * will clear it. A header change and a replay come before the gestures, so the
+ * wait names the older work. A save is last, so a press behind a save that is
+ * itself behind a sort waits for the sort by name.
  */
 export function history_press_gate(facts: HistoryPressFacts): HistoryPressGate {
     if (facts.reopen_required) return { kind: 'reopen-required' };

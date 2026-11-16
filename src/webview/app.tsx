@@ -3139,14 +3139,15 @@ export function App(): React.JSX.Element {
     // left to wait for; only a reload lowers it.
     const header_reload_required_ref = useRef(false);
     const lower_header_fence_ref = useRef<() => void>(() => {});
+    /** Why Save does nothing while the header fence is up. */
+    const header_save_wait_message = () => (
+        header_reload_required_ref.current
+            ? 'Reload this window to finish the header row change, then save.'
+            : 'Wait for the header row change to finish, then save.'
+    );
     /** Say why Save does nothing while the header fence is up. */
     const warn_save_waits_for_header = useCallback(() => {
-        host_bridge.postMessage({
-            type: 'showWarning',
-            message: header_reload_required_ref.current
-                ? 'Reload this window to finish the header row change, then save.'
-                : 'Wait for the header row change to finish, then save.',
-        });
+        host_bridge.postMessage({ type: 'showWarning', message: header_save_wait_message() });
     }, []);
     // The edit warning last shown for this fence, so a burst of keys says it
     // once; cleared when the fence drops.
@@ -3175,11 +3176,14 @@ export function App(): React.JSX.Element {
         if (refused_for_reopen()) return;
         warn_edit_waits_for_header();
     }, [refused_for_reopen, warn_edit_waits_for_header]);
-    /** Say why Cmd/Ctrl+S saves nothing while edits are paused; starts nothing. */
+    /**
+     * Say why Cmd/Ctrl+S saves nothing while edits are paused; starts nothing.
+     * Once for a held key, by `say_history`'s repeat rule.
+     */
     const warn_save_paused = useCallback(() => {
         if (reopen_required_ref.current) say_history(REOPEN_REQUIRED_SAVE_MESSAGE);
-        else if (header_fence_ref.current) warn_save_waits_for_header();
-    }, [say_history, warn_save_waits_for_header]);
+        else if (header_fence_ref.current) say_history(header_save_wait_message());
+    }, [say_history]);
     const [header_fence, set_header_fence] = useState(false);
     // The header queue's verdict on a header result; see `drain_excel_header_queue`.
     const header_result_handler_ref = useRef<

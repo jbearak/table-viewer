@@ -3457,14 +3457,16 @@ describe('Excel first-row header toggle', () => {
         await click_button('Header Row');
         expect(header_requests(post_message)).toHaveLength(1);
         expect(grid_shell_mock.latest_props?.edit_session_id).toBeUndefined();
+        const wait = { type: 'showWarning', message: 'Wait for the header row change to finish, then save.' };
         for (const save of ['on_save_paused', 'on_save_request'] as const) {
             post_message.mockClear();
             act(() => { (grid_shell_mock.latest_props?.[save] as () => unknown)(); });
-            expect(post_message, save).toHaveBeenCalledWith({
-                type: 'showWarning',
-                message: 'Wait for the header row change to finish, then save.',
-            });
+            expect(post_message, save).toHaveBeenCalledWith(wait);
         }
+        // A held Cmd+S repeats the key: said once.
+        post_message.mockClear();
+        act(() => { (grid_shell_mock.latest_props?.on_save_paused as () => unknown)(); });
+        expect(post_message).not.toHaveBeenCalledWith(wait);
     });
 
     it('lifts the fence on a refusal, so editing goes on', async () => {
