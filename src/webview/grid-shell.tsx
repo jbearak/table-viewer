@@ -3367,12 +3367,26 @@ export function GridShell({
             compare_changed_column_names,
         ],
     );
+    // Whether App alone keeps the cells from taking an edit, for callbacks that
+    // outlive their render (an open dialog's), so a commit refused for it says
+    // why rather than nothing. Set from the committed tree, below.
+    const edits_held_by_pause_ref = useRef(false);
+    const on_edit_paused_gesture_ref = useRef(on_edit_paused_gesture);
+    const say_edits_paused = useCallback((): void => {
+        if (edits_held_by_pause_ref.current) on_edit_paused_gesture_ref.current?.();
+    }, []);
     const [rename_column, set_rename_column] = useState<{
         sourceColumn: number;
         initial: string;
     } | null>(null);
     const apply_column_rename = useCallback((value: string): boolean => {
         if (!rename_column) return false;
+        // Opened before App paused edits: refused, as App's admission would
+        // refuse it, and told why.
+        if (edits_held_by_pause_ref.current) {
+            say_edits_paused();
+            return false;
+        }
         const source_column = rename_column.sourceColumn;
         return commit_edits([{
             source_row: header_source_row,
@@ -3386,7 +3400,7 @@ export function GridShell({
                 italic: false,
             },
         }], 'Rename column');
-    }, [commit_edits, header_source_row, rename_column, sheet_meta]);
+    }, [commit_edits, header_source_row, rename_column, say_edits_paused, sheet_meta]);
     useEffect(() => {
         if (!host_observed_bases) return;
         store.observe_file_bases(
@@ -3607,6 +3621,11 @@ export function GridShell({
         on_edit_session_idle,
         on_request_edit_session,
     ]);
+    // Declared above, with the dialogs that read them.
+    useLayoutEffect(() => {
+        edits_held_by_pause_ref.current = edits_held_by_pause;
+        on_edit_paused_gesture_ref.current = on_edit_paused_gesture;
+    }, [edits_held_by_pause, on_edit_paused_gesture]);
     /**
      * Settled by the commit that renders App's answer to a row admission,
      * with whether the grid takes edits again. The admission resolves before
@@ -6662,7 +6681,13 @@ export function GridShell({
     }, [column_display_name, column_layout, projected_columns, sheet_meta.columnCount]);
     const apply_pending_column_rename = useCallback((value: string): boolean => {
         const target = rename_pending_column;
-        if (target === null || !structure_gesture_admitted()) return false;
+        if (target === null) return false;
+        // Opened before App paused edits: told why.
+        if (edits_held_by_pause_ref.current) {
+            say_edits_paused();
+            return false;
+        }
+        if (!structure_gesture_admitted()) return false;
         const before = pending_store.snapshot();
         const plan = plan_pending_column_update(
             before,
@@ -6686,6 +6711,7 @@ export function GridShell({
         history_capture,
         pending_store,
         rename_pending_column,
+        say_edits_paused,
         show_pending_size_warning,
         structure_context.worksheet,
         structure_gesture_admitted,

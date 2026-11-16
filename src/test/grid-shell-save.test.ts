@@ -2754,7 +2754,7 @@ describe('GridShell editing with no session held yet', () => {
     });
 });
 
-describe('GridShell when App pauses edits under an open editor', () => {
+describe('GridShell when App pauses edits, or its publications are fenced', () => {
     it('closes the editor without committing what it holds', async () => {
         // App pauses edits at once when it says the view no longer matches
         // the file: an editor open then would otherwise commit into a store
@@ -2781,6 +2781,22 @@ describe('GridShell when App pauses edits under an open editor', () => {
         expect(grid_mock.dismiss_overlay).toHaveBeenCalled();
         expect([...store.snapshot()]).toEqual([]);
         clip.remove();
+    });
+
+    it('publishes no store change while the publication fence is up', async () => {
+        const { post_message } = await render_grid();
+        const { publication_fence } = await import('../webview/host-bridge');
+        publication_fence.raise();
+        try {
+            await edit_cell('held back');
+            expect(pending_edit_messages(post_message)).toEqual([]);
+        } finally {
+            publication_fence.lower();
+        }
+        await edit_cell('sent');
+        expect(pending_edit_messages(post_message)).toEqual([
+            { edits: { '0:0': { value: 'sent', base: 'base', formattingKnown: true } } },
+        ]);
     });
 
     it('hands Cmd+S to App, which says why nothing is saved', async () => {

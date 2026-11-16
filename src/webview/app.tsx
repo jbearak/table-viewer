@@ -1353,6 +1353,8 @@ export function App(): React.JSX.Element {
     const [reopen_required, set_reopen_required] = useState(false);
     // Declared with the header queue's drain, further down.
     const wake_header_drain_ref = useRef<() => void>(() => {});
+    // `refused_for_reopen`, for the callbacks declared before it.
+    const refused_for_reopen_ref = useRef<() => boolean>(() => false);
     // The dirty maps, one per worksheet, owned here so they survive the
     // generation-keyed GridShell remounts that a transform or refresh snapshot
     // forces.
@@ -1686,12 +1688,8 @@ export function App(): React.JSX.Element {
         const sheet = meta_ref.current?.sheets[sheet_index];
         const session_id = csv_edit_session_id_ref.current;
         if (sheet === undefined || session_id === undefined) return;
-        // A window that must be reopened changes no store (declared before
-        // `refused_for_reopen`, so it says so itself).
-        if (reopen_required_ref.current) {
-            host_bridge.postMessage({ type: 'showWarning', message: REOPEN_REQUIRED_MESSAGE });
-            return;
-        }
+        // A window that must be reopened changes no store.
+        if (refused_for_reopen_ref.current()) return;
         // Admitted like every other edit gesture: not across a save, a
         // replay, an outstanding highlight, resize, or append.
         if (save_in_flight_ref.current || !edit_gestures_admitted()) return;
@@ -1733,10 +1731,7 @@ export function App(): React.JSX.Element {
         const sheet = meta_ref.current?.sheets[sheet_index];
         const session_id = csv_edit_session_id_ref.current;
         if (sheet === undefined || session_id === undefined) return;
-        if (reopen_required_ref.current) {
-            host_bridge.postMessage({ type: 'showWarning', message: REOPEN_REQUIRED_MESSAGE });
-            return;
-        }
+        if (refused_for_reopen_ref.current()) return;
         if (save_in_flight_ref.current || !edit_gestures_admitted()) return;
         const store = edit_session_registry_ref.current!.pending_rows_for_sheet(sheet_index);
         const before = store.snapshot();
@@ -1905,6 +1900,7 @@ export function App(): React.JSX.Element {
         say_history(REOPEN_REQUIRED_MESSAGE);
         return true;
     }, [say_history]);
+    refused_for_reopen_ref.current = refused_for_reopen;
 
     /**
      * This window has said it no longer matches its file. From here it sends
@@ -4057,25 +4053,28 @@ export function App(): React.JSX.Element {
     }, [clear_save_verdict, csv_edit_session_id, fence_edit_session_exit, refused_for_reopen]);
 
     const begin_save_operation = useCallback((): CsvSaveOperation | undefined => {
-        // A conflict notice's dismissal is occurrence-scoped: Save is the
-        // user's explicit request to see whether the condition still blocks
-        // persistence. Dismissed formula warnings stay dismissed.
-        set_dismissed_notices((current) => [...current].some(is_conflict_dismissal)
-            ? new Set([...current].filter((key) => !is_conflict_dismissal(key)))
-            : current);
-        if (!csv_edit_session_id || save_projection_ref.current.operation) return undefined;
+        // Both refusals come before anything a Save starts (the notices
+        // below): nothing is asked of the file.
         // A window that no longer matches its file would save its own stores,
-        // which disagree with it, over the file.
+        // which disagree with it, over the file. Said with a session or
+        // without one.
         if (reopen_required_ref.current) {
             host_bridge.postMessage({ type: 'showWarning', message: REOPEN_REQUIRED_SAVE_MESSAGE });
             return undefined;
         }
+        if (!csv_edit_session_id || save_projection_ref.current.operation) return undefined;
         // A Header Row change carries the session's Pending Changes to the new
         // header in its own durable write; Save waits until it has landed.
         if (header_fence_ref.current) {
             warn_save_waits_for_header();
             return undefined;
         }
+        // A conflict notice's dismissal is occurrence-scoped: Save is the
+        // user's explicit request to see whether the condition still blocks
+        // persistence. Dismissed formula warnings stay dismissed.
+        set_dismissed_notices((current) => [...current].some(is_conflict_dismissal)
+            ? new Set([...current].filter((key) => !is_conflict_dismissal(key)))
+            : current);
         // And for a view change still being written. A size or column write
         // posted just before Save could be answered after a structural save
         // has renumbered rows and columns and cut history off, and its step
@@ -7638,10 +7637,10 @@ export function App(): React.JSX.Element {
             // about the document.
             // A press waiting behind it was for a stack this view no longer
             // agrees with the file about: dropped with the message.
+            raise_reopen_fence();
             refuse_history_press(
                 `The change was ${replayed_verb(accepted.direction)} in the file, but this view could not be updated. Reopen the file to resynchronize.`,
             );
-            raise_reopen_fence();
             return;
         }
         const display_focus = committed.displayFocus;
@@ -9001,7 +9000,8 @@ export function App(): React.JSX.Element {
                 }
                 return;
             }
-            // Clear (or a fence that needs a reload, which the attempt says):
+            // Clear (or a fence that needs a reload, or a window that must be
+            // reopened, which the attempt says):
             // a press made at this instant, which peeks the stack as it is.
             held_press_ref.current = null;
             arm_history_press_timer();

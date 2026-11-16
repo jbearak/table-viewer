@@ -3268,6 +3268,9 @@ describe('Excel first-row header toggle', () => {
         });
         await acquire_editing_session(post_message);
         seed_mounted_store();
+        // Published, and dropped by the host: never acknowledged.
+        await dispatch_host_message({ type: 'requestPendingChangesFlush', requestId: 'before-undo' });
+        await vi.waitUntil(() => post_message.mock.calls.some(([message]) => message?.type === 'pendingChangesFlush'));
         await dispatch_host_message({ type: 'editCommand', command: 'undo' });
         const sent = <T extends WebviewMessage['type']>(type: T) => post_message.mock.calls
             .map(([message]) => message as WebviewMessage)
@@ -3313,6 +3316,38 @@ describe('Excel first-row header toggle', () => {
             .filter((message): message is Extract<WebviewMessage, { type: 'showWarning' }> => message.type === 'showWarning')
             .map((message) => message.message);
         expect(said).toContain('This view no longer matches the file. Reopen the file to keep editing.');
+
+        // A Header Row gesture made now is refused outright, and says so.
+        const clock = vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 2_001);
+        try {
+            post_message.mockClear();
+            await click_button('Header Row');
+            expect(header_requests(post_message)).toEqual([]);
+            expect(post_message).toHaveBeenCalledWith({
+                type: 'showWarning',
+                message: 'This view no longer matches the file. Reopen the file to keep editing.',
+            });
+        } finally {
+            clock.mockRestore();
+        }
+
+        // Reopened: the publication the host dropped before the fence is
+        // forgotten with the store it was of, so a Header Row change does not
+        // wait on its acknowledgement.
+        await dispatch_host_message(initial_snapshot_message(excel_meta(true), {
+            capabilities: { ...EDITABLE, csvEditSessionId: 'test-edit-session' },
+        }));
+        const { pending_changes_durability } = await import('../webview/host-bridge');
+        expect(pending_changes_durability.has_unacknowledged('test-edit-session')).toBe(false);
+        post_message.mockClear();
+        await click_button('Header Row');
+        // It publishes the new stores first and waits for that alone.
+        await dispatch_host_message({
+            type: 'pendingEditsAcknowledged',
+            editSessionId: 'test-edit-session',
+            sequence: last_publication_sequence(post_message),
+        });
+        expect(header_requests(post_message)).toHaveLength(1);
     });
 
     it('holds undo while a header change holds the fence, and says so only if it does not end', async () => {
@@ -20325,6 +20360,101 @@ describe('undo and redo, from the keyboard and the desktop menu', () => {
         post_message.mockClear();
         await release_idle_edit_session();
         expect(sent(post_message, 'releaseEditSession')).toBeDefined();
+        // The session gone, Cmd+S (which the grid hands to App while edits are
+        // paused) still says why nothing is saved.
+        await dispatch_host_message(refresh_snapshot_message(make_meta(['Sheet1', 'Sheet2']), {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        expect(grid_shell_mock.latest_props!.edit_session_id).toBeUndefined();
+        post_message.mockClear();
+        act(() => { (grid_shell_mock.latest_props!.on_save_request as () => unknown)(); });
+        expect(sent(post_message, 'showWarning')?.message)
+            .toBe('This view no longer matches the file. Reopen the file, then save.');
+    });
+
+    it('says why for each change it refuses after it could not follow, and keeps a dirty session', async () => {
+        const REOPEN = 'This view no longer matches the file. Reopen the file to keep editing.';
+        const { post_message } = await render_app();
+        await record_highlight(post_message, {
+            snapshot_extra: { capabilities: { csvEditable: true, csvEditingSupported: true } },
+        });
+        await acquire_editing_session(post_message);
+        seed_mounted_store();
+        await undo_via_menu();
+        const prepare = sent(post_message, 'prepareHistoryReplay');
+        await dispatch_host_message({
+            type: 'historyReplayPrepared',
+            prepared: {
+                requestId: prepare.request.requestId,
+                replayId: prepare.request.replayId,
+                leaseId: 'lease-1',
+                focusSheetIndex: 0,
+                focus: prepare.request.focus,
+                cells: [],
+            },
+        });
+        const commit = sent(post_message, 'commitHistoryReplay');
+        const store = grid_shell_mock.latest_props!.edit_session as EditSessionStore;
+        store.install({ session_id: 'moved-on' });
+        await dispatch_host_message({
+            type: 'historyReplayCommitted',
+            committed: {
+                requestId: commit.request.requestId,
+                replayId: commit.request.replayId,
+                leaseId: commit.request.leaseId,
+                mutationId: commit.request.mutationId,
+                sourceGeneration: 1,
+                cells: [{ ordinal: 0, resolvedSheetIndex: 0, key: '3:2', entry: null }],
+                focusSheetIndex: 0,
+                focus: prepare.request.focus,
+                displayFocus: null,
+            },
+        });
+        expect(sent(post_message, 'showWarning').message).toContain('could not be updated');
+        // The session's store holds unsaved edits again.
+        act(() => { store.install({ session_id: 'test-edit-session' }, { '0:0': { value: 'dirty', base: 'base' } }); });
+
+        // Each gesture past the repeat window of the one before, so each must
+        // say it for itself.
+        let now = Date.now();
+        const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+        const props = () => grid_shell_mock.latest_props as unknown as GridShellProps;
+        const warnings = () => post_message.mock.calls
+            .map(([message]) => message as WebviewMessage)
+            .filter((message): message is Extract<WebviewMessage, { type: 'showWarning' }> => message.type === 'showWarning')
+            .map((message) => message.message);
+        const refused: [string, () => Promise<unknown>, WebviewMessage['type'][]][] = [
+            ['Undo', () => undo_via_menu(), ['prepareHistoryReplay']],
+            ['Redo', () => dispatch_host_message({ type: 'editCommand', command: 'redo' }), ['prepareHistoryReplay']],
+            ['an edit', () => act(async () => { props().on_edit_paused_gesture?.(); }), []],
+            ['Discard', () => click_button('Discard'), ['discardEditSession']],
+            ['a sort', () => act(async () => {
+                props().on_transform_change?.({ sort: [{ colIndex: 0, direction: 'asc' }], filters: [] });
+            }), ['setTransform']],
+            ['a row resize', () => act(async () => { expect(props().size_gesture_may_start?.()).toBe(false); }), []],
+            ['Clear all highlights', async () => {
+                await click_button('Highlight');
+                await click_button('Clear all highlights');
+            }, ['clearAllCellHighlights']],
+        ];
+        try {
+            for (const [name, gesture, never] of refused) {
+                now += 2_001;
+                post_message.mockClear();
+                await gesture();
+                expect(warnings(), name).toEqual([REOPEN]);
+                for (const type of never) {
+                    expect(post_message.mock.calls.some(([message]) => message?.type === type), `${name}: ${type}`)
+                        .toBe(false);
+                }
+            }
+        } finally {
+            clock.mockRestore();
+        }
+        // A session with unsaved edits is not let go: only a clean one is.
+        post_message.mockClear();
+        await release_idle_edit_session();
+        expect(sent(post_message, 'releaseEditSession')).toBeUndefined();
     });
 
     it('says so when the replayed region is hidden by the view', async () => {
@@ -20652,7 +20782,7 @@ describe('undo and redo, from the keyboard and the desktop menu', () => {
 
         it('does not fence the window when a press only waited out its lease', async () => {
             const { post_message } = await render_app();
-            await two_steps(post_message);
+            await two_steps(post_message, { capabilities: { csvEditable: true, csvEditingSupported: true } });
             vi.useFakeTimers();
             try {
                 await undo_via_menu();
@@ -20670,6 +20800,15 @@ describe('undo and redo, from the keyboard and the desktop menu', () => {
             expect(publication_fence.is_raised()).toBe(false);
             expect(grid_shell_mock.latest_props!.edits_paused).toBe(false);
             expect(props().gestures_admitted?.()).toBe(true);
+            // And an edit made now is published.
+            await acquire_editing_session(post_message);
+            seed_mounted_store();
+            post_message.mockClear();
+            await dispatch_host_message({ type: 'requestPendingChangesFlush', requestId: 'after-the-lease' });
+            await vi.waitUntil(() => sent(post_message, 'pendingChangesFlush') !== undefined);
+            expect(sent(post_message, 'pendingEditsChanged')).toMatchObject({
+                edits: { '0:0': { value: 'dirty', base: 'base' } },
+            });
         });
 
         it('drops the held press when the view could not follow a committed replay', async () => {
