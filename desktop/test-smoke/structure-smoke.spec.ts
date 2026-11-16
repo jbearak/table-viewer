@@ -305,7 +305,8 @@ test('a row drag and a column drag are the first edits to a file', async () => {
     await expect(page.locator('.grid-shell-root')).toHaveAttribute('data-edit-session', 'held');
     await page.mouse.up();
     await expect_undo_label('Move row');
-    await save_changes(page);
+    // Past the read-back, which replaces the rows the column drag below starts on.
+    await save_and_reread(app!, page);
     await expect.poll(() => fs.readFileSync(file, 'utf8')).toBe('name,qty\ncherry,3\napple,1\nbanana,2\n');
 
     await expect(save_button(page)).toBeDisabled();

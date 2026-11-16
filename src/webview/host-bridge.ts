@@ -220,9 +220,10 @@ export const publication_fence = {
      * nothing will retry them. Left outstanding, one the host dropped would
      * hold every wait for acknowledgement for ever. The sequence itself is
      * kept: the host refuses one that goes back. The dedupe memory is kept
-     * too: within one renderer a new document under the same session comes
-     * only from the host switching the panel to another file, and forgetting
-     * it would post an echo of the hydrated stores, which the failed-save
+     * too: a mounted renderer is sent one initial snapshot, its first (the
+     * host presents another only for a new file id, and a panel's is fixed),
+     * so a reopen is a new renderer whose memory starts empty; forgetting it
+     * here would post an echo of the hydrated stores, which the failed-save
      * guard in GridShell exists to prevent.
      */
     forget_outstanding(): void {

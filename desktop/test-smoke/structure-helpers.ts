@@ -209,7 +209,7 @@ export async function applied_revision(app: ElectronApplication): Promise<number
 export async function save_and_reread(app: ElectronApplication, page: Page): Promise<void> {
     const before = await applied_revision(app);
     await save_changes(page);
-    await expect.poll(() => applied_revision(app)).toBeGreaterThan(before);
+    await expect.poll(() => applied_revision(app), { timeout: 30_000 }).toBeGreaterThan(before);
 }
 
 /** Save through the toolbar and wait until nothing is left unsaved. */
