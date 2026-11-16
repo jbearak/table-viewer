@@ -348,13 +348,19 @@ async function click_row_marker(page: Page, shown: Layout, line: number, extend 
     last_probe = undefined;
 }
 
-/** Wait for the file to remember a width for `column`, near `about`, and return it. */
+/**
+ * Wait for the file to remember a width for `column` within a few pixels of
+ * `about`, and return it. A drag ends a pixel or two from where it is aimed,
+ * and a second drag of the same column starts from a width already stored,
+ * so the wait is for the width, not for any width.
+ */
 async function stored_width(file: string, column: number, about: number): Promise<number> {
-    await expect.poll(() => stored(file)?.widths[column]).toBeDefined();
-    const width = stored(file)!.widths[column];
-    expect(Math.abs(width - about), `column ${column} is stored ${width} wide, expected about ${about}`)
-        .toBeLessThanOrEqual(4);
-    return width;
+    let width: number | undefined;
+    await expect.poll(() => {
+        width = stored(file)?.widths[column];
+        return width === undefined ? `nothing stored for column ${column}` : Math.abs(width - about) <= 4;
+    }, { message: `column ${column} is stored about ${about} wide` }).toBe(true);
+    return width!;
 }
 
 const auto_fit_button = (page: Page) => page.getByRole('button', { name: 'Auto-fit Columns' });
@@ -425,11 +431,13 @@ test('Auto-fit on and off are steps, and undo and redo leave the toolbar as each
     await expect_sizes(page, file, { stored: NOTHING, shown: layout(), undo: 'Undo', redo: 'Redo' });
 
     await auto_fit_button(page).click();
-    await expect.poll(() => Object.keys(stored(file)?.widths ?? {}).length).toBeGreaterThan(0);
-    const fitted = stored(file)!;
+    // The fit makes at least the first column narrower than the default.
+    let fitted: Stored = NOTHING;
+    await expect.poll(() => {
+        fitted = stored(file) ?? NOTHING;
+        return fitted.widths[0] ?? COLUMN_WIDTH_PX;
+    }).toBeLessThan(COLUMN_WIDTH_PX);
     const fitted_shown = layout([0, 1, 2].map((column) => fitted.widths[column] ?? COLUMN_WIDTH_PX));
-    // The fit made at least the first column narrower than the default.
-    expect(fitted.widths[0]).toBeLessThan(COLUMN_WIDTH_PX);
     await expect_sizes(page, file, { stored: fitted, shown: fitted_shown, undo: 'Undo Auto-fit columns', redo: 'Redo' });
     await expect(auto_fit_button(page)).toHaveClass(/active/);
 
@@ -654,9 +662,12 @@ test('a double-click on a column border fits the column in one step', async () =
         box.x + left_of(layout(), 0) + COLUMN_WIDTH_PX - 2,
         box.y + HEADER_HEIGHT_PX / 2,
     );
-    await expect.poll(() => stored(file)?.widths[0]).toBeDefined();
-    const width = stored(file)!.widths[0];
-    expect(width).toBeLessThan(COLUMN_WIDTH_PX);
+    // The fit makes the column narrower than the default: its longest text is short.
+    let width = COLUMN_WIDTH_PX;
+    await expect.poll(() => {
+        width = stored(file)?.widths[0] ?? COLUMN_WIDTH_PX;
+        return width;
+    }).toBeLessThan(COLUMN_WIDTH_PX);
     const fitted = { stored: { widths: { 0: width }, heights: [] }, shown: layout([width]) };
     await expect_sizes(page, file, { ...fitted, undo: 'Undo Resize column', redo: 'Redo' });
 
