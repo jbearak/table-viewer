@@ -107,8 +107,9 @@ function with_current_height(
 }
 
 function without_row_heights(changes: PendingStructuralChanges): PendingStructuralChanges {
-    if (!changes.appendedRows.some((row) => row.viewerRowHeight !== undefined)) return changes;
-    return { ...changes, appendedRows: changes.appendedRows.map(without_row_height) };
+    const rows = pending_rows(changes);
+    if (!rows.some((row) => row.viewerRowHeight !== undefined)) return changes;
+    return { ...changes, appendedRows: rows.map(without_row_height) };
 }
 
 /**
@@ -131,9 +132,10 @@ function with_current_sizes(
     desired: PendingStructuralChanges,
     current: PendingStructuralChanges,
 ): PendingStructuralChanges {
-    const rows_now = new Map(current.appendedRows.map((row) => [row.id, row]));
-    const rows = desired.appendedRows.map((row) => with_current_height(row, rows_now.get(row.id)));
-    const sized: PendingStructuralChanges = rows.some((row, index) => row !== desired.appendedRows[index])
+    const rows_now = new Map(pending_rows(current).map((row) => [row.id, row]));
+    const desired_rows = pending_rows(desired);
+    const rows = desired_rows.map((row) => with_current_height(row, rows_now.get(row.id)));
+    const sized: PendingStructuralChanges = rows.some((row, index) => row !== desired_rows[index])
         ? { ...desired, appendedRows: rows }
         : desired;
     if (sized.pendingColumns === undefined) return sized;
