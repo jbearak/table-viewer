@@ -2131,6 +2131,64 @@ describe('formatting toggle', () => {
         expect(next?.snapshotIdentity).toEqual(following.snapshot.identity);
     });
 
+    it('shows the choice a refresh of the same file carries, when another window made it', async () => {
+        // The choice is stored for the file. A second window on it (a
+        // comparison beside the plain window, a split editor) turns
+        // formatting off, and this window hears of it in its next snapshot:
+        // a session let go, an edit elsewhere, anything that leaves the file
+        // as it is.
+        const { post_message } = await render_app();
+        const meta = make_meta(['First', 'Second']);
+        await dispatch_host_message(initial_snapshot_message(meta));
+        expect(grid_stub().getAttribute('data-show-formatting')).toBe('true');
+
+        await dispatch_host_message(refresh_snapshot_message(meta, {
+            generation: 1,
+            sourceGeneration: 1,
+            reason: 'other',
+            state: { showFormatting: [false, true] },
+        }));
+
+        expect(grid_stub().getAttribute('data-show-formatting')).toBe('false');
+        await click_sheet_tab('Second');
+        expect(grid_stub().getAttribute('data-show-formatting')).toBe('true');
+        await click_sheet_tab('First');
+
+        // The button then turns on what is shown off, and stores that.
+        post_message.mockClear();
+        await click_button('Formatting');
+        expect(grid_stub().getAttribute('data-show-formatting')).toBe('true');
+        const stored = post_message.mock.calls
+            .map((call) => call[0] as WebviewMessage)
+            .filter((message): message is Extract<WebviewMessage, { type: 'stateChanged' }> => (
+                message.type === 'stateChanged'
+            )).at(-1);
+        expect(stored?.state.showFormatting).toEqual([true, true]);
+    });
+
+    it('shows another window\'s choice for a sheet this window never set, after setting a later one', async () => {
+        // Turning formatting off on the second sheet alone leaves the first
+        // with no choice of its own here. Another window then turns the
+        // first sheet's off as well.
+        await render_app();
+        const meta = make_meta(['First', 'Second']);
+        await dispatch_host_message(initial_snapshot_message(meta));
+        await click_sheet_tab('Second');
+        await click_button('Formatting');
+        expect(grid_stub().getAttribute('data-show-formatting')).toBe('false');
+
+        await dispatch_host_message(refresh_snapshot_message(meta, {
+            generation: 1,
+            sourceGeneration: 1,
+            reason: 'other',
+            state: { showFormatting: [false, false] },
+        }));
+
+        expect(grid_stub().getAttribute('data-show-formatting')).toBe('false');
+        await click_sheet_tab('First');
+        expect(grid_stub().getAttribute('data-show-formatting')).toBe('false');
+    });
+
     it('restores saved formatting from initial snapshot state', async () => {
         // Reloading the same file after an external edit keeps the choice, rather
         // than snapping every sheet back to formatted.
@@ -5378,7 +5436,7 @@ describe('row height persistence', () => {
         });
         // But not painted: the host refuses the whole request and delivers nothing, so a
         // layer for it would have no delivery to reconcile against and would show a
-        // height no file holds until the generation next moved. Springing back as the
+        // height no file holds until its answer arrived. Springing back as the
         // drag ends is the truth.
         expect(grid_stub().getAttribute('data-row-height-overlay')).toBe('null');
     });
@@ -13749,6 +13807,102 @@ describe('sorting and filtering', () => {
             await dispatch_host_message(next);
 
             expect(document.querySelector('.filter-popover')).toBeNull();
+        });
+
+        describe('closed by a refresh that changes its columns', () => {
+            // Nobody dismissed the editor, so nothing handed focus back, and
+            // the control that held it is unmounted with the editor.
+            const with_a_column_added = () => refresh_snapshot_message(
+                two_column_meta(['Name', 'Age', 'City']),
+            );
+
+            /** Open the editor from the grid, as a header menu's "Filter…" does, with focus in it. */
+            async function open_from_grid(focused = true) {
+                const has_focus = vi.spyOn(document, 'hasFocus').mockReturnValue(focused);
+                await render_app();
+                await dispatch_host_message(initial_snapshot_message(two_column_meta()));
+                grid_shell_mock.has_grid_focus.mockReturnValue(false);
+                await open_filter_with(vi.fn());
+                await type_filter_value('3');
+                grid_shell_mock.focus_grid.mockClear();
+                return has_focus;
+            }
+
+            it('gives focus to the grid', async () => {
+                await open_from_grid();
+
+                await dispatch_host_message(with_a_column_added());
+
+                expect(document.querySelector('.filter-popover')).toBeNull();
+                await vi.waitUntil(() => grid_shell_mock.focus_grid.mock.calls.length > 0);
+                expect(grid_shell_mock.focus_grid).toHaveBeenCalledOnce();
+            });
+
+            it('gives focus to the toolbar when the grid has nothing to focus', async () => {
+                await open_from_grid();
+                grid_shell_mock.focus_grid.mockReturnValue(false);
+
+                await dispatch_host_message(with_a_column_added());
+
+                const toolbar = document.querySelector('.toolbar') as HTMLElement;
+                await vi.waitUntil(() => document.activeElement === toolbar);
+            });
+
+            it('leaves focus on a control the person moved to', async () => {
+                await open_from_grid();
+
+                await dispatch_host_message(with_a_column_added());
+                expect(document.querySelector('.filter-popover')).toBeNull();
+                columns_trigger().focus();
+                // The hand-back asks whether the grid holds focus before it
+                // decides the person has moved on.
+                const asked = grid_shell_mock.has_grid_focus.mock.calls.length;
+                await vi.waitUntil(() => grid_shell_mock.has_grid_focus.mock.calls.length > asked);
+
+                expect(grid_shell_mock.focus_grid).not.toHaveBeenCalled();
+                expect(document.activeElement).toBe(columns_trigger());
+            });
+
+            it('takes no focus while the window does not have it', async () => {
+                const has_focus = await open_from_grid(false);
+
+                await dispatch_host_message(with_a_column_added());
+                expect(document.querySelector('.filter-popover')).toBeNull();
+                const asked = has_focus.mock.calls.length;
+                await vi.waitUntil(() => has_focus.mock.calls.length > asked);
+
+                expect(grid_shell_mock.focus_grid).not.toHaveBeenCalled();
+                expect(document.activeElement).toBe(document.body);
+            });
+
+            it('gives focus to the toolbar when a filter chip opened it', async () => {
+                vi.spyOn(document, 'hasFocus').mockReturnValue(true);
+                const { post_message } = await render_app();
+                await load_acknowledged_transform(post_message, {
+                    sort: [],
+                    filters: [{
+                        id: 'theirs', colIndex: 0, operator: 'equals', value: 'x',
+                        caseSensitive: false, enabled: true,
+                    }],
+                    schema: '["Sheet1",1,null]',
+                });
+                grid_shell_mock.has_grid_focus.mockReturnValue(false);
+                await act(async () => (
+                    document.querySelector('.filter-chip-body') as HTMLButtonElement
+                ).click());
+                expect(document.querySelector('.filter-popover')).not.toBeNull();
+                grid_shell_mock.focus_grid.mockClear();
+
+                // Another column: the filter is dropped and its chip with it.
+                await dispatch_host_message(refresh_snapshot_message(two_column_meta(), {
+                    generation: 3,
+                }));
+
+                expect(document.querySelector('.filter-popover')).toBeNull();
+                const toolbar = document.querySelector('.toolbar') as HTMLElement;
+                await vi.waitUntil(() => document.activeElement === toolbar);
+                expect(grid_shell_mock.focus_grid).not.toHaveBeenCalled();
+            });
         });
     });
 
@@ -22802,12 +22956,35 @@ describe('view steps in history', () => {
 
                 await act(async () => props().on_row_resize([{ start: 1, end: 1 }], 60, { gesture: false }));
 
-                // Unanswered and not a view request: cells stay editable.
-                expect(row_height_writes(post_message)).toEqual([expect.not.objectContaining({
-                    requestId: expect.anything(),
+                // Answered, and still not a view request: cells stay editable.
+                expect(row_height_writes(post_message)).toEqual([expect.objectContaining({
+                    requestId: expect.any(String),
                 })]);
                 expect(cells_editable()).toEqual(EDITABLE);
+                await answer_row_heights(post_message, { before: [] });
+                expect(cells_editable()).toEqual(EDITABLE);
                 expect(undo_labels()).toEqual([]);
+            });
+
+            it('takes down the height painted for the row an edit grew when the host refuses to keep it', async () => {
+                // At the limit of custom heights the host stores nothing and
+                // delivers nothing, so only its answer can say the paint is
+                // not a height the file holds.
+                const { post_message } = await render_app();
+                await open(post_message);
+
+                await act(async () => props().on_row_resize([{ start: 1, end: 1 }], 60, { gesture: false }));
+                expect(row_overlay()).toEqual([
+                    { rows: [{ start: 1, end: 1 }], height: 60, requestId: expect.any(String) },
+                ]);
+
+                await answer_row_heights(post_message, { applied: false, refused: 'limit' });
+
+                expect(row_overlay()).toBeNull();
+                expect(undo_labels()).toEqual([]);
+                // The host said why; the window adds nothing.
+                expect(warnings(post_message)).toEqual([]);
+                expect(cells_editable()).toEqual(EDITABLE);
             });
 
             it('removes its painted height on a refusal, so a later undo shows what the host delivers', async () => {
@@ -22903,7 +23080,7 @@ describe('view steps in history', () => {
                 expect(undo_labels()).toEqual(['Reset 2 row heights']);
             });
 
-            /** The row a committed edit grows: painted at once, its write not answered. */
+            /** The row a committed edit grows: painted at once, its answer still to come. */
             async function grow_row(row: number, height: number) {
                 await act(async () => {
                     props().on_row_resize([{ start: row, end: row }], height, { gesture: false });
@@ -22911,15 +23088,15 @@ describe('view steps in history', () => {
             }
 
             it('takes down a height painted for a write the host never stored', async () => {
-                // The row an edit grows is painted at once and its write is
-                // not answered. Refused at the limit, nothing is stored, so
-                // no delivery agrees with the paint and Reset is offered for
-                // a height that is only on screen. The reset changes nothing
-                // stored, and still has to leave the row as the host has it.
+                // The row an edit grows is painted at once. While its answer
+                // is on the way, Reset is offered for a height that is only
+                // on screen. A reset the host applies was written after it,
+                // so it leaves the row as the host has it, whatever became
+                // of the growth.
                 const { post_message } = await render_app();
                 await open(post_message);
                 await grow_row(1, 54);
-                const painted = { rows: [{ start: 1, end: 1 }], height: 54 };
+                const painted = { rows: [{ start: 1, end: 1 }], height: 54, requestId: expect.any(String) };
                 expect(row_overlay()).toEqual([painted]);
 
                 await resize_rows([{ start: 1, end: 1 }], null);
@@ -22939,7 +23116,9 @@ describe('view steps in history', () => {
                 await resize_rows([{ start: 1, end: 1 }], null);
                 await answer_row_heights(post_message, { applied: false, refused: 'unresolved' });
 
-                expect(row_overlay()).toEqual([{ rows: [{ start: 1, end: 1 }], height: 54 }]);
+                expect(row_overlay()).toEqual([
+                    { rows: [{ start: 1, end: 1 }], height: 54, requestId: expect.any(String) },
+                ]);
             });
 
             it('leaves a height painted after the reset was posted', async () => {
@@ -22962,7 +23141,9 @@ describe('view steps in history', () => {
                     change: { height: null, before: [{ start: 4, end: 4, height: 60 }] },
                 });
 
-                expect(row_overlay()).toEqual([{ rows: [{ start: 1, end: 1 }], height: 54 }]);
+                expect(row_overlay()).toEqual([
+                    { rows: [{ start: 1, end: 1 }], height: 54, requestId: expect.any(String) },
+                ]);
                 expect(undo_labels()).toEqual(['Reset row height']);
             });
 
@@ -22980,12 +23161,13 @@ describe('view steps in history', () => {
                 const { post_message } = await render_app();
                 await open(post_message);
                 await resized_rows(post_message);
-                // An edit then grows row 1, and the host refuses that write
-                // at the limit: painted, not stored, never answered.
+                // An edit then grows row 1, and the host has not answered
+                // that write yet: painted, and nothing says it is stored.
                 await act(async () => {
                     props().on_row_resize([{ start: 1, end: 1 }], 80, { gesture: false });
                 });
-                expect(row_overlay()).toEqual([{ rows: [{ start: 1, end: 1 }], height: 80 }]);
+                const grown = { rows: [{ start: 1, end: 1 }], height: 80, requestId: expect.any(String) };
+                expect(row_overlay()).toEqual([grown]);
 
                 await undo();
                 await deliver_heights([{ 2: 30 }]);
@@ -23001,7 +23183,7 @@ describe('view steps in history', () => {
                 });
                 await redo();
                 await answer_row_heights(post_message, { applied: false });
-                expect(row_overlay()).toEqual([{ rows: [{ start: 1, end: 1 }], height: 80 }]);
+                expect(row_overlay()).toEqual([grown]);
                 expect(redo_labels()).toEqual(['Resize 2 rows']);
             });
 

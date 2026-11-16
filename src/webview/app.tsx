@@ -701,6 +701,8 @@ interface GridFocusRestoreState {
     sheet_index: number;
     generation: number;
     document_epoch: number;
+    /** Focus the toolbar when the grid, once mounted, has nothing to focus. */
+    or_toolbar?: true;
 }
 
 /**
@@ -2177,6 +2179,16 @@ export function App(): React.JSX.Element {
         restore_focus: () => void;
         origin: Exclude<TransformOrigin, 'restore'>;
     } | null>(null);
+    const filter_editor_ref = useRef(filter_editor);
+    filter_editor_ref.current = filter_editor;
+    /**
+     * Where the filter editor a refresh just closed was opened from. Nobody
+     * dismissed that editor, so nobody handed focus back: the effect that
+     * sees it gone does.
+     */
+    const filter_editor_closed_by_refresh_ref = useRef<
+        Exclude<TransformOrigin, 'restore'> | null
+    >(null);
     const [sheet_context_menu, set_sheet_context_menu] = useState<{
         // Null for a right-click on the tab strip's own background rather than on a
         // tab: the tab-orientation command applies to the strip, so it is offered
@@ -3911,12 +3923,16 @@ export function App(): React.JSX.Element {
             }
 
             if (msg.type === 'rowHeightsChanged') {
+                // No entry: the row a committed edit grew, which nothing
+                // waits on, or a request a refresh of another source dropped.
+                // Its layer, if one still stands, is retired like any other.
                 const pending = pending_row_resize_requests_ref.current.get(msg.requestId);
-                if (pending === undefined) return;
-                pending_row_resize_requests_ref.current.delete(msg.requestId);
-                sync_view_request_pending();
+                if (pending !== undefined) {
+                    pending_row_resize_requests_ref.current.delete(msg.requestId);
+                    sync_view_request_pending();
+                }
                 const applied = msg.applied
-                    && msg.sourceGeneration === pending.sourceGeneration
+                    && (pending === undefined || msg.sourceGeneration === pending.sourceGeneration)
                     && msg.sourceGeneration === source_generation_ref.current;
                 // Any answer retires the layer painted for this request. The
                 // host delivers what is stored before it answers, so from
@@ -3938,6 +3954,7 @@ export function App(): React.JSX.Element {
                         return layers.length === 0 ? undefined : { ...overlay, layers };
                     },
                 ));
+                if (pending === undefined) return;
                 pending.finish?.(applied);
                 if (pending.replay !== undefined && pending.worksheet !== undefined) {
                     const { replay, worksheet } = pending;
@@ -5009,7 +5026,9 @@ export function App(): React.JSX.Element {
                     const reloaded_column_names = source_changed
                         ? next_active_sheet?.columnNames ?? []
                         : undefined;
-                    set_filter_editor((editor) => {
+                    const filter_editor_after_snapshot = <Editor extends { column_index: number }>(
+                        editor: Editor | null,
+                    ): Editor | null => {
                         if (editor === null || filter_editor_columns_changed) return null;
                         if (reloaded_column_names === undefined) return editor;
                         const name = reloaded_column_names[editor.column_index];
@@ -5019,7 +5038,17 @@ export function App(): React.JSX.Element {
                                 === reloaded_column_names.lastIndexOf(name)
                             ? editor
                             : null;
-                    });
+                    };
+                    // Closing it here unmounts the control that held focus,
+                    // with nobody to hand focus back as a dismissal does.
+                    const filter_editor_shown = filter_editor_ref.current;
+                    if (
+                        filter_editor_shown !== null
+                        && filter_editor_after_snapshot(filter_editor_shown) === null
+                    ) {
+                        filter_editor_closed_by_refresh_ref.current = filter_editor_shown.origin;
+                    }
+                    set_filter_editor(filter_editor_after_snapshot);
                     if (source_changed) {
                         histogram_cache_ref.current.clear();
                         set_filter_histogram({ key: '', value: { status: 'loading' } });
@@ -5465,6 +5494,26 @@ export function App(): React.JSX.Element {
                             cellHighlights: authoritative_state.cellHighlights,
                         });
                         set_column_widths(next_column_widths);
+                        // The choice is stored for the file, so another window
+                        // on it can change it, and `state_ref` below takes the
+                        // delivered one either way: what the sheets show has
+                        // to be the same choice, or the Formatting button
+                        // would say one thing and the next layout change store
+                        // another. The same array when nothing changed, asked
+                        // of every sheet by index: a toggle on a later sheet
+                        // leaves holes before it, which `every` would skip.
+                        const next_show_formatting = authoritative_state.showFormatting ?? [];
+                        set_show_formatting_by_sheet((shown) => {
+                            if (shown.length !== next_show_formatting.length) {
+                                return next_show_formatting;
+                            }
+                            for (let index = 0; index < shown.length; index += 1) {
+                                if (shown[index] !== next_show_formatting[index]) {
+                                    return next_show_formatting;
+                                }
+                            }
+                            return shown;
+                        });
                         set_transforms(next_transforms);
                         set_column_visibility(next_column_visibility);
                         set_active_sheet_index(next_active_sheet_index);
@@ -6213,6 +6262,9 @@ export function App(): React.JSX.Element {
             }
             attempt += 1;
             if (attempt >= GRID_FOCUS_RESTORE_MAX_ATTEMPTS) {
+                // Reached with the document focused and no control holding
+                // focus: both were asked above, on this same attempt.
+                if (grid_focus_restore.or_toolbar) toolbar_focus_ref.current?.focus();
                 set_grid_focus_restore((current) => (
                     current === grid_focus_restore ? null : current
                 ));
@@ -7772,7 +7824,8 @@ export function App(): React.JSX.Element {
     }, [open_find, run_history_command]);
 
     /**
-     * The only writer, so the live array and the persisted copy cannot drift.
+     * The only writer besides a snapshot, which installs both, so the live
+     * array and the persisted copy cannot drift.
      *
      * Persisted per file: reloading the same file after an external edit keeps the
      * choice, and opening a different file in this panel gets that file's own rather
@@ -8975,6 +9028,33 @@ export function App(): React.JSX.Element {
             filter_restore_timer_ref.current = undefined;
         }
     }, [filter_editor]);
+
+    // A refresh closed the editor (its column can now mean another one), and
+    // nobody dismissed it, so nobody handed focus back. The same hand-back as
+    // a dismissal's, by the tokens a refresh uses: such a refresh remounts
+    // the grid, which cannot take focus until it is mounted. To the grid, or
+    // to the toolbar when the grid has nothing to focus or a chip opened the
+    // editor; never from a control the person moved to. What opened the
+    // editor is not asked: the columns it belonged to changed under it.
+    useEffect(() => {
+        const origin = filter_editor_closed_by_refresh_ref.current;
+        if (origin === null) return;
+        filter_editor_closed_by_refresh_ref.current = null;
+        if (filter_editor !== null) return;
+        if (origin === 'grid') {
+            set_grid_focus_restore((current) => current ?? {
+                sheet_index: active_sheet_index,
+                generation: generation_ref.current,
+                document_epoch: document_epoch_ref.current,
+                or_toolbar: true,
+            });
+        } else {
+            set_toolbar_focus_restore((current) => current ?? {
+                sheet_index: active_sheet_index,
+                document_epoch: document_epoch_ref.current,
+            });
+        }
+    }, [active_sheet_index, filter_editor, set_grid_focus_restore]);
 
     const apply_filter_editor = useCallback((entry: FilterEntry) => {
         if (!filter_editor) return;
@@ -10300,14 +10380,17 @@ export function App(): React.JSX.Element {
             // clamps (`row-resize-model`), so this is the case that should not arise
             // rather than one that does.
             const clamped = height === null ? null : clamp_row_height(height);
-            const request_id = !gesture && on_result === undefined
-                ? undefined
-                : [
-                    'row-resize',
-                    highlight_request_prefix_ref.current,
-                    ++row_resize_request_seq_ref.current,
-                ].join(':');
-            if (request_id !== undefined) {
+            // Every write is answered, so a refused one never leaves its
+            // height painted. Only a gesture, or a write Pending Rows wait on,
+            // is also waited for here: the row a committed edit grows holds
+            // no gate and records no step, so its answer finds no entry and
+            // retires its layer.
+            const request_id = [
+                'row-resize',
+                highlight_request_prefix_ref.current,
+                ++row_resize_request_seq_ref.current,
+            ].join(':');
+            if (gesture || on_result !== undefined) {
                 const sheet = meta_ref.current?.sheets[active_sheet_index];
                 pending_row_resize_requests_ref.current.set(request_id, {
                     sourceGeneration: source_generation_ref.current,
@@ -10331,29 +10414,26 @@ export function App(): React.JSX.Element {
                 height: clamped,
                 generation: generation_ref.current,
                 sourceGeneration: source_generation_ref.current,
-                ...(request_id === undefined ? {} : { requestId: request_id }),
+                requestId: request_id,
             });
             // Posted either way, but painted optimistically only when the host can
             // actually keep it. Over the cap the host refuses the whole request and warns
             // the owner, delivering nothing — so an overlay layer for it would have no
             // delivery to reconcile against and would show a height nothing persisted
-            // until the generation next moved. Better to let the row spring back as the
+            // until its answer arrived. Better to let the row spring back as the
             // drag ends, which is the truth.
             //
             // The same cap applied to the *accumulated* durable map is a refusal this
             // panel cannot predict: it never holds that map, and the projection is not a
-            // proxy for its size. The user is told (the host warns, naming the limit).
-            // For a resize that is answered, which is every one a person makes, the
-            // answer retires the layer painted below and the row springs back. Only
-            // the unanswered write, the row a committed edit grows, leaves its layer
-            // with nothing behind it until the generation next moves; reasoning at
-            // `row_height_layers_for_delivery`.
+            // proxy for its size. The user is told (the host warns, naming the limit),
+            // and the answer retires the layer painted below, so the row springs back:
+            // a resize a person made, and the row a committed edit grew alike.
             //
             // A reset paints nothing ahead of the host either: which rows hold a
             // custom height is the host's to say, and they change with its delivery.
             // It only takes its place among the heights already painted.
             if (clamped === null) {
-                if (request_id !== undefined) mark_row_height_request(active_sheet_index, request_id);
+                mark_row_height_request(active_sheet_index, request_id);
                 return;
             }
             if (requested_rows > MAX_PERSISTED_ROW_HEIGHTS) return;
@@ -10362,7 +10442,7 @@ export function App(): React.JSX.Element {
                 const layer: RowHeightLayer = {
                     rows,
                     height: clamped,
-                    ...(request_id === undefined ? {} : { requestId: request_id }),
+                    requestId: request_id,
                 };
                 const existing = previous[active_sheet_index];
                 const next = [...previous];

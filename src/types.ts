@@ -3964,10 +3964,11 @@ export type WebviewMessage =
      * `height: null` is a reset: every named row that has a custom height loses it.
      * A reset is not bounded by `MAX_PERSISTED_ROW_HEIGHTS`, since it only removes.
      *
-     * `requestId` asks for an answer (`rowHeightsChanged`). A resize or reset the
-     * person made sends one: the answer says which source rows changed and what
-     * they held, which is the gesture's step in undo history. The row a committed
-     * multi-line edit grows sends none and is answered only by the delivery.
+     * `requestId` asks for an answer (`rowHeightsChanged`), and the window
+     * always sends one. For a resize or reset the person made, the answer says
+     * which source rows changed and what they held, which is the gesture's step
+     * in undo history. For the row a committed multi-line edit grows, it says
+     * whether the height was kept, so a refused one is not left painted.
      */
     | { type: 'setRowHeights'; sheetIndex: number; rows: DisplayRowInterval[]; height: number | null; generation: number; sourceGeneration: number; requestId?: string }
     /**

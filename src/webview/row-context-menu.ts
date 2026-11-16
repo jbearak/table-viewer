@@ -22,7 +22,7 @@ export interface RowContextMenuModelProps {
      * when at least one of them shows a custom height.
      */
     on_reset_row_heights?: () => void;
-    /** How many saved rows the reset names. */
+    /** How many of those rows show a custom height: the rows the reset changes. */
     reset_row_count?: number;
     on_promote_row_to_header: () => void;
     on_copy_rows: () => void;

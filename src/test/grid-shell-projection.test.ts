@@ -4198,6 +4198,43 @@ describe('GridShell column projection', () => {
         }).current?.cell).toEqual([1, 3]);
     });
 
+    it('offers the row-resize strip when the pointer reaches a row border from inside the same cell', async () => {
+        await render_grid(props({ row_count: 10 }));
+        const on_mouse_move = grid_mock.props!.onMouseMove as
+            (args: Record<string, unknown>) => void;
+        // Glide reports a hover when the pointer changes cell and a move every
+        // time it moves. Row 1's cell, 24 px tall, with its top at y = 60.
+        const over_row_one = (local_event_y: number, buttons = 0) => ({
+            kind: 'cell', location: [0, 1], buttons,
+            bounds: { x: 30, y: 60, width: 100, height: 24 },
+            localEventX: 10, localEventY: local_event_y,
+        });
+        grid_mock.row_resize_set_target.mockClear();
+
+        // The middle of the cell: no border, no strip.
+        on_mouse_move(over_row_one(12));
+        expect(grid_mock.row_resize_set_target).toHaveBeenLastCalledWith(null);
+
+        // Down to the bottom border without leaving the cell.
+        on_mouse_move(over_row_one(21));
+        expect(grid_mock.row_resize_set_target)
+            .toHaveBeenLastCalledWith({ row: 1, boundary_y: 84, height: 24 });
+
+        // Up to the top border: the row above is the one a drag there resizes.
+        on_mouse_move(over_row_one(2));
+        expect(grid_mock.row_resize_set_target)
+            .toHaveBeenLastCalledWith({ row: 0, boundary_y: 60, height: 24 });
+
+        // Back to the middle: the strip goes.
+        on_mouse_move(over_row_one(12));
+        expect(grid_mock.row_resize_set_target).toHaveBeenLastCalledWith(null);
+
+        // A drag in progress owns the pointer: a move with a button down arms nothing.
+        grid_mock.row_resize_set_target.mockClear();
+        on_mouse_move(over_row_one(21, 1));
+        expect(grid_mock.row_resize_set_target).not.toHaveBeenCalled();
+    });
+
     it('sweeps a row-marker drag through hovered rows and back', async () => {
         await render_grid(props({ row_count: 10 }));
         const on_selection_change = grid_mock.props!.onGridSelectionChange as
@@ -10184,13 +10221,33 @@ describe('row Insert in the row-gutter menu', () => {
         expect(size_gesture_may_start).toHaveBeenCalledOnce();
         expect(on_row_resize).toHaveBeenCalledExactlyOnceWith([{ start: 2, end: 2 }], null, { gesture: true });
 
-        // A selection that includes it: the label counts the selected rows.
+        // A selection that includes it: the reset names every selected row,
+        // and the label counts the one that has a height to lose, as the
+        // step in undo history will ("Undo Reset row height").
         on_row_resize.mockClear();
         const on_selection_change = grid_mock.props!.onGridSelectionChange as (selection: unknown) => void;
         await act(async () => on_selection_change({ columns: compact([]), rows: compact([1, 2, 3]) }));
         await open_row_menu(2);
-        await act(async () => menu_item('Reset 3 row heights')!.click());
+        expect(menu_item('Reset 3 row heights')).toBeUndefined();
+        await act(async () => menu_item('Reset row height')!.click());
         expect(on_row_resize).toHaveBeenCalledExactlyOnceWith([{ start: 1, end: 3 }], null, { gesture: true });
+    });
+
+    it('counts the selected rows that show a custom height in the Reset row height label', async () => {
+        await render_grid(structure_props({
+            pending_row_store: create_pending_row_store({ session_id: 'session' }),
+            // Rows 1 and 3 stored; row 2 painted by a resize not yet answered.
+            row_heights: { 1: 50, 3: 60 },
+            row_height_overlay: [{ rows: [{ start: 2, end: 3 }], height: 70, requestId: 'drag' }],
+            on_row_resize: vi.fn(),
+            size_gesture_may_start: () => true,
+        }));
+        const on_selection_change = grid_mock.props!.onGridSelectionChange as (selection: unknown) => void;
+        await act(async () => on_selection_change({ columns: compact([]), rows: compact([0, 1, 2]) }));
+        await open_row_menu(1);
+        // Row 0 has none; row 3 is not selected.
+        expect(menu_button_labels().filter((label) => label.startsWith('Reset')))
+            .toEqual(['Reset 2 row heights']);
     });
 
     it('resets the rows the menu was opened on when an inserted row sits above them', async () => {
@@ -10211,6 +10268,16 @@ describe('row Insert in the row-gutter menu', () => {
         await act(async () => menu_item('Reset row height')!.click());
 
         expect(on_row_resize).toHaveBeenCalledExactlyOnceWith([{ start: 1, end: 1 }], null, { gesture: true });
+    });
+
+    it('draws an inserted row that has no height of its own at the default height', async () => {
+        // Display rows 0 (source 0), 1 (inserted), 2 (source 1), 3 (source 2).
+        // The host holds source row 1's height under its own display row 1,
+        // which is the number of the inserted row's place in the grid.
+        await insert_after_first({ row_heights: { 1: 60 } });
+
+        const get_row_height = grid_mock.props!.rowHeight as (row: number) => number;
+        expect([0, 1, 2, 3].map(get_row_height)).toEqual([24, 24, 60, 24]);
     });
 
     it('resets every saved row of a selection that spans an inserted row, and leaves the inserted row alone', async () => {

@@ -466,10 +466,10 @@ describe('the setRowHeights host handler', () => {
 
     it('acknowledges a no-op resize with the freshly read projection', async () => {
         // A no-op is a *success* that writes nothing, and silence is not an acceptable
-        // answer to it. The webview has already appended an optimistic layer, and a layer
-        // is only dropped by a delivered projection that agrees with it
-        // (`row_height_layers_for_delivery`) — so an unanswered no-op leaves the layer
-        // masking whatever the projection later says, for the rest of the generation.
+        // answer to it. The webview has already appended an optimistic layer over a
+        // projection that may be stale. Its answer retires that layer
+        // (`row_height_layers_after_answer`), and the delivery ahead of the answer
+        // carries what the file holds.
         //
         // Not a hypothetical, because "the height is already durable" is exactly what a
         // sibling panel's write makes true behind this panel's back: durable heights move
@@ -505,13 +505,11 @@ describe('the setRowHeights host handler', () => {
 
     it('does not acknowledge a refusal, only a no-op success', async () => {
         // The distinction the no-op acknowledgement must not blur. A write refused on the
-        // accumulated-map bound also returns no committed snapshot, and it must stay
-        // unanswered: nothing was persisted, so no projection could agree with the layer,
-        // and the deliberate residue is that the layer stands until the generation moves
-        // (reasoned out in full at `row_height_layers_for_delivery`). Acknowledging it
-        // would deliver a projection that *disagrees*, which is the one thing the webview
-        // reads as "not yet answered" and would leave the layer in place anyway — while
-        // costing a delivery per refused drag.
+        // accumulated-map bound also returns no committed snapshot, and it gets no
+        // delivery: nothing was persisted, so the projection is what it was, and a
+        // delivery would cost one per refused drag to say so. What takes the painted
+        // height down is the request's answer (`rowHeightsChanged`, which every request
+        // from the window asks for), reasoned out at `row_height_layers_for_delivery`.
         const seeded: Record<number, number> = {};
         for (let row = 10; row < 10 + MAX_PERSISTED_ROW_HEIGHTS + 50; row += 1) {
             seeded[row] = 30;

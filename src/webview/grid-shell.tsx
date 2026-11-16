@@ -305,7 +305,7 @@ import {
     default_row_height_for_font,
     line_height_for_font,
     natural_row_height,
-    display_rows_have_custom_height,
+    custom_height_row_count,
     resolved_row_height,
     type RowHeightLayer,
     type RowHeightOverrides,
@@ -7495,13 +7495,17 @@ export function GridShell({
             )
         ) return row_resize_preview.height;
         const projected = pending_projection.row_at(row);
-        const height_row = projected?.kind === 'source'
-            ? projected.sourceDisplayRow
-            : row;
-        return structural_row_height(row) ?? resolved_row_height(
+        // The stored heights and the layers over them are the host's, keyed
+        // by its display rows. An unsaved row is not one of those: with no
+        // height of its own it takes the default, not the height of the
+        // saved row that its place in the grid happens to number.
+        if (projected !== undefined && projected.kind !== 'source') {
+            return structural_row_height(row) ?? default_row_height;
+        }
+        return resolved_row_height(
             row_heights,
             row_height_overlay,
-            height_row,
+            projected?.sourceDisplayRow ?? row,
             default_row_height,
         );
     }, [
@@ -10111,8 +10115,47 @@ export function GridShell({
     }, [ensure_edit_session, notify_session_idle, open_held_edits]);
 
     // Arm/clear the row-resize strip as the pointer nears a row border. Glide's
-    // hover args give the cell's client `bounds` + in-cell `localEventY`.
-    // Also drives the truncated-cell tooltip: dwell on an overflowing cell
+    // mouse args give the cell's client `bounds` + in-cell `localEventY`.
+    //
+    // No `transformed` bail any more; the prop it read is gone with it. Arming
+    // the strip was suppressed under a permutation only because the resize it
+    // leads to used to persist a display-keyed height; the resize now names
+    // display intervals the host maps, so there is nothing left for a
+    // permutation to mis-key.
+    const arm_row_resize_strip = useCallback((args: GridMouseEventArgs) => {
+        if (args.kind !== 'cell') {
+            row_resize_ref.current?.set_target(null);
+            return;
+        }
+        // Physical geometry, not the merge-canonicalized location/bounds:
+        // inside a vertical merge the event reports the anchor row and the
+        // block's full bounds, but the boundary under the pointer belongs to
+        // the physical row — dragging a merge's bottom edge must resize its
+        // last row, and interior boundaries must stay reachable.
+        const row = (args.physicalLocation ?? args.location)[1];
+        const bounds = args.physicalBounds ?? args.bounds;
+        const hit = row_boundary_hit(
+            row,
+            bounds.y,
+            bounds.height,
+            // localEventY is relative to the canonicalized bounds; rebase it
+            // onto the physical cell.
+            args.localEventY + args.bounds.y - bounds.y,
+            ROW_RESIZE_TOLERANCE_PX,
+        );
+        row_resize_ref.current?.set_target(
+            hit
+                ? {
+                      row: hit.row,
+                      boundary_y: hit.boundary_y,
+                      height: effective_row_height(hit.row, false),
+                  }
+                : null,
+        );
+    }, [effective_row_height]);
+
+    // The hover half of the row-resize strip (see `on_mouse_move` for the
+    // other), and the truncated-cell tooltip: dwell on an overflowing cell
     // surfaces the full displayed value without changing selection or editing state.
     const on_item_hovered = useCallback(
         (args: GridMouseEventArgs) => {
@@ -10180,44 +10223,11 @@ export function GridShell({
                     args.bounds,
                 );
             }
-            // No `transformed` bail here any more; the prop it read is gone with it.
-            // Arming the strip was suppressed
-            // under a permutation only because the resize it leads to used to persist a
-            // display-keyed height; the resize now names display intervals the host
-            // maps, so there is nothing left for a permutation to mis-key.
-            if (args.kind !== 'cell') {
-                row_resize_ref.current?.set_target(null);
-                return;
-            }
-            // Physical geometry, not the merge-canonicalized location/bounds:
-            // inside a vertical merge the event reports the anchor row and the
-            // block's full bounds, but the boundary under the pointer belongs to
-            // the physical row — dragging a merge's bottom edge must resize its
-            // last row, and interior boundaries must stay reachable.
-            const row = (args.physicalLocation ?? args.location)[1];
-            const bounds = args.physicalBounds ?? args.bounds;
-            const hit = row_boundary_hit(
-                row,
-                bounds.y,
-                bounds.height,
-                // localEventY is relative to the canonicalized bounds; rebase it
-                // onto the physical cell.
-                args.localEventY + args.bounds.y - bounds.y,
-                ROW_RESIZE_TOLERANCE_PX,
-            );
-            row_resize_ref.current?.set_target(
-                hit
-                    ? {
-                          row: hit.row,
-                          boundary_y: hit.boundary_y,
-                          height: effective_row_height(hit.row, false),
-                      }
-                    : null,
-            );
+            arm_row_resize_strip(args);
         },
         [
+            arm_row_resize_strip,
             display_column_count,
-            effective_row_height,
             hide_cell_tooltip,
             row_markers,
             schedule_cell_tooltip,
@@ -10225,6 +10235,15 @@ export function GridShell({
             write_grid_selection,
         ],
     );
+
+    // Glide reports a hover only when the pointer changes cell, so a pointer
+    // that reaches a row border from inside the cell it is already over is
+    // seen only here. Not while a button is down: a drag owns the pointer
+    // then, and the hover handler above decides what it arms.
+    const on_mouse_move = useCallback((args: GridMouseEventArgs) => {
+        if (args.buttons !== 0) return;
+        arm_row_resize_strip(args);
+    }, [arm_row_resize_strip]);
 
     // Snapshot the compact row selection once. Live moves retain that compact
     // representation so even select-all previews stay bounded to the viewport;
@@ -12319,6 +12338,7 @@ export function GridShell({
                 onColumnResize={handle_column_resize}
                 onColumnResizeEnd={handle_column_resize_end}
                 onItemHovered={on_item_hovered}
+                onMouseMove={on_mouse_move}
                 onCellsEdited={on_cells_edited}
                 onPaste={editable_cells
                     ? on_append_rows === undefined ? true : allow_rectangular_paste
@@ -12494,6 +12514,11 @@ export function GridShell({
                     || selected_removal_rows.size > 0;
                 const structure = structure_items(row_menu.structure
                     && { axis: 'rows', selection: row_menu.structure });
+                const reset_row_count = custom_height_row_count(
+                    row_heights,
+                    row_height_overlay,
+                    row_menu.source_display_rows,
+                );
                 return (
                     <ContextMenu
                         x={row_menu.x}
@@ -12538,18 +12563,12 @@ export function GridShell({
                                 || promote_row_to_header_waits,
                             on_hide_rows: () => on_hide_rows(row_menu.source_display_rows),
                             // Offered when a saved row of the selection shows a
-                            // custom height. Pending Rows keep theirs.
-                            ...(row_menu.source_display_rows.some((interval) =>
-                                display_rows_have_custom_height(
-                                    row_heights,
-                                    row_height_overlay,
-                                    interval,
-                                ))
+                            // custom height, and counts the rows that do: the
+                            // rows the reset changes, as its step in undo
+                            // history counts them. Pending Rows keep theirs.
+                            ...(reset_row_count > 0
                                 ? {
-                                    reset_row_count: row_menu.source_display_rows.reduce(
-                                        (count, interval) => count + interval.end - interval.start + 1,
-                                        0,
-                                    ),
+                                    reset_row_count,
                                     // The menu's rows are the host's display
                                     // rows already, as Hide rows posts them.
                                     on_reset_row_heights: () => {
