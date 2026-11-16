@@ -158,6 +158,35 @@ async function history(page: Page, command: 'undo' | 'redo', times = 1): Promise
     }, { sent: command, count: times });
 }
 
+/**
+ * Undo or redo a cell edit soon after a Save, and wait for `expected`.
+ *
+ * This allows for a race that has nothing to do with the header row. The file
+ * watcher's refresh for the save can land while the edit is being replayed,
+ * and the host then refuses the replay and says "… did not run because the
+ * file was refreshing. Try again." The helper does what the message says.
+ * Any other message fails, with its text.
+ */
+async function history_after_save(
+    page: Page,
+    command: 'undo' | 'redo',
+    expected: Partial<Shown>,
+): Promise<void> {
+    const try_again = `${command === 'undo' ? 'Undo' : 'Redo'} did not run because the file was refreshing. Try again.`;
+    await history(page, command);
+    const said: string[] = [];
+    await expect.poll(async () => {
+        for (const dialog of await take_dialogs(app!)) {
+            if (dialog.message === try_again) await history(page, command);
+            else said.push(dialog.message ?? '');
+        }
+        const now = await shown(page);
+        const picked: Record<string, unknown> = {};
+        for (const key of Object.keys(expected) as (keyof Shown)[]) picked[key] = now[key];
+        return { ...picked, dialogs: [...said] };
+    }).toEqual({ ...expected, dialogs: [] });
+}
+
 interface Remembered {
     /** The worksheet's stored header choice; `auto` when none is stored. */
     header: 'auto' | 'on' | 'off';
@@ -402,13 +431,16 @@ test('an edit on the row that then became the header is undone after the header 
         undo: 'Undo Edit cell',
         redo: 'Redo Use row 2 as header',
     });
-    await history(page, 'undo');
-    await expect_shown(page, { headers: NO_HEADER, body: TITLED_BODY, undo: 'Undo', redo: 'Redo Edit cell' });
+    await history_after_save(page, 'undo', {
+        headers: NO_HEADER,
+        body: TITLED_BODY,
+        undo: 'Undo',
+        redo: 'Redo Edit cell',
+    });
     await expect(save_button(page)).toHaveClass(/has-unsaved/);
 
     // And forward: the edit, then the header over it.
-    await history(page, 'redo');
-    await expect_shown(page, { headers: NO_HEADER, body: edited, redo: 'Redo Use row 2 as header' });
+    await history_after_save(page, 'redo', { headers: NO_HEADER, body: edited, redo: 'Redo Use row 2 as header' });
     await history(page, 'redo');
     await expect_shown(page, { headers: ['title', 'qty'], body: FRUIT, undo: 'Undo Use row 2 as header', redo: 'Redo' });
     await expect_clean_and_released(page);
@@ -701,8 +733,7 @@ test('a header step under a saved edit that was undone says to save first, and g
     await expect.poll(() => saved(file)).toEqual(['label|qty', ...FRUIT]);
 
     // Undoing a saved edit leaves the cell unsaved against the file.
-    await history(page, 'undo');
-    await expect_shown(page, { headers: NO_HEADER, body: off_body, undo: 'Undo Turn off header row' });
+    await history_after_save(page, 'undo', { headers: NO_HEADER, body: off_body, undo: 'Undo Turn off header row' });
     await expect(save_button(page)).toHaveClass(/has-unsaved/);
     // A header cell is saved as a column name and a body cell is not, so an
     // unsaved cell cannot be carried onto the row that becomes the header.
