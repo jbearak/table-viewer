@@ -19726,6 +19726,64 @@ describe('auto-fit with Pending Columns', () => {
         expect(store.snapshot().pendingColumns?.[0]?.viewerWidth).toBe(90);
     });
 
+    it('puts a Pending Column\'s width back when the host refuses the fit, or the restore', async () => {
+        // Auto-fit sizes a Pending Column at once, with the saved columns it
+        // asks the host to store. Refused, the saved columns spring back and
+        // the toolbar with them; the Pending Column has to follow.
+        grid_shell_mock.auto_fit_result = { 0: 120 };
+        const { post_message } = await render_app();
+        const meta = make_meta(['Sheet1'], false);
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        await acquire_editing_session(post_message, 'refusal-session');
+        const store = (grid_shell_mock.latest_props as unknown as GridShellProps).pending_row_store!;
+        const before = store.snapshot();
+        await act(async () => {
+            const staged = store.stage_replace('refusal-session', before, {
+                ...before,
+                columnLayout: {
+                    columns: [{ kind: 'source', sourceColumn: 0 }, { kind: 'pending', pendingColumnId: 'column-a' }],
+                    removedSourceColumns: [],
+                    discardedPendingColumns: [],
+                },
+                pendingColumns: [{
+                    id: 'column-a', header: 'New column', cells: {}, viewerWidth: 90,
+                    format: { kind: 'none' }, createdOrder: 1,
+                }],
+            });
+            staged!.commit();
+            staged!.notify();
+        });
+        grid_shell_mock.pending_auto_fit_result = { 'column-a': 180 };
+        const pending_width = () => store.snapshot().pendingColumns?.[0]?.viewerWidth;
+        const fitted = () => grid_shell_mock.latest_props!.auto_fit_active;
+
+        // A fit the host refuses: not fitted, and the width from before it.
+        await click_button('Auto-fit Columns');
+        expect(pending_width()).toBe(180);
+        await answer_width_write(post_message, { applied: false });
+        expect(fitted()).toBe(false);
+        expect(pending_width()).toBe(90);
+
+        // A fit that lands, then a restore the host refuses: still fitted.
+        await click_button('Auto-fit Columns');
+        await answer_width_write(post_message);
+        expect(pending_width()).toBe(180);
+        await click_button('Auto-fit Columns');
+        expect(pending_width()).toBe(90);
+        await answer_width_write(post_message, { applied: false });
+        expect(fitted()).toBe(true);
+        expect(pending_width()).toBe(180);
+
+        // And the restore, pressed again and stored, still knows the width
+        // from before the fit.
+        await click_button('Auto-fit Columns');
+        await answer_width_write(post_message, { stored: [{ 0: 120 }] });
+        expect(fitted()).toBe(false);
+        expect(pending_width()).toBe(90);
+    });
+
     it('does not start a fit while a highlight request holds the gesture slot, and says to wait', async () => {
         const { post_message } = await render_app();
         const meta = make_meta(['Sheet1'], false);

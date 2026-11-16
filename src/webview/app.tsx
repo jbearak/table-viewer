@@ -439,6 +439,12 @@ interface PendingWidthSheet {
     };
     /** What the gesture did to Auto-fit, for its step. */
     readonly autoFit?: AutoFitChange;
+    /**
+     * The widths the gesture replaced on the sheet's Pending Columns, by
+     * column ID. Auto-fit on and off size them with the saved columns, in the
+     * Pending Changes and at once; a refusal puts these back.
+     */
+    readonly pendingColumnWidthsBefore?: Readonly<Record<string, number | undefined>>;
 }
 
 /**
@@ -506,6 +512,8 @@ interface WidthWriteSheet {
         | { readonly active: false };
     /** What the gesture did to Auto-fit, for its step. */
     readonly auto_fit_change?: AutoFitChange;
+    /** The Pending Column widths the caller has just replaced: see `PendingWidthSheet`. */
+    readonly pending_column_widths_before?: Readonly<Record<string, number | undefined>>;
 }
 
 /** Whether an action is a column-width or row-height step. */
@@ -9843,6 +9851,9 @@ export function App(): React.JSX.Element {
                     snapshot: auto_fit_snapshot_ref.current[entry.sheet_index],
                 },
                 ...(entry.auto_fit_change === undefined ? {} : { autoFit: entry.auto_fit_change }),
+                ...(entry.pending_column_widths_before === undefined
+                    ? {}
+                    : { pendingColumnWidthsBefore: entry.pending_column_widths_before }),
             });
         }
         state_ref.current = { ...state_ref.current, columnWidths: widths };
@@ -9970,6 +9981,17 @@ export function App(): React.JSX.Element {
             commit_staged_transaction([record]);
             return;
         }
+        // The Pending Columns go back with the toolbar. They were sized with
+        // the saved columns, ahead of the answer. A refused fit leaves the
+        // toolbar off whether or not a snapshot arrived meanwhile; a refused
+        // restore leaves it on only when none did, and off otherwise, which
+        // is where the restored Pending Columns already are.
+        for (const sheet of pending.sheets) {
+            if (sheet.pendingColumnWidthsBefore === undefined) continue;
+            if (pending.snapshotAdopted && sheet.autoFit !== 'on') continue;
+            const index = index_of(sheet);
+            if (index !== undefined) write_pending_column_widths(index, sheet.pendingColumnWidthsBefore);
+        }
         if (pending.snapshotAdopted) {
             end_superseded_auto_fit(true);
         } else {
@@ -10022,6 +10044,7 @@ export function App(): React.JSX.Element {
         set_auto_fit_for_sheet,
         show_warning,
         update_pending_auto_fit_sheets,
+        write_pending_column_widths,
     ]);
     settle_width_write_ref.current = settle_width_write;
     post_column_widths_ref.current = post_column_widths;
@@ -10351,13 +10374,20 @@ export function App(): React.JSX.Element {
         const pending_ids = Object.keys(pending_fitted);
         if (!fitted && pending_ids.length === 0) return 'nothing-to-measure';
         const sheet_index = active_sheet_index;
+        // Read before the fit touches any of it: a fit the host refuses did
+        // not happen, and this is what it puts back.
+        const auto_fit_extras_before = auto_fit_extras();
+        let pending_column_widths_before: Record<string, number | undefined> | undefined;
         if (pending_ids.length > 0) {
             const before = new Map((edit_session_registry_ref.current!
                 .pending_rows_for_sheet(sheet_index).snapshot().pendingColumns ?? [])
                 .map((column) => [column.id, column.viewerWidth]));
-            const snapshot = pending_auto_fit_snapshot_ref.current[sheet_index] ?? {};
+            // A copy: the one in the ref is what a refusal puts back.
+            const snapshot = { ...(pending_auto_fit_snapshot_ref.current[sheet_index] ?? {}) };
+            pending_column_widths_before = {};
             for (const id of pending_ids) {
                 if (!Object.prototype.hasOwnProperty.call(snapshot, id)) snapshot[id] = before.get(id);
+                pending_column_widths_before[id] = before.get(id);
             }
             pending_auto_fit_snapshot_ref.current[sheet_index] = snapshot;
             write_pending_column_widths(sheet_index, pending_fitted);
@@ -10387,10 +10417,12 @@ export function App(): React.JSX.Element {
             widths,
             auto_fit: { active: true, snapshot },
             auto_fit_change: 'on',
-        }], { owed });
+            ...(pending_column_widths_before === undefined ? {} : { pending_column_widths_before }),
+        }], { owed, auto_fit_extras_before });
         return 'posted';
     }, [
         active_sheet_index,
+        auto_fit_extras,
         post_column_widths,
         set_auto_fit_for_sheet,
         write_pending_column_widths,
@@ -10418,10 +10450,21 @@ export function App(): React.JSX.Element {
     ) => {
         const fitted = indices.filter((index) => auto_fit_active_ref.current[index]);
         if (fitted.length === 0) return;
+        // The fitted widths each sheet's Pending Columns have now, which a
+        // refused restore puts back.
+        const pending_widths_before = new Map<number, Record<string, number | undefined>>();
         for (const index of fitted) {
             const pending = pending_auto_fit_snapshot_ref.current[index];
             pending_auto_fit_snapshot_ref.current[index] = undefined;
-            if (pending !== undefined) write_pending_column_widths(index, pending);
+            if (pending === undefined) continue;
+            const now = new Map((edit_session_registry_ref.current!
+                .pending_rows_for_sheet(index).snapshot().pendingColumns ?? [])
+                .map((column) => [column.id, column.viewerWidth]));
+            pending_widths_before.set(
+                index,
+                Object.fromEntries(Object.keys(pending).map((id) => [id, now.get(id)])),
+            );
+            write_pending_column_widths(index, pending);
         }
         const writes: WidthWriteSheet[] = [];
         for (const index of fitted) {
@@ -10452,11 +10495,13 @@ export function App(): React.JSX.Element {
                 continue;
             }
             widths.sort((left, right) => left.column - right.column);
+            const pending_column_widths_before = pending_widths_before.get(index);
             writes.push({
                 sheet_index: index,
                 widths,
                 auto_fit: { active: false },
                 auto_fit_change: 'off',
+                ...(pending_column_widths_before === undefined ? {} : { pending_column_widths_before }),
             });
         }
         if (writes.length > 0) post_column_widths(writes, { auto_fit_extras_before });
