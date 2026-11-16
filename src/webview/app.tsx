@@ -10337,7 +10337,9 @@ export function App(): React.JSX.Element {
      * Reads the fit through `auto_fit_ref` rather than taking widths as an argument
      * because only a *mounted* grid can measure, and all three callers — the button,
      * the all-sheets action, and the deferred pass below — run against whichever grid
-     * is mounted at the time. Returns false when there was nothing to measure.
+     * is mounted at the time. Answers what it did: nothing when the grid had
+     * nothing to measure, a request posted for the host to answer, or the
+     * toolbar turned on with no request when only Pending Columns were measured.
      */
     const apply_auto_fit_to_active_sheet = useCallback((
         // A fit owed to this sheet and applied now that it can be: nobody
@@ -10367,12 +10369,16 @@ export function App(): React.JSX.Element {
         // would restore the fit.
         const snapshot = auto_fit_snapshot_ref.current[sheet_index]
             ?? (current_widths ? { ...current_widths } : undefined);
+        // Every measured width is asked for, whatever this window shows: its
+        // copy can be behind what another window stored, and a column left
+        // out for looking fitted here would keep that other width. Whether
+        // anything changed, and so whether there is a step, is the host's
+        // answer.
         const widths = Object.entries(fitted ?? {})
-            .map(([column, width]) => ({ column: Number(column), width }))
-            .filter(({ column, width }) => current_widths?.[column] !== width);
+            .map(([column, width]) => ({ column: Number(column), width }));
         if (widths.length === 0) {
-            // Every column already has its fitted width: nothing to write, so
-            // no step. The toolbar still turns on.
+            // Only Pending Columns were measured: nothing to ask the host
+            // for, so no step. The toolbar still turns on.
             set_auto_fit_for_sheet(sheet_index, true, snapshot);
             return 'unchanged';
         }
@@ -10426,10 +10432,13 @@ export function App(): React.JSX.Element {
             // The host refuses a request that names one, so they are left
             // as they are, like the columns a replay leaves out.
             const column_count = meta_ref.current?.sheets[index]?.columnCount ?? 0;
+            // Every width of the snapshot is asked for, not only those this
+            // window shows as different: its copy can be behind what another
+            // window stored. The host's answer says what changed.
             const widths: { column: number; width: number | null }[] = [];
             for (const [key, width] of Object.entries(snapshot)) {
                 const column = Number(key);
-                if (column < column_count && current[column] !== width) widths.push({ column, width });
+                if (column < column_count) widths.push({ column, width });
             }
             for (const key of Object.keys(current)) {
                 const column = Number(key);
@@ -10438,7 +10447,7 @@ export function App(): React.JSX.Element {
                 }
             }
             if (widths.length === 0) {
-                // Already on the widths the fit replaced: nothing to write.
+                // No width before the fit and none now: nothing to ask for.
                 set_auto_fit_for_sheet(index, false, undefined);
                 continue;
             }

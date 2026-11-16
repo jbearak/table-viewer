@@ -22906,14 +22906,55 @@ describe('view steps in history', () => {
                 const { post_message } = await render_app();
                 await open(post_message, { state: { columnWidths: [{ 0: 120 }] } });
 
+                // The window cannot know the host holds what it shows, so it
+                // asks; the host says nothing changed.
                 await click_button('Auto-fit Columns');
+                expect(latest_width_write(post_message).sheets[0].widths).toEqual([{ column: 0, width: 120 }]);
+                await answer_width_write(post_message, { stored: [{ 0: 120 }] });
                 expect(auto_fit_on()).toBe(true);
                 await click_button('Auto-fit Columns');
+                expect(latest_width_write(post_message).sheets[0].widths).toEqual([{ column: 0, width: 120 }]);
+                await answer_width_write(post_message, { stored: [{ 0: 120 }] });
                 expect(auto_fit_on()).toBe(false);
 
-                expect(width_writes(post_message)).toEqual([]);
+                expect(width_writes(post_message)).toHaveLength(2);
                 expect(undo_labels()).toEqual([]);
                 expect(cells_editable()).toEqual(EDITABLE);
+            });
+
+            it('asks for every fitted and every restored width, whatever this window shows', async () => {
+                // This window shows 120 and 80. Another window has since
+                // stored 250 for the first column, and this one has not been
+                // told. The fit measures 120 and 90: leaving out the column
+                // that looks fitted here would keep the other window's 250.
+                grid_shell_mock.auto_fit_result = { 0: 120, 1: 90 };
+                const { post_message } = await render_app();
+                await open(post_message, { state: { columnWidths: [{ 0: 120, 1: 80 }] } });
+
+                await click_button('Auto-fit Columns');
+                expect(latest_width_write(post_message).sheets[0].widths)
+                    .toEqual([{ column: 0, width: 120 }, { column: 1, width: 90 }]);
+                await deliver_widths([{ 0: 120, 1: 90 }]);
+                await answer_width_write(post_message, { stored: [{ 0: 250, 1: 80 }] });
+                // Both columns were written, the sheet is fitted, and the
+                // step is what the host changed.
+                expect(auto_fit_on()).toBe(true);
+                expect(view_step_change(history().undoStack[0].action)!.delta).toMatchObject({
+                    columns: [{ column: 0, before: 250, after: 120 }, { column: 1, before: 80, after: 90 }],
+                    autoFit: 'on',
+                });
+
+                // The restore likewise names every width it puts back.
+                await click_button('Auto-fit Columns');
+                expect(latest_width_write(post_message).sheets[0].widths)
+                    .toEqual([{ column: 0, width: 120 }, { column: 1, width: 80 }]);
+                await deliver_widths([{ 0: 120, 1: 80 }]);
+                await answer_width_write(post_message, { stored: [{ 0: 120, 1: 90 }] });
+                expect(auto_fit_on()).toBe(false);
+                expect(view_step_change(history().undoStack[1].action)!.delta).toMatchObject({
+                    columns: [{ column: 1, before: 90, after: 80 }],
+                    autoFit: 'off',
+                });
             });
 
             it('put back, with its widths, when the host did not write the fit', async () => {
