@@ -6819,6 +6819,19 @@ describe('GridShell edit-admission lifetime', () => {
             history_store: history,
         });
         const GridShell = await render_grid(initial);
+        // The admission polls each animation frame for the rows to render.
+        // The test runs the frames itself, so it can tell when the poll has
+        // stopped to wait for App's answer.
+        const frames: FrameRequestCallback[] = [];
+        const raf = vi.spyOn(window, 'requestAnimationFrame').mockImplementation((callback) => {
+            frames.push(callback);
+            return frames.length;
+        });
+        const run_frames = async () => {
+            await act(async () => {
+                for (const callback of frames.splice(0)) callback(0);
+            });
+        };
         const admit_for_paste = grid_mock.props!.onPasteRowsNeeded as (
             count: number,
             topology_key: unknown,
@@ -6842,14 +6855,13 @@ describe('GridShell edit-admission lifetime', () => {
                 settle: vi.fn(),
             });
         });
-        // The row is in the grid, and frames go by: still not answered.
+        // The row is in the grid. The poll's next frame finds it there, and
+        // the poll asks for no more frames: it waits for App's answer.
         await vi.waitUntil(() => grid_mock.props!.rows === 2);
-        for (let frame = 0; frame < 5; frame += 1) {
-            await act(async () => {
-                await new Promise((resolve) => window.requestAnimationFrame(resolve));
-            });
-        }
+        await run_frames();
+        expect(frames).toEqual([]);
         expect(admitted).toBeUndefined();
+        raf.mockRestore();
 
         await act(async () => {
             root!.render(React.createElement(GridShell, { ...initial, append_in_flight: false }));
