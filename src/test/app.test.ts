@@ -18845,6 +18845,8 @@ describe('undo and redo, from the keyboard and the desktop menu', () => {
         ['already in place, on any commit', 'desired', false, true],
         ['moved only in its conflicts, on a commit whose view moved after its write', 'conflicts', true, true],
         ['already in place but for newer conflicts, on a commit whose view moved after its write', 'desired-conflicts', true, true],
+        // An answer re-sent after a lost one, once a refresh installed it.
+        ['already in place but for newer conflicts, on an ordinary commit', 'desired-conflicts', false, true],
         ['moved in its rows, on a commit whose view moved after its write', 'rows', true, false],
         ['moved in its rows and kept by this window, on a commit whose view moved after its write', 'rows-kept', true, false],
         ['moved only in its conflicts, on an ordinary commit', 'conflicts', false, false],

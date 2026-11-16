@@ -17880,8 +17880,23 @@ export function attach_viewer(
             const ledger_generation = view_moved_after_write
                 ? core?.source_generation ?? payload.sourceGeneration
                 : payload.sourceGeneration;
+            // Across a reload, a worksheet the replay named by its old index
+            // gets a ledger only while that index still names it.
+            const source_moved = view_moved_after_write
+                && core?.source_generation !== payload.sourceGeneration;
+            const current_sheets = source?.meta().sheets ?? [];
             if (lease_session_id !== undefined) {
                 for (const structural of payload.structures) {
+                    if (source_moved) {
+                        const now = current_sheets[structural.resolvedSheetIndex];
+                        const then = structural.worksheet;
+                        if (
+                            now === undefined
+                            || (then.worksheetId !== undefined && now.worksheetId !== undefined
+                                ? now.worksheetId !== then.worksheetId
+                                : now.name !== then.sheetName)
+                        ) continue;
+                    }
                     const target = canonical_worksheet_target({
                         ...structural.worksheet,
                         sheetIndex: structural.resolvedSheetIndex,

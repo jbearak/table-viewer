@@ -451,6 +451,8 @@ describe('a replay whose view moves while its commit runs', () => {
             && snapshot_highlight((message as { snapshot: unknown }).snapshot) === 'yellow');
         expect(answered_at).toBeGreaterThanOrEqual(0);
         expect(answered_at).toBeLessThan(first_written);
+        // And the window is left with the write.
+        expect(snapshot_highlight(messages_of(panel, 'workbookSnapshot').at(-1)!.snapshot)).toBe('yellow');
     });
 
     it('still answers conflict when the durable highlight differs from the one the replay expects', async () => {

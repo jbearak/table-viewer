@@ -3743,7 +3743,8 @@ export function GridShell({
             if (!await request(quiet)) return false;
             // A grid gone meanwhile has settled what was waiting on it, and a
             // signal made now would never be: the gesture is told no. (The
-            // session the host granted stays App's, which lets it go idle.)
+            // session the host granted stays App's, and is let go once a
+            // grid is there to answer that it is idle.)
             if (grid_unmounted_ref.current) return false;
             if (editable_cells_ref.current) return true;
             const committed = editable_commit_ref.current ?? pending_signal<boolean>();
