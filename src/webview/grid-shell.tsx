@@ -4220,8 +4220,9 @@ export function GridShell({
     }, [column_projection, merges, pending_projection, projected_columns, row_count]);
     const mutate_highlight_selection = useCallback((mutation: CellHighlightMutation): boolean => {
         if (gestures_admitted !== undefined && !gestures_admitted()) {
-            // Said only while a press of Undo or Redo is waiting.
-            refused_for_history_press();
+            // Said while a press of Undo or Redo is waiting, or while App
+            // pauses edits (a pending row's highlight is an edit of its store).
+            if (!refused_for_history_press() && edits_paused) on_edit_paused_gesture?.();
             return false;
         }
         const target = current_highlight_selection();
@@ -4387,8 +4388,10 @@ export function GridShell({
     }, [
         current_highlight_selection,
         edit_session_id,
+        edits_paused,
         gestures_admitted,
         history_capture,
+        on_edit_paused_gesture,
         on_highlight_selection,
         pending_column_row_target,
         pending_projection,
@@ -7995,17 +7998,21 @@ export function GridShell({
 
     // Cmd/Ctrl+S saves while editing. The custom editor lets this bubble; here we
     // catch it at the window so it works whether or not an overlay is focused.
+    // While App alone pauses edits (a header change, a window that must be
+    // reopened) it goes to App, which says why nothing is saved; there is no
+    // editor open to fold.
     useEffect(() => {
-        if (!editable_cells) return;
+        if (!editable_cells && !edits_held_by_pause) return;
         const handler = (e: KeyboardEvent) => {
             if ((e.metaKey || e.ctrlKey) && (e.key === 's' || e.key === 'S')) {
                 e.preventDefault();
-                request_save();
+                if (editable_cells) request_save();
+                else on_save_request();
             }
         };
         window.addEventListener('keydown', handler);
         return () => window.removeEventListener('keydown', handler);
-    }, [editable_cells, request_save]);
+    }, [editable_cells, edits_held_by_pause, on_save_request, request_save]);
 
     const guarded_clear_dirty = useCallback(() => {
         if (edit_admission_is_fenced() || save_in_flight_ref.current) return;

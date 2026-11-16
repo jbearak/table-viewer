@@ -45,6 +45,11 @@ export type HistoryPressWait = 'applying' | 'updating' | 'refreshing' | 'finishi
 
 /** What the window is doing, read from its refs at one instant. */
 export interface HistoryPressFacts {
+    /**
+     * This window said it no longer matches its file ("…Reopen the file…"):
+     * its history describes a document the file is not.
+     */
+    readonly reopen_required: boolean;
     /** A header result needs a reload: the fence stays up with nothing to wait for. */
     readonly header_reload_required: boolean;
     /** A header change is queued, posted, or fenced. */
@@ -68,18 +73,22 @@ export type HistoryPressGate =
     | { readonly kind: 'run' }
     | { readonly kind: 'hold'; readonly wait: HistoryPressWait }
     /** Not transient: only a reload clears it, so the press is told at once. */
-    | { readonly kind: 'reload-required' };
+    | { readonly kind: 'reload-required' }
+    /** Not transient either: only a reopen of the file clears it. */
+    | { readonly kind: 'reopen-required' };
 
 /**
  * The first thing a press is asked, whatever is on top of the stack.
  *
- * The order is the order of the answers a person would want: a fence that
- * needs a reload is said, because nothing will clear it; a header change and a
+ * The order is the order of the answers a person would want: a window that
+ * must be reopened, or a fence that needs a reload, is said, because nothing
+ * will clear it; a header change and a
  * replay come before the gestures, so the wait names the older work; a save is
  * last, so a press behind a save that is itself behind a sort waits for the
  * sort by name.
  */
 export function history_press_gate(facts: HistoryPressFacts): HistoryPressGate {
+    if (facts.reopen_required) return { kind: 'reopen-required' };
     if (facts.header_reload_required) return { kind: 'reload-required' };
     if (facts.header_change_in_flight) return { kind: 'hold', wait: 'applying' };
     if (facts.replay_in_flight) return { kind: 'hold', wait: 'applying' };

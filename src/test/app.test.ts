@@ -3248,6 +3248,73 @@ describe('Excel first-row header toggle', () => {
         ]));
     });
 
+    it('ends a header change queued behind an undo whose answer the view could not follow, sending nothing', async () => {
+        const { post_message } = await render_app();
+        const snapshot = initial_snapshot_message(excel_meta(true), { capabilities: EDITABLE });
+        await dispatch_host_message(snapshot);
+        await click_button('Highlight');
+        await click_button('Clear all highlights');
+        const clear = post_message.mock.calls
+            .map(([message]) => message as { type?: string; requestId?: string })
+            .find((message) => message.type === 'clearAllCellHighlights');
+        await dispatch_host_message({
+            type: 'cellHighlightsChanged',
+            requestId: clear!.requestId!,
+            stateRevision: snapshot.snapshot.identity.stateRevision + 1,
+            physicalRevision: snapshot.snapshot.identity.sourceBasis.physicalRevision,
+            state: undefined,
+            deltas: [{ sheetIndex: 0, sourceRow: 1, sourceColumn: 0, before: 'yellow', after: null }],
+            sourceGeneration: snapshot.snapshot.sourceGeneration,
+        });
+        await acquire_editing_session(post_message);
+        seed_mounted_store();
+        await dispatch_host_message({ type: 'editCommand', command: 'undo' });
+        const sent = <T extends WebviewMessage['type']>(type: T) => post_message.mock.calls
+            .map(([message]) => message as WebviewMessage)
+            .filter((message): message is Extract<WebviewMessage, { type: T }> => message.type === type)
+            .at(-1)!;
+        const prepare = sent('prepareHistoryReplay');
+        await click_button('Header Row');
+        expect(header_requests(post_message)).toEqual([]);
+
+        await dispatch_host_message({
+            type: 'historyReplayPrepared',
+            prepared: {
+                requestId: prepare.request.requestId,
+                replayId: prepare.request.replayId,
+                leaseId: 'lease-1',
+                focusSheetIndex: 0,
+                focus: prepare.request.focus,
+                cells: [],
+            },
+        });
+        const commit = sent('commitHistoryReplay');
+        // The stores refuse the write: the view cannot follow it.
+        (grid_shell_mock.latest_props!.edit_session as EditSessionStore).install({ session_id: 'moved-on' });
+        await dispatch_host_message({
+            type: 'historyReplayCommitted',
+            committed: {
+                requestId: commit.request.requestId,
+                replayId: commit.request.replayId,
+                leaseId: commit.request.leaseId,
+                mutationId: commit.request.mutationId,
+                sourceGeneration: 1,
+                cells: [{ ordinal: 0, resolvedSheetIndex: 0, key: '1:0', entry: null }],
+                focusSheetIndex: 0,
+                focus: prepare.request.focus,
+                displayFocus: null,
+            },
+        });
+        // A render later, as the drain would run.
+        await dispatch_host_message({ type: 'fontChanged', fontFamily: 'serif', fontSize: 12 });
+        expect(header_requests(post_message)).toEqual([]);
+        const said = post_message.mock.calls
+            .map(([message]) => message as WebviewMessage)
+            .filter((message): message is Extract<WebviewMessage, { type: 'showWarning' }> => message.type === 'showWarning')
+            .map((message) => message.message);
+        expect(said).toContain('This view no longer matches the file. Reopen the file to keep editing.');
+    });
+
     it('holds undo while a header change holds the fence, and says so only if it does not end', async () => {
         const { post_message } = await render_app();
         await dispatch_host_message(initial_snapshot_message(excel_meta(true), {
@@ -3445,6 +3512,43 @@ describe('Excel first-row header toggle', () => {
             type: 'showWarning',
             message: 'Reload this window to finish the header row change, then edit.',
         }]);
+    });
+
+    it('publishes nothing once the header change could not be confirmed, until a reload', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(excel_meta(true), {
+            capabilities: EDITABLE,
+        }));
+        await acquire_editing_session(post_message);
+        await click_button('Header Row');
+        const [request] = header_requests(post_message);
+        await dispatch_host_message(refresh_snapshot_message(excel_meta(true), {
+            reason: 'excelHeader',
+            commandResult: {
+                type: 'excelFirstRowHeader',
+                requestId: request.requestId,
+                outcome: 'recovered',
+                reloadRequired: true,
+                error: 'Failed to reload: disk unavailable',
+            },
+            capabilities: { ...EDITABLE, csvEditSessionId: 'test-edit-session' },
+        }));
+        // The host may have moved the Pending Changes to the new header; this
+        // window's stores are in the old numbering.
+        seed_mounted_store({ '1:0': { value: 'Alicia', base: 'Alice' } });
+        post_message.mockClear();
+        const publications = () => post_message.mock.calls
+            .map(([message]) => message as WebviewMessage)
+            .filter((message) => message.type === 'pendingEditsChanged' || message.type === 'pendingChangesChanged');
+        await dispatch_host_message({ type: 'requestPendingChangesFlush', requestId: 'close-after-header' });
+        await vi.waitUntil(() => post_message.mock.calls.some(([message]) => message?.type === 'pendingChangesFlush'));
+        expect(publications()).toEqual([]);
+
+        await dispatch_host_message(initial_snapshot_message(excel_meta(true), {
+            capabilities: { ...EDITABLE, csvEditSessionId: 'test-edit-session' },
+        }));
+        const { publication_fence } = await import('../webview/host-bridge');
+        expect(publication_fence.is_raised()).toBe(false);
     });
 
     it('drops a queued promotion when the view changes before it can be sent', async () => {
@@ -20172,6 +20276,57 @@ describe('undo and redo, from the keyboard and the desktop menu', () => {
             .toEqual(['Clear all highlights']);
     });
 
+    it('fences the window after a committed replay it could not land, and still lets a clean session go', async () => {
+        // Main's case: the stores refuse to stage the host's write (stamped
+        // for another session). The window stops sending its stores until a
+        // new document; releasing a session that holds nothing sends none.
+        const { post_message } = await render_app();
+        await record_highlight(post_message, {
+            snapshot_extra: { capabilities: { csvEditable: true, csvEditingSupported: true } },
+        });
+        await acquire_editing_session(post_message);
+        seed_mounted_store();
+        await undo_via_menu();
+        const prepare = sent(post_message, 'prepareHistoryReplay');
+        await dispatch_host_message({
+            type: 'historyReplayPrepared',
+            prepared: {
+                requestId: prepare.request.requestId,
+                replayId: prepare.request.replayId,
+                leaseId: 'lease-1',
+                focusSheetIndex: 0,
+                focus: prepare.request.focus,
+                cells: [],
+            },
+        });
+        const commit = sent(post_message, 'commitHistoryReplay');
+        (grid_shell_mock.latest_props!.edit_session as EditSessionStore)
+            .install({ session_id: 'moved-on' });
+        post_message.mockClear();
+        await dispatch_host_message({
+            type: 'historyReplayCommitted',
+            committed: {
+                requestId: commit.request.requestId,
+                replayId: commit.request.replayId,
+                leaseId: commit.request.leaseId,
+                mutationId: commit.request.mutationId,
+                sourceGeneration: 1,
+                cells: [{ ordinal: 0, resolvedSheetIndex: 0, key: '3:2', entry: null }],
+                focusSheetIndex: 0,
+                focus: prepare.request.focus,
+                displayFocus: null,
+            },
+        });
+        expect(sent(post_message, 'showWarning').message).toContain('could not be updated');
+        const { publication_fence } = await import('../webview/host-bridge');
+        expect(publication_fence.is_raised()).toBe(true);
+        expect(grid_shell_mock.latest_props!.edits_paused).toBe(true);
+
+        post_message.mockClear();
+        await release_idle_edit_session();
+        expect(sent(post_message, 'releaseEditSession')).toBeDefined();
+    });
+
     it('says so when the replayed region is hidden by the view', async () => {
         const { post_message } = await render_app();
         await record_highlight(post_message);
@@ -20493,6 +20648,28 @@ describe('undo and redo, from the keyboard and the desktop menu', () => {
             await complete_replay(post_message);
             expect(prepares(post_message)).toHaveLength(1);
             expect(undo_labels()).toEqual([CLEAR]);
+        });
+
+        it('does not fence the window when a press only waited out its lease', async () => {
+            const { post_message } = await render_app();
+            await two_steps(post_message);
+            vi.useFakeTimers();
+            try {
+                await undo_via_menu();
+                await act(async () => { vi.advanceTimersByTime(30_000); });
+                expect(warnings(post_message)).toContain(
+                    'Undo has not finished yet. If this window stays busy, reopen the file.',
+                );
+            } finally {
+                vi.useRealTimers();
+            }
+            const { publication_fence } = await import('../webview/host-bridge');
+            expect(publication_fence.is_raised()).toBe(false);
+            await complete_replay(post_message);
+            expect(undo_labels()).toEqual([CLEAR]);
+            expect(publication_fence.is_raised()).toBe(false);
+            expect(grid_shell_mock.latest_props!.edits_paused).toBe(false);
+            expect(props().gestures_admitted?.()).toBe(true);
         });
 
         it('drops the held press when the view could not follow a committed replay', async () => {
@@ -24563,6 +24740,140 @@ describe('view steps in history', () => {
                 expect(warnings(post_message)).toEqual([
                     'The change was undone in the file, but this view could not be updated. Reopen the file to resynchronize.',
                 ]);
+            });
+
+            describe('after it says the view needs reopening', () => {
+                const REOPEN = 'This view no longer matches the file. Reopen the file to keep editing.';
+                const REOPEN_SAVE = 'This view no longer matches the file. Reopen the file, then save.';
+                const SESSION = { ...CSV, csvEditSessionId: 'first-session' };
+                const publications = (post_message: ReturnType<typeof vi.fn>) => post_message.mock.calls
+                    .map(([message]) => message as WebviewMessage)
+                    .filter((message) => message.type === 'pendingEditsChanged' || message.type === 'pendingChangesChanged');
+                async function flush(post_message: ReturnType<typeof vi.fn>, request_id: string) {
+                    await dispatch_host_message({ type: 'requestPendingChangesFlush', requestId: request_id });
+                    await vi.waitUntil(() => posted(post_message, 'pendingChangesFlush')
+                        .some((answer) => answer.requestId === request_id));
+                    return posted(post_message, 'pendingChangesFlush').find((answer) => answer.requestId === request_id)!;
+                }
+                async function fence() {
+                    const { publication_fence } = await import('../webview/host-bridge');
+                    return publication_fence;
+                }
+                /**
+                 * Sol's sequence: Sheet1 holds an edit; Undo; a refresh takes
+                 * Sheet1 away before the answer, which says the write landed
+                 * and the view moved. Sheet1's parked store still holds the
+                 * edit the host undid.
+                 */
+                async function diverge(post_message: ReturnType<typeof vi.fn>) {
+                    await edited(post_message, table_meta(['Sheet1', 'Sheet2']));
+                    // Published before the Undo and dropped by the host (it
+                    // never answers): a sequence nothing will acknowledge.
+                    const before = await flush(post_message, 'before-undo');
+                    expect(before.highestProducedSequence).toBe(1);
+                    post_message.mockClear();
+                    await undo();
+                    await complete_cell_replay(post_message, {
+                        viewMoved: true,
+                        displayFocus: ROW_0,
+                        keep_messages: true,
+                        before_answer: () => dispatch_host_message(refresh_snapshot_message(
+                            table_meta(['Sheet2']),
+                            { generation: view_generation, sourceGeneration: 1, reason: 'other', capabilities: SESSION },
+                        )),
+                    });
+                    expect(warnings(post_message)).toEqual([
+                        'The change was undone in the file, but this view could not be updated. Reopen the file to resynchronize.',
+                    ]);
+                    post_message.mockClear();
+                }
+
+                it('publishes nothing at a refresh or at close, and the close answers only what the host acknowledged', async () => {
+                    const { post_message } = await render_app();
+                    await diverge(post_message);
+
+                    // Sheet1 back: its parked store would be published again.
+                    await dispatch_host_message(refresh_snapshot_message(
+                        table_meta(['Sheet1', 'Sheet2']),
+                        { generation: view_generation, sourceGeneration: 1, reason: 'other', capabilities: SESSION },
+                    ));
+                    const answer = await flush(post_message, 'close-after-divergence');
+                    expect(publications(post_message)).toEqual([]);
+                    // Not sequence 1, which the host dropped and would wait on
+                    // until the close timed out.
+                    expect(answer).toMatchObject({ editSessionId: 'first-session', highestProducedSequence: 0 });
+                });
+
+                it('refuses Save, edits, Undo and Redo with one message', async () => {
+                    const { post_message } = await render_app();
+                    await diverge(post_message);
+
+                    expect(props().edits_paused).toBe(true);
+                    expect(props().gestures_admitted?.()).toBe(false);
+                    await click_button('Save');
+                    expect(posted(post_message, 'saveCsv')).toEqual([]);
+                    expect(warnings(post_message)).toEqual([REOPEN_SAVE]);
+
+                    post_message.mockClear();
+                    await undo();
+                    await redo();
+                    act(() => { props().on_edit_paused_gesture?.(); });
+                    act(() => { props().on_edit_paused_gesture?.(); });
+                    expect(posted(post_message, 'prepareHistoryReplay')).toEqual([]);
+                    expect(undo_labels()).toEqual(['Edit cell']);
+                    // A burst says it once.
+                    expect(warnings(post_message)).toEqual([REOPEN]);
+                });
+
+                it('refuses Discard with the message', async () => {
+                    const { post_message } = await render_app();
+                    await diverge(post_message);
+
+                    await click_button('Discard');
+                    expect(posted(post_message, 'discardEditSession')).toEqual([]);
+                    expect(warnings(post_message)).toEqual([REOPEN]);
+                });
+
+                it('comes down with a new document, which publishes again, and a close answers what it produced', async () => {
+                    const { post_message } = await render_app();
+                    await diverge(post_message);
+                    expect((await fence()).is_raised()).toBe(true);
+
+                    await dispatch_host_message(initial_snapshot_message(table_meta(['Sheet1', 'Sheet2']), {
+                        capabilities: SESSION,
+                    }));
+                    expect((await fence()).is_raised()).toBe(false);
+                    expect(props().edits_paused).toBe(false);
+                    expect(props().gestures_admitted?.()).toBe(true);
+                    // The close publishes the replaced stores' truth under new
+                    // sequences, and answers those, not the dropped one.
+                    post_message.mockClear();
+                    const reopened = await flush(post_message, 'close-after-reopen');
+                    const truth = publications(post_message) as Extract<WebviewMessage, { type: 'pendingEditsChanged' }>[];
+                    expect(truth.map((message) => message.edits)).toEqual([{}]);
+                    expect(reopened.highestProducedSequence).toBe(truth[0].sequence);
+                    expect(reopened.highestProducedSequence).toBeGreaterThan(1);
+
+                    await act(async () => {
+                        props().edit_session!.commit('first-session', '1:1', { value: 'again', base: 'x' });
+                    });
+                    post_message.mockClear();
+                    const answer = await flush(post_message, 'close-after-edit');
+                    const edited_again = publications(post_message) as Extract<WebviewMessage, { type: 'pendingEditsChanged' }>[];
+                    expect(edited_again.map((message) => message.edits)).toEqual([{ '1:1': { value: 'again', base: 'x' } }]);
+                    expect(answer.highestProducedSequence).toBe(edited_again[0].sequence);
+                });
+
+                it('takes the fence down when the window goes', async () => {
+                    const { post_message } = await render_app();
+                    await diverge(post_message);
+                    const publication_fence = await fence();
+                    expect(publication_fence.is_raised()).toBe(true);
+                    act(() => { root?.unmount(); });
+                    root = null;
+                    expect(publication_fence.is_raised()).toBe(false);
+                });
+
             });
 
             it('does not apply a delivery made before the write that arrives after the answer', async () => {

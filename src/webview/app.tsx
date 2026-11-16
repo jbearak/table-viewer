@@ -230,6 +230,8 @@ import {
     COLUMN_WRITE_REFUSED_MESSAGE,
     FOLD_REFUSED_MESSAGE,
     REDO_REPLACED_BY_FOLD_MESSAGE,
+    REOPEN_REQUIRED_MESSAGE,
+    REOPEN_REQUIRED_SAVE_MESSAGE,
     SIZE_WRITE_REFUSED_MESSAGE,
     SIZE_WRITE_UNRESOLVED_MESSAGE,
     UNRESOLVED_SAVE_SIZE_REASON,
@@ -256,6 +258,7 @@ import {
     view_step_press_gate,
     type HistoryPress,
     type HistoryPressFacts,
+    type HistoryPressGate,
     type HistoryPressWait,
 } from './history-press-model';
 import {
@@ -374,6 +377,7 @@ import {
     install_pending_edit_flush_responder,
     pending_edit_durability,
     pending_changes_durability,
+    publication_fence,
 } from './host-bridge';
 import { apply_font_family, apply_font_size } from './vscode-theme';
 import {
@@ -399,6 +403,23 @@ type ColumnVisibilityUpdater = (
  * when it installs.
  */
 type TransformOrigin = 'grid' | 'toolbar' | 'restore' | 'history';
+
+/** What a press is told when the window gate needs a reopen or a reload. */
+function terminal_gate_message(
+    gate: Extract<HistoryPressGate, { kind: 'reload-required' | 'reopen-required' }>,
+): string {
+    return gate.kind === 'reopen-required'
+        ? REOPEN_REQUIRED_MESSAGE
+        : 'Reload this window to finish the header row change, then edit.';
+}
+
+/** What a gesture admission may leave out. */
+interface GestureAdmissionOptions {
+    /** The reopen fence: only for releasing an idle session. */
+    readonly ignore_reopen?: boolean;
+    /** A replay still waiting for this window's transforms: only for Cancel. */
+    readonly replay_waiting_may_pass?: boolean;
+}
 
 /** A view step's replay in flight: the entry it moves when the host answers. */
 interface ViewReplay {
@@ -1322,6 +1343,16 @@ export function App(): React.JSX.Element {
      */
     const edit_session_sheet_index_ref = useRef<number>(0);
     const renderer_publication_fenced_session_ref = useRef<string>();
+    /**
+     * This window said it no longer matches its file ("…Reopen the file to
+     * resynchronize."). Until a new document replaces every store it takes no
+     * recorded change, and `publication_fence` keeps its stores from the host.
+     * The state copy pauses the grid's editing in the same render.
+     */
+    const reopen_required_ref = useRef(false);
+    const [reopen_required, set_reopen_required] = useState(false);
+    // Declared with the header queue's drain, further down.
+    const wake_header_drain_ref = useRef<() => void>(() => {});
     // The dirty maps, one per worksheet, owned here so they survive the
     // generation-keyed GridShell remounts that a transform or refresh snapshot
     // forces.
@@ -1655,6 +1686,12 @@ export function App(): React.JSX.Element {
         const sheet = meta_ref.current?.sheets[sheet_index];
         const session_id = csv_edit_session_id_ref.current;
         if (sheet === undefined || session_id === undefined) return;
+        // A window that must be reopened changes no store (declared before
+        // `refused_for_reopen`, so it says so itself).
+        if (reopen_required_ref.current) {
+            host_bridge.postMessage({ type: 'showWarning', message: REOPEN_REQUIRED_MESSAGE });
+            return;
+        }
         // Admitted like every other edit gesture: not across a save, a
         // replay, an outstanding highlight, resize, or append.
         if (save_in_flight_ref.current || !edit_gestures_admitted()) return;
@@ -1696,6 +1733,10 @@ export function App(): React.JSX.Element {
         const sheet = meta_ref.current?.sheets[sheet_index];
         const session_id = csv_edit_session_id_ref.current;
         if (sheet === undefined || session_id === undefined) return;
+        if (reopen_required_ref.current) {
+            host_bridge.postMessage({ type: 'showWarning', message: REOPEN_REQUIRED_MESSAGE });
+            return;
+        }
         if (save_in_flight_ref.current || !edit_gestures_admitted()) return;
         const store = edit_session_registry_ref.current!.pending_rows_for_sheet(sheet_index);
         const before = store.snapshot();
@@ -1854,6 +1895,46 @@ export function App(): React.JSX.Element {
         said.set(message, now);
         host_bridge.postMessage({ type: 'showWarning', message });
     }, []);
+
+    /**
+     * Whether this window must be reopened before it takes a change, saying so
+     * when it must (once for a burst, by `say_history`'s repeat rule).
+     */
+    const refused_for_reopen = useCallback((): boolean => {
+        if (!reopen_required_ref.current) return false;
+        say_history(REOPEN_REQUIRED_MESSAGE);
+        return true;
+    }, [say_history]);
+
+    /**
+     * This window has said it no longer matches its file. From here it sends
+     * nothing of its stores to the host and takes no recorded change, until a
+     * new document replaces every store (`lower_reopen_fence`): a store that
+     * disagrees with the file would otherwise be written over the change.
+     */
+    const raise_reopen_fence = useCallback(() => {
+        reopen_required_ref.current = true;
+        // In this render, so the grid closes an open editor without
+        // committing it (its `editable_cells` layout effect).
+        set_reopen_required(true);
+        publication_fence.raise();
+        // A Header Row change queued behind the replay ends now.
+        wake_header_drain_ref.current();
+    }, []);
+    /**
+     * A new document has replaced every store from durable state, so this
+     * window matches its file again. The publications of the stores it
+     * replaced are forgotten, if the fence held them back: nothing will retry
+     * them, and one the host dropped would hold every wait for acknowledgement.
+     */
+    const lower_reopen_fence = useCallback(() => {
+        if (publication_fence.is_raised()) publication_fence.forget_outstanding();
+        publication_fence.lower();
+        reopen_required_ref.current = false;
+        set_reopen_required(false);
+    }, []);
+    // The bridge outlives this window's App.
+    useLayoutEffect(() => () => publication_fence.lower(), []);
 
     /**
      * One timer for both slots, at the earlier of their two bounds. It forces
@@ -2760,6 +2841,7 @@ export function App(): React.JSX.Element {
         // Whatever a header change waits for, a held press may wait for too.
         wake_history_press();
     }, [wake_history_press]);
+    wake_header_drain_ref.current = wake_header_drain;
     const [filter_editor, set_filter_editor] = useState<{
         column_index: number;
         anchor: { left: number; top: number };
@@ -3091,6 +3173,11 @@ export function App(): React.JSX.Element {
         header_edit_warning_ref.current = message;
         host_bridge.postMessage({ type: 'showWarning', message });
     }, []);
+    /** Say why an edit gesture met cells the window keeps from taking it. */
+    const warn_edit_paused = useCallback(() => {
+        if (refused_for_reopen()) return;
+        warn_edit_waits_for_header();
+    }, [refused_for_reopen, warn_edit_waits_for_header]);
     const [header_fence, set_header_fence] = useState(false);
     // The header queue's verdict on a header result; see `drain_excel_header_queue`.
     const header_result_handler_ref = useRef<
@@ -3881,6 +3968,9 @@ export function App(): React.JSX.Element {
 
     const discard_edit_session = useCallback(() => {
         if (!csv_edit_session_id) return;
+        // Nothing this window holds is sent, and a Discard is recorded: it
+        // waits for the reopen like every other change.
+        if (refused_for_reopen()) return;
         // A discard is a recorded gesture, so it answers to the same reservation
         // every other one does — and it does NOT reach `run_edit_gesture`, which is
         // where the rest of them are gated. Recorded across a highlight round trip
@@ -3964,7 +4054,7 @@ export function App(): React.JSX.Element {
             type: 'discardEditSession',
             editSessionId: csv_edit_session_id,
         });
-    }, [clear_save_verdict, csv_edit_session_id, fence_edit_session_exit]);
+    }, [clear_save_verdict, csv_edit_session_id, fence_edit_session_exit, refused_for_reopen]);
 
     const begin_save_operation = useCallback((): CsvSaveOperation | undefined => {
         // A conflict notice's dismissal is occurrence-scoped: Save is the
@@ -3974,6 +4064,12 @@ export function App(): React.JSX.Element {
             ? new Set([...current].filter((key) => !is_conflict_dismissal(key)))
             : current);
         if (!csv_edit_session_id || save_projection_ref.current.operation) return undefined;
+        // A window that no longer matches its file would save its own stores,
+        // which disagree with it, over the file.
+        if (reopen_required_ref.current) {
+            host_bridge.postMessage({ type: 'showWarning', message: REOPEN_REQUIRED_SAVE_MESSAGE });
+            return undefined;
+        }
         // A Header Row change carries the session's Pending Changes to the new
         // header in its own durable write; Save waits until it has landed.
         if (header_fence_ref.current) {
@@ -5263,6 +5359,7 @@ export function App(): React.JSX.Element {
                         pending_row_replay_plan_ref.current = null;
                         pending_row_replay_busy_ref.current = false;
                         edit_session_registry_ref.current!.replace_document();
+                        lower_reopen_fence();
                         // A different file is under the history now. Any
                         // surviving action would be the previous workbook's
                         // edits, waiting to be replayed through whatever
@@ -7215,9 +7312,13 @@ export function App(): React.JSX.Element {
      * Both reservations therefore live in refs.
      */
     const base_gestures_admitted = useCallback(
-        (replay_waiting_may_pass = false) => !header_fence_ref.current
+        // `ignore_reopen`: for releasing an idle session, which sends nothing
+        // of the stores and is the one thing a window that must be reopened
+        // still does.
+        (options?: GestureAdmissionOptions) => !header_fence_ref.current
+            && (options?.ignore_reopen === true || !reopen_required_ref.current)
             && (
-                (replay_waiting_may_pass && replay_waiting_for_transforms_ref.current > 0)
+                (options?.replay_waiting_may_pass === true && replay_waiting_for_transforms_ref.current > 0)
                 || (
                     !(replay_coordinator_ref.current?.is_busy() ?? false)
                     && !pending_row_replay_busy_ref.current
@@ -7248,7 +7349,7 @@ export function App(): React.JSX.Element {
      * the press waits for must still finish.
      */
     const history_free = useCallback(
-        () => base_gestures_admitted()
+        (options?: GestureAdmissionOptions) => base_gestures_admitted(options)
             && press_admits()
             && pending_column_write_ref.current === null
             && pending_width_write_ref.current === null
@@ -7262,7 +7363,7 @@ export function App(): React.JSX.Element {
      * of the gesture the person made first.
      */
     const edit_gestures_admitted = useCallback(
-        () => history_free()
+        (options?: GestureAdmissionOptions) => history_free(options)
             && !pending_view_transforms_ref.current.some((pending) => pending !== undefined),
         [history_free],
     );
@@ -7540,6 +7641,7 @@ export function App(): React.JSX.Element {
             refuse_history_press(
                 `The change was ${replayed_verb(accepted.direction)} in the file, but this view could not be updated. Reopen the file to resynchronize.`,
             );
+            raise_reopen_fence();
             return;
         }
         const display_focus = committed.displayFocus;
@@ -8185,6 +8287,7 @@ export function App(): React.JSX.Element {
         const row_requests = [...pending_row_resize_requests_ref.current.values()];
         const session_id = csv_edit_session_id_ref.current;
         return {
+            reopen_required: reopen_required_ref.current,
             header_reload_required: header_reload_required_ref.current,
             header_change_in_flight: excel_header_queue_ref.current !== null
                 || pending_excel_header_ref.current !== null
@@ -8245,8 +8348,8 @@ export function App(): React.JSX.Element {
                 hold_history_press(press, gate.wait);
                 return false;
             }
-            // A header result needs a reload: nothing will clear it.
-            refuse_history_press('Reload this window to finish the header row change, then edit.');
+            // A reopen or a reload is needed: nothing else will clear it.
+            refuse_history_press(terminal_gate_message(gate));
             return false;
         };
         if (!ask_window()) return;
@@ -8812,12 +8915,13 @@ export function App(): React.JSX.Element {
                 const arrived = (retry.awaits === 'delivery'
                     ? snapshot_applied_seq_ref.current
                     : applied_snapshot_seq_ref.current) > retry.posted_after;
-                if (history_press_gate(read_press_facts(true)).kind === 'reload-required') {
-                    // A header result needs a reload: nothing will clear it,
-                    // and that, not a refresh, is what to say.
+                const gate = history_press_gate(read_press_facts(true));
+                if (gate.kind === 'reload-required' || gate.kind === 'reopen-required') {
+                    // A reopen or a reload is needed: nothing else will clear
+                    // it, and that, not a refresh, is what to say.
                     retry_press_ref.current = null;
                     arm_history_press_timer();
-                    refuse_history_press('Reload this window to finish the header row change, then edit.');
+                    refuse_history_press(terminal_gate_message(gate));
                 } else if (history_press_bound_reached(retry.press, Date.now())) {
                     give_up();
                 } else if (!arrived) {
@@ -9450,6 +9554,15 @@ export function App(): React.JSX.Element {
         if (queue === null || pending_excel_header_ref.current !== null) return;
         const [next_sheet] = queue.sheets;
         const run = header_run_ref.current;
+        if (reopen_required_ref.current) {
+            // Queued before this window said it no longer matches its file
+            // (behind the replay it could not follow): not sent. A replay's
+            // own run never gets here, since the press gate refuses it first.
+            set_excel_header_status('Header row was not updated.');
+            say_history(REOPEN_REQUIRED_MESSAGE);
+            finish_header_queue({ reason: REOPEN_REQUIRED_MESSAGE });
+            return;
+        }
         if (next_sheet === undefined) {
             finish_header_queue();
             return;
@@ -9601,6 +9714,12 @@ export function App(): React.JSX.Element {
         const report = replaying ? 'handled' as const : 'report' as const;
         if (result.reloadRequired === true) {
             header_reload_required_ref.current = true;
+            // The header change may have been stored, moving the Pending
+            // Changes to the new header while this window's stores keep the
+            // old numbering: none of them is sent until the reload replaces
+            // them. (Everything was published and acknowledged before the
+            // request was posted, so nothing is held back.)
+            publication_fence.raise();
             // What changed before this is recorded; a replay's entry stays,
             // and the reload message below is what the person is told, in
             // place of anything an earlier sheet left to say.
@@ -9679,6 +9798,8 @@ export function App(): React.JSX.Element {
         ) return false;
         const sheets = meta_ref.current?.sheets ?? [];
         const { replay } = request;
+        // A replay is refused at the press gate before it gets here.
+        if (replay === undefined && refused_for_reopen()) return false;
         // A header gesture made while a press of Undo or Redo is waiting is
         // not queued. Queued, it would be carried out ahead of the press, the
         // press would be held behind it, and the press would then undo the
@@ -9748,6 +9869,7 @@ export function App(): React.JSX.Element {
         header_change_refusal,
         history_press_held,
         refuse_history_press,
+        refused_for_reopen,
         replace_excel_header_queue,
         say_history_hold_gesture,
         show_warning,
@@ -10048,7 +10170,7 @@ export function App(): React.JSX.Element {
             || pending_edit_request_ref.current !== null
             || discard_cleanup_ref.current !== undefined
             || pending_saved_row_restorations_ref.current.size > 0
-            || !edit_gestures_admitted()
+            || !edit_gestures_admitted({ ignore_reopen: true })
             // Text typed into the append composer is unsaved work too, and the
             // drafts are dropped with the session that owns them.
             || [...append_composer_drafts_ref.current.values()].some(({ draft }) =>
@@ -10107,7 +10229,7 @@ export function App(): React.JSX.Element {
         // A replay still waiting for this window's transforms has asked the
         // host for nothing yet: a Cancel of one of them goes through, and the
         // replay waits for the cancel's answer instead.
-        || !base_gestures_admitted(true)
+        || !base_gestures_admitted({ replay_waiting_may_pass: true })
     ), [base_gestures_admitted, edit_session_pending, preview_mode]);
 
     /**
@@ -10129,6 +10251,7 @@ export function App(): React.JSX.Element {
     const view_gesture_may_start = useCallback((
         transform_sheet_index: number | undefined,
     ): boolean => {
+        if (refused_for_reopen()) return false;
         const fold = fold_before_view_request();
         if (fold === 'refused') return false;
         const column_write = pending_column_write_ref.current;
@@ -10156,7 +10279,7 @@ export function App(): React.JSX.Element {
         // the click did commit the edit, and only the gesture is left to repeat.
         if (blocked && fold === 'folded') show_warning(VIEW_GESTURE_WAIT_MESSAGE);
         return !blocked;
-    }, [edit_gestures_admitted, fold_before_view_request, show_warning, transform_request_blocked]);
+    }, [edit_gestures_admitted, fold_before_view_request, refused_for_reopen, show_warning, transform_request_blocked]);
 
     /**
      * While a worksheet holds Pending Inserted Rows its display order must
@@ -10697,6 +10820,7 @@ export function App(): React.JSX.Element {
         // on a stale generation. That is why a cancel asks the same question every
         // other transform request asks — see `transform_request_blocked` — on
         // the terms `cancel_blocked` keeps.
+        if (refused_for_reopen()) return;
         if (cancel_blocked()) return;
         const previous = transform_rollback_baseline(
             sheet_views[active_sheet_index],
@@ -10728,6 +10852,7 @@ export function App(): React.JSX.Element {
         cancel_blocked,
         drop_history_presses,
         meta,
+        refused_for_reopen,
         request_transform,
         sheet_views,
     ]);
@@ -10735,7 +10860,12 @@ export function App(): React.JSX.Element {
     const request_save_or_remain_dirty = useCallback(() => {
         const editing = editing_ref.current;
         if (!editing) return false;
-        // See `begin_save_operation`: nothing is saved across a header change.
+        // See `begin_save_operation`: nothing is saved from a window that must
+        // be reopened, or across a header change.
+        if (reopen_required_ref.current) {
+            show_warning(REOPEN_REQUIRED_SAVE_MESSAGE);
+            return true;
+        }
         if (header_fence_ref.current) {
             warn_save_waits_for_header();
             return true;
@@ -10746,7 +10876,7 @@ export function App(): React.JSX.Element {
         const requested = editing.request_save();
         return requested
             || edit_session_registry_ref.current!.has_dirty_entries();
-    }, []);
+    }, [show_warning]);
 
     const handle_save = useCallback(() => {
         request_save_or_remain_dirty();
@@ -11482,6 +11612,7 @@ export function App(): React.JSX.Element {
             || preview_mode_ref.current
             || pending_highlight_request_ref.current
         ) return;
+        if (refused_for_reopen()) return;
         if (!edit_gestures_admitted()) {
             // Said only while a press of Undo or Redo is waiting.
             if (history_press_held()) say_history_hold_gesture();
@@ -11506,7 +11637,7 @@ export function App(): React.JSX.Element {
             sourceGeneration: source_generation_ref.current,
             snapshotIdentity: identity,
         });
-    }, [edit_gestures_admitted, history_press_held, say_history_hold_gesture]);
+    }, [edit_gestures_admitted, history_press_held, refused_for_reopen, say_history_hold_gesture]);
 
     const handle_toggle_tab_orientation = useCallback(() => {
         set_vertical_tabs((prev) => {
@@ -11880,13 +12011,14 @@ export function App(): React.JSX.Element {
      * border that springs back needs a reason.
      */
     const size_gesture_may_start = useCallback((): boolean => {
+        if (refused_for_reopen()) return false;
         if (fold_before_view_request() === 'refused') return false;
         if (save_in_flight_ref.current || !edit_gestures_admitted()) {
             show_warning(VIEW_GESTURE_WAIT_MESSAGE);
             return false;
         }
         return true;
-    }, [edit_gestures_admitted, fold_before_view_request, show_warning]);
+    }, [edit_gestures_admitted, fold_before_view_request, refused_for_reopen, show_warning]);
 
     const column_write_seq_ref = useRef(0);
     /**
@@ -13487,8 +13619,8 @@ export function App(): React.JSX.Element {
             edit_activation_id={edit_activation_id}
             highlight_in_flight={highlight_request_pending}
             view_request_in_flight={view_request_pending}
-            edits_paused={header_fence}
-            on_edit_paused_gesture={warn_edit_waits_for_header}
+            edits_paused={header_fence || reopen_required}
+            on_edit_paused_gesture={warn_edit_paused}
             append_in_flight={append_request_pending}
             csv_editable={csv_editable}
             append_row_ceiling={append_row_ceiling}
@@ -14162,6 +14294,10 @@ export function App(): React.JSX.Element {
                                         )}
                                         <button
                                             onClick={() => {
+                                                // Writes this window's store, which
+                                                // a window that must be reopened
+                                                // no longer sends to the file.
+                                                if (refused_for_reopen()) return;
                                                 cancel_external_change_navigation();
                                                 if (external_change_item_count === 1) {
                                                     grid_focus_ref.current?.focus();
@@ -14271,6 +14407,10 @@ export function App(): React.JSX.Element {
                                     <div className="external-change-item-actions">
                                         <button
                                             onClick={() => {
+                                                // Writes this window's store, which
+                                                // a window that must be reopened
+                                                // no longer sends to the file.
+                                                if (refused_for_reopen()) return;
                                                 cancel_external_change_navigation();
                                                 if (external_change_item_count === 1) {
                                                     grid_focus_ref.current?.focus();

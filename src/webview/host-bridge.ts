@@ -82,6 +82,19 @@ interface PendingEditSessionChannel {
      * every earlier write landed, and prunes them.
      */
     supersededStructuralBySheet: Map<string, { readonly sequence: number; readonly payload: string }[]>;
+    /**
+     * The highest sequence the host has acknowledged. The host's own count is
+     * a maximum too, and it acknowledges before this window hears of it, so
+     * this never runs ahead of the host's.
+     */
+    highestAcknowledged: number;
+    /**
+     * Sequences up to here were posted before the publication fence last rose,
+     * and this window no longer vouches for them: the host either took one
+     * (and drains it before it waits) or dropped it, and a dropped one is never
+     * acknowledged.
+     */
+    abandonedThrough: number;
 }
 
 /**
@@ -164,11 +177,56 @@ function pending_edit_channel(session_id: string): PendingEditSessionChannel {
             latestPublicationBySheet: new Map(),
             unacknowledgedSequences: new Set(),
             supersededStructuralBySheet: new Map(),
+            highestAcknowledged: 0,
+            abandonedThrough: 0,
         };
         pending_edit_channels.set(session_id, channel);
     }
     return channel;
 }
+
+/**
+ * Up from the moment this window says it no longer matches its file ("…Reopen
+ * the file…") until a new document has replaced every store: nothing the
+ * window holds is sent to the host, so a store that disagrees with the file
+ * cannot be written over it. Every publication passes through the two
+ * publishers below, which post nothing while it is up.
+ */
+let publications_fenced = false;
+
+/** The highest sequence of the session this window vouches for. */
+function vouched_sequence(channel: PendingEditSessionChannel | undefined): number {
+    if (channel === undefined) return 0;
+    const produced = channel.nextSequence - 1;
+    return produced > channel.abandonedThrough ? produced : channel.highestAcknowledged;
+}
+
+export const publication_fence = {
+    raise(): void {
+        publications_fenced = true;
+        for (const channel of pending_edit_channels.values()) {
+            channel.abandonedThrough = channel.nextSequence - 1;
+        }
+    },
+    lower(): void {
+        publications_fenced = false;
+    },
+    is_raised(): boolean {
+        return publications_fenced;
+    },
+    /**
+     * A new document replaced the stores these publications were of, so
+     * nothing will retry them. Left outstanding, one the host dropped would
+     * hold every wait for acknowledgement for ever. The sequence itself is
+     * kept: the host refuses one that goes back.
+     */
+    forget_outstanding(): void {
+        for (const channel of pending_edit_channels.values()) {
+            channel.unacknowledgedSequences.clear();
+            channel.supersededStructuralBySheet.clear();
+        }
+    },
+};
 
 /** Webview-lifetime sequence owner, so GridShell remounts cannot reuse a sequence. */
 export interface PendingEditFlushResult {
@@ -224,6 +282,7 @@ export const pending_edit_durability = {
         force = false,
         worksheetId?: string,
     ): number {
+        if (publications_fenced) return vouched_sequence(pending_edit_channels.get(editSessionId));
         const channel = pending_edit_channel(editSessionId);
         // DirtyEntry carries renderer-only `base_pending` while a legacy value's
         // source page is unavailable. Snapshot normalization deliberately strips
@@ -243,7 +302,7 @@ export const pending_edit_durability = {
                 || latest.sheetIndex === sheetIndex
             )
         ) {
-            return channel.nextSequence - 1;
+            return vouched_sequence(channel);
         }
         const sequence = channel.nextSequence++;
         if (latest) channel.unacknowledgedSequences.delete(latest.sequence);
@@ -266,9 +325,8 @@ export const pending_edit_durability = {
         return sequence;
     },
     snapshot(editSessionId: string): PendingEditDurabilitySnapshot {
-        const channel = pending_edit_channel(editSessionId);
         return {
-            highestProducedSequence: channel.nextSequence - 1,
+            highestProducedSequence: vouched_sequence(pending_edit_channels.get(editSessionId)),
         };
     },
     has_publication(
@@ -355,6 +413,7 @@ function acknowledge_channel(
     sequence: number,
 ): void {
     channel.unacknowledgedSequences.delete(sequence);
+    channel.highestAcknowledged = Math.max(channel.highestAcknowledged, sequence);
     // The host writes publications in sequence order, so every
     // superseded one at or before this sequence has landed: no later
     // refresh can carry it as the host's current truth.
@@ -373,6 +432,7 @@ export const pending_changes_durability = {
         sourceGeneration: number,
         force = false,
     ): number {
+        if (publications_fenced) return vouched_sequence(pending_edit_channels.get(editSessionId));
         const channel = pending_edit_channel(editSessionId);
         const dedupe_key = worksheet_target_key(changes);
         const latest = channel.latestPublicationBySheet.get(dedupe_key);
@@ -397,7 +457,7 @@ export const pending_changes_durability = {
             && latest === undefined
             && !structural
             && Object.keys(changes.cells).length === 0
-        ) return channel.nextSequence - 1;
+        ) return vouched_sequence(channel);
         if (
             !force
             && latest?.payload === payload
@@ -406,7 +466,7 @@ export const pending_changes_durability = {
                 !channel.unacknowledgedSequences.has(latest.sequence)
                 || latest.sheetIndex === changes.sheetIndex
             )
-        ) return channel.nextSequence - 1;
+        ) return vouched_sequence(channel);
         const sequence = channel.nextSequence++;
         if (latest?.structural && channel.unacknowledgedSequences.has(latest.sequence)) {
             const superseded = channel.supersededStructuralBySheet.get(dedupe_key) ?? [];

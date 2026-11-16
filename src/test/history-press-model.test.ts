@@ -12,6 +12,7 @@ import {
 } from '../webview/history-press-model';
 
 const idle: HistoryPressFacts = {
+    reopen_required: false,
     header_reload_required: false,
     header_change_in_flight: false,
     replay_in_flight: false,
@@ -22,6 +23,21 @@ const idle: HistoryPressFacts = {
 };
 
 describe('history_press_gate', () => {
+    it('refuses a press in a window that no longer matches its file, ahead of everything', () => {
+        expect(history_press_gate({ ...idle, reopen_required: true }))
+            .toEqual({ kind: 'reopen-required' });
+        expect(history_press_gate({
+            reopen_required: true,
+            header_reload_required: true,
+            header_change_in_flight: true,
+            replay_in_flight: true,
+            gesture_in_flight: true,
+            view_request_in_flight: true,
+            session_gesture_pending: true,
+            save_in_flight: true,
+        })).toEqual({ kind: 'reopen-required' });
+    });
+
     it('runs a press in a window that is doing nothing', () => {
         expect(history_press_gate(idle)).toEqual({ kind: 'run' });
     });
@@ -41,6 +57,7 @@ describe('history_press_gate', () => {
         expect(history_press_gate({ ...idle, header_reload_required: true }))
             .toEqual({ kind: 'reload-required' });
         expect(history_press_gate({
+            reopen_required: false,
             header_reload_required: true,
             header_change_in_flight: true,
             replay_in_flight: true,
