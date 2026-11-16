@@ -92,7 +92,8 @@ interface PendingEditSessionChannel {
      * Sequences up to here were posted before the publication fence last rose,
      * and this window no longer vouches for them: the host either took one
      * (and drains it before it waits) or dropped it, and a dropped one is never
-     * acknowledged.
+     * acknowledged. That holds after the fence lowers too, until something
+     * newer is produced.
      */
     abandonedThrough: number;
 }

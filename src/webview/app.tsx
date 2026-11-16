@@ -3139,7 +3139,10 @@ export function App(): React.JSX.Element {
     // left to wait for; only a reload lowers it.
     const header_reload_required_ref = useRef(false);
     const lower_header_fence_ref = useRef<() => void>(() => {});
-    /** Why Save does nothing while the header fence is up. */
+    /**
+     * Why Save does nothing while the header fence is up. Reads refs only, so
+     * the callbacks below may hold any render's copy.
+     */
     const header_save_wait_message = () => (
         header_reload_required_ref.current
             ? 'Reload this window to finish the header row change, then save.'
