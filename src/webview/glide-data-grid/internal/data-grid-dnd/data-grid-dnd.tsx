@@ -248,6 +248,10 @@ export function columnResizeWidthFromPointer(
 const DataGridDnd: React.FunctionComponent<DataGridDndProps> = p => {
     const [resizeCol, setResizeCol] = React.useState<number>();
     const resizeColRef = React.useRef<number>();
+    // Fork change: the column as it was pressed. The columns can change while
+    // the border is held; an index that no longer holds a column is not read,
+    // and the end call names this one, so the consumer can close its gesture.
+    const resizeColumnRef = React.useRef<InnerGridColumn>();
     const resizeColStartXRef = React.useRef<number>();
     const resizeStartScrollLeftRef = React.useRef(0);
     const resizeScaleRef = React.useRef(1);
@@ -347,6 +351,8 @@ const DataGridDnd: React.FunctionComponent<DataGridDndProps> = p => {
             for (const selected of selectedColumns) {
                 if (selected === currentResizeCol) continue;
                 const selectedColumn = columns[selected];
+                // Fork change: no longer a column (see `resizeColumnRef`).
+                if (selectedColumn === undefined) continue;
                 const selectedSize = offsetColumnSize(
                     selectedColumn,
                     rawWidth,
@@ -378,7 +384,8 @@ const DataGridDnd: React.FunctionComponent<DataGridDndProps> = p => {
             resizeStartScrollLeftRef.current,
             resizeScaleRef.current
         );
-        const column = columns[colIndex];
+        const column = columns[colIndex] ?? resizeColumnRef.current;
+        if (column === undefined) return;
         const size = offsetColumnSize(column, rawWidth, minColumnWidth, maxColumnWidth);
         onColumnResize?.(column, size, colIndex, size + (column.growOffset ?? 0));
         lastResizeWidthRef.current = rawWidth;
@@ -486,6 +493,7 @@ const DataGridDnd: React.FunctionComponent<DataGridDndProps> = p => {
                         resizeStartScrollLeftRef.current = eventTargetRef?.current?.scrollLeft ?? 0;
                         setResizeCol(columns.length - 1);
                         resizeColRef.current = columns.length - 1;
+                        resizeColumnRef.current = columns[columns.length - 1];
                         const rect = canvas.getBoundingClientRect();
                         const scale = rect.width / canvas.offsetWidth;
                         resizeScaleRef.current = scale;
@@ -506,6 +514,7 @@ const DataGridDnd: React.FunctionComponent<DataGridDndProps> = p => {
                         resizeStartScrollLeftRef.current = eventTargetRef?.current?.scrollLeft ?? 0;
                         setResizeCol(col);
                         resizeColRef.current = col;
+                        resizeColumnRef.current = columns[col];
                         const rect = canvas.getBoundingClientRect();
                         const scale = rect.width / canvas.offsetWidth;
                         resizeScaleRef.current = scale;
@@ -600,6 +609,7 @@ const DataGridDnd: React.FunctionComponent<DataGridDndProps> = p => {
         stopResizeEdgeScroll();
         lastResizeWidthRef.current = -1;
         resizeColRef.current = undefined;
+        resizeColumnRef.current = undefined;
         resizeColStartXRef.current = undefined;
         resizePointerXRef.current = undefined;
         rowMoveRef.current = undefined;
@@ -621,7 +631,8 @@ const DataGridDnd: React.FunctionComponent<DataGridDndProps> = p => {
             fanOutSelectedColumnResize(currentResizeCol, lastResizeWidthRef.current, onColumnResize);
         }
 
-        const column = columns[currentResizeCol];
+        const column = columns[currentResizeCol] ?? resizeColumnRef.current;
+        if (column === undefined) return;
         const size = offsetColumnSize(column, lastResizeWidthRef.current, minColumnWidth, maxColumnWidth);
         onColumnResizeEnd?.(column, size, currentResizeCol, size + (column.growOffset ?? 0));
         if (selectedColumns.hasIndex(currentResizeCol)) {

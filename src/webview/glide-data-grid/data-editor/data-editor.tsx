@@ -1098,11 +1098,19 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
         [onGridSelectionChange, getCellsForSelection, rowMarkerOffset, spanRangeBehavior, mergedCells]
     );
 
+    // Fork change: the column whose border was pressed. The columns can
+    // change while the border is held; a call for an index that no longer
+    // holds a column names this one (only the pressed index can be such a
+    // call: the grid skips the selection's other columns that are gone).
+    const resizePressedColumnRef = React.useRef<GridColumn>();
+
     const onColumnResize = whenDefined(
         onColumnResizeIn,
         React.useCallback<NonNullable<typeof onColumnResizeIn>>(
             (_, w, ind, wg) => {
-                onColumnResizeIn?.(columnsIn[ind - rowMarkerOffset], w, ind - rowMarkerOffset, wg);
+                const column = columnsIn[ind - rowMarkerOffset] ?? resizePressedColumnRef.current;
+                if (column === undefined) return;
+                onColumnResizeIn?.(column, w, ind - rowMarkerOffset, wg);
             },
             [onColumnResizeIn, rowMarkerOffset, columnsIn]
         )
@@ -1112,16 +1120,21 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
         onColumnResizeEndIn,
         React.useCallback<NonNullable<typeof onColumnResizeEndIn>>(
             (_, w, ind, wg) => {
-                onColumnResizeEndIn?.(columnsIn[ind - rowMarkerOffset], w, ind - rowMarkerOffset, wg);
+                const column = columnsIn[ind - rowMarkerOffset] ?? resizePressedColumnRef.current;
+                if (column === undefined) return;
+                onColumnResizeEndIn?.(column, w, ind - rowMarkerOffset, wg);
             },
             [onColumnResizeEndIn, rowMarkerOffset, columnsIn]
         )
     );
 
+    // Defined whenever any resize callback is, so the pressed column is
+    // always recorded.
     const onColumnResizeStart = whenDefined(
-        onColumnResizeStartIn,
+        onColumnResizeStartIn ?? onColumnResizeIn ?? onColumnResizeEndIn,
         React.useCallback<NonNullable<typeof onColumnResizeStartIn>>(
             (_, w, ind, wg) => {
+                resizePressedColumnRef.current = columnsIn[ind - rowMarkerOffset];
                 onColumnResizeStartIn?.(columnsIn[ind - rowMarkerOffset], w, ind - rowMarkerOffset, wg);
             },
             [onColumnResizeStartIn, rowMarkerOffset, columnsIn]

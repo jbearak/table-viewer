@@ -317,6 +317,8 @@ const ROW_RESIZE_TOLERANCE_PX = 5;
 /** A finished press on a column border. */
 interface BorderPress {
     readonly display_column: number;
+    /** The column that stood at `display_column` when it was pressed. */
+    readonly key: string | undefined;
     /** Whether the press moved the border. */
     readonly dragged: boolean;
     /** Which press in the window it was, counting every press anywhere. */
@@ -325,13 +327,16 @@ interface BorderPress {
 
 /**
  * Whether the last two presses on a column border were a double-click on
- * `display_column`'s border: both on it, neither dragging it, and no other
- * press anywhere in the window between them. How close in time they were is
+ * `display_column`'s border: both on it, both on the column `key` names (the
+ * one there now: an Undo or Redo can move columns between two clicks),
+ * neither dragging it, and no other press anywhere in the window between
+ * them. How close in time they were is
  * Glide's to judge: it asks for a fit only within its double-click time.
  */
 function border_was_double_clicked(
     presses: readonly BorderPress[],
     display_column: number,
+    key: string | undefined,
 ): boolean {
     const [last, previous] = presses;
     return last !== undefined
@@ -340,6 +345,9 @@ function border_was_double_clicked(
         && !previous.dragged
         && last.display_column === display_column
         && previous.display_column === display_column
+        && key !== undefined
+        && last.key === key
+        && previous.key === key
         && last.ordinal === previous.ordinal + 1;
 }
 
@@ -1478,6 +1486,8 @@ interface RowResizePreview {
     preview_rows: GridSelection['rows'] | null;
     start_height: number;
     height: number;
+    /** `pending_selection_topology_key` as the drag began: which row a display index names. */
+    topology_key: string;
 }
 
 export interface GridShellProps {
@@ -2454,6 +2464,8 @@ export function GridShell({
     ].join(':');
     const paste_topology_key_ref = useRef(paste_topology_key);
     paste_topology_key_ref.current = paste_topology_key;
+    const pending_selection_topology_key_ref = useRef(pending_selection_topology_key);
+    pending_selection_topology_key_ref.current = pending_selection_topology_key;
     const pending_tail_removal_source_rows = useMemo(() => new Set(
         pending_rows.tailRemovals.map((removal) => removal.sourceRow),
     ), [pending_rows.tailRemovals]);
@@ -3128,6 +3140,16 @@ export function GridShell({
         readonly source: Map<number, number>;
         /** Draft widths by Pending Column ID. */
         readonly pending: Map<string, number>;
+        /**
+         * Which column stood at each display index when the gesture began.
+         * Glide names a column by display index in every call of the gesture,
+         * and the order can change while the border is held (a column move
+         * undone from the keyboard), so an index is checked against this
+         * before it is believed.
+         */
+        readonly keys: readonly string[];
+        /** A call of this gesture named an index that holds another column now. */
+        discarded: boolean;
     }
     const column_resize_ref = useRef<ColumnResizeGesture | null>(null);
     /**
@@ -10260,6 +10282,7 @@ export function GridShell({
             preview_rows: commit_rows?.first() === row ? commit_rows : null,
             start_height: height,
             height,
+            topology_key: pending_selection_topology_key_ref.current,
         };
         row_resize_preview_ref.current = preview;
     }, []);
@@ -10303,6 +10326,12 @@ export function GridShell({
         row_resize_preview_ref.current = null;
         set_row_resize_preview(null);
         if (!preview || preview.row !== row || height === preview.start_height) return;
+        // The drag names rows by display index, the dragged one and the row
+        // selection it resizes with, and resolves them only now. If another
+        // row can stand at one of those indexes (a row inserted or removed, an
+        // insert undone from the keyboard while the border was held), the
+        // height was dragged for rows that are not there any more.
+        if (preview.topology_key !== pending_selection_topology_key_ref.current) return;
         // Handed up as intervals, never as the expanded row list this used to pass.
         // `commit_rows` is the user's whole row selection and can be select-all, so the
         // expansion produced one number per row of the sheet purely to say "all of
@@ -11816,10 +11845,40 @@ export function GridShell({
                 moved: false,
                 source: new Map(),
                 pending: new Map(),
+                keys: projected_columns_ref.current.map((column) => column.key),
+                discarded: false,
             };
         },
         [],
     );
+    /**
+     * Whether `display_column` still holds the column it held when `gesture`
+     * began. One that does not ends the gesture with nothing: its drafts are
+     * dropped and its end commits no width.
+     */
+    const column_resize_still_names = useCallback(
+        (gesture: ColumnResizeGesture, display_column: number): boolean => {
+            if (gesture.discarded) return false;
+            if (projected_columns_ref.current[display_column]?.key === gesture.keys[display_column]) return true;
+            gesture.discarded = true;
+            if (gesture.source.size > 0) {
+                gesture.source.clear();
+                set_source_column_draft_revision((revision) => revision + 1);
+            }
+            if (gesture.pending.size > 0) {
+                gesture.pending.clear();
+                set_pending_column_width_drafts((current) => current.size === 0 ? current : new Map());
+            }
+            return false;
+        },
+        [],
+    );
+    /** Whether every display index still holds the column it held when `gesture` began. */
+    const column_resize_keys_unchanged = useCallback((gesture: ColumnResizeGesture): boolean => {
+        const columns = projected_columns_ref.current;
+        return columns.length === gesture.keys.length
+            && columns.every((column, index) => column.key === gesture.keys[index]);
+    }, []);
     /**
      * A column's width while a border is dragged, or a fit's result. Drawn at
      * once and stored nowhere until the gesture ends.
@@ -11831,11 +11890,22 @@ export function GridShell({
                 // A resize with no press open is a fit. Glide asks for one
                 // more often than a person double-clicks a border; one that
                 // is not taken ends with no gesture open.
-                if (!border_was_double_clicked(border_presses_ref.current, display_column)) return;
+                if (!border_was_double_clicked(
+                    border_presses_ref.current,
+                    display_column,
+                    projected_columns_ref.current[display_column]?.key,
+                )) return;
                 border_presses_ref.current = [];
-                gesture = { moved: false, source: new Map(), pending: new Map() };
+                gesture = {
+                    moved: false,
+                    source: new Map(),
+                    pending: new Map(),
+                    keys: projected_columns_ref.current.map((column) => column.key),
+                    discarded: false,
+                };
                 column_resize_ref.current = gesture;
             }
+            if (!column_resize_still_names(gesture, display_column)) return;
             if (
                 gesture.press !== undefined
                 && gesture.press.display_column === display_column
@@ -11858,7 +11928,7 @@ export function GridShell({
                     ? current
                     : new Map(current).set(identity.pendingColumnId, new_size));
         },
-        [projected_columns, source_column_for_display],
+        [column_resize_still_names, projected_columns, source_column_for_display],
     );
     /**
      * The end of a column-width gesture: one commit, with every column it
@@ -11883,7 +11953,13 @@ export function GridShell({
                 border_presses_ref.current = [
                     {
                         display_column: gesture.press.display_column,
-                        dragged: gesture.moved,
+                        // The column pressed, which a release with the
+                        // columns moved under it no longer finds there.
+                        key: gesture.keys[gesture.press.display_column],
+                        // A drag discarded because the columns moved under it
+                        // was still a drag, not a click: it is no half of a
+                        // double-click.
+                        dragged: gesture.moved || gesture.discarded,
                         ordinal: gesture.press.ordinal,
                     },
                     ...border_presses_ref.current.slice(0, 1),
@@ -11896,6 +11972,12 @@ export function GridShell({
                 set_pending_column_width_drafts((current) => current.size === 0 ? current : new Map());
             }
             if (gesture.press !== undefined && !gesture.moved) return;
+            // The columns changed places under the held border: the widths
+            // were dragged for the columns that stood there before. Any
+            // column, not only the pressed one: the gesture also sized the
+            // rest of a column selection, by display index. One pass, here
+            // and not per call, which Glide makes once per selected column.
+            if (gesture.discarded || !column_resize_keys_unchanged(gesture)) return;
             // Every saved column the gesture sized is reported, whatever
             // width this window shows for it: its copy can be behind what
             // another window stored, and a column left out for looking right
@@ -11936,7 +12018,7 @@ export function GridShell({
             }
             if (source_changes.length > 0) on_columns_resized(source_changes);
         },
-        [edit_session_id, on_columns_resized, pending_store, size_gesture_may_start],
+        [column_resize_keys_unchanged, edit_session_id, on_columns_resized, pending_store, size_gesture_may_start],
     );
 
     /**

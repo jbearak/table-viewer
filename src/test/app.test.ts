@@ -17840,10 +17840,11 @@ describe('undo and redo, from the keyboard and the desktop menu', () => {
             // Snapshot fields the gesture itself does not care about, for the one
             // test that needs an edit session standing before it records.
             readonly snapshot_extra?: SnapshotExtra;
+            readonly meta?: WorkbookMeta;
         } = {},
     ) {
         const snapshot = initial_snapshot_message(
-            make_meta(['Sheet1', 'Sheet2']),
+            options.meta ?? make_meta(['Sheet1', 'Sheet2']),
             options.snapshot_extra ?? {},
         );
         await dispatch_host_message(snapshot);
@@ -17908,11 +17909,22 @@ describe('undo and redo, from the keyboard and the desktop menu', () => {
                 displayRowEnd: number;
                 mappingGeneration: number;
             } | null;
+            // The source cells the host says the replay touched, where a test
+            // is about them and not about the gesture that was replayed.
+            readonly focus?: {
+                sourceRowStart: number;
+                sourceRowEnd: number;
+                sourceColumnStart: number;
+                sourceColumnEnd: number;
+            };
         } = {},
     ) {
         const prepare = sent(post_message, 'prepareHistoryReplay');
         expect(prepare).toBeDefined();
         const focus_sheet = options.focusSheetIndex ?? 0;
+        const committed_focus = options.focus === undefined
+            ? prepare.request.focus
+            : { ...prepare.request.focus, ...options.focus };
         await dispatch_host_message({
             type: 'historyReplayPrepared',
             prepared: {
@@ -17936,7 +17948,7 @@ describe('undo and redo, from the keyboard and the desktop menu', () => {
                 sourceGeneration: 1,
                 cells: [],
                 focusSheetIndex: focus_sheet,
-                focus: prepare.request.focus,
+                focus: committed_focus,
                 displayFocus: options.displayFocus === undefined
                     ? { displayRowStart: 3, displayRowEnd: 3, mappingGeneration: 1 }
                     : options.displayFocus,
@@ -18977,6 +18989,86 @@ describe('undo and redo, from the keyboard and the desktop menu', () => {
         await click_stub_button('.stub-history-focus-hidden');
         expect(sent(post_message, 'showWarning').message)
             .toBe('The change was redone, but the affected cells are hidden by the current view.');
+    });
+
+    describe('a replay that landed in a Header Row', () => {
+        // The host gives such a replay no display row: the Header Row is the
+        // column headers, not a row of the body.
+        const header_on = { mode: 'on' as const, detected: false, active: true, available: true, sourceRow: 0 };
+        const header_meta = (): WorkbookMeta => {
+            const meta = make_meta(['Sheet1', 'Sheet2']);
+            return {
+                ...meta,
+                sheets: meta.sheets.map((sheet) => ({ ...sheet, columnCount: 3, excelFirstRowHeader: header_on })),
+            };
+        };
+        const renamed = { sourceRowStart: 0, sourceRowEnd: 0, sourceColumnStart: 1, sourceColumnEnd: 1 };
+        const hidden = (sheet_name: string) => ({
+            hiddenColumns: [1],
+            schema: JSON.stringify([sheet_name, 3, null]),
+        });
+
+        it('says nothing where the renamed column is on screen', async () => {
+            const { post_message } = await render_app();
+            await record_highlight(post_message, { meta: header_meta() });
+            await undo_via_menu();
+            await complete_replay(post_message, { displayFocus: null, focus: renamed });
+
+            expect(sent(post_message, 'showWarning')).toBeUndefined();
+            // The entry did move.
+            expect(JSON.parse(grid_stub().getAttribute('data-undo-labels')!)).toEqual([]);
+        });
+
+        it('still says the cells are hidden where that column is hidden', async () => {
+            const { post_message } = await render_app();
+            await record_highlight(post_message, {
+                meta: header_meta(),
+                snapshot_extra: { state: { columnVisibility: [hidden('Sheet1')] } },
+            });
+            await undo_via_menu();
+            await complete_replay(post_message, { displayFocus: null, focus: renamed });
+
+            expect(sent(post_message, 'showWarning').message)
+                .toBe('The change was undone, but the affected cells are hidden by the current view.');
+        });
+
+        it('still says so for a row of data', async () => {
+            const { post_message } = await render_app();
+            await record_highlight(post_message, { meta: header_meta() });
+            await undo_via_menu();
+            await complete_replay(post_message, {
+                displayFocus: null,
+                focus: { ...renamed, sourceRowStart: 2, sourceRowEnd: 2 },
+            });
+
+            expect(sent(post_message, 'showWarning').message)
+                .toBe('The change was undone, but the affected cells are hidden by the current view.');
+        });
+
+        it('is judged by the hidden columns of the sheet it landed on, not the one shown', async () => {
+            const { post_message } = await render_app();
+            // The column is hidden on the second sheet and shown on the first.
+            await record_highlight(post_message, {
+                meta: header_meta(),
+                snapshot_extra: { state: { columnVisibility: [undefined, hidden('Sheet2')] } },
+            });
+            await undo_via_menu();
+            await complete_replay(post_message, { displayFocus: null, focus: renamed, focusSheetIndex: 1 });
+            expect(sent(post_message, 'showWarning').message)
+                .toBe('The change was undone, but the affected cells are hidden by the current view.');
+        });
+
+        it('is judged by the shown columns of the sheet it landed on', async () => {
+            const { post_message } = await render_app();
+            // Hidden on the sheet in view, shown on the one the replay landed on.
+            await record_highlight(post_message, {
+                meta: header_meta(),
+                snapshot_extra: { state: { columnVisibility: [hidden('Sheet1'), undefined] } },
+            });
+            await undo_via_menu();
+            await complete_replay(post_message, { displayFocus: null, focus: renamed, focusSheetIndex: 1 });
+            expect(sent(post_message, 'showWarning')).toBeUndefined();
+        });
     });
 
     it('shows only the newest replay destination when a later replay returns', async () => {
