@@ -467,9 +467,9 @@ describe('the setRowHeights host handler', () => {
     it('acknowledges a no-op resize with the freshly read projection', async () => {
         // A no-op is a *success* that writes nothing, and silence is not an acceptable
         // answer to it. The webview has already appended an optimistic layer over a
-        // projection that may be stale, and its answer retires that layer
-        // (`row_height_layers_after_answer`): without a delivery ahead of the answer the
-        // row would fall back to a height the file no longer holds.
+        // projection that may be stale. Its answer retires that layer
+        // (`row_height_layers_after_answer`), and the delivery ahead of the answer
+        // carries what the file holds.
         //
         // Not a hypothetical, because "the height is already durable" is exactly what a
         // sibling panel's write makes true behind this panel's back: durable heights move
