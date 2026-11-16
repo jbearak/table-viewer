@@ -596,6 +596,36 @@ describe('setRowHeights, answered', () => {
     });
 });
 
+describe('setRowHeights, when the read after its commit fails', () => {
+    it('still answers applied, with what it changed', async () => {
+        // The verdict is the write's: a failure delivering it must not turn a
+        // durable resize into "nothing was written", or the step is lost.
+        const versioned = versioned_state_store();
+        let committed = false;
+        const panel = open_csv(queued({
+            ...versioned.store,
+            async read(path) {
+                if (committed) throw new Error('read failed');
+                return versioned.store.read(path);
+            },
+            async compare_and_set(path, expected, next, validate, basis) {
+                const result = await versioned.store.compare_and_set(path, expected, next, validate, basis);
+                if (result.type === 'committed' && next.rowHeights?.[0]) committed = true;
+                return result;
+            },
+        }));
+        const initial = await ready(panel);
+
+        const answer = await resize_rows(panel, initial, [{ start: 1, end: 1 }], 60);
+
+        expect(answer).toMatchObject({
+            applied: true,
+            change: { height: 60, before: [{ start: 1, end: 1, height: null }] },
+        });
+        expect(versioned.get_state(file_path).rowHeights).toEqual([{ 1: 60 }]);
+    });
+});
+
 describe('setSourceRowHeights', () => {
     it('sets and removes heights by source row, delivers, then answers', async () => {
         const state = versioned_state_store({ rowHeights: [{ 0: 50, 2: 70 }] } as StoredPerFileState);
