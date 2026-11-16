@@ -3131,24 +3131,18 @@ export function attach_viewer(
     // durable state and holding the transform admission until it ends.
     const answered_transform_authorities = new Set<TransformAuthority>();
     /**
-     * The renderer is being told the answer to `request_id` on `sheet_index`.
-     * That transform is done as far as the renderer knows; and if it
-     * installed, so is every earlier one on the sheet, which its install
-     * superseded (a restore a Cancel replaced, still observing its
-     * cancellation). Marked before the post settles, because the renderer may
-     * ask for a session as soon as the answer arrives.
-     *
-     * A refusal supersedes nothing: an earlier transform is still running. An
-     * answer to a request that was never admitted marks nothing at all. In
-     * both cases the session refusal below stands for what is still running,
-     * as it always has.
+     * The renderer is being told the answer to `request_id` on `sheet_index`:
+     * that transform is done as far as the renderer knows. Marked before the
+     * post settles, because the renderer may ask for a session as soon as the
+     * answer arrives. (Work it superseded or that went stale is no longer
+     * current, which a session request also waits out; see below.)
      */
-    function note_transform_answered(sheet_index: number, request_id: string, installed: boolean): void {
-        const on_sheet = [...transform_authorities].filter(([message]) => message.sheetIndex === sheet_index);
-        const answered_at = on_sheet.findIndex(([message]) => message.requestId === request_id);
-        if (answered_at < 0) return;
-        const answered = installed ? on_sheet.slice(0, answered_at + 1) : [on_sheet[answered_at]!];
-        for (const [, authority] of answered) answered_transform_authorities.add(authority);
+    function note_transform_answered(sheet_index: number, request_id: string): void {
+        for (const [message, authority] of transform_authorities) {
+            if (message.sheetIndex === sheet_index && message.requestId === request_id) {
+                answered_transform_authorities.add(authority);
+            }
+        }
     }
     const transform_commit_barriers = new Set<TransformAuthority>();
     let load_seq = 0;
@@ -14401,18 +14395,26 @@ export function attach_viewer(
                     current_edit_cleanup_waiter = undefined;
                 }
                 if (!request_is_current()) return;
-                // Transform work this panel's renderer has been answered for is
-                // only reconciling durable state now, and holds the transform
-                // admission until it has. A request made after the answer (a
-                // replay or an edit the renderer held back for it) waits for that
-                // instead of being refused for a sort nobody is waiting on. Work
-                // not yet answered still refuses, as below. Asked again after
-                // each wait: another may have been answered meanwhile. Each
-                // wait ends with that transform's reconciliation, a bounded
-                // number of state reads (`READY_STATE_REBASE_COUNT`), so the
-                // loop needs no bound of its own beyond the state store's.
-                while (answered_transform_authorities.size > 0) {
-                    await Promise.all([...answered_transform_authorities].map((authority) => authority.completion));
+                // Transform work the renderer is no longer waiting for still
+                // holds the transform admission until it ends: work it has been
+                // answered for (reconciling durable state now), and work no
+                // longer current (superseded on its sheet by a later request,
+                // or left behind by a new source or receiver), which notices and
+                // stops. A request made after that (a replay or an edit the
+                // renderer held back) waits for it instead of being refused for
+                // a sort nobody is waiting on. Current work not yet answered
+                // still refuses, as below. Asked again after each wait: more may
+                // have joined meanwhile. Each wait ends with a reconciliation (a
+                // bounded number of state reads) or a stale computation's next
+                // check, so the loop needs no bound of its own.
+                const settling = () => [...transform_authorities]
+                    .filter(([message, authority]) => (
+                        answered_transform_authorities.has(authority)
+                        || !transform_authority_is_current(message, authority)
+                    ))
+                    .map(([, authority]) => authority.completion);
+                for (let waiting = settling(); waiting.length > 0; waiting = settling()) {
+                    await Promise.all(waiting);
                     if (!request_is_current()) return;
                 }
                 let phase = edit_phase();

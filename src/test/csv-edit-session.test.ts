@@ -9008,6 +9008,56 @@ describe('CSV edit sessions', () => {
         expect(warning).not.toHaveBeenCalledWith('Wait for sorting and filtering to finish before editing.');
     });
 
+    it('waits for a transform a new receiver left behind instead of refusing a session for it', async () => {
+        // Transform work no longer current (here, begun for a renderer that has
+        // since been replaced) notices and stops, holding the transform
+        // admission until then: a session request waits for that rather than
+        // being refused for a sort nobody is waiting on.
+        const warning = vi.spyOn(vscode_mock.window, 'showWarningMessage');
+        const versioned = state_store();
+        const commit_started = deferred();
+        const commit_gate = deferred();
+        let hold_commit = false;
+        const store: FileStateStore = {
+            ...versioned.store,
+            async compare_and_set(path, expected, next, validate) {
+                if (hold_commit) {
+                    hold_commit = false;
+                    commit_started.resolve();
+                    await commit_gate.promise;
+                }
+                return versioned.store.compare_and_set(path, expected, next, validate);
+            },
+        };
+        const panel = open_csv_table(uri('/tmp/session-after-stale-transform.csv'), store);
+        await panel.__receive({ type: 'ready' });
+
+        hold_commit = true;
+        const sort = panel.__receive({
+            type: 'setTransform',
+            sheetIndex: 0,
+            requestId: 'sort',
+            sourceGeneration: 1,
+            intent: 'user',
+            state: { sort: [{ colIndex: 0, direction: 'asc' }], filters: [], schema: '["Sheet1",1,["h"]]' },
+        } as never);
+        await commit_started.promise;
+        const reloaded = panel.__receive({ type: 'ready' });
+        await flush_promises();
+
+        const request = panel.__receive({ type: 'requestEditSession' } as never);
+        await flush_promises();
+        expect(edit_session_results(panel)).toEqual([]);
+        commit_gate.resolve();
+        await sort;
+        await reloaded;
+        await request;
+        expect(edit_session_results(panel)).toEqual([
+            expect.objectContaining({ type: 'editSessionResult', granted: true }),
+        ]);
+        expect(warning).not.toHaveBeenCalledWith('Wait for sorting and filtering to finish before editing.');
+    });
+
     it('refuses a quiet request without announcing it', async () => {
         const warning = vi.spyOn(vscode_mock.window, 'showWarningMessage');
         const panel = open_csv_table(uri('/tmp/session.csv'), state_store().store);
