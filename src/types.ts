@@ -756,6 +756,104 @@ export interface PerFileState {
     showFormatting?: (boolean | undefined)[];
 }
 
+/** A worksheet's Header Row as a window is shown it. */
+export interface ExcelHeaderSide {
+    readonly mode: 'auto' | ExcelHeaderOverride;
+    /** The Header Row's canonical source row while one is shown; absent when none is. */
+    readonly row?: number;
+}
+
+/**
+ * The side `excelFirstRowHeader` describes. An active automatic header carries
+ * no `sourceRow`, because it is always the first row.
+ */
+export function excel_header_side(header: {
+    readonly mode: 'auto' | ExcelHeaderOverride;
+    readonly active: boolean;
+    readonly sourceRow?: number;
+}): ExcelHeaderSide {
+    return header.active
+        ? { mode: header.mode, row: header.sourceRow ?? 0 }
+        : { mode: header.mode };
+}
+
+export function excel_header_sides_equal(left: ExcelHeaderSide, right: ExcelHeaderSide): boolean {
+    return left.mode === right.mode && left.row === right.row;
+}
+
+/**
+ * What one Header Row write changed for its worksheet, taken across the
+ * durable compare-and-set: the only place both sides are in hand. A window's
+ * own view of the hidden rows can be stale, and another window can change the
+ * worksheet inside the request's round trip, so a difference measured by the
+ * window that asked could name a change it did not make.
+ */
+export interface ExcelHeaderChange {
+    readonly before: ExcelHeaderSide;
+    readonly after: ExcelHeaderSide;
+    /** Canonical source rows the write hid and showed; ascending, unique, disjoint. */
+    readonly hidden: readonly number[];
+    readonly shown: readonly number[];
+}
+
+/**
+ * A Header Row state to install by source row: how a header step is replayed.
+ * A gesture names what the person pointed at (a toggle, a display row); a
+ * target names where the header was.
+ */
+export interface ExcelHeaderTarget {
+    readonly mode: 'auto' | ExcelHeaderOverride;
+    /**
+     * `'on'` only, and required with it: the source row to use as the Header
+     * Row, or `null` for "on, with no row to use" (every row hidden).
+     */
+    readonly headerSourceRow?: number | null;
+    /** Source rows to hide and to show in the same write. */
+    readonly hideRows?: readonly number[];
+    readonly showRows?: readonly number[];
+}
+
+/**
+ * Whether a `setExcelFirstRowHeader` request that carries a `target` is well
+ * formed. A target replaces the gesture's `unhideAll` and `headerRow`; its
+ * `enabled` restates the mode; a source row goes with `'on'` and only with it;
+ * and no row is in both row lists. (A row may repeat within one list.)
+ */
+export function excel_header_target_request_valid(request: {
+    readonly enabled: boolean;
+    readonly unhideAll?: boolean;
+    readonly headerRow?: number;
+    readonly target: ExcelHeaderTarget;
+}): boolean {
+    const target = request.target as Partial<ExcelHeaderTarget> | null;
+    if (target === null || typeof target !== 'object') return false;
+    if (request.unhideAll !== undefined || request.headerRow !== undefined) return false;
+    if (target.mode !== 'auto' && target.mode !== 'on' && target.mode !== 'off') return false;
+    if (request.enabled !== (target.mode === 'on')) return false;
+    const row = target.headerSourceRow;
+    if (target.mode === 'on') {
+        if (row !== null && !(typeof row === 'number' && Number.isInteger(row) && row >= 0)) {
+            return false;
+        }
+    } else if (row !== undefined) {
+        return false;
+    }
+    const seen = new Set<number>();
+    for (const rows of [target.hideRows, target.showRows]) {
+        if (rows === undefined) continue;
+        if (!Array.isArray(rows) || rows.length > MAX_PERSISTED_HIDDEN_ROWS) return false;
+        const own = new Set<number>();
+        for (const entry of rows) {
+            if (typeof entry !== 'number' || !Number.isInteger(entry) || entry < 0) return false;
+            // A row may repeat inside one list; it may not be in both.
+            if (seen.has(entry)) return false;
+            own.add(entry);
+        }
+        for (const entry of own) seen.add(entry);
+    }
+    return true;
+}
+
 export function sanitize_excel_header_overrides(
     value: unknown,
 ): Record<string, ExcelHeaderOverride> {
@@ -3912,7 +4010,12 @@ export type WebviewMessage =
     | { type: 'openExternal'; url: string }
     | { type: 'requestFilterHistogram'; sheetIndex: number; columnIndex: number; requestId: string; generation: number; sourceGeneration: number }
     | { type: 'cancelFilterHistogram'; requestId: string }
-    | { type: 'setExcelFirstRowHeader'; sheetIndex: number; sheetName: string; enabled: boolean; unhideAll?: boolean; headerRow?: number; requestId: string; generation: number; sourceGeneration: number }
+    /**
+     * Change a worksheet's Header Row. A gesture sends `enabled`, with
+     * `unhideAll` or a display `headerRow`. A header step's replay sends
+     * `target` instead of those two, and `enabled` equal to its mode being `'on'`.
+     */
+    | { type: 'setExcelFirstRowHeader'; sheetIndex: number; sheetName: string; enabled: boolean; unhideAll?: boolean; headerRow?: number; target?: ExcelHeaderTarget; requestId: string; generation: number; sourceGeneration: number }
     | { type: 'setTransform'; sheetIndex: number; state: SheetTransformState; requestId: string; generation: number; sourceGeneration: number; intent: TransformIntent }
     | { type: 'hideRows'; sheetIndex: number; displayRows: DisplayRowInterval[]; requestId: string; generation: number; sourceGeneration: number }
     /** Ask the host to authorize replaying one history action. */

@@ -29,6 +29,7 @@ import {
     worksheet_target_key,
     worksheet_target_matches,
     type CellHighlightColor,
+    type ExcelHeaderSide,
     type FilterEntry,
     type SortKey,
     type WorksheetTarget,
@@ -52,6 +53,7 @@ import {
 } from './history-cell-state-model';
 import type {
     ColumnWidthsViewDelta,
+    HeaderViewDelta,
     MemberTransition,
     ViewHistoryDelta,
 } from './view-history-model';
@@ -149,11 +151,11 @@ export type HistoryChange =
     | { readonly kind: 'rowLayout'; readonly delta: RowLayoutHistoryDelta }
     | { readonly kind: 'columnLayout'; readonly delta: ColumnLayoutHistoryDelta }
     /**
-     * A sort, a filter, hidden rows, hidden columns, column widths, or row
-     * heights: view state, not content. A view step is an action holding
-     * exactly one such change, except a column-width step made on several
-     * worksheets at once, which holds one per worksheet
-     * (`width_step_changes`). It needs no editing session, and replay
+     * A sort, a filter, hidden rows, hidden columns, column widths, row
+     * heights, or the Header Row: view state, not content. A view step is an
+     * action holding exactly one such change, except a column-width or header
+     * step made on several worksheets at once, which holds one per worksheet
+     * (`width_step_changes`, `header_step_changes`). It needs no editing session, and replay
      * re-issues the view request the gesture used instead of the cell replay
      * protocol (see `view-history-model.ts`).
      */
@@ -184,15 +186,43 @@ export function view_step_change(action: HistoryAction): ViewHistoryChange | und
 export function width_step_changes(
     action: HistoryAction,
 ): readonly (ViewHistoryChange & { readonly delta: ColumnWidthsViewDelta })[] | undefined {
+    return view_changes_of(action, 'columnWidths');
+}
+
+/**
+ * The changes of a header step, one per worksheet, or undefined for any other
+ * action. One header gesture can change several worksheets (the all-sheets
+ * items), and it is one action holding one `header` change per worksheet, as
+ * a column-width step is.
+ */
+export function header_step_changes(
+    action: HistoryAction,
+): readonly (ViewHistoryChange & { readonly delta: HeaderViewDelta })[] | undefined {
+    return view_changes_of(action, 'header');
+}
+
+/**
+ * The changes of an action whose every change is a view change of `slice`, on
+ * distinct worksheets; undefined for any other action.
+ */
+function view_changes_of<Slice extends ViewHistoryDelta['slice']>(
+    action: HistoryAction,
+    slice: Slice,
+): readonly (ViewHistoryChange & {
+    readonly delta: Extract<ViewHistoryDelta, { slice: Slice }>;
+})[] | undefined {
+    type Change = ViewHistoryChange & {
+        readonly delta: Extract<ViewHistoryDelta, { slice: Slice }>;
+    };
     if (action.changes.length === 0) return undefined;
-    const changes: (ViewHistoryChange & { readonly delta: ColumnWidthsViewDelta })[] = [];
+    const changes: Change[] = [];
     const worksheets = new Set<string>();
     for (const change of action.changes) {
-        if (change.kind !== 'view' || change.delta.slice !== 'columnWidths') return undefined;
+        if (change.kind !== 'view' || change.delta.slice !== slice) return undefined;
         const key = worksheet_target_key(change.delta.worksheet);
         if (worksheets.has(key)) return undefined;
         worksheets.add(key);
-        changes.push(change as ViewHistoryChange & { readonly delta: ColumnWidthsViewDelta });
+        changes.push(change as Change);
     }
     return changes;
 }
@@ -3220,6 +3250,19 @@ function own_view_history_delta(
             ...(delta.autoFit === undefined
                 ? {}
                 : { autoFit: delta.autoFit === 'on' ? 'on' as const : 'off' as const }),
+        });
+    }
+    if (delta.slice === 'header') {
+        const side = (from: ExcelHeaderSide): ExcelHeaderSide => Object.freeze({
+            mode: from.mode === 'on' ? 'on' as const : from.mode === 'off' ? 'off' as const : 'auto' as const,
+            ...(from.row === undefined ? {} : { row: index(from.row) }),
+        });
+        return Object.freeze({
+            worksheet,
+            slice: 'header',
+            before: side(delta.before),
+            after: side(delta.after),
+            ...(delta.hiddenRows === undefined ? {} : { hiddenRows: members(delta.hiddenRows) }),
         });
     }
     if (delta.slice === 'rowHeights') {

@@ -16,7 +16,7 @@ import type {
     DurableFileAuthority,
     FileStateStore,
 } from '../state';
-import type { HostMessage, PerFileState } from '../types';
+import type { HostMessage, PerFileState, WebviewMessage } from '../types';
 import { MAX_SHEET_ROWS } from '../spreadsheet-safety';
 import type { WorkbookSnapshot } from '../viewer-snapshot';
 import * as vscode_mock from './mocks/vscode';
@@ -302,6 +302,13 @@ describe('Excel workbook snapshot controller', () => {
             type: 'excelFirstRowHeader',
             requestId: 'fast',
             outcome: 'applied',
+            // What the write changed, for the asking window's undo history.
+            change: {
+                before: { mode: 'auto', row: 0 },
+                after: { mode: 'off' },
+                hidden: [],
+                shown: [],
+            },
         });
     });
 
@@ -1062,6 +1069,13 @@ describe('Excel workbook snapshot controller', () => {
         await toggle(first, first_initial, 'indeterminate-header', false);
         await vi.waitFor(() => expect(snapshots(first).at(-1)?.commandResult)
             .toMatchObject({ requestId: 'indeterminate-header', outcome: 'recovered' }));
+        // The commit was established before the inspection failed, so the
+        // recovered result says what this request's write changed.
+        expect(snapshots(first).find((snapshot) => (
+            snapshot.commandResult?.requestId === 'indeterminate-header'
+        ))?.commandResult).toMatchObject({
+            change: { before: { mode: 'auto', row: 0 }, after: { mode: 'off' }, hidden: [], shown: [] },
+        });
         await vi.waitFor(() => expect(first_builds.count).toBeGreaterThan(1));
         await vi.waitFor(() => expect(second_builds.count).toBeGreaterThan(1));
         await vi.waitFor(() => expect(snapshots(second).at(-1)?.meta.sheets[0]
@@ -1117,6 +1131,12 @@ describe('Excel workbook snapshot controller', () => {
             && snapshot.commandResult?.requestId === 'finalize-reconcile-failure'
             && snapshot.commandResult.outcome === 'applied'
         ))).toBe(false);
+        // Nothing established the commit, so the result names no change, even
+        // though the header the request asked for is what the file now has.
+        const settled = snapshots(panel).find((snapshot) => (
+            snapshot.commandResult?.requestId === 'finalize-reconcile-failure'
+        ))!;
+        expect(settled.commandResult && 'change' in settled.commandResult).toBe(false);
     });
 
     it('uses a result-only snapshot for validation rejection', async () => {
@@ -1176,6 +1196,8 @@ describe('Excel workbook snapshot controller', () => {
         expect(recovered.commandResult).toMatchObject({
             requestId: 'recovered',
             outcome: 'recovered',
+            // Parked with its receipt: the write was committed.
+            change: { before: { mode: 'auto', row: 0 }, after: { mode: 'off' }, hidden: [], shown: [] },
         });
     });
 
@@ -1212,6 +1234,51 @@ describe('Excel workbook snapshot controller', () => {
         ))!;
         expect(settled.meta.sheets[0].excelFirstRowHeader?.active).toBe(false);
         expect(settled.commandResult).toMatchObject({ outcome: 'recovered' });
+    });
+
+    it('says what the write changed when the panel is already past the receipt\'s projection', async () => {
+        // The branch that answers a receipt this panel has nothing left to
+        // apply for. A receipt is processed one microtask after its commit,
+        // ahead of any refresh's adoption, so the asking panel does not get
+        // here by itself; the microtask is held to put a refresh's newer
+        // authority in first. What is pinned is the answer: the write was
+        // committed, so it says what it changed.
+        const state = mutable_state_store();
+        const builds = { count: 0 };
+        const panel = open_excel('/header-receipt-after-refresh.xlsx', state.store, excel_profile(builds));
+        const initial = await ready(panel);
+        const run_now = globalThis.queueMicrotask;
+        const held: (() => void)[] = [];
+        let holding = true;
+        vi.stubGlobal('queueMicrotask', (callback: () => void) => {
+            if (holding && callback.name === 'process_excel_header_receipts') held.push(callback);
+            else run_now(callback);
+        });
+        try {
+            await toggle(panel, initial, 'receipt-after-refresh', false);
+            await vi.waitFor(() => expect(held.length).toBeGreaterThan(0));
+            await vscode_mock.__getWatchers()[0].__fireChange();
+            expect(builds.count).toBe(2);
+            expect(snapshots(panel).some((snapshot) => snapshot.commandResult !== undefined)).toBe(false);
+            holding = false;
+            for (const callback of held.splice(0)) run_now(callback);
+
+            await vi.waitFor(() => expect(snapshots(panel).some((snapshot) => (
+                snapshot.commandResult?.requestId === 'receipt-after-refresh'
+            ))).toBe(true));
+            const settled = snapshots(panel).find((snapshot) => (
+                snapshot.commandResult?.requestId === 'receipt-after-refresh'
+            ))!;
+            expect(settled.commandResult).toEqual({
+                type: 'excelFirstRowHeader',
+                requestId: 'receipt-after-refresh',
+                outcome: 'recovered',
+                error: 'A newer workbook projection was already active.',
+                change: { before: { mode: 'auto', row: 0 }, after: { mode: 'off' }, hidden: [], shown: [] },
+            });
+        } finally {
+            vi.unstubAllGlobals();
+        }
     });
 
     it('reports reload-required when the header reload stops at a declined file-size prompt', async () => {
@@ -1381,5 +1448,443 @@ describe('Excel workbook snapshot controller', () => {
         expect(initial.rowHeightProjection).toEqual([{ 0: 40, 1: 60 }]);
         expect(state.value().rowHeights).toEqual([{ 1: 40, 2: 60 }]);
         expect(state.value().rowHeightsVersion).toBe(1);
+    });
+
+    describe("a header target: a header step's replay", () => {
+        const rows = [
+            [text('Report'), text('')],
+            [text('Generated'), text('')],
+            [text('Name'), text('Age')],
+            [text('Alice'), number(30)],
+            [text('Bob'), number(25)],
+        ];
+        type Target = NonNullable<Extract<WebviewMessage, { type: 'setExcelFirstRowHeader' }>['target']>;
+
+        async function send_target(
+            panel: ReturnType<typeof open_excel>,
+            basis: { generation: number; sourceGeneration: number },
+            requestId: string,
+            target: Target,
+            extra: Record<string, unknown> = {},
+        ): Promise<WorkbookSnapshot> {
+            await panel.__receive({
+                type: 'setExcelFirstRowHeader',
+                sheetIndex: 0,
+                sheetName: 'People',
+                enabled: target.mode === 'on',
+                target,
+                requestId,
+                generation: basis.generation,
+                sourceGeneration: basis.sourceGeneration,
+                ...extra,
+            } as WebviewMessage);
+            await vi.waitFor(() => expect(snapshots(panel).some((snapshot) => (
+                snapshot.commandResult?.requestId === requestId
+            ))).toBe(true));
+            return snapshots(panel).find((snapshot) => snapshot.commandResult?.requestId === requestId)!;
+        }
+
+        it('installs each mode and says what the write changed, a write that changes nothing included', async () => {
+            const state = mutable_state_store();
+            const panel = open_excel('/target-modes.xlsx', state.store, excel_profile({ count: 0 }));
+            const initial = await ready(panel);
+            expect(initial.meta.sheets[0].excelFirstRowHeader).toMatchObject({ mode: 'auto', active: true });
+
+            const off = await send_target(panel, initial, 'target-off', { mode: 'off' });
+            expect(off.commandResult).toEqual({
+                type: 'excelFirstRowHeader',
+                requestId: 'target-off',
+                outcome: 'applied',
+                change: { before: { mode: 'auto', row: 0 }, after: { mode: 'off' }, hidden: [], shown: [] },
+            });
+            expect(off.meta.sheets[0].excelFirstRowHeader).toMatchObject({ mode: 'off', active: false });
+
+            // Back to automatic: the override is gone, and the detector decides again.
+            const auto = await send_target(panel, off, 'target-auto', { mode: 'auto' });
+            expect(auto.commandResult).toMatchObject({
+                outcome: 'applied',
+                change: { before: { mode: 'off' }, after: { mode: 'auto', row: 0 } },
+            });
+            expect(auto.meta.sheets[0].excelFirstRowHeader).toMatchObject({ mode: 'auto', active: true });
+            expect(state.value().excelFirstRowHeaders).toEqual({});
+
+            const on = await send_target(panel, auto, 'target-on', { mode: 'on', headerSourceRow: 0 });
+            expect(on.commandResult).toMatchObject({
+                outcome: 'applied',
+                change: { before: { mode: 'auto', row: 0 }, after: { mode: 'on', row: 0 } },
+            });
+            expect(on.meta.sheets[0].excelFirstRowHeader).toMatchObject({ mode: 'on', active: true, sourceRow: 0 });
+
+            // Already in place: the write changes nothing, and says so.
+            const again = await send_target(panel, on, 'target-on-again', { mode: 'on', headerSourceRow: 0 });
+            expect(again.commandResult).toMatchObject({
+                outcome: 'applied',
+                change: { before: { mode: 'on', row: 0 }, after: { mode: 'on', row: 0 }, hidden: [], shown: [] },
+            });
+        });
+
+        it('puts the header on a source row with the rows above hidden, and takes it back, in one write each', async () => {
+            const state = mutable_state_store({ excelFirstRowHeaders: { People: 'off' } });
+            const panel = open_excel(
+                '/target-rows.xlsx',
+                state.store,
+                excel_profile({ count: 0 }, () => new PhysicalExcelSource(rows)),
+            );
+            const initial = await ready(panel);
+
+            const promoted = await send_target(panel, initial, 'target-promote', {
+                mode: 'on', headerSourceRow: 2, hideRows: [0, 1], showRows: [],
+            });
+            expect(promoted.commandResult).toMatchObject({
+                outcome: 'applied',
+                change: { before: { mode: 'off' }, after: { mode: 'on', row: 2 }, hidden: [0, 1], shown: [] },
+            });
+            expect(promoted.meta.sheets[0]).toMatchObject({
+                columnNames: ['Name', 'Age'],
+                excelFirstRowHeader: { mode: 'on', active: true, sourceRow: 2 },
+            });
+            expect(state.value().transforms?.[0]?.hiddenRows).toEqual([0, 1]);
+
+            const undone = await send_target(panel, promoted, 'target-unpromote', {
+                mode: 'off', hideRows: [], showRows: [0, 1],
+            });
+            expect(undone.commandResult).toMatchObject({
+                outcome: 'applied',
+                change: { before: { mode: 'on', row: 2 }, after: { mode: 'off' }, hidden: [], shown: [0, 1] },
+            });
+            expect(undone.meta.sheets[0].excelFirstRowHeader).toMatchObject({ mode: 'off', active: false });
+            expect(state.value().excelFirstRowHeaders).toEqual({ People: 'off' });
+            expect(state.value().transforms?.[0]).toBeUndefined();
+        });
+
+        it('shows rows under an explicit header: undoing a promotion made from a header at row 1', async () => {
+            const state = mutable_state_store({ excelFirstRowHeaders: { People: 'on' } });
+            const panel = open_excel(
+                '/target-on-to-on.xlsx',
+                state.store,
+                excel_profile({ count: 0 }, () => new PhysicalExcelSource(rows)),
+            );
+            const initial = await ready(panel);
+            expect(initial.meta.sheets[0].excelFirstRowHeader).toMatchObject({ mode: 'on', sourceRow: 0 });
+            const promoted = await send_target(panel, initial, 'promote-from-on', {
+                mode: 'on', headerSourceRow: 2, hideRows: [0, 1],
+            });
+            expect(promoted.meta.sheets[0].excelFirstRowHeader).toMatchObject({ sourceRow: 2 });
+
+            const undone = await send_target(panel, promoted, 'back-to-row-1', {
+                mode: 'on', headerSourceRow: 0, showRows: [0, 1],
+            });
+            expect(undone.commandResult).toMatchObject({
+                outcome: 'applied',
+                change: { before: { mode: 'on', row: 2 }, after: { mode: 'on', row: 0 }, shown: [0, 1] },
+            });
+            expect(undone.meta.sheets[0]).toMatchObject({
+                columnNames: ['Report', ''],
+                excelFirstRowHeader: { mode: 'on', active: true, sourceRow: 0 },
+            });
+            expect(state.value().transforms?.[0]).toBeUndefined();
+        });
+
+        it('makes a row that is hidden now the header', async () => {
+            const state = mutable_state_store({ excelFirstRowHeaders: { People: 'off' } });
+            const panel = open_excel(
+                '/target-hidden-row.xlsx',
+                state.store,
+                excel_profile({ count: 0 }, () => new PhysicalExcelSource(rows)),
+            );
+            const initial = await ready(panel);
+            const hidden = await send_target(panel, initial, 'hide-row-3', { mode: 'off', hideRows: [2] });
+            expect(state.value().transforms?.[0]?.hiddenRows).toEqual([2]);
+
+            const header = await send_target(panel, hidden, 'hidden-row-header', {
+                mode: 'on', headerSourceRow: 2,
+            });
+            expect(header.commandResult).toMatchObject({
+                outcome: 'applied',
+                change: { after: { mode: 'on', row: 2 }, hidden: [0, 1], shown: [2] },
+            });
+            expect(header.meta.sheets[0].excelFirstRowHeader).toMatchObject({ active: true, sourceRow: 2 });
+            expect(state.value().transforms?.[0]?.hiddenRows).toEqual([0, 1]);
+        });
+
+        it('is not held to "clear sorting and filtering first": it names source rows', async () => {
+            const state = mutable_state_store({ excelFirstRowHeaders: { People: 'off' } });
+            const panel = open_excel(
+                '/target-sorted.xlsx',
+                state.store,
+                excel_profile({ count: 0 }, () => new PhysicalExcelSource(rows)),
+            );
+            const initial = await ready(panel);
+            await panel.__receive({
+                type: 'setTransform',
+                sheetIndex: 0,
+                state: {
+                    sort: [{ colIndex: 0, direction: 'asc' }],
+                    filters: [],
+                    schema: '["People",2,null]',
+                },
+                requestId: 'sort-first',
+                generation: initial.generation,
+                sourceGeneration: initial.sourceGeneration,
+                intent: 'user',
+            });
+            await vi.waitFor(() => expect(messages_of(panel, 'transformInstalled').some(
+                (message) => message.requestId === 'sort-first',
+            )).toBe(true));
+            const sorted = messages_of(panel, 'transformInstalled').find(
+                (message) => message.requestId === 'sort-first',
+            )!;
+            const header = await send_target(panel, sorted.view.basis, 'sorted-target', {
+                mode: 'on', headerSourceRow: 2, hideRows: [0, 1],
+            });
+            expect(header.commandResult).toMatchObject({ outcome: 'applied' });
+            expect(header.meta.sheets[0].excelFirstRowHeader).toMatchObject({ active: true, sourceRow: 2 });
+            expect(state.value().transforms?.[0]).toMatchObject({
+                sort: [{ colIndex: 0, direction: 'asc' }],
+                hiddenRows: [0, 1],
+            });
+        });
+
+        it('carries unsaved changes in the same write, and refuses with the reason when it cannot', async () => {
+            const pending = (cells: Record<string, unknown>) => mutable_state_store({
+                excelFirstRowHeaders: { People: 'off' },
+                pendingEdits: [{ sheetName: 'People', cells } as never],
+            });
+            const carried = pending({ '3:0': { value: 'Alicia', base: 'Alice' } });
+            const panel = open_excel(
+                '/target-pending.xlsx',
+                carried.store,
+                excel_profile({ count: 0 }, () => new PhysicalExcelSource(rows)),
+            );
+            const initial = await ready(panel);
+            const promoted = await send_target(panel, initial, 'pending-target', {
+                mode: 'on', headerSourceRow: 2, hideRows: [0, 1],
+            });
+            expect(promoted.commandResult).toMatchObject({ outcome: 'applied' });
+            expect(carried.value().pendingEdits?.[0]).toMatchObject({
+                cells: { '3:0': { value: 'Alicia', base: 'Alice' } },
+            });
+
+            const blocked_state: PerFileState = {
+                excelFirstRowHeaders: { People: 'off' },
+                pendingEdits: [{ sheetName: 'People', cells: { '2:1': { value: 'Years', base: 'Age' } } } as never],
+            };
+            const blocked = mutable_state_store(blocked_state);
+            const other = open_excel(
+                '/target-pending-refused.xlsx',
+                blocked.store,
+                excel_profile({ count: 0 }, () => new PhysicalExcelSource(rows)),
+            );
+            const other_initial = await ready(other);
+            const refused = await send_target(other, other_initial, 'pending-target-refused', {
+                mode: 'on', headerSourceRow: 2, hideRows: [0, 1],
+            });
+            expect(refused.commandResult).toEqual({
+                type: 'excelFirstRowHeader',
+                requestId: 'pending-target-refused',
+                outcome: 'rejected',
+                error: 'Save first: the row that would become the header row has unsaved changes.',
+            });
+            expect(blocked.value()).toMatchObject(blocked_state);
+        });
+
+        it('rejects a target that is not well formed, or names a row the worksheet does not have', async () => {
+            // One window per request: a result waits for the one before it to
+            // be acknowledged, and nothing here acknowledges.
+            const open = async (name: string) => {
+                const state = mutable_state_store({ excelFirstRowHeaders: { People: 'off' } });
+                const panel = open_excel(
+                    `/target-invalid-${name}.xlsx`,
+                    state.store,
+                    excel_profile({ count: 0 }, () => new PhysicalExcelSource(rows)),
+                );
+                return { state, panel, initial: await ready(panel) };
+            };
+            const invalid: [string, Target, Record<string, unknown>][] = [
+                ['with-unhide', { mode: 'off' }, { unhideAll: true }],
+                ['with-display-row', { mode: 'on', headerSourceRow: 2 }, { headerRow: 2 }],
+                ['enabled-contradicts', { mode: 'on', headerSourceRow: 2 }, { enabled: false }],
+                ['row-without-on', { mode: 'off', headerSourceRow: 2 }, {}],
+                ['on-without-row', { mode: 'on' }, {}],
+                ['shared-row', { mode: 'off', hideRows: [1], showRows: [1] }, {}],
+                ['negative-row', { mode: 'off', hideRows: [-1] }, {}],
+            ];
+            for (const [requestId, target, extra] of invalid) {
+                const { state, panel, initial } = await open(requestId);
+                const rejected = await send_target(panel, initial, requestId, target, extra);
+                expect(rejected.commandResult).toEqual({
+                    type: 'excelFirstRowHeader',
+                    requestId,
+                    outcome: 'rejected',
+                    error: 'The requested header change is invalid.',
+                });
+                expect(state.value().excelFirstRowHeaders).toEqual({ People: 'off' });
+                expect(state.value().transforms?.[0]).toBeUndefined();
+            }
+            const { state, panel, initial } = await open('row-gone');
+            const gone = await send_target(panel, initial, 'row-gone', { mode: 'on', headerSourceRow: 99 });
+            expect(gone.commandResult).toMatchObject({
+                outcome: 'rejected',
+                error: 'The selected row is no longer available.',
+            });
+            expect(state.value().excelFirstRowHeaders).toEqual({ People: 'off' });
+        });
+
+        async function all_hidden_panel(path: string, extra: PerFileState = {}) {
+            const state = mutable_state_store({
+                excelFirstRowHeaders: { People: 'on' },
+                transforms: [{
+                    sort: [],
+                    filters: [],
+                    hiddenRows: [0, 1, 2],
+                    schema: '["People",2,null]',
+                }],
+                ...extra,
+            });
+            const panel = open_excel(path, state.store, excel_profile({ count: 0 }));
+            const initial = await ready(panel);
+            expect(initial.meta.sheets[0].excelFirstRowHeader).toMatchObject({
+                mode: 'on', active: false, available: false,
+            });
+            await panel.__receive({
+                type: 'setTransform',
+                sheetIndex: 0,
+                state: initial.state.transforms![0]!,
+                requestId: 'restore-all-hidden',
+                generation: initial.generation,
+                sourceGeneration: initial.sourceGeneration,
+                intent: 'restore',
+            });
+            const restored = messages_of(panel, 'transformInstalled').find(
+                (message) => message.requestId === 'restore-all-hidden',
+            )!;
+            return { state, panel, basis: restored.view.basis };
+        }
+
+        it('puts back "on, with no row to use" after Unhide all: the hidden rows and the inactive header', async () => {
+            const { state, panel, basis } = await all_hidden_panel('/target-rowless-unhide.xlsx');
+            await panel.__receive({
+                type: 'setExcelFirstRowHeader',
+                sheetIndex: 0,
+                sheetName: 'People',
+                enabled: false,
+                unhideAll: true,
+                requestId: 'unhide-all',
+                generation: basis.generation,
+                sourceGeneration: basis.sourceGeneration,
+            });
+            await vi.waitFor(() => expect(snapshots(panel).at(-1)?.commandResult)
+                .toMatchObject({ requestId: 'unhide-all', outcome: 'applied' }));
+            const unhidden = snapshots(panel).at(-1)!;
+            // What Undo is built from: the side with no row, and every row shown.
+            expect(unhidden.commandResult).toMatchObject({
+                change: { before: { mode: 'on' }, after: { mode: 'off' }, hidden: [], shown: [0, 1, 2] },
+            });
+
+            const restored = await send_target(panel, unhidden, 'rowless-restore', {
+                mode: 'on', headerSourceRow: null, hideRows: [0, 1, 2], showRows: [],
+            });
+            expect(restored.commandResult).toMatchObject({
+                outcome: 'applied',
+                change: { before: { mode: 'off' }, after: { mode: 'on' }, hidden: [0, 1, 2], shown: [] },
+            });
+            expect(restored.meta.sheets[0].excelFirstRowHeader).toMatchObject({ mode: 'on', active: false });
+            expect(state.value().excelFirstRowHeaders).toEqual({ People: 'on' });
+            expect(state.value().transforms?.[0]?.hiddenRows).toEqual([0, 1, 2]);
+        });
+
+        it('plans a target with both lists empty by the same rule: "on, with no row" after the header was turned off', async () => {
+            const { state, panel, basis } = await all_hidden_panel('/target-rowless-toggle.xlsx');
+            await toggle(panel, basis as unknown as WorkbookSnapshot, 'toggle-off', false);
+            await vi.waitFor(() => expect(snapshots(panel).at(-1)?.commandResult)
+                .toMatchObject({ requestId: 'toggle-off', outcome: 'applied' }));
+            const off = snapshots(panel).at(-1)!;
+            expect(off.commandResult).toMatchObject({
+                change: { before: { mode: 'on' }, after: { mode: 'off' }, hidden: [], shown: [] },
+            });
+            expect(state.value().transforms?.[0]?.hiddenRows).toEqual([0, 1, 2]);
+
+            const restored = await send_target(panel, off, 'rowless-toggle-undo', {
+                mode: 'on', headerSourceRow: null,
+            });
+            expect(restored.commandResult).toMatchObject({
+                outcome: 'applied',
+                change: { before: { mode: 'off' }, after: { mode: 'on' }, hidden: [], shown: [] },
+            });
+            expect(restored.meta.sheets[0].excelFirstRowHeader).toMatchObject({ mode: 'on', active: false });
+            expect(state.value().transforms?.[0]?.hiddenRows).toEqual([0, 1, 2]);
+        });
+
+        it('refuses "on, with no row" over an unsaved cell on a row it would hide, and writes nothing', async () => {
+            const start: PerFileState = {
+                excelFirstRowHeaders: { People: 'off' },
+                pendingEdits: [{ sheetName: 'People', cells: { '1:0': { value: 'Alicia', base: 'Alice' } } } as never],
+            };
+            const state = mutable_state_store(start);
+            const panel = open_excel('/target-rowless-refused.xlsx', state.store, excel_profile({ count: 0 }));
+            const initial = await ready(panel);
+            const refused = await send_target(panel, initial, 'rowless-refused', {
+                mode: 'on', headerSourceRow: null, hideRows: [0, 1, 2],
+            });
+            expect(refused.commandResult).toMatchObject({
+                outcome: 'rejected',
+                error: 'Save first: rows that would be hidden have unsaved changes.',
+            });
+            expect(state.value()).toMatchObject(start);
+            expect(state.value().transforms?.[0]).toBeUndefined();
+        });
+
+        it("a second window adopts 'auto' from the receipt and is sent no change", async () => {
+            const state = mutable_state_store({ excelFirstRowHeaders: { People: 'off' } });
+            const origin = open_excel('/target-two-windows.xlsx', state.store, excel_profile({ count: 0 }));
+            const other = open_excel('/target-two-windows.xlsx', state.store, excel_profile({ count: 0 }));
+            const initial = await ready(origin);
+            await ready(other);
+            expect(snapshots(other).at(-1)?.meta.sheets[0].excelFirstRowHeader).toMatchObject({ mode: 'off' });
+
+            const auto = await send_target(origin, initial, 'two-windows-auto', { mode: 'auto' });
+            expect(auto.commandResult).toMatchObject({ outcome: 'applied', change: { after: { mode: 'auto', row: 0 } } });
+            await vi.waitFor(() => expect(snapshots(other).at(-1)?.meta.sheets[0].excelFirstRowHeader)
+                .toMatchObject({ mode: 'auto', active: true }));
+            expect(snapshots(other).some((snapshot) => snapshot.commandResult !== undefined)).toBe(false);
+        });
+
+        it('names no change when the commit was not established, though another writer left the very header it asked for', async () => {
+            const state = mutable_state_store();
+            const base = with_in_memory_authority_transactions(state.store);
+            let projection_id = '';
+            const store: AuthorityFileStateStore = {
+                ...base,
+                async finalize_authority_transaction(path, id) {
+                    if (!id.startsWith('projection:') || projection_id !== '') {
+                        return base.finalize_authority_transaction(path, id);
+                    }
+                    projection_id = id;
+                    // This request writes nothing. Another window writes the
+                    // identical header while it is failing.
+                    const current = await base.read(path);
+                    await base.compare_and_set(path, current.revision, {
+                        ...(current.state as PerFileState),
+                        excelFirstRowHeaders: { People: 'off' },
+                        excelFirstRowHeaderActive: { People: false },
+                        excelFirstRowHeaderVersion: 1,
+                    });
+                    throw new Error('finalize failed before writing');
+                },
+                async inspect_authority_transaction(path, id) {
+                    if (id === projection_id) throw new Error('inspection unavailable');
+                    return base.inspect_authority_transaction(path, id);
+                },
+            };
+            const panel = open_excel('/target-unattributed.xlsx', store, excel_profile({ count: 0 }));
+            const initial = await ready(panel);
+
+            const settled = await send_target(panel, initial, 'unattributed', { mode: 'off' });
+            expect(settled.commandResult).toMatchObject({ requestId: 'unattributed', outcome: 'recovered' });
+            // The recovery adopted exactly what the request planned. That
+            // proves the state exists, not that this request wrote it.
+            expect(settled.state.excelFirstRowHeaders).toEqual({ People: 'off' });
+            expect(settled.commandResult && 'change' in settled.commandResult).toBe(false);
+        });
     });
 });

@@ -23,7 +23,7 @@ import type {
     DurableFileAuthority,
     FileStateStore,
 } from '../state';
-import type { StoredPerFileState } from '../types';
+import type { PerFileState, StoredPerFileState } from '../types';
 import {
     finalize_authority,
     read_authority,
@@ -869,9 +869,12 @@ describe('file coordinator reservations', () => {
             recovery_events.push(event);
         }, factory);
 
-        await expect(coordinator.commit_excel_header(
+        const result = await coordinator.commit_excel_header(
             header_command(store, 'double-failure', 'off'),
-        )).resolves.toMatchObject({ type: 'indeterminate' });
+        );
+        expect(result).toMatchObject({ type: 'indeterminate' });
+        // Nothing says the write happened, so nothing says what it changed.
+        expect('change' in result).toBe(false);
         expect(notified).not.toHaveBeenCalled();
         expect(recovery_events).toMatchObject([{
             reason: 'projectionRecovery',
@@ -960,9 +963,13 @@ describe('file coordinator reservations', () => {
             second_events.push(event);
         }, factory);
 
-        await expect(coordinator.commit_excel_header(
+        const advanced = await coordinator.commit_excel_header(
             header_command(store, 'advanced-stage', 'off'),
-        )).resolves.toMatchObject({ type: 'indeterminate' });
+        );
+        expect(advanced).toMatchObject({ type: 'indeterminate' });
+        // The durable state holds the header, but reconciliation could not
+        // say this request's commit is what put it there.
+        expect('change' in advanced).toBe(false);
 
         expect(base.value(coordinator.statePath)).toMatchObject({
             excelFirstRowHeaders: { People: 'off' },
@@ -1699,6 +1706,219 @@ describe('file coordinator Task 10 invariants', () => {
         coordinator.dispose();
     });
 
+    it("commits a header target: hidden rows change in the same write, 'auto' removes the override, and the receipt says what changed", async () => {
+        const path = `/tmp/header-target-${Math.random()}.xlsx`;
+        const base = mapped_state_store();
+        const coordinator = acquire_file_coordinator(path, base.store);
+        await establish(coordinator, 'digest-a', base.store);
+        const receipts: ExcelHeaderOperationReceipt[] = [];
+        const subscription = coordinator.subscribe_excel_headers((receipt) => {
+            receipts.push(receipt);
+        });
+
+        const off = await coordinator.commit_excel_header({
+            ...header_command(base.store, 'target-off', 'off'),
+            hiddenRowChange: { hide: [1], show: [] },
+        });
+        expect(off).toMatchObject({
+            type: 'committed',
+            receipt: {
+                override: 'off',
+                change: { before: { mode: 'auto', row: 0 }, after: { mode: 'off' }, hidden: [1], shown: [] },
+            },
+        });
+        expect(base.value(coordinator.statePath)).toMatchObject({
+            excelFirstRowHeaders: { People: 'off' },
+            transforms: [{ hiddenRows: [1] }],
+        });
+
+        const auto = await coordinator.commit_excel_header({
+            ...header_command(base.store, 'target-auto', 'off'),
+            override: 'auto',
+            hiddenRowChange: { hide: [], show: [1] },
+        });
+        expect(auto).toMatchObject({
+            type: 'committed',
+            receipt: {
+                override: 'auto',
+                change: { before: { mode: 'off' }, after: { mode: 'auto', row: 0 }, hidden: [], shown: [1] },
+            },
+        });
+        const stored = base.value(coordinator.statePath) as PerFileState;
+        expect(stored.excelFirstRowHeaders).toEqual({});
+        expect(stored.transforms?.[0]).toBeUndefined();
+        await vi.waitFor(() => expect(receipts.map((receipt) => receipt.override)).toEqual(['off', 'auto']));
+        subscription.dispose();
+        coordinator.dispose();
+    });
+
+    it('reports only its own rows when another writer hides a row between the plan and the retry', async () => {
+        const path = `/tmp/header-target-retry-${Math.random()}.xlsx`;
+        const base = mapped_state_store();
+        const coordinator = acquire_file_coordinator(path, base.store);
+        await establish(coordinator, 'digest-a', base.store);
+        let interfered = false;
+        const store: AuthorityFileStateStore = {
+            ...base.store,
+            async stage_authority_transaction(file_path, stage) {
+                if (stage.kind === 'projection' && !interfered) {
+                    interfered = true;
+                    // Another window's write lands after this request planned.
+                    const current = await base.store.read(file_path);
+                    await base.store.compare_and_set(file_path, current.revision, {
+                        ...(current.state as PerFileState),
+                        transforms: [{ sort: [], filters: [], hiddenRows: [2] }],
+                    });
+                }
+                return base.store.stage_authority_transaction(file_path, stage);
+            },
+        };
+        const result = await coordinator.commit_excel_header({
+            ...header_command(store, 'retry-own-rows', 'off'),
+            hiddenRowChange: { hide: [1], show: [] },
+        });
+        expect(interfered).toBe(true);
+        // Planned again from the fresher state: the other window's row
+        // survives, and is not this write's.
+        expect(result).toMatchObject({
+            type: 'committed',
+            receipt: { change: { hidden: [1], shown: [] } },
+        });
+        expect((base.value(coordinator.statePath) as PerFileState).transforms?.[0]?.hiddenRows)
+            .toEqual([1, 2]);
+        coordinator.dispose();
+    });
+
+    it("rejects, and writes nothing, when another writer changes the leading hidden rows under 'on' before the retry", async () => {
+        const path = `/tmp/header-target-leading-${Math.random()}.xlsx`;
+        const base = mapped_state_store();
+        const coordinator = acquire_file_coordinator(path, base.store);
+        await establish(coordinator, 'digest-a', base.store);
+        // The asking panel's source saw no hidden rows: its manual candidate is row 0.
+        const with_candidate: ExcelHeaderPlanningInput = {
+            hasFormatting: false,
+            sheets: [{
+                ...planning_input.sheets[0]!,
+                manualHeaderRow: 0,
+                manualHeaderSourceRow: 0,
+                manualColumnNames: ['Name', 'Age'],
+            }],
+        };
+        let interfered = false;
+        const store: AuthorityFileStateStore = {
+            ...base.store,
+            async stage_authority_transaction(file_path, stage) {
+                if (stage.kind === 'projection' && !interfered) {
+                    interfered = true;
+                    const current = await base.store.read(file_path);
+                    await base.store.compare_and_set(file_path, current.revision, {
+                        ...(current.state as PerFileState),
+                        transforms: [{ sort: [], filters: [], hiddenRows: [0] }],
+                    });
+                }
+                return base.store.stage_authority_transaction(file_path, stage);
+            },
+        };
+        await expect(coordinator.commit_excel_header({
+            ...header_command(store, 'leading-rows', 'on'),
+            planningInput: with_candidate,
+        })).resolves.toEqual({
+            type: 'rejected',
+            error: 'The selected worksheet no longer matches this request.',
+        });
+        const stored = base.value(coordinator.statePath) as PerFileState;
+        expect(stored.excelFirstRowHeaders).toBeUndefined();
+        expect(stored.transforms?.[0]?.hiddenRows).toEqual([0]);
+        coordinator.dispose();
+    });
+
+    it('says what the write changed when something throws after the commit is established', async () => {
+        const path = `/tmp/header-throw-after-commit-${Math.random()}.xlsx`;
+        const base = mapped_state_store();
+        const coordinator = acquire_file_coordinator(path, base.store);
+        await establish(coordinator, 'digest-a', base.store);
+        const store: AuthorityFileStateStore = {
+            ...base.store,
+            // The inspection answers, and reading its answer throws: outside
+            // every handled failure, after `finalized`.
+            async inspect_authority_transaction(file_path, id) {
+                const inspected = await base.store.inspect_authority_transaction(file_path, id);
+                if (!id.startsWith('projection:')) return inspected;
+                return Object.defineProperty({ ...inspected }, 'authority', {
+                    get() {
+                        throw new Error('unreadable authority');
+                    },
+                });
+            },
+        };
+        const result = await coordinator.commit_excel_header({
+            ...header_command(store, 'throw-after-commit', 'off'),
+            hiddenRowChange: { hide: [2], show: [] },
+        });
+        expect(result).toEqual({
+            type: 'indeterminate',
+            error: 'The header setting could not be saved.',
+            change: { before: { mode: 'auto', row: 0 }, after: { mode: 'off' }, hidden: [2], shown: [] },
+        });
+        expect(base.value(coordinator.statePath)).toMatchObject({
+            excelFirstRowHeaders: { People: 'off' },
+        });
+        coordinator.dispose();
+    });
+
+    it('says what the write changed when the commit is established and the inspection reports another authority', async () => {
+        const path = `/tmp/header-inspection-mismatch-${Math.random()}.xlsx`;
+        const base = mapped_state_store();
+        const coordinator = acquire_file_coordinator(path, base.store);
+        await establish(coordinator, 'digest-a', base.store);
+        const store: AuthorityFileStateStore = {
+            ...base.store,
+            async inspect_authority_transaction(file_path, id) {
+                const inspected = await base.store.inspect_authority_transaction(file_path, id);
+                if (!id.startsWith('projection:')) return inspected;
+                return {
+                    ...inspected,
+                    authority: {
+                        ...inspected.authority,
+                        commitSequence: inspected.authority.commitSequence + 1,
+                    },
+                };
+            },
+        };
+        await expect(coordinator.commit_excel_header(
+            header_command(store, 'inspection-mismatch', 'off'),
+        )).resolves.toEqual({
+            type: 'indeterminate',
+            error: 'The header setting was saved, but the latest workbook authority could not be confirmed.',
+            change: { before: { mode: 'auto', row: 0 }, after: { mode: 'off' }, hidden: [], shown: [] },
+        });
+        coordinator.dispose();
+    });
+
+    it('says what the write changed when installing the finalized authority throws', async () => {
+        const path = `/tmp/header-finalizer-throw-${Math.random()}.xlsx`;
+        const base = mapped_state_store();
+        const coordinator = acquire_file_coordinator(path, base.store);
+        await establish(coordinator, 'digest-a', base.store);
+        const finalize = vi.spyOn(coordinator, 'finalize_authority_commit');
+        finalize.mockImplementationOnce(() => {
+            throw new Error('The finalized authority was not a monotonic advance.');
+        });
+        await expect(coordinator.commit_excel_header(
+            header_command(base.store, 'finalizer-throw', 'off'),
+        )).resolves.toEqual({
+            type: 'indeterminate',
+            error: 'The header setting could not be saved.',
+            change: { before: { mode: 'auto', row: 0 }, after: { mode: 'off' }, hidden: [], shown: [] },
+        });
+        expect(finalize).toHaveBeenCalledOnce();
+        expect(base.value(coordinator.statePath)).toMatchObject({
+            excelFirstRowHeaders: { People: 'off' },
+        });
+        finalize.mockRestore();
+        coordinator.dispose();
+    });
+
     it('bounds state-only projection staging conflicts without hot-looping', async () => {
         const path = `/tmp/bounded-projection-${Math.random()}.xlsx`;
         const base = mapped_state_store();
@@ -1871,7 +2091,13 @@ describe('file coordinator Task 10 invariants', () => {
         const result = await coordinator.commit_excel_header(
             header_command(store, 'inspect-failure', 'off'),
         );
-        expect(result).toMatchObject({ type: 'indeterminate' });
+        // The commit is established: only what followed it failed. So the
+        // answer says what this request's write changed.
+        expect(result).toEqual({
+            type: 'indeterminate',
+            error: expect.any(String),
+            change: { before: { mode: 'auto', row: 0 }, after: { mode: 'off' }, hidden: [], shown: [] },
+        });
         expect(subscriber).not.toHaveBeenCalled();
         const lower_bound = coordinator.authority();
         const durable = await base.store.read_authority(coordinator.statePath);
@@ -1942,9 +2168,15 @@ describe('file coordinator Task 10 invariants', () => {
             recovery_events.push(event);
         }, factory);
 
+        // Established, then the inspection failed: the answer says what
+        // this request's write changed.
         await expect(coordinator.commit_excel_header(
             header_command(store, 'alias-observed', 'off'),
-        )).resolves.toMatchObject({ type: 'indeterminate' });
+        )).resolves.toEqual({
+            type: 'indeterminate',
+            error: 'The header setting was saved, but the latest workbook authority could not be confirmed.',
+            change: { before: { mode: 'auto', row: 0 }, after: { mode: 'off' }, hidden: [], shown: [] },
+        });
 
         const durable = await base.store.read_authority(coordinator.statePath);
         expect(durable.commitSequence).toBe(3);
@@ -2217,7 +2449,11 @@ describe('file coordinator Task 10 invariants', () => {
 
         await expect(coordinator.commit_excel_header(
             header_command(store, 'post-confirmation-advance', 'off'),
-        )).resolves.toMatchObject({ type: 'indeterminate' });
+        )).resolves.toEqual({
+            type: 'indeterminate',
+            error: 'The header setting was saved before the durable workbook advanced.',
+            change: { before: { mode: 'auto', row: 0 }, after: { mode: 'off' }, hidden: [], shown: [] },
+        });
 
         expect(receipt_subscriber).not.toHaveBeenCalled();
         expect(first_events).toMatchObject([{ reason: 'projectionRecovery', priority: 'high' }]);
@@ -2231,6 +2467,51 @@ describe('file coordinator Task 10 invariants', () => {
         receipts.dispose();
         alias?.dispose();
         coordinator.dispose();
+    });
+
+    it('says what the write changed when the workbook file moved on after the commit was established', async () => {
+        const upper = 'C:\\Data\\Post-Confirmation-Physical.xlsx';
+        const lower = 'c:\\data\\post-confirmation-physical.xlsx';
+        const base = mapped_state_store();
+        const coordinator = acquire_file_coordinator(upper, base.store, 'win32');
+        await establish(coordinator, 'digest-a', base.store);
+        let alias: ReturnType<typeof acquire_file_coordinator> | undefined;
+        const store: AuthorityFileStateStore = {
+            ...base.store,
+            async inspect_authority_transaction(file_path, id) {
+                const inspected = await base.store.inspect_authority_transaction(file_path, id);
+                if (id.startsWith('projection:')) {
+                    // The file itself is saved by another writer, and this
+                    // coordinator learns of it before it confirms.
+                    const current = await base.store.read(file_path);
+                    await base.store.stage_authority_transaction(file_path, {
+                        id: 'post-confirmation-physical',
+                        kind: 'physical',
+                        ordinal: 999,
+                        expectedStateRevision: current.revision,
+                        expectedCommitSequence: inspected.authority.commitSequence,
+                        physicalDigest: 'digest-b',
+                    });
+                    await base.store.finalize_authority_transaction(
+                        file_path,
+                        'post-confirmation-physical',
+                    );
+                    alias = acquire_file_coordinator(lower, base.store, 'win32');
+                    await alias.state_ready();
+                }
+                return inspected;
+            },
+        };
+        const result = await coordinator.commit_excel_header(
+            header_command(store, 'post-confirmation-physical', 'off'),
+        );
+        alias?.dispose();
+        coordinator.dispose();
+        expect(result).toEqual({
+            type: 'indeterminate',
+            error: 'The header setting was saved against an older physical workbook basis.',
+            change: { before: { mode: 'auto', row: 0 }, after: { mode: 'off' }, hidden: [], shown: [] },
+        });
     });
 
     it('settles equal or dominated observations without installing divergent authority', async () => {

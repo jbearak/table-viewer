@@ -37,6 +37,7 @@ import {
     rekey_saved_appended_row_history,
     view_step_change,
     width_step_changes,
+    header_step_changes,
     type HistoryAction,
     type HistoryChange,
     type HistoryStackState,
@@ -45,8 +46,11 @@ import { create_history_store } from '../webview/history-store';
 import {
     column_widths_view_step,
     columns_view_step,
+    header_step_label,
+    header_view_delta,
     row_heights_view_step,
     transform_view_step,
+    type HeaderViewDelta,
     type ViewStep,
 } from '../webview/view-history-model';
 
@@ -493,6 +497,159 @@ describe('a view step under a Header Row change', () => {
     });
 });
 
+/** A header step: one action, one `header` change per worksheet. */
+function header_action(...deltas: (HeaderViewDelta | undefined)[]): HistoryAction {
+    const kept = deltas.map((delta) => {
+        if (delta === undefined) throw new Error('fixture built no header change');
+        return delta;
+    });
+    return {
+        label: header_step_label(kept),
+        changes: kept.map((delta) => ({ kind: 'view' as const, delta })),
+    };
+}
+const use_row_3 = (sheet = SHEET) => header_view_delta(sheet, {
+    before: { mode: 'auto', row: 0 }, after: { mode: 'on', row: 2 }, hidden: [0, 1], shown: [],
+});
+const turn_off = (sheet = SHEET) => header_view_delta(sheet, {
+    before: { mode: 'on', row: 0 }, after: { mode: 'off' }, hidden: [], shown: [],
+});
+
+describe('a header step in the stack', () => {
+    it('is recorded with its label, clears redo, and moves between the stacks', () => {
+        let state = recorded(empty_history_stack(), { label: 'Edit cell', changes: [cell_change(1, 'a')] });
+        state = recorded(state, sort_action());
+        state = moved(state, 'undo');
+        expect(state.redoStack).toHaveLength(1);
+
+        state = recorded(state, header_action(use_row_3()));
+        expect(state.redoStack).toHaveLength(0);
+        expect(state.undoStack.map((entry) => entry.action.label))
+            .toEqual(['Edit cell', 'Use row 3 as header']);
+
+        const stored = state.undoStack[1].action;
+        const undone = moved(state, 'undo');
+        expect(undone.redoStack[0].action).toBe(stored);
+        expect(moved(undone, 'redo').undoStack[1].action).toBe(stored);
+    });
+
+    it('owns what it keeps: the caller can change its arrays and sides afterwards', () => {
+        const action = header_action(use_row_3());
+        const state = recorded(empty_history_stack(), action);
+        const given = (action.changes[0] as Extract<HistoryChange, { kind: 'view' }>).delta as HeaderViewDelta;
+        (given.hiddenRows!.hidden as number[]).push(99);
+        (given.after as { row?: number }).row = 7;
+        const kept = header_step_changes(state.undoStack[0].action)![0].delta;
+        expect(kept).toEqual({
+            worksheet: SHEET,
+            slice: 'header',
+            before: { mode: 'auto', row: 0 },
+            after: { mode: 'on', row: 2 },
+            hiddenRows: { hidden: [0, 1], shown: [] },
+        });
+        expect(Object.isFrozen(kept)).toBe(true);
+        expect(Object.isFrozen(kept.after)).toBe(true);
+        expect(Object.isFrozen(kept.hiddenRows!.hidden)).toBe(true);
+    });
+
+    it('holds one header change per worksheet when a gesture spans worksheets', () => {
+        const action = header_action(turn_off(), turn_off(OTHER_SHEET));
+        expect(action.label).toBe('Show first row as data on all sheets');
+        const kept = recorded(empty_history_stack(), action).undoStack[0].action;
+        expect(header_step_changes(kept)?.map((change) => change.delta.worksheet.sheetName))
+            .toEqual(['Data', 'More']);
+        // One change is a header step too; other shapes are not.
+        expect(header_step_changes(header_action(turn_off()))).toHaveLength(1);
+        expect(header_step_changes(sort_action())).toBeUndefined();
+        expect(header_step_changes(resize_column_action())).toBeUndefined();
+        expect(width_step_changes(action)).toBeUndefined();
+        expect(header_step_changes({ label: 'x', changes: [action.changes[0], action.changes[0]] }))
+            .toBeUndefined();
+        expect(header_step_changes({ label: 'x', changes: [action.changes[0], cell_change(1, 'a')] }))
+            .toBeUndefined();
+    });
+
+    it('counts no cells, and costs more the more hidden rows it names', () => {
+        const few = measure_history_action(header_action(use_row_3()));
+        const many = measure_history_action(header_action(header_view_delta(SHEET, {
+            before: { mode: 'on', row: 5_000 },
+            after: { mode: 'off' },
+            hidden: [],
+            shown: Array.from({ length: 5_000 }, (_unused, row) => row),
+        })));
+        expect(few.cellCount).toBe(0);
+        expect(many.cellCount).toBe(0);
+        expect(few.byteCost).toBeGreaterThan(0);
+        expect(many.byteCost).toBeGreaterThan(few.byteCost + 5_000);
+    });
+
+    it('is carried unchanged when a save rebases the cells it wrote', () => {
+        let state = recorded(empty_history_stack(), { label: 'Edit cell', changes: [cell_change(1, 'a')] });
+        state = recorded(state, header_action(use_row_3()));
+        const before = state.undoStack[1].action.changes;
+        const rebased = rebase_saved_cell_history(state, [{
+            worksheet: SHEET,
+            sourceRow: 1,
+            sourceColumn: 0,
+            value: history_value('a'),
+        }]);
+        expect(rebased).not.toBe(state);
+        expect(rebased.undoStack[1].action.changes).toEqual(before);
+        expect(rebased.undoStack.map((entry) => entry.action.label))
+            .toEqual(['Edit cell', 'Use row 3 as header']);
+    });
+
+    it('is carried as it is by the header rebase: it names source rows', () => {
+        const store = create_history_store(undefined, { body_start: () => 0 });
+        store.stage_record(header_action(use_row_3(), turn_off(OTHER_SHEET))).commit();
+        const entry = store.snapshot().undoStack[0];
+        expect(entry_for_current_header(entry, () => ({ bodyStart: 3, sourceRowCount: 10 })))
+            .toEqual({ ok: true, entry });
+    });
+
+    it('is dropped with everything else by the structural-save barrier', () => {
+        const state = install_structural_save_barrier(
+            recorded(empty_history_stack(), header_action(use_row_3())),
+        );
+        expect(state.undoStack).toHaveLength(0);
+    });
+
+    it('is never built into a cell replay request', () => {
+        const state = recorded(empty_history_stack(), header_action(use_row_3()));
+        expect(action_has_view_change(state.undoStack[0].action)).toBe(true);
+        expect(view_step_change(state.undoStack[0].action)?.delta.slice).toBe('header');
+    });
+});
+
+describe('the Edit menu for a header step', () => {
+    it('names each kind of step in both directions', () => {
+        const unhide = header_view_delta(SHEET, {
+            before: { mode: 'on', row: 2 }, after: { mode: 'off' }, hidden: [], shown: [0, 1],
+        });
+        const actions = [
+            header_action(use_row_3()),
+            header_action(turn_off()),
+            header_action(unhide),
+            header_action(use_row_3(), use_row_3(OTHER_SHEET)),
+        ];
+        expect(actions.map((action) => action.label)).toEqual([
+            'Use row 3 as header',
+            'Turn off header row',
+            'Unhide rows',
+            'Use first row as header on all sheets',
+        ]);
+        let state = empty_history_stack();
+        for (const action of actions) state = recorded(state, action);
+        state = moved(moved(moved(state, 'undo'), 'undo'), 'undo');
+        expect(history_menu_projection(state, false)).toMatchObject({
+            undoAvailable: true,
+            undoLabel: 'Use row 3 as header',
+            redoAvailable: true,
+            redoLabel: 'Turn off header row',
+        });
+    });
+});
+
 describe('the Edit menu for a view step', () => {
     it('names the step in both directions', () => {
         let state = recorded(empty_history_stack(), sort_action());
@@ -636,6 +793,23 @@ describe('what a view replay says', () => {
             .toBe('Sheet “Data”: Undo skipped “Hide row”: rows above the header row stay hidden.');
         expect(view_skip_warning('redo', 'Hide row', ['too-many-hidden'], true))
             .toBe('Redo skipped “Hide row”: too many rows would be hidden.');
+    });
+
+    it('says why a header step, or part of it, was skipped', () => {
+        expect(view_skip_warning('undo', 'Use row 3 as header', ['header-row-gone'], true))
+            .toBe('Undo skipped “Use row 3 as header”: '
+                + 'the row it used as the header row is no longer in the worksheet.');
+        expect(view_skip_warning('redo', 'Unhide rows', ['header-unavailable'], true, 'Data'))
+            .toBe("Sheet “Data”: Redo skipped “Unhide rows”: the header row can't be restored on this worksheet.");
+        expect(view_skip_warning('undo', 'Show first row as data on all sheets', ['sheets-gone'], false))
+            .toBe('Undo skipped part of “Show first row as data on all sheets”: '
+                + 'worksheets that are no longer in the workbook were left out.');
+        expect(view_replay_refusal_warning(
+            'undo',
+            'Use row 2 as header',
+            'Save first: the header row has unsaved changes, and it would stop being the header row.',
+        )).toBe("Can't undo “Use row 2 as header”: Save first: the header row has unsaved changes, "
+            + 'and it would stop being the header row.');
     });
 
     it('says what a size step left out, and why a size write did not land', () => {

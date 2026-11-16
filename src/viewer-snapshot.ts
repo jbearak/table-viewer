@@ -15,6 +15,7 @@ import {
     transform_schema_for_sheet,
     type CellHighlightState,
     type CsvSaveLifecycle,
+    type ExcelHeaderChange,
     type PerFileState,
     type ScrollPosition,
     type StoredPerFileState,
@@ -76,6 +77,12 @@ export interface ExcelHeaderSnapshotResult {
      * reloads, which reads durable state back in one consistent piece.
      */
     readonly reloadRequired?: true;
+    /**
+     * What this request's write changed, when the host knows the write was
+     * committed. Absent on a rejection, and on a `recovered` result whose
+     * commit the host could not establish.
+     */
+    readonly change?: ExcelHeaderChange;
 }
 
 export type RetainedSnapshotCommandResult = ExcelHeaderSnapshotResult;
