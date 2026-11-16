@@ -1148,6 +1148,10 @@ export function App(): React.JSX.Element {
     // place. A transformed view still remounts because source adoption replaces
     // its display-row mapping before the transform is restored.
     const [grid_mount_epoch, set_grid_mount_epoch] = useState(0);
+    // Counts the grids mounted: one per active sheet and mount epoch. A
+    // gesture that waited compares it, to know its grid is still the one
+    // shown (a sheet left and returned to is a new grid).
+    const grid_instance_ref = useRef(0);
     const [active_sheet_index, set_active_sheet_index] = useState(0);
     // Read when a save captures the cursor, from callbacks that may be stale.
     const active_sheet_index_for_focus_ref = useRef(0);
@@ -7151,6 +7155,10 @@ export function App(): React.JSX.Element {
         [history_free],
     );
 
+    useLayoutEffect(() => {
+        grid_instance_ref.current += 1;
+    }, [active_sheet_index, grid_mount_epoch]);
+
     const handle_sheet_select = useCallback(
         (sheet_index: number) => {
             // The grid is keyed by the active sheet, so this unmounts the one
@@ -9693,17 +9701,19 @@ export function App(): React.JSX.Element {
         if (!quiet && pending_edit_request_ref.current === null) {
             const document = history_document_ref.current;
             const generation = generation_ref.current;
-            const sheet = active_sheet_index_for_focus_ref.current;
+            const grid = grid_instance_ref.current;
             const deadline = Date.now() + HISTORY_PRESS_HOLD_MS;
             const restoring = (sheet_index: number) => pending_transform_origins_ref.current[sheet_index] === 'restore';
             for (;;) {
                 const wait = next_window_transform_wait(restoring, deadline, document);
                 if (wait === 'clear' || wait === 'past-bound') break;
                 if (await wait === 'replaced') return false;
-                // The person moved to another sheet meanwhile: the grid that
-                // held the gesture is gone, and the gesture with it. Nothing is
-                // said; they left it.
-                if (active_sheet_index_for_focus_ref.current !== sheet) return false;
+                // The view moved: said below.
+                if (generation_ref.current !== generation) break;
+                // Another grid is shown (the person moved to another sheet,
+                // even if they came back): the grid that held the gesture is
+                // gone, and the gesture with it. Nothing is said; they left it.
+                if (grid_instance_ref.current !== grid) return false;
                 if (held()) return true;
             }
             // A restore that moved the view remounted the grid that holds the

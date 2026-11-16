@@ -3137,6 +3137,26 @@ export function attach_viewer(
      * answer arrives. (Work it superseded or that went stale is no longer
      * current, which a session request also waits out; see below.)
      */
+    // The view the renderer was last sent, to tell when a snapshot moves it.
+    let last_posted_view: { readonly generation: number; readonly sourceGeneration: number } | undefined;
+    /**
+     * A snapshot is being posted. One that moves the view (a new generation
+     * or source generation) makes the renderer drop every transform it was
+     * waiting for: a reconciliation installed a saved view, or the source
+     * changed. Work still running for those requests is then, as far as the
+     * renderer knows, done, and a session request waits it out rather than
+     * being refused for it.
+     */
+    function note_snapshot_posted(snapshot: { readonly generation: number; readonly sourceGeneration: number }): void {
+        const moved = last_posted_view !== undefined && (
+            last_posted_view.generation !== snapshot.generation
+            || last_posted_view.sourceGeneration !== snapshot.sourceGeneration
+        );
+        last_posted_view = { generation: snapshot.generation, sourceGeneration: snapshot.sourceGeneration };
+        if (!moved) return;
+        for (const authority of transform_authorities.values()) answered_transform_authorities.add(authority);
+    }
+
     function note_transform_answered(sheet_index: number, request_id: string): void {
         for (const [message, authority] of transform_authorities) {
             if (message.sheetIndex === sheet_index && message.requestId === request_id) {
@@ -4714,6 +4734,7 @@ export function attach_viewer(
             || (receiver_epoch !== undefined
                 && receiver_epoch !== session.current_receiver_epoch)
         ) return Promise.resolve(false);
+        if (message.type === 'workbookSnapshot') note_snapshot_posted(message.snapshot);
         try {
             options.integrationTestPort?.on_host_message(message);
             return Promise.resolve(webview.postMessage(message)).catch(() => false);

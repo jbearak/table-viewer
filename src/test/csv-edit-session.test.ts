@@ -9132,6 +9132,84 @@ describe('CSV edit sessions', () => {
         expect(warning).not.toHaveBeenCalledWith('Wait for sorting and filtering to finish before editing.');
     });
 
+    it('waits for a restore still computing when another sheet\'s reconciliation moves the view', async () => {
+        // The renderer drops every pending transform on a snapshot that moves
+        // the view. A restore still computing on another sheet is then done as
+        // far as it knows, and a session request waits it out.
+        const warning = vi.spyOn(vscode_mock.window, 'showWarningMessage');
+        class TwoSheetGatedSource extends TrackingTransformSource {
+            readonly entered = deferred();
+            readonly gate = deferred();
+            private gating = true;
+            override meta(): WorkbookMeta {
+                const sheet = super.meta().sheets[0]!;
+                return { hasFormatting: false, sheets: [sheet, { ...sheet, name: 'Sheet2' }] };
+            }
+            async read_raw_columns_async(
+                sheet_index: number,
+                start_row: number,
+                count: number,
+                column_indices: readonly number[],
+            ): Promise<RawColumnWindow> {
+                if (this.gating && sheet_index === 0) {
+                    this.gating = false;
+                    this.entered.resolve();
+                    await this.gate.promise;
+                }
+                const plain: DataSource = {
+                    meta: () => this.meta(),
+                    read_rows: (sheet, start, rows) => this.read_rows(sheet, start, rows),
+                    close: () => undefined,
+                } as DataSource;
+                return read_source_raw_columns_async(plain, sheet_index, start_row, count, column_indices, () => false);
+            }
+        }
+        const source = new TwoSheetGatedSource();
+        const sorted = (name: string) => ({
+            sort: [{ colIndex: 0, direction: 'asc' as const }],
+            filters: [],
+            schema: `["${name}",1,null]`,
+        });
+        const panel = open_csv_table(
+            uri('/tmp/session-after-other-sheet-reconcile.csv'),
+            state_store({ transforms: [sorted('Sheet1'), sorted('Sheet2')] }).store,
+            { ...csv_table_profile(), build_source: async () => source },
+        );
+        await panel.__receive({ type: 'ready' });
+        const snapshot = latest_snapshot(panel);
+        const restore = (sheet_index: number, name: string) => panel.__receive({
+            type: 'setTransform',
+            sheetIndex: sheet_index,
+            requestId: `restore-${sheet_index}`,
+            state: sorted(name),
+            generation: snapshot.generation,
+            sourceGeneration: snapshot.sourceGeneration,
+            intent: 'restore',
+        } as never);
+
+        const first = restore(0, 'Sheet1');
+        await source.entered.promise;
+        const second = restore(1, 'Sheet2');
+        await second;
+        // Sheet 2's reconciliation moved the view while Sheet 1 computes.
+        expect(panel.__messages.flatMap((message) => (
+            (message as { type?: string }).type === 'workbookSnapshot'
+                ? [(message as { snapshot: WorkbookSnapshot }).snapshot.generation]
+                : []
+        )).at(-1)).not.toBe(snapshot.generation);
+
+        const request = panel.__receive({ type: 'requestEditSession' } as never);
+        await flush_promises();
+        expect(edit_session_results(panel)).toEqual([]);
+        source.gate.resolve();
+        await first;
+        await request;
+        expect(edit_session_results(panel)).toEqual([
+            expect.objectContaining({ type: 'editSessionResult', granted: true }),
+        ]);
+        expect(warning).not.toHaveBeenCalledWith('Wait for sorting and filtering to finish before editing.');
+    });
+
     it('refuses a quiet request without announcing it', async () => {
         const warning = vi.spyOn(vscode_mock.window, 'showWarningMessage');
         const panel = open_csv_table(uri('/tmp/session.csv'), state_store().store);
