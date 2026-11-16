@@ -25534,6 +25534,173 @@ describe('the header row as a step in history', () => {
         });
     });
 
+    // The one class of refusal a walk in order can meet: an edit that was
+    // saved and then undone, or redone, leaves its cell unsaved against the
+    // file, on a row the header step would turn into the header row, out of
+    // it, or hide. The host's rebase refuses; the step waits for a Save.
+    describe('across a Save: a cell left unsaved where the header step would move it', () => {
+        const ROW_2: ExcelHeaderChange = {
+            before: { mode: 'off' }, after: { mode: 'on', row: 1 }, hidden: [0], shown: [],
+        };
+
+        /** As after the Undo or Redo of an edit that had been saved: a held session, one cell unsaved. */
+        async function leave_a_cell_unsaved(post_message: ReturnType<typeof vi.fn>) {
+            await acquire_editing_session(post_message);
+            seed_mounted_store({ '0:0': { value: 'typed', base: 'saved' } });
+            post_message.mockClear();
+        }
+
+        /** Move the newest step to Redo, as its Undo did. */
+        function undone() {
+            const moved = props().history_store!.stage_move('undo', history().undoStack.at(-1)!);
+            expect(moved.commit()).toBe(true);
+            moved.notify();
+        }
+
+        /** The press: the stores are published, the host says it holds them, and the request goes out. */
+        async function press(
+            post_message: ReturnType<typeof vi.fn>,
+            command: 'undo' | 'redo',
+            unsaved = false,
+        ) {
+            const before = requests(post_message).length;
+            await (command === 'undo' ? undo() : redo());
+            // With a cell unsaved, the request waits: the host must hold
+            // the cell to judge the header change against it.
+            if (unsaved) expect(requests(post_message)).toHaveLength(before);
+            if (requests(post_message).length === before) {
+                await dispatch_host_message({
+                    type: 'pendingEditsAcknowledged',
+                    editSessionId: 'test-edit-session',
+                    sequence: last_publication_sequence(post_message),
+                });
+            }
+            expect(requests(post_message)).toHaveLength(before + 1);
+            return requests(post_message).at(-1)!;
+        }
+
+        /** What a Save leaves: nothing unsaved. */
+        function save() {
+            seed_mounted_store({});
+        }
+
+        it('header, rename, Save, Undo, Undo: the header row has unsaved changes and would stop being the header row', async () => {
+            const { post_message } = await render_app();
+            const promoted = book([on(1)]);
+            await open_with_view_owed(post_message, promoted, [0]);
+            await install_saved_view(post_message);
+            record_header('Use row 2 as header', [[0, ROW_2]]);
+            record_edit('Rename column');
+            // Saved, then undone: the header cell is unsaved against the file.
+            undone();
+            await leave_a_cell_unsaved(post_message);
+
+            const refused = await press(post_message, 'undo', true);
+            expect(refused.target).toEqual({ mode: 'off', hideRows: [], showRows: [0] });
+            await answer(refused, promoted, {
+                outcome: 'rejected',
+                error: 'Save first: the header row has unsaved changes, and it would stop being the header row.',
+            }, { capabilities: HELD, state: { transforms: [hiding(promoted, [0])] } });
+            await install_saved_view(post_message);
+
+            expect(warnings(post_message)).toEqual([
+                'Can\'t undo “Use row 2 as header”: Save first: the header row has unsaved changes, '
+                + 'and it would stop being the header row.',
+            ]);
+            expect(history_labels('undo')).toEqual(['Use row 2 as header']);
+            expect(history_labels('redo')).toEqual(['Rename column']);
+            expect(edits_admitted()).toBe(true);
+
+            save();
+            post_message.mockClear();
+            const retried = await press(post_message, 'undo');
+            expect(retried.target).toEqual({ mode: 'off', hideRows: [], showRows: [0] });
+            await answer(retried, book([OFF]), {
+                change: { before: ROW_2.after, after: ROW_2.before, hidden: [], shown: [0] },
+            }, { capabilities: HELD });
+            expect(history_labels('undo')).toEqual([]);
+            expect(history_labels('redo')).toEqual(['Rename column', 'Use row 2 as header']);
+            expect(warnings(post_message)).toEqual([]);
+            expect(edits_admitted()).toBe(true);
+        });
+
+        it('edit, Save, header, Undo, Undo, Save, Redo, Redo: the row that would become the header row has unsaved changes', async () => {
+            const { post_message } = await render_app();
+            await open(post_message, book([OFF]));
+            record_edit();
+            record_header('Use row 2 as header', [[0, ROW_2]]);
+            // Both undone, a Save, and the edit redone: its cell is unsaved again.
+            undone();
+            await leave_a_cell_unsaved(post_message);
+            expect(history_labels('undo')).toEqual(['Edit cell']);
+            expect(history_labels('redo')).toEqual(['Use row 2 as header']);
+
+            const refused = await press(post_message, 'redo', true);
+            expect(refused.target).toEqual({ mode: 'on', headerSourceRow: 1, hideRows: [0], showRows: [] });
+            await answer(refused, book([OFF]), {
+                outcome: 'rejected',
+                error: 'Save first: the row that would become the header row has unsaved changes.',
+            }, { capabilities: HELD });
+
+            expect(warnings(post_message)).toEqual([
+                'Can\'t redo “Use row 2 as header”: '
+                + 'Save first: the row that would become the header row has unsaved changes.',
+            ]);
+            expect(history_labels('undo')).toEqual(['Edit cell']);
+            expect(history_labels('redo')).toEqual(['Use row 2 as header']);
+            expect(edits_admitted()).toBe(true);
+
+            save();
+            post_message.mockClear();
+            const retried = await press(post_message, 'redo');
+            expect(retried.target).toEqual({ mode: 'on', headerSourceRow: 1, hideRows: [0], showRows: [] });
+            const promoted = book([on(1)]);
+            await answer(retried, promoted, { change: ROW_2 }, {
+                capabilities: HELD,
+                state: { transforms: [hiding(promoted, [0])] },
+            });
+            expect(history_labels('undo')).toEqual(['Edit cell', 'Use row 2 as header']);
+            expect(history_labels('redo')).toEqual([]);
+            expect(warnings(post_message)).toEqual([]);
+        });
+
+        it('Unhide all, edit a shown row, Save, Undo, Undo: rows that would be hidden have unsaved changes', async () => {
+            const { post_message } = await render_app();
+            await open(post_message, book([OFF]));
+            record_header('Unhide rows', [[0, ROW_3_UNDONE]]);
+            record_edit();
+            undone();
+            await leave_a_cell_unsaved(post_message);
+
+            const refused = await press(post_message, 'undo', true);
+            expect(refused.target).toEqual({ mode: 'on', headerSourceRow: 2, hideRows: [0, 1], showRows: [] });
+            await answer(refused, book([OFF]), {
+                outcome: 'rejected',
+                error: 'Save first: rows that would be hidden above the header row have unsaved changes.',
+            }, { capabilities: HELD });
+
+            expect(warnings(post_message)).toEqual([
+                'Can\'t undo “Unhide rows”: '
+                + 'Save first: rows that would be hidden above the header row have unsaved changes.',
+            ]);
+            expect(history_labels('undo')).toEqual(['Unhide rows']);
+            expect(history_labels('redo')).toEqual(['Edit cell']);
+            expect(edits_admitted()).toBe(true);
+
+            save();
+            post_message.mockClear();
+            const retried = await press(post_message, 'undo');
+            const promoted = book([on(2)]);
+            await answer(retried, promoted, { change: ROW_3 }, {
+                capabilities: HELD,
+                state: { transforms: [hiding(promoted, [0, 1])] },
+            });
+            expect(history_labels('undo')).toEqual([]);
+            expect(history_labels('redo')).toEqual(['Edit cell', 'Unhide rows']);
+            expect(warnings(post_message)).toEqual([]);
+        });
+    });
+
     describe('a step that can no longer be applied', () => {
         it('skips a step whose header row is no longer in the worksheet, and lets the older step through', async () => {
             const { post_message } = await render_app();
