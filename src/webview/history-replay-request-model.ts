@@ -64,10 +64,22 @@ import {
  * where it was so the user can try again.
  */
 export type ReplayRefusalReason =
+    /** This window's coordinator already holds a replay. The caller holds the press. */
     | 'busy'
+    /** The host is busy with something this window cannot see (another window's save). */
+    | 'host-busy'
+    /** The top entry is a view step, which its caller replays. The caller starts again. */
+    | 'view-step'
     | 'nothing-to-replay'
     | 'blocked'
     | 'conflict'
+    /**
+     * The host's view had moved under the replay and the host wrote nothing:
+     * a refused preparation, or a commit refused before its write. The caller
+     * tries again once the refresh it lost to has been applied.
+     */
+    | 'not-current'
+    /** The view moved after the commit's write landed. Not tried again. */
     | 'document-changed'
     | 'unavailable'
     | 'malformed'
@@ -418,14 +430,18 @@ export function prepare_refusal_reason(
     reason: HistoryReplayPrepareRefused['reason'],
 ): ReplayRefusalReason {
     switch (reason) {
-        case 'busy': return 'busy';
+        // The window's own replay in flight never reaches the host (the
+        // coordinator holds one slot), so this is something else's: a save of
+        // another window, or a preparation the host still holds.
+        case 'busy': return 'host-busy';
         case 'conflict': return 'conflict';
         case 'malformed': return 'malformed';
         case 'unavailable':
         case 'edit-session-unavailable':
             return 'unavailable';
         case 'document-changed':
-            return 'document-changed';
+            // Preparation only reads, compares, and issues a lease.
+            return 'not-current';
     }
 }
 
@@ -441,7 +457,10 @@ export function commit_refusal_reason(
         case 'expired':
         case 'document-changed':
             // The same fact to the caller: the state this replay was planned
-            // against is gone, and a fresh preparation is the only way forward.
+            // against is gone, the host wrote nothing, and a fresh preparation
+            // is the only way forward.
+            return 'not-current';
+        case 'changed-after-write':
             return 'document-changed';
     }
 }

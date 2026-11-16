@@ -32,23 +32,28 @@ export function replayed_verb(direction: HistoryDirection): string {
 }
 
 /**
- * The warning a refusal deserves, or `null` for the ones that deserve silence.
+ * The warning a refusal deserves, or `null` for the ones the caller answers
+ * another way.
  *
- * Silent, deliberately:
- *  - `busy` — a second keypress while the first replay is still out. Holding the
- *    key down is how a user walks back a dozen edits; warning about it would fire
- *    once per repeat.
- *  - `nothing-to-replay` — the stack is empty. The menu item is already disabled,
- *    and in the webview there is nothing to say beyond "no".
- *  - `malformed` — a protocol fault, not a user-actionable condition. Reporting
- *    it would ask the user to act on something only a bug report can fix.
+ * Null, deliberately:
+ *  - `busy` — this window's own replay holds the slot. The caller holds the
+ *    press and carries it out when the slot is free.
+ *  - `view-step` — the top entry is a view step. The caller starts the press
+ *    again and replays it as one.
+ *  - `nothing-to-replay` — the stack is empty: the press was carried out and
+ *    there was nothing to carry out. The menu item names no step, and a
+ *    message would be a dialog for every key repeat past the end.
  *  - `header-row` — worded by `header_wait_warning`, which knows which rows.
  *
- * `document-changed` speaks. The caller has already returned for a document
- * that really was replaced, so what arrives here is the same document whose
- * host-side view moved under the replay — a refresh not yet acknowledged, a
- * lease that expired — and saying nothing would leave a keypress that did
- * nothing with no account of why.
+ * `document-changed` and `not-current` speak. The caller has already returned
+ * for a document that really was replaced, so what arrives here is the same
+ * document whose host-side view moved under the replay, and saying nothing
+ * would leave a keypress that did nothing with no account of why. (The caller
+ * tries a `not-current` replay again first, where the refresh it lost to has
+ * arrived; this is what it says when it has not.)
+ *
+ * `malformed` speaks too, as `unavailable`: a press must not vanish, whatever
+ * the fault was.
  *
  * The protocol's own vocabulary — leases, proposals, overlays — never reaches
  * these strings. They describe what happened to the document.
@@ -61,10 +66,13 @@ export function history_refusal_warning(
 ): string | null {
     switch (reason) {
         case 'busy':
+        case 'view-step':
         case 'nothing-to-replay':
-        case 'malformed':
         case 'header-row':
             return null;
+        case 'host-busy':
+            return view_replay_wait_warning('applying', direction);
+        case 'not-current':
         case 'document-changed':
             return `${verb(direction)} did not run because the file was refreshing. Try again.`;
         case 'blocked':
@@ -74,6 +82,7 @@ export function history_refusal_warning(
             return barrier_label === undefined
                 ? `Cannot ${direction} any further: an earlier change was too large to keep in history.`
                 : `Cannot ${direction} past “${barrier_label}”: it was too large to keep in history.`;
+        case 'malformed':
         case 'unavailable':
             return `${verb(direction)} is unavailable: the change it would apply can no longer be reached.`;
         case 'conflict':
@@ -159,6 +168,7 @@ export type ViewReplayWait =
     | 'updating'
     | 'refreshing'
     | 'finishing'
+    | 'saving'
     | 'preview';
 
 /**
@@ -176,9 +186,34 @@ export function view_replay_wait_warning(wait: ViewReplayWait, direction: Histor
             return `${verb(direction)} did not run because the file was refreshing. Try again.`;
         case 'finishing':
             return `${verb(direction)} did not run because editing is still finishing. Try again.`;
+        case 'saving':
+            return `${verb(direction)} did not run because the file is still being saved. Try again.`;
         case 'preview':
             return `${verb(direction)} is unavailable in preview.`;
     }
+}
+
+/**
+ * An undo or redo the host has not answered for as long as a lease lasts. The
+ * request stays out and its answer is still taken; this only says so, because
+ * a press that changed nothing must not also say nothing.
+ */
+export function history_unanswered_warning(direction: HistoryDirection): string {
+    return `${verb(direction)} has not finished yet. If this window stays busy, reopen the file.`;
+}
+
+/**
+ * An undo or redo held behind a change of the person's own that then recorded
+ * nothing (refused, or overtaken by a refresh). The press was made for that
+ * change, and would otherwise undo the step under it, so it is not carried out.
+ */
+export function history_gesture_unrecorded_warning(direction: HistoryDirection): string {
+    return `${verb(direction)} did not run because the change made before it was not applied.`;
+}
+
+/** An undo or redo that needed an editing session the window could not get. */
+export function history_session_unavailable_warning(direction: HistoryDirection): string {
+    return `${verb(direction)} is unavailable because editing could not be started.`;
 }
 
 /** A view replay the host, or a rule of this window, refused. The entry stays. */

@@ -451,7 +451,17 @@ export type HistoryReplayCommitRefusalReason =
     | 'expired'
     | 'proposal-mismatch'
     | 'conflict'
+    /**
+     * The view the replay was prepared against had moved, and the commit
+     * wrote nothing. A fresh preparation is the way forward.
+     */
     | 'document-changed'
+    /**
+     * The commit's write landed, and the view moved before it could be
+     * answered as committed. Not `document-changed`: the write is in the file,
+     * so the same replay prepared again would not be a second attempt.
+     */
+    | 'changed-after-write'
     | 'unavailable';
 
 export interface HistoryReplayCommitRefused extends HistoryReplayLeaseIdentity {

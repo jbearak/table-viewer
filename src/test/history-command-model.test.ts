@@ -1,5 +1,12 @@
 import { describe, expect, it } from 'vitest';
-import { header_wait_warning, history_refusal_warning } from '../webview/history-command-model';
+import {
+    header_wait_warning,
+    history_gesture_unrecorded_warning,
+    history_refusal_warning,
+    history_session_unavailable_warning,
+    history_unanswered_warning,
+    view_replay_wait_warning,
+} from '../webview/history-command-model';
 
 const worksheet = { sheetIndex: 0, sheetName: 'Data', worksheetId: 'rId1' };
 
@@ -11,10 +18,60 @@ describe('history_refusal_warning', () => {
             .toBe('Redo did not run because the file was refreshing. Try again.');
     });
 
-    it('stays silent for a key repeat, an empty stack, a protocol fault, and a header wait worded elsewhere', () => {
-        for (const reason of ['busy', 'nothing-to-replay', 'malformed', 'header-row'] as const) {
+    it('says the same of a replay the host refused before it wrote anything', () => {
+        // What the caller says when the refresh the replay lost to has not
+        // arrived, so there is nothing to try it again against.
+        expect(history_refusal_warning('not-current', 'undo', undefined))
+            .toBe('Undo did not run because the file was refreshing. Try again.');
+    });
+
+    it('has no words for the refusals the caller answers another way', () => {
+        // `busy` and `view-step`: the press is held, or started again.
+        // `nothing-to-replay`: carried out, with nothing to carry out.
+        // `header-row`: worded by `header_wait_warning`.
+        for (const reason of ['busy', 'view-step', 'nothing-to-replay', 'header-row'] as const) {
             expect(history_refusal_warning(reason, 'undo', undefined)).toBeNull();
         }
+    });
+
+    it('says a host that is busy with something this window cannot see', () => {
+        expect(history_refusal_warning('host-busy', 'redo', undefined))
+            .toBe('Redo did not run because another change is still being applied. Try again.');
+    });
+
+    it('says a protocol fault as unavailable: a press must not vanish', () => {
+        expect(history_refusal_warning('malformed', 'undo', undefined))
+            .toBe(history_refusal_warning('unavailable', 'undo', undefined));
+        expect(history_refusal_warning('malformed', 'undo', undefined))
+            .toBe('Undo is unavailable: the change it would apply can no longer be reached.');
+    });
+});
+
+describe('what a press says when it could not be carried out', () => {
+    it('names a save still in flight', () => {
+        expect(view_replay_wait_warning('saving', 'undo'))
+            .toBe('Undo did not run because the file is still being saved. Try again.');
+        expect(view_replay_wait_warning('saving', 'redo'))
+            .toBe('Redo did not run because the file is still being saved. Try again.');
+    });
+
+    it('says a request the host has not answered', () => {
+        expect(history_unanswered_warning('undo'))
+            .toBe('Undo has not finished yet. If this window stays busy, reopen the file.');
+        expect(history_unanswered_warning('redo'))
+            .toBe('Redo has not finished yet. If this window stays busy, reopen the file.');
+    });
+
+    it('says a press not carried out because the change made before it was not applied', () => {
+        expect(history_gesture_unrecorded_warning('undo'))
+            .toBe('Undo did not run because the change made before it was not applied.');
+        expect(history_gesture_unrecorded_warning('redo'))
+            .toBe('Redo did not run because the change made before it was not applied.');
+    });
+
+    it('says an editing session that could not be started', () => {
+        expect(history_session_unavailable_warning('redo'))
+            .toBe('Redo is unavailable because editing could not be started.');
     });
 });
 

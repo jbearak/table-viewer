@@ -8,8 +8,9 @@
  * A post per keystroke would rebuild the application menu on every keystroke.
  *
  * Deliberately narrow: two labels, two booleans and the text-editing flag. A
- * replay being in flight is not among them, because it changes neither item — the
- * renderer's own busy refusal is the throttle, and it is silent by design.
+ * replay being in flight is not among them, because it changes neither item: a
+ * press made meanwhile is held by the page and carried out when the replay has
+ * landed (`history-press-model.ts`).
  */
 
 import type { HistoryMenuProjection } from '../types';
@@ -18,11 +19,10 @@ import { peek_history, type HistoryStackState } from './history-stack-model';
 /**
  * The projection for one history state.
  *
- * A `blocked` peek — undo has run back into a barrier — counts as unavailable.
- * The item greys out, which is the truthful answer: there is nothing further
- * back to reach. The reason is not on the menu, because a disabled item cannot be
- * clicked to hear it; the keystroke path still explains itself (see
- * `history_refusal_warning`).
+ * A `blocked` peek — undo has run back into a barrier — counts as unavailable,
+ * so the item reads plain "Undo": there is nothing further back to reach. The
+ * item stays enabled (`desktop/main/history-menu-model.ts`), and a press of it
+ * says why (`history_refusal_warning`).
  */
 export function history_menu_projection(
     state: HistoryStackState,

@@ -1,6 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { DataSource } from '../data-source/interface';
-import { SourceCandidate } from '../source-candidate';
+import {
+    SourceCandidate,
+    same_physical_observation,
+    type PhysicalSourceObservation,
+} from '../source-candidate';
 
 function source(close = vi.fn()): DataSource {
     return {
@@ -108,5 +112,58 @@ describe('SourceCandidate', () => {
 
         expect(owned.observation).toEqual({ fingerprint: '1:2', digest: 'digest' });
         expect(Object.isFrozen(owned.observation)).toBe(true);
+    });
+});
+
+describe('same_physical_observation', () => {
+    const observation = (overrides: Partial<PhysicalSourceObservation> = {}): PhysicalSourceObservation => ({
+        fingerprint: '1:2',
+        digest: 'digest',
+        byteLength: 2,
+        verification: 'bracketedDigest',
+        comparisonFingerprint: '3:4',
+        comparisonDigest: 'comparison',
+        ...overrides,
+    });
+    const structure = {} as NonNullable<PhysicalSourceObservation['xlsxStructure']>;
+
+    it('is the same object', () => {
+        const one = observation();
+        expect(same_physical_observation(one, one)).toBe(true);
+    });
+
+    it('is another object that says the same of the same bytes', () => {
+        expect(same_physical_observation(observation(), observation())).toBe(true);
+        expect(same_physical_observation(
+            { fingerprint: '1:2', digest: 'digest' },
+            { fingerprint: '1:2', digest: 'digest' },
+        )).toBe(true);
+    });
+
+    it.each([
+        ['fingerprint', { fingerprint: '9:2' }],
+        ['digest', { digest: 'other' }],
+        ['byteLength', { byteLength: 3 }],
+        ['verification', { verification: undefined }],
+        ['comparisonFingerprint', { comparisonFingerprint: '9:4' }],
+        ['comparisonDigest', { comparisonDigest: 'other' }],
+    ] as const)('is not one whose %s differs', (_field, overrides) => {
+        expect(same_physical_observation(observation(), observation(overrides))).toBe(false);
+        expect(same_physical_observation(observation(overrides), observation())).toBe(false);
+    });
+
+    it('compares the structural scan by whether there is one', () => {
+        expect(same_physical_observation(
+            observation({ xlsxStructure: structure }),
+            observation({ xlsxStructure: { ...structure } }),
+        )).toBe(true);
+        expect(same_physical_observation(observation({ xlsxStructure: structure }), observation())).toBe(false);
+        expect(same_physical_observation(observation(), observation({ xlsxStructure: structure }))).toBe(false);
+    });
+
+    it('is none against one, and none against none', () => {
+        expect(same_physical_observation(undefined, observation())).toBe(false);
+        expect(same_physical_observation(observation(), undefined)).toBe(false);
+        expect(same_physical_observation(undefined, undefined)).toBe(true);
     });
 });

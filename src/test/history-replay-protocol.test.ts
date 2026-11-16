@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, expectTypeOf, it } from 'vitest';
 import type { CellHyperlink, RichText } from '../cell-content';
 import {
     MAX_HISTORY_ACTION_CELLS,
@@ -12,6 +12,7 @@ import {
     sanitized_wire_cell_overlay_state,
     sanitized_wire_history_replay_display_focus,
     sanitized_wire_history_replay_focus,
+    type HistoryReplayCommitRefusalReason,
 } from '../history-replay-protocol';
 
 const LINK: CellHyperlink = { kind: 'external', target: 'https://example.com/' };
@@ -778,5 +779,23 @@ describe('history_replay_proposal_digest', () => {
         );
         expect(history_replay_proposal_digest(first!))
             .not.toBe(history_replay_proposal_digest(second!));
+    });
+});
+
+describe('commit refusal reasons', () => {
+    // Host-to-window answers are not sanitized, so the set is pinned by type:
+    // `changed-after-write` (the write landed, then the view moved) is its own
+    // reason, apart from `document-changed` (nothing written), because the
+    // window tries the second again and must not try the first.
+    it('says apart a view that moved after the write from one that moved before it', () => {
+        expectTypeOf<HistoryReplayCommitRefusalReason>().toEqualTypeOf<
+            | 'malformed'
+            | 'expired'
+            | 'proposal-mismatch'
+            | 'conflict'
+            | 'document-changed'
+            | 'changed-after-write'
+            | 'unavailable'
+        >();
     });
 });

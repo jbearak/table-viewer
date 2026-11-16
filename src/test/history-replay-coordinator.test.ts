@@ -22,6 +22,7 @@ import type {
     PrepareHistoryReplayRequest,
 } from '../history-replay-protocol';
 import { wire_overlay_from_cell_overlay_state } from '../webview/history-replay-wire-model';
+import { columns_view_step } from '../webview/view-history-model';
 
 const SHEET: WorksheetTarget = { sheetIndex: 0, sheetName: 'Data', worksheetId: 'rId1' };
 const OTHER: WorksheetTarget = { sheetIndex: 1, sheetName: 'Notes', worksheetId: 'rId2' };
@@ -209,7 +210,22 @@ async function started(
     return { outcome };
 }
 
+/** A view step: hidden columns, which the coordinator never replays. */
+function view_change(): HistoryChange {
+    const step = columns_view_step(SHEET, 'schema-1', [], [1]);
+    if (step === undefined) throw new Error('fixture built no step');
+    return { kind: 'view', delta: step.delta };
+}
+
 describe('beginning a replay', () => {
+    it('hands a view step on top of the stack back to its caller, acquiring nothing', async () => {
+        const { coordinator, session, posted } = harness([view_change()]);
+        await expect(coordinator.begin('undo')).resolves.toEqual({ kind: 'refused', reason: 'view-step' });
+        expect(session.calls).toBe(0);
+        expect(posted).toEqual([]);
+        expect(coordinator.is_busy()).toBe(false);
+    });
+
     it('refuses when the history has nothing to replay', async () => {
         const store = create_history_store();
         const coordinator = create_history_replay_coordinator({
@@ -368,6 +384,23 @@ describe('beginning a replay', () => {
             expect(last_prepare(posted).highlights).toHaveLength(1);
             expect(coordinator.is_busy()).toBe(true);
             void pending;
+        });
+
+        it('hands a view step that reached the top during the acquisition back to its caller', async () => {
+            // A sort of this window installs, and records, while the cell
+            // undo under it is acquiring its session. The press is for the
+            // newest entry, and a view step is its caller's to replay.
+            const { coordinator, session, posted, record } = harness([cell_change(0, 0, 'typed')]);
+            session.gate = () => {};
+            const pending = coordinator.begin('undo');
+            for (let index = 0; index < 5; index += 1) await Promise.resolve();
+
+            record([view_change()]);
+            session.gate?.();
+
+            await expect(pending).resolves.toEqual({ kind: 'refused', reason: 'view-step' });
+            expect(coordinator.is_busy()).toBe(false);
+            expect(posted).toEqual([]);
         });
 
         it('abandons an acquisition whose document went away', async () => {
@@ -625,7 +658,7 @@ describe('settling', () => {
         expect(coordinator.is_busy()).toBe(false);
     });
 
-    it('reads a moved document as the state it planned against being gone', async () => {
+    it('reads a preparation refused over a moved view as one to try again', async () => {
         const { coordinator, posted } = harness([cell_change(0, 0, 'typed')]);
         const { outcome: pending } = await started(coordinator, 'undo');
         const request = last_prepare(posted);
@@ -634,7 +667,42 @@ describe('settling', () => {
             replayId: request.replayId,
             reason: 'document-changed',
         });
-        await expect(pending).resolves.toEqual({ kind: 'refused', reason: 'document-changed' });
+        await expect(pending).resolves.toEqual({ kind: 'refused', reason: 'not-current' });
+        expect(coordinator.is_busy()).toBe(false);
+    });
+
+    it.each([
+        ['expired', 'not-current'],
+        ['document-changed', 'not-current'],
+        ['changed-after-write', 'document-changed'],
+    ] as const)('reads a commit refused as %s as %s', async (reason, expected) => {
+        const { coordinator, posted, history } = harness([cell_change(0, 0, 'typed')]);
+        const { outcome: pending } = await started(coordinator, 'undo');
+        coordinator.on_prepared(prepared_for(last_prepare(posted)));
+        const commit = last_commit(posted);
+        coordinator.on_commit_refused({
+            requestId: commit.requestId,
+            replayId: commit.replayId,
+            leaseId: commit.leaseId,
+            mutationId: commit.mutationId,
+            reason,
+        });
+        await expect(pending).resolves.toEqual({ kind: 'refused', reason: expected });
+        // The entry stays where it was either way.
+        expect(history().undoStack).toHaveLength(1);
+        expect(coordinator.is_busy()).toBe(false);
+    });
+
+    it('reads a host that is busy as that, not as this window being busy', async () => {
+        const { coordinator, posted } = harness([cell_change(0, 0, 'typed')]);
+        const { outcome: pending } = await started(coordinator, 'undo');
+        const request = last_prepare(posted);
+        coordinator.on_prepare_refused({
+            requestId: request.requestId,
+            replayId: request.replayId,
+            reason: 'busy',
+        });
+        await expect(pending).resolves.toEqual({ kind: 'refused', reason: 'host-busy' });
     });
 
     it('translates a commit conflict, leaving history where it was', async () => {

@@ -1971,7 +1971,9 @@ describe('GridShell editing with no session held yet', () => {
 
         expect(grid_mock.props!.getCellContent!([0, 0]).allowOverlay).toBe(false);
         expect(grid_mock.props!.onOverlayOpenRequest).toBeUndefined();
-        expect(grid_mock.props!.onPasteAdmission).toBeUndefined();
+        // The paste hook is always there (it is where a paste takes its
+        // ticket), and answers that there is nothing to paste into.
+        await expect(grid_mock.props!.onPasteAdmission!(Promise.resolve())).resolves.toBe(false);
         expect(grid_mock.props!.onPaste).toBe(false);
     });
 
@@ -2003,8 +2005,9 @@ describe('GridShell editing with no session held yet', () => {
         expect(grid_mock.open_overlay).toHaveBeenCalledTimes(1);
         expect(grid_mock.open_overlay).toHaveBeenCalledWith([0, 0], 'h');
         expect(overlay.input()!.value).toBe('hi');
-        // Under the session the grid opens editors itself again.
-        expect(grid_mock.props!.onOverlayOpenRequest).toBeUndefined();
+        // Under the session the grid opens editors itself again: Glide
+        // still asks, and is told to go ahead.
+        expect(grid_mock.props!.onOverlayOpenRequest!([0, 0], 'x')).toBe(false);
         // In use while the editor is open.
         expect(editing_ref.current!.session_busy()).toBe(true);
         await overlay.unmount();

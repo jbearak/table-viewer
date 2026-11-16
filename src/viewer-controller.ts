@@ -138,6 +138,7 @@ import {
 import { reconcile_finalization } from './finalization-reconciliation';
 import {
     SourceCandidate,
+    same_physical_observation,
     type PhysicalSourceObservation,
 } from './source-candidate';
 import {
@@ -10826,7 +10827,7 @@ export function attach_viewer(
                 || receiver_epoch !== session.current_receiver_epoch
                 || !core
                 || message.sourceGeneration !== core.source_generation
-                || source_observation !== observation
+                || !same_physical_observation(source_observation, observation)
             ) {
                 await refuse('The workbook changed while the row format was being captured.');
                 return;
@@ -11244,7 +11245,7 @@ export function attach_viewer(
             if (
                 content_digest(raw) !== observation.digest
                 || !session_is_current()
-                || source_observation !== observation
+                || !same_physical_observation(source_observation, observation)
             ) {
                 await refuse('The workbook changed while the row format was being captured.');
                 return;
@@ -11615,7 +11616,7 @@ export function attach_viewer(
         }
         if (
             content_digest(raw) !== observation.digest
-            || source_observation !== observation
+            || !same_physical_observation(source_observation, observation)
             || !edit_message_is_current(message.editSessionId)
         ) {
             await reply(false);
@@ -11902,7 +11903,7 @@ export function attach_viewer(
             const raw = await host.fs.read_file(uri);
             if (
                 content_digest(raw) !== observation.digest
-                || source_observation !== observation
+                || !same_physical_observation(source_observation, observation)
                 || !edit_message_is_current(message.editSessionId)
                 || receiver_epoch !== session.current_receiver_epoch
             ) {
@@ -16761,7 +16762,7 @@ export function attach_viewer(
             && adoption?.resources.source === src
             && adoption.resources.core === replay_core
             && replay_core.source_generation === bound_source_generation
-            && source_observation === observation
+            && same_physical_observation(source_observation, observation)
             && session.acknowledged_current()
             && source_authority.authorityRevision === expected_authority
             && source_authority.physicalRevision === expected_physical_revision
@@ -17391,13 +17392,21 @@ export function attach_viewer(
         // the replay was in flight — and must leave history exactly where it is.
         let conflicted = false;
         let unavailable = false;
+        // Whether the updater ran at all, and whether it found the view this
+        // replay was prepared against already replaced. Either way nothing
+        // was compared and nothing was written: that is a view that moved,
+        // not a conflict and not a failure, and the window prepares afresh.
+        let updater_ran = false;
+        let view_moved = false;
         let committed_structures: readonly HistoryReplayAcceptedStructuralWrite[] | undefined;
-        await update_file_state((current, updater_sheets) => {
+        const written = await update_file_state((current, updater_sheets) => {
+            updater_ran = true;
             conflicted = false;
             unavailable = false;
+            view_moved = false;
             committed_structures = undefined;
             if (!payload.isCurrent()) {
-                unavailable = true;
+                view_moved = true;
                 return current;
             }
             // Re-verified INSIDE the updater, which is what makes the check
@@ -17672,8 +17681,19 @@ export function attach_viewer(
 
         if (unavailable) return refused('unavailable');
         if (conflicted) return refused('conflict');
+        // A refresh that lands during `update_file_state`'s own read fails its
+        // first validation, and the updater is never called.
+        if (!updater_ran || view_moved) return refused('document-changed');
         if (committed_structures === undefined) return refused('conflict');
-        if (!payload.isCurrent()) return refused('document-changed');
+        // `written` is the snapshot this call committed, and undefined when it
+        // committed none (it lost its compare-and-swap to a view that moved,
+        // or the state already held everything the replay writes). A view
+        // that moved after this call's write is said apart, because the
+        // write is in the file: trying the replay again would not be a
+        // second attempt at something that did not happen.
+        if (!payload.isCurrent()) {
+            return refused(written === undefined ? 'document-changed' : 'changed-after-write');
+        }
         if (!accept_replay_row_admissions(
             payload.rowAdmissionRequestIds,
             request.leaseId,

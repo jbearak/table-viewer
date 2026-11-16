@@ -1386,6 +1386,15 @@ export interface EditingHandle {
      * then folds that editor, so its text commits before edits pause.
      */
     typing_pending(): boolean;
+    /**
+     * True while a gesture the grid has taken is still on its way to being
+     * recorded: one waiting for the editing session (until the grant has been
+     * rendered into the grid and its continuation has run), a row admission
+     * the grid was asked for and has not finished (queued behind another, or
+     * out), or a paste Glide has not finished. A press of Undo or Redo is
+     * held behind it, so the press undoes the gesture made before it.
+     */
+    gesture_pending(): boolean;
 }
 
 /** Imperative focus bridge used by App after generation-keyed remounts. */
@@ -1735,6 +1744,40 @@ export interface GridShellProps {
      */
     gestures_admitted?: () => boolean;
     /**
+     * Whether a press of Undo or Redo is waiting to be carried out. A getter
+     * and not a rendered value: the hold is in force in the task that makes
+     * it, and a key repeat or a click in that same task must already meet it.
+     *
+     * Read where an editor is asked for and where a Save is, which it
+     * refuses; and where a gesture the other gates have already refused
+     * (a delete, fill or cut; a row or column structure action; a highlight)
+     * says why, through `on_history_hold_gesture`. A gesture made during a
+     * hold opens no editor and saves nothing: it was made after the press,
+     * and the press must not undo it. It does
+     * not enter `editable_cells` or `edit_armed`, and touches no cell's
+     * `editable`: the work the press waits for needs the grid editable, and
+     * that flag is also the writability a paste made before the press reads.
+     */
+    history_press_held?: () => boolean;
+    /** A key, a double click, or a Save was refused for `history_press_held`, so App can say so. */
+    on_history_hold_gesture?: () => void;
+    /**
+     * The ticket a gesture takes when it is made, and the way its later
+     * continuation shows it at App's gates: work made before a waiting press
+     * is still recorded, work made after it is not. Both stable.
+     */
+    gesture_ticket?: () => number;
+    with_gesture_ticket?: <T>(ticket: number, run: () => T) => T;
+    /** Keys held for an editor have landed in one, or will not: see `typing_pending`. */
+    on_held_typing_end?: () => void;
+    /**
+     * A gesture that took `ticket` ended without recording anything: its
+     * session was refused, its view moved, or it was refused when it ran. A
+     * press of Undo or Redo made after it, and held behind it, was for its
+     * step; App drops that press rather than let it undo the step under it.
+     */
+    on_gesture_unrecorded?: (ticket: number | undefined) => void;
+    /**
      * Source-keyed keys the host refused the last save over. Unioned into the
      * informational tint so a `baseMismatch` cell is visibly marked even when the
      * webview cannot inspect its non-resident row. A
@@ -1902,6 +1945,12 @@ export function GridShell({
     on_insert_columns,
     history_store,
     gestures_admitted,
+    history_press_held,
+    on_history_hold_gesture,
+    gesture_ticket,
+    with_gesture_ticket,
+    on_held_typing_end,
+    on_gesture_unrecorded,
     host_rejected_keys,
     host_observed_bases,
     on_editing_change,
@@ -3584,6 +3633,64 @@ export function GridShell({
     // Gestures waiting on the session. Counted so the session they are about
     // to use is not released as empty in the moment before they run.
     const session_requests_ref = useRef(0);
+    // Row admissions this grid was asked for and has not finished: waiting in
+    // its queue behind another, or out with the host. App sees only the one
+    // that is out.
+    const row_admissions_pending_ref = useRef(0);
+    // A press of Undo or Redo that is waiting (see `history_press_held`), and
+    // the ticket by which work made before it is still let through. In refs,
+    // read when a gesture asks: none of the callbacks below is rebuilt for them.
+    const history_press_held_ref = useRef(history_press_held);
+    history_press_held_ref.current = history_press_held;
+    const on_history_hold_gesture_ref = useRef(on_history_hold_gesture);
+    on_history_hold_gesture_ref.current = on_history_hold_gesture;
+    const gesture_ticket_ref = useRef(gesture_ticket);
+    gesture_ticket_ref.current = gesture_ticket;
+    const with_gesture_ticket_ref = useRef(with_gesture_ticket);
+    with_gesture_ticket_ref.current = with_gesture_ticket;
+    const on_held_typing_end_ref = useRef(on_held_typing_end);
+    on_held_typing_end_ref.current = on_held_typing_end;
+    const on_gesture_unrecorded_ref = useRef(on_gesture_unrecorded);
+    on_gesture_unrecorded_ref.current = on_gesture_unrecorded;
+    /** See `on_gesture_unrecorded`. */
+    const gesture_unrecorded = useCallback((ticket: number | undefined) => {
+        on_gesture_unrecorded_ref.current?.(ticket);
+    }, []);
+    /** The ticket of a gesture made now, for the continuation that will finish it. */
+    const take_gesture_ticket = useCallback((): number | undefined => gesture_ticket_ref.current?.(), []);
+    /**
+     * Run the synchronous part of a continuation as the gesture that took
+     * `ticket`. One that awaits again wraps again when it resumes.
+     */
+    const run_with_ticket = useCallback(<T,>(ticket: number | undefined, run: () => T): T => {
+        const wrap = with_gesture_ticket_ref.current;
+        return ticket === undefined || wrap === undefined ? run() : wrap(ticket, run);
+    }, []);
+    /**
+     * Whether a gesture made now is refused because a press of Undo or Redo
+     * is waiting. Says so through App when it is.
+     */
+    const refused_for_history_press = useCallback((): boolean => {
+        if (history_press_held_ref.current?.() !== true) return false;
+        on_history_hold_gesture_ref.current?.();
+        return true;
+    }, []);
+    /** Keys held for an editor are no longer on their way to one. */
+    const notify_held_typing_end = useCallback(() => {
+        queueMicrotask(() => on_held_typing_end_ref.current?.());
+    }, []);
+    /**
+     * The pastes Glide has been handed and has not finished, oldest first,
+     * which is the order it runs them in: each with the ticket it took when
+     * its event arrived. What Glide calls for the paste it is running is run
+     * under the head's ticket, however many awaits lie between the event and
+     * the call.
+     */
+    const paste_tickets_ref = useRef<{ readonly ticket: number | undefined; edited: boolean }[]>([]);
+    const running_paste_ticket = useCallback(
+        (): number | undefined => paste_tickets_ref.current[0]?.ticket,
+        [],
+    );
     // What display coordinates currently mean. A gesture held for the session
     // is replayed only if this has not changed underneath it.
     const view_identity_ref = useRef('');
@@ -3636,6 +3743,20 @@ export function GridShell({
             session_requests_ref.current -= 1;
         }
     }, []);
+    /**
+     * Acquire the session for a gesture as `ensure_edit_session` does, and run
+     * the gesture's continuation with the answer. The gesture counts as
+     * pending (`gesture_pending`) until its continuation has run, not only
+     * until the grant lands: a press of Undo or Redo is held across both.
+     */
+    const with_edit_session = useCallback(async <T,>(run: (granted: boolean) => T): Promise<T> => {
+        session_requests_ref.current += 1;
+        try {
+            return run(await ensure_edit_session());
+        } finally {
+            session_requests_ref.current -= 1;
+        }
+    }, [ensure_edit_session]);
     // A row or column press that acquired the session for the drag it may
     // become. Held until the button comes up, so the drop meets the session.
     const drag_holds_session_ref = useRef(false);
@@ -3650,12 +3771,23 @@ export function GridShell({
      */
     const admit_paste = useCallback((pasted: Promise<void>) => {
         session_requests_ref.current += 1;
+        // Taken now, while the event that carries the person's intent is
+        // live: the paste then crosses the session, the clipboard, and the
+        // rows it needs added before it reaches the store.
+        const queued = { ticket: take_gesture_ticket(), edited: false };
+        paste_tickets_ref.current.push(queued);
         void pasted.then(() => {
             session_requests_ref.current -= 1;
+            const at = paste_tickets_ref.current.indexOf(queued);
+            if (at >= 0) paste_tickets_ref.current.splice(at, 1);
+            // Finished with no edit taken for it: its session was refused,
+            // its rows or its rectangle were refused, or its edit was (the
+            // pending-changes limit, say). It recorded nothing.
+            if (!queued.edited) gesture_unrecorded(queued.ticket);
             notify_session_idle();
         });
         return ensure_edit_session();
-    }, [ensure_edit_session, notify_session_idle]);
+    }, [ensure_edit_session, gesture_unrecorded, notify_session_idle, take_gesture_ticket]);
     const acquire_session_for_drag = useCallback(() => {
         if (drag_holds_session_ref.current) return;
         drag_holds_session_ref.current = true;
@@ -4075,7 +4207,11 @@ export function GridShell({
         return has_highlightable_row ? { selection, pendingColumnIds: pending_column_ids } : null;
     }, [column_projection, merges, pending_projection, projected_columns, row_count]);
     const mutate_highlight_selection = useCallback((mutation: CellHighlightMutation): boolean => {
-        if (gestures_admitted !== undefined && !gestures_admitted()) return false;
+        if (gestures_admitted !== undefined && !gestures_admitted()) {
+            // Said only while a press of Undo or Redo is waiting.
+            refused_for_history_press();
+            return false;
+        }
         const target = current_highlight_selection();
         if (!target) return false;
         const { selection, pendingColumnIds: pending_column_ids } = target;
@@ -4873,7 +5009,11 @@ export function GridShell({
         editable_cells_ref.current && structure_admission_open()
     ), [structure_admission_open]);
     const delete_rows_gesture = useCallback((runs: readonly RowSelectionRun[]): boolean => {
-        if (!structure_gesture_admitted()) return false;
+        if (!structure_gesture_admitted()) {
+            // Said only while a press of Undo or Redo is waiting.
+            refused_for_history_press();
+            return false;
+        }
         const display_column = grid_selection_ref.current.current?.cell[0] ?? 0;
         const before = pending_store.snapshot();
         // Where the first deleted row was, for focus once a deleted Pending
@@ -4917,7 +5057,11 @@ export function GridShell({
         structure_gesture_admitted,
     ]);
     const restore_rows_gesture = useCallback((source_rows: readonly SourceInterval[]): boolean => {
-        if (!structure_gesture_admitted()) return false;
+        if (!structure_gesture_admitted()) {
+            // Said only while a press of Undo or Redo is waiting.
+            refused_for_history_press();
+            return false;
+        }
         const plan = plan_row_restore_runs(pending_store.snapshot(), action_structure_context(), source_rows);
         if (!plan.ok) {
             host_bridge.postMessage({ type: 'showWarning', message: plan.message });
@@ -5594,7 +5738,20 @@ export function GridShell({
             | ((row_ids: readonly string[]) => readonly Readonly<Record<number, PendingRowCell>>[]),
         /** Pending Column cells the rows carry from birth, by row: Pending Column ID to cell. */
         seed_column_cells?: (row_ids: readonly string[]) => readonly Readonly<Record<string, PendingRowCell>>[],
+        /**
+         * The ticket of the gesture these rows are for, where it was made
+         * earlier than this call: a paste's, taken when its event arrived.
+         */
+        gesture?: { readonly ticket: number | undefined },
     ) => {
+        // The host request is not made in this call: it waits its turn behind
+        // the admissions before it, and by then nothing says this one was
+        // asked for before a press of Undo or Redo that came in between. So
+        // the ticket is taken now and kept with the queued request.
+        const ticket = gesture === undefined ? take_gesture_ticket() : gesture.ticket;
+        // Counted from here until `execute` has returned, so a press held
+        // behind it is not attempted between two queued admissions.
+        row_admissions_pending_ref.current += 1;
         // Capture the activation before joining the serialization tail. The
         // first request's busy affordance may render while a second gesture is
         // queued; that affordance must not retroactively cancel the gesture.
@@ -5604,7 +5761,7 @@ export function GridShell({
             && edit_session_id_ref.current === edit_session_id
             && pending_store.identity()?.session_id === edit_session_id
             && append_capacity(count);
-        const execute = async () => {
+        const run = async () => {
             if (
                 !activation_admitted
                 || on_append_rows === undefined
@@ -5624,10 +5781,14 @@ export function GridShell({
                             : 'Appending another row would exceed the worksheet row limit.',
                     });
                 }
+                gesture_unrecorded(ticket);
                 return undefined;
             }
-            const admitted = await on_append_rows(count);
+            const admitted = await run_with_ticket(ticket, () => on_append_rows(count));
             if (admitted === undefined) return undefined;
+            return run_with_ticket(ticket, () => install(admitted));
+        };
+        const install = (admitted: AppendRowsAdmission) => {
             if (admitted.rowIds.length !== count) {
                 admitted.settle(false);
                 return undefined;
@@ -5679,6 +5840,15 @@ export function GridShell({
             }
             return { rowIds: admitted.rowIds, before };
         };
+        const execute = async () => {
+            try {
+                return await run();
+            } finally {
+                row_admissions_pending_ref.current -= 1;
+                // What a press held behind this admission is woken by.
+                notify_session_idle();
+            }
+        };
         const result = append_admission_tail_ref.current.then(execute, execute);
         append_admission_tail_ref.current = result.then(() => undefined, () => undefined);
         return result;
@@ -5694,6 +5864,9 @@ export function GridShell({
         pending_store,
         record_pending_row_gesture,
         show_pending_size_warning,
+        notify_session_idle,
+        run_with_ticket,
+        take_gesture_ticket,
     ]);
     const pending_display_row = useCallback((pending_row_id: string): Promise<
         number | undefined
@@ -5764,7 +5937,12 @@ export function GridShell({
         side: 'before' | 'after',
         count: number,
     ): Promise<boolean> => {
-        if (on_insert_rows === undefined || !structure_gesture_admitted()) return false;
+        if (on_insert_rows === undefined) return false;
+        if (!structure_gesture_admitted()) {
+            // Said only while a press of Undo or Redo is waiting.
+            refused_for_history_press();
+            return false;
+        }
         // The menu was built before this click: re-check that no sort,
         // filter, or hide was installed or started since.
         if (structure_context_ref.current.bodyViewTransformed) {
@@ -5773,58 +5951,64 @@ export function GridShell({
         }
         const session_id = edit_session_id;
         const display_column = grid_selection_ref.current.current?.cell[0] ?? 0;
+        // The insert was asked for now. Its install, after the host has
+        // admitted it, shows this at the gate: a press of Undo or Redo made
+        // meanwhile waits for the insert and must not refuse it.
+        const ticket = take_gesture_ticket();
         const admitted = await on_insert_rows({ anchor, side, count });
         if (admitted === undefined) return false;
-        const current = () => edit_session_id_ref.current === session_id
-            && pending_store.identity()?.session_id === session_id;
-        if (
-            admitted.rowIds.length !== count
-            || !current()
-            || edit_admission_is_fenced()
-            || save_in_flight_ref.current
-            || (gestures_admitted !== undefined && !gestures_admitted())
-        ) {
-            admitted.settle(false);
-            return false;
-        }
-        const before = pending_store.snapshot();
-        // With the Formula Anchor references, so the insert keeps the
-        // discarded tombstones a stored anchor names, as delete and restore do.
-        const context = action_structure_context_ref.current();
-        if (!insert_anchor_is_live(before, context, anchor)) {
-            admitted.settle(false);
-            announce_structure(INSERT_CANCELED_MESSAGE);
-            return false;
-        }
-        const refusal_before = envelope_refusal_sequence_ref.current;
-        const plan = plan_row_insert(
-            before,
-            { ...context, structuralBasis: admitted.structuralBasis },
-            anchor,
-            side,
-            admitted.rowIds,
-            admitted.formatTemplate,
-            insert_created_order(before, issue_value_edit_order()),
-            admitted.appendBasis,
-        );
-        if (!plan.ok) {
-            admitted.settle(false);
-            host_bridge.postMessage({ type: 'showWarning', message: plan.message });
-            return false;
-        }
-        if (!commit_row_structure_plan(plan)) {
-            admitted.settle(false);
-            if (envelope_refusal_sequence_ref.current === refusal_before) {
-                host_bridge.postMessage({
-                    type: 'showWarning',
-                    message: 'The rows could not be inserted because the pending worksheet changed.',
-                });
+        return run_with_ticket(ticket, (): boolean => {
+            const current = () => edit_session_id_ref.current === session_id
+                && pending_store.identity()?.session_id === session_id;
+            if (
+                admitted.rowIds.length !== count
+                || !current()
+                || edit_admission_is_fenced()
+                || save_in_flight_ref.current
+                || (gestures_admitted !== undefined && !gestures_admitted())
+            ) {
+                admitted.settle(false);
+                return false;
             }
-            return false;
-        }
-        admitted.settle(true);
-        void focus_new_row(admitted.rowIds[0]!, display_column);
-        return true;
+            const before = pending_store.snapshot();
+            // With the Formula Anchor references, so the insert keeps the
+            // discarded tombstones a stored anchor names, as delete and restore do.
+            const context = action_structure_context_ref.current();
+            if (!insert_anchor_is_live(before, context, anchor)) {
+                admitted.settle(false);
+                announce_structure(INSERT_CANCELED_MESSAGE);
+                return false;
+            }
+            const refusal_before = envelope_refusal_sequence_ref.current;
+            const plan = plan_row_insert(
+                before,
+                { ...context, structuralBasis: admitted.structuralBasis },
+                anchor,
+                side,
+                admitted.rowIds,
+                admitted.formatTemplate,
+                insert_created_order(before, issue_value_edit_order()),
+                admitted.appendBasis,
+            );
+            if (!plan.ok) {
+                admitted.settle(false);
+                host_bridge.postMessage({ type: 'showWarning', message: plan.message });
+                return false;
+            }
+            if (!commit_row_structure_plan(plan)) {
+                admitted.settle(false);
+                if (envelope_refusal_sequence_ref.current === refusal_before) {
+                    host_bridge.postMessage({
+                        type: 'showWarning',
+                        message: 'The rows could not be inserted because the pending worksheet changed.',
+                    });
+                }
+                return false;
+            }
+            admitted.settle(true);
+            void focus_new_row(admitted.rowIds[0]!, display_column);
+            return true;
+        });
     }, [
         announce_structure,
         commit_row_structure_plan,
@@ -5835,12 +6019,18 @@ export function GridShell({
         issue_value_edit_order,
         on_insert_rows,
         pending_store,
+        run_with_ticket,
         save_in_flight_ref,
         structure_gesture_admitted,
+        take_gesture_ticket,
     ]);
     /** "Insert below" on the band's last row: append instead, then focus the first new row. */
     const append_rows_gesture = useCallback(async (count: number): Promise<boolean> => {
-        if (!structure_gesture_admitted()) return false;
+        if (!structure_gesture_admitted()) {
+            // Said only while a press of Undo or Redo is waiting.
+            refused_for_history_press();
+            return false;
+        }
         const display_column = grid_selection_ref.current.current?.cell[0] ?? 0;
         const appended = await admit_pending_rows(count);
         if (appended === undefined) return false;
@@ -5888,7 +6078,11 @@ export function GridShell({
         identities: readonly RowIdentity[],
         before: RowIdentity | 'end',
     ): boolean => {
-        if (!structure_gesture_admitted()) return false;
+        if (!structure_gesture_admitted()) {
+            // Said only while a press of Undo or Redo is waiting.
+            refused_for_history_press();
+            return false;
+        }
         // The menu or drag was set up before this gesture: re-check that no
         // sort, filter, or hide was installed or started since.
         if (structure_context_ref.current.bodyViewTransformed) {
@@ -5947,7 +6141,11 @@ export function GridShell({
             acquire_session_for_drag();
             return true;
         }
-        if (!structure_gesture_admitted()) return false;
+        if (!structure_gesture_admitted()) {
+            // Said only while a press of Undo or Redo is waiting.
+            refused_for_history_press();
+            return false;
+        }
         return row_move_block_refusal({
             support: structural_support.rows,
             ready: true,
@@ -6002,8 +6200,13 @@ export function GridShell({
             || grid_selection_ref.current.rows.length === 0) return false;
         if (!editable_cells_ref.current && edit_armed_ref.current) {
             // No session yet: acquire one, then make the same move against it.
-            void ensure_edit_session().then((granted) => {
-                if (granted) move_rows_by_keyboard_ref.current(direction);
+            const ticket = take_gesture_ticket();
+            void with_edit_session((granted) => {
+                // Whether the move recorded its step (it does so in the call):
+                // the shortcut answers "handled" for a refusal it announced too.
+                const before = history_store?.snapshot();
+                if (granted) run_with_ticket(ticket, () => move_rows_by_keyboard_ref.current(direction));
+                if (!granted || history_store?.snapshot() === before) gesture_unrecorded(ticket);
                 notify_session_idle();
             });
             return true;
@@ -6028,7 +6231,6 @@ export function GridShell({
         return true;
     }, [
         announce_structure,
-        ensure_edit_session,
         move_rows_gesture,
         notify_session_idle,
         pending_store,
@@ -6036,6 +6238,7 @@ export function GridShell({
         row_moves_offered,
         structural_support,
         structure_gesture_admitted,
+        with_edit_session,
     ]);
     move_rows_by_keyboard_ref.current = move_rows_by_keyboard;
 
@@ -6105,72 +6308,81 @@ export function GridShell({
         side: 'before' | 'after',
         count: number,
     ): Promise<boolean> => {
-        if (on_insert_columns === undefined || !structure_gesture_admitted()) return false;
+        if (on_insert_columns === undefined) return false;
+        if (!structure_gesture_admitted()) {
+            // Said only while a press of Undo or Redo is waiting.
+            refused_for_history_press();
+            return false;
+        }
         const session_id = edit_session_id;
         const focused_row = grid_selection_ref.current.current?.cell[1];
+        // As a row insert: asked for now, installed under its ticket.
+        const ticket = take_gesture_ticket();
         const admitted = await on_insert_columns({ anchor, side, count });
         if (admitted === undefined) return false;
-        const current = () => edit_session_id_ref.current === session_id
-            && pending_store.identity()?.session_id === session_id;
-        if (
-            admitted.columnIds.length !== count
-            || !current()
-            || edit_admission_is_fenced()
-            || save_in_flight_ref.current
-            || (gestures_admitted !== undefined && !gestures_admitted())
-        ) {
-            admitted.settle(false);
-            return false;
-        }
-        const before = pending_store.snapshot();
-        const context = action_structure_context_ref.current();
-        if (!column_insert_anchor_is_live(before, context, anchor)) {
-            admitted.settle(false);
-            announce_structure(INSERT_COLUMN_CANCELED_MESSAGE);
-            return false;
-        }
-        const names = has_header_row
-            ? default_pending_column_names(prospective_column_names(), count)
-            : Array.from({ length: count }, () => '');
-        const format = pending_column_format(before, context, anchor, side, edit_syntax !== 'markdown');
-        const first_order = column_insert_created_order(before, issue_value_edit_order());
-        const new_columns = admitted.columnIds.map((id, index): PendingColumn => ({
-            id,
-            header: names[index] ?? '',
-            cells: {},
-            format,
-            createdOrder: first_order + index,
-        }));
-        const refusal_before = envelope_refusal_sequence_ref.current;
-        const plan = plan_column_insert(
-            before,
-            { ...context, structuralBasis: admitted.structuralBasis },
-            anchor,
-            side,
-            new_columns,
-        );
-        if (!plan.ok) {
-            admitted.settle(false);
-            host_bridge.postMessage({ type: 'showWarning', message: plan.message });
-            return false;
-        }
-        if (!commit_row_structure_plan(plan)) {
-            admitted.settle(false);
-            if (envelope_refusal_sequence_ref.current === refusal_before) {
-                host_bridge.postMessage({
-                    type: 'showWarning',
-                    message: 'The columns could not be inserted because the pending worksheet changed.',
-                });
+        return run_with_ticket(ticket, (): boolean => {
+            const current = () => edit_session_id_ref.current === session_id
+                && pending_store.identity()?.session_id === session_id;
+            if (
+                admitted.columnIds.length !== count
+                || !current()
+                || edit_admission_is_fenced()
+                || save_in_flight_ref.current
+                || (gestures_admitted !== undefined && !gestures_admitted())
+            ) {
+                admitted.settle(false);
+                return false;
             }
-            return false;
-        }
-        admitted.settle(true);
-        const key = `p:${admitted.columnIds[0]!}`;
-        when_columns_show(
-            (columns) => columns.some((column) => column.key === key),
-            (columns) => focus_column_cell(columns.findIndex((column) => column.key === key), focused_row),
-        );
-        return true;
+            const before = pending_store.snapshot();
+            const context = action_structure_context_ref.current();
+            if (!column_insert_anchor_is_live(before, context, anchor)) {
+                admitted.settle(false);
+                announce_structure(INSERT_COLUMN_CANCELED_MESSAGE);
+                return false;
+            }
+            const names = has_header_row
+                ? default_pending_column_names(prospective_column_names(), count)
+                : Array.from({ length: count }, () => '');
+            const format = pending_column_format(before, context, anchor, side, edit_syntax !== 'markdown');
+            const first_order = column_insert_created_order(before, issue_value_edit_order());
+            const new_columns = admitted.columnIds.map((id, index): PendingColumn => ({
+                id,
+                header: names[index] ?? '',
+                cells: {},
+                format,
+                createdOrder: first_order + index,
+            }));
+            const refusal_before = envelope_refusal_sequence_ref.current;
+            const plan = plan_column_insert(
+                before,
+                { ...context, structuralBasis: admitted.structuralBasis },
+                anchor,
+                side,
+                new_columns,
+            );
+            if (!plan.ok) {
+                admitted.settle(false);
+                host_bridge.postMessage({ type: 'showWarning', message: plan.message });
+                return false;
+            }
+            if (!commit_row_structure_plan(plan)) {
+                admitted.settle(false);
+                if (envelope_refusal_sequence_ref.current === refusal_before) {
+                    host_bridge.postMessage({
+                        type: 'showWarning',
+                        message: 'The columns could not be inserted because the pending worksheet changed.',
+                    });
+                }
+                return false;
+            }
+            admitted.settle(true);
+            const key = `p:${admitted.columnIds[0]!}`;
+            when_columns_show(
+                (columns) => columns.some((column) => column.key === key),
+                (columns) => focus_column_cell(columns.findIndex((column) => column.key === key), focused_row),
+            );
+            return true;
+        });
     }, [
         announce_structure,
         commit_row_structure_plan,
@@ -6184,8 +6396,10 @@ export function GridShell({
         on_insert_columns,
         pending_store,
         prospective_column_names,
+        run_with_ticket,
         save_in_flight_ref,
         structure_gesture_admitted,
+        take_gesture_ticket,
         when_columns_show,
     ]);
     /**
@@ -6193,7 +6407,11 @@ export function GridShell({
      * column at or after the first deleted one, as a row Delete's does.
      */
     const delete_columns_gesture = useCallback((identities: readonly ColumnIdentity[]): boolean => {
-        if (!structure_gesture_admitted()) return false;
+        if (!structure_gesture_admitted()) {
+            // Said only while a press of Undo or Redo is waiting.
+            refused_for_history_press();
+            return false;
+        }
         const plan = plan_column_delete(
             pending_store.snapshot(),
             action_structure_context_ref.current(),
@@ -6219,7 +6437,11 @@ export function GridShell({
         return true;
     }, [commit_row_structure_plan, focus_column_cell, pending_store, store, structure_gesture_admitted, when_columns_show]);
     const restore_columns_gesture = useCallback((source_columns: readonly number[]): boolean => {
-        if (!structure_gesture_admitted()) return false;
+        if (!structure_gesture_admitted()) {
+            // Said only while a press of Undo or Redo is waiting.
+            refused_for_history_press();
+            return false;
+        }
         const plan = plan_column_restore(pending_store.snapshot(), action_structure_context_ref.current(), source_columns);
         if (!plan.ok) {
             host_bridge.postMessage({ type: 'showWarning', message: plan.message });
@@ -6238,7 +6460,11 @@ export function GridShell({
         identities: readonly ColumnIdentity[],
         before: ColumnIdentity | 'end',
     ): boolean => {
-        if (!structure_gesture_admitted()) return false;
+        if (!structure_gesture_admitted()) {
+            // Said only while a press of Undo or Redo is waiting.
+            refused_for_history_press();
+            return false;
+        }
         const plan = plan_column_move(
             pending_store.snapshot(),
             action_structure_context_ref.current(),
@@ -6286,8 +6512,13 @@ export function GridShell({
         const selected = grid_selection_ref.current.columns;
         if (selected.length === 0) return false;
         if (!editable_cells_ref.current && edit_armed_ref.current) {
-            void ensure_edit_session().then((granted) => {
-                if (granted) move_columns_by_keyboard_ref.current(direction);
+            const ticket = take_gesture_ticket();
+            void with_edit_session((granted) => {
+                // Whether the move recorded its step (it does so in the call):
+                // the shortcut answers "handled" for a refusal it announced too.
+                const before = history_store?.snapshot();
+                if (granted) run_with_ticket(ticket, () => move_columns_by_keyboard_ref.current(direction));
+                if (!granted || history_store?.snapshot() === before) gesture_unrecorded(ticket);
                 notify_session_idle();
             });
             return true;
@@ -6310,12 +6541,12 @@ export function GridShell({
     }, [
         announce_structure,
         column_structure_offered,
-        ensure_edit_session,
         move_columns_gesture,
         notify_session_idle,
         pending_store,
         structural_support,
         structure_gesture_admitted,
+        with_edit_session,
     ]);
     move_columns_by_keyboard_ref.current = move_columns_by_keyboard;
     /** A drag's block, resolved once per block rather than once per drop target. */
@@ -6343,7 +6574,11 @@ export function GridShell({
             acquire_session_for_drag();
             return true;
         }
-        if (!structure_gesture_admitted()) return false;
+        if (!structure_gesture_admitted()) {
+            // Said only while a press of Undo or Redo is waiting.
+            refused_for_history_press();
+            return false;
+        }
         return column_move_block_refusal({
             support: structural_support.columns,
             ready: true,
@@ -6455,6 +6690,10 @@ export function GridShell({
             count,
             false,
             () => paste_topology_key_ref.current === expected_topology_key,
+            undefined,
+            undefined,
+            // The rows are for the paste Glide is running.
+            { ticket: running_paste_ticket() },
         );
         if (appended === undefined) return false;
         pending_paste_history_ref.current = {
@@ -6809,16 +7048,20 @@ export function GridShell({
         && remaining_append_capacity > 0;
     const open_armed_dock = useCallback((open: boolean) => {
         if (!open) return;
-        void ensure_edit_session().then((granted) => {
-            if (!granted) return;
-            dock_opened_for_session_ref.current = edit_session_id_ref.current;
-            // Marked open here, not only by the render that shows it: until
-            // that render commits, nothing else says the session just acquired
-            // is in use, and an empty session is released on sight.
-            session_surface_open_ref.current = true;
-            set_append_dock_open(true);
+        void with_edit_session((granted) => {
+            if (granted) {
+                dock_opened_for_session_ref.current = edit_session_id_ref.current;
+                // Marked open here, not only by the render that shows it: until
+                // that render commits, nothing else says the session just acquired
+                // is in use, and an empty session is released on sight.
+                session_surface_open_ref.current = true;
+                set_append_dock_open(true);
+            }
+            // As every gesture that waited for the session: App is told it has
+            // run, so a press of Undo or Redo held behind the claim asks again.
+            notify_session_idle();
         });
-    }, [ensure_edit_session]);
+    }, [notify_session_idle, with_edit_session]);
     /**
      * Labels for the composer's fields — the same titles the grid header
      * paints, so a field is identifiable by the column the user can see.
@@ -7083,6 +7326,7 @@ export function GridShell({
         }
         pending_editor_navigation_ref.current = null;
         overlay_admission_revoked_ref.current = true;
+        if (overlay_opening_ref.current) notify_held_typing_end();
         overlay_opening_ref.current = false;
         // `provideEditor` controls whether a *new* overlay may open; Glide does
         // not consistently apply that change to one it already owns. The caller
@@ -7424,6 +7668,12 @@ export function GridShell({
         if (edit_admission_is_fenced() || save_in_flight_ref.current || !edit_session_id) {
             return false;
         }
+        // A press of Undo or Redo is waiting. The Save was asked for after it:
+        // it would fold the open editor into an edit the press would then
+        // undo, and move the saved boundary under a press made on the other
+        // side of it. Refused, as the gate below refuses it, but said: a hold
+        // can last seconds, and a Save must not vanish. Nothing is folded.
+        if (refused_for_history_press()) return false;
         if (gestures_admitted !== undefined && !gestures_admitted()) return false;
         // The hyperlink editor owns its draft state. Fold a valid draft into the
         // shared store before App snapshots every worksheet; an invalid draft
@@ -7460,6 +7710,7 @@ export function GridShell({
         gestures_admitted,
         on_save_request,
         read_live_edit,
+        refused_for_history_press,
         worksheet_payload,
     ]);
 
@@ -7771,6 +8022,10 @@ export function GridShell({
             typing_held: () => overlay_intent_ref.current !== null,
             typing_pending: () => overlay_intent_ref.current !== null
                 || overlay_opening_ref.current,
+            // A paste is in the first count from its event until Glide has
+            // finished it (`admit_paste`), so no third count is kept.
+            gesture_pending: () => session_requests_ref.current > 0
+                || row_admissions_pending_ref.current > 0,
         };
         return () => {
             editing_ref.current = null;
@@ -9033,12 +9288,14 @@ export function GridShell({
             if (!editable_cells_ref.current && edit_armed_ref.current && source !== 'edit') {
                 if (items.length === 0) return 'refused';
                 const armed_view = view_identity_ref.current;
-                void ensure_edit_session().then((granted) => {
+                const ticket = take_gesture_ticket();
+                void with_edit_session((granted) => {
                     // The coordinates are display coordinates, so they mean
                     // what they did only while the view has not moved.
-                    if (granted && view_identity_ref.current === armed_view) {
-                        on_cells_edited_ref.current(items, source);
-                    }
+                    const result = granted && view_identity_ref.current === armed_view
+                        ? run_with_ticket(ticket, () => on_cells_edited_ref.current(items, source))
+                        : 'refused';
+                    if (result === 'refused') gesture_unrecorded(ticket);
                     notify_session_idle();
                 });
                 return 'refused';
@@ -9063,7 +9320,13 @@ export function GridShell({
             // row grown on the way past would persist a durable height for text
             // that never reached the store. `editable_cells` does not cover this —
             // it excludes a save and a highlight in flight, not a replay.
-            if (gestures_admitted !== undefined && !gestures_admitted()) return 'refused';
+            if (gestures_admitted !== undefined && !gestures_admitted()) {
+                // Refused because a press of Undo or Redo is waiting: said, as
+                // a typed key is (a paste is told by Glide that it was not
+                // applied, so it is not said twice).
+                if (source !== 'paste') refused_for_history_press();
+                return 'refused';
+            }
 
             const stale_cut_identity = items.some((item) => [
                 item.movedFromRowIdentity,
@@ -9780,6 +10043,8 @@ export function GridShell({
         function TrackingCsvCellEditor(props: CsvCellEditorProps): React.JSX.Element {
             useEffect(() => {
                 overlay_opening_ref.current = false;
+                // The keys held for this editor are in it, and it has focus.
+                notify_held_typing_end();
                 overlay_mounted_ref.current = true;
                 capture_open_overlay_row();
                 const opened_value = read_live_edit_ref.current()?.original;
@@ -9969,6 +10234,7 @@ export function GridShell({
                     && !(cell.kind === GridCellKind.Custom && is_rich_text_cell(cell)))
             ) {
                 // No editor will mount, so nothing is opening any more.
+                if (overlay_opening_ref.current) notify_held_typing_end();
                 overlay_opening_ref.current = false;
                 return undefined;
             }
@@ -10004,6 +10270,7 @@ export function GridShell({
             }
             if (!opened) {
                 overlay_opening_ref.current = false;
+                notify_held_typing_end();
                 return index > 0;
             }
             const commit = open_editor_commit_ref.current;
@@ -10056,25 +10323,35 @@ export function GridShell({
         };
         overlay_intent_ref.current = intent;
         const armed_view = view_identity_ref.current;
+        const ticket = take_gesture_ticket();
         const appending = acquire_session
-            ? ensure_edit_session().then((granted) => granted
+            ? with_edit_session((granted) => granted
                 && overlay_intent_ref.current === intent
                 && view_identity_ref.current === armed_view
                 && may_append_rows_ref.current
-                && append_and_focus_ref.current(display_column))
+                && run_with_ticket(ticket, () => append_and_focus_ref.current(display_column)))
             : append_and_focus_ref.current(display_column);
         void appending.then(async (appended) => {
-            if (overlay_intent_ref.current !== intent) return;
+            if (overlay_intent_ref.current !== intent) {
+                // Replaced or cancelled meanwhile; whichever did it says so
+                // for its own intent. This one is over either way.
+                notify_held_typing_end();
+                return;
+            }
             let editable = appended && editable_cells_ref.current;
             if (appended && append_in_flight_ref.current) {
                 const answered = append_answered_ref.current ?? pending_signal<boolean>();
                 append_answered_ref.current = answered;
                 editable = await answered.settled;
             }
-            if (overlay_intent_ref.current !== intent) return;
+            if (overlay_intent_ref.current !== intent) {
+                notify_held_typing_end();
+                return;
+            }
             overlay_intent_ref.current = null;
             const typing: HeldTyping = { ...intent.typing, edits: intent.typing.edits.slice(1) };
             if (!editable || typing.edits.length === 0) {
+                notify_held_typing_end();
                 notify_session_idle();
                 return;
             }
@@ -10083,7 +10360,7 @@ export function GridShell({
             const cell = grid_selection_ref.current.current?.cell;
             if (cell === undefined || !open_held_edits(cell, typing)) notify_session_idle();
         });
-    }, [ensure_edit_session, notify_session_idle, open_held_edits]);
+    }, [notify_session_idle, open_held_edits, with_edit_session]);
     append_holding_keys_ref.current = append_holding_keys;
 
     /**
@@ -10095,6 +10372,13 @@ export function GridShell({
         cell: Item,
         initial: string | undefined,
     ): boolean => {
+        // A press of Undo or Redo is waiting: the request is taken and
+        // nothing opens, with a session or without. An editor opened now
+        // would be folded by the press when it is carried out, and the press
+        // would then undo an edit begun after it. Glide asks here before it
+        // makes an overlay; answering no editor from `provide_editor` would
+        // not do, because Glide then falls back to the cell's own.
+        if (refused_for_history_press()) return true;
         if (editable_cells_ref.current || !edit_armed_ref.current) return false;
         const waiting = overlay_intent_ref.current;
         if (waiting !== null) {
@@ -10122,19 +10406,26 @@ export function GridShell({
             typing: hold_typing(initial),
         };
         overlay_intent_ref.current = intent;
-        void ensure_edit_session().then((granted) => {
+        void with_edit_session((granted) => {
             // Escape cancelled every edit held, so nothing opens, and the
             // session goes back unless a later gesture is using it.
             if (intent.typing.edits.length === 0) {
+                notify_held_typing_end();
                 notify_session_idle();
                 return;
             }
-            if (overlay_intent_ref.current !== intent) return;
+            if (overlay_intent_ref.current !== intent) {
+                notify_held_typing_end();
+                return;
+            }
             overlay_intent_ref.current = null;
-            if (!granted || !open_held_edits(intent.cell, intent.typing)) notify_session_idle();
+            if (!granted || !open_held_edits(intent.cell, intent.typing)) {
+                notify_held_typing_end();
+                notify_session_idle();
+            }
         });
         return true;
-    }, [ensure_edit_session, notify_session_idle, open_held_edits]);
+    }, [notify_held_typing_end, notify_session_idle, open_held_edits, refused_for_history_press, with_edit_session]);
 
     // Arm/clear the row-resize strip as the pointer nears a row border. Glide's
     // mouse args give the cell's client `bounds` + in-cell `localEventY`.
@@ -11335,6 +11626,28 @@ export function GridShell({
         [external_link_url, open_external_url, row_markers],
     );
 
+    // What Glide calls for the paste it is running, run as that paste: under
+    // the ticket it took when its event arrived (`admit_paste`). A paste made
+    // before a press of Undo or Redo is then admitted at each of its steps,
+    // and one made while a press waits is refused at the first.
+    const on_cells_edited_for_glide = useCallback(
+        (items: readonly EditListItem[], source: CellEditSource): boolean | 'refused' => {
+            if (source !== 'paste') return on_cells_edited(items, source);
+            const running = paste_tickets_ref.current[0];
+            const result = run_with_ticket(running?.ticket, () => on_cells_edited(items, source));
+            // Taken (or a paste of what the cells already hold): not unrecorded.
+            if (result !== 'refused' && running !== undefined) running.edited = true;
+            return result;
+        },
+        [on_cells_edited, run_with_ticket],
+    );
+    const allow_paste_for_glide = useCallback(
+        (target: Item, values: readonly (readonly string[])[]): boolean => (
+            run_with_ticket(running_paste_ticket(), () => allow_rectangular_paste(target, values))
+        ),
+        [allow_rectangular_paste, run_with_ticket, running_paste_ticket],
+    );
+
     // Controlled keyboard nav. Tab/Shift+Tab use row-major wrapping and
     // view-mode hjkl keeps merge-aware movement; arrows (and range extension,
     // shortcuts) stay native to Glide, which steps past merges itself.
@@ -11352,7 +11665,10 @@ export function GridShell({
                     waiting.typing = typing;
                     // Escape cancelled the edit before it opened. The grid
                     // takes the next key as it would after the editor closed.
-                    if (typing.edits.length === 0) overlay_intent_ref.current = null;
+                    if (typing.edits.length === 0) {
+                        overlay_intent_ref.current = null;
+                        notify_held_typing_end();
+                    }
                     args.cancel();
                     args.preventDefault();
                     return;
@@ -12421,14 +12737,19 @@ export function GridShell({
                 onColumnResizeEnd={handle_column_resize_end}
                 onItemHovered={on_item_hovered}
                 onMouseMove={on_mouse_move}
-                onCellsEdited={on_cells_edited}
+                onCellsEdited={on_cells_edited_for_glide}
                 onPaste={editable_cells
-                    ? on_append_rows === undefined ? true : allow_rectangular_paste
+                    ? on_append_rows === undefined ? true : allow_paste_for_glide
                     : false}
                 // A paste before a session exists waits here for one, and is
-                // then assembled against the grid that holds it.
-                onPasteAdmission={edit_armed ? admit_paste : undefined}
-                onOverlayOpenRequest={edit_armed ? on_overlay_open_request : undefined}
+                // then assembled against the grid that holds it. Passed with
+                // a session too: the hook is where a paste takes its ticket,
+                // when its event arrives.
+                onPasteAdmission={admit_paste}
+                // Glide asks before it opens an editor. With no session the
+                // request is held for one; with or without, it is refused
+                // while a press of Undo or Redo is waiting.
+                onOverlayOpenRequest={cells_accept_edits ? on_overlay_open_request : undefined}
                 onPasteRowsNeeded={can_request_append_rows
                     ? append_rows_for_paste
                     : undefined}

@@ -728,16 +728,16 @@ describe('a view step and the cell replay protocol', () => {
         return { coordinator, posted, sessions: () => sessions };
     }
 
-    it('is refused as busy, with no session acquired and nothing posted', async () => {
+    it('is refused as a view step, with no session acquired and nothing posted, so the caller replays it', async () => {
         const state = recorded(empty_history_stack(), sort_action());
         const { coordinator, posted, sessions } = coordinator_over(() => state);
-        expect(await coordinator.begin('undo')).toEqual({ kind: 'refused', reason: 'busy' });
+        expect(await coordinator.begin('undo')).toEqual({ kind: 'refused', reason: 'view-step' });
         expect(posted).toEqual([]);
         expect(sessions()).toBe(0);
         expect(coordinator.is_busy()).toBe(false);
     });
 
-    it('is refused when it reaches the top while a session is being acquired', async () => {
+    it('is refused as a view step when it reaches the top while a session is being acquired, so the press starts again', async () => {
         let state = recorded(empty_history_stack(), { label: 'Edit cell', changes: [cell_change(1, 'a')] });
         let open: (() => void) | undefined;
         const posted: unknown[] = [];
@@ -751,7 +751,7 @@ describe('a view step and the cell replay protocol', () => {
         const begun = coordinator.begin('undo');
         state = recorded(state, sort_action());
         open!();
-        expect(await begun).toEqual({ kind: 'refused', reason: 'busy' });
+        expect(await begun).toEqual({ kind: 'refused', reason: 'view-step' });
         expect(posted).toEqual([]);
         expect(coordinator.is_busy()).toBe(false);
     });
