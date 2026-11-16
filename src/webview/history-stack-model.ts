@@ -149,18 +149,24 @@ export type HistoryChange =
     | { readonly kind: 'rowLayout'; readonly delta: RowLayoutHistoryDelta }
     | { readonly kind: 'columnLayout'; readonly delta: ColumnLayoutHistoryDelta }
     /**
-     * A sort, a filter, hidden rows, or hidden columns: view state, not
-     * content. A view step is an action holding exactly one such change. It
-     * needs no editing session, and replay re-issues the view request the
-     * gesture used instead of the cell replay protocol (see
-     * `view-history-model.ts`).
+     * A sort, a filter, hidden rows, hidden columns, column widths, or row
+     * heights: view state, not content. A view step is an action holding
+     * exactly one such change, except a column-width step made on several
+     * worksheets at once, which holds one per worksheet
+     * (`width_step_changes`). It needs no editing session, and replay
+     * re-issues the view request the gesture used instead of the cell replay
+     * protocol (see `view-history-model.ts`).
      */
     | { readonly kind: 'view'; readonly delta: ViewHistoryDelta };
 
 /** The view arm. */
 export type ViewHistoryChange = Extract<HistoryChange, { kind: 'view' }>;
 
-/** The change of a view step, or undefined for any other action. */
+/**
+ * The change of a view step that holds one change, or undefined for any
+ * other action, a column-width step on several worksheets included: that one
+ * is read with `width_step_changes`.
+ */
 export function view_step_change(action: HistoryAction): ViewHistoryChange | undefined {
     const change = action.changes.length === 1 ? action.changes[0] : undefined;
     return change?.kind === 'view' ? change : undefined;
