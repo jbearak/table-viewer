@@ -687,29 +687,21 @@ describe('a compare original that is an LFS pointer', () => {
     });
 });
 
-describe('a failed download explained while a layout change waits', () => {
-    it('keeps the layout change, and delivers it after the explanation', async () => {
-        // The compare window shows the table while the original side is still
-        // a pointer, so the person can scroll in it. One layout write is being
-        // stored and a second waits behind it when the download fails. The
-        // rebuild that would carry the explanation adopts nothing (the file
-        // has grown past what the panel opens), so the explanation is
-        // delivered on the source already shown, from outside the layout
-        // queue. That used to make the host refuse the waiting change for
-        // naming the snapshot before it.
-        //
-        // When the rebuild does adopt a source, the waiting change is refused
-        // as one made on the contents before it, like any change that meets a
-        // reload; that is not what this covers.
-        serve('original');
+describe('the outcome of a download delivered while a layout change waits', () => {
+    /**
+     * Open a panel on a pointer, with one layout write being stored and a
+     * second waiting behind it: a scroll to row 77 with formatting off.
+     *
+     * The first write is held after it commits, outside the per-file queue:
+     * it has left that queue and still occupies the layout queue.
+     */
+    async function open_with_a_layout_change_waiting(options: ViewerControllerOptions = {}) {
         const versioned = versioned_state_store();
         let committed!: () => void;
         const first_committed = new Promise<void>((done) => { committed = done; });
         let release!: () => void;
         const released = new Promise<void>((done) => { release = done; });
         let hold = true;
-        // Gated outside the per-file queue: the first write has left that
-        // queue and still occupies the layout queue.
         const queued = with_in_memory_authority_transactions(versioned.store);
         const store: typeof queued = {
             ...queued,
@@ -730,7 +722,7 @@ describe('a failed download explained while a layout change waits', () => {
             store,
             csv_table_profile(),
             fake_viewer_host,
-            { compare: { originalUri: vscode_mock.Uri.file('/tmp/original.csv') as unknown as vscode.Uri } },
+            options,
         );
         panel.onDidDispose(() => controller.dispose());
         await panel.__receive({ type: 'ready' });
@@ -750,30 +742,87 @@ describe('a failed download explained while a layout change waits', () => {
             snapshotIdentity: ready.identity,
             state: { ...ready.state, ...state },
         });
-
         const first = layout({ scrollPosition: [{ top: 50, left: 0 }] });
         await first_committed;
         const second = layout({ scrollPosition: [{ top: 77, left: 0 }], showFormatting: [false] });
+        return { panel, versioned, ready, latest, release, writes: Promise.all([first, second]) };
+    }
+
+    /**
+     * Let the held write go. The waiting change must be stored, and a
+     * snapshot carrying it must follow the `delivered` already posted.
+     */
+    async function expect_the_waiting_change_kept(
+        context: Awaited<ReturnType<typeof open_with_a_layout_change_waiting>>,
+        delivered: number,
+    ): Promise<void> {
+        const { panel, versioned, latest, release, writes } = context;
+        expect(latest().state.showFormatting).not.toEqual([false]);
+
+        release();
+        await writes;
+        await vi.waitFor(() => expect(posted(panel, 'workbookSnapshot').length).toBeGreaterThan(delivered));
+
+        const durable = versioned.get_state('/tmp/data.csv') as PerFileState;
+        expect(durable.scrollPosition).toEqual([{ top: 77, left: 0 }]);
+        expect(durable.showFormatting).toEqual([false]);
+        expect(latest().state.scrollPosition).toEqual([{ top: 77, left: 0 }]);
+        expect(latest().state.showFormatting).toEqual([false]);
+    }
+
+    it('keeps the layout change, and delivers it after a failure is explained', async () => {
+        // The compare window shows the table while the original side is still
+        // a pointer, so the person can scroll in it. One layout write is being
+        // stored and a second waits behind it when the download fails. The
+        // rebuild that would carry the explanation adopts nothing (the file
+        // has grown past what the panel opens), so the explanation is
+        // delivered on the source already shown, from outside the layout
+        // queue. That used to make the host refuse the waiting change for
+        // naming the snapshot before it.
+        //
+        // When the rebuild does adopt a source, the waiting change is refused
+        // as one made on the contents before it, like any change that meets a
+        // reload; that is not what this covers.
+        serve('original');
+        const context = await open_with_a_layout_change_waiting({
+            compare: { originalUri: vscode_mock.Uri.file('/tmp/original.csv') as unknown as vscode.Uri },
+        });
+        const { panel, ready, latest } = context;
         fake_git_lfs.smudge_outcomes.push({ type: 'failed', reason: 'failed' });
         vscode_mock.__setStatImplementation(async () => ({ size: 4096 * 1024 * 1024, mtime: 9 }));
         await resolve(panel);
         await latest_lfs(panel, (value) => value?.failure !== undefined);
         expect(latest().sourceGeneration).toBe(ready.sourceGeneration);
-        const explained = posted(panel, 'workbookSnapshot').length;
-        expect(latest().state.showFormatting).not.toEqual([false]);
 
-        release();
-        await Promise.all([first, second]);
-        await vi.waitFor(() => expect(posted(panel, 'workbookSnapshot').length).toBeGreaterThan(explained));
+        await expect_the_waiting_change_kept(context, posted(panel, 'workbookSnapshot').length);
 
-        const durable = versioned.get_state('/tmp/data.csv') as PerFileState;
-        expect(durable.scrollPosition).toEqual([{ top: 77, left: 0 }]);
-        expect(durable.showFormatting).toEqual([false]);
-        // The window ends on a snapshot with the layout change, and still
-        // with the explanation.
-        expect(latest().state.scrollPosition).toEqual([{ top: 77, left: 0 }]);
-        expect(latest().state.showFormatting).toEqual([false]);
+        // The window still has the explanation.
         expect(await latest_lfs(panel)).toMatchObject({ side: 'original', failure: { reason: 'failed' } });
+    });
+
+    it('keeps the layout change, and delivers it after the banner is put back', async () => {
+        // The other delivery a download makes from outside the layout queue.
+        // git-lfs reports the object fetched, and the rebuild that would show
+        // it adopts nothing (the person cancels the file-size prompt, or the
+        // file is past what the panel opens). The file is still a pointer, so
+        // the banner and its button are put back, on the source already shown.
+        serve('file');
+        const context = await open_with_a_layout_change_waiting();
+        const { panel, ready, latest } = context;
+        fake_git_lfs.pull_outcomes.push({ type: 'resolved' });
+        vscode_mock.__setStatImplementation(async () => ({ size: 4096 * 1024 * 1024, mtime: 9 }));
+        const before = posted(panel, 'workbookSnapshot').length;
+        await resolve(panel);
+        // Put back, not explained: there is no failure to name.
+        await vi.waitFor(() => expect(posted(panel, 'workbookSnapshot').length).toBeGreaterThan(before));
+        expect(await latest_lfs(panel)).toEqual(expect.objectContaining({ side: 'file' }));
+        expect((await latest_lfs(panel))?.failure).toBeUndefined();
+        expect(latest().sourceGeneration).toBe(ready.sourceGeneration);
+
+        await expect_the_waiting_change_kept(context, posted(panel, 'workbookSnapshot').length);
+
+        // The window still has the banner.
+        expect(await latest_lfs(panel)).toEqual(expect.objectContaining({ side: 'file' }));
     });
 });
 
