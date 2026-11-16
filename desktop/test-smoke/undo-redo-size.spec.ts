@@ -532,6 +532,180 @@ test('Reset row height is a step, undone and redone', async () => {
     await expect(plain).toHaveCount(0);
 });
 
+test('a row border reached from inside its own cell offers the drag', async () => {
+    watch([], [1]);
+    const { file, page } = await open_file('inside.csv', CSV);
+    await expect_sizes(page, file, { stored: NOTHING, shown: layout(), undo: 'Undo', redo: 'Redo' });
+
+    const box = await canvas_box(page);
+    const x = box.x + left_of(layout(), 0) + 40;
+    const border = box.y + top_of(layout(), 1) + ROW_HEIGHT_PX;
+    const strip = page.locator('.row-resize-strip');
+    // Into the middle of row 1's cell, where there is no border to drag.
+    await page.mouse.move(x, border - 12);
+    await expect(strip).toHaveCount(0);
+    // Down to its bottom border, without leaving the cell.
+    await page.mouse.move(x, border - 2);
+    await expect(strip).toBeVisible();
+    await page.mouse.down();
+    await page.mouse.move(x, border + 28, { steps: 6 });
+    await page.mouse.up();
+    await expect_sizes(page, file, {
+        stored: { widths: {}, heights: [54] },
+        shown: layout([], [24, 54]),
+        undo: 'Undo Resize row',
+        redo: 'Redo',
+    });
+});
+
+test('a row inserted above a taller row is drawn at the default height', async () => {
+    watch([], [1, 2]);
+    const { file, page } = await open_file('inserted.csv', CSV);
+    await drag_row_border(page, layout(), 2, 30);
+    await expect_sizes(page, file, {
+        stored: { widths: {}, heights: [54] },
+        shown: layout([], [24, 24, 54]),
+        undo: 'Undo Resize row',
+        redo: 'Redo',
+    });
+
+    await choose(await open_row_menu(page, 2), 'Insert row above');
+    await expect.poll(async () => (await body(page)).length).toBe(5);
+
+    // Alice, Bob, the new row, then Charlie: still the one tall row. The new
+    // row sits where the grid used to number Charlie's.
+    await expect_layout(page, layout([], [24, 24, 24, 54]));
+});
+
+test('Reset row height counts the rows that have a height to lose, as its step does', async () => {
+    watch([], [1]);
+    const { file, page } = await open_file('count.csv', CSV);
+    await drag_row_border(page, layout(), 1, 30);
+    const taller = { stored: { widths: {}, heights: [54] }, shown: layout([], [24, 54]) };
+    await expect_sizes(page, file, { ...taller, undo: 'Undo Resize row', redo: 'Redo' });
+
+    // All four rows selected, one of them resized.
+    await click_row_marker(page, taller.shown, 0);
+    await click_row_marker(page, taller.shown, 3, true);
+    const menu = await open_row_menu(page, 0);
+    await expect(menu).toHaveAttribute('aria-label', 'Row actions for 4 selected rows');
+    await expect(menu.getByRole('menuitem', { name: /^Reset/ })).toHaveText('Reset row height');
+    await choose(menu, 'Reset row height');
+    await expect_sizes(page, file, { stored: NOTHING, shown: layout(), undo: 'Undo Reset row height', redo: 'Redo' });
+});
+
+test('a column resize waits for an outside reader of the state database to finish', async () => {
+    watch([0], []);
+    const { file, page } = await open_file('reader.csv', CSV);
+    await expect_sizes(page, file, { stored: NOTHING, shown: layout(), undo: 'Undo', redo: 'Redo' });
+
+    // Whatever reads the database with SQLite (a backup tool, a person with
+    // `sqlite3`) holds a shared lock for as long as its read lasts, and the
+    // app's commit needs the file to itself. This reader finishes once the
+    // app is inside its write, which is when the rollback journal exists.
+    const reader = new DatabaseSync(state_database_path(user_data_dir()), { readOnly: true });
+    reader.exec('BEGIN');
+    reader.prepare('SELECT count(*) FROM entries').get();
+    let reading = true;
+    const finish = setInterval(() => {
+        if (!hot_journal_present(user_data_dir())) return;
+        clearInterval(finish);
+        reader.exec('COMMIT');
+        reading = false;
+    }, 1);
+    try {
+        await drag_column_border(page, layout(), 0, 60);
+        await expect.poll(() => reading, { message: 'the app wrote while the reader held its lock' })
+            .toBe(false);
+    } finally {
+        clearInterval(finish);
+        if (reading) reader.exec('COMMIT');
+        reader.close();
+    }
+
+    // The resize is stored and is a step, and nothing was said about it.
+    const width = await stored_width(file, 0, 180);
+    await expect_sizes(page, file, {
+        stored: { widths: { 0: width }, heights: [] },
+        shown: layout([width]),
+        undo: 'Undo Resize column',
+        redo: 'Redo',
+    });
+});
+
+test('a row an edit grew springs back when the sheet can keep no more custom heights', async () => {
+    // 10,001 rows. Every row but the first takes a custom height in one drag:
+    // 10,000 of them, which is as many as a sheet keeps.
+    const lines = ['Name,Age'];
+    for (let index = 0; index <= 10_000; index += 1) lines.push(`n${index},${index}`);
+    const { file, page } = await open_file('full.csv', `${lines.join('\n')}\n`);
+    const box = await canvas_box(page);
+    // The row marker is wider with five-digit row numbers: aim inside it,
+    // and well inside the first column.
+    const marker_x = box.x + 16;
+    const cell_x = box.x + 100;
+    const scroll_to = (top: number) => page.evaluate((wanted) => {
+        const scroller = document.querySelector('.dvn-scroller')!;
+        scroller.scrollTop = wanted;
+        return scroller.scrollTop;
+    }, top);
+    const row_line = (line: number) => page.locator(`tbody tr[aria-rowindex="${line + 2}"]`);
+
+    await page.mouse.click(marker_x, box.y + HEADER_HEIGHT_PX + ROW_HEIGHT_PX + ROW_HEIGHT_PX / 2);
+    await expect(row_line(1)).toHaveAttribute('aria-selected', 'true');
+    const bottom = await scroll_to(10_001 * ROW_HEIGHT_PX);
+    await expect(row_line(10_000)).toHaveCount(1);
+    const top_of_last = box.y + HEADER_HEIGHT_PX + 10_000 * ROW_HEIGHT_PX - bottom;
+    await page.keyboard.down('Shift');
+    await page.mouse.click(marker_x, top_of_last + ROW_HEIGHT_PX / 2);
+    await page.keyboard.up('Shift');
+    await expect(row_line(10_000)).toHaveAttribute('aria-selected', 'true');
+    await expect(row_line(0)).toHaveCount(0);
+
+    // The border between the last two rows, from the last row's side.
+    await page.mouse.move(cell_x, top_of_last + 10);
+    await page.mouse.move(cell_x, top_of_last - 2);
+    await expect(page.locator('.row-resize-strip')).toBeVisible();
+    await page.mouse.down();
+    await page.mouse.move(cell_x, top_of_last + 4, { steps: 3 });
+    await page.mouse.up();
+    await expect.poll(() => stored(file)?.heights.length, { timeout: 30_000 }).toBe(10_000);
+    expect(new Set(stored(file)!.heights)).toEqual(new Set([30]));
+    expect(await take_dialogs(app!)).toEqual([]);
+
+    // Three lines of text in the first row, the one row with no custom
+    // height. The row grows as the edit is committed, and the app has no room
+    // to keep that height.
+    expect(await scroll_to(0)).toBe(0);
+    await expect(row_line(0)).toHaveCount(1);
+    const first_row = box.y + HEADER_HEIGHT_PX;
+    await page.mouse.dblclick(cell_x, first_row + ROW_HEIGHT_PX / 2);
+    const editor = page.locator('.cell-editor-input');
+    await expect(editor).toBeVisible();
+    await editor.fill('a');
+    for (const letter of ['b', 'c']) {
+        await page.keyboard.press('Shift+Alt+Enter');
+        await page.keyboard.type(letter);
+    }
+    await page.keyboard.press('Tab');
+    await expect(editor).toBeHidden();
+    const said: string[] = [];
+    await expect.poll(async () => {
+        said.push(...(await take_dialogs(app!)).map((dialog) => dialog.message ?? ''));
+        return said;
+    }).toEqual(['Too many resized rows to persist: a sheet may keep at most 10,000 custom row heights.']);
+    expect(stored(file)?.heights.length).toBe(10_000);
+
+    // The row is drawn at the height the file has for it, the default: its
+    // bottom border is one row below the header, where the pointer finds it.
+    // Grown to three lines, that point is inside the row and offers nothing.
+    await expect(async () => {
+        await page.mouse.move(cell_x, first_row + ROW_HEIGHT_PX + 14);
+        await page.mouse.move(cell_x, first_row + ROW_HEIGHT_PX - 2);
+        await expect(page.locator('.row-resize-strip')).toBeVisible({ timeout: 500 });
+    }).toPass({ timeout: 15_000 });
+});
+
 test('an edit, a column resize, a sort, and a row resize are undone and redone in order', async () => {
     watch([1], [0]);
     const { file, page } = await open_file('mixed.csv', CSV);
