@@ -11865,6 +11865,12 @@ export function GridShell({
         },
         [],
     );
+    /** Whether every display index still holds the column it held when `gesture` began. */
+    const column_resize_keys_unchanged = useCallback((gesture: ColumnResizeGesture): boolean => {
+        const columns = projected_columns_ref.current;
+        return columns.length === gesture.keys.length
+            && columns.every((column, index) => column.key === gesture.keys[index]);
+    }, []);
     /**
      * A column's width while a border is dragged, or a fit's result. Drawn at
      * once and stored nowhere until the gesture ends.
@@ -11949,12 +11955,11 @@ export function GridShell({
             }
             if (gesture.press !== undefined && !gesture.moved) return;
             // The columns changed places under the held border: the widths
-            // were dragged for the columns that stood there before.
-            if (
-                gesture.discarded
-                || (gesture.press !== undefined
-                    && !column_resize_still_names(gesture, gesture.press.display_column))
-            ) return;
+            // were dragged for the columns that stood there before. Any
+            // column, not only the pressed one: the gesture also sized the
+            // rest of a column selection, by display index. One pass, here
+            // and not per call, which Glide makes once per selected column.
+            if (gesture.discarded || !column_resize_keys_unchanged(gesture)) return;
             // Every saved column the gesture sized is reported, whatever
             // width this window shows for it: its copy can be behind what
             // another window stored, and a column left out for looking right
@@ -11995,7 +12000,7 @@ export function GridShell({
             }
             if (source_changes.length > 0) on_columns_resized(source_changes);
         },
-        [column_resize_still_names, edit_session_id, on_columns_resized, pending_store, size_gesture_may_start],
+        [column_resize_keys_unchanged, edit_session_id, on_columns_resized, pending_store, size_gesture_may_start],
     );
 
     /**

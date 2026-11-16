@@ -2383,6 +2383,32 @@ describe('GridShell column projection', () => {
             expect(shown_widths()).toEqual([['s:1', 150], ['s:0', 100], ['s:2', 200]]);
         });
 
+        it('commits nothing when other selected columns change places, though the pressed one stays', async () => {
+            const on_columns_resized = vi.fn();
+            const initial = props({ on_columns_resized, column_projection: all_columns });
+            const GridShell = await render_grid(initial);
+            await act(async () => {
+                callbacks().start({}, 100, 0);
+                callbacks().resize({}, 130, 0);
+                callbacks().resize({}, 130, 1);
+                callbacks().resize({}, 130, 2);
+            });
+            // The second and third columns trade places; the first stays.
+            await act(async () => {
+                root!.render(React.createElement(GridShell, {
+                    ...initial,
+                    column_projection: { visible_to_source: [0, 2, 1], source_to_visible: [0, 2, 1], hidden_count: 0 },
+                }));
+            });
+            await act(async () => {
+                callbacks().end({}, 130, 0);
+                callbacks().end({}, 130, 1);
+                callbacks().end({}, 130, 2);
+            });
+            expect(on_columns_resized).not.toHaveBeenCalled();
+            expect(shown_widths()).toEqual([['s:0', 100], ['s:2', 200], ['s:1', 150]]);
+        });
+
         it('still commits a drag when a render in the middle leaves the columns where they were', async () => {
             const on_columns_resized = vi.fn();
             const initial = props({ on_columns_resized, column_projection: all_columns });
