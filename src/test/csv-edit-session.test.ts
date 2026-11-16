@@ -4618,6 +4618,67 @@ describe('CSV edit sessions', () => {
             expect(latest_snapshot(panel).state.columnVisibility).toEqual([hidden]);
             expect(latest_snapshot(panel).state.columnWidths).toEqual([{ 0: 77 }]);
         });
+
+        it('keeps a layout change that was queued behind another layout write when the columns were written', async () => {
+            const file_path = '/tmp/visibility-answer-queued-layout.csv';
+            const versioned = state_store();
+            const first_committed = deferred();
+            const resume_first = deferred();
+            let hold = true;
+            // Gated outside the per-file queue: the first layout write has
+            // committed and still occupies the layout tail, so the second one
+            // waits behind it while the visibility write goes through.
+            const queued = with_in_memory_authority_transactions(versioned.store);
+            const store: typeof queued = {
+                ...queued,
+                async compare_and_set(path, expected, next, validate, basis) {
+                    const result = await queued.compare_and_set(path, expected, next, validate, basis);
+                    if (hold && next.columnWidths?.[0]?.[0] === 50 && result.type === 'committed') {
+                        hold = false;
+                        first_committed.resolve();
+                        await resume_first.promise;
+                    }
+                    return result;
+                },
+            };
+            const panel = vscode_mock.window.createWebviewPanel('tableViewer.editor', 'table');
+            const controller = attach_viewer(
+                panel as unknown as Parameters<typeof attach_viewer>[0],
+                uri(file_path),
+                store,
+                csv_table_profile(),
+                fake_viewer_host,
+            );
+            panel.onDidDispose(() => controller.dispose());
+            await panel.__receive({ type: 'ready' });
+            const ready = latest_snapshot(panel);
+            const from = panel.__messages.length;
+            const layout = (width: number) => ({
+                type: 'stateChanged',
+                sourceGeneration: ready.sourceGeneration,
+                snapshotIdentity: ready.identity,
+                state: { columnWidths: [{ 0: width }] },
+            });
+
+            const first = panel.__receive(layout(50));
+            await first_committed.promise;
+            const second = panel.__receive(layout(77));
+            const visibility = panel.__receive(write(ready));
+            await flush_promises();
+            // The delivery clears the identity the queued layout write names,
+            // so it waits its turn behind that write.
+            expect(posts_since(panel, from)).toEqual([]);
+            resume_first.resolve();
+            await Promise.all([first, second, visibility]);
+            await flush_promises();
+
+            expect(versioned.get_state(file_path).columnWidths).toEqual([{ 0: 77 }]);
+            expect(versioned.get_state(file_path).columnVisibility).toEqual([hidden]);
+            expect(posts_since(panel, from)).toEqual(['workbookSnapshot', 'columnVisibilityChanged']);
+            expect(answers(panel)).toEqual([expect.objectContaining({ applied: true })]);
+            expect(latest_snapshot(panel).state.columnVisibility).toEqual([hidden]);
+            expect(latest_snapshot(panel).state.columnWidths).toEqual([{ 0: 77 }]);
+        });
     });
 
     it('rebases a transform-blocked replacement ready and cancels a conflicting old visibility retry', async () => {

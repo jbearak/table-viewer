@@ -13841,7 +13841,16 @@ export function attach_viewer(
                     // `update_state_snapshot(committed)`, which delivers
                     // nothing once another writer has installed a later
                     // revision; the later revision contains this commit.
-                    if (committed !== undefined && !disposed) session.deliver_current_material();
+                    //
+                    // Queued on the layout tail for the reason the row-height
+                    // delivery is: delivering clears the acknowledged identity,
+                    // and a `stateChanged` already waiting behind another layout
+                    // write names that identity and would be refused.
+                    if (committed !== undefined && !disposed) {
+                        await enqueue_layout_write(async () => {
+                            if (!disposed) session.deliver_current_material();
+                        });
+                    }
                     // After the delivery, so the answer never overtakes the
                     // state it reports. Only a receiver that is gone gets none.
                     if (
