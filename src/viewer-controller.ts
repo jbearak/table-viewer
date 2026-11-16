@@ -3211,6 +3211,8 @@ export function attach_viewer(
         readonly focus: HistoryReplayFocus;
         readonly focusSheetIndex: number;
         readonly sourceGeneration: number;
+        /** The edit session the lease is bound to, for a replay that needs one. */
+        readonly editSessionId: string | undefined;
         /** Whether the host state the lease was bound to is still in place. */
         readonly isCurrent: () => boolean;
     }
@@ -7704,8 +7706,26 @@ export function attach_viewer(
                 write_basis ?? undefined,
             );
             if (result.type === 'committed') {
-                observe_durable_state(result.snapshot);
-                if (!disposed) update_session_state_material(result.snapshot);
+                // The write is durable from here. What follows is
+                // bookkeeping, and a failure in it must not report the write
+                // as failed: a caller would then tell the window nothing
+                // changed when the file holds the change.
+                try {
+                    observe_durable_state(result.snapshot);
+                    if (!disposed) update_session_state_material(result.snapshot);
+                } catch (error) {
+                    console.warn('Recording a committed state write failed', error);
+                    // What the session delivers must hold the write: read it
+                    // back, install it again, and deliver it, since a
+                    // delivery made meanwhile carried the material as it was.
+                    if (!disposed) {
+                        void refresh_session_state_material().then(() => {
+                            if (!disposed) session.deliver_current_material();
+                        }, (refresh_error: unknown) => {
+                            console.warn('Reading back a committed state write failed', refresh_error);
+                        });
+                    }
+                }
                 return result.snapshot;
             }
             file_coordinator.observe_state_authority(result.authority);
@@ -17157,6 +17177,7 @@ export function attach_viewer(
                 focus: request.focus,
                 focusSheetIndex: focus_sheet_index,
                 sourceGeneration: replay_core.source_generation,
+                editSessionId: edit_session,
                 isCurrent: replay_is_current,
             },
             now,
@@ -17268,8 +17289,11 @@ export function attach_viewer(
                 }
                 const outcome = Object.freeze({
                     result,
+                    // A view that moved after the write may have been
+                    // delivered from material that predates it, cells and
+                    // highlights alike: the material held now contains it.
                     publishCurrentMaterial: !('reason' in result)
-                        && payload.highlights.length > 0,
+                        && (payload.highlights.length > 0 || result.viewMoved === true),
                 });
                 replay_leases.settle(request.leaseId, outcome, Date.now());
                 return outcome;
@@ -17789,39 +17813,79 @@ export function attach_viewer(
         if (committed_structures === undefined) return refused('conflict');
         // `written` is the snapshot this call committed, and undefined when it
         // committed none (it lost its compare-and-swap to a view that moved,
-        // or the state already held everything the replay writes). A view
-        // that moved after this call's write is said apart, because the
-        // write is in the file: trying the replay again would not be a
-        // second attempt at something that did not happen.
-        if (!payload.isCurrent()) {
-            return refused(written === undefined ? 'document-changed' : 'changed-after-write');
+        // or the state already held everything the replay writes).
+        if (written === undefined) {
+            if (!payload.isCurrent()) return refused('document-changed');
+            if (!accept_replay_row_admissions(
+                payload.rowAdmissionRequestIds,
+                request.leaseId,
+            )) return refused('conflict');
         }
-        if (!accept_replay_row_admissions(
-            payload.rowAdmissionRequestIds,
-            request.leaseId,
-        )) return refused('conflict');
-        // The replay's rows are durable now, and the renderer publishes them
-        // next. A worksheet this session has admitted nothing on yet gets its
-        // ledger here, so that publication is planned against one and projects
-        // the same retained authority the replay was checked against.
-        // `payload.isCurrent()` held just above, so the session that owns the
-        // lease is the active one.
-        const lease_session_id = active_edit_session_id;
-        if (lease_session_id !== undefined) {
-            for (const structural of payload.structures) {
-                const target = canonical_worksheet_target({
-                    ...structural.worksheet,
-                    sheetIndex: structural.resolvedSheetIndex,
-                });
-                if (target === undefined) continue;
-                const ledger_key = append_ledger_key(lease_session_id, target);
-                if (!append_admission_ledgers.has(ledger_key)) {
-                    append_admission_ledgers.set(
-                        ledger_key,
-                        empty_append_admission_ledger(payload.sourceGeneration),
-                    );
+        // Once the write has landed the replay is in the file, and it is
+        // answered as committed whatever follows: a refusal now would leave
+        // the window's history offering a step the file has already taken.
+        // A view that moved after the write is said (`viewMoved`), and the
+        // window lands the answer as any other.
+        const view_moved_after_write = written !== undefined && !payload.isCurrent();
+        if (written !== undefined) {
+            // The rows are durable, so each admission that can still be
+            // accepted is; one that cannot (its session ended, its ledger is
+            // gone) is released, so none keeps this lease.
+            for (const request_id of payload.rowAdmissionRequestIds) {
+                let accepted = false;
+                try {
+                    const reservation = row_admission_reservations.get(request_id);
+                    accepted = reservation !== undefined
+                        && reservation.state === 'unsettled'
+                        && reservation.replayLeaseId === request.leaseId
+                        && settle_row_admission({
+                            type: 'settleRowAdmission',
+                            requestId: request_id,
+                            editSessionId: reservation.editSessionId,
+                            accepted: true,
+                        }, request.leaseId);
+                } catch (error) {
+                    console.warn('History replay row admission failed after its write', error);
+                } finally {
+                    if (!accepted) release_replay_row_admissions([request_id], request.leaseId);
                 }
             }
+        }
+        try {
+            // The replay's rows are durable now, and the renderer publishes
+            // them next. A worksheet this session has admitted nothing on yet
+            // gets its ledger here, so that publication is planned against one
+            // and projects the same retained authority the replay was checked
+            // against. With the view current, the session that owns the lease
+            // is the active one; after a view that moved, only if it still is.
+            // After a view that moved, also only while the source the lease
+            // was issued against is still the one installed: a reload seeds
+            // its own ledgers from durable state, which holds the write.
+            const lease_session_id = !view_moved_after_write
+                ? active_edit_session_id
+                : active_edit_session_id === payload.editSessionId
+                    && core?.source_generation === payload.sourceGeneration
+                    ? payload.editSessionId
+                    : undefined;
+            if (lease_session_id !== undefined) {
+                for (const structural of payload.structures) {
+                    const target = canonical_worksheet_target({
+                        ...structural.worksheet,
+                        sheetIndex: structural.resolvedSheetIndex,
+                    });
+                    if (target === undefined) continue;
+                    const ledger_key = append_ledger_key(lease_session_id, target);
+                    if (!append_admission_ledgers.has(ledger_key)) {
+                        append_admission_ledgers.set(
+                            ledger_key,
+                            empty_append_admission_ledger(payload.sourceGeneration),
+                        );
+                    }
+                }
+            }
+        } catch (error) {
+            if (written === undefined) throw error;
+            console.warn('History replay ledger set-up failed after its write', error);
         }
         // An unchanged updater reports `undefined` — for a replay that means the document
         // already held everything the replay would write, a byte-identical redo of
@@ -17845,6 +17909,9 @@ export function attach_viewer(
             // after the commit, and the generation stamp is what lets the renderer
             // decline a projection that was overtaken anyway.
             displayFocus: display_focus,
+            ...(view_moved_after_write && written !== undefined
+                ? { viewMoved: true as const, stateRevision: written.revision }
+                : {}),
         });
     }
 

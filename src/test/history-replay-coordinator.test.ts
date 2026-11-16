@@ -674,7 +674,6 @@ describe('settling', () => {
     it.each([
         ['expired', 'not-current'],
         ['document-changed', 'not-current'],
-        ['changed-after-write', 'document-changed'],
     ] as const)('reads a commit refused as %s as %s', async (reason, expected) => {
         const { coordinator, posted, history } = harness([cell_change(0, 0, 'typed')]);
         const { outcome: pending } = await started(coordinator, 'undo');
@@ -690,6 +689,31 @@ describe('settling', () => {
         await expect(pending).resolves.toEqual({ kind: 'refused', reason: expected });
         // The entry stays where it was either way.
         expect(history().undoStack).toHaveLength(1);
+        expect(coordinator.is_busy()).toBe(false);
+    });
+
+    it('accepts a commit whose view moved after its write as a commit, and hands back what history moves', async () => {
+        // The write is in the file: the window lands it as any other.
+        const { coordinator, posted, history } = harness([cell_change(0, 0, 'typed')]);
+        const entry = history().undoStack[0];
+        const { outcome: pending } = await started(coordinator, 'undo');
+        const request = last_prepare(posted);
+        coordinator.on_prepared(prepared_for(request));
+        const commit = last_commit(posted);
+        const accepted = coordinator.on_committed({
+            requestId: commit.requestId,
+            replayId: commit.replayId,
+            leaseId: commit.leaseId,
+            mutationId: commit.mutationId,
+            sourceGeneration: 1,
+            cells: [],
+            focusSheetIndex: 0,
+            focus: request.focus,
+            displayFocus: null,
+            viewMoved: true,
+        });
+        expect(accepted).toMatchObject({ entry, direction: 'undo' });
+        expect((await pending).kind).toBe('committed');
         expect(coordinator.is_busy()).toBe(false);
     });
 

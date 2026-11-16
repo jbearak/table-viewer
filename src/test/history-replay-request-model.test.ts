@@ -492,8 +492,10 @@ describe('refusal vocabularies', () => {
         expect(commit_refusal_reason('unavailable')).toBe('unavailable');
         expect(commit_refusal_reason('expired')).toBe('not-current');
         expect(commit_refusal_reason('document-changed')).toBe('not-current');
-        // The write landed and the view moved afterwards: said, not tried again.
-        expect(commit_refusal_reason('changed-after-write')).toBe('document-changed');
+        // There is no `changed-after-write` refusal: a write that landed is
+        // answered as committed (`viewMoved`).
+        // @ts-expect-error The type refuses it.
+        commit_refusal_reason('changed-after-write');
     });
 });
 

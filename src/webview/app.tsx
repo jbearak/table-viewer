@@ -1133,6 +1133,13 @@ function history_header_sheet(
         };
 }
 
+/**
+ * How a committed replay landed in this window: stores and history together;
+ * not at all because no session holds the stores now; or not at all because
+ * this view cannot follow the file.
+ */
+type ReplayLanding = 'applied' | 'unstaged' | 'diverged';
+
 export function App(): React.JSX.Element {
     const [meta, set_meta] = useState<WorkbookMeta | null>(null);
     const [generation, set_generation] = useState(0);
@@ -1784,6 +1791,32 @@ export function App(): React.JSX.Element {
      */
     const replay_posted_after_ref = useRef(0);
     /**
+     * After a commit answered `viewMoved`: the file and the durable state
+     * revision its write produced. A delivery for that file whose state is
+     * older was made before the write; it arrives late (a retried post) and
+     * is not applied, however often it is retried. Another delivery below it
+     * means the host's material never reached the write: the floor gives way
+     * then, so this view keeps taking deliveries. Cleared by a delivery at or
+     * past it.
+     */
+    const replay_state_floor_ref = useRef<{
+        readonly fileId: string;
+        readonly stateRevision: number;
+        /** The delivery the floor has turned away, as often as it is retried. */
+        readonly rejected?: number;
+    } | null>(null);
+    /**
+     * The worksheets as they stood when the last replay's preparation was
+     * sent, by its replay: the host resolves sheet indices against that view.
+     * A commit answered after its view moved (`viewMoved`) names sheets by
+     * those indices, and is landed on the same worksheets wherever they are
+     * now. Replaced by the next preparation.
+     */
+    const replay_commit_sheets_ref = useRef<{
+        readonly replayId: string;
+        readonly sheets: readonly { readonly name: string; readonly worksheetId: string | undefined }[];
+    } | null>(null);
+    /**
      * Row and column admissions the host has granted and the grid has not
      * finished installing. The request is forgotten when its answer arrives,
      * and the grid installs the rows in a continuation; a press held behind
@@ -2421,6 +2454,13 @@ export function App(): React.JSX.Element {
                 // is the refresh it lost to (`RetryPress.awaits`).
                 if (message.type === 'prepareHistoryReplay') {
                     replay_posted_after_ref.current = snapshot_applied_seq_ref.current;
+                    replay_commit_sheets_ref.current = {
+                        replayId: message.request.replayId,
+                        sheets: (meta_ref.current?.sheets ?? []).map((sheet) => ({
+                            name: sheet.name,
+                            worksheetId: sheet.worksheetId,
+                        })),
+                    };
                 }
                 host_bridge.postMessage(message);
             },
@@ -2442,7 +2482,7 @@ export function App(): React.JSX.Element {
         committed: HistoryReplayCommitted,
         entry: HistoryEntry,
         direction: HistoryDirection,
-    ): boolean => {
+    ): ReplayLanding => {
         const session_id = csv_edit_session_id_ref.current;
         const registry = edit_session_registry_ref.current!;
         // Grouped per store, because a store owns exactly one worksheet and a
@@ -2466,20 +2506,33 @@ export function App(): React.JSX.Element {
                 structural === null
                 || structural.entryId !== entry.id
                 || structural.direction !== direction
-            ) return false;
-            if (requested_structures.length !== structural.plans.length) return false;
+            ) return 'diverged';
+            if (requested_structures.length !== structural.plans.length) return 'diverged';
         } else if (requested_structures.length > 0) {
-            return false;
+            return 'diverged';
         }
 
         const sheets = meta_ref.current?.sheets;
-        if (sheets === undefined) return false;
+        if (sheets === undefined) return 'diverged';
+        // The view moved after the host's write (see `committed_for_view`).
+        const view_moved = committed.viewMoved === true;
+        // No session holds these stores any more: what they held is replaced
+        // from durable state when one is acquired.
+        if (
+            view_moved
+            && session_id === undefined
+            && (committed.cells.length > 0 || accepted_structures.length > 0)
+        ) return 'unstaged';
         const structural_by_sheet = new Map<number, {
             readonly expected: PendingStructuralChanges;
             readonly desired: PendingStructuralChanges;
         }>();
+        // Sheets an arm names, so two arms for one sheet are refused even
+        // where one stages nothing.
+        const structural_sheets = new Set<number>();
         for (const accepted of accepted_structures) {
-            if (structural_by_sheet.has(accepted.resolvedSheetIndex)) return false;
+            if (structural_sheets.has(accepted.resolvedSheetIndex)) return 'diverged';
+            structural_sheets.add(accepted.resolvedSheetIndex);
             if (accepted.hostDerived === true) {
                 // A host-derived arm is deliberately only a conflict CAS patch.
                 // Preserve every renderer-owned row/template field from the
@@ -2488,13 +2541,44 @@ export function App(): React.JSX.Element {
                 const current = registry.pending_rows_for_sheet(
                     accepted.resolvedSheetIndex,
                 ).snapshot();
-                if (JSON.stringify(current.conflicts)
-                    !== JSON.stringify(accepted.expectedConflicts)) return false;
+                const conflicts = JSON.stringify(current.conflicts);
+                // Already in place: a delivery made from the written state
+                // reached the window first.
+                if (conflicts === JSON.stringify(accepted.desiredConflicts)) continue;
+                if (conflicts !== JSON.stringify(accepted.expectedConflicts)) {
+                    // After a view that moved, the conflicts the host
+                    // computed since (a delivery brought them) are kept, as
+                    // for a requested arm that moved only in its conflicts.
+                    if (view_moved) continue;
+                    return 'diverged';
+                }
                 structural_by_sheet.set(accepted.resolvedSheetIndex, {
                     expected: current,
                     desired: { ...current, conflicts: accepted.desiredConflicts },
                 });
             } else {
+                const current = JSON.stringify(
+                    registry.pending_rows_for_sheet(accepted.resolvedSheetIndex).snapshot(),
+                );
+                // Already in place stages nothing, as for a host-derived arm.
+                if (current === JSON.stringify(accepted.desired)) continue;
+                if (view_moved && current !== JSON.stringify(accepted.expected)) {
+                    const store = registry.pending_rows_for_sheet(accepted.resolvedSheetIndex).snapshot();
+                    // A delivery recomputed only the conflicts: the replay
+                    // lands, with the conflicts the host has now.
+                    if (JSON.stringify({ ...store, conflicts: accepted.expected.conflicts })
+                        === JSON.stringify(accepted.expected)) {
+                        structural_by_sheet.set(accepted.resolvedSheetIndex, {
+                            expected: store,
+                            desired: { ...accepted.desired, conflicts: store.conflicts },
+                        });
+                        continue;
+                    }
+                    // Anything else this window cannot follow: until a
+                    // delivery reconciled it, the store would be published
+                    // as it is, over the write.
+                    return 'diverged';
+                }
                 structural_by_sheet.set(accepted.resolvedSheetIndex, {
                     expected: accepted.expected,
                     desired: accepted.desired,
@@ -2513,18 +2597,18 @@ export function App(): React.JSX.Element {
         ]);
         for (const sheet_index of affected_sheet_indices) {
             const sheet = sheets[sheet_index];
-            if (sheet === undefined) return false;
+            if (sheet === undefined) return 'diverged';
             const desired_cells: Record<string, string | CsvDirtyEntry> = {};
             for (const [key, entry] of registry.for_sheet(sheet_index).snapshot()) {
                 const wire = wire_entry_for_destination(entry);
-                if (wire === undefined || wire === null) return false;
+                if (wire === undefined || wire === null) return 'diverged';
                 desired_cells[key] = wire;
             }
             for (const write of by_sheet.get(sheet_index) ?? []) {
                 if (write.entry === undefined) delete desired_cells[write.key];
                 else {
                     const wire = wire_entry_for_destination(write.entry);
-                    if (wire === undefined || wire === null) return false;
+                    if (wire === undefined || wire === null) return 'diverged';
                     desired_cells[write.key] = wire;
                 }
             }
@@ -2541,7 +2625,7 @@ export function App(): React.JSX.Element {
                     ...desired_structural,
                 });
             } catch {
-                return false;
+                return 'diverged';
             }
         }
 
@@ -2555,7 +2639,7 @@ export function App(): React.JSX.Element {
             // A store whose session moved on refuses to stage. Abandoning the
             // whole transaction is right: a replay is one gesture, and applying
             // the sheets that would still take it leaves half an undo.
-            if (staging === undefined) return false;
+            if (staging === undefined) return 'diverged';
             staged.push(staging);
         }
         for (const [sheet_index, changes] of structural_by_sheet) {
@@ -2565,7 +2649,7 @@ export function App(): React.JSX.Element {
                 changes.desired,
                 true,
             );
-            if (staging === undefined) return false;
+            if (staging === undefined) return 'diverged';
             staged.push(staging);
         }
         const move = history_store_ref.current!.stage_move(direction, entry);
@@ -2578,7 +2662,7 @@ export function App(): React.JSX.Element {
             structural.settleRestorations.forEach((settle) => settle(true));
             pending_row_replay_plan_ref.current = null;
         }
-        return applied;
+        return applied ? 'applied' : 'diverged';
     }, []);
 
     const set_csv_edit_session_id = useCallback((next: string | undefined) => {
@@ -4671,10 +4755,25 @@ export function App(): React.JSX.Element {
                     && previous_native_identity !== null
                     && previous_native_identity.authority.fileId
                         !== snapshot.identity.authority.fileId;
-                const disposition = classify_snapshot(
-                    snapshot.identity,
-                    last_applied_snapshot_ref.current,
-                );
+                const floor = replay_state_floor_ref.current;
+                // One delivery at most is turned away, each time it is
+                // retried: only one is out at a time, so another below the
+                // floor means the host's material never reached the write.
+                const below_replay_floor = floor !== null
+                    && floor.fileId === snapshot.identity.authority.fileId
+                    && snapshot.identity.stateRevision < floor.stateRevision
+                    && (floor.rejected === undefined || floor.rejected === snapshot.identity.deliveryId);
+                if (floor !== null) {
+                    replay_state_floor_ref.current = below_replay_floor
+                        ? { ...floor, rejected: snapshot.identity.deliveryId }
+                        : null;
+                }
+                const disposition = below_replay_floor
+                    ? 'stale'
+                    : classify_snapshot(
+                        snapshot.identity,
+                        last_applied_snapshot_ref.current,
+                    );
                 if (cross_file_initial && disposition === 'applied') {
                     reset_save_projection();
                     pending_excel_header_ref.current = null;
@@ -7316,6 +7415,67 @@ export function App(): React.JSX.Element {
     }, [say_history]);
 
     /**
+     * The committed answer as this window's sheets read now.
+     *
+     * The host names sheets by the index they had when the preparation was
+     * sent, and a delivery that reorders or renames them may have reached this
+     * window first: after a commit whose view moved (`viewMoved`), or before
+     * an answer re-sent after a lost one. Each index is mapped to where the
+     * same worksheet is now: by its id when both have one, else by its name.
+     * Undefined when one has gone. Cell keys are source coordinates, the keys
+     * durable state holds them by, and are kept. A display focus whose sheet
+     * moved is dropped: its rows are the old index's, so the cursor stays
+     * with the grid rather than following them.
+     */
+    const committed_for_view = useCallback((
+        committed: HistoryReplayCommitted,
+    ): HistoryReplayCommitted | undefined => {
+        const sent = replay_commit_sheets_ref.current;
+        const sheets = meta_ref.current?.sheets;
+        if (
+            sent === null
+            || sheets === undefined
+            || sent.replayId !== committed.replayId
+        ) return committed.viewMoved === true ? undefined : committed;
+        const mapped = new Map<number, number>();
+        const map = (index: number): number | undefined => {
+            if (mapped.has(index)) return mapped.get(index);
+            const then = sent.sheets[index];
+            if (then === undefined) return undefined;
+            const now = sheets.findIndex((sheet) => (
+                then.worksheetId !== undefined && sheet.worksheetId !== undefined
+                    ? sheet.worksheetId === then.worksheetId
+                    : sheet.name === then.name
+            ));
+            if (now < 0) return undefined;
+            mapped.set(index, now);
+            return now;
+        };
+        const focus_sheet = map(committed.focusSheetIndex);
+        if (focus_sheet === undefined) return undefined;
+        const cells: HistoryReplayCommitted['cells'][number][] = [];
+        for (const write of committed.cells) {
+            const index = map(write.resolvedSheetIndex);
+            if (index === undefined) return undefined;
+            cells.push({ ...write, resolvedSheetIndex: index });
+        }
+        const structures: NonNullable<HistoryReplayCommitted['structures']>[number][] = [];
+        for (const write of committed.structures ?? []) {
+            const index = map(write.resolvedSheetIndex);
+            if (index === undefined) return undefined;
+            structures.push({ ...write, resolvedSheetIndex: index });
+        }
+        return {
+            ...committed,
+            cells,
+            ...(committed.structures === undefined ? {} : { structures }),
+            focusSheetIndex: focus_sheet,
+            // Display rows belong to the sheet at the index the host saw.
+            displayFocus: focus_sheet === committed.focusSheetIndex ? committed.displayFocus : null,
+        };
+    }, []);
+
+    /**
      * Land an accepted replay, then send the cursor after it.
      *
      * The focus is installed only if the local transaction COMMITTED. A focus
@@ -7331,12 +7491,37 @@ export function App(): React.JSX.Element {
         history_focus_ref.current = null;
         set_history_focus(null);
         deferred_history_grid_focus_ref.current = null;
-        const applied = apply_committed_replay(
-            accepted.committed,
-            accepted.entry,
-            accepted.direction,
-        );
-        if (!applied) {
+        const committed = committed_for_view(accepted.committed);
+        const landing: ReplayLanding = committed === undefined
+            ? 'diverged'
+            : apply_committed_replay(committed, accepted.entry, accepted.direction);
+        if (
+            accepted.committed.viewMoved === true
+            && accepted.committed.stateRevision !== undefined
+            && last_applied_snapshot_ref.current !== null
+        ) {
+            replay_state_floor_ref.current = {
+                fileId: last_applied_snapshot_ref.current.authority.fileId,
+                stateRevision: accepted.committed.stateRevision,
+            };
+        }
+        if (landing === 'unstaged') {
+            // The write is in the file and the view moved under it, and no
+            // session holds the stores now: the next one is hydrated from
+            // durable state, which holds the write. History takes the step
+            // alone and nothing is said. (Anything else this window cannot
+            // follow, a worksheet gone included, is said below.)
+            const move = history_store_ref.current!.stage_move(accepted.direction, accepted.entry);
+            if (commit_staged_transaction([move])) {
+                const structural = pending_row_replay_plan_ref.current;
+                if (structural?.entryId === accepted.entry.id) {
+                    structural.settleRestorations.forEach((settle) => settle(true));
+                    pending_row_replay_plan_ref.current = null;
+                }
+                return;
+            }
+        }
+        if (committed === undefined || landing !== 'applied') {
             // The host committed and the renderer could not follow, which no
             // further undo can describe: the two are now telling different stories
             // about the document.
@@ -7347,7 +7532,7 @@ export function App(): React.JSX.Element {
             );
             return;
         }
-        const display_focus = accepted.committed.displayFocus;
+        const display_focus = committed.displayFocus;
         const structural_only = accepted.entry.action.changes.length > 0
             && accepted.entry.action.changes.every((change) => (
                 is_structural_history_change(change)
@@ -7355,14 +7540,14 @@ export function App(): React.JSX.Element {
         // A change to a Header Row has no display row: the row is the column
         // headers. Where one of them is on screen the change is in view, and
         // the grid keeps the keyboard as it does after a structural replay.
-        const focus_sheet = meta_ref.current?.sheets[accepted.committed.focusSheetIndex];
+        const focus_sheet = meta_ref.current?.sheets[committed.focusSheetIndex];
         const landed_in_shown_header = display_focus === null
             && focus_sheet !== undefined
             && replay_focus_is_shown_header(
-                accepted.committed.focus,
+                committed.focus,
                 focus_sheet,
                 hidden_source_columns(
-                    state_ref.current.columnVisibility?.[accepted.committed.focusSheetIndex],
+                    state_ref.current.columnVisibility?.[committed.focusSheetIndex],
                     focus_sheet.columnCount,
                 ),
             );
@@ -7370,20 +7555,28 @@ export function App(): React.JSX.Element {
             const request = history_focus_request(
                 history_focus_sequence_ref.current += 1,
                 accepted.direction,
-                accepted.committed.focusSheetIndex,
+                committed.focusSheetIndex,
                 display_focus,
-                accepted.committed.focus.sourceColumnStart,
-                accepted.committed.focus.sourceColumnEnd,
+                committed.focus.sourceColumnStart,
+                committed.focus.sourceColumnEnd,
             );
             history_focus_ref.current = request;
             set_history_focus(request);
-        } else if (!structural_only && !landed_in_shown_header) {
+        } else if (
+            !structural_only
+            && !landed_in_shown_header
+            && committed.viewMoved !== true
+            && committed.focusSheetIndex === accepted.committed.focusSheetIndex
+        ) {
+            // (After a view that moved, or onto a sheet that moved, the host's
+            // display rows may be for a view this window no longer shows:
+            // nothing true to say.)
             // Every touched row is filtered out of the view. The replay succeeded;
             // there is simply nowhere truthful for the cursor to go.
             say_history(
                 `The change was ${replayed_verb(accepted.direction)}, but the affected cells are hidden by the current view.`,
             );
-        } else if (accepted.committed.focusSheetIndex === active_sheet_index) {
+        } else if (committed.focusSheetIndex === active_sheet_index) {
             // Structural-only replay has no source-keyed cells from which the
             // host can derive a display row, and a replay that landed in the
             // column headers has no body row. The store transaction has already
@@ -7392,7 +7585,7 @@ export function App(): React.JSX.Element {
             // filtered out.
             grid_focus_ref.current?.focus();
         } else {
-            deferred_history_grid_focus_ref.current = accepted.committed.focusSheetIndex;
+            deferred_history_grid_focus_ref.current = committed.focusSheetIndex;
         }
         // The cursor follows what changed, which for a workbook-wide history can be
         // a sheet the user is not looking at.
@@ -7402,12 +7595,13 @@ export function App(): React.JSX.Element {
         // a switched sheet without the request. What DOES matter is that the
         // request is state and not a call: the grid for that sheet has yet to
         // mount, and it finds the request waiting when it does.
-        if (accepted.committed.focusSheetIndex !== active_sheet_index) {
-            handle_sheet_select(accepted.committed.focusSheetIndex);
+        if (committed.focusSheetIndex !== active_sheet_index) {
+            handle_sheet_select(committed.focusSheetIndex);
         }
     }, [
         active_sheet_index,
         apply_committed_replay,
+        committed_for_view,
         handle_sheet_select,
         refuse_history_press,
         say_history,
