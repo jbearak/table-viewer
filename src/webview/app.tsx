@@ -1603,7 +1603,9 @@ export function App(): React.JSX.Element {
 
     /**
      * Record a view gesture this window made (a sort, a filter, hidden rows,
-     * hidden columns), once the host has applied it.
+     * hidden columns, a row resize or reset), once the host has applied it. A
+     * column-width gesture can span worksheets and records its own action in
+     * `settle_width_write`, the same way.
      *
      * Like a highlight, with nothing staged alongside and no editing session:
      * the change has already happened on the host and in durable state. A
@@ -2519,10 +2521,11 @@ export function App(): React.JSX.Element {
     /** A view replay holding its turn while this window's editing session is on its way out. */
     const view_replay_wait_ref = useRef<{ readonly finish: (go: boolean) => void } | null>(null);
     /**
-     * Whether a view request of this window is pending: the three refs above,
-     * read into state so the grid stops offering an editor meanwhile. Never
-     * set on its own; `sync_view_request_pending` is called at every site
-     * that sets or clears one of them, so no exit can leave it up.
+     * Whether a view request of this window is pending: the refs above and
+     * the row-height requests a person made or a replay posted, read into
+     * state so the grid stops offering an editor meanwhile. Never set on its
+     * own; `sync_view_request_pending` is called at every site that sets or
+     * clears one of them, so no exit can leave it up.
      */
     const [view_request_pending, set_view_request_pending] = useState(false);
     const view_request_is_pending = useCallback((): boolean => {
@@ -6795,10 +6798,13 @@ export function App(): React.JSX.Element {
     ) => boolean) | null>(null);
 
     /**
-     * Undo or redo a view step: a sort, a filter, hidden rows, hidden columns.
+     * Undo or redo a view step: a sort, a filter, hidden rows, hidden columns,
+     * column widths, row heights.
      *
      * Replayed through the request its gesture used (`setTransform`,
-     * `setColumnVisibility`), with no editing session and not through the
+     * `setColumnVisibility`, `setColumnWidths`), except row heights: the
+     * gesture names display rows and the step holds source rows, so it is
+     * replayed through `setSourceRowHeights`. No editing session, and not the
      * cell replay protocol, which exists to compare-and-swap document content.
      * The host keeps every rule it has and persists what it installs, so the
      * saved view follows undo and redo. History moves on the host's answer.

@@ -124,7 +124,7 @@ export function header_wait_warning(
         + `${remedy} to ${direction} it.`;
 }
 
-// ---- View steps (a sort, a filter, hidden rows, hidden columns) ----
+// ---- View steps (a sort, a filter, hidden rows, hidden columns, column widths, row heights) ----
 
 /** A view gesture that cannot start while another one of this window is in flight. */
 export const VIEW_GESTURE_WAIT_MESSAGE = 'Wait for the table view to finish updating.';

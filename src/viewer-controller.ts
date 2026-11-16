@@ -14922,8 +14922,8 @@ export function attach_viewer(
              * the view contains, which is a claim about the document that a read-only
              * preview has no business making. A row height changes nothing about row
              * identity or membership — it is layout, in the same class as `columnWidths` and
-             * `scrollPosition`, which preview already persists today because
-             * `persist_layout_state` has no preview guard. Refusing here would have made
+             * `scrollPosition`, which preview already persists because neither
+             * `setColumnWidths` nor `persist_layout_state` has a preview guard. Refusing here would have made
              * this PR the first thing to stop layout persisting in preview, and it would
              * have done it *silently*: the webview still mounts the resize overlay in
              * preview and still paints the new height optimistically, so the row would have
