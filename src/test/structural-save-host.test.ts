@@ -676,8 +676,21 @@ describe('an unresolved rekey intent', () => {
             type: 'setRowHeights', sheetIndex: 0, rows: [{ start: 0, end: 0 }], height: 50, requestId: 'resize', ...stamp,
         });
         await viewer.controller.drain();
+        // Refused for a reason that will not clear by itself, and said so:
+        // the window gives it instead of "the file was refreshing".
         expect(viewer.last<{ requestId: string; applied: boolean }>('rowHeightsChanged'))
-            .toMatchObject({ requestId: 'resize', applied: false });
+            .toMatchObject({ requestId: 'resize', applied: false, refused: 'unresolved' });
+        await viewer.panel.__receive({
+            type: 'setSourceRowHeights',
+            requestId: 'undo-resize',
+            sheetIndex: 0,
+            sheetName: 'Sheet1',
+            sourceGeneration: snapshot.sourceGeneration,
+            rows: [{ start: 0, end: 0, height: null }],
+        });
+        await viewer.controller.drain();
+        expect(viewer.last<{ requestId: string; applied: boolean }>('rowHeightsChanged'))
+            .toMatchObject({ requestId: 'undo-resize', applied: false, refused: 'unresolved' });
 
         await viewer.panel.__receive({
             type: 'setTransform',
@@ -691,12 +704,14 @@ describe('an unresolved rekey intent', () => {
         expect(viewer.last<{ requestId: string }>('transformRefused')).toMatchObject({ requestId: 'hide' });
 
         await viewer.panel.__receive({
-            type: 'stateChanged',
-            state: { ...snapshot.state, columnWidths: [{ 0: 300 }] },
+            type: 'setColumnWidths',
+            requestId: 'widths',
             sourceGeneration: snapshot.sourceGeneration,
-            snapshotIdentity: snapshot.identity,
+            sheets: [{ sheetIndex: 0, sheetName: 'Sheet1', widths: [{ column: 0, width: 300 }] }],
         });
         await viewer.controller.drain();
+        expect(viewer.last<{ requestId: string; applied: boolean }>('columnWidthsChanged'))
+            .toMatchObject({ requestId: 'widths', applied: false, refused: 'unresolved' });
 
         const after = state.get_state(FILE) as PerFileState;
         expect(after.cellHighlights).toEqual(before.cellHighlights);
@@ -707,17 +722,17 @@ describe('an unresolved rekey intent', () => {
     });
 
     it.each(['finished', 'notFinished'] as const)(
-        'keeps column widths through a resize during the notice, its answer (%s), and a stale write',
+        'keeps column widths through a resize during the notice and its answer (%s), then writes one',
         async (choice) => {
             const { viewer, state } = await open_unresolved(enc.encode('h\na\nc\n'));
             const snapshot = viewer.last<{
                 snapshot: { sourceGeneration: number; identity: unknown; state: PerFileState };
             }>('workbookSnapshot').snapshot;
-            const resize = () => viewer.panel.__receive({
-                type: 'stateChanged',
-                state: { ...snapshot.state, columnWidths: [{ 0: 300 }] },
-                sourceGeneration: snapshot.sourceGeneration,
-                snapshotIdentity: snapshot.identity,
+            const resize = (sourceGeneration = snapshot.sourceGeneration) => viewer.panel.__receive({
+                type: 'setColumnWidths',
+                requestId: 'resize',
+                sourceGeneration,
+                sheets: [{ sheetIndex: 0, sheetName: 'Sheet1', widths: [{ column: 0, width: 300 }] }],
             });
             const widths = () => (state.get_state(FILE) as PerFileState).columnWidths;
             // The panel shows the sheet without widths; a resize there names
@@ -735,10 +750,15 @@ describe('an unresolved rekey intent', () => {
             expect(snapshots().length).toBeGreaterThan(before);
             expect((snapshots().at(-1) as unknown as { snapshot: { state: PerFileState } })
                 .snapshot.state.columnWidths?.[0]).toEqual({ 0: 120 });
-            // A write still stamped with the notice's snapshot is dropped.
+            // A resize still stamped with the notice's snapshot is refused;
+            // one made on the snapshot the answer delivered is written.
             await resize();
             await viewer.controller.drain();
             expect(widths()).toEqual([{ 0: 120 }]);
+            await resize(viewer.last<{ snapshot: { sourceGeneration: number } }>('workbookSnapshot')
+                .snapshot.sourceGeneration);
+            await viewer.controller.drain();
+            expect(widths()).toEqual([{ 0: 300 }]);
             await viewer.dispose();
         },
     );
