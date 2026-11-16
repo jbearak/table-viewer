@@ -220,11 +220,12 @@ export const publication_fence = {
      * nothing will retry them. Left outstanding, one the host dropped would
      * hold every wait for acknowledgement for ever. The sequence itself is
      * kept: the host refuses one that goes back. The dedupe memory is kept
-     * too: a mounted renderer is sent one initial snapshot, its first (the
-     * host presents another only for a new file id, and a panel's is fixed),
-     * so a reopen is a new renderer whose memory starts empty; forgetting it
-     * here would post an echo of the hydrated stores, which the failed-save
-     * guard in GridShell exists to prevent.
+     * too: once a mounted renderer has acknowledged its first snapshot (which
+     * it has before it can publish, or this fence rise), it is sent no other
+     * initial one, since a panel's file id is fixed. So a reopen is a new
+     * renderer whose memory starts empty; forgetting it here would post an
+     * echo of the hydrated stores, which the failed-save guard in GridShell
+     * exists to prevent.
      */
     forget_outstanding(): void {
         for (const channel of pending_edit_channels.values()) {

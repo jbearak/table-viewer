@@ -207,7 +207,8 @@ export async function applied_revision(app: ElectronApplication): Promise<number
  * file the save wrote. The Save button is clean before that read lands, and
  * when it lands it replaces the rows a menu was opened on, so it closes any
  * menu that is open: one opened in between would close under the click.
- * Needs `install_applied_snapshot_capture` at launch.
+ * Needs `install_applied_snapshot_capture` at launch, and a Save that changes
+ * the file's bytes: only a new digest raises the file revision.
  */
 export async function save_and_reread(app: ElectronApplication, page: Page): Promise<void> {
     const before = await applied_revision(app);
