@@ -16,7 +16,7 @@ import type {
     DurableFileAuthority,
     FileStateStore,
 } from '../state';
-import type { HostMessage, PerFileState } from '../types';
+import type { HostMessage, PerFileState, WebviewMessage } from '../types';
 import { MAX_SHEET_ROWS } from '../spreadsheet-safety';
 import type { WorkbookSnapshot } from '../viewer-snapshot';
 import * as vscode_mock from './mocks/vscode';
@@ -1819,7 +1819,7 @@ describe('Excel workbook snapshot controller', () => {
                     // identical header while it is failing.
                     const current = await base.read(path);
                     await base.compare_and_set(path, current.revision, {
-                        ...current.state,
+                        ...(current.state as PerFileState),
                         excelFirstRowHeaders: { People: 'off' },
                         excelFirstRowHeaderActive: { People: false },
                         excelFirstRowHeaderVersion: 1,

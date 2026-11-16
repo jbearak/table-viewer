@@ -518,31 +518,42 @@ test('a sort on another worksheet is undone from the first, which switches to it
     await expect_shown(page, { body: by_quantity, strip, undo: 'Undo Sort', redo: 'Redo' });
 });
 
-test('a sort whose columns changed under a new header row is skipped with a message, and the edit under it is still undone', async () => {
+test('a sort made before the header row was turned off is undone in order, once the header has gone back, with no message', async () => {
     const { page } = await open_file('header.xlsx', fixture('xlsx'));
     await expect_shown(page, { headers: ['Name', 'Age', 'City'], body: NATURAL });
     await type_into_cell(page, 1, 0, 'Ann');
     await sort(page, 1, 'descending');
-    await expect_shown(page, {
-        body: ['Charlie|35|Paris', 'Ann|30|New York', 'Dora|28|Oslo', 'Bob|25|London'],
-        undo: 'Undo Sort',
-    });
+    const sorted = ['Charlie|35|Paris', 'Ann|30|New York', 'Dora|28|Oslo', 'Bob|25|London'];
+    await expect_shown(page, { body: sorted, undo: 'Undo Sort' });
+    const strip = (await shown(page)).strip;
 
     // Turn the header row off: its cells become the first row, and the
-    // columns are no longer the ones the sort named.
+    // columns are no longer the ones the sort named. That is a step too.
     await page.getByRole('button', { name: 'Header Row', exact: true }).click();
     await expect.poll(async () => (await shown(page)).headers).toEqual(['A', 'B', 'C']);
     await expect.poll(async () => (await shown(page)).body).toContain('Ann|30|New York');
-    const before = await shown(page);
-    expect(before.undo).toBe('Undo Sort');
+    await expect_shown(page, { undo: 'Undo Turn off header row' });
 
+    // In order, the header goes back before the sort made under it is
+    // reached, so the sort's columns are the ones it named and nothing is
+    // skipped. (The skip, "the columns of this worksheet changed since
+    // then", is for a header change this window's history does not hold;
+    // app.test.ts covers it.)
     await history(page, 'undo');
-    await expect_shown(
-        page,
-        { body: before.body, headers: before.headers, strip: before.strip, redo: 'Redo Sort', undo: 'Undo Edit cell' },
-        ['Undo skipped “Sort”: the columns of this worksheet changed since then.'],
-    );
+    await expect_shown(page, {
+        headers: ['Name', 'Age', 'City'],
+        body: sorted,
+        strip,
+        undo: 'Undo Sort',
+        redo: 'Redo Turn off header row',
+    });
     await history(page, 'undo');
-    await expect.poll(async () => (await shown(page)).body).toContain('Alice|30|New York');
-    await expect_shown(page, { undo: 'Undo', redo: 'Redo Edit cell' });
+    await expect_shown(page, {
+        body: ['Ann|30|New York', 'Bob|25|London', 'Charlie|35|Paris', 'Dora|28|Oslo'],
+        strip: '',
+        undo: 'Undo Edit cell',
+        redo: 'Redo Sort',
+    });
+    await history(page, 'undo');
+    await expect_shown(page, { body: NATURAL, undo: 'Undo', redo: 'Redo Edit cell' });
 });

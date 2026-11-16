@@ -287,7 +287,7 @@ describe('rebase_pending_edits_for_header', () => {
         const given = slot({
             cells: { '0:0': 'x', '1:0': 'y' },
             rowLayout: inserted,
-            conflicts: [{ reason: 'structuralBasisChanged' }] as HeaderRebaseSlot['conflicts'],
+            conflicts: [{ reason: 'structuralBasisChanged', pendingRowIds: [], tailRemovalIds: [] }],
         });
         for (const context of [
             { from: 0, to: 0, sourceRowCount: ROWS, hiddenBefore: [0, 1], hiddenAfter: [0, 1] },

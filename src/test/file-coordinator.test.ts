@@ -1766,7 +1766,7 @@ describe('file coordinator Task 10 invariants', () => {
                     // Another window's write lands after this request planned.
                     const current = await base.store.read(file_path);
                     await base.store.compare_and_set(file_path, current.revision, {
-                        ...current.state,
+                        ...(current.state as PerFileState),
                         transforms: [{ sort: [], filters: [], hiddenRows: [2] }],
                     });
                 }
@@ -1812,7 +1812,7 @@ describe('file coordinator Task 10 invariants', () => {
                     interfered = true;
                     const current = await base.store.read(file_path);
                     await base.store.compare_and_set(file_path, current.revision, {
-                        ...current.state,
+                        ...(current.state as PerFileState),
                         transforms: [{ sort: [], filters: [], hiddenRows: [0] }],
                     });
                 }
