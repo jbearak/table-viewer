@@ -2312,14 +2312,21 @@ describe('GridShell column projection', () => {
             expect(shown_widths()).toEqual([['s:0', 100], ['s:1', 150], ['s:2', 200]]);
         });
 
-        /** A double-click on a column's border, as Glide reports it: two presses that do not move, then the fit. */
+        /** A press somewhere in the window that is not on a column border. */
+        const press_elsewhere = () => { window.dispatchEvent(new Event('pointerdown')); };
+        /** A press on a column's border and its release, without moving: what Glide reports for a click there. */
+        const click_border = (display_column: number, width: number) => {
+            const { start, end } = callbacks();
+            window.dispatchEvent(new Event('pointerdown'));
+            start({}, width, display_column);
+            end({}, width, display_column);
+        };
+        /** A double-click on a column's border, as Glide reports it: two clicks, then the fit. */
         const double_click_border = async (display_column: number, start_width: number, fitted: number) => {
-            const { start, resize, end } = callbacks();
+            const { resize, end } = callbacks();
             await act(async () => {
-                start({}, start_width, display_column);
-                end({}, start_width, display_column);
-                start({}, start_width, display_column);
-                end({}, start_width, display_column);
+                click_border(display_column, start_width);
+                click_border(display_column, start_width);
                 // The fit arrives with no press open.
                 resize({}, fitted, display_column);
                 end({}, fitted, display_column);
@@ -2343,10 +2350,10 @@ describe('GridShell column projection', () => {
             // border the pointer is on.
             const on_columns_resized = vi.fn();
             await render_grid(props({ on_columns_resized, column_projection: all_columns }));
-            const { start, resize, end } = callbacks();
+            const { resize, end } = callbacks();
             await act(async () => {
-                start({}, 150, 1);
-                end({}, 150, 1);
+                press_elsewhere();
+                click_border(1, 150);
                 resize({}, 77, 1);
                 end({}, 77, 1);
             });
@@ -2355,34 +2362,32 @@ describe('GridShell column projection', () => {
 
             // Nor from a click on one border and then one on another.
             await act(async () => {
-                start({}, 100, 0);
-                end({}, 100, 0);
+                click_border(0, 100);
                 resize({}, 71, 0);
                 end({}, 71, 0);
             });
             expect(on_columns_resized).not.toHaveBeenCalled();
         });
 
-        it('takes no fit from two clicks on a border that are not a double-click', async () => {
+        it('takes no fit from two clicks on a border with a click somewhere else between them', async () => {
+            // A border, a header, the border again, all within half a second:
+            // Glide reads the last release as a double-click from the header
+            // click before it. The two border clicks are not one.
             const on_columns_resized = vi.fn();
             await render_grid(props({ on_columns_resized, column_projection: all_columns }));
-            const { start, resize, end } = callbacks();
-            const now = vi.spyOn(performance, 'now');
-            try {
-                now.mockReturnValue(1_000);
-                await act(async () => { start({}, 150, 1); end({}, 150, 1); });
-                // The second, a second later, right after a click somewhere else.
-                now.mockReturnValue(2_000);
-                await act(async () => {
-                    start({}, 150, 1);
-                    end({}, 150, 1);
-                    resize({}, 77, 1);
-                    end({}, 77, 1);
-                });
-                expect(on_columns_resized).not.toHaveBeenCalled();
-            } finally {
-                now.mockRestore();
-            }
+            const { resize, end } = callbacks();
+            await act(async () => {
+                click_border(1, 150);
+                press_elsewhere();
+                click_border(1, 150);
+                resize({}, 77, 1);
+                end({}, 77, 1);
+            });
+            expect(on_columns_resized).not.toHaveBeenCalled();
+
+            // A double-click right after that still fits.
+            await double_click_border(1, 150, 77);
+            expect(on_columns_resized).toHaveBeenCalledExactlyOnceWith([{ column: 1, width: 77 }]);
         });
 
         it('does not take the fit Glide asks for when a drag is released soon after another click', async () => {
@@ -2396,6 +2401,8 @@ describe('GridShell column projection', () => {
             await render_grid(props({ on_columns_resized, size_gesture_may_start, column_projection: all_columns }));
             const { start, resize, end } = callbacks();
             await act(async () => {
+                press_elsewhere();
+                window.dispatchEvent(new Event('pointerdown'));
                 start({}, 100, 0);
                 resize({}, 160, 0);
                 end({}, 160, 0);
@@ -2410,8 +2417,7 @@ describe('GridShell column projection', () => {
             // Nor is a drag and then one click on the same border a double-click.
             on_columns_resized.mockClear();
             await act(async () => {
-                start({}, 100, 0);
-                end({}, 100, 0);
+                click_border(0, 100);
                 resize({}, 71, 0);
                 end({}, 71, 0);
             });

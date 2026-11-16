@@ -314,20 +314,24 @@ import {
 
 /** Pixel proximity to a row border that arms the resize strip. */
 const ROW_RESIZE_TOLERANCE_PX = 5;
-/** The longest a double-click's two releases may be apart. Glide's own threshold. */
-const BORDER_DOUBLE_CLICK_MS = 500;
+
+/** A finished press on a column border. */
+interface BorderPress {
+    readonly display_column: number;
+    /** Whether the press moved the border. */
+    readonly dragged: boolean;
+    /** Which press in the window it was, counting every press anywhere. */
+    readonly ordinal: number;
+}
 
 /**
  * Whether the last two presses on a column border were a double-click on
- * `display_column`'s border: both on it, neither dragging it, released within
- * the double-click time of each other.
+ * `display_column`'s border: both on it, neither dragging it, and no other
+ * press anywhere in the window between them. How close in time they were is
+ * Glide's to judge: it asks for a fit only within its double-click time.
  */
 function border_was_double_clicked(
-    presses: readonly {
-        readonly display_column: number;
-        readonly dragged: boolean;
-        readonly ended_at: number;
-    }[],
+    presses: readonly BorderPress[],
     display_column: number,
 ): boolean {
     const [last, previous] = presses;
@@ -337,7 +341,7 @@ function border_was_double_clicked(
         && !previous.dragged
         && last.display_column === display_column
         && previous.display_column === display_column
-        && last.ended_at - previous.ended_at <= BORDER_DOUBLE_CLICK_MS;
+        && last.ordinal === previous.ordinal + 1;
 }
 
 /**
@@ -3105,20 +3109,18 @@ export function GridShell({
      * anything, so state would hand the end call the widths of the render
      * before. The drafts are drawn through the revision counter below.
      */
-    interface BorderPress {
-        readonly display_column: number;
-        /** Whether the press moved the border. */
-        readonly dragged: boolean;
-        /** When it was released, in `performance.now()` time. */
-        readonly ended_at: number;
-    }
     interface ColumnResizeGesture {
         /**
          * The pressed border: its column and the width that column had.
          * Absent for a resize that arrives with no press open, which is a
          * fit (Glide makes one on a double-click, after the press has ended).
          */
-        readonly press?: { readonly display_column: number; readonly start_width: number };
+        readonly press?: {
+            readonly display_column: number;
+            readonly start_width: number;
+            /** Which press in the window this is: see `window_press_count_ref`. */
+            readonly ordinal: number;
+        };
         /** Whether the pressed column itself was resized to another width. */
         moved: boolean;
         /** Draft widths by source column. */
@@ -3138,6 +3140,18 @@ export function GridShell({
      * double-click on the border itself: see `border_was_double_clicked`.
      */
     const border_presses_ref = useRef<readonly BorderPress[]>([]);
+    /**
+     * How many presses the window has seen, anywhere in it: Glide's
+     * double-click counts releases anywhere, so a press between two border
+     * presses is what makes them not a double-click. Counted in the capture
+     * phase, before Glide's own handler reports a border press.
+     */
+    const window_press_count_ref = useRef(0);
+    useEffect(() => {
+        const count = () => { window_press_count_ref.current += 1; };
+        window.addEventListener('pointerdown', count, true);
+        return () => window.removeEventListener('pointerdown', count, true);
+    }, []);
     const [source_column_draft_revision, set_source_column_draft_revision] = useState(0);
     const shown_column_widths = useMemo(() => {
         const drafts = column_resize_ref.current?.source;
@@ -11776,7 +11790,7 @@ export function GridShell({
     const handle_column_resize_start = useCallback(
         (_column: GridColumn, size: number, display_column: number) => {
             column_resize_ref.current = {
-                press: { display_column, start_width: size },
+                press: { display_column, start_width: size, ordinal: window_press_count_ref.current },
                 moved: false,
                 source: new Map(),
                 pending: new Map(),
@@ -11848,7 +11862,7 @@ export function GridShell({
                     {
                         display_column: gesture.press.display_column,
                         dragged: gesture.moved,
-                        ended_at: performance.now(),
+                        ordinal: gesture.press.ordinal,
                     },
                     ...border_presses_ref.current.slice(0, 1),
                 ];
