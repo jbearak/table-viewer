@@ -445,11 +445,26 @@ interface PendingWidthSheet {
  * The one column-width write awaiting `columnWidthsChanged`: a resize, a fit,
  * a restore, or a width step's replay.
  */
+/**
+ * What Auto-fit keeps beside the widths and the toolbar: the worksheets still
+ * owed a fit, and each worksheet's Pending Column widths from before its fit.
+ */
+interface AutoFitExtras {
+    readonly owed: ReadonlySet<number>;
+    readonly pendingColumnSnapshots: readonly (Record<string, number | undefined> | undefined)[];
+}
+
 interface PendingWidthWrite {
     readonly requestId: string;
     readonly sourceGeneration: number;
     readonly sheets: readonly PendingWidthSheet[];
     readonly replay?: ViewReplay;
+    /**
+     * What the gesture or replay dropped of Auto-fit's own state on its way
+     * to the write, as it was before: put back with the widths if the host
+     * refuses.
+     */
+    readonly autoFitExtrasBefore?: AutoFitExtras;
     /**
      * A fit owed to a worksheet, applied when it could be: nobody pressed
      * anything, so a refusal says nothing and the fit stays owed.
@@ -6757,7 +6772,11 @@ export function App(): React.JSX.Element {
     /** `post_column_widths`, which is declared further down. */
     const post_column_widths_ref = useRef<((
         sheets: readonly WidthWriteSheet[],
-        options?: { readonly replay?: ViewReplay; readonly owed?: boolean },
+        options?: {
+            readonly replay?: ViewReplay;
+            readonly owed?: boolean;
+            readonly auto_fit_extras_before?: AutoFitExtras;
+        },
     ) => boolean) | null>(null);
     /** `post_column_visibility`, which is declared further down. */
     const post_column_visibility_ref = useRef<((
@@ -6865,12 +6884,19 @@ export function App(): React.JSX.Element {
                 return;
             }
             // Taking a fit back: a fit still owed to another worksheet would
-            // be the opposite of what the person asked.
+            // be the opposite of what the person asked. A replay the host
+            // refuses did not happen, so what is dropped here comes back.
+            const auto_fit_extras_before: AutoFitExtras = {
+                owed: pending_auto_fit_sheets_ref.current,
+                pendingColumnSnapshots: [...pending_auto_fit_snapshot_ref.current],
+            };
             if (undoes_a_fit) update_pending_auto_fit_sheets(EMPTY_PENDING_AUTO_FIT);
             for (const write of writes) {
                 pending_auto_fit_snapshot_ref.current[write.sheet_index] = undefined;
             }
-            if (post_column_widths_ref.current?.(writes, { replay }) !== true) say_wait('refreshing');
+            if (post_column_widths_ref.current?.(writes, { replay, auto_fit_extras_before }) !== true) {
+                say_wait('refreshing');
+            }
             return;
         }
         const change = view_step_change(entry.action);
@@ -9745,6 +9771,11 @@ export function App(): React.JSX.Element {
         set_auto_fit_snapshot(next_snapshot);
     }, []);
 
+    /** Auto-fit's own state as it is now, for a caller about to drop some of it. */
+    const auto_fit_extras = useCallback((): AutoFitExtras => ({
+        owed: pending_auto_fit_sheets_ref.current,
+        pendingColumnSnapshots: [...pending_auto_fit_snapshot_ref.current],
+    }), []);
     const width_write_seq_ref = useRef(0);
     /**
      * Sheets whose owed fit the host refused, held until the next snapshot is
@@ -9766,7 +9797,12 @@ export function App(): React.JSX.Element {
      */
     const post_column_widths = useCallback((
         sheets: readonly WidthWriteSheet[],
-        options: { readonly replay?: ViewReplay; readonly owed?: boolean } = {},
+        options: {
+            readonly replay?: ViewReplay;
+            readonly owed?: boolean;
+            /** Read by the caller before it dropped any of it: see `PendingWidthWrite`. */
+            readonly auto_fit_extras_before?: AutoFitExtras;
+        } = {},
     ): boolean => {
         const meta_sheets = meta_ref.current?.sheets;
         if (meta_sheets === undefined || sheets.length === 0) return false;
@@ -9828,6 +9864,9 @@ export function App(): React.JSX.Element {
             sourceGeneration: source_generation_ref.current,
             sheets: pending_sheets,
             ...(options.replay === undefined ? {} : { replay: options.replay }),
+            ...(options.auto_fit_extras_before === undefined
+                ? {}
+                : { autoFitExtrasBefore: options.auto_fit_extras_before }),
             owed: options.owed === true,
             snapshotAdopted: false,
         };
@@ -9948,6 +9987,12 @@ export function App(): React.JSX.Element {
             }
             state_ref.current = { ...state_ref.current, columnWidths: widths };
             set_column_widths(widths);
+            if (pending.autoFitExtrasBefore !== undefined) {
+                update_pending_auto_fit_sheets(pending.autoFitExtrasBefore.owed);
+                pending_auto_fit_snapshot_ref.current = [
+                    ...pending.autoFitExtrasBefore.pendingColumnSnapshots,
+                ];
+            }
         }
         if (pending.owed) {
             // Nobody pressed anything, so nothing is said; the fit stays owed
@@ -9971,7 +10016,13 @@ export function App(): React.JSX.Element {
         } else {
             show_warning(outcome.unresolved ? SIZE_WRITE_UNRESOLVED_MESSAGE : SIZE_WRITE_REFUSED_MESSAGE);
         }
-    }, [cancel_pending_auto_fit_for_sheet, land_view_replay, set_auto_fit_for_sheet, show_warning]);
+    }, [
+        cancel_pending_auto_fit_for_sheet,
+        land_view_replay,
+        set_auto_fit_for_sheet,
+        show_warning,
+        update_pending_auto_fit_sheets,
+    ]);
     settle_width_write_ref.current = settle_width_write;
     post_column_widths_ref.current = post_column_widths;
 
@@ -10122,16 +10173,18 @@ export function App(): React.JSX.Element {
             if (changes.length === 0) return;
             // A direct resize supersedes both active and still-pending auto-fit.
             // Keep the current widths, Pending Columns' too, and discard any
-            // restore snapshot or owed fit.
+            // restore snapshot or owed fit. A resize the host refuses did not
+            // happen, so they come back with the widths.
+            const auto_fit_extras_before = auto_fit_extras();
             cancel_pending_auto_fit_for_sheet(active_sheet_index);
             pending_auto_fit_snapshot_ref.current[active_sheet_index] = undefined;
             post_column_widths([{
                 sheet_index: active_sheet_index,
                 widths: changes,
                 auto_fit: { active: false },
-            }]);
+            }], { auto_fit_extras_before });
         },
-        [active_sheet_index, cancel_pending_auto_fit_for_sheet, post_column_widths],
+        [active_sheet_index, auto_fit_extras, cancel_pending_auto_fit_for_sheet, post_column_widths],
     );
 
     /**
@@ -10350,7 +10403,12 @@ export function App(): React.JSX.Element {
      * column in it, and no width for every column that has one now and is
      * not in the snapshot.
      */
-    const restore_widths_for_sheets = useCallback((indices: readonly number[]) => {
+    const restore_widths_for_sheets = useCallback((
+        indices: readonly number[],
+        // Auto-fit's own state from before the caller dropped any of it; read
+        // here when the caller dropped nothing.
+        auto_fit_extras_before: AutoFitExtras = auto_fit_extras(),
+    ) => {
         const fitted = indices.filter((index) => auto_fit_active_ref.current[index]);
         if (fitted.length === 0) return;
         for (const index of fitted) {
@@ -10362,14 +10420,20 @@ export function App(): React.JSX.Element {
         for (const index of fitted) {
             const current = state_ref.current.columnWidths?.[index] ?? {};
             const snapshot = auto_fit_snapshot_ref.current[index] ?? {};
+            // Widths are kept by position, and a file that has since lost
+            // columns leaves widths behind for positions it no longer has.
+            // The host refuses a request that names one, so they are left
+            // as they are, like the columns a replay leaves out.
+            const column_count = meta_ref.current?.sheets[index]?.columnCount ?? 0;
             const widths: { column: number; width: number | null }[] = [];
             for (const [key, width] of Object.entries(snapshot)) {
                 const column = Number(key);
-                if (current[column] !== width) widths.push({ column, width });
+                if (column < column_count && current[column] !== width) widths.push({ column, width });
             }
             for (const key of Object.keys(current)) {
-                if (!Object.prototype.hasOwnProperty.call(snapshot, key)) {
-                    widths.push({ column: Number(key), width: null });
+                const column = Number(key);
+                if (column < column_count && !Object.prototype.hasOwnProperty.call(snapshot, key)) {
+                    widths.push({ column, width: null });
                 }
             }
             if (widths.length === 0) {
@@ -10385,8 +10449,8 @@ export function App(): React.JSX.Element {
                 auto_fit_change: 'off',
             });
         }
-        if (writes.length > 0) post_column_widths(writes);
-    }, [post_column_widths, set_auto_fit_for_sheet, write_pending_column_widths]);
+        if (writes.length > 0) post_column_widths(writes, { auto_fit_extras_before });
+    }, [auto_fit_extras, post_column_widths, set_auto_fit_for_sheet, write_pending_column_widths]);
 
     /**
      * The toolbar's Auto-fit: fit the active sheet, or put its widths back.
@@ -10534,11 +10598,19 @@ export function App(): React.JSX.Element {
     const handle_restore_widths_all_sheets = useCallback(() => {
         // Asked first: refused, the fits still owed stay owed.
         if (!size_gesture_may_start()) return;
+        const auto_fit_extras_before = auto_fit_extras();
         update_pending_auto_fit_sheets(EMPTY_PENDING_AUTO_FIT);
         restore_widths_for_sheets(
             Array.from({ length: meta?.sheets.length ?? 0 }, (_, index) => index),
+            auto_fit_extras_before,
         );
-    }, [meta, restore_widths_for_sheets, size_gesture_may_start, update_pending_auto_fit_sheets]);
+    }, [
+        auto_fit_extras,
+        meta,
+        restore_widths_for_sheets,
+        size_gesture_may_start,
+        update_pending_auto_fit_sheets,
+    ]);
 
     const current_sheet = meta?.sheets[active_sheet_index];
     // Discarded tombstones a stored Formula Anchor names must survive a

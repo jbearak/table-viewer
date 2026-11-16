@@ -19683,6 +19683,49 @@ describe('auto-fit with Pending Columns', () => {
         expect(store.snapshot().pendingColumns?.[0]?.viewerWidth).toBe(90);
     });
 
+    it('still puts a Pending Column\'s width back after a drag the host refused', async () => {
+        // A drag ends Auto-fit and with it the widths Restore would put back.
+        // Refused, the drag did not happen: Auto-fit is on again, and Restore
+        // still knows the Pending Column's width from before the fit.
+        grid_shell_mock.auto_fit_result = { 0: 120 };
+        const { post_message } = await render_app();
+        const meta = make_meta(['Sheet1'], false);
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        await acquire_editing_session(post_message, 'refused-session');
+        const store = (grid_shell_mock.latest_props as unknown as GridShellProps).pending_row_store!;
+        const before = store.snapshot();
+        await act(async () => {
+            const staged = store.stage_replace('refused-session', before, {
+                ...before,
+                columnLayout: {
+                    columns: [{ kind: 'source', sourceColumn: 0 }, { kind: 'pending', pendingColumnId: 'column-a' }],
+                    removedSourceColumns: [],
+                    discardedPendingColumns: [],
+                },
+                pendingColumns: [{
+                    id: 'column-a', header: 'New column', cells: {}, viewerWidth: 90,
+                    format: { kind: 'none' }, createdOrder: 1,
+                }],
+            });
+            staged!.commit();
+            staged!.notify();
+        });
+        grid_shell_mock.pending_auto_fit_result = { 'column-a': 180 };
+        await click_button('Auto-fit Columns');
+        await answer_width_write(post_message);
+        expect(store.snapshot().pendingColumns?.[0]?.viewerWidth).toBe(180);
+
+        await click_stub_button('.stub-resize');
+        expect(grid_shell_mock.latest_props!.auto_fit_active).toBe(false);
+        await answer_width_write(post_message, { applied: false });
+        expect(grid_shell_mock.latest_props!.auto_fit_active).toBe(true);
+
+        await click_button('Auto-fit Columns');
+        expect(store.snapshot().pendingColumns?.[0]?.viewerWidth).toBe(90);
+    });
+
     it('does not start a fit while a highlight request holds the gesture slot, and says to wait', async () => {
         const { post_message } = await render_app();
         const meta = make_meta(['Sheet1'], false);
@@ -23088,6 +23131,82 @@ describe('view steps in history', () => {
                 await answer_width_write(post_message);
                 expect(undo_labels()).toEqual(['Auto-fit columns', 'Auto-fit columns']);
                 expect(fit_is_owed_here()).toBe(false);
+            });
+
+            it('restore leaves alone a width kept for a column the worksheet no longer has', async () => {
+                // Widths are kept by position. The worksheet has lost its third
+                // column since the fit, and the host refuses a request that
+                // names a column it does not have.
+                grid_shell_mock.auto_fit_result = { 0: 120, 2: 90 };
+                const { post_message } = await render_app();
+                await open(post_message);
+                await click_button('Auto-fit Columns');
+                await answer_width_write(post_message);
+                const narrower = table_meta();
+                narrower.sheets[0].columnCount = 2;
+                narrower.sheets[0].columnNames = ['Name', 'Value'];
+                await deliver_widths([{ 0: 120, 2: 90 }], narrower);
+                expect(auto_fit_on()).toBe(true);
+
+                await click_button('Auto-fit Columns');
+
+                expect(latest_width_write(post_message).sheets).toEqual([
+                    { sheetIndex: 0, sheetName: 'Sheet1', widths: [{ column: 0, width: null }] },
+                ]);
+                await answer_width_write(post_message, { stored: [{ 0: 120, 2: 90 }] });
+                expect(auto_fit_on()).toBe(false);
+                expect(undo_labels()).toEqual(['Auto-fit columns', 'Restore column widths']);
+            });
+
+            it('still owes its fits after a drag, a restore, or an undo that the host refused', async () => {
+                // Each of the three drops fits that are owed on its way to the
+                // write. Refused, it did not happen, and neither did that.
+                grid_shell_mock.auto_fit_result = null;
+                const { post_message } = await render_app();
+                await open(post_message, {}, two_sheets());
+                // Nothing can be measured yet: both worksheets are owed a fit.
+                await open_scope_menu('Auto-fit scope');
+                await click_menu_item('Auto-fit columns on all 2 sheets');
+                expect(fit_is_owed_here()).toBe(true);
+
+                // A drag on the worksheet that is owed one.
+                await resize_columns([{ column: 1, width: 180 }]);
+                expect(fit_is_owed_here()).toBe(false);
+                await answer_width_write(post_message, { applied: false });
+                expect(fit_is_owed_here()).toBe(true);
+                expect(widths_shown()).toEqual({});
+
+                // Sheet1 is fitted once it can be measured; Sheet2 stays owed.
+                grid_shell_mock.auto_fit_result = { 0: 120 };
+                await notify_auto_fit_sample_change();
+                await vi.waitFor(() => expect(width_writes(post_message)).toHaveLength(2));
+                await answer_width_write(post_message);
+                expect(undo_labels()).toEqual(['Auto-fit columns']);
+                const sheet2_is_owed = async () => {
+                    grid_shell_mock.auto_fit_result = null;
+                    await click_button('Sheet2');
+                    const owed = fit_is_owed_here();
+                    await click_button('Sheet1');
+                    grid_shell_mock.auto_fit_result = { 0: 120 };
+                    return owed;
+                };
+                expect(await sheet2_is_owed()).toBe(true);
+
+                // "Restore on all sheets", refused: Sheet1 is fitted again and
+                // Sheet2 is still owed its fit.
+                await open_scope_menu('Auto-fit scope');
+                await click_menu_item('Restore original widths on all 2 sheets');
+                await answer_width_write(post_message, { applied: false });
+                expect(auto_fit_on()).toBe(true);
+                expect(widths_shown()).toEqual({ 0: 120 });
+                expect(await sheet2_is_owed()).toBe(true);
+
+                // Undo of the fit, refused: the same.
+                await undo();
+                await answer_width_write(post_message, { applied: false });
+                expect(auto_fit_on()).toBe(true);
+                expect(undo_labels()).toEqual(['Auto-fit columns']);
+                expect(await sheet2_is_owed()).toBe(true);
             });
 
             it('on all sheets, and restore on all sheets, change nothing and say to wait while the window is busy', async () => {

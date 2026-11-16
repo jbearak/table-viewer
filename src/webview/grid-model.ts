@@ -45,7 +45,6 @@ export function get_needed_page_starts(
     return starts;
 }
 
-
 /** Spreadsheet column label for a 0-based index: 0→A, 25→Z, 26→AA, 702→AAA. */
 export function column_letter(index: number): string {
     let n = index;

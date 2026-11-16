@@ -14891,11 +14891,11 @@ export function attach_viewer(
              * sit at those display positions. Nor is a message needed: the delivery that
              * moved the generation is what makes the webview's generation differ from the
              * one it posted, so the optimistic overlay tagged with that generation is
-             * discarded and the row visibly springs back. The user's next drag is the retry. "Stale" is scoped to
-             * the sheet the request names, not to the core-wide generation — see
-             * `mapping_generation` in the predicate below — and the webview's overlay
-             * lifecycle is scoped the same way, so the two halves agree about which
-             * requests die.
+             * discarded and the row visibly springs back. The user's next drag is the
+             * retry. "Stale" is scoped to the sheet the request names, not to the
+             * core-wide generation — see `mapping_generation` in the predicate below —
+             * and the webview's overlay lifecycle is scoped the same way, so the two
+             * halves agree about which requests die.
              *
              * No preview-mode refusal, unlike `hideRows` directly above, and the difference
              * is not an oversight. `hideRows` is a *view transform*: it changes which rows
