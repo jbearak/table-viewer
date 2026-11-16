@@ -19002,6 +19002,125 @@ describe('undo and redo, from the keyboard and the desktop menu', () => {
         }
     });
 
+    it('lands a re-sent answer whose sibling conflict arm the host has since recomputed, keeping the newer conflicts', async () => {
+        const { post_message } = await render_app();
+        const meta = make_meta(['Sheet1', 'Sheet2'], false);
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        await acquire_editing_session(post_message, 'sibling-session');
+        const props = grid_shell_mock.latest_props as unknown as GridShellProps;
+        const pending_store = props.pending_row_store!;
+        const template = { id: 'plain', format: { kind: 'none' as const } };
+        await act(async () => {
+            expect(pending_store.append_rows('sibling-session', ['pending-a'], template, 1, {
+                sourceRowCount: 1,
+                provisionalStartRow: 1,
+                provisionalRowCount: 1,
+                columnCount: 1,
+                schemaFingerprint: transform_schema_for_sheet(meta.sheets[0]),
+            })).toBe(true);
+        });
+        const after = pending_store.snapshot();
+        const record = props.history_store!.stage_record({
+            label: 'Append row',
+            changes: [{
+                kind: 'rowAppend',
+                delta: {
+                    worksheet: { sheetIndex: 0, sheetName: 'Sheet1' },
+                    pendingRowId: after.appendedRows[0].id,
+                    before: null,
+                    after: after.appendedRows[0],
+                    beforeIndex: null,
+                    afterIndex: 0,
+                    formatTemplates: [template],
+                },
+            }, {
+                kind: 'pendingRows',
+                delta: {
+                    worksheet: { sheetIndex: 0, sheetName: 'Sheet1' },
+                    before: { ...after, appendBasis: undefined },
+                    after,
+                },
+            }],
+        });
+        expect(record.commit()).toBe(true);
+        record.notify();
+        await click_sheet_tab('Sheet2');
+        const sibling_store = (grid_shell_mock.latest_props as unknown as GridShellProps).pending_row_store!;
+        const conflict = (sourceRow: number) => [{
+            reason: 'ambiguousPendingFormula' as const,
+            pendingRowIds: [],
+            tailRemovalIds: [],
+            formulaCells: [{ rowIdentity: { kind: 'source' as const, sourceRow }, sourceColumn: 0 }],
+        }];
+        expect(sibling_store.install(
+            { session_id: 'sibling-session' },
+            { formatTemplates: [], appendedRows: [], tailRemovals: [], conflicts: conflict(0) },
+        )).toBe(true);
+        await click_sheet_tab('Sheet1');
+        post_message.mockClear();
+
+        await undo_via_menu();
+        await vi.waitUntil(() => sent(post_message, 'prepareHistoryReplay') !== undefined);
+        const prepare = sent(post_message, 'prepareHistoryReplay');
+        const structures = prepare.request.structures.map((structure: object) => ({
+            ...structure,
+            resolvedSheetIndex: 0,
+        }));
+        await dispatch_host_message({
+            type: 'historyReplayPrepared',
+            prepared: {
+                requestId: prepare.request.requestId,
+                replayId: prepare.request.replayId,
+                leaseId: 'sibling-lease',
+                focusSheetIndex: 0,
+                focus: prepare.request.focus,
+                cells: [],
+                structures,
+            },
+        });
+        const commit = sent(post_message, 'commitHistoryReplay');
+        // The answer is lost; a refresh installs the written rows and a
+        // sibling conflict the host recomputed since.
+        await act(async () => {
+            expect(pending_store.install(
+                { session_id: 'sibling-session' },
+                prepare.request.structures[0].desired,
+            )).toBe(true);
+            expect(sibling_store.install(
+                { session_id: 'sibling-session' },
+                { formatTemplates: [], appendedRows: [], tailRemovals: [], conflicts: conflict(1) },
+            )).toBe(true);
+        });
+        // The answer, re-sent, as it was: ordinary.
+        await dispatch_host_message({
+            type: 'historyReplayCommitted',
+            committed: {
+                requestId: commit.request.requestId,
+                replayId: commit.request.replayId,
+                leaseId: commit.request.leaseId,
+                mutationId: commit.request.mutationId,
+                sourceGeneration: 1,
+                cells: [],
+                structures: [...structures, {
+                    ordinal: 1,
+                    resolvedSheetIndex: 1,
+                    expectedConflicts: conflict(0),
+                    desiredConflicts: [],
+                    hostDerived: true,
+                }],
+                focusSheetIndex: 0,
+                focus: prepare.request.focus,
+                displayFocus: null,
+            },
+        });
+
+        expect(props.history_store!.snapshot().undoStack).toEqual([]);
+        expect(sent(post_message, 'showWarning')).toBeUndefined();
+        expect(sibling_store.snapshot().conflicts).toEqual(conflict(1));
+    });
+
     it('stages a structural undo that changes only conflicts, from the store where the replay found it', async () => {
         const { post_message } = await render_app();
         const meta = make_meta(['Sheet1'], false);

@@ -2545,13 +2545,10 @@ export function App(): React.JSX.Element {
                 // Already in place: a delivery made from the written state
                 // reached the window first.
                 if (conflicts === JSON.stringify(accepted.desiredConflicts)) continue;
-                if (conflicts !== JSON.stringify(accepted.expectedConflicts)) {
-                    // After a view that moved, the conflicts the host
-                    // computed since (a delivery brought them) are kept, as
-                    // for a requested arm that moved only in its conflicts.
-                    if (view_moved) continue;
-                    return 'diverged';
-                }
+                // Conflicts the host computed since (a delivery brought them,
+                // before this answer or before an answer re-sent after a
+                // lost one) are kept: the arm is only the host's conflicts.
+                if (conflicts !== JSON.stringify(accepted.expectedConflicts)) continue;
                 structural_by_sheet.set(accepted.resolvedSheetIndex, {
                     expected: current,
                     desired: { ...current, conflicts: accepted.desiredConflicts },
