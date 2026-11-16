@@ -3140,14 +3140,14 @@ export function App(): React.JSX.Element {
     const header_reload_required_ref = useRef(false);
     const lower_header_fence_ref = useRef<() => void>(() => {});
     /** Say why Save does nothing while the header fence is up. */
-    const warn_save_waits_for_header = () => {
+    const warn_save_waits_for_header = useCallback(() => {
         host_bridge.postMessage({
             type: 'showWarning',
             message: header_reload_required_ref.current
                 ? 'Reload this window to finish the header row change, then save.'
                 : 'Wait for the header row change to finish, then save.',
         });
-    };
+    }, []);
     // The edit warning last shown for this fence, so a burst of keys says it
     // once; cleared when the fence drops.
     const header_edit_warning_ref = useRef<string | null>(null);
@@ -3179,7 +3179,7 @@ export function App(): React.JSX.Element {
     const warn_save_paused = useCallback(() => {
         if (reopen_required_ref.current) say_history(REOPEN_REQUIRED_SAVE_MESSAGE);
         else if (header_fence_ref.current) warn_save_waits_for_header();
-    }, [say_history]);
+    }, [say_history, warn_save_waits_for_header]);
     const [header_fence, set_header_fence] = useState(false);
     // The header queue's verdict on a header result; see `drain_excel_header_queue`.
     const header_result_handler_ref = useRef<
@@ -4148,7 +4148,7 @@ export function App(): React.JSX.Element {
         save_in_flight_ref.current = true;
         host_bridge.postMessage({ type: 'saveCsv', operation });
         return operation;
-    }, [csv_edit_session_id, say_history, view_request_is_pending]);
+    }, [csv_edit_session_id, say_history, view_request_is_pending, warn_save_waits_for_header]);
 
     const reset_save_projection = useCallback(() => {
         save_projection_ref.current = INITIAL_CSV_SAVE_PROJECTION;
@@ -9568,15 +9568,15 @@ export function App(): React.JSX.Element {
         const run = header_run_ref.current;
         if (reopen_required_ref.current) {
             // Queued before this window said it no longer matches its file
-            // (behind the replay it could not follow): not sent. Ended as a
-            // result that needs a reload ends it. (A
-            // replay's run would end the same way, its entry left where it
-            // is; the press gate refuses one before it is queued.) Never with
-            // a header result that needs a reload: that result empties the
-            // queue, and nothing is queued under its fence, so lowering the
-            // header fence here cannot clear it.
-            // The window has just said to reopen the file; the status line
-            // says the rest.
+            // (behind the replay it could not follow): not sent, and ended as
+            // a result that needs a reload ends it. The window has just said
+            // to reopen the file; the status line says the rest. A replay's
+            // run would end the same way, its entry left where it is, but the
+            // press gate refuses one before it is queued.
+            //
+            // A header result that needs a reload is never pending here: it
+            // empties the queue, and nothing is queued under its fence, so
+            // lowering the header fence here cannot clear it.
             if (run !== null) run.failed = { silent: true };
             set_excel_header_status('Header row was not updated.');
             finish_header_queue();
@@ -10897,7 +10897,7 @@ export function App(): React.JSX.Element {
         const requested = editing.request_save();
         return requested
             || edit_session_registry_ref.current!.has_dirty_entries();
-    }, [say_history]);
+    }, [say_history, warn_save_waits_for_header]);
 
     const handle_save = useCallback(() => {
         request_save_or_remain_dirty();
