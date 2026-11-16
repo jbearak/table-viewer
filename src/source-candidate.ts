@@ -97,3 +97,32 @@ export class SourceCandidate {
         this.source.close();
     }
 }
+
+/**
+ * Whether two observations describe the same bytes.
+ *
+ * A request that captured an observation is still current while the panel
+ * holds one equal to it. The panel can install a new observation object for
+ * bytes it already holds: a refresh that finds the file as it was commits a
+ * stage with the same digest and installs its candidate's observation, so
+ * comparing by identity would call an unchanged file changed.
+ *
+ * `xlsxStructure` is compared by presence. Its content is derived from the
+ * bytes `digest` covers, so equal digests give equal scans; but it is taken
+ * only while structural editing is enabled, so a source rebuilt after that
+ * setting changed can differ in having one, and is then not the same.
+ */
+export function same_physical_observation(
+    left: PhysicalSourceObservation | undefined,
+    right: PhysicalSourceObservation | undefined,
+): boolean {
+    if (left === right) return true;
+    if (left === undefined || right === undefined) return false;
+    return left.fingerprint === right.fingerprint
+        && left.digest === right.digest
+        && left.byteLength === right.byteLength
+        && left.verification === right.verification
+        && left.comparisonFingerprint === right.comparisonFingerprint
+        && left.comparisonDigest === right.comparisonDigest
+        && (left.xlsxStructure === undefined) === (right.xlsxStructure === undefined);
+}

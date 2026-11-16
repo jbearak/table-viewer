@@ -24,11 +24,31 @@ describe('what the desktop Edit menu says about undo', () => {
         });
     });
 
-    it('greys out with a plain label when there is nothing to walk back', () => {
+    it('reads plainly, and stays enabled, when there is nothing to walk back', () => {
+        // Enabled, so the press reaches the page: an empty stack that a replay
+        // in flight is about to fill, a barrier the page explains, and a copy
+        // of the stack that is one message behind all look like this here.
         expect(history_menu_item('undo', state({ undoAvailable: false }))).toEqual({
             label: 'Undo',
-            enabled: false,
+            enabled: true,
         });
+        // What a barrier posts: unavailable, with no label.
+        expect(history_menu_item('undo', state({ undoAvailable: false, undoLabel: undefined }))).toEqual({
+            label: 'Undo',
+            enabled: true,
+        });
+    });
+
+    it.each([
+        ['an empty stack on both sides', state({ undoAvailable: false, undoLabel: undefined })],
+        ['a step to undo', state()],
+        ['a step on each side', state({ redoAvailable: true, redoLabel: 'Sort' })],
+        ['only a step to redo', state({ undoAvailable: false, undoLabel: undefined, redoAvailable: true, redoLabel: 'Sort' })],
+        ['a text field', state({ textEditing: true })],
+        ['a window that has not reported', undefined],
+    ])('enables both items with %s', (_name, reported) => {
+        expect(history_menu_item('undo', reported).enabled).toBe(true);
+        expect(history_menu_item('redo', reported).enabled).toBe(true);
     });
 
     it('leaves a text field to its own undo, whatever the workbook stack holds', () => {
@@ -57,10 +77,11 @@ describe('what the desktop Edit menu says about undo', () => {
         const both = state({ redoAvailable: true, redoLabel: 'Clear highlights' });
         expect(history_menu_item('redo', both).label).toBe('Redo Clear highlights');
         expect(history_menu_item('undo', both).label).toBe('Undo Paste');
-        // Each half also greys out on its own: the two stacks empty at different
-        // times, and after one undo of a single gesture they are exact opposites.
+        // Each half also reads plainly on its own: the two stacks empty at
+        // different times, and after one undo of a single gesture they are
+        // exact opposites.
         const undone = state({ undoAvailable: false, redoAvailable: true, redoLabel: 'Paste' });
-        expect(history_menu_item('undo', undone)).toEqual({ label: 'Undo', enabled: false });
+        expect(history_menu_item('undo', undone)).toEqual({ label: 'Undo', enabled: true });
         expect(history_menu_item('redo', undone)).toEqual({ label: 'Redo Paste', enabled: true });
     });
 });

@@ -474,21 +474,26 @@ describe('build_commit_request', () => {
 
 describe('refusal vocabularies', () => {
     it('maps every prepare refusal the host can send', () => {
-        expect(prepare_refusal_reason('busy')).toBe('busy');
+        // The host's `busy` is never this window's own replay, which the
+        // coordinator's one slot keeps from being sent.
+        expect(prepare_refusal_reason('busy')).toBe('host-busy');
         expect(prepare_refusal_reason('conflict')).toBe('conflict');
         expect(prepare_refusal_reason('malformed')).toBe('malformed');
         expect(prepare_refusal_reason('unavailable')).toBe('unavailable');
         expect(prepare_refusal_reason('edit-session-unavailable')).toBe('unavailable');
-        expect(prepare_refusal_reason('document-changed')).toBe('document-changed');
+        // Preparation only reads and compares: tried again.
+        expect(prepare_refusal_reason('document-changed')).toBe('not-current');
     });
 
-    it('maps every commit refusal, reading an expired lease as a moved document', () => {
+    it('maps every commit refusal, reading an expired lease as a view that moved before the write', () => {
         expect(commit_refusal_reason('conflict')).toBe('conflict');
         expect(commit_refusal_reason('malformed')).toBe('malformed');
         expect(commit_refusal_reason('proposal-mismatch')).toBe('malformed');
         expect(commit_refusal_reason('unavailable')).toBe('unavailable');
-        expect(commit_refusal_reason('expired')).toBe('document-changed');
-        expect(commit_refusal_reason('document-changed')).toBe('document-changed');
+        expect(commit_refusal_reason('expired')).toBe('not-current');
+        expect(commit_refusal_reason('document-changed')).toBe('not-current');
+        // The write landed and the view moved afterwards: said, not tried again.
+        expect(commit_refusal_reason('changed-after-write')).toBe('document-changed');
     });
 });
 

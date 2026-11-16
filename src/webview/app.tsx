@@ -224,6 +224,7 @@ import {
     create_history_replay_coordinator,
     type AcceptedReplay,
     type HistoryReplayCoordinator,
+    type ReplayOutcome,
 } from './history-replay-coordinator';
 import {
     COLUMN_WRITE_REFUSED_MESSAGE,
@@ -233,6 +234,9 @@ import {
     SIZE_WRITE_UNRESOLVED_MESSAGE,
     UNRESOLVED_SAVE_SIZE_REASON,
     VIEW_GESTURE_WAIT_MESSAGE,
+    history_gesture_unrecorded_warning,
+    history_session_unavailable_warning,
+    history_unanswered_warning,
     header_wait_warning,
     history_refusal_warning,
     replayed_verb,
@@ -243,6 +247,17 @@ import {
     view_skip_warning,
     type ViewReplayWait,
 } from './history-command-model';
+import {
+    HISTORY_PRESS_HOLD_MS,
+    history_message_is_repeat,
+    history_press_bound_reached,
+    history_press_gate,
+    press_admits_ticket,
+    view_step_press_gate,
+    type HistoryPress,
+    type HistoryPressFacts,
+    type HistoryPressWait,
+} from './history-press-model';
 import {
     auto_fit_after_width_replay,
     column_widths_label,
@@ -296,6 +311,7 @@ import {
     retained_pending_row_authorities,
     is_structural_history_change,
     retained_saved_append_authorities,
+    type HistoryBarrier,
     type HistoryEntry,
     type SavedHistoryCell,
 } from './history-stack-model';
@@ -303,7 +319,10 @@ import {
     plan_pending_row_history_replay,
     type PendingRowHistoryPlan,
 } from './pending-row-history';
-import type { HistoryReplayCommitted } from '../history-replay-protocol';
+import {
+    HISTORY_REPLAY_LEASE_TTL_MS,
+    type HistoryReplayCommitted,
+} from '../history-replay-protocol';
 import { pending_signal, type PendingSignal } from './pending-signal';
 import { run_discard_transaction } from './discard-transaction-model';
 import { highlight_history_source } from './highlight-capture-model';
@@ -381,18 +400,65 @@ type ColumnVisibilityUpdater = (
  */
 type TransformOrigin = 'grid' | 'toolbar' | 'restore' | 'history';
 
-/**
- * How long a view step's replay waits, saying nothing, for this window's
- * editing session to finish leaving before it gives up with a message.
- */
-const SESSION_RELEASE_WAIT_MS = 5_000;
-
 /** A view step's replay in flight: the entry it moves when the host answers. */
 interface ViewReplay {
     readonly entry: HistoryEntry;
     readonly direction: HistoryDirection;
     /** Why parts of the step were left out, for the message once it lands. */
     readonly skipped: readonly ViewSkipReason[];
+    /**
+     * The press this replay carries out, and how many snapshots the window
+     * had applied when its request was posted. A replay the host refused
+     * because a refresh was in transit is tried again for the same press,
+     * once a snapshot applied since then says the refresh has arrived.
+     */
+    readonly press: HistoryPress;
+    readonly posted_after: number;
+}
+
+/**
+ * A press of Undo or Redo that is waiting: for something this window started
+ * to clear (`wait`), for what a view step's own replay found in its way
+ * (`step_wait`), or for keys typed at a cell to reach their editor (`typing`).
+ */
+interface HeldPress {
+    readonly press: HistoryPress;
+    readonly wait: HistoryPressWait;
+    /**
+     * What `replay_view_step` found pending for the step it resolved: a
+     * request on that worksheet (a saved view being re-installed), or no
+     * snapshot identity yet. The drain does not attempt the press again
+     * until it is gone.
+     */
+    readonly step_wait?: { readonly sheet: number } | 'identity';
+    /** Held for typed keys, not for the window: reserves nothing. */
+    readonly typing?: true;
+}
+
+/**
+ * A press whose replay a refresh overtook, waiting to be tried again. In its
+ * own slot, so a press made meanwhile is held behind it and never replaces it.
+ */
+interface RetryPress {
+    readonly press: HistoryPress;
+    /** The entry the refused replay was for. The retry runs only if it is still on top. */
+    readonly entry: HistoryEntry;
+    /** The count `awaits` names, as it was when the refused request was posted. */
+    readonly posted_after: number;
+    /**
+     * What says the refresh it lost to has arrived. A view replay: a snapshot
+     * this window applied since its post (`applied_snapshot_seq_ref`). A cell
+     * or structural replay: any delivery this window acknowledged since its
+     * preparation was posted (`snapshot_applied_seq_ref`), applied or not, and
+     * it waits for one within the bound. The host refused it because its view
+     * had moved past what this window had acknowledged, so a delivery is on
+     * its way; the refusal can arrive first (a refresh that cancelled the
+     * lease is still building its snapshot), and a delivery this window
+     * acknowledges without applying (stale or a duplicate) makes the host's
+     * view current again all the same.
+     */
+    readonly awaits: 'applied' | 'delivery';
+    readonly step_wait?: { readonly sheet: number } | 'identity';
 }
 
 /**
@@ -579,8 +645,6 @@ interface HeaderRun {
     readonly replay?: ViewReplay;
     /** The worksheet a replay's messages name. */
     readonly worksheet?: WorksheetTarget;
-    /** Replay only: an Undo or Redo pressed while it ran, carried out after it. */
-    then?: HistoryDirection;
     /** What the host says each settled request changed, one per worksheet. */
     readonly changes: HeaderViewDelta[];
     /** Replay only: how many of its requests the host committed. */
@@ -595,8 +659,6 @@ interface HeaderRun {
         | { readonly reason: string }
         | { readonly wait: ViewReplayWait }
         | { readonly silent: true };
-    /** The delivery id of the snapshot that carried the last result this run received. */
-    last_delivery?: number;
 }
 
 /** Where the queued sheet is now, or -1 once it is gone. */
@@ -650,6 +712,13 @@ interface ExcelHeaderQueue {
     readonly ack_wait_started?: number;
     /** Set for a header step's replay: what the disabled controls say meanwhile. */
     readonly replay?: HistoryDirection;
+    /**
+     * The gesture's ticket (`gesture_ticket`), taken when it was queued. The
+     * drain's fold of the open editor shows it at the edit gate: a press of
+     * Undo or Redo made after the gesture is held behind it, and must not
+     * refuse the fold that the gesture was asked for before it.
+     */
+    readonly ticket: number;
 }
 
 /** How long a header change waits for the host to acknowledge the session's publications. */
@@ -1079,6 +1148,10 @@ export function App(): React.JSX.Element {
     // place. A transformed view still remounts because source adoption replaces
     // its display-row mapping before the transform is restored.
     const [grid_mount_epoch, set_grid_mount_epoch] = useState(0);
+    // Counts the grids mounted: one per active sheet and mount epoch. A
+    // gesture that waited compares it, to know its grid is still the one
+    // shown (a sheet left and returned to is a new grid).
+    const grid_instance_ref = useRef(0);
     const [active_sheet_index, set_active_sheet_index] = useState(0);
     // Read when a save captures the cursor, from callbacks that may be stale.
     const active_sheet_index_for_focus_ref = useRef(0);
@@ -1670,6 +1743,337 @@ export function App(): React.JSX.Element {
         host_bridge.postMessage({ type: 'showWarning', message });
     }, []);
 
+    // ---- A press of Undo or Redo that has to wait (see `history-press-model.ts`) ----
+    //
+    // Two slots. `held_press_ref` is the press waiting for something this
+    // window started to clear; `retry_press_ref` is a press whose replay a
+    // refresh overtook, waiting to be tried again. Every reader (the gate,
+    // `press_admits`, the grid's `history_press_held`) reads the slots when it
+    // is asked, so nothing has to be kept in step with them.
+    const held_press_ref = useRef<HeldPress | null>(null);
+    const retry_press_ref = useRef<RetryPress | null>(null);
+    /** Numbers the presses. A gesture that will finish later takes its value as a ticket. */
+    const press_epoch_ref = useRef(0);
+    // The first ticket of the document now under the history. A ticket below
+    // it was taken in a document that has since been replaced: whatever that
+    // gesture does when it ends is not about a press made in this one.
+    const document_ticket_floor_ref = useRef(0);
+    /**
+     * The ticket of the work that is asking a gesture gate right now, set for
+     * the length of one synchronous call (`with_gesture_ticket`). Work made
+     * before a waiting press carries a ticket lower than the press's epoch,
+     * and is admitted; with none set, nothing is.
+     */
+    const ambient_ticket_ref = useRef<number | undefined>(undefined);
+    /**
+     * How many snapshots this window has applied. Not `snapshot_applied_seq_ref`,
+     * which also counts a delivery that was acknowledged and not applied: only
+     * an applied snapshot ends the wait for a session to finish going, and only
+     * one says the refresh a view replay lost to has arrived. (A cell or
+     * structural replay's retry counts every acknowledged delivery instead:
+     * see `RetryPress.awaits`.)
+     */
+    const applied_snapshot_seq_ref = useRef(0);
+    /** Set while the drain attempts the retry, so a hold it meets is written back to the retry's slot. */
+    const attempting_retry_ref = useRef<RetryPress | null>(null);
+    const draining_history_press_ref = useRef(false);
+    const history_press_timer_ref = useRef<number | undefined>(undefined);
+    /**
+     * `snapshot_applied_seq_ref` (every delivery acknowledged, applied or not)
+     * as it was when the coordinator last posted a preparation.
+     */
+    const replay_posted_after_ref = useRef(0);
+    /**
+     * Row and column admissions the host has granted and the grid has not
+     * finished installing. The request is forgotten when its answer arrives,
+     * and the grid installs the rows in a continuation; a press held behind
+     * the admission waits for that too.
+     */
+    const unsettled_admissions_ref = useRef(new Set<string>());
+    /** Row-height and width replays being watched for an answer, by request. */
+    const view_replay_watch_ref = useRef(new Map<string, number>());
+    // When each sentence about Undo or Redo was last said.
+    const history_messages_said_ref = useRef(new Map<string, number>());
+    // Bumped to render, and so to drain, when what a waiting press waits for
+    // may have cleared without any other state changing.
+    const [, set_history_press_tick] = useState(0);
+
+    /**
+     * Say something about an Undo or a Redo. The same sentence is not said
+     * twice within two seconds: a key held down against something that does
+     * not clear would otherwise put up one dialog per repeat. A deliberate
+     * second press, later, is told again. Each sentence is remembered on its
+     * own, so another said in between does not make a repeat new: a second
+     * press that ends with the same sentence within two seconds, even with
+     * another between, is not told again (a press refused at once, with the
+     * key held down, would otherwise put up a box per repeat). `force` says
+     * it regardless, for the one answer whose press is not a repeat of the
+     * last (a press dropped behind a gesture): it is still remembered.
+     */
+    const say_history = useCallback((message: string, force = false) => {
+        const now = Date.now();
+        const said = history_messages_said_ref.current;
+        const at = said.get(message);
+        if (!force && history_message_is_repeat(at === undefined ? null : { message, at }, message, now)) return;
+        for (const [other, other_at] of said) {
+            if (!history_message_is_repeat({ message: other, at: other_at }, other, now)) said.delete(other);
+        }
+        said.set(message, now);
+        host_bridge.postMessage({ type: 'showWarning', message });
+    }, []);
+
+    /**
+     * One timer for both slots, at the earlier of their two bounds. It forces
+     * a render, and the drain that follows ends the press with its message.
+     * So a wake that is missed costs a late answer and never a lost press.
+     */
+    const arm_history_press_timer = useCallback(() => {
+        window.clearTimeout(history_press_timer_ref.current);
+        history_press_timer_ref.current = undefined;
+        const starts = [held_press_ref.current?.press.started, retry_press_ref.current?.press.started]
+            .filter((started): started is number => started !== undefined);
+        if (starts.length === 0) return;
+        const due = Math.min(...starts) + HISTORY_PRESS_HOLD_MS - Date.now();
+        history_press_timer_ref.current = window.setTimeout(() => {
+            history_press_timer_ref.current = undefined;
+            set_history_press_tick((tick) => tick + 1);
+        }, Math.max(0, due));
+    }, []);
+
+    /**
+     * Render, so that the drain asks again, because something a waiting press
+     * may be waiting for has ended. Nothing when no press waits. The drain's
+     * own bookkeeping does not wake it: what it writes it has just read.
+     */
+    const wake_history_press = useCallback(() => {
+        if (draining_history_press_ref.current) return;
+        if (held_press_ref.current === null && retry_press_ref.current === null) return;
+        set_history_press_tick((tick) => tick + 1);
+    }, []);
+
+    /**
+     * The ticket a gesture takes when it is made, to show at the gate when it
+     * finishes. A gesture started inside the continuation of another (an
+     * append a held key's session grant runs) is part of that one, and takes
+     * its ticket.
+     */
+    const gesture_ticket = useCallback(
+        (): number => ambient_ticket_ref.current ?? press_epoch_ref.current,
+        [],
+    );
+    /** Run `run` as the work that took `ticket`. Synchronous: an await inside is outside. */
+    const with_gesture_ticket = useCallback(<T,>(ticket: number, run: () => T): T => {
+        const outer = ambient_ticket_ref.current;
+        ambient_ticket_ref.current = ticket;
+        try {
+            return run();
+        } finally {
+            ambient_ticket_ref.current = outer;
+        }
+    }, []);
+    /**
+     * Whether what is asking may be recorded although a press may be waiting:
+     * no press waits (a typing hold reserves nothing), or the work that asks
+     * was made before every press that does.
+     */
+    const press_admits = useCallback((): boolean => {
+        const held = held_press_ref.current;
+        return press_admits_ticket({
+            held_epoch: held === null || held.typing === true ? undefined : held.press.epoch,
+            retry_epoch: retry_press_ref.current?.press.epoch,
+            ticket: ambient_ticket_ref.current,
+        });
+    }, []);
+    /** Whether a press is waiting that a new gesture must not get under. */
+    const history_press_held = useCallback((): boolean => {
+        const held = held_press_ref.current;
+        return (held !== null && held.typing !== true) || retry_press_ref.current !== null;
+    }, []);
+
+    /**
+     * Hold a press. The one writer of either slot for a press that waits, and
+     * the one place the bound is enforced: a press already at its bound is
+     * not held, it says why it did not run.
+     *
+     * While the drain is attempting the retry, a hold belongs to the retry and
+     * goes back to its slot, never to the held one, which may hold the press
+     * waiting behind it.
+     */
+    const hold_history_press = useCallback((
+        press: HistoryPress,
+        wait: HistoryPressWait,
+        options: { readonly step_wait?: HeldPress['step_wait']; readonly typing?: true } = {},
+    ) => {
+        const retry = attempting_retry_ref.current;
+        if (history_press_bound_reached(press, Date.now())) {
+            if (retry !== null && retry_press_ref.current === retry) {
+                // The retry's attempt is ended by its bound: the press behind
+                // it was for the stack as the retry would have left it. Keys
+                // on their way to an editor are not that press: they keep
+                // their hold, and its own bound answers it.
+                retry_press_ref.current = null;
+                if (held_press_ref.current?.typing !== true) held_press_ref.current = null;
+            }
+            say_history(view_replay_wait_warning(wait, press.direction));
+            arm_history_press_timer();
+            return;
+        }
+        const waiting: HistoryPress = wait === 'finishing' && press.release_seq === undefined
+            ? { ...press, release_seq: applied_snapshot_seq_ref.current }
+            : press;
+        if (retry !== null && retry_press_ref.current === retry) {
+            retry_press_ref.current = {
+                press: waiting,
+                entry: retry.entry,
+                posted_after: retry.posted_after,
+                awaits: retry.awaits,
+                ...(options.step_wait === undefined ? {} : { step_wait: options.step_wait }),
+            };
+            arm_history_press_timer();
+            return;
+        }
+        const other = held_press_ref.current;
+        if (other !== null && other.press.epoch !== press.epoch) {
+            // An attempt already under way has to wait again, and a press made
+            // meanwhile is waiting behind it. The same direction is the same
+            // request, and the earlier press stands for both; the other
+            // direction cancels it, as it would have had this press still been
+            // waiting when it was made.
+            if (other.press.direction !== press.direction) {
+                held_press_ref.current = null;
+                arm_history_press_timer();
+                return;
+            }
+            // Not reached today (a press is not made while one is held, and the
+            // drain empties the slot before it attempts), kept so the older
+            // press always stands for both.
+            if (other.press.epoch < press.epoch) return;
+        }
+        held_press_ref.current = {
+            press: waiting,
+            wait,
+            ...(options.step_wait === undefined ? {} : { step_wait: options.step_wait }),
+            ...(options.typing === true ? { typing: true as const } : {}),
+        };
+        arm_history_press_timer();
+    }, [arm_history_press_timer, say_history]);
+
+    /**
+     * Watch a row-height or width replay for an answer. Neither is sure to
+     * draw anything while it is out, so one the host never answers would be a
+     * press that changed nothing and said nothing. After as long as a lease
+     * lasts the press says so, once; the request stays pending, so a late
+     * answer still settles it.
+     */
+    const watch_view_replay = useCallback((key: string, direction: HistoryDirection) => {
+        window.clearTimeout(view_replay_watch_ref.current.get(key));
+        view_replay_watch_ref.current.set(key, window.setTimeout(() => {
+            view_replay_watch_ref.current.delete(key);
+            say_history(history_unanswered_warning(direction));
+        }, HISTORY_REPLAY_LEASE_TTL_MS));
+    }, [say_history]);
+    /** The watched request was answered, overtaken, or abandoned. All of them, with no key. */
+    const unwatch_view_replay = useCallback((key?: string) => {
+        const watches = view_replay_watch_ref.current;
+        if (key === undefined) {
+            for (const timer of watches.values()) window.clearTimeout(timer);
+            watches.clear();
+            return;
+        }
+        window.clearTimeout(watches.get(key));
+        watches.delete(key);
+    }, []);
+
+    /**
+     * A key, a double click, or a Save the grid refused because a press of
+     * Undo or Redo is waiting. Through `say_history`, because a key repeats.
+     */
+    const say_history_hold_gesture = useCallback(() => {
+        say_history(VIEW_GESTURE_WAIT_MESSAGE);
+    }, [say_history]);
+
+    /**
+     * Drop every waiting press and say nothing: the document was replaced, or
+     * the person cancelled. A Cancel keeps a press held for typed keys: those
+     * keys are on their way to an editor, not waiting for what was cancelled.
+     */
+    const drop_history_presses = useCallback((options: { readonly keep_typing?: boolean } = {}) => {
+        if (held_press_ref.current === null && retry_press_ref.current === null) return;
+        if (!(options.keep_typing === true && held_press_ref.current?.typing === true)) {
+            held_press_ref.current = null;
+        }
+        retry_press_ref.current = null;
+        arm_history_press_timer();
+    }, [arm_history_press_timer]);
+
+    /**
+     * A replay did not run, or did not finish, and the person is told why.
+     * The press waiting behind it is dropped: it was for the stack as that
+     * replay would have left it.
+     */
+    const refuse_history_press = useCallback((message: string | null) => {
+        if (message !== null) say_history(message);
+        if (held_press_ref.current !== null && held_press_ref.current.typing !== true) {
+            held_press_ref.current = null;
+            arm_history_press_timer();
+        }
+    }, [arm_history_press_timer, say_history]);
+
+    /**
+     * A gesture of the person's own, made before the held press, ended
+     * without recording a step. The press was made for that step and would
+     * otherwise undo the one under it, so it is not carried out (as with
+     * Cancel). Unlike a Cancel the person did not ask for that, so it is said:
+     * in a microtask, after whatever the gesture says of itself in the same
+     * task, and for every press dropped. A refusal that says why must say it
+     * in the task that drops the press (each does today): one said after an
+     * await would come after this sentence instead of before it. The repeat rule
+     * is for a key held against a hold that does not clear; a dropped press
+     * empties the slot, so the next one is a new press with its own hold.
+     */
+    const drop_press_behind_unrecorded_gesture = useCallback(() => {
+        const held = held_press_ref.current;
+        if (held === null || held.typing === true) return;
+        refuse_history_press(null);
+        const message = history_gesture_unrecorded_warning(held.press.direction);
+        queueMicrotask(() => say_history(message, true));
+    }, [refuse_history_press, say_history]);
+
+    /**
+     * A gesture of the person's own ended in the grid without recording
+     * anything (its session refused, its view moved, refused when it ran).
+     * A press held behind it was made after it, for its step; it is dropped
+     * rather than undo the step under it (as with Cancel). Only for a gesture
+     * made before the press: one made after it, refused because of it, says
+     * nothing about it.
+     */
+    const drop_press_for_unrecorded_gesture = useCallback((ticket: number | undefined) => {
+        const held = held_press_ref.current;
+        if (held === null || held.typing === true) return;
+        if (ticket === undefined || ticket >= held.press.epoch) return;
+        // Made in a document that has since been replaced.
+        if (ticket < document_ticket_floor_ref.current) return;
+        drop_press_behind_unrecorded_gesture();
+    }, [drop_press_behind_unrecorded_gesture]);
+
+    /**
+     * A replay ended because the host's view had moved under it and the host
+     * wrote nothing. The site only hands the press over. Whether the refresh
+     * it lost to is already here, which decides between trying again and
+     * saying so, is the drain's to read: the sites inside the snapshot
+     * handler run before that handler has counted its own snapshot.
+     */
+    const hand_over_history_retry = useCallback((
+        press: HistoryPress,
+        entry: HistoryEntry,
+        posted_after: number,
+        awaits: RetryPress['awaits'] = 'applied',
+    ) => {
+        retry_press_ref.current = { press, entry, posted_after, awaits };
+        arm_history_press_timer();
+        wake_history_press();
+    }, [arm_history_press_timer, wake_history_press]);
+
     /**
      * Fold the open cell editor before a view request is posted.
      *
@@ -1685,10 +2089,14 @@ export function App(): React.JSX.Element {
      * `'refused'` has said why; the draft stays open and nothing is posted.
      * `'folded'` committed an edit, which recorded a step.
      */
-    const fold_before_view_request = useCallback((): 'refused' | 'folded' | 'nothing' => {
+    const fold_before_view_request = useCallback((
+        // How to say a fold that would not commit. A press of Undo or Redo
+        // says it through `say_history`, so a held key puts up one box.
+        say: (message: string) => void = show_warning,
+    ): 'refused' | 'folded' | 'nothing' => {
         const before = history_store_ref.current!.snapshot();
         if (editing_ref.current?.commit_live_edit({ fenced_empty_ok: true }) === false) {
-            show_warning(FOLD_REFUSED_MESSAGE);
+            say(FOLD_REFUSED_MESSAGE);
             return 'refused';
         }
         return history_store_ref.current!.snapshot() === before ? 'nothing' : 'folded';
@@ -1733,10 +2141,7 @@ export function App(): React.JSX.Element {
         if (move.outcome.kind === 'dropped') {
             // History was cleared or cut off behind a barrier during the round
             // trip. The view change stands; it has no entry any more.
-            host_bridge.postMessage({
-                type: 'showWarning',
-                message: view_replay_dropped_warning(replay.direction),
-            });
+            say_history(view_replay_dropped_warning(replay.direction));
             return false;
         }
         if (replay.skipped.length > 0) {
@@ -1746,18 +2151,12 @@ export function App(): React.JSX.Element {
             const sheet_name = sheets.length > 1
                 ? (index === undefined ? undefined : sheets[index]?.name) ?? worksheet.sheetName
                 : undefined;
-            host_bridge.postMessage({
-                type: 'showWarning',
-                message: view_skip_warning(replay.direction, label, replay.skipped, whole, sheet_name),
-            });
+            say_history(view_skip_warning(replay.direction, label, replay.skipped, whole, sheet_name));
         } else if (partly) {
-            host_bridge.postMessage({
-                type: 'showWarning',
-                message: view_partly_applied_warning(replay.direction, label),
-            });
+            say_history(view_partly_applied_warning(replay.direction, label));
         }
         return true;
-    }, []);
+    }, [say_history]);
 
     /**
      * Settle a column visibility write.
@@ -1795,6 +2194,10 @@ export function App(): React.JSX.Element {
                     hidden_source_columns(pending.before, sheet.columnCount),
                     hidden_source_columns(pending.after, sheet.columnCount),
                 ));
+            } else {
+                // Its worksheet is gone: nothing recorded for the person's
+                // own gesture, and a press held behind it was for its step.
+                drop_press_behind_unrecorded_gesture();
             }
             return;
         }
@@ -1808,14 +2211,19 @@ export function App(): React.JSX.Element {
             set_column_visibility(restored);
         }
         if (pending.replay !== undefined) {
-            host_bridge.postMessage({
-                type: 'showWarning',
-                message: view_replay_wait_warning('refreshing', pending.replay.direction),
-            });
-        } else if (by === 'answer') {
-            host_bridge.postMessage({ type: 'showWarning', message: COLUMN_WRITE_REFUSED_MESSAGE });
+            // The write was composed against a snapshot the host had already
+            // replaced. Tried again once that refresh is here, or said.
+            hand_over_history_retry(pending.replay.press, pending.replay.entry, pending.replay.posted_after);
+        } else {
+            if (by === 'answer') {
+                host_bridge.postMessage({ type: 'showWarning', message: COLUMN_WRITE_REFUSED_MESSAGE });
+            }
+            // The person's own gesture was refused, or a refresh does not show
+            // it: nothing was recorded. A press held behind it was for its
+            // step, and would otherwise undo the one under it (as with Cancel).
+            drop_press_behind_unrecorded_gesture();
         }
-    }, [land_view_replay, record_view_step]);
+    }, [drop_press_behind_unrecorded_gesture, hand_over_history_retry, land_view_replay, record_view_step]);
 
     /** `settle_width_write`, which is declared with the width gestures further down. */
     const settle_width_write_ref = useRef<(
@@ -1872,8 +2280,9 @@ export function App(): React.JSX.Element {
                 && transform_schema_for_sheet(sheet) === pending.schema;
             if (pending.replay !== undefined) {
                 if (sheet === undefined) {
-                    const gone = history_refusal_warning('unavailable', pending.replay.direction, undefined);
-                    if (gone !== null) host_bridge.postMessage({ type: 'showWarning', message: gone });
+                    refuse_history_press(
+                        history_refusal_warning('unavailable', pending.replay.direction, undefined),
+                    );
                 } else if (
                     same_columns
                     && pending.target !== undefined
@@ -1881,30 +2290,37 @@ export function App(): React.JSX.Element {
                 ) {
                     land_view_replay(pending.replay, pending.worksheet, false);
                 } else {
-                    host_bridge.postMessage({
-                        type: 'showWarning',
-                        message: view_replay_wait_warning('refreshing', pending.replay.direction),
-                    });
+                    hand_over_history_retry(
+                        pending.replay.press,
+                        pending.replay.entry,
+                        pending.replay.posted_after,
+                    );
                 }
                 continue;
             }
-            if (
-                sheet === undefined
+            const step = sheet === undefined
                 || index === undefined
                 || pending.target === undefined
                 || !same_columns
-            ) continue;
-            record_view_step(overtaken_transform_step(
-                {
-                    sheetIndex: index,
-                    sheetName: sheet.name,
-                    ...(sheet.worksheetId === undefined ? {} : { worksheetId: sheet.worksheetId }),
-                },
-                pending.schema,
-                pending.baseline,
-                pending.target,
-                adopted,
-            ));
+                ? undefined
+                : overtaken_transform_step(
+                    {
+                        sheetIndex: index,
+                        sheetName: sheet.name,
+                        ...(sheet.worksheetId === undefined ? {} : { worksheetId: sheet.worksheetId }),
+                    },
+                    pending.schema,
+                    pending.baseline,
+                    pending.target,
+                    adopted,
+                );
+            if (step === undefined) {
+                // Nothing recorded for the person's own gesture: a press held behind it
+                // was for its step, and would otherwise undo the one under it (as with Cancel).
+                drop_press_behind_unrecorded_gesture();
+                continue;
+            }
+            record_view_step(step);
         }
         if (column !== null) {
             const index = worksheet_target_index(sheets, column.worksheet);
@@ -1924,7 +2340,7 @@ export function App(): React.JSX.Element {
         if (width !== null) settle_width_write_ref.current(width, { kind: 'overtaken' });
         // A settled replay renders nothing; a queued header change waits on it.
         wake_header_drain();
-    }, [land_view_replay, record_view_step, settle_column_write]);
+    }, [drop_press_behind_unrecorded_gesture, land_view_replay, record_view_step, refuse_history_press, settle_column_write]);
 
     /**
      * The one outstanding replay, if any.
@@ -1999,7 +2415,15 @@ export function App(): React.JSX.Element {
                     ? planned.plans
                     : undefined;
             },
-            post: (message) => { host_bridge.postMessage(message); },
+            post: (message) => {
+                // What a refused preparation or commit is measured against:
+                // a delivery acknowledged since this post (applied or not)
+                // is the refresh it lost to (`RetryPress.awaits`).
+                if (message.type === 'prepareHistoryReplay') {
+                    replay_posted_after_ref.current = snapshot_applied_seq_ref.current;
+                }
+                host_bridge.postMessage(message);
+            },
             next_id: (prefix) => `${prefix}-${++replay_id_counter_ref.current}`,
         });
     }
@@ -2167,11 +2591,13 @@ export function App(): React.JSX.Element {
             edit_session_registry_ref.current?.retire_parked();
         }
         if (previous !== next) append_composer_drafts_ref.current.clear();
+        // Admissions belong to the session that asked for them.
+        if (previous !== next) unsettled_admissions_ref.current.clear();
         csv_edit_session_id_ref.current = next;
         set_csv_edit_session_id_state(next);
-        // A view replay waiting for the outgoing session to be gone.
-        if (previous !== next) view_replay_wait_ref.current?.finish(true);
-    }, []);
+        // A press waiting for the outgoing session to be gone.
+        if (previous !== next) wake_history_press();
+    }, [wake_history_press]);
     // The Save-refusal notice's input: an `.xlsx` conditional-formatting
     // element or data-validation rule on this worksheet that the current
     // layouts would split past the writer's cap, counted with the writer's
@@ -2240,7 +2666,11 @@ export function App(): React.JSX.Element {
      * nothing else.
      */
     const [, set_header_drain_tick] = useState(0);
-    const wake_header_drain = useCallback(() => set_header_drain_tick((tick) => tick + 1), []);
+    const wake_header_drain = useCallback(() => {
+        set_header_drain_tick((tick) => tick + 1);
+        // Whatever a header change waits for, a held press may wait for too.
+        wake_history_press();
+    }, [wake_history_press]);
     const [filter_editor, set_filter_editor] = useState<{
         column_index: number;
         anchor: { left: number; top: number };
@@ -2533,24 +2963,6 @@ export function App(): React.JSX.Element {
     const pending_excel_header_ref = useRef<string | null>(null);
     /** The header queue's run in progress; see `HeaderRun` and `end_header_run`. */
     const header_run_ref = useRef<HeaderRun | null>(null);
-    /**
-     * A press remembered during a header step's replay, between that replay
-     * moving its entry and the effect that carries the press out. The header
-     * fence stays up for as long as this is set, so nothing can be recorded
-     * and no other history command can run in between.
-     */
-    const header_handoff_ref = useRef<{
-        readonly direction: HistoryDirection;
-        readonly delivery: number;
-    } | null>(null);
-    const [header_handoff_tick, set_header_handoff_tick] = useState(0);
-    /**
-     * The delivery id of the last snapshot whose `meta` this window adopted.
-     * Written where the snapshot handler adopts it, which is after every
-     * early return of that handler; `last_applied_snapshot_ref` is written
-     * before them and so cannot say a snapshot was installed.
-     */
-    const installed_snapshot_delivery_ref = useRef<number | null>(null);
     // The header fence (see `lower_header_fence`): raised by the gesture that
     // asks for a Header Row change, lowered by its last result. A ref for the
     // gesture gates, which read it synchronously; the state re-renders.
@@ -2640,6 +3052,49 @@ export function App(): React.JSX.Element {
     const processed_save_receipts_ref = useRef(new Set<string>());
     const meta_ref = useRef<WorkbookMeta | null>(null);
     const pending_transform_request_ids_ref = useRef<(string | undefined)[]>([]);
+    // Settled each time a transform of this window is answered or dropped, for a
+    // replay that has to wait for every one of them before it asks for a session.
+    const transform_settled_ref = useRef<PendingSignal<void> | null>(null);
+    // Replays in `ensure_replay_session` waiting for those transforms.
+    const replay_waiting_for_transforms_ref = useRef(0);
+    const notify_transform_settled = useCallback(() => {
+        const settled = transform_settled_ref.current;
+        transform_settled_ref.current = null;
+        settled?.settle();
+    }, []);
+    /**
+     * One step of waiting until no transform of this window that `which`
+     * names is pending: the host starts no editing session while one
+     * installs. `'clear'`, said synchronously, means none is pending now, so
+     * a caller that posts its request in the same step cannot be overtaken
+     * by one; `'past-bound'` means the bound has passed and the request goes
+     * to the host, which answers as it would have. Otherwise it waits for the
+     * next transform to settle (or the bound) and says whether the document
+     * was replaced meanwhile; the caller asks again.
+     */
+    const next_window_transform_wait = useCallback((
+        which: (sheet_index: number) => boolean,
+        deadline: number,
+        document: number,
+    ): 'clear' | 'past-bound' | Promise<'again' | 'replaced'> => {
+        const pending = pending_transform_request_ids_ref.current
+            .some((id, sheet_index) => id !== undefined && which(sheet_index));
+        if (!pending) return 'clear';
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) return 'past-bound';
+        const settled = transform_settled_ref.current ?? pending_signal<void>();
+        transform_settled_ref.current = settled;
+        return (async () => {
+            let timer: number | undefined;
+            await Promise.race([
+                settled.settled,
+                new Promise<void>((resolve) => { timer = window.setTimeout(resolve, remaining); }),
+            ]);
+            window.clearTimeout(timer);
+            return history_document_ref.current !== document ? 'replaced' : 'again';
+        })();
+    }, []);
+
     const pending_transform_states_ref = useRef<(SheetTransformState | undefined)[]>([]);
     const pending_transform_origins_ref = useRef<(TransformOrigin | undefined)[]>([]);
     /**
@@ -2651,14 +3106,19 @@ export function App(): React.JSX.Element {
     const pending_view_transforms_ref = useRef<(PendingViewTransform | undefined)[]>([]);
     const pending_column_write_ref = useRef<PendingColumnWrite | null>(null);
     const pending_width_write_ref = useRef<PendingWidthWrite | null>(null);
-    /** A view replay holding its turn while this window's editing session is on its way out. */
-    const view_replay_wait_ref = useRef<{ readonly finish: (go: boolean) => void } | null>(null);
     /**
      * Whether a view request of this window is pending: the refs above and
      * the row-height requests a person made or a replay posted, read into
      * state so the grid stops offering an editor meanwhile. Never set on its
      * own; `sync_view_request_pending` is called at every site that sets or
      * clears one of them, so no exit can leave it up.
+     *
+     * A press of Undo or Redo that is waiting is not one, and is not shown
+     * to the grid as one. The header queue's drain waits on this, and must
+     * never wait on a held press; and the grid turns it into cells that
+     * accept no edit, which the work a press waits for needs them to accept
+     * (a claim resolves once the grid has rendered editable). A hold shown
+     * as a view request would wait for the claim that waits for it.
      */
     const [view_request_pending, set_view_request_pending] = useState(false);
     const view_request_is_pending = useCallback((): boolean => {
@@ -2666,7 +3126,6 @@ export function App(): React.JSX.Element {
             pending_view_transforms_ref.current.some((pending) => pending !== undefined)
             || pending_column_write_ref.current !== null
             || pending_width_write_ref.current !== null
-            || view_replay_wait_ref.current !== null
         ) return true;
         // A row resize, reset, or row-height replay. The row a committed
         // edit grows is not one: it holds the edit gate, as it always has,
@@ -2678,7 +3137,10 @@ export function App(): React.JSX.Element {
     }, []);
     const sync_view_request_pending = useCallback(() => {
         set_view_request_pending(view_request_is_pending());
-    }, [view_request_is_pending]);
+        // A request that settled renders only when the boolean changes; a
+        // press held behind it is woken either way.
+        wake_history_press();
+    }, [view_request_is_pending, wake_history_press]);
     // Request-dedup bookkeeping, both of these, and deliberately *not* part of
     // `sheet_views`: they record what has already been asked of the host, which is a
     // different fact from what the host installed, and folding them into the view
@@ -3970,6 +4432,7 @@ export function App(): React.JSX.Element {
                 if (matching_request) {
                     pending_highlight_request_ref.current = null;
                     set_highlight_request_pending(false);
+                    wake_history_press();
                     if (!msg.error && msg.deltas !== undefined && pending_highlight !== null) {
                         if (pending_highlight.pendingGesture !== undefined) {
                             const committed = pending_highlight.pendingGesture.commit(
@@ -3984,12 +4447,16 @@ export function App(): React.JSX.Element {
                                     type: 'showWarning',
                                     message: 'The pending-row half of the highlight could not be applied.',
                                 });
+                                // Nothing recorded: a press held behind it was for its step.
+                                drop_press_behind_unrecorded_gesture();
                             }
                         } else {
                             record_highlight_gesture(msg.deltas, pending_highlight.label);
                         }
                     } else {
                         pending_highlight?.pendingGesture?.cancel();
+                        // Nothing recorded: a press held behind it was for its step.
+                        drop_press_behind_unrecorded_gesture();
                     }
                 }
                 if (msg.stateRevision < last_highlight_state_revision_ref.current) {
@@ -4014,6 +4481,8 @@ export function App(): React.JSX.Element {
                 if (msg.error) {
                     set_highlight_status(msg.error);
                     host_bridge.postMessage({ type: 'showWarning', message: msg.error });
+                    // (A press held behind this window's own request was
+                    // dropped above, where the request was matched.)
                 } else {
                     set_highlight_status(msg.requestId ? 'Cell highlights updated.' : 'Cell highlights refreshed.');
                 }
@@ -4026,6 +4495,7 @@ export function App(): React.JSX.Element {
                 const pending = pending_row_resize_requests_ref.current.get(msg.requestId);
                 if (pending !== undefined) {
                     pending_row_resize_requests_ref.current.delete(msg.requestId);
+                    unwatch_view_replay(msg.requestId);
                     sync_view_request_pending();
                 }
                 const applied = msg.applied
@@ -4067,27 +4537,29 @@ export function App(): React.JSX.Element {
                             true,
                         );
                     } else if (!msg.applied && msg.refused === 'unresolved') {
-                        host_bridge.postMessage({
-                            type: 'showWarning',
-                            message: view_replay_refusal_warning(
-                                replay.direction,
-                                replay.entry.action.label,
-                                UNRESOLVED_SAVE_SIZE_REASON,
-                            ),
-                        });
+                        refuse_history_press(view_replay_refusal_warning(
+                            replay.direction,
+                            replay.entry.action.label,
+                            UNRESOLVED_SAVE_SIZE_REASON,
+                        ));
                     } else {
-                        host_bridge.postMessage({
-                            type: 'showWarning',
-                            message: view_replay_wait_warning('refreshing', replay.direction),
-                        });
+                        // Not applied because the source it named had been
+                        // replaced: tried again once that refresh is here.
+                        hand_over_history_retry(replay.press, replay.entry, replay.posted_after);
                     }
                 } else if (pending.gesture) {
+                    // Whether the gesture recorded nothing it should have: not
+                    // applied here (refused, or a refresh of another source
+                    // overtook it), or its worksheet is gone. A write that
+                    // changed nothing is no failure, and records nothing.
+                    let unrecorded = !applied || pending.worksheet === undefined;
                     if (applied && msg.change !== undefined && pending.worksheet !== undefined) {
                         // The step is what the host says the write changed:
                         // which source rows, and what each held.
                         const sheets = meta_ref.current?.sheets ?? [];
                         const index = worksheet_target_index(sheets, pending.worksheet);
                         const sheet = index === undefined ? undefined : sheets[index];
+                        unrecorded = sheet === undefined || index === undefined;
                         if (sheet !== undefined && index !== undefined) {
                             record_view_step(row_heights_view_step(
                                 {
@@ -4106,6 +4578,12 @@ export function App(): React.JSX.Element {
                             message: SIZE_WRITE_UNRESOLVED_MESSAGE,
                         });
                     }
+                    if (unrecorded) {
+                        // The person's own gesture recorded nothing: a press
+                        // held behind it was for its step, and would otherwise
+                        // undo the one under it (as with Cancel).
+                        drop_press_behind_unrecorded_gesture();
+                    }
                 }
                 // A refusal renders nothing; a queued header change waits on this.
                 wake_header_drain();
@@ -4123,6 +4601,7 @@ export function App(): React.JSX.Element {
                         || msg.sourceGeneration !== source_generation_ref.current)
                 ) return;
                 pending_width_write_ref.current = null;
+                unwatch_view_replay(pending.requestId);
                 sync_view_request_pending();
                 settle_width_write_ref.current(pending, msg.applied
                     ? { kind: 'applied', change: msg.change ?? [] }
@@ -4694,7 +5173,15 @@ export function App(): React.JSX.Element {
                         pending_column_write_ref.current = null;
                         pending_width_write_ref.current = null;
                         overtaken_view_requests_ref.current = { views: [], column: null, width: null };
-                        view_replay_wait_ref.current?.finish(false);
+                        // A press waiting, or waiting to be tried again, was
+                        // for the history that has just gone. Nothing is said.
+                        drop_history_presses();
+                        // Gestures of the outgoing document may still end (a
+                        // paste whose clipboard read is out survives the
+                        // grid): their tickets are fenced off from this one's.
+                        document_ticket_floor_ref.current = press_epoch_ref.current += 1;
+                        unwatch_view_replay();
+                        unsettled_admissions_ref.current.clear();
                         sync_view_request_pending();
                         // And any replay still in flight was planned against the
                         // document that just left. Its caller is awaiting an
@@ -5098,7 +5585,6 @@ export function App(): React.JSX.Element {
                     // `lfs_resolving`.
                     set_unresolved_lfs(snapshot.configuration.unresolvedLfs);
                     meta_ref.current = snapshot.meta;
-                    installed_snapshot_delivery_ref.current = snapshot.identity.deliveryId;
                     set_meta(snapshot.meta);
                     const source_changed =
                         snapshot.presentation === 'initial'
@@ -5215,6 +5701,10 @@ export function App(): React.JSX.Element {
                         pending_highlight_request_ref.current.pendingGesture?.cancel();
                         pending_highlight_request_ref.current = null;
                         set_highlight_request_pending(false);
+                        // Nothing recorded for the person's own gesture: a press held behind it
+                        // was for its step, and would otherwise undo the one under it (as with Cancel).
+                        drop_press_behind_unrecorded_gesture();
+                        wake_history_press();
                     }
                     for (const [request_id, pending] of pending_row_resize_requests_ref.current) {
                         if (
@@ -5222,20 +5712,27 @@ export function App(): React.JSX.Element {
                             && pending.sourceGeneration === snapshot.sourceGeneration
                         ) continue;
                         pending_row_resize_requests_ref.current.delete(request_id);
+                        unwatch_view_replay(request_id);
                         pending.finish?.(false);
+                        if (pending.gesture) {
+                            // Nothing recorded for the person's own gesture: a press held behind it
+                            // was for its step, and would otherwise undo the one under it (as with Cancel).
+                            drop_press_behind_unrecorded_gesture();
+                        }
                         // This window holds no durable heights, so the refresh
                         // cannot say whether the write landed. A gesture
                         // records nothing. A replay's entry stays, and
                         // pressing again is right either way: it writes from
                         // the step, not from a comparison.
                         if (pending.replay !== undefined && snapshot.presentation !== 'initial') {
-                            host_bridge.postMessage({
-                                type: 'showWarning',
-                                message: view_replay_wait_warning(
-                                    'refreshing',
-                                    pending.replay.direction,
-                                ),
-                            });
+                            // This snapshot is the refresh the replay lost
+                            // to. It is counted further down, and the drain,
+                            // which runs after this handler, reads it there.
+                            hand_over_history_retry(
+                                pending.replay.press,
+                                pending.replay.entry,
+                                pending.replay.posted_after,
+                            );
                         }
                     }
                     // A pending width write: a refresh of another source
@@ -5246,6 +5743,7 @@ export function App(): React.JSX.Element {
                     if (pending_width_write !== null) {
                         if (pending_width_write.sourceGeneration !== snapshot.sourceGeneration) {
                             pending_width_write_ref.current = null;
+                            unwatch_view_replay(pending_width_write.requestId);
                             overtaken_view_requests_ref.current.width = pending_width_write;
                         } else if (snapshot.presentation !== 'initial') {
                             pending_width_write.snapshotAdopted = true;
@@ -5388,6 +5886,7 @@ export function App(): React.JSX.Element {
                         pending_transform_request_ids_ref.current = [];
                         pending_transform_states_ref.current = [];
                         pending_transform_origins_ref.current = [];
+                        notify_transform_settled();
                         // The view requests dropped with them are settled below
                         // by what this snapshot shows.
                         overtaken_view_requests_ref.current.views.push(
@@ -5411,6 +5910,7 @@ export function App(): React.JSX.Element {
 
                     let correction_required = false;
                     if (snapshot.presentation === 'initial') {
+                        note_grid_replaced();
                         set_load_epoch((n) => n + 1);
                         const normalized = initial_normalized_state!;
                         const base = normalize_complete_per_file_state(
@@ -5426,6 +5926,7 @@ export function App(): React.JSX.Element {
                             columnVisibility: normalized.columnVisibility,
                             cellHighlights: normalized.cellHighlights,
                         });
+                        note_grid_replaced(normalized.activeSheetIndex);
                         set_active_sheet_index(normalized.activeSheetIndex);
                         set_column_widths(normalized.columnWidths);
                         set_show_formatting_by_sheet(normalized.showFormatting ?? []);
@@ -5617,6 +6118,7 @@ export function App(): React.JSX.Element {
                         });
                         set_transforms(next_transforms);
                         set_column_visibility(next_column_visibility);
+                        note_grid_replaced(next_active_sheet_index);
                         set_active_sheet_index(next_active_sheet_index);
                         state_ref.current = {
                             ...state_ref.current,
@@ -5856,6 +6358,10 @@ export function App(): React.JSX.Element {
                     settle_overtaken_view_requests();
                     // A fit the host refused may be tried again now.
                     owed_fit_held_ref.current = new Set();
+                    // Counted here and nowhere else: what a held press and a
+                    // retry read is "a snapshot was applied", and the render
+                    // this state change causes is what drains them.
+                    applied_snapshot_seq_ref.current += 1;
                     set_applied_snapshot_count((count) => count + 1);
                     // Acknowledge the exact delivered identity before an optional
                     // corrective CAS write.
@@ -5866,10 +6372,11 @@ export function App(): React.JSX.Element {
                         disposition,
                     });
                     if (correction_required) persist_immediate();
-                    // A view replay waiting for the editing session to go.
-                    view_replay_wait_ref.current?.finish(true);
                 } else {
                     snapshot_applied_seq_ref.current += 1;
+                    // Not applied, but acknowledged: a cell or structural
+                    // replay's retry waits for exactly this.
+                    wake_history_press();
                     host_bridge.postMessage({
                         type: 'snapshotApplied',
                         identity: snapshot.identity,
@@ -5930,6 +6437,7 @@ export function App(): React.JSX.Element {
                 pending_transform_request_ids_ref.current[msg.sheetIndex] = undefined;
                 pending_transform_states_ref.current[msg.sheetIndex] = undefined;
                 pending_transform_origins_ref.current[msg.sheetIndex] = undefined;
+                notify_transform_settled();
                 // A refused view request records nothing and moves nothing: a
                 // gesture did not happen, and a replay's entry stays where it
                 // was, to be tried again.
@@ -5997,14 +6505,13 @@ export function App(): React.JSX.Element {
                 // `refusal_origin` deliberately read above, before the pending refs
                 // were cleared.
                 if (refused_replay !== undefined) {
-                    host_bridge.postMessage({
-                        type: 'showWarning',
-                        message: view_replay_refusal_warning(
-                            refused_replay.direction,
-                            refused_replay.entry.action.label,
-                            msg.reason,
-                        ),
-                    });
+                    // The press waiting behind it was for the stack as this
+                    // replay would have left it.
+                    refuse_history_press(view_replay_refusal_warning(
+                        refused_replay.direction,
+                        refused_replay.entry.action.label,
+                        msg.reason,
+                    ));
                     // A refused replay renders nothing; a queued header change waits on it.
                     wake_header_drain();
                 } else if (!(refusal_origin === 'restore' && !msg.terminal)) {
@@ -6012,6 +6519,12 @@ export function App(): React.JSX.Element {
                         type: 'showWarning',
                         message: `Could not update the table view: ${msg.reason}`,
                     });
+                }
+                if (refused_replay === undefined && refusal_origin !== 'restore') {
+                    // The person's own gesture was refused, so nothing was recorded: a press
+                    // held behind it was for its step, and would otherwise undo the one under it
+                    // (as with Cancel).
+                    drop_press_behind_unrecorded_gesture();
                 }
                 return;
             }
@@ -6096,6 +6609,7 @@ export function App(): React.JSX.Element {
                 pending_transform_request_ids_ref.current[msg.sheetIndex] = undefined;
                 pending_transform_states_ref.current[msg.sheetIndex] = undefined;
                 pending_transform_origins_ref.current[msg.sheetIndex] = undefined;
+                notify_transform_settled();
                 if (origin === 'grid' || origin === 'history') {
                     set_grid_focus_restore({
                         sheet_index: msg.sheetIndex,
@@ -6448,12 +6962,32 @@ export function App(): React.JSX.Element {
     // restore request and compared on the next run: see
     // `restore_request_blockers_ref`.
     const [restore_blocker_epoch, set_restore_blocker_epoch] = useState(0);
+    // Bumped when a session request is answered and when a replay attempt
+    // ends, the two things the restore effect waits out; neither need render
+    // by itself.
+    const [restore_wake, set_restore_wake] = useState(0);
+    // The restore effect stepped aside for a replay: the attempt's end wakes it.
+    const restore_waits_for_replay_ref = useRef(false);
     useEffect(() => {
         set_restore_blocker_epoch((n) => n + 1);
     }, [csv_editable, save_in_flight]);
     useEffect(() => {
         if (!meta || preview_mode || pending_excel_header !== null) return;
         if (save_in_flight) return;
+        // Not while this window's request for an editing session is out: the
+        // host may still be settling the session a Save let go when the
+        // restore reaches it, and a transform it starts meanwhile refuses that
+        // session ("Wait for sorting and filtering to finish before editing."),
+        // and with it the edit or the Undo that asked. The restore goes once
+        // the request is answered. (The ref is the request as posted, before
+        // the render that shows it.) Nor while a replay is out: it would
+        // install under the replay's lease. `restore_wake` runs this again
+        // when either ends.
+        if (edit_session_pending || pending_edit_request_ref.current !== null) return;
+        if (replay_coordinator_ref.current?.is_busy() || pending_row_replay_busy_ref.current) {
+            restore_waits_for_replay_ref.current = true;
+            return;
+        }
         const sheet = meta.sheets[active_sheet_index];
         if (!sheet) return;
         if (
@@ -6545,6 +7079,8 @@ export function App(): React.JSX.Element {
         sheet_views,
         request_transform,
         save_in_flight,
+        edit_session_pending,
+        restore_wake,
         restore_blocker_epoch,
     ]);
 
@@ -6575,9 +7111,14 @@ export function App(): React.JSX.Element {
      * Both reservations therefore live in refs.
      */
     const base_gestures_admitted = useCallback(
-        () => !header_fence_ref.current
-            && !(replay_coordinator_ref.current?.is_busy() ?? false)
-            && !pending_row_replay_busy_ref.current
+        (replay_waiting_may_pass = false) => !header_fence_ref.current
+            && (
+                (replay_waiting_may_pass && replay_waiting_for_transforms_ref.current > 0)
+                || (
+                    !(replay_coordinator_ref.current?.is_busy() ?? false)
+                    && !pending_row_replay_busy_ref.current
+                )
+            )
             && pending_highlight_request_ref.current === null
             && pending_row_resize_requests_ref.current.size === 0
             && pending_append_requests_ref.current.size === 0
@@ -6596,14 +7137,19 @@ export function App(): React.JSX.Element {
      *
      * A person's own sort, filter, or hide in flight does not count here: a
      * second one on the same sheet may still replace it, as it always could.
+     *
+     * And no press of Undo or Redo waiting (`press_admits`), unless the work
+     * that asks was made before that press and says so with its ticket: a
+     * gesture made after a press must not be recorded under it, and the work
+     * the press waits for must still finish.
      */
     const history_free = useCallback(
         () => base_gestures_admitted()
-            && view_replay_wait_ref.current === null
+            && press_admits()
             && pending_column_write_ref.current === null
             && pending_width_write_ref.current === null
             && !pending_view_transforms_ref.current.some((pending) => pending?.replay !== undefined),
-        [base_gestures_admitted],
+        [base_gestures_admitted, press_admits],
     );
     /**
      * Whether an edit may be recorded now: `history_free`, and no sort, filter,
@@ -6616,6 +7162,32 @@ export function App(): React.JSX.Element {
             && !pending_view_transforms_ref.current.some((pending) => pending !== undefined),
         [history_free],
     );
+
+    // Every part of the grid's key: a change to any one mounts a new grid.
+    const grid_sheet_identity = meta?.sheets[active_sheet_index]?.worksheetId
+        ?? meta?.sheets[active_sheet_index]?.name;
+    useLayoutEffect(() => {
+        grid_instance_ref.current += 1;
+    }, [active_sheet_index, grid_sheet_identity, load_epoch, grid_mount_epoch]);
+    // Counts the changes of active sheet, so a gesture can tell it was left
+    // even if the person came back to its sheet.
+    const sheet_visit_ref = useRef(0);
+    useLayoutEffect(() => {
+        sheet_visit_ref.current += 1;
+    }, [active_sheet_index]);
+    /**
+     * Counted at once where the grid is replaced, not only when React has
+     * committed it (the layout effects above): a gesture's wait resumes in a
+     * microtask, before that commit. An extra count only ends a waiting
+     * gesture, silently.
+     */
+    const note_grid_replaced = useCallback((next_sheet_index?: number) => {
+        if (next_sheet_index !== undefined) {
+            if (next_sheet_index === active_sheet_index_for_focus_ref.current) return;
+            sheet_visit_ref.current += 1;
+        }
+        grid_instance_ref.current += 1;
+    }, []);
 
     const handle_sheet_select = useCallback(
         (sheet_index: number) => {
@@ -6634,6 +7206,7 @@ export function App(): React.JSX.Element {
             cancel_external_change_navigation();
             set_open_external_change_occurrence(null);
             set_external_change_navigation_status('');
+            note_grid_replaced(sheet_index);
             set_active_sheet_index(sheet_index);
             state_ref.current = {
                 ...state_ref.current,
@@ -6736,12 +7309,11 @@ export function App(): React.JSX.Element {
             // undoing an edit keeps the view as it is. A filter is its own step
             // in history, and clearing one here to expose the row would make
             // this undo change view state the person never asked about.
-            host_bridge.postMessage({
-                type: 'showWarning',
-                message: `The change was ${replayed_verb(answered.direction)}, but the affected cells are hidden by the current view.`,
-            });
+            say_history(
+                `The change was ${replayed_verb(answered.direction)}, but the affected cells are hidden by the current view.`,
+            );
         }
-    }, []);
+    }, [say_history]);
 
     /**
      * Land an accepted replay, then send the cursor after it.
@@ -6768,10 +7340,11 @@ export function App(): React.JSX.Element {
             // The host committed and the renderer could not follow, which no
             // further undo can describe: the two are now telling different stories
             // about the document.
-            host_bridge.postMessage({
-                type: 'showWarning',
-                message: `The change was ${replayed_verb(accepted.direction)} in the file, but this view could not be updated. Reopen the file to resynchronize.`,
-            });
+            // A press waiting behind it was for a stack this view no longer
+            // agrees with the file about: dropped with the message.
+            refuse_history_press(
+                `The change was ${replayed_verb(accepted.direction)} in the file, but this view could not be updated. Reopen the file to resynchronize.`,
+            );
             return;
         }
         const display_focus = accepted.committed.displayFocus;
@@ -6807,10 +7380,9 @@ export function App(): React.JSX.Element {
         } else if (!structural_only && !landed_in_shown_header) {
             // Every touched row is filtered out of the view. The replay succeeded;
             // there is simply nowhere truthful for the cursor to go.
-            host_bridge.postMessage({
-                type: 'showWarning',
-                message: `The change was ${replayed_verb(accepted.direction)}, but the affected cells are hidden by the current view.`,
-            });
+            say_history(
+                `The change was ${replayed_verb(accepted.direction)}, but the affected cells are hidden by the current view.`,
+            );
         } else if (accepted.committed.focusSheetIndex === active_sheet_index) {
             // Structural-only replay has no source-keyed cells from which the
             // host can derive a display row, and a replay that landed in the
@@ -6837,6 +7409,8 @@ export function App(): React.JSX.Element {
         active_sheet_index,
         apply_committed_replay,
         handle_sheet_select,
+        refuse_history_press,
+        say_history,
     ]);
 
     /**
@@ -6971,10 +7545,7 @@ export function App(): React.JSX.Element {
         };
     }, [publish_history_menu_state, publish_retained_saved_append_authorities]);
 
-    const run_history_command_ref = useRef<(
-        direction: HistoryDirection,
-        after_release_wait?: boolean,
-    ) => Promise<void>>(async () => {});
+    const run_history_command_ref = useRef<(press: HistoryPress) => Promise<void>>(async () => {});
     /** `post_column_widths`, which is declared further down. */
     const post_column_widths_ref = useRef<((
         sheets: readonly WidthWriteSheet[],
@@ -7034,27 +7605,29 @@ export function App(): React.JSX.Element {
      * moves on all the same: a view step never stands in the way of an older
      * step. Everything that says "did not run" leaves the entry where it was.
      */
-    const replay_view_step = useCallback((entry: HistoryEntry, direction: HistoryDirection) => {
+    const replay_view_step = useCallback((entry: HistoryEntry, press: HistoryPress) => {
+        const direction = press.direction;
+        // Said at once, for what does not clear by itself. A press waiting
+        // behind this one is dropped with it (`refuse_history_press`).
         const say_wait = (wait: ViewReplayWait) => {
-            show_warning(view_replay_wait_warning(wait, direction));
+            refuse_history_press(view_replay_wait_warning(wait, direction));
         };
         const say_unavailable = () => {
-            const message = history_refusal_warning('unavailable', direction, undefined);
-            if (message !== null) show_warning(message);
+            refuse_history_press(history_refusal_warning('unavailable', direction, undefined));
         };
+        // What every replay of this press carries to its settle site.
+        const replay_of = (skipped: readonly ViewSkipReason[]): ViewReplay => ({
+            entry,
+            direction,
+            skipped,
+            press,
+            posted_after: applied_snapshot_seq_ref.current,
+        });
         const sheets = meta_ref.current?.sheets;
         const width_changes = width_step_changes(entry.action);
         if (width_changes !== undefined && sheets !== undefined) {
-            // The windows in which a write would be refused anyway, or would
-            // be answered after a save had renumbered what it names.
-            if (
-                save_in_flight_ref.current
-                || edit_session_pending
-                || pending_excel_header_ref.current !== null
-            ) {
-                say_wait('applying');
-                return;
-            }
+            // (A save, a claim, or a header request in flight held the press
+            // before it got here: `history_press_gate`.)
             // Member by member, from the step alone: each column gets the
             // step's other side, and columns it never touched keep what they
             // have. Whether anything is left to change is the host's to say,
@@ -7099,12 +7672,8 @@ export function App(): React.JSX.Element {
                 say_unavailable();
                 return;
             }
-            const replay: ViewReplay = {
-                entry,
-                direction,
-                skipped: (['sheets-gone', 'columns-gone'] as const)
-                    .filter((reason) => skipped.has(reason)),
-            };
+            const replay = replay_of((['sheets-gone', 'columns-gone'] as const)
+                .filter((reason) => skipped.has(reason)));
             // Undo shows a worksheet its step belongs to.
             if (!present.includes(active_sheet_index) && !handle_sheet_select(present[0]!)) {
                 say_wait('applying');
@@ -7137,18 +7706,8 @@ export function App(): React.JSX.Element {
             // A header step is replayed through the header queue, like the
             // gesture that made it: the host carries the worksheet's unsaved
             // changes to the restored header in the same durable write.
-            //
-            // Not while keys are still owed to a cell (the state a gesture's
-            // drain waits out): the fence about to rise would swallow them.
-            if (
-                save_in_flight_ref.current
-                || edit_session_pending
-                || pending_excel_header_ref.current !== null
-                || editing_ref.current?.typing_pending() === true
-            ) {
-                say_wait('applying');
-                return;
-            }
+            // (Keys still owed to a cell, which the fence about to rise would
+            // swallow, hold the press before it gets here: `run_edit_command`.)
             const skipped = new Set<ViewSkipReason>();
             const targets = new Map<number, ExcelHeaderTarget>();
             const present: number[] = [];
@@ -7183,7 +7742,7 @@ export function App(): React.JSX.Element {
             // that stays where it is leaves the person where they are.
             const refusal = header_change_refusal([...targets.keys()]);
             if (refusal !== undefined) {
-                show_warning(view_replay_refusal_warning(direction, entry.action.label, refusal));
+                refuse_history_press(view_replay_refusal_warning(direction, entry.action.label, refusal));
                 return;
             }
             // Undo shows a worksheet its step belongs to.
@@ -7203,7 +7762,7 @@ export function App(): React.JSX.Element {
                     sheetName: named.name,
                     ...(named.worksheetId === undefined ? {} : { worksheetId: named.worksheetId }),
                 };
-            const replay: ViewReplay = { entry, direction, skipped: ordered_skips(skipped) };
+            const replay = replay_of(ordered_skips(skipped));
             if (targets.size === 0) {
                 // Every worksheet was left out or skipped. The entry moves all
                 // the same: a header step never stands in the way of an older
@@ -7246,15 +7805,6 @@ export function App(): React.JSX.Element {
             say_unavailable();
             return;
         }
-        // The windows in which the host would refuse the request anyway.
-        if (
-            save_in_flight_ref.current
-            || edit_session_pending
-            || pending_excel_header_ref.current !== null
-        ) {
-            say_wait('applying');
-            return;
-        }
         const schema = transform_schema_for_sheet(sheet);
         const worksheet: WorksheetTarget = {
             sheetIndex: index,
@@ -7278,8 +7828,10 @@ export function App(): React.JSX.Element {
             // Any request pending on this sheet, a restore included: a replay
             // never replaces one. The replaced request's answer would no longer
             // match, and this window would sit on a generation the host has left.
+            // It clears by itself (a saved view being re-installed), so the
+            // press waits for it, and the drain reads the same ref.
             if (pending_transform_request_ids_ref.current[index] !== undefined) {
-                say_wait('updating');
+                hold_history_press(press, 'updating', { step_wait: { sheet: index } });
                 return;
             }
             const live = sanitize_transform_state(
@@ -7301,7 +7853,7 @@ export function App(): React.JSX.Element {
                     ? { headerRow: header.sourceRow }
                     : {}),
             });
-            const replay: ViewReplay = { entry, direction, skipped: plan.skipped };
+            const replay = replay_of(plan.skipped);
             // Not reachable walking in order: the insert is a newer step and is
             // undone first, and no transform installs while such rows exist.
             if (
@@ -7313,7 +7865,7 @@ export function App(): React.JSX.Element {
                 for (const [pending_index, store] of
                     edit_session_registry_ref.current?.pending_entries() ?? []) {
                     if (pending_index !== index || !has_inserted_or_moved_rows(store.snapshot())) continue;
-                    show_warning(view_replay_refusal_warning(
+                    refuse_history_press(view_replay_refusal_warning(
                         direction,
                         entry.action.label,
                         INSERTED_ROWS_TRANSFORM_MESSAGE,
@@ -7343,7 +7895,7 @@ export function App(): React.JSX.Element {
             // no durable heights, so "already in place" is the host's to
             // say, and its no-op success moves the entry.
             const target = row_heights_replay_target(delta, direction, sheet.sourceRowCount);
-            const replay: ViewReplay = { entry, direction, skipped: target.skipped };
+            const replay = replay_of(target.skipped);
             if (!show_sheet()) return;
             if (target.rows.length === 0) {
                 land_view_replay(replay, worksheet, true);
@@ -7363,6 +7915,7 @@ export function App(): React.JSX.Element {
             });
             mark_row_height_request(index, request_id);
             sync_view_request_pending();
+            watch_view_replay(request_id, direction);
             host_bridge.postMessage({
                 type: 'setSourceRowHeights',
                 requestId: request_id,
@@ -7373,8 +7926,9 @@ export function App(): React.JSX.Element {
             });
             return;
         }
+        // A refresh is being adopted: it clears by itself.
         if (!snapshot_identity_ref.current) {
-            say_wait('refreshing');
+            hold_history_press(press, 'refreshing', { step_wait: 'identity' });
             return;
         }
         const current = sanitize_column_visibility_state(
@@ -7388,7 +7942,7 @@ export function App(): React.JSX.Element {
             hidden_source_columns(current, sheet.columnCount),
             { schema, columnCount: sheet.columnCount },
         );
-        const replay: ViewReplay = { entry, direction, skipped: plan.skipped };
+        const replay = replay_of(plan.skipped);
         if (!show_sheet()) return;
         if (!plan.changes) {
             land_view_replay(replay, worksheet, true);
@@ -7404,69 +7958,94 @@ export function App(): React.JSX.Element {
         if (posted !== true) say_wait('refreshing');
     }, [
         active_sheet_index,
-        edit_session_pending,
         handle_sheet_select,
         header_change_refusal,
+        hold_history_press,
         land_view_replay,
         mark_row_height_request,
         preview_mode,
+        refuse_history_press,
         request_transform,
-        show_warning,
         wake_header_drain,
+        watch_view_replay,
     ]);
 
     /**
-     * Undo or redo, from a keystroke or the desktop Edit menu.
+     * What the window is doing, as a press of Undo or Redo is asked. Read
+     * from the refs at this instant; see `history_press_gate`.
      *
-     * The one entry point into the coordinator. Everything that LANDS a replay is
-     * in the committed handler above, driven by the host's answer — this only
-     * starts one and reports why it did not happen.
+     * `without_retry`: the retry that is asking is left out, so it cannot
+     * hold itself. For any other press a waiting retry is a replay in flight.
+     */
+    const read_press_facts = useCallback((without_retry = false): HistoryPressFacts => {
+        const row_requests = [...pending_row_resize_requests_ref.current.values()];
+        const session_id = csv_edit_session_id_ref.current;
+        return {
+            header_reload_required: header_reload_required_ref.current,
+            header_change_in_flight: excel_header_queue_ref.current !== null
+                || pending_excel_header_ref.current !== null
+                || header_run_ref.current !== null
+                || header_fence_ref.current,
+            replay_in_flight: (replay_coordinator_ref.current?.is_busy() ?? false)
+                || pending_row_replay_busy_ref.current
+                || pending_view_transforms_ref.current.some((pending) => pending?.replay !== undefined)
+                || pending_column_write_ref.current?.replay !== undefined
+                || pending_width_write_ref.current?.replay !== undefined
+                || row_requests.some((pending) => pending.replay !== undefined)
+                || (!without_retry && retry_press_ref.current !== null),
+            gesture_in_flight: pending_highlight_request_ref.current !== null
+                || row_requests.length > 0
+                || pending_append_requests_ref.current.size > 0
+                || unsettled_admissions_ref.current.size > 0
+                || pending_column_write_ref.current !== null
+                || pending_width_write_ref.current !== null
+                || (session_id !== undefined
+                    && pending_changes_durability.structural_backlog_full(session_id)),
+            view_request_in_flight: pending_view_transforms_ref.current.some((pending) => pending !== undefined),
+            session_gesture_pending: pending_edit_request_ref.current !== null
+                || editing_ref.current?.gesture_pending() === true,
+            save_in_flight: save_in_flight_ref.current
+                || save_projection_ref.current.operation !== undefined,
+        };
+    }, []);
+
+    /**
+     * Carry out a press of Undo or Redo, or hold it.
+     *
+     * The one way into the coordinator and into a view step's replay.
+     * Everything that LANDS a replay is in the committed handler above, driven
+     * by the host's answer; this only starts one, holds the press where it
+     * cannot start yet, and says why where it cannot start at all.
+     *
+     * A press that meets something this window itself started is held and
+     * carried out when that has cleared (`hold_history_press`,
+     * `drain_history_press`). A press never ends here with nothing done and
+     * nothing said, except where there was nothing to do: an empty stack, or
+     * a document that was replaced under it.
      *
      * It never releases the edit session itself: undo may bring a session back
      * to restore an overlay, and an empty one is released by the same rule as
      * any other (`release_edit_session_if_idle`), not by the replay.
      */
-    const run_history_command = useCallback(async (
-        direction: HistoryDirection,
-        // Set when this call resumes after waiting for an editing session to go.
-        after_release_wait = false,
-    ): Promise<void> => {
+    const run_history_command = useCallback(async (press: HistoryPress): Promise<void> => {
+        const direction = press.direction;
         const coordinator = replay_coordinator_ref.current;
         if (coordinator === null) return;
         const replay_document = history_document_ref.current;
-        // A header step's replay is in flight. The press is carried out after
-        // it: it is not run now, which could start the same step twice or
-        // reach the entry under it before the step has moved, and it is not
-        // dropped. One slot; a later press replaces an earlier one.
-        const header_run = header_run_ref.current;
-        if (header_run?.replay !== undefined) {
-            header_run.then = direction;
-            return;
-        }
-        const handoff = header_handoff_ref.current;
-        if (handoff !== null) {
-            header_handoff_ref.current = { ...handoff, direction };
-            return;
-        }
-        // A header gesture of this window is asked for and its fence has not
-        // risen yet.
-        if (excel_header_queue_ref.current !== null || pending_excel_header_ref.current !== null) {
-            warn_edit_waits_for_header(true);
-            return;
-        }
-        if (!history_free()) {
-            // Says nothing unless the header fence is what holds edits.
-            warn_edit_waits_for_header();
-            return;
-        }
-        // A sort, filter, or hide of this window is still in flight. Its step
-        // is recorded only when it installs, so a move made now would be
-        // followed by a recording that clears the redo it just made. (A replay
-        // in flight failed the gate above, silently.)
-        if (pending_view_transforms_ref.current.some((pending) => pending !== undefined)) {
-            show_warning(view_replay_wait_warning('updating', direction));
-            return;
-        }
+        const as_retry = attempting_retry_ref.current !== null;
+        // Asked before anything else, whatever is on top of the stack.
+        const ask_window = (): boolean => {
+            const gate = history_press_gate(read_press_facts(as_retry));
+            if (gate.kind === 'run') return true;
+            if (gate.kind === 'hold') {
+                hold_history_press(press, gate.wait);
+                return false;
+            }
+            // A header result needs a reload: nothing will clear it.
+            refuse_history_press('Reload this window to finish the header row change, then edit.');
+            return false;
+        };
+        if (!ask_window()) return;
         const warn_header_wait = () => {
             const wait = header_wait_ref.current;
             if (wait === null) return;
@@ -7477,10 +8056,12 @@ export function App(): React.JSX.Element {
             const sheet_name = sheets.length > 1
                 ? (index === undefined ? undefined : sheets[index]?.name) ?? wait.worksheet.sheetName
                 : undefined;
-            host_bridge.postMessage({
-                type: 'showWarning',
-                message: header_wait_warning(wait, direction, sheet_name),
-            });
+            refuse_history_press(header_wait_warning(wait, direction, sheet_name));
+        };
+        /** Undo has run into a barrier: say which, as the coordinator's refusal would. */
+        const say_blocked = () => {
+            const barrier = history_store_ref.current?.snapshot().barrier;
+            refuse_history_press(history_refusal_warning('blocked', direction, barrier?.label, barrier?.reason));
         };
         let initial = peek_history(history_store_ref.current!.snapshot(), direction);
         if (initial.kind === 'available' && action_has_view_change(initial.entry.action)) {
@@ -7489,387 +8070,652 @@ export function App(): React.JSX.Element {
             // releases the session, and until the host has finished, its
             // transform admission answers "try again in a moment". A person
             // holding Undo to walk back through an edit and then a sort must
-            // not get that as a dialog, so the replay holds its turn and waits,
-            // saying nothing, until the session id clears or the next snapshot
-            // is applied. Holding the turn also holds off the idle-session
-            // release, which is safe: the fence is only ever raised together
-            // with the release or discard post, so that is already on its way.
+            // not get that as a dialog, so the press is held until the session
+            // id clears or the next snapshot is applied. Holding it also holds
+            // off the idle-session release, which is safe: the fence is only
+            // ever raised together with the release or discard post, so that
+            // is already on its way.
             //
             // A size step does not wait: the wait exists because the host's
             // transform admission refuses while a session is released, and a
             // width or row-height write passes no such admission.
-            const session_id = csv_edit_session_id_ref.current;
-            if (
-                !after_release_wait
-                && !action_is_size_step(initial.entry.action)
-                && session_id !== undefined
-                && renderer_publication_fenced_session_ref.current === session_id
-            ) {
-                const outcome = await new Promise<'settled' | 'timeout' | 'abandoned'>((resolve) => {
-                    const finish_with = (settled: 'settled' | 'timeout' | 'abandoned') => {
-                        if (view_replay_wait_ref.current !== held) return;
-                        view_replay_wait_ref.current = null;
-                        window.clearTimeout(timer);
-                        sync_view_request_pending();
-                        // A released turn renders nothing; a queued header change waits on it.
-                        wake_header_drain();
-                        resolve(settled);
-                    };
-                    const held = {
-                        finish: (go: boolean) => finish_with(go ? 'settled' : 'abandoned'),
-                    };
-                    // Bounded: a release that never settles must not leave
-                    // the window refusing every edit and every undo.
-                    const timer = window.setTimeout(
-                        () => finish_with('timeout'),
-                        SESSION_RELEASE_WAIT_MS,
-                    );
-                    view_replay_wait_ref.current = held;
-                    sync_view_request_pending();
+            if (!action_is_size_step(initial.entry.action)) {
+                const gate = view_step_press_gate({
+                    session_id: csv_edit_session_id_ref.current,
+                    fenced_session_id: renderer_publication_fenced_session_ref.current,
+                    applied_snapshot_seq: applied_snapshot_seq_ref.current,
+                    release_seq: press.release_seq,
                 });
-                if (history_document_ref.current !== replay_document || outcome === 'abandoned') return;
-                if (outcome === 'timeout') {
-                    show_warning(view_replay_wait_warning('finishing', direction));
+                if (gate.kind === 'hold') {
+                    hold_history_press(press, gate.wait);
                     return;
                 }
-                // Start again from the peek; if the release has still not
-                // settled, the replay goes ahead and the host's answer decides.
-                return run_history_command_ref.current(direction, true);
             }
             // Fold the open editor first: committing it records a cell edit,
-            // and Undo means the top entry after that commit.
-            const fold = fold_before_view_request();
-            if (fold === 'refused') return;
-            // The checks run on the state the fold left.
-            if (!history_free()) {
-                show_warning(view_replay_wait_warning('applying', direction));
+            // and Undo means the top entry after that commit. The fold is
+            // part of the press, so it passes a gate that a retry of this
+            // same press may be holding shut.
+            const fold = with_gesture_ticket(0, () => fold_before_view_request(say_history));
+            if (fold === 'refused') {
+                // `fold_before_view_request` has said why.
+                refuse_history_press(null);
                 return;
             }
+            // What the commit left to replay is read first: a press held
+            // below would come back to an empty redo stack and say nothing.
             initial = peek_history(history_store_ref.current!.snapshot(), direction);
             if (initial.kind !== 'available') {
-                // The commit cleared the redo stack.
-                if (direction === 'redo' && fold === 'folded') {
-                    show_warning(REDO_REPLACED_BY_FOLD_MESSAGE);
+                if (initial.kind === 'blocked') {
+                    // The commit was too large to keep in history, which
+                    // cleared both stacks behind a barrier.
+                    say_blocked();
+                } else if (direction === 'redo' && fold === 'folded') {
+                    // The commit cleared the redo stack.
+                    refuse_history_press(REDO_REPLACED_BY_FOLD_MESSAGE);
                 }
                 return;
             }
+            // The checks run on the state the fold left: the row a committed
+            // edit grew is being measured, and the press waits for it.
+            if (!ask_window()) return;
             if (action_has_view_change(initial.entry.action)) {
-                replay_view_step(initial.entry, direction);
+                replay_view_step(initial.entry, press);
                 return;
             }
             // Otherwise the top is the edit just committed: the ordinary path.
         }
-        // Before a session is acquired for it: a change that has no form under
-        // the current Header Row says so and stays where it is.
-        if (initial.kind === 'available' && entry_for_replay_ref.current(initial.entry) === undefined) {
-            warn_header_wait();
-            return;
-        }
-        if (
-            initial.kind === 'available'
-            && initial.entry.action.changes.some((change) =>
-                is_structural_history_change(change))
-        ) {
-            pending_row_replay_busy_ref.current = true;
-            const restoration_settlements: ((accepted: boolean) => void)[] = [];
-            const restoration_request_ids: string[] = [];
-            const restoration_bases = new Map<string, PendingAppendBasis>();
-            let restorations_handed_off = false;
-            let restorations_accepted = false;
-            try {
-                const replay_session_ready = await (
-                    ensure_replay_session_ref.current?.() ?? Promise.resolve(false)
-                );
-                if (history_document_ref.current !== replay_document) return;
-                if (!replay_session_ready) {
-                    host_bridge.postMessage({
-                        type: 'showWarning',
-                        message: `${direction === 'undo' ? 'Undo' : 'Redo'} is unavailable because editing could not be started.`,
-                    });
+        /**
+         * What the coordinator's refusal means for the press. `barrier` was
+         * read before the replay: a `blocked` refusal is about the barrier
+         * that was in the way, and the stack may move under the await.
+         */
+        const answer_refusal = (
+            outcome: ReplayOutcome,
+            barrier: HistoryBarrier | undefined,
+            // The entry the refused replay was for: a retry runs only while
+            // it is still on top.
+            entry: HistoryEntry | undefined,
+        ) => {
+            if (outcome.kind !== 'refused') return;
+            switch (outcome.reason) {
+                case 'nothing-to-replay':
+                    // The press was carried out, and there was nothing to
+                    // carry out. The menu item names no step.
                     return;
-                }
-                // Session acquisition can hydrate stores and can let a newer
-                // gesture land. Undo always means the top entry after that
-                // boundary, so re-read and only take the local path if it is
-                // still structural.
-                const current = peek_history(history_store_ref.current!.snapshot(), direction);
-                if (current.kind !== 'available') return;
-                // Planned from the entry as it reads under the current Header
-                // Row; history moves the stored entry, `current.entry`.
-                const replay_entry = entry_for_replay_ref.current(current.entry);
-                if (replay_entry === undefined) {
+                case 'busy':
+                    // Another replay took the slot first.
+                    hold_history_press(press, 'applying');
+                    return;
+                case 'view-step':
+                    // A sort of this window installed, and recorded, while
+                    // the cell replay under it was acquiring its session.
+                    // The press is for the newest entry: start again.
+                    void run_history_command_ref.current(press);
+                    return;
+                case 'header-row':
                     warn_header_wait();
                     return;
-                }
-                const sheets = meta_ref.current?.sheets;
-                const session_id = csv_edit_session_id_ref.current;
-                if (sheets === undefined || session_id === undefined) return;
-                const restoration_groups = new Map<string, {
-                    worksheet: WorksheetTarget;
-                    ids: string[];
-                }>();
-                for (const change of replay_entry.action.changes) {
-                    if (
-                        change.kind !== 'rowAppend'
-                        || change.delta.restoredFromSavedRemoval !== true
-                    ) continue;
-                    const desired = direction === 'undo'
-                        ? change.delta.before
-                        : change.delta.after;
-                    if (desired === null) continue;
-                    const key = worksheet_target_key(change.delta.worksheet);
-                    const group = restoration_groups.get(key) ?? {
-                        worksheet: change.delta.worksheet,
-                        ids: [],
-                    };
-                    group.ids.push(change.delta.pendingRowId);
-                    restoration_groups.set(key, group);
-                }
-                for (const { worksheet, ids } of restoration_groups.values()) {
-                    const sheet_index = worksheet_target_index(sheets, worksheet);
-                    if (sheet_index === undefined) return;
-                    const source_generation = source_generation_ref.current;
-                    const request_id = [
-                        'restore-saved-rows',
-                        ++restore_saved_rows_seq_ref.current,
-                    ].join(':');
-                    const admission = await new Promise<{
-                        readonly requestId: string;
-                        readonly appendBasis: PendingAppendBasis;
-                        readonly settle: (accepted: boolean) => void;
-                    } | undefined>((resolve) => {
-                        pending_saved_row_restorations_ref.current.set(request_id, {
-                            sourceGeneration: source_generation,
-                            expectedIds: [...ids],
-                            sheetIndex: sheet_index,
-                            editSessionId: session_id,
-                            resolve,
-                        });
-                        host_bridge.postMessage({
-                            type: 'requestRestoreSavedRows',
-                            requestId: request_id,
-                            editSessionId: session_id,
-                            worksheet,
-                            sourceGeneration: source_generation,
-                            appendHistoryIds: ids,
-                        });
-                    });
-                    if (history_document_ref.current !== replay_document) return;
-                    if (admission === undefined) {
-                        host_bridge.postMessage({
-                            type: 'showWarning',
-                            message: 'The saved appended rows could not be restored.',
-                        });
+                case 'not-current': {
+                    // The host's view had moved and the host wrote nothing.
+                    // Tried again once the refresh it lost to is here.
+                    if (entry !== undefined) {
+                        hand_over_history_retry(press, entry, replay_posted_after_ref.current, 'delivery');
                         return;
                     }
-                    restoration_settlements.push(admission.settle);
-                    restoration_request_ids.push(admission.requestId);
-                    restoration_bases.set(
-                        worksheet_target_key(worksheet),
-                        admission.appendBasis,
+                    break;
+                }
+                default:
+                    break;
+            }
+            refuse_history_press(history_refusal_warning(
+                outcome.reason,
+                direction,
+                barrier?.label,
+                barrier?.reason,
+            ));
+        };
+        // From here the press asks the host, and waits for each answer. If the
+        // attempt has not ended after as long as a lease lasts, the press says
+        // so: a request the host never answers keeps its reservation, and the
+        // press that started it must not have changed nothing and said nothing.
+        const watch = window.setTimeout(() => {
+            if (history_document_ref.current !== replay_document) return;
+            say_history(history_unanswered_warning(direction));
+        }, HISTORY_REPLAY_LEASE_TTL_MS);
+        try {
+            // Before a session is acquired for it: a change that has no form under
+            // the current Header Row says so and stays where it is.
+            if (initial.kind === 'available' && entry_for_replay_ref.current(initial.entry) === undefined) {
+                warn_header_wait();
+                return;
+            }
+            if (
+                initial.kind === 'available'
+                && initial.entry.action.changes.some((change) =>
+                    is_structural_history_change(change))
+            ) {
+                pending_row_replay_busy_ref.current = true;
+                let structural_outcome: {
+                    readonly outcome: ReplayOutcome;
+                    readonly barrier: HistoryBarrier | undefined;
+                    readonly entry: HistoryEntry;
+                } | undefined;
+                const restoration_settlements: ((accepted: boolean) => void)[] = [];
+                const restoration_request_ids: string[] = [];
+                const restoration_bases = new Map<string, PendingAppendBasis>();
+                let restorations_handed_off = false;
+                let restorations_accepted = false;
+                try {
+                    const replay_session_ready = await (
+                        ensure_replay_session_ref.current?.() ?? Promise.resolve(false)
                     );
-                }
-                let planned = plan_pending_row_history_replay(
-                    replay_entry.action,
-                    direction,
-                    (worksheet) => {
-                        const sheet_index = worksheet_target_index(sheets, worksheet);
-                        return sheet_index === undefined
-                            ? undefined
-                            : edit_session_registry_ref.current!
-                                .pending_rows_for_sheet(sheet_index)
-                                .snapshot();
-                        },
-                );
-                if (planned.kind === 'plan' && restoration_bases.size > 0) {
-                    let invalid_basis = false;
-                    const plans = planned.plans.map((plan): PendingRowHistoryPlan => {
-                        const admitted = restoration_bases.get(
-                            worksheet_target_key(plan.worksheet),
-                        );
-                        if (admitted === undefined) return plan;
-                        const advanced = plan.next.appendBasis === undefined
-                            ? admitted
-                            : advance_pending_append_basis(
-                                plan.next.appendBasis,
-                                admitted,
-                            );
-                        if (advanced === undefined) {
-                            invalid_basis = true;
-                            return plan;
-                        }
-                        return {
-                            ...plan,
-                            next: { ...plan.next, appendBasis: advanced },
-                        };
-                    });
-                    planned = invalid_basis
-                        ? { kind: 'refused', reason: 'conflict' }
-                        : { kind: 'plan', plans };
-                }
-                if (planned.kind === 'not-structural') {
-                    // A different action landed during acquisition; release the
-                    // local reservation and let the ordinary coordinator handle
-                    // that action below.
-                } else if (planned.kind === 'refused') {
-                    host_bridge.postMessage({
-                        type: 'showWarning',
-                        message: direction === 'undo'
-                            && current.entry.action.changes.some(
-                                (change) => change.kind === 'tailRemoval',
-                            )
-                            ? "Can't undo appended rows because the worksheet changed after they were saved."
-                            : 'The pending rows changed, so this history action could not be replayed.',
-                    });
-                    return;
-                } else {
-                    // A saved append can become a prospective removal only while
-                    // every row in question is still part of the physical suffix.
-                    // The save planner repeats this against fresh file bytes and
-                    // fingerprints; this immediate check keeps an obviously-grown
-                    // worksheet from appearing to accept the undo meanwhile.
-                    const suffix_is_safe = planned.plans.every((plan) => {
-                        // Undoing a saved append on a worksheet with a layout
-                        // change is refused: both assume the source rows keep
-                        // their physical place.
-                        if (
-                            plan.next.tailRemovals.length > 0
-                            && has_live_layout_change(plan.next)
-                        ) return false;
-                        const sheet_index = worksheet_target_index(sheets, plan.worksheet);
-                        if (sheet_index === undefined) return false;
-                        const source_row_count = sheets[sheet_index]?.sourceRowCount;
-                        if (source_row_count === undefined) return false;
-                        return plan.next.tailRemovals.every(
-                            (removal, index, removals) => removal.sourceRow
-                                === source_row_count - removals.length + index,
-                        );
-                    });
-                    if (!suffix_is_safe) {
-                        host_bridge.postMessage({
-                            type: 'showWarning',
-                            message: "Can't undo appended rows because the worksheet changed after they were saved.",
-                        });
+                    if (history_document_ref.current !== replay_document) return;
+                    if (!replay_session_ready) {
+                        refuse_history_press(history_session_unavailable_warning(direction));
                         return;
                     }
-                    const removals_to_validate = planned.plans.flatMap((plan) => {
-                        const expected_ids = new Set(plan.expected.tailRemovals.map(
-                            (removal) => removal.appendHistoryId,
-                        ));
-                        const added_removals = plan.next.tailRemovals.filter(
-                            (removal) => !expected_ids.has(removal.appendHistoryId),
-                        );
-                        return added_removals.length === 0 ? [] : [{
-                            ...plan.worksheet,
-                            // Host validation proves the complete prospective
-                            // suffix, including removals staged by earlier Undos.
-                            removals: plan.next.tailRemovals.map(({
-                                appendHistoryId,
-                                sourceRow,
-                                savedFingerprint,
-                            }) => ({
-                                appendHistoryId,
-                                sourceRow,
-                                savedFingerprint,
-                            })),
-                        }];
-                    });
-                    if (removals_to_validate.length > 0) {
+                    // Session acquisition can hydrate stores and can let a newer
+                    // gesture land. Undo always means the top entry after that
+                    // boundary, so re-read and only take the local path if it is
+                    // still structural.
+                    const current = peek_history(history_store_ref.current!.snapshot(), direction);
+                    if (current.kind !== 'available') {
+                        // Undo: a save's receipt landed meanwhile and set its
+                        // barrier. Redo: a new action cleared what there was.
+                        if (current.kind === 'blocked') say_blocked();
+                        return;
+                    }
+                    // Planned from the entry as it reads under the current Header
+                    // Row; history moves the stored entry, `current.entry`.
+                    const replay_entry = entry_for_replay_ref.current(current.entry);
+                    if (replay_entry === undefined) {
+                        warn_header_wait();
+                        return;
+                    }
+                    const sheets = meta_ref.current?.sheets;
+                    const session_id = csv_edit_session_id_ref.current;
+                    if (sheets === undefined || session_id === undefined) {
+                        refuse_history_press(history_session_unavailable_warning(direction));
+                        return;
+                    }
+                    const restoration_groups = new Map<string, {
+                        worksheet: WorksheetTarget;
+                        ids: string[];
+                    }>();
+                    for (const change of replay_entry.action.changes) {
+                        if (
+                            change.kind !== 'rowAppend'
+                            || change.delta.restoredFromSavedRemoval !== true
+                        ) continue;
+                        const desired = direction === 'undo'
+                            ? change.delta.before
+                            : change.delta.after;
+                        if (desired === null) continue;
+                        const key = worksheet_target_key(change.delta.worksheet);
+                        const group = restoration_groups.get(key) ?? {
+                            worksheet: change.delta.worksheet,
+                            ids: [],
+                        };
+                        group.ids.push(change.delta.pendingRowId);
+                        restoration_groups.set(key, group);
+                    }
+                    for (const { worksheet, ids } of restoration_groups.values()) {
+                        const sheet_index = worksheet_target_index(sheets, worksheet);
+                        if (sheet_index === undefined) {
+                            // The worksheet the rows were saved on is gone.
+                            refuse_history_press(history_refusal_warning('unavailable', direction, undefined));
+                            return;
+                        }
                         const source_generation = source_generation_ref.current;
                         const request_id = [
-                            'tail-removal-validation',
-                            ++tail_removal_validation_seq_ref.current,
+                            'restore-saved-rows',
+                            ++restore_saved_rows_seq_ref.current,
                         ].join(':');
-                        const valid = await new Promise<boolean>((resolve) => {
-                            pending_tail_removal_validations_ref.current.set(request_id, {
+                        const admission = await new Promise<{
+                            readonly requestId: string;
+                            readonly appendBasis: PendingAppendBasis;
+                            readonly settle: (accepted: boolean) => void;
+                        } | undefined>((resolve) => {
+                            pending_saved_row_restorations_ref.current.set(request_id, {
                                 sourceGeneration: source_generation,
+                                expectedIds: [...ids],
+                                sheetIndex: sheet_index,
+                                editSessionId: session_id,
                                 resolve,
                             });
                             host_bridge.postMessage({
-                                type: 'validateTailRemovalReplay',
+                                type: 'requestRestoreSavedRows',
                                 requestId: request_id,
                                 editSessionId: session_id,
+                                worksheet,
                                 sourceGeneration: source_generation,
-                                worksheets: removals_to_validate,
+                                appendHistoryIds: ids,
                             });
                         });
                         if (history_document_ref.current !== replay_document) return;
-                        if (!valid) {
-                            host_bridge.postMessage({
-                                type: 'showWarning',
-                                message: "Can't undo appended rows because the worksheet changed after they were saved.",
-                            });
+                        if (admission === undefined) {
+                            refuse_history_press('The saved appended rows could not be restored.');
                             return;
                         }
-                    }
-                    pending_row_replay_plan_ref.current = {
-                        entryId: current.entry.id,
-                        direction,
-                        plans: planned.plans,
-                        restorationRequestIds: Object.freeze([
-                            ...restoration_request_ids,
-                        ]),
-                        settleRestorations: restoration_settlements,
-                    };
-                    restorations_handed_off = true;
-                    const barrier = history_store_ref.current?.snapshot().barrier;
-                    const outcome = await coordinator.begin(direction);
-                    if (history_document_ref.current !== replay_document) return;
-                    if (outcome.kind === 'refused') {
-                        if (outcome.reason === 'header-row') warn_header_wait();
-                        const warning = history_refusal_warning(
-                            outcome.reason,
-                            direction,
-                            barrier?.label,
-                            barrier?.reason,
+                        restoration_settlements.push(admission.settle);
+                        restoration_request_ids.push(admission.requestId);
+                        restoration_bases.set(
+                            worksheet_target_key(worksheet),
+                            admission.appendBasis,
                         );
-                        if (warning !== null) {
-                            host_bridge.postMessage({ type: 'showWarning', message: warning });
-                        }
                     }
-                    return;
+                    let planned = plan_pending_row_history_replay(
+                        replay_entry.action,
+                        direction,
+                        (worksheet) => {
+                            const sheet_index = worksheet_target_index(sheets, worksheet);
+                            return sheet_index === undefined
+                                ? undefined
+                                : edit_session_registry_ref.current!
+                                    .pending_rows_for_sheet(sheet_index)
+                                    .snapshot();
+                            },
+                    );
+                    if (planned.kind === 'plan' && restoration_bases.size > 0) {
+                        let invalid_basis = false;
+                        const plans = planned.plans.map((plan): PendingRowHistoryPlan => {
+                            const admitted = restoration_bases.get(
+                                worksheet_target_key(plan.worksheet),
+                            );
+                            if (admitted === undefined) return plan;
+                            const advanced = plan.next.appendBasis === undefined
+                                ? admitted
+                                : advance_pending_append_basis(
+                                    plan.next.appendBasis,
+                                    admitted,
+                                );
+                            if (advanced === undefined) {
+                                invalid_basis = true;
+                                return plan;
+                            }
+                            return {
+                                ...plan,
+                                next: { ...plan.next, appendBasis: advanced },
+                            };
+                        });
+                        planned = invalid_basis
+                            ? { kind: 'refused', reason: 'conflict' }
+                            : { kind: 'plan', plans };
+                    }
+                    if (planned.kind === 'not-structural') {
+                        // A different action landed during acquisition; release the
+                        // local reservation and let the ordinary coordinator handle
+                        // that action below.
+                    } else if (planned.kind === 'refused') {
+                        refuse_history_press(
+                            direction === 'undo'
+                                && current.entry.action.changes.some(
+                                    (change) => change.kind === 'tailRemoval',
+                                )
+                                ? "Can't undo appended rows because the worksheet changed after they were saved."
+                                : 'The pending rows changed, so this history action could not be replayed.',
+                        );
+                        return;
+                    } else {
+                        // A saved append can become a prospective removal only while
+                        // every row in question is still part of the physical suffix.
+                        // The save planner repeats this against fresh file bytes and
+                        // fingerprints; this immediate check keeps an obviously-grown
+                        // worksheet from appearing to accept the undo meanwhile.
+                        const suffix_is_safe = planned.plans.every((plan) => {
+                            // Undoing a saved append on a worksheet with a layout
+                            // change is refused: both assume the source rows keep
+                            // their physical place.
+                            if (
+                                plan.next.tailRemovals.length > 0
+                                && has_live_layout_change(plan.next)
+                            ) return false;
+                            const sheet_index = worksheet_target_index(sheets, plan.worksheet);
+                            if (sheet_index === undefined) return false;
+                            const source_row_count = sheets[sheet_index]?.sourceRowCount;
+                            if (source_row_count === undefined) return false;
+                            return plan.next.tailRemovals.every(
+                                (removal, index, removals) => removal.sourceRow
+                                    === source_row_count - removals.length + index,
+                            );
+                        });
+                        if (!suffix_is_safe) {
+                            refuse_history_press(
+                                "Can't undo appended rows because the worksheet changed after they were saved.",
+                            );
+                            return;
+                        }
+                        const removals_to_validate = planned.plans.flatMap((plan) => {
+                            const expected_ids = new Set(plan.expected.tailRemovals.map(
+                                (removal) => removal.appendHistoryId,
+                            ));
+                            const added_removals = plan.next.tailRemovals.filter(
+                                (removal) => !expected_ids.has(removal.appendHistoryId),
+                            );
+                            return added_removals.length === 0 ? [] : [{
+                                ...plan.worksheet,
+                                // Host validation proves the complete prospective
+                                // suffix, including removals staged by earlier Undos.
+                                removals: plan.next.tailRemovals.map(({
+                                    appendHistoryId,
+                                    sourceRow,
+                                    savedFingerprint,
+                                }) => ({
+                                    appendHistoryId,
+                                    sourceRow,
+                                    savedFingerprint,
+                                })),
+                            }];
+                        });
+                        if (removals_to_validate.length > 0) {
+                            const source_generation = source_generation_ref.current;
+                            const request_id = [
+                                'tail-removal-validation',
+                                ++tail_removal_validation_seq_ref.current,
+                            ].join(':');
+                            const valid = await new Promise<boolean>((resolve) => {
+                                pending_tail_removal_validations_ref.current.set(request_id, {
+                                    sourceGeneration: source_generation,
+                                    resolve,
+                                });
+                                host_bridge.postMessage({
+                                    type: 'validateTailRemovalReplay',
+                                    requestId: request_id,
+                                    editSessionId: session_id,
+                                    sourceGeneration: source_generation,
+                                    worksheets: removals_to_validate,
+                                });
+                            });
+                            if (history_document_ref.current !== replay_document) return;
+                            if (!valid) {
+                                refuse_history_press(
+                                    "Can't undo appended rows because the worksheet changed after they were saved.",
+                                );
+                                return;
+                            }
+                        }
+                        pending_row_replay_plan_ref.current = {
+                            entryId: current.entry.id,
+                            direction,
+                            plans: planned.plans,
+                            restorationRequestIds: Object.freeze([
+                                ...restoration_request_ids,
+                            ]),
+                            settleRestorations: restoration_settlements,
+                        };
+                        restorations_handed_off = true;
+                        const barrier = history_store_ref.current?.snapshot().barrier;
+                        const outcome = await coordinator.begin(direction);
+                        if (history_document_ref.current !== replay_document) return;
+                        structural_outcome = { outcome, barrier, entry: current.entry };
+                        return;
+                    }
+                } finally {
+                    if (!restorations_handed_off && !restorations_accepted) {
+                        restoration_settlements.forEach((settle) => settle(false));
+                    }
+                    const replay = pending_row_replay_plan_ref.current;
+                    if (replay !== null && replay.settleRestorations === restoration_settlements) {
+                        replay.settleRestorations.forEach((settle) => settle(false));
+                    }
+                    pending_row_replay_busy_ref.current = false;
+                    pending_row_replay_plan_ref.current = null;
+                    // Answered only now, with the reservation released: a press
+                    // that starts again, or is tried again, must find it free.
+                    if (structural_outcome !== undefined) {
+                        answer_refusal(
+                            structural_outcome.outcome,
+                            structural_outcome.barrier,
+                            structural_outcome.entry,
+                        );
+                    }
                 }
-            } finally {
-                if (!restorations_handed_off && !restorations_accepted) {
-                    restoration_settlements.forEach((settle) => settle(false));
-                }
-                const replay = pending_row_replay_plan_ref.current;
-                if (replay !== null && replay.settleRestorations === restoration_settlements) {
-                    replay.settleRestorations.forEach((settle) => settle(false));
-                }
-                pending_row_replay_busy_ref.current = false;
-                pending_row_replay_plan_ref.current = null;
-                // A refused replay renders nothing; a queued header change waits on it.
-                wake_header_drain();
             }
+            // Read BEFORE the replay: a `blocked` refusal is about the barrier that was
+            // in the way, and the stack may move under the await.
+            const barrier = history_store_ref.current?.snapshot().barrier;
+            // The entry the coordinator replays: nothing can be recorded
+            // while its replay is out, so the top now is the one it takes.
+            const replayed = peek_history(history_store_ref.current!.snapshot(), direction);
+            const outcome = await coordinator.begin(direction);
+            if (history_document_ref.current !== replay_document) return;
+            answer_refusal(outcome, barrier, replayed.kind === 'available' ? replayed.entry : undefined);
+        } finally {
+            window.clearTimeout(watch);
+            // A restore of the saved view that stepped aside for the attempt
+            // is asked about again.
+            if (restore_waits_for_replay_ref.current) {
+                restore_waits_for_replay_ref.current = false;
+                set_restore_wake((wake) => wake + 1);
+            }
+            // An attempt that ended renders nothing by itself; a press held
+            // behind it, and a queued header change, wait on it.
+            wake_header_drain();
         }
-        // Read BEFORE the replay: a `blocked` refusal is about the barrier that was
-        // in the way, and the stack may move under the await.
-        const barrier = history_store_ref.current?.snapshot().barrier;
-        const outcome = await coordinator.begin(direction);
-        wake_header_drain();
-        if (history_document_ref.current !== replay_document) return;
-        if (outcome.kind !== 'refused') return;
-        if (outcome.reason === 'header-row') warn_header_wait();
-        const warning = history_refusal_warning(
-            outcome.reason,
-            direction,
-            barrier?.label,
-            barrier?.reason,
-        );
-        if (warning !== null) host_bridge.postMessage({ type: 'showWarning', message: warning });
     }, [
-        active_sheet_index,
         fold_before_view_request,
-        handle_sheet_select,
-        history_free,
+        hand_over_history_retry,
+        hold_history_press,
+        read_press_facts,
+        refuse_history_press,
         replay_view_step,
-        show_warning,
-        sync_view_request_pending,
+        say_history,
         wake_header_drain,
-        warn_edit_waits_for_header,
+        with_gesture_ticket,
     ]);
     run_history_command_ref.current = run_history_command;
+
+    /**
+     * A press of Undo or Redo, from the keyboard or the Edit menu: the one
+     * way a press is made.
+     *
+     * While a press is already waiting, a press in the same direction is the
+     * same request and changes nothing: a held key sends a press every 30 ms
+     * or so, and counted presses would go on undoing after the key was let
+     * go. A press in the other direction cancels the one waiting: Undo then
+     * Redo, both pressed before either could run, is nothing.
+     *
+     * `handed_on` is a press that was held for typed keys and is now sent on
+     * (see the drain): it is attempted as it is, with the `started` and the
+     * `epoch` it was given when the key was pressed.
+     */
+    const press_history = useCallback((direction: HistoryDirection, handed_on?: HistoryPress) => {
+        if (handed_on !== undefined) {
+            void run_history_command(handed_on);
+            return;
+        }
+        const held = held_press_ref.current;
+        if (held !== null) {
+            if (held.press.direction !== direction) {
+                held_press_ref.current = null;
+                arm_history_press_timer();
+            }
+            return;
+        }
+        void run_history_command({
+            direction,
+            started: Date.now(),
+            epoch: press_epoch_ref.current += 1,
+        });
+    }, [arm_history_press_timer, run_history_command]);
+
+    /**
+     * A press made while keys typed at a cell are still on their way into an
+     * editor (held for a session or an appended row, or their editor has not
+     * mounted yet). A moment later the same press would be that editor's own
+     * text undo, so it waits for that moment. This hold reserves nothing: the
+     * keys must reach their editor, and its commit must be admitted.
+     */
+    const hold_history_press_for_typing = useCallback((direction: HistoryDirection) => {
+        const held = held_press_ref.current;
+        if (held !== null) {
+            if (held.press.direction !== direction) {
+                held_press_ref.current = null;
+                arm_history_press_timer();
+            }
+            return;
+        }
+        hold_history_press(
+            { direction, started: Date.now(), epoch: press_epoch_ref.current += 1 },
+            'applying',
+            { typing: true },
+        );
+    }, [arm_history_press_timer, hold_history_press]);
+
+    /** `run_edit_command`, which is declared further down. */
+    const run_edit_command_ref = useRef<(command: EditCommand, handed_on?: HistoryPress) => void>(() => {});
+
+    /**
+     * Carry out a waiting press if what it waits for has cleared, or end it
+     * with its message if its bound has passed.
+     *
+     * After every render, like the header queue's drain. Everything a press
+     * waits for either changes state when it ends, which renders, or calls
+     * `wake_history_press`; and the bound's timer renders at the bound.
+     *
+     * The retry is looked at before the held press, and stays in its own slot
+     * until its attempt has posted a request, moved its entry, or been
+     * answered with a message, so it cannot replace the press behind it.
+     */
+    const drain_history_press = () => {
+        if (draining_history_press_ref.current) return;
+        if (held_press_ref.current === null && retry_press_ref.current === null) return;
+        draining_history_press_ref.current = true;
+        try {
+            const step_wait_clear = (step_wait: HeldPress['step_wait']): boolean => {
+                if (step_wait === undefined) return true;
+                if (step_wait === 'identity') return snapshot_identity_ref.current !== null;
+                return pending_transform_request_ids_ref.current[step_wait.sheet] === undefined;
+            };
+            const releasing = (press: HistoryPress): boolean => view_step_press_gate({
+                session_id: csv_edit_session_id_ref.current,
+                fenced_session_id: renderer_publication_fenced_session_ref.current,
+                applied_snapshot_seq: applied_snapshot_seq_ref.current,
+                release_seq: press.release_seq,
+            }).kind === 'hold';
+            const retry = retry_press_ref.current;
+            if (retry !== null) {
+                const direction = retry.press.direction;
+                const give_up = () => {
+                    // The press behind it was for the stack as the retry
+                    // would have left it (a typing hold is not: see
+                    // `refuse_history_press`).
+                    retry_press_ref.current = null;
+                    if (held_press_ref.current?.typing !== true) held_press_ref.current = null;
+                    arm_history_press_timer();
+                    say_history(view_replay_wait_warning('refreshing', direction));
+                };
+                const arrived = (retry.awaits === 'delivery'
+                    ? snapshot_applied_seq_ref.current
+                    : applied_snapshot_seq_ref.current) > retry.posted_after;
+                if (history_press_gate(read_press_facts(true)).kind === 'reload-required') {
+                    // A header result needs a reload: nothing will clear it,
+                    // and that, not a refresh, is what to say.
+                    retry_press_ref.current = null;
+                    arm_history_press_timer();
+                    refuse_history_press('Reload this window to finish the header row change, then edit.');
+                } else if (history_press_bound_reached(retry.press, Date.now())) {
+                    give_up();
+                } else if (!arrived) {
+                    // A view replay with no snapshot applied since its post:
+                    // nothing says a refresh is coming. A cell or structural
+                    // replay waits for the delivery its refusal says is on
+                    // its way, until the bound.
+                    if (retry.awaits === 'applied') give_up();
+                } else if (
+                    history_press_gate(read_press_facts(true)).kind === 'run'
+                    && !(action_has_view_change(retry.entry.action)
+                        && !action_is_size_step(retry.entry.action)
+                        && releasing(retry.press))
+                    && step_wait_clear(retry.step_wait)
+                ) {
+                    const top = peek_history(history_store_ref.current!.snapshot(), direction);
+                    if (top.kind !== 'available' || top.entry !== retry.entry) {
+                        // Something else is on top now.
+                        give_up();
+                    } else {
+                        attempting_retry_ref.current = retry;
+                        try {
+                            // The press itself passes the gate its own
+                            // retry holds shut.
+                            void with_gesture_ticket(0, () => run_history_command(retry.press));
+                        } finally {
+                            attempting_retry_ref.current = null;
+                        }
+                        // Not held again: it posted, landed, or was answered.
+                        if (retry_press_ref.current === retry) {
+                            retry_press_ref.current = null;
+                            arm_history_press_timer();
+                        }
+                    }
+                }
+                // Otherwise it is left where it is. Nothing was written, so
+                // nothing wakes; the settling of what it waits for, or the
+                // timer at the bound, comes next.
+            }
+            const held = held_press_ref.current;
+            if (held === null) return;
+            const { press } = held;
+            const bound_reached = history_press_bound_reached(press, Date.now());
+            if (held.typing === true) {
+                if (editing_ref.current?.typing_pending() !== true) {
+                    // The keys have landed. With their editor open and
+                    // focused this is its own text undo; if nothing opened it
+                    // is an ordinary press, still the one that was made.
+                    held_press_ref.current = null;
+                    arm_history_press_timer();
+                    run_edit_command_ref.current(press.direction, press);
+                } else if (bound_reached) {
+                    // Not made into an ordinary press: the editor those keys
+                    // are for would open after it, and the press could not
+                    // be put in order with typing that came before it.
+                    held_press_ref.current = null;
+                    arm_history_press_timer();
+                    say_history(view_replay_wait_warning('applying', press.direction));
+                }
+                return;
+            }
+            const gate = history_press_gate(read_press_facts());
+            const waiting: HistoryPressWait | undefined = gate.kind === 'hold'
+                ? gate.wait
+                : gate.kind === 'run' && held.wait === 'finishing' && releasing(press)
+                    ? 'finishing'
+                    : gate.kind === 'run' && !step_wait_clear(held.step_wait)
+                        ? held.wait
+                        : undefined;
+            if (waiting !== undefined) {
+                if (bound_reached) {
+                    held_press_ref.current = null;
+                    arm_history_press_timer();
+                    say_history(view_replay_wait_warning(waiting, press.direction));
+                } else if (waiting !== held.wait) {
+                    held_press_ref.current = { ...held, wait: waiting };
+                }
+                return;
+            }
+            // Clear (or a fence that needs a reload, which the attempt says):
+            // a press made at this instant, which peeks the stack as it is.
+            held_press_ref.current = null;
+            arm_history_press_timer();
+            void run_history_command(press);
+        } finally {
+            draining_history_press_ref.current = false;
+            // Whatever still waits keeps a timer for its bound. One that fired
+            // early (a timer and the wall clock can disagree) found the bound
+            // not reached and would otherwise leave the press with no answer
+            // until some other render. Arming writes no state.
+            if (held_press_ref.current !== null || retry_press_ref.current !== null) {
+                arm_history_press_timer();
+            }
+        }
+    };
+    useEffect(() => {
+        drain_history_press();
+    });
+    useEffect(() => () => {
+        window.clearTimeout(history_press_timer_ref.current);
+        unwatch_view_replay();
+    }, [unwatch_view_replay]);
 
     /**
      * Undo and redo from the keyboard, for the VS Code webview.
@@ -7884,8 +8730,8 @@ export function App(): React.JSX.Element {
      * OS eats the accelerator before this listener could ever run.
      *
      * Key repeat is not filtered. Holding the chord down to walk back a run of
-     * edits is how the feature is used, and the coordinator's own busy refusal is
-     * already the throttle — a silent one, by design.
+     * edits is how the feature is used: a repeat that arrives while a step is
+     * still out is held, and carried out when that step has landed.
      */
     useEffect(() => {
         const handler = (event: KeyboardEvent) => {
@@ -7896,12 +8742,15 @@ export function App(): React.JSX.Element {
             event.preventDefault();
             event.stopPropagation();
             // Typed for an editor not open yet, where it would undo text.
-            if (editing_ref.current?.typing_held()) return;
-            void run_history_command(command);
+            if (editing_ref.current?.typing_pending()) {
+                hold_history_press_for_typing(command);
+                return;
+            }
+            press_history(command);
         };
         window.addEventListener('keydown', handler, true);
         return () => window.removeEventListener('keydown', handler, true);
-    }, [run_history_command]);
+    }, [hold_history_press_for_typing, press_history]);
 
     /**
      * Route the host's replay answers to the coordinator, and land a committed one.
@@ -8038,7 +8887,11 @@ export function App(): React.JSX.Element {
     // Copy / Select All arriving from a host menu that owns the keyboard
     // shortcut (the desktop app's native Edit menu). Whatever has focus decides:
     // the CSV cell editor's text field, otherwise the grid.
-    const run_edit_command = useCallback((command: EditCommand) => {
+    const run_edit_command = useCallback((
+        command: EditCommand,
+        // A press that was held for typed keys and is sent on by the drain.
+        handed_on?: HistoryPress,
+    ) => {
         // Before the text-field branch: Find opens from a cell editor too,
         // rather than copying the field.
         if (command === 'find') {
@@ -8072,14 +8925,18 @@ export function App(): React.JSX.Element {
         }
         if (command === 'undo' || command === 'redo') {
             // Typed for an editor not open yet, where it would undo text.
-            if (editing_ref.current?.typing_held()) return;
-            void run_history_command(command);
+            if (handed_on === undefined && editing_ref.current?.typing_pending()) {
+                hold_history_press_for_typing(command);
+                return;
+            }
+            press_history(command, handed_on);
             return;
         }
         const handle = grid_actions_ref.current;
         if (command === 'selectAll') handle?.select_all();
         else handle?.copy_selection();
-    }, [open_find, run_history_command]);
+    }, [hold_history_press_for_typing, open_find, press_history]);
+    run_edit_command_ref.current = run_edit_command;
 
     /**
      * The only writer besides a snapshot, which installs both, so the live
@@ -8300,7 +9157,6 @@ export function App(): React.JSX.Element {
             set_pending_excel_header(null);
             set_excel_header_status('');
         }
-        header_handoff_ref.current = null;
         header_fence_ref.current = false;
         header_reload_required_ref.current = false;
         header_edit_warning_ref.current = null;
@@ -8330,24 +9186,32 @@ export function App(): React.JSX.Element {
      * change (`HistoryEntry.bodyStarts`); nothing reads that field for a
      * view-only entry.
      *
-     * Answers `'handoff'` when a press was remembered during a replay that
-     * moved its entry: the caller then leaves the header fence up, and the
-     * effect below lowers it and carries the press out.
+     * A press made while the run was under way is held (a header change in
+     * flight is the first thing a press is asked), and is carried out by the
+     * drain after the render that follows the run's end. Until then the hold
+     * covers what the fence covered: nothing new can be recorded. A replay
+     * that did not move its entry drops that press, having said why.
      */
-    const end_header_run = (
-        failure?: { readonly reason: string },
-    ): 'handoff' | undefined => {
+    const end_header_run = (failure?: { readonly reason: string }) => {
         const run = header_run_ref.current;
-        if (run === null) return undefined;
+        if (run === null) return;
         header_run_ref.current = null;
         if (run.replay === undefined) {
-            if (run.changes.length === 0) return undefined;
+            if (run.changes.length === 0) {
+                // Nothing landed for the person's own gesture (rejected, its
+                // worksheet or view gone, or the fold refused): a press held
+                // behind it was for its step, and would otherwise undo the one
+                // under it (as with Cancel). One that landed and changed
+                // nothing is no failure, and the press runs.
+                if (run.landed === 0 || (failure ?? run.failed) !== undefined) drop_press_behind_unrecorded_gesture();
+                return;
+            }
             const record = history_store_ref.current!.stage_record({
                 label: header_step_label(run.changes),
                 changes: run.changes.map((delta) => ({ kind: 'view' as const, delta })),
             });
             commit_staged_transaction([record]);
-            return undefined;
+            return;
         }
         // A replay shows none of a gesture's status lines.
         set_excel_header_status('');
@@ -8355,52 +9219,27 @@ export function App(): React.JSX.Element {
         const failed = failure ?? run.failed;
         if (failed !== undefined) {
             if ('reason' in failed) {
-                show_warning(view_replay_refusal_warning(direction, entry.action.label, failed.reason));
+                refuse_history_press(view_replay_refusal_warning(direction, entry.action.label, failed.reason));
             } else if ('wait' in failed) {
-                show_warning(view_replay_wait_warning(failed.wait, direction));
+                refuse_history_press(view_replay_wait_warning(failed.wait, direction));
+            } else {
+                // Said by what the queue already says (a result that needs a reload).
+                refuse_history_press(null);
             }
-            return undefined;
+            return;
         }
-        const moved = land_view_replay(
+        land_view_replay(
             { ...run.replay, skipped: ordered_skips(run.skipped) },
             run.worksheet ?? entry.action.changes[0]!.delta.worksheet,
             run.landed === 0,
         );
-        if (!moved || run.then === undefined || run.last_delivery === undefined) return undefined;
-        header_handoff_ref.current = { direction: run.then, delivery: run.last_delivery };
-        set_header_handoff_tick((tick) => tick + 1);
-        return 'handoff';
     };
     /** End the run and the queue with it. */
     const finish_header_queue = (failure?: { readonly reason: string }) => {
-        if (end_header_run(failure) !== 'handoff') {
-            lower_header_fence();
-            return;
-        }
-        // The fence stays up with the queue gone, the state a result that
-        // needs a reload already leaves, so the drain does not lower it.
-        header_in_flight_ref.current = null;
-        for (const timer of header_timer_refs.current) clearTimeout(timer);
-        header_timer_refs.current = [];
-        replace_excel_header_queue(null);
+        end_header_run(failure);
+        lower_header_fence();
+        wake_history_press();
     };
-    /**
-     * Carry out the press remembered during a header step's replay.
-     *
-     * After the render that follows the replay's last result, and only if
-     * the snapshot that carried that result is the last one this window
-     * installed: then the stack, the header, and the grid are the ones the
-     * result left. Otherwise the press is dropped, saying nothing: the
-     * window may not be showing the header the entry under the step was made
-     * with, and a held key sends another press anyway.
-     */
-    useEffect(() => {
-        const handoff = header_handoff_ref.current;
-        if (handoff === null) return;
-        lower_header_fence_ref.current();
-        if (installed_snapshot_delivery_ref.current !== handoff.delivery) return;
-        void run_history_command_ref.current(handoff.direction);
-    }, [header_handoff_tick]);
 
     const drain_excel_header_queue = () => {
         const queue = excel_header_queue_ref.current;
@@ -8454,7 +9293,10 @@ export function App(): React.JSX.Element {
             // text commits, then raise the fence.
             if (
                 editing_session_held_ref.current
-                && editing_ref.current?.commit_live_edit() === false
+                && with_gesture_ticket(
+                    queue.ticket,
+                    () => editing_ref.current?.commit_live_edit(),
+                ) === false
             ) {
                 set_excel_header_status('Header row was not updated.');
                 finish_header_queue();
@@ -8553,7 +9395,6 @@ export function App(): React.JSX.Element {
         // A replay answers for itself: none of a gesture's status lines or
         // warnings are shown for it.
         const report = replaying ? 'handled' as const : 'report' as const;
-        if (run !== null) run.last_delivery = delivery;
         if (result.reloadRequired === true) {
             header_reload_required_ref.current = true;
             // What changed before this is recorded; a replay's entry stays,
@@ -8634,18 +9475,28 @@ export function App(): React.JSX.Element {
         ) return false;
         const sheets = meta_ref.current?.sheets ?? [];
         const { replay } = request;
+        // A header gesture made while a press of Undo or Redo is waiting is
+        // not queued. Queued, it would be carried out ahead of the press, the
+        // press would be held behind it, and the press would then undo the
+        // header step: a gesture made after it. (One asked for before the
+        // press is already in the queue, and finishes as it would have. Not
+        // asked through `history_free`, which would also refuse a gesture
+        // behind a replay or a write in flight, where it is queued.)
+        if (replay === undefined && history_press_held()) {
+            say_history_hold_gesture();
+            return false;
+        }
         const refusal = header_change_refusal(request.sheets);
         if (refusal !== undefined) {
-            host_bridge.postMessage({
-                type: 'showWarning',
-                message: replay === undefined
-                    ? `Could not change the header row: ${refusal}`
-                    : view_replay_refusal_warning(
-                        replay.direction,
-                        replay.entry.action.label,
-                        refusal,
-                    ),
-            });
+            if (replay === undefined) {
+                show_warning(`Could not change the header row: ${refusal}`);
+            } else {
+                refuse_history_press(view_replay_refusal_warning(
+                    replay.direction,
+                    replay.entry.action.label,
+                    refusal,
+                ));
+            }
             return false;
         }
         const grid_focus_sheet = request.grid_focus_sheet_index === undefined
@@ -8685,9 +9536,18 @@ export function App(): React.JSX.Element {
             fenced: replay !== undefined,
             flushed: false,
             ...(replay === undefined ? {} : { replay: replay.direction }),
+            ticket: gesture_ticket(),
         });
         return true;
-    }, [header_change_refusal, replace_excel_header_queue]);
+    }, [
+        gesture_ticket,
+        header_change_refusal,
+        history_press_held,
+        refuse_history_press,
+        replace_excel_header_queue,
+        say_history_hold_gesture,
+        show_warning,
+    ]);
     enqueue_excel_header_change_ref.current = enqueue_excel_header_change;
 
     const handle_toggle_excel_header = useCallback(() => {
@@ -8776,6 +9636,39 @@ export function App(): React.JSX.Element {
         // here until the host's next snapshot, and a replay prepared against
         // it would be refused for a session this panel no longer owns.
         if (editing_session_held_ref.current && csv_edit_session_id_ref.current !== undefined) return true;
+        // A transform of this window still installing (a restore the window
+        // posted after the press was let through, say): the host refuses a
+        // session until it has, so the request waits for it instead of being
+        // refused. A replaced document ends the wait, and the replay with it.
+        // The last check and the request below are one synchronous step, so a
+        // restore cannot be posted in between.
+        const document = history_document_ref.current;
+        const deadline = Date.now() + HISTORY_PRESS_HOLD_MS;
+        let waited_discard = discarding;
+        for (;;) {
+            const wait = next_window_transform_wait(() => true, deadline, document);
+            if (wait !== 'clear' && wait !== 'past-bound') {
+                // Counted only while it waits for transforms: a Cancel of one
+                // of them may go through then (`cancel_blocked`), and not
+                // while it waits out a discard, when the host refuses one.
+                replay_waiting_for_transforms_ref.current += 1;
+                let next: 'again' | 'replaced';
+                try {
+                    next = await wait;
+                } finally {
+                    replay_waiting_for_transforms_ref.current -= 1;
+                }
+                if (next === 'replaced') return false;
+                continue;
+            }
+            // A discard that started meanwhile is waited out too, and
+            // the transforms are asked about again after it.
+            const discarding_now = discard_cleanup_ref.current;
+            if (discarding_now === undefined || discarding_now === waited_discard) break;
+            if (!await discarding_now.settled) return false;
+            waited_discard = discarding_now;
+        }
+        if (editing_session_held_ref.current && csv_edit_session_id_ref.current !== undefined) return true;
         // A request already in flight — an editing gesture made a moment ago —
         // is joined rather than duplicated: the host answers one request, and a
         // second would be refused while the first is outstanding.
@@ -8805,7 +9698,7 @@ export function App(): React.JSX.Element {
             });
         }
         return grant.settled;
-    }, []);
+    }, [next_window_transform_wait]);
     // In an effect, not the render body: a render-phase write is a side effect,
     // and StrictMode's double render makes that a rule with teeth. A layout effect
     // is early enough — nothing calls this before the user asks for a replay.
@@ -8834,6 +9727,59 @@ export function App(): React.JSX.Element {
         if (held()) return true;
         const discarding = discard_cleanup_ref.current;
         if (discarding !== undefined && !await discarding.settled) return false;
+        if (held()) return true;
+        // A restore of the saved view this window posted (after a Save, say)
+        // is waited for: the person did not ask for it, and an edit refused
+        // for it would read as a sort of theirs in the way. Not for a quiet
+        // request (a menu opening), which is refused quietly as before, nor
+        // for one that joins a request already out.
+        if (!quiet && pending_edit_request_ref.current === null) {
+            const document = history_document_ref.current;
+            const generation = generation_ref.current;
+            const visit = sheet_visit_ref.current;
+            const grid = grid_instance_ref.current;
+            // The sheet the gesture is on, by identity: a snapshot that puts
+            // another worksheet at its index replaces the grid too.
+            const sheet_index = active_sheet_index_for_focus_ref.current;
+            const sheet_identity = () => {
+                const sheet = meta_ref.current?.sheets[sheet_index];
+                return sheet?.worksheetId ?? sheet?.name;
+            };
+            const identity = sheet_identity();
+            const deadline = Date.now() + HISTORY_PRESS_HOLD_MS;
+            const restoring = (sheet_index: number) => pending_transform_origins_ref.current[sheet_index] === 'restore';
+            for (;;) {
+                const wait = next_window_transform_wait(restoring, deadline, document);
+                if (wait === 'clear' || wait === 'past-bound') break;
+                if (await wait === 'replaced') return false;
+                // The person went to another sheet (even if they came back):
+                // the grid that held the gesture is gone, and the gesture with
+                // it. Nothing is said; they left it. Asked first, so a view that
+                // also moved meanwhile does not speak for a gesture left behind.
+                if (sheet_visit_ref.current !== visit || sheet_identity() !== identity) return false;
+                // The view moved under it: said below.
+                if (generation_ref.current !== generation) break;
+                // Another grid on the same sheet (the document loaded again):
+                // the gesture's keys went with the old one, and again nothing
+                // is said.
+                if (grid_instance_ref.current !== grid) return false;
+                if (held()) return true;
+            }
+            // A restore that moved the view remounted the grid that holds the
+            // gesture's keys: nothing is left to open an editor for, so the
+            // edit is refused with a reason, as it was before it could wait.
+            // That is most restores (one computed afresh after a refresh moves
+            // the generation); only one the host acknowledges as already in
+            // place lets the edit through. A refresh can move it too, so the
+            // reason names the view, not a sort.
+            if (generation_ref.current !== generation) {
+                host_bridge.postMessage({
+                    type: 'showWarning',
+                    message: 'The table view changed before the edit could start. Try again.',
+                });
+                return false;
+            }
+        }
         if (held()) return true;
         if (pending_edit_request_ref.current === null) {
             // Only work in flight, and only because the host refuses it: warning
@@ -8872,7 +9818,7 @@ export function App(): React.JSX.Element {
         const grant = session_grant_ref.current ?? pending_signal<boolean>();
         session_grant_ref.current = grant;
         return grant.settled;
-    }, []);
+    }, [next_window_transform_wait]);
 
     /**
      * Release a session that holds nothing: no unsaved change on any worksheet,
@@ -8954,7 +9900,10 @@ export function App(): React.JSX.Element {
         || edit_session_pending
         || preview_mode
         || pending_excel_header_ref.current !== null
-        || !base_gestures_admitted()
+        // A replay still waiting for this window's transforms has asked the
+        // host for nothing yet: a Cancel of one of them goes through, and the
+        // replay waits for the cancel's answer instead.
+        || !base_gestures_admitted(true)
     ), [base_gestures_admitted, edit_session_pending, preview_mode]);
 
     /**
@@ -9158,6 +10107,13 @@ export function App(): React.JSX.Element {
             || !Number.isSafeInteger(count)
             || count <= 0
         ) return Promise.resolve(undefined);
+        // Rows asked for while a press of Undo or Redo is waiting are not
+        // added: the press would then remove rows added after it. Rows asked
+        // for before the press carry their ticket to this check.
+        if (!press_admits()) {
+            say_history_hold_gesture();
+            return Promise.resolve(undefined);
+        }
         const source_generation = source_generation_ref.current;
         const request_id = [
             'append',
@@ -9552,10 +10508,21 @@ export function App(): React.JSX.Element {
             pending_state !== undefined
             && transforms_semantically_equal(current, previous)
         ) return;
+        // A press of Undo or Redo waiting behind what is cancelled is dropped
+        // with it, and nothing is said. The cancel replaces the pending
+        // record with no answer to anyone, so nothing else would end that
+        // press, and it would then run against a stack it was not made for:
+        // an Undo held behind a slow Undo would start the same undo the
+        // person has just stopped; a Redo held behind it would redo an older
+        // entry; an Undo held behind the person's own sort would undo the
+        // step under a sort that was never recorded. Cancel is the person's
+        // own instruction to stop, made after the press.
+        drop_history_presses({ keep_typing: true });
         request_transform(active_sheet_index, previous, 'cancel');
     }, [
         active_sheet_index,
         cancel_blocked,
+        drop_history_presses,
         meta,
         request_transform,
         sheet_views,
@@ -9612,6 +10579,7 @@ export function App(): React.JSX.Element {
                 if (pending_edit_request_ref.current !== msg.requestId) return;
                 pending_edit_request_ref.current = null;
                 set_edit_session_pending(false);
+                set_restore_wake((wake) => wake + 1);
                 if (msg.granted && msg.editSessionId) {
                     if (!diff_mode_initialized_ref.current) {
                         set_diff_mode(msg.diffOnByDefault ?? diff_on_by_default_ref.current);
@@ -9694,18 +10662,37 @@ export function App(): React.JSX.Element {
                         });
                     }
                     pending.resolve(undefined);
+                    // The person's own gesture was refused, so nothing was recorded: a press
+                    // held behind it was for its step, and would otherwise undo the one under it
+                    // (as with Cancel).
+                    drop_press_behind_unrecorded_gesture();
+                    wake_history_press();
                     if (msg.reason) {
                         host_bridge.postMessage({ type: 'showWarning', message: msg.reason });
                     }
                     return;
                 }
                 let settled = false;
+                // The document the admission was granted in: a refusal to
+                // install it, if a replacement came first, is not about a press
+                // made in the new one.
+                const admitted_document = history_document_ref.current;
+                // In flight for a press until the grid has installed it, or not.
+                unsettled_admissions_ref.current.add(msg.requestId);
                 pending.resolve({
                     columnIds: msg.columnIds,
                     structuralBasis: msg.structuralBasis,
                     settle: (accepted) => {
                         if (settled) return;
                         settled = true;
+                        unsettled_admissions_ref.current.delete(msg.requestId);
+                        // The grid did not install what was admitted: the
+                        // person's own gesture recorded nothing, and a press
+                        // held behind it was for its step.
+                        if (!accepted && history_document_ref.current === admitted_document) {
+                            drop_press_behind_unrecorded_gesture();
+                        }
+                        wake_history_press();
                         host_bridge.postMessage({
                             type: 'settleRowAdmission',
                             requestId: msg.requestId,
@@ -9753,12 +10740,23 @@ export function App(): React.JSX.Element {
                         });
                     }
                     pending.resolve(undefined);
+                    // The person's own gesture was refused, so nothing was recorded: a press
+                    // held behind it was for its step, and would otherwise undo the one under it
+                    // (as with Cancel).
+                    drop_press_behind_unrecorded_gesture();
+                    wake_history_press();
                     if (msg.reason) {
                         host_bridge.postMessage({ type: 'showWarning', message: msg.reason });
                     }
                     return;
                 }
                 let settled = false;
+                // The document the admission was granted in: a refusal to
+                // install it, if a replacement came first, is not about a press
+                // made in the new one.
+                const admitted_document = history_document_ref.current;
+                // In flight for a press until the grid has installed it, or not.
+                unsettled_admissions_ref.current.add(msg.requestId);
                 pending.resolve({
                     rowIds: msg.rowIds,
                     formatTemplate: msg.formatTemplate,
@@ -9767,6 +10765,14 @@ export function App(): React.JSX.Element {
                     settle: (accepted) => {
                         if (settled) return;
                         settled = true;
+                        unsettled_admissions_ref.current.delete(msg.requestId);
+                        // The grid did not install what was admitted: the
+                        // person's own gesture recorded nothing, and a press
+                        // held behind it was for its step.
+                        if (!accepted && history_document_ref.current === admitted_document) {
+                            drop_press_behind_unrecorded_gesture();
+                        }
+                        wake_history_press();
                         host_bridge.postMessage({
                             type: 'settleRowAdmission',
                             requestId: msg.requestId,
@@ -9801,12 +10807,23 @@ export function App(): React.JSX.Element {
                         });
                     }
                     pending.resolve(undefined);
+                    // The person's own gesture was refused, so nothing was recorded: a press
+                    // held behind it was for its step, and would otherwise undo the one under it
+                    // (as with Cancel).
+                    drop_press_behind_unrecorded_gesture();
+                    wake_history_press();
                     if (msg.reason) {
                         host_bridge.postMessage({ type: 'showWarning', message: msg.reason });
                     }
                     return;
                 }
                 let settled = false;
+                // The document the admission was granted in: a refusal to
+                // install it, if a replacement came first, is not about a press
+                // made in the new one.
+                const admitted_document = history_document_ref.current;
+                // In flight for a press until the grid has installed it, or not.
+                unsettled_admissions_ref.current.add(msg.requestId);
                 pending.resolve({
                     rowIds: msg.rowIds,
                     formatTemplate: msg.formatTemplate,
@@ -9814,6 +10831,14 @@ export function App(): React.JSX.Element {
                     settle: (accepted) => {
                         if (settled) return;
                         settled = true;
+                        unsettled_admissions_ref.current.delete(msg.requestId);
+                        // The grid did not install what was admitted: the
+                        // person's own gesture recorded nothing, and a press
+                        // held behind it was for its step.
+                        if (!accepted && history_document_ref.current === admitted_document) {
+                            drop_press_behind_unrecorded_gesture();
+                        }
+                        wake_history_press();
                         host_bridge.postMessage({
                             type: 'settleRowAdmission',
                             requestId: msg.requestId,
@@ -10252,8 +11277,12 @@ export function App(): React.JSX.Element {
             !identity
             || preview_mode_ref.current
             || pending_highlight_request_ref.current
-            || !edit_gestures_admitted()
         ) return;
+        if (!edit_gestures_admitted()) {
+            // Said only while a press of Undo or Redo is waiting.
+            if (history_press_held()) say_history_hold_gesture();
+            return;
+        }
         if (editing_ref.current?.commit_live_edit() === false) return;
         const request_id = [
             'highlight',
@@ -10273,7 +11302,7 @@ export function App(): React.JSX.Element {
             sourceGeneration: source_generation_ref.current,
             snapshotIdentity: identity,
         });
-    }, [edit_gestures_admitted]);
+    }, [edit_gestures_admitted, history_press_held, say_history_hold_gesture]);
 
     const handle_toggle_tab_orientation = useCallback(() => {
         set_vertical_tabs((prev) => {
@@ -10437,6 +11466,7 @@ export function App(): React.JSX.Element {
             snapshotAdopted: false,
         };
         sync_view_request_pending();
+        if (options.replay !== undefined) watch_view_replay(request_id, options.replay.direction);
         host_bridge.postMessage({
             type: 'setColumnWidths',
             requestId: request_id,
@@ -10479,7 +11509,14 @@ export function App(): React.JSX.Element {
         const index_of = (sheet: PendingWidthSheet) => worksheet_target_index(meta_sheets, sheet.worksheet);
         if (outcome.kind === 'overtaken') {
             if (pending.replay !== undefined) {
-                show_warning(view_replay_wait_warning('refreshing', pending.replay.direction));
+                // A refresh of another source overtook the write: tried
+                // again against what that refresh brought.
+                hand_over_history_retry(pending.replay.press, pending.replay.entry, pending.replay.posted_after);
+            } else if (!pending.owed) {
+                // Nothing recorded for the person's own gesture: a press held behind it
+                // was for its step, and would otherwise undo the one under it (as with Cancel).
+                // (An owed fit is nobody's gesture: a press held behind it runs.)
+                drop_press_behind_unrecorded_gesture();
             }
             return;
         }
@@ -10514,6 +11551,7 @@ export function App(): React.JSX.Element {
             const changes: { kind: 'view'; delta: ViewHistoryDelta }[] = [];
             let columns = 0;
             let auto_fit: AutoFitChange | undefined;
+            let resolved = 0;
             for (const sheet_change of outcome.change) {
                 const sheet = meta_sheets[sheet_change.sheetIndex];
                 // A worksheet a reload removed since the post has no step.
@@ -10521,6 +11559,7 @@ export function App(): React.JSX.Element {
                     (candidate) => index_of(candidate) === sheet_change.sheetIndex,
                 );
                 if (sheet === undefined || pending_sheet === undefined) continue;
+                resolved += 1;
                 const step = column_widths_view_step(
                     {
                         sheetIndex: sheet_change.sheetIndex,
@@ -10535,7 +11574,13 @@ export function App(): React.JSX.Element {
                 columns += sheet_change.columns.length;
                 auto_fit ??= pending_sheet.autoFit;
             }
-            if (changes.length === 0) return;
+            if (changes.length === 0) {
+                // Every worksheet it changed is gone: the person's own gesture
+                // recorded nothing it should have. (A write that changed
+                // nothing is no failure.)
+                if (!pending.owed && outcome.change.length > 0 && resolved === 0) drop_press_behind_unrecorded_gesture();
+                return;
+            }
             const record = history_store_ref.current!.stage_record({
                 label: column_widths_label(columns, auto_fit),
                 changes,
@@ -10590,19 +11635,28 @@ export function App(): React.JSX.Element {
             return;
         }
         if (pending.replay !== undefined) {
-            show_warning(outcome.unresolved
-                ? view_replay_refusal_warning(
+            if (outcome.unresolved) {
+                refuse_history_press(view_replay_refusal_warning(
                     pending.replay.direction,
                     pending.replay.entry.action.label,
                     UNRESOLVED_SAVE_SIZE_REASON,
-                )
-                : view_replay_wait_warning('refreshing', pending.replay.direction));
+                ));
+            } else {
+                hand_over_history_retry(pending.replay.press, pending.replay.entry, pending.replay.posted_after);
+            }
         } else {
             show_warning(outcome.unresolved ? SIZE_WRITE_UNRESOLVED_MESSAGE : SIZE_WRITE_REFUSED_MESSAGE);
+            // The person's own gesture was refused, so nothing was recorded: a press
+            // held behind it was for its step, and would otherwise undo the one under it
+            // (as with Cancel).
+            drop_press_behind_unrecorded_gesture();
         }
     }, [
         cancel_pending_auto_fit_for_sheet,
+        drop_press_behind_unrecorded_gesture,
+        hand_over_history_retry,
         land_view_replay,
+        refuse_history_press,
         set_auto_fit_for_sheet,
         show_warning,
         update_pending_auto_fit_sheets,
@@ -11184,7 +12238,10 @@ export function App(): React.JSX.Element {
     const handle_grid_idle = useCallback(() => {
         release_edit_session_if_idle();
         try_apply_pending_auto_fit();
-    }, [release_edit_session_if_idle, try_apply_pending_auto_fit]);
+        // A gesture that waited for the session has run, or an admission the
+        // grid was asked for has finished: a press held behind it asks again.
+        wake_history_press();
+    }, [release_edit_session_if_idle, try_apply_pending_auto_fit, wake_history_press]);
 
     const handle_auto_fit_all_sheets = useCallback(() => {
         // Asked first: refused, no sheet is owed a fit.
@@ -12253,6 +13310,12 @@ export function App(): React.JSX.Element {
             on_insert_columns={request_structural_column_insert}
             history_store={history_store_ref.current!}
             gestures_admitted={edit_gestures_admitted}
+            history_press_held={history_press_held}
+            on_history_hold_gesture={say_history_hold_gesture}
+            gesture_ticket={gesture_ticket}
+            with_gesture_ticket={with_gesture_ticket}
+            on_held_typing_end={wake_history_press}
+            on_gesture_unrecorded={drop_press_for_unrecorded_gesture}
             host_rejected_keys={live_rejected_keys}
             host_observed_bases={live_host_observed_bases}
             on_editing_change={handle_editing_change}

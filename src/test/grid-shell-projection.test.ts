@@ -11008,6 +11008,70 @@ describe('row Move by menu, shortcut, and drag', () => {
         expect(announcement()).toBe('Moved 2 rows up');
     });
 
+    it('tells App a keyboard move made before a session recorded nothing when the move is refused after the grant', async () => {
+        const pending = create_pending_row_store({ session_id: 'session' });
+        const history = create_history_store();
+        const on_gesture_unrecorded = vi.fn();
+        let grant!: (granted: boolean) => void;
+        const shared = {
+            edit_session: create_edit_session_store({ session_id: 'session' }),
+            pending_row_store: pending,
+            history_store: history,
+            on_gesture_unrecorded,
+            gesture_ticket: () => 3,
+        } satisfies Partial<GridShellProps>;
+        const GridShell = await render_grid(structure_props({
+            ...shared,
+            editing_session_held: false,
+            edit_session_id: undefined,
+            on_request_edit_session: () => new Promise<boolean>((resolve) => { grant = resolve; }),
+        }));
+        const on_key_down = () => grid_mock.props!.onKeyDown as (args: Record<string, unknown>) => void;
+        const rows = grid_mock.props!.rows as number;
+        // The last row, moved down: refused ("already at the bottom").
+        await select_rows([rows - 1]);
+        await act(async () => on_key_down()(key('ArrowDown')));
+        grant(true);
+        await act(async () => {
+            root!.render(React.createElement(GridShell, structure_props(shared)));
+        });
+
+        await vi.waitFor(() => expect(on_gesture_unrecorded).toHaveBeenCalledWith(3));
+        expect(peek_history(history.snapshot(), 'undo').kind).not.toBe('available');
+
+    });
+
+    it('does not report a keyboard move made before a session that went through after the grant', async () => {
+        const pending = create_pending_row_store({ session_id: 'session' });
+        const history = create_history_store();
+        const on_gesture_unrecorded = vi.fn();
+        let grant!: (granted: boolean) => void;
+        const shared = {
+            edit_session: create_edit_session_store({ session_id: 'session' }),
+            pending_row_store: pending,
+            history_store: history,
+            on_gesture_unrecorded,
+            gesture_ticket: () => 3,
+        } satisfies Partial<GridShellProps>;
+        const GridShell = await render_grid(structure_props({
+            ...shared,
+            editing_session_held: false,
+            edit_session_id: undefined,
+            on_request_edit_session: () => new Promise<boolean>((resolve) => { grant = resolve; }),
+        }));
+        const on_key_down = grid_mock.props!.onKeyDown as (args: Record<string, unknown>) => void;
+        await select_rows([1]);
+        await act(async () => on_key_down(key('ArrowDown')));
+        grant(true);
+        await act(async () => {
+            root!.render(React.createElement(GridShell, structure_props(shared)));
+        });
+
+        await vi.waitFor(() => expect(peek_history(history.snapshot(), 'undo').kind).toBe('available'));
+        await act(async () => { await Promise.resolve(); });
+        expect(on_gesture_unrecorded).not.toHaveBeenCalled();
+    });
+
     it('leaves Alt+Shift+arrows alone without a whole-row selection, or in an editor', async () => {
         const { pending } = await render_moves();
         const on_key_down = grid_mock.props!.onKeyDown as (args: Record<string, unknown>) => void;

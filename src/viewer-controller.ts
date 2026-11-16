@@ -138,6 +138,7 @@ import {
 import { reconcile_finalization } from './finalization-reconciliation';
 import {
     SourceCandidate,
+    same_physical_observation,
     type PhysicalSourceObservation,
 } from './source-candidate';
 import {
@@ -3126,6 +3127,57 @@ export function attach_viewer(
         TransformAuthority
     >();
     const latest_transform_authority_by_sheet = new Map<number, TransformAuthority>();
+    // Transform work whose answer the renderer already has, still reconciling
+    // durable state and holding the transform admission until it ends.
+    const answered_transform_authorities = new Set<TransformAuthority>();
+    // The view the last snapshot posted showed, to tell when a snapshot moves
+    // it. Installs are not followed: the renderer ignores one whose request it
+    // no longer holds, and a baseline moved by that would miss the next move
+    // and refuse a session. Compared with snapshots only, a redelivery after an
+    // install can count as a move, which only makes a request wait.
+    let last_posted_view: { readonly generation: number; readonly sourceGeneration: number } | undefined;
+    // The view of the last snapshot handed to the renderer, delivered or not:
+    // a transform the renderer asked for from an older view arrives after it,
+    // and the renderer drops that request when it applies the snapshot.
+    let last_offered_view: { readonly generation: number; readonly sourceGeneration: number } | undefined;
+    /**
+     * A snapshot is being posted. One that moves the view (a new generation
+     * or source generation) makes the renderer drop every transform it was
+     * waiting for: a reconciliation installed a saved view, or the source
+     * changed. Work still running for those requests is then, as far as the
+     * renderer knows, done, and a session request waits it out rather than
+     * being refused for it. Records the view as offered at once; returns the
+     * callback that moves the baseline, to call once the post is accepted.
+     */
+    function note_snapshot_posted(snapshot: { readonly generation: number; readonly sourceGeneration: number }): () => void {
+        const view = { generation: snapshot.generation, sourceGeneration: snapshot.sourceGeneration };
+        last_offered_view = view;
+        const moved = last_posted_view !== undefined && (
+            last_posted_view.generation !== view.generation
+            || last_posted_view.sourceGeneration !== view.sourceGeneration
+        );
+        if (moved) {
+            for (const authority of transform_authorities.values()) answered_transform_authorities.add(authority);
+        }
+        // The baseline moves only once the renderer has the snapshot: a post
+        // that fails is retried, and the retry must still count as a move.
+        return () => { last_posted_view = view; };
+    }
+
+    /**
+     * The renderer is being told the answer to `request_id` on `sheet_index`:
+     * that transform is done as far as the renderer knows. Marked before the
+     * post settles, because the renderer may ask for a session as soon as the
+     * answer arrives. (Work it superseded or that went stale is no longer
+     * current, which a session request also waits out; see below.)
+     */
+    function note_transform_answered(sheet_index: number, request_id: string): void {
+        for (const [message, authority] of transform_authorities) {
+            if (message.sheetIndex === sheet_index && message.requestId === request_id) {
+                answered_transform_authorities.add(authority);
+            }
+        }
+    }
     const transform_commit_barriers = new Set<TransformAuthority>();
     let load_seq = 0;
     let latest_refresh_event: FileRefreshEvent | undefined;
@@ -4696,9 +4748,17 @@ export function attach_viewer(
             || (receiver_epoch !== undefined
                 && receiver_epoch !== session.current_receiver_epoch)
         ) return Promise.resolve(false);
+        const delivered = message.type === 'workbookSnapshot'
+            ? note_snapshot_posted(message.snapshot)
+            : undefined;
         try {
             options.integrationTestPort?.on_host_message(message);
-            return Promise.resolve(webview.postMessage(message)).catch(() => false);
+            return Promise.resolve(webview.postMessage(message))
+                .then((accepted) => {
+                    if (accepted) delivered?.();
+                    return accepted;
+                })
+                .catch(() => false);
         } catch {
             return Promise.resolve(false);
         }
@@ -9249,6 +9309,7 @@ export function attach_viewer(
                     durablePendingEditKeys: durable_pending_edit_keys,
                     durableRowHeights: durable_row_heights,
                     ...(compare_mode ? { onRowWindowServed: start_compare_diff } : {}),
+                    onTransformAnswered: note_transform_answered,
                 },
                 (installed) => {
                     installed.begin_receiver_epoch(session.current_receiver_epoch);
@@ -10826,7 +10887,7 @@ export function attach_viewer(
                 || receiver_epoch !== session.current_receiver_epoch
                 || !core
                 || message.sourceGeneration !== core.source_generation
-                || source_observation !== observation
+                || !same_physical_observation(source_observation, observation)
             ) {
                 await refuse('The workbook changed while the row format was being captured.');
                 return;
@@ -11244,7 +11305,7 @@ export function attach_viewer(
             if (
                 content_digest(raw) !== observation.digest
                 || !session_is_current()
-                || source_observation !== observation
+                || !same_physical_observation(source_observation, observation)
             ) {
                 await refuse('The workbook changed while the row format was being captured.');
                 return;
@@ -11615,7 +11676,7 @@ export function attach_viewer(
         }
         if (
             content_digest(raw) !== observation.digest
-            || source_observation !== observation
+            || !same_physical_observation(source_observation, observation)
             || !edit_message_is_current(message.editSessionId)
         ) {
             await reply(false);
@@ -11902,7 +11963,7 @@ export function attach_viewer(
             const raw = await host.fs.read_file(uri);
             if (
                 content_digest(raw) !== observation.digest
-                || source_observation !== observation
+                || !same_physical_observation(source_observation, observation)
                 || !edit_message_is_current(message.editSessionId)
                 || receiver_epoch !== session.current_receiver_epoch
             ) {
@@ -13478,8 +13539,22 @@ export function attach_viewer(
             message.sheetIndex,
             transform_authority,
         );
+        // Asked for from a view older than the last snapshot handed to the
+        // renderer. Usually the renderer drops this request when it applies
+        // that snapshot (or already has). If an install already moved the
+        // renderer to that view, it keeps the request until it is answered and
+        // asks for no session meanwhile, so marking it here has no effect on
+        // that renderer's requests. Either way a session request waits this
+        // out rather than being refused for it. Do not narrow this to
+        // snapshots the renderer saw move.
+        if (
+            last_offered_view !== undefined
+            && (message.generation < last_offered_view.generation
+                || message.sourceGeneration < last_offered_view.sourceGeneration)
+        ) answered_transform_authorities.add(transform_authority);
         try {
             await core?.handle_message(message);
+            answered_transform_authorities.add(transform_authority);
             try {
                 await reconcile_transform_terminal(message, transform_authority);
             } catch (error) {
@@ -13489,6 +13564,7 @@ export function attach_viewer(
                 );
             }
         } finally {
+            answered_transform_authorities.delete(transform_authority);
             if (transform_authorities.get(message) === transform_authority) {
                 transform_authorities.delete(message);
             }
@@ -14374,6 +14450,33 @@ export function attach_viewer(
                     current_edit_cleanup_waiter = undefined;
                 }
                 if (!request_is_current()) return;
+                // Transform work the renderer is no longer waiting for still
+                // holds the transform admission until it ends: work it has been
+                // answered for (reconciling durable state now), and work no
+                // longer current (superseded on its sheet by a later request,
+                // or left behind by a new source or receiver), which notices and
+                // stops. A request made after that (a replay or an edit the
+                // renderer held back) waits for it instead of being refused for
+                // a sort nobody is waiting on. Current work not yet answered
+                // still refuses, as below. Asked again after each wait: more may
+                // have joined meanwhile. Each wait ends with a reconciliation (a
+                // bounded number of state reads) or a stale computation's next
+                // cancellation check, so the loop needs no bound of its own. (The
+                // renderer's own 5 s bound covers only its wait before posting
+                // this request; a press it holds is told it has not finished
+                // after the replay lease, as for any slow answer.)
+                const settling = () => [...transform_authorities]
+                    .filter(([message, authority]) => (
+                        answered_transform_authorities.has(authority)
+                        || !transform_authority_is_current(message, authority)
+                    ))
+                    .map(([, authority]) => authority.completion);
+                // Not for a quiet request (a menu opening): it is refused quietly
+                // as before, and must not hold the next request behind it.
+                for (let waiting = settling(); msg.quiet !== true && waiting.length > 0; waiting = settling()) {
+                    await Promise.all(waiting);
+                    if (!request_is_current()) return;
+                }
                 let phase = edit_phase();
                 let cleanup_blocked = phase.type === 'cleanupPending'
                     || phase.type === 'uncertain';
@@ -16761,7 +16864,7 @@ export function attach_viewer(
             && adoption?.resources.source === src
             && adoption.resources.core === replay_core
             && replay_core.source_generation === bound_source_generation
-            && source_observation === observation
+            && same_physical_observation(source_observation, observation)
             && session.acknowledged_current()
             && source_authority.authorityRevision === expected_authority
             && source_authority.physicalRevision === expected_physical_revision
@@ -17391,13 +17494,21 @@ export function attach_viewer(
         // the replay was in flight — and must leave history exactly where it is.
         let conflicted = false;
         let unavailable = false;
+        // Whether the updater ran at all, and whether it found the view this
+        // replay was prepared against already replaced. Either way nothing
+        // was compared and nothing was written: that is a view that moved,
+        // not a conflict and not a failure, and the window prepares afresh.
+        let updater_ran = false;
+        let view_moved = false;
         let committed_structures: readonly HistoryReplayAcceptedStructuralWrite[] | undefined;
-        await update_file_state((current, updater_sheets) => {
+        const written = await update_file_state((current, updater_sheets) => {
+            updater_ran = true;
             conflicted = false;
             unavailable = false;
+            view_moved = false;
             committed_structures = undefined;
             if (!payload.isCurrent()) {
-                unavailable = true;
+                view_moved = true;
                 return current;
             }
             // Re-verified INSIDE the updater, which is what makes the check
@@ -17672,8 +17783,19 @@ export function attach_viewer(
 
         if (unavailable) return refused('unavailable');
         if (conflicted) return refused('conflict');
+        // A refresh that lands during `update_file_state`'s own read fails its
+        // first validation, and the updater is never called.
+        if (!updater_ran || view_moved) return refused('document-changed');
         if (committed_structures === undefined) return refused('conflict');
-        if (!payload.isCurrent()) return refused('document-changed');
+        // `written` is the snapshot this call committed, and undefined when it
+        // committed none (it lost its compare-and-swap to a view that moved,
+        // or the state already held everything the replay writes). A view
+        // that moved after this call's write is said apart, because the
+        // write is in the file: trying the replay again would not be a
+        // second attempt at something that did not happen.
+        if (!payload.isCurrent()) {
+            return refused(written === undefined ? 'document-changed' : 'changed-after-write');
+        }
         if (!accept_replay_row_admissions(
             payload.rowAdmissionRequestIds,
             request.leaseId,

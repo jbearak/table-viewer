@@ -316,10 +316,11 @@ export function create_history_replay_coordinator(
             // A view step is not this protocol's to replay: it writes no
             // document content, and its caller replays it through the view
             // request its gesture used. That caller never gets here with one;
-            // if one arrives all the same, it is refused as `busy`, which says
-            // nothing and changes nothing, never built into a cell request.
+            // if one arrives all the same, it is refused as `view-step`, on
+            // which the caller starts the press again from the peek. It is
+            // never built into a cell request.
             if (action_has_view_change(before_acquiring.entry.action)) {
-                resolve({ kind: 'refused', reason: 'busy' });
+                resolve({ kind: 'refused', reason: 'view-step' });
                 return;
             }
             if (entry_for_replay(before_acquiring.entry) === undefined) {
@@ -369,9 +370,12 @@ export function create_history_replay_coordinator(
                 // We only await here when the original entry needed a session, so
                 // the session now held is sufficient for any replacement entry
                 // (and harmless for a highlight-only one).
-                // A view step that reached the top across the acquisition.
+                // A view step that reached the top across the acquisition: a
+                // sort of this window installed, and recorded, meanwhile. The
+                // press is for the newest entry, so the caller starts again
+                // from the peek and replays the view step.
                 if (action_has_view_change(peek.entry.action)) {
-                    release(held, { kind: 'refused', reason: 'busy' });
+                    release(held, { kind: 'refused', reason: 'view-step' });
                     return;
                 }
                 const replay_entry = entry_for_replay(peek.entry);

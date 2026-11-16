@@ -185,6 +185,13 @@ type DurableRowHeightsProvider = (sheet_names: readonly string[]) => {
     readonly heights: readonly (Record<number, number> | undefined)[];
 };
 
+/**
+ * Told, just before a transform's answer (`transformInstalled` or
+ * `transformRefused`) is handed to the webview, which request it answers.
+ * The webview may act on the answer before the post's promise settles.
+ */
+type TransformAnswered = (sheet_index: number, request_id: string) => void;
+
 type RowWindowServed = (
     msg: Extract<WebviewMessage, { type: 'requestRows' }>,
     window: Pick<TransformedRowWindow, 'startRow' | 'sourceRows'>,
@@ -450,6 +457,7 @@ export class ViewerPanelCore {
     private readonly durable_pending_edit_keys?: (sheet_index: number) => readonly string[];
     private readonly durable_row_heights?: DurableRowHeightsProvider;
     private readonly on_row_window_served?: RowWindowServed;
+    private readonly on_transform_answered?: TransformAnswered;
     /**
      * The last computed display-keyed projection, with the facts it is a function of.
      * See `row_height_projection_by_sheet` for why each is needed and why a memo is
@@ -518,6 +526,7 @@ export class ViewerPanelCore {
              * request, so an augmenting sidecar cannot migrate across receivers.
              */
             onRowWindowServed?: RowWindowServed;
+            onTransformAnswered?: TransformAnswered;
         },
     ) {
         this.max_cached_pages = opts?.maxCachedPages ?? DEFAULT_MAX_CACHED_PAGES;
@@ -533,6 +542,7 @@ export class ViewerPanelCore {
         this.durable_pending_edit_keys = opts?.durablePendingEditKeys;
         this.durable_row_heights = opts?.durableRowHeights;
         this.on_row_window_served = opts?.onRowWindowServed;
+        this.on_transform_answered = opts?.onTransformAnswered;
     }
 
     get generation(): number {
@@ -2153,6 +2163,9 @@ export class ViewerPanelCore {
             this.disposed
             || (receiver_epoch !== undefined && receiver_epoch !== this.receiver_epoch)
         ) return Promise.resolve(false);
+        if (message.type === 'transformInstalled' || message.type === 'transformRefused') {
+            this.on_transform_answered?.(message.sheetIndex, message.requestId);
+        }
         return Promise.resolve(this.panel.webview.postMessage(message));
     }
 }
@@ -2216,6 +2229,7 @@ export function adopt_source_into_core(
         durablePendingEditKeys?: (sheet_index: number) => readonly string[];
         durableRowHeights?: DurableRowHeightsProvider;
         onRowWindowServed?: RowWindowServed;
+        onTransformAnswered?: TransformAnswered;
     },
     on_installed?: (installed: ViewerPanelCore) => void,
 ): AdoptSourceIntoCoreResult {

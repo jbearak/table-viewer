@@ -2655,7 +2655,8 @@ export type PeekResult = AvailableMove | ExhaustedMove | BlockedMove;
  * find the same compare-and-swap precondition satisfied, both could land, and no
  * bookkeeping here can tell "the second attempt applied it again" from "the first
  * attempt's commit is merely late". So the caller must not start a move while one
- * is outstanding — a keypress arriving mid-replay is dropped, not queued twice.
+ * is outstanding — a keypress arriving mid-replay is held, one at a time, and
+ * carried out only after the replay in flight has landed or been answered.
  */
 export function peek_history(state: HistoryStackState, direction: HistoryDirection): PeekResult {
     const stack = stack_for(state, direction);

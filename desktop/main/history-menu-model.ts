@@ -2,20 +2,18 @@
  * The desktop Edit menu's Undo and Redo items, as pure data.
  *
  * The menu is the only place a desktop user can *see* what undo would do, so it
- * has to say it: a label of "Undo Paste" rather than a bare "Undo", greyed out
- * when there is nothing to walk back. That means main.ts holds a copy of state
- * the renderer owns, refreshed by a `historyMenuStateChanged` post, and every
- * question about what the menu should read is answered here rather than inside a
- * click handler.
+ * has to say it: a label of "Undo Paste" rather than a bare "Undo", and a bare
+ * "Undo" when there is nothing to walk back. That means main.ts holds a copy of
+ * state the renderer owns, refreshed by a `historyMenuStateChanged` post, and
+ * every question about what the menu should read is answered here rather than
+ * inside a click handler.
  *
  * Pure and Electron-free, because the interesting part is the rules and not the
- * MenuItem — in particular the two ways an item can be enabled. A viewer window
- * whose history has something in it enables the item and forwards the intent to
- * the renderer. A window with no history model at all — welcome, preferences,
- * the state inspector, or a viewer with an empty stack whose focus is in a text
- * field — leaves it enabled for the *native* text undo, which is a different
- * stack with its own contents that nothing here can see. Disabling the item in
- * that case would take text undo away from the CSV cell editor.
+ * MenuItem. Both items are always enabled. In a viewer window the press is
+ * forwarded to the renderer, which decides what it means. A window with no
+ * history model at all — welcome, preferences, the state inspector, or a viewer
+ * whose focus is in a text field — gets the *native* text undo, which is a
+ * different stack with its own contents that nothing here can see.
  */
 
 import { is_plain_record } from '../../src/plain-record';
@@ -47,16 +45,24 @@ export interface HistoryMenuItem {
 /**
  * The item for one direction.
  *
- * A replay already in flight does not enter into it. Both items keep the label
- * and enablement they had: the renderer refuses a second replay silently, and an
- * item that greyed out for the few hundred milliseconds one takes would flicker
- * under a held-down chord.
+ * Always enabled; the label is what says whether there is a step, and which.
+ * On the desktop the keystroke *is* this item, so an item that greyed out would
+ * swallow the press before the page saw it, and this copy of the page's
+ * history is always one message and one menu rebuild behind the page:
+ *  - Undo, then Redo before that Undo has come back: there is nothing to redo
+ *    yet, and there will be. The page holds that press and carries it out.
+ *  - Undo that has run into a barrier: the page says why, which a greyed item
+ *    cannot.
+ *  - a press right after the first step is recorded would meet the item as it
+ *    was a moment ago.
+ * With an empty stack the page carries the press out and there is nothing to
+ * carry out. The cost is that the items no longer grey in a document window.
  *
  * `state` is undefined for a window that has never reported — a non-viewer
- * window, or a viewer whose renderer has not posted yet. Enabled with a plain
- * label, because that is the native-text-undo case: the routing fallback in
- * main.ts calls `webContents.undo()`, and only the page knows whether its own
- * undo stack has anything in it.
+ * window, or a viewer whose renderer has not posted yet. A plain label, because
+ * that is the native-text-undo case: the routing fallback in main.ts calls
+ * `webContents.undo()`, and only the page knows whether its own undo stack has
+ * anything in it.
  */
 export function history_menu_item(
     direction: 'undo' | 'redo',
@@ -68,7 +74,7 @@ export function history_menu_item(
     }
     const available = direction === 'undo' ? state.undoAvailable : state.redoAvailable;
     const label = direction === 'undo' ? state.undoLabel : state.redoLabel;
-    if (!available) return { label: plain, enabled: false };
+    if (!available) return { label: plain, enabled: true };
     return {
         label: label === undefined || label === '' ? plain : `${plain} ${label}`,
         enabled: true,

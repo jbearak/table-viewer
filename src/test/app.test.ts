@@ -51,6 +51,9 @@ const grid_shell_mock = vi.hoisted(() => ({
     typing_held: false,
     // An editor that is opening: keys are owed to it, and none are held.
     editor_opening: false,
+    // A gesture the grid has taken and not finished: one waiting for the
+    // session, a row admission, a paste.
+    gesture_pending: false,
     mount_count: 0,
     on_editing_change: null as null | ((status: { is_dirty: boolean; has_live_uncommitted: boolean; save_in_flight: boolean; edits: Record<string, CsvDirtyEntry>; conflicted: string[] }) => void),
     request_save: vi.fn(() => false),
@@ -269,6 +272,7 @@ vi.mock('../webview/grid-shell', () => ({
                 session_busy: () => grid_shell_mock.session_busy,
                 typing_held: () => grid_shell_mock.typing_held,
                 typing_pending: () => grid_shell_mock.typing_held || grid_shell_mock.editor_opening,
+                gesture_pending: () => grid_shell_mock.gesture_pending,
             };
         }
         // Mirror the real GridShell: publish a measure function into the ref so
@@ -1166,6 +1170,7 @@ function cleanup() {
     grid_shell_mock.has_uncommitted_changes = false;
     grid_shell_mock.session_busy = true;
     grid_shell_mock.editor_opening = false;
+    grid_shell_mock.gesture_pending = false;
     grid_shell_mock.mount_count = 0;
     snapshot_delivery_sequence = 0;
     grid_shell_mock.on_editing_change = null;
@@ -3243,7 +3248,7 @@ describe('Excel first-row header toggle', () => {
         ]));
     });
 
-    it('says why undo and redo do nothing while a header change holds the fence', async () => {
+    it('holds undo while a header change holds the fence, and says so only if it does not end', async () => {
         const { post_message } = await render_app();
         await dispatch_host_message(initial_snapshot_message(excel_meta(true), {
             capabilities: EDITABLE,
@@ -3253,22 +3258,38 @@ describe('Excel first-row header toggle', () => {
         expect(header_requests(post_message)).toHaveLength(1);
         expect(edits_admitted()).toBe(false);
         post_message.mockClear();
-
-        await dispatch_host_message({ type: 'editCommand', command: 'undo' });
-        await act(async () => {
-            window.dispatchEvent(new KeyboardEvent('keydown', {
-                key: 'z', bubbles: true, cancelable: true, metaKey: true, shiftKey: true,
-            }));
-        });
-
-        const warnings = post_message.mock.calls
+        const warnings = () => post_message.mock.calls
             .map(([message]) => message as { type?: string; message?: string })
             .filter((message) => message.type === 'showWarning');
-        // Once per fence, like a typed key.
-        expect(warnings).toEqual([{
-            type: 'showWarning',
-            message: 'Wait for the header row change to finish, then edit.',
-        }]);
+
+        vi.useFakeTimers();
+        try {
+            // From the menu and then from the keyboard: one press waiting.
+            await dispatch_host_message({ type: 'editCommand', command: 'undo' });
+            await act(async () => {
+                window.dispatchEvent(new KeyboardEvent('keydown', {
+                    key: 'z', bubbles: true, cancelable: true, metaKey: true,
+                }));
+            });
+            // Held: the press is carried out when the header change has
+            // settled, and undoes the header step it recorded.
+            expect(warnings()).toEqual([]);
+            expect(post_message.mock.calls.some(([message]) =>
+                message?.type === 'prepareHistoryReplay')).toBe(false);
+
+            // A header change that never settles: the press says why it did
+            // not run, once, at its bound.
+            await act(async () => { vi.advanceTimersByTime(4_999); });
+            expect(warnings()).toEqual([]);
+            await act(async () => { vi.advanceTimersByTime(1); });
+            expect(warnings()).toEqual([{
+                type: 'showWarning',
+                message: 'Undo did not run because another change is still being applied. Try again.',
+            }]);
+            expect(vi.getTimerCount()).toBe(0);
+        } finally {
+            vi.useRealTimers();
+        }
         expect(post_message.mock.calls.some(([message]) =>
             message?.type === 'prepareHistoryReplay')).toBe(false);
     });
@@ -5648,6 +5669,42 @@ describe('auto-fit state', () => {
         expect(grid_shell_mock.latest_props?.on_auto_fit_sample_change).toBeDefined();
         await answer_width_write(post_message);
         expect(grid_shell_mock.latest_props?.on_auto_fit_sample_change).toBeUndefined();
+    });
+
+    it('carries out a press held behind an owed fit that a refresh of another source overtook', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(make_meta(['A', 'B'])));
+        await open_scope_menu('Auto-fit scope');
+        await click_menu_item('Auto-fit columns on all 2 sheets');
+        await answer_width_write(post_message);
+        grid_shell_mock.auto_fit_result = { 0: 220 };
+        await click_sheet_tab('B');
+        await vi.waitFor(() => expect(JSON.parse(grid_stub().getAttribute('data-col-widths')!)).toEqual({ 0: 220 }));
+        const writes = width_writes(post_message).length;
+        const props = grid_shell_mock.latest_props as unknown as GridShellProps;
+
+        // The owed fit is out; an Undo waits behind it.
+        await dispatch_host_message({ type: 'editCommand', command: 'undo' });
+        expect(props.history_press_held?.()).toBe(true);
+        await dispatch_host_message(refresh_snapshot_message(make_meta(['A', 'B']), {
+            generation: 3,
+            sourceGeneration: 3,
+        }));
+
+        // Nobody pressed anything for the fit: the press is not dropped with it.
+        await vi.waitFor(() => expect(width_writes(post_message).length).toBeGreaterThan(writes));
+        expect((grid_shell_mock.latest_props as unknown as GridShellProps).history_press_held?.()).toBe(false);
+        // The write is the Undo's own: sheet A's fitted column back to its default width.
+        const undo_write = width_writes(post_message).slice(writes);
+        expect(undo_write.map((write) => write.sheets)).toEqual([
+            [{ sheetIndex: 0, sheetName: 'A', widths: [{ column: 0, width: null }] }],
+        ]);
+        await answer_width_write(post_message);
+        const history = (grid_shell_mock.latest_props as unknown as GridShellProps).history_store!.snapshot();
+        expect(history.undoStack.map((entry) => entry.action.label)).toEqual([]);
+        expect(history.redoStack.map((entry) => entry.action.label)).toEqual(['Auto-fit columns']);
+        expect(post_message.mock.calls.map((call) => call[0] as WebviewMessage)
+            .filter((message) => message.type === 'showWarning')).toEqual([]);
     });
 
     it('keeps an owed fit when hidden columns become visible', async () => {
@@ -18292,6 +18349,467 @@ describe('undo and redo, from the keyboard and the desktop menu', () => {
         expect(sent(post_message, 'showWarning')).toBeUndefined();
     });
 
+    it('asks for an Undo\'s session only once a restore this window asked for has installed', async () => {
+        // After a Save the window may reconcile the view it holds with the rules
+        // the file keeps, by asking the host to install them. While that runs
+        // the host starts no editing session, so an Undo that needs one asks
+        // for it once the restore is answered.
+        const { post_message } = await render_app();
+        const meta = make_meta(['Sheet1'], false);
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        await acquire_editing_session(post_message, 'saved-edit-session');
+        const props = grid_shell_mock.latest_props as unknown as GridShellProps;
+        props.edit_session!.commit('saved-edit-session', '0:0', { value: 'edited', base: 'Alice' });
+        record_cell_edit(props.history_store!, 'edited', 'Alice');
+        const operation: CsvSaveOperation = {
+            editSessionId: 'saved-edit-session',
+            saveRequestId: 'save-1',
+            worksheets: [{
+                sheetIndex: 0,
+                sheetName: 'Sheet1',
+                edits: { '0:0': 'edited' },
+                dirtyEdits: { '0:0': { value: 'edited', base: 'Alice' } },
+            }],
+        };
+        await dispatch_host_message({
+            type: 'saveOperationStarted',
+            lifecycle: { revision: 1, state: 'active', operation },
+        });
+        await dispatch_host_message({
+            type: 'saveResult',
+            success: true,
+            lifecycle: { revision: 2, state: 'succeeded', operation },
+        });
+        // The refresh after the save carries rules the view does not hold yet.
+        post_message.mockClear();
+        await dispatch_host_message(refresh_snapshot_message(meta, {
+            state: { transforms: [{
+                sort: [{ colIndex: 0, direction: 'asc' }],
+                filters: [],
+                schema: transform_schema_for_sheet(meta.sheets[0]),
+            }] },
+            generation: 2,
+            sourceGeneration: 2,
+        }));
+        const restore = latest_transform_request(post_message);
+        expect(restore.intent).toBe('restore');
+        post_message.mockClear();
+
+        await undo_via_menu();
+        // No session is asked for while the restore installs (the host would
+        // refuse it), and nothing is said.
+        expect(sent(post_message, 'requestEditSession')).toBeUndefined();
+        expect(sent(post_message, 'showWarning')).toBeUndefined();
+
+        await acknowledge_transform(restore, 3);
+        await vi.waitUntil(() => sent(post_message, 'requestEditSession') !== undefined);
+        expect(sent(post_message, 'showWarning')).toBeUndefined();
+    });
+
+    it('posts the restore a refresh after a Save asks for only once the Undo\'s replay has ended', async () => {
+        // The press is let through with nothing in flight and asks for its
+        // session; the refresh the save brought wants a restore. The host may
+        // still be settling the session the save let go, and a transform it
+        // started meanwhile would refuse the Undo's session: the restore waits.
+        const { post_message } = await render_app();
+        const meta = make_meta(['Sheet1'], false);
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        await acquire_editing_session(post_message, 'saved-edit-session');
+        const props = grid_shell_mock.latest_props as unknown as GridShellProps;
+        props.edit_session!.commit('saved-edit-session', '0:0', { value: 'edited', base: 'Alice' });
+        record_cell_edit(props.history_store!, 'edited', 'Alice');
+        const operation: CsvSaveOperation = {
+            editSessionId: 'saved-edit-session',
+            saveRequestId: 'save-1',
+            worksheets: [{
+                sheetIndex: 0,
+                sheetName: 'Sheet1',
+                edits: { '0:0': 'edited' },
+                dirtyEdits: { '0:0': { value: 'edited', base: 'Alice' } },
+            }],
+        };
+        await dispatch_host_message({
+            type: 'saveOperationStarted',
+            lifecycle: { revision: 1, state: 'active', operation },
+        });
+        await dispatch_host_message({
+            type: 'saveResult',
+            success: true,
+            lifecycle: { revision: 2, state: 'succeeded', operation },
+        });
+        // The press, and in the same task the refresh after the save, which
+        // carries rules the view does not hold yet.
+        post_message.mockClear();
+        await act(async () => {
+            window.dispatchEvent(new MessageEvent('message', { data: { type: 'editCommand', command: 'undo' } }));
+            window.dispatchEvent(new MessageEvent('message', {
+                data: refresh_snapshot_message(meta, {
+                    state: { transforms: [{
+                        sort: [{ colIndex: 0, direction: 'asc' }],
+                        filters: [],
+                        schema: transform_schema_for_sheet(meta.sheets[0]),
+                    }] },
+                    generation: 2,
+                    sourceGeneration: 2,
+                }),
+            }));
+        });
+        expect(sent(post_message, 'requestEditSession')).toBeDefined();
+        const transforms = () => post_message.mock.calls
+            .map((call) => call[0] as WebviewMessage)
+            .filter((message) => message.type === 'setTransform');
+        expect(transforms()).toEqual([]);
+
+        // Granted, with the rules the file keeps: the replay is out, and the
+        // restore would install under its lease. It goes once the replay has ended.
+        await dispatch_host_message({ type: 'editSessionResult', granted: true, editSessionId: 'undo-session' });
+        await dispatch_host_message(workbook_snapshot_message(meta, {
+            presentation: 'refresh',
+            reason: 'other',
+            generation: 2,
+            sourceGeneration: 2,
+            state: { transforms: [{
+                sort: [{ colIndex: 0, direction: 'asc' }],
+                filters: [],
+                schema: transform_schema_for_sheet(meta.sheets[0]),
+            }] },
+            capabilities: { csvEditable: true, csvEditingSupported: true, csvEditSessionId: 'undo-session' },
+        }));
+        await vi.waitUntil(() => sent(post_message, 'prepareHistoryReplay') !== undefined);
+        expect(transforms()).toEqual([]);
+        const prepare = sent(post_message, 'prepareHistoryReplay');
+        await dispatch_host_message({
+            type: 'historyReplayPrepared',
+            prepared: {
+                requestId: prepare.request.requestId,
+                replayId: prepare.request.replayId,
+                leaseId: 'lease-1',
+                focusSheetIndex: 0,
+                focus: prepare.request.focus,
+                cells: [{
+                    ordinal: 0,
+                    worksheet: { sheetIndex: 0, sheetName: 'Sheet1' },
+                    resolvedSheetIndex: 0,
+                    sourceRow: 0,
+                    sourceColumn: 0,
+                    overlay: { kind: 'absent' },
+                    persisted: { text: 'edited' },
+                    persistedHyperlink: null,
+                }],
+            },
+        });
+        const commit = sent(post_message, 'commitHistoryReplay');
+        expect(commit).toBeDefined();
+        expect(transforms()).toEqual([]);
+        await dispatch_host_message({
+            type: 'historyReplayCommitted',
+            committed: {
+                requestId: commit.request.requestId,
+                replayId: commit.request.replayId,
+                leaseId: commit.request.leaseId,
+                mutationId: commit.request.mutationId,
+                sourceGeneration: 2,
+                cells: [],
+                focusSheetIndex: 0,
+                focus: prepare.request.focus,
+                displayFocus: null,
+            },
+        });
+        // The Undo landed (the cell is out of sight under the sort, which is
+        // what the one message says), and only then is the restore posted.
+        expect(props.history_store!.snapshot().redoStack).toHaveLength(1);
+        await vi.waitUntil(() => transforms().length > 0);
+        expect(latest_transform_request(post_message).intent).toBe('restore');
+        expect(post_message.mock.calls.map((call) => call[0] as WebviewMessage)
+            .filter((message) => message.type === 'showWarning')
+            .map((message) => (message as { message: string }).message))
+            .toEqual(['The change was undone, but the affected cells are hidden by the current view.']);
+    });
+
+    /**
+     * A saved edit, and then the refresh after the save asking for a restore
+     * of the saved view, still pending. Posts cleared.
+     */
+    async function saved_edit_with_restore_pending() {
+        const { post_message } = await render_app();
+        const meta = make_meta(['Sheet1'], false);
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        await acquire_editing_session(post_message, 'saved-edit-session');
+        const props = grid_shell_mock.latest_props as unknown as GridShellProps;
+        props.edit_session!.commit('saved-edit-session', '0:0', { value: 'edited', base: 'Alice' });
+        record_cell_edit(props.history_store!, 'edited', 'Alice');
+        const operation: CsvSaveOperation = {
+            editSessionId: 'saved-edit-session',
+            saveRequestId: 'save-1',
+            worksheets: [{
+                sheetIndex: 0,
+                sheetName: 'Sheet1',
+                edits: { '0:0': 'edited' },
+                dirtyEdits: { '0:0': { value: 'edited', base: 'Alice' } },
+            }],
+        };
+        await dispatch_host_message({
+            type: 'saveOperationStarted',
+            lifecycle: { revision: 1, state: 'active', operation },
+        });
+        await dispatch_host_message({
+            type: 'saveResult',
+            success: true,
+            lifecycle: { revision: 2, state: 'succeeded', operation },
+        });
+        post_message.mockClear();
+        await dispatch_host_message(refresh_snapshot_message(meta, {
+            state: { transforms: [{
+                sort: [{ colIndex: 0, direction: 'asc' }],
+                filters: [],
+                schema: transform_schema_for_sheet(meta.sheets[0]),
+            }] },
+            generation: 2,
+            sourceGeneration: 2,
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        const restore = latest_transform_request(post_message);
+        expect(restore.intent).toBe('restore');
+        post_message.mockClear();
+        return { post_message, props, restore };
+    }
+
+    it('asks for an Undo\'s session once a restore it waited for is refused', async () => {
+        const { post_message, restore } = await saved_edit_with_restore_pending();
+        await undo_via_menu();
+        expect(sent(post_message, 'requestEditSession')).toBeUndefined();
+        await dispatch_host_message({
+            type: 'transformRefused',
+            sheetIndex: restore.sheetIndex,
+            requestId: restore.requestId,
+            intent: restore.intent,
+            reason: 'A save is in progress.',
+            terminal: false,
+        });
+        await vi.waitUntil(() => sent(post_message, 'requestEditSession') !== undefined);
+    });
+
+    it('asks for an Undo\'s session after five seconds when a restore it waits for is never answered', async () => {
+        const { post_message } = await saved_edit_with_restore_pending();
+        vi.useFakeTimers();
+        try {
+            await undo_via_menu();
+            await act(async () => { vi.advanceTimersByTime(4_999); });
+            expect(sent(post_message, 'requestEditSession')).toBeUndefined();
+            await act(async () => { vi.advanceTimersByTime(1); });
+            expect(sent(post_message, 'requestEditSession')).toBeDefined();
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
+    it('ends an Undo\'s wait for a restore, asking for nothing and saying nothing, when the document is replaced', async () => {
+        const { post_message } = await saved_edit_with_restore_pending();
+        await undo_via_menu();
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Other']), {
+            generation: 5,
+            sourceGeneration: 5,
+        }));
+        await act(async () => { await Promise.resolve(); });
+        expect(sent(post_message, 'requestEditSession')).toBeUndefined();
+        expect(sent(post_message, 'prepareHistoryReplay')).toBeUndefined();
+        expect(sent(post_message, 'showWarning')).toBeUndefined();
+    });
+
+    it('takes a Cancel of a restore an Undo is waiting for, and the Undo asks for its session once the cancel is answered', async () => {
+        const { post_message } = await saved_edit_with_restore_pending();
+        await undo_via_menu();
+        expect(sent(post_message, 'requestEditSession')).toBeUndefined();
+
+        await click_button('Cancel');
+        const cancel = latest_transform_request(post_message);
+        expect(cancel.intent).toBe('cancel');
+        expect(sent(post_message, 'requestEditSession')).toBeUndefined();
+        await acknowledge_transform(cancel, 3);
+        await vi.waitUntil(() => sent(post_message, 'requestEditSession') !== undefined);
+        expect(sent(post_message, 'showWarning')).toBeUndefined();
+    });
+
+    it('refuses a quiet request for a session at once while a restore is pending, saying nothing', async () => {
+        const { post_message } = await saved_edit_with_restore_pending();
+        const props = grid_shell_mock.latest_props as unknown as GridShellProps;
+        let granted: boolean | undefined;
+        await act(async () => { granted = await props.on_request_edit_session!(true); });
+        expect(granted).toBe(false);
+        expect(sent(post_message, 'requestEditSession')).toBeUndefined();
+        expect(sent(post_message, 'showWarning')).toBeUndefined();
+    });
+
+    it('lets an edit wait for a restore the host acknowledges as already in place, which moves no view', async () => {
+        const { post_message, restore } = await saved_edit_with_restore_pending();
+        const props = grid_shell_mock.latest_props as unknown as GridShellProps;
+        let granted: Promise<boolean> | undefined;
+        await act(async () => { granted = props.on_request_edit_session!(); });
+        expect(sent(post_message, 'requestEditSession')).toBeUndefined();
+        expect(sent(post_message, 'showWarning')).toBeUndefined();
+        await acknowledge_transform(restore, 2);
+        await vi.waitUntil(() => sent(post_message, 'requestEditSession') !== undefined);
+        expect(sent(post_message, 'showWarning')).toBeUndefined();
+        void granted;
+    });
+
+    it('drops an edit, saying nothing, whose restore wait ended after the person moved to another sheet', async () => {
+        const { post_message } = await render_app();
+        const meta = make_meta(['Sheet1', 'Sheet2'], false);
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        await dispatch_host_message(refresh_snapshot_message(meta, {
+            state: { transforms: [{
+                sort: [{ colIndex: 0, direction: 'asc' }],
+                filters: [],
+                schema: transform_schema_for_sheet(meta.sheets[0]),
+            }] },
+            generation: 2,
+            sourceGeneration: 2,
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        const restore = latest_transform_request(post_message);
+        expect(restore.intent).toBe('restore');
+        post_message.mockClear();
+
+        const props = grid_shell_mock.latest_props as unknown as GridShellProps;
+        let granted: boolean | undefined;
+        let asked!: Promise<void>;
+        await act(async () => { asked = props.on_request_edit_session!().then((value) => { granted = value; }); });
+        await click_sheet_tab('Sheet2');
+        // Acknowledged as already in place: the view did not move.
+        await acknowledge_transform(restore, 2);
+        await act(async () => { await asked; });
+        expect(granted).toBe(false);
+        expect(sent(post_message, 'requestEditSession')).toBeUndefined();
+        expect(sent(post_message, 'showWarning')).toBeUndefined();
+    });
+
+    it('drops an edit, saying nothing, when the person moved to another sheet and the restore it waited for moved the view', async () => {
+        const { post_message } = await render_app();
+        const meta = make_meta(['Sheet1', 'Sheet2'], false);
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        await dispatch_host_message(refresh_snapshot_message(meta, {
+            state: { transforms: [{
+                sort: [{ colIndex: 0, direction: 'asc' }],
+                filters: [],
+                schema: transform_schema_for_sheet(meta.sheets[0]),
+            }] },
+            generation: 2,
+            sourceGeneration: 2,
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        const restore = latest_transform_request(post_message);
+        expect(restore.intent).toBe('restore');
+        post_message.mockClear();
+
+        const props = grid_shell_mock.latest_props as unknown as GridShellProps;
+        let granted: boolean | undefined;
+        let asked!: Promise<void>;
+        await act(async () => { asked = props.on_request_edit_session!().then((value) => { granted = value; }); });
+        await click_sheet_tab('Sheet2');
+        // The restore moves the view too: the gesture was left all the same.
+        await acknowledge_transform(restore, 3);
+        await act(async () => { await asked; });
+        expect(granted).toBe(false);
+        expect(sent(post_message, 'requestEditSession')).toBeUndefined();
+        expect(sent(post_message, 'showWarning')).toBeUndefined();
+    });
+
+    it('drops an edit, saying nothing, whose restore wait ended after the person left its sheet and came back', async () => {
+        const { post_message } = await render_app();
+        const meta = make_meta(['Sheet1', 'Sheet2'], false);
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        await dispatch_host_message(refresh_snapshot_message(meta, {
+            state: { transforms: [{
+                sort: [{ colIndex: 0, direction: 'asc' }],
+                filters: [],
+                schema: transform_schema_for_sheet(meta.sheets[0]),
+            }] },
+            generation: 2,
+            sourceGeneration: 2,
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        const restore = latest_transform_request(post_message);
+        expect(restore.intent).toBe('restore');
+        post_message.mockClear();
+
+        const props = grid_shell_mock.latest_props as unknown as GridShellProps;
+        let granted: boolean | undefined;
+        let asked!: Promise<void>;
+        await act(async () => { asked = props.on_request_edit_session!().then((value) => { granted = value; }); });
+        await click_sheet_tab('Sheet2');
+        await click_sheet_tab('Sheet1');
+        // Acknowledged as already in place: the view did not move.
+        await acknowledge_transform(restore, 2);
+        await act(async () => { await asked; });
+        expect(granted).toBe(false);
+        expect(sent(post_message, 'requestEditSession')).toBeUndefined();
+        expect(sent(post_message, 'showWarning')).toBeUndefined();
+    });
+
+    it('drops an edit, saying nothing, when the person left its sheet and came back and the restore moved the view', async () => {
+        const { post_message } = await render_app();
+        const meta = make_meta(['Sheet1', 'Sheet2'], false);
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        await dispatch_host_message(refresh_snapshot_message(meta, {
+            state: { transforms: [{
+                sort: [{ colIndex: 0, direction: 'asc' }],
+                filters: [],
+                schema: transform_schema_for_sheet(meta.sheets[0]),
+            }] },
+            generation: 2,
+            sourceGeneration: 2,
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        const restore = latest_transform_request(post_message);
+        expect(restore.intent).toBe('restore');
+        post_message.mockClear();
+
+        const props = grid_shell_mock.latest_props as unknown as GridShellProps;
+        let granted: boolean | undefined;
+        let asked!: Promise<void>;
+        await act(async () => { asked = props.on_request_edit_session!().then((value) => { granted = value; }); });
+        await click_sheet_tab('Sheet2');
+        await click_sheet_tab('Sheet1');
+        // The restore moves the view too: the gesture was left all the same.
+        await acknowledge_transform(restore, 3);
+        await act(async () => { await asked; });
+        expect(granted).toBe(false);
+        expect(sent(post_message, 'requestEditSession')).toBeUndefined();
+        expect(sent(post_message, 'showWarning')).toBeUndefined();
+    });
+
+    it('refuses an edit, saying why, when the restore it waited for moved the view under it', async () => {
+        const { post_message, restore } = await saved_edit_with_restore_pending();
+        const props = grid_shell_mock.latest_props as unknown as GridShellProps;
+        let granted: boolean | undefined;
+        let asked!: Promise<void>;
+        await act(async () => { asked = props.on_request_edit_session!().then((value) => { granted = value; }); });
+        // A new generation: the grid holding the gesture's keys is remounted.
+        await acknowledge_transform(restore, 3);
+        await act(async () => { await asked; });
+        expect(granted).toBe(false);
+        expect(sent(post_message, 'requestEditSession')).toBeUndefined();
+        expect(post_message.mock.calls.map((call) => call[0] as WebviewMessage)
+            .filter((message) => message.type === 'showWarning')
+            .map((message) => (message as { message: string }).message))
+            .toEqual(['The table view changed before the edit could start. Try again.']);
+    });
+
     it('reports a refusal on the press that had to acquire a session', async () => {
         // Acquiring a session delivers a snapshot. That is not the document
         // leaving, and the refusal it precedes still has to be reported: a first
@@ -18823,13 +19341,23 @@ describe('undo and redo, from the keyboard and the desktop menu', () => {
             // Kept from VS Code too, which would undo the workbook.
             expect(prevented).toBe(true);
             expect(sent(post_message, 'prepareHistoryReplay')).toBeUndefined();
+            expect(sent(post_message, 'showWarning')).toBeUndefined();
             expect(JSON.parse(grid_stub().getAttribute('data-undo-labels')!))
                 .toEqual(['Clear all highlights']);
+            // The hold reserves nothing: the keys are on their way into an
+            // editor, and its commit must be admitted.
+            expect((grid_shell_mock.latest_props as unknown as GridShellProps).gestures_admitted?.()).toBe(true);
+            expect((grid_shell_mock.latest_props as unknown as GridShellProps).history_press_held?.()).toBe(false);
         } finally {
             grid_shell_mock.typing_held = false;
         }
-        await undo_via_menu();
+        // The keys have landed and nothing opened (the session was refused,
+        // say): the press that was held is an ordinary undo, with no further
+        // press, and one press for the two that were made.
+        await act(async () => { (grid_shell_mock.latest_props as unknown as GridShellProps).on_held_typing_end?.(); });
         expect(sent(post_message, 'prepareHistoryReplay')).toBeDefined();
+        expect(post_message.mock.calls.filter(([message]) =>
+            message?.type === 'prepareHistoryReplay')).toHaveLength(1);
     });
 
     it('hands the grid the region the host resolved', async () => {
@@ -18979,16 +19507,23 @@ describe('undo and redo, from the keyboard and the desktop menu', () => {
             .toBe('The change was redone, but the affected cells are hidden by the current view.');
 
         // And the same question asked the other way: the grid, not App, discovering
-        // the region is hidden once it tries to resolve it.
-        await record_highlight(post_message);
-        await undo_via_menu();
-        await complete_replay(post_message);
-        post_message.mockClear();
-        await press('z', { shiftKey: true });
-        await complete_replay(post_message);
-        await click_stub_button('.stub-history-focus-hidden');
-        expect(sent(post_message, 'showWarning').message)
-            .toBe('The change was redone, but the affected cells are hidden by the current view.');
+        // the region is hidden once it tries to resolve it. A later press: the
+        // same sentence within two seconds is said once (a held key).
+        const later = Date.now() + 2_000;
+        const clock = vi.spyOn(Date, 'now').mockReturnValue(later);
+        try {
+            await record_highlight(post_message);
+            await undo_via_menu();
+            await complete_replay(post_message);
+            post_message.mockClear();
+            await press('z', { shiftKey: true });
+            await complete_replay(post_message);
+            await click_stub_button('.stub-history-focus-hidden');
+            expect(sent(post_message, 'showWarning').message)
+                .toBe('The change was redone, but the affected cells are hidden by the current view.');
+        } finally {
+            clock.mockRestore();
+        }
     });
 
     describe('a replay that landed in a Header Row', () => {
@@ -19297,11 +19832,19 @@ describe('undo and redo, from the keyboard and the desktop menu', () => {
         expect(sent(post_message, 'showWarning').message).toContain('hidden by the current view');
     });
 
-    it('says the file was refreshing when the host refuses over a view of it that moved', async () => {
+    it('says the file was refreshing when the host refuses over a view of it that moved, and no delivery follows', async () => {
         const { post_message } = await render_app();
         await record_highlight(post_message);
-        await undo_via_menu();
-        await refuse_prepare(post_message, 'document-changed');
+        vi.useFakeTimers();
+        try {
+            await undo_via_menu();
+            await refuse_prepare(post_message, 'document-changed');
+            // The refusal says a delivery is on its way; the press waits for it.
+            expect(sent(post_message, 'showWarning')).toBeUndefined();
+            await act(async () => { vi.advanceTimersByTime(5_000); });
+        } finally {
+            vi.useRealTimers();
+        }
 
         expect(sent(post_message, 'showWarning')).toEqual({
             type: 'showWarning',
@@ -19312,18 +19855,23 @@ describe('undo and redo, from the keyboard and the desktop menu', () => {
             .toEqual(['Clear all highlights']);
     });
 
-    it('stays silent for the refusals that are not the user\'s problem', async () => {
-        for (const reason of ['busy', 'malformed'] as const) {
-            const { post_message } = await render_app();
-            await record_highlight(post_message);
-            await undo_via_menu();
-            await refuse_prepare(post_message, reason);
+    it.each([
+        // The host is busy with something this window cannot see: a save of
+        // another window, or a preparation it still holds. (This window's
+        // own replay in flight never reaches the host: a press behind it is
+        // held here.)
+        ['busy', 'Undo did not run because another change is still being applied. Try again.'],
+        // A protocol fault. Not the person's to fix, but a press must not vanish.
+        ['malformed', 'Undo is unavailable: the change it would apply can no longer be reached.'],
+    ] as const)('says why when the host refuses a preparation as %s', async (reason, message) => {
+        const { post_message } = await render_app();
+        await record_highlight(post_message);
+        await undo_via_menu();
+        await refuse_prepare(post_message, reason);
 
-            // A held-down chord walking back a run of edits refuses as `busy` on
-            // every repeat; a warning per repeat would be unusable.
-            expect(sent(post_message, 'showWarning')).toBeUndefined();
-            cleanup();
-        }
+        expect(sent(post_message, 'showWarning')).toEqual({ type: 'showWarning', message });
+        expect(JSON.parse(grid_stub().getAttribute('data-undo-labels')!))
+            .toEqual(['Clear all highlights']);
     });
 
     it('reports a conflict, naming what was not applied', async () => {
@@ -19439,6 +19987,871 @@ describe('undo and redo, from the keyboard and the desktop menu', () => {
         expect(grid_stub().getAttribute('data-editing-session-held')).toBe('true');
         expect(sent(post_message, 'releaseEditSession')).toBeUndefined();
         expect(sent(post_message, 'discardEditSession')).toBeUndefined();
+    });
+
+    // A press that meets something this window started is held, and carried
+    // out when that has cleared; only at its bound is it answered instead.
+    describe('a press held until the window is free', () => {
+        const props = () => grid_shell_mock.latest_props as unknown as GridShellProps;
+        const undo_labels = (): string[] => JSON.parse(grid_stub().getAttribute('data-undo-labels')!);
+        const redo_labels = (): string[] => props().history_store!.snapshot().redoStack
+            .map((entry) => entry.action.label).reverse();
+        const prepares = (post_message: ReturnType<typeof vi.fn>) => post_message.mock.calls
+            .map(([message]) => message)
+            .filter((message: { type?: string } | undefined) => message?.type === 'prepareHistoryReplay');
+        const warnings = (post_message: ReturnType<typeof vi.fn>): string[] => post_message.mock.calls
+            .map(([message]) => message as { type?: string; message?: string })
+            .filter((message) => message.type === 'showWarning')
+            .map((message) => message.message!);
+        const CLEAR = 'Clear all highlights';
+        const redo_via_menu = () => dispatch_host_message({ type: 'editCommand', command: 'redo' });
+
+        /** Two highlight steps, both "Clear all highlights". */
+        async function two_steps(post_message: ReturnType<typeof vi.fn>, snapshot_extra?: SnapshotExtra) {
+            await record_highlight(post_message, snapshot_extra === undefined ? {} : { snapshot_extra });
+            await click_button('Highlight');
+            await click_button('Clear all highlights');
+            const request = sent(post_message, 'clearAllCellHighlights');
+            expect(request).toBeDefined();
+            await dispatch_host_message({
+                type: 'cellHighlightsChanged',
+                requestId: request.requestId,
+                stateRevision: 3,
+                physicalRevision: 1,
+                state: undefined,
+                deltas: [{ sheetIndex: 0, sourceRow: 1, sourceColumn: 1, before: 'green', after: null }],
+                sourceGeneration: 1,
+            });
+            expect(undo_labels()).toEqual([CLEAR, CLEAR]);
+            post_message.mockClear();
+        }
+
+        it('carries a press made while a replay is in flight out once, on the entry under it', async () => {
+            const { post_message } = await render_app();
+            await two_steps(post_message);
+
+            await undo_via_menu();
+            expect(prepares(post_message)).toHaveLength(1);
+            // A held key: one press waits, and it is not a count.
+            await undo_via_menu();
+            await press('z');
+            await undo_via_menu();
+            expect(prepares(post_message)).toHaveLength(1);
+            expect(warnings(post_message)).toEqual([]);
+            expect(props().history_press_held?.()).toBe(true);
+            expect(props().gestures_admitted?.()).toBe(false);
+
+            await complete_replay(post_message);
+            expect(prepares(post_message)).toHaveLength(2);
+            expect(undo_labels()).toEqual([CLEAR]);
+            await complete_replay(post_message);
+            expect(prepares(post_message)).toHaveLength(2);
+            expect(undo_labels()).toEqual([]);
+            expect(redo_labels()).toEqual([CLEAR, CLEAR]);
+            expect(warnings(post_message)).toEqual([]);
+            expect(props().history_press_held?.()).toBe(false);
+            expect(props().gestures_admitted?.()).toBe(true);
+        });
+
+        it('cancels a held Undo with a Redo pressed after it: one step is undone in all', async () => {
+            const { post_message } = await render_app();
+            await two_steps(post_message);
+
+            await undo_via_menu();
+            await undo_via_menu();
+            await redo_via_menu();
+            expect(props().history_press_held?.()).toBe(false);
+            await complete_replay(post_message);
+
+            expect(prepares(post_message)).toHaveLength(1);
+            expect(undo_labels()).toEqual([CLEAR]);
+            expect(redo_labels()).toEqual([CLEAR]);
+            expect(warnings(post_message)).toEqual([]);
+            // A third press is an ordinary one.
+            await undo_via_menu();
+            expect(prepares(post_message)).toHaveLength(2);
+        });
+
+        it('holds a Redo sent while the first Undo is in flight, with nothing on the redo stack yet, and carries it out', async () => {
+            const { post_message } = await render_app();
+            await two_steps(post_message);
+
+            await undo_via_menu();
+            await redo_via_menu();
+            expect(prepares(post_message)).toHaveLength(1);
+            await complete_replay(post_message);
+            // The Redo, on the step the Undo just moved.
+            expect(prepares(post_message)).toHaveLength(2);
+            expect(undo_labels()).toEqual([CLEAR]);
+            await complete_replay(post_message);
+            expect(undo_labels()).toEqual([CLEAR, CLEAR]);
+            expect(warnings(post_message)).toEqual([]);
+        });
+
+        it('drops the held press when the replay in flight is refused', async () => {
+            const { post_message } = await render_app();
+            await two_steps(post_message);
+
+            await undo_via_menu();
+            await undo_via_menu();
+            await refuse_prepare(post_message, 'conflict');
+
+            expect(prepares(post_message)).toHaveLength(1);
+            expect(warnings(post_message)).toHaveLength(1);
+            expect(undo_labels()).toEqual([CLEAR, CLEAR]);
+            expect(props().history_press_held?.()).toBe(false);
+            expect(props().gestures_admitted?.()).toBe(true);
+        });
+
+        it('answers a press whose replay never ends at its bound, says so after a lease, and still takes the late answer once', async () => {
+            const { post_message } = await render_app();
+            await two_steps(post_message);
+            vi.useFakeTimers();
+            try {
+                await undo_via_menu();
+                await undo_via_menu();
+                await act(async () => { vi.advanceTimersByTime(4_999); });
+                expect(warnings(post_message)).toEqual([]);
+                await act(async () => { vi.advanceTimersByTime(1); });
+                expect(warnings(post_message)).toEqual([
+                    'Undo did not run because another change is still being applied. Try again.',
+                ]);
+                expect(props().history_press_held?.()).toBe(false);
+                // The first press, whose request is still out, after as long
+                // as a lease lasts.
+                await act(async () => { vi.advanceTimersByTime(25_000); });
+                expect(warnings(post_message)).toEqual([
+                    'Undo did not run because another change is still being applied. Try again.',
+                    'Undo has not finished yet. If this window stays busy, reopen the file.',
+                ]);
+            } finally {
+                vi.useRealTimers();
+            }
+            await complete_replay(post_message);
+            expect(prepares(post_message)).toHaveLength(1);
+            expect(undo_labels()).toEqual([CLEAR]);
+        });
+
+        it('drops the held press when the view could not follow a committed replay', async () => {
+            const { post_message } = await render_app();
+            await two_steps(post_message);
+
+            await undo_via_menu();
+            await undo_via_menu();
+            const prepare = sent(post_message, 'prepareHistoryReplay');
+            await dispatch_host_message({
+                type: 'historyReplayPrepared',
+                prepared: {
+                    requestId: prepare.request.requestId,
+                    replayId: prepare.request.replayId,
+                    leaseId: 'lease-diverged',
+                    focusSheetIndex: 0,
+                    focus: prepare.request.focus,
+                    cells: [],
+                },
+            });
+            const commit = sent(post_message, 'commitHistoryReplay');
+            (grid_shell_mock.latest_props!.edit_session as EditSessionStore)
+                .install({ session_id: 'moved-on' });
+            await dispatch_host_message({
+                type: 'historyReplayCommitted',
+                committed: {
+                    requestId: commit.request.requestId,
+                    replayId: commit.request.replayId,
+                    leaseId: commit.request.leaseId,
+                    mutationId: commit.request.mutationId,
+                    sourceGeneration: 1,
+                    cells: [{ ordinal: 0, resolvedSheetIndex: 0, key: '3:2', entry: null }],
+                    focusSheetIndex: 0,
+                    focus: prepare.request.focus,
+                    displayFocus: { displayRowStart: 3, displayRowEnd: 3, mappingGeneration: 1 },
+                },
+            });
+
+            expect(warnings(post_message)).toEqual([
+                'The change was undone in the file, but this view could not be updated. Reopen the file to resynchronize.',
+            ]);
+            expect(prepares(post_message)).toHaveLength(1);
+            expect(props().history_press_held?.()).toBe(false);
+        });
+
+        it('says that the cells are hidden once for two replays landing within two seconds, and carries the held press out', async () => {
+            const { post_message } = await render_app();
+            await two_steps(post_message);
+
+            await undo_via_menu();
+            await undo_via_menu();
+            await complete_replay(post_message, { displayFocus: null });
+            expect(prepares(post_message)).toHaveLength(2);
+            await complete_replay(post_message, { displayFocus: null });
+
+            expect(warnings(post_message)).toEqual([
+                'The change was undone, but the affected cells are hidden by the current view.',
+            ]);
+            expect(undo_labels()).toEqual([]);
+        });
+
+        it('drops a press held behind a highlight that records nothing', async () => {
+            const { post_message } = await render_app();
+            await record_highlight(post_message);
+            await click_button('Highlight');
+            await click_button('Clear all highlights');
+            const request = sent(post_message, 'clearAllCellHighlights');
+            await undo_via_menu();
+            expect(props().history_press_held?.()).toBe(true);
+            await dispatch_host_message({
+                type: 'cellHighlightsChanged',
+                requestId: request.requestId,
+                stateRevision: 3,
+                physicalRevision: 1,
+                state: undefined,
+                sourceGeneration: 1,
+            });
+
+            expect(undo_labels()).toEqual([CLEAR]);
+            expect(prepares(post_message)).toEqual([]);
+            expect(props().history_press_held?.()).toBe(false);
+        });
+
+        it('drops a held press, saying nothing, when the document is replaced', async () => {
+            const { post_message } = await render_app();
+            await two_steps(post_message);
+
+            await undo_via_menu();
+            await undo_via_menu();
+            await dispatch_host_message(initial_snapshot_message(make_meta(['Other']), {
+                generation: 5,
+                sourceGeneration: 5,
+                identity: {
+                    authority: { fileId: 'file:other', revision: 0 },
+                } as SnapshotExtra['identity'],
+            }));
+
+            expect(prepares(post_message)).toHaveLength(1);
+            expect(warnings(post_message)).toEqual([]);
+            expect(props().history_press_held?.()).toBe(false);
+        });
+
+        it('keeps a press held in a new document when a gesture of the replaced one ends unrecorded', async () => {
+            const { post_message } = await render_app();
+            await two_steps(post_message);
+            // A paste of the outgoing document, its clipboard read still out.
+            const outgoing = props().gesture_ticket!();
+            // The document is replaced, and two steps are made in the new one.
+            await dispatch_host_message(initial_snapshot_message(make_meta(['Other']), {
+                generation: 5,
+                sourceGeneration: 5,
+            }));
+            expect(undo_labels()).toEqual([]);
+            for (const revision of [10, 11]) {
+                post_message.mockClear();
+                await click_button('Highlight');
+                await click_button('Clear all highlights');
+                const request = sent(post_message, 'clearAllCellHighlights');
+                await dispatch_host_message({
+                    type: 'cellHighlightsChanged',
+                    requestId: request.requestId,
+                    stateRevision: revision,
+                    physicalRevision: request.snapshotIdentity.sourceBasis.physicalRevision,
+                    state: undefined,
+                    deltas: [{ sheetIndex: 0, sourceRow: 1, sourceColumn: 1, before: 'green', after: null }],
+                    sourceGeneration: 5,
+                });
+            }
+            expect(undo_labels()).toEqual([CLEAR, CLEAR]);
+            post_message.mockClear();
+            const current = props().gesture_ticket!();
+            await undo_via_menu();
+            await undo_via_menu();
+            expect(props().history_press_held?.()).toBe(true);
+
+            // The old paste finishes with no edit taken: not about this press.
+            await act(async () => { props().on_gesture_unrecorded?.(outgoing); });
+            expect(props().history_press_held?.()).toBe(true);
+            expect(warnings(post_message)).toEqual([]);
+            // One of this document's, made before the press, still drops it.
+            await act(async () => { props().on_gesture_unrecorded?.(current); });
+            expect(props().history_press_held?.()).toBe(false);
+        });
+
+        describe('a replay refused because a refresh was in transit', () => {
+            /** Apply a refresh of the same document, as the watcher's after a save. */
+            async function refresh() {
+                await dispatch_host_message(refresh_snapshot_message(make_meta(['Sheet1', 'Sheet2'])));
+            }
+
+            it('is tried again, once, when the refresh it lost to has been applied, and moves its entry', async () => {
+                const { post_message } = await render_app();
+                await two_steps(post_message);
+
+                await undo_via_menu();
+                await refresh();
+                await refuse_prepare(post_message, 'document-changed');
+
+                expect(prepares(post_message)).toHaveLength(2);
+                expect(warnings(post_message)).toEqual([]);
+                await complete_replay(post_message);
+                expect(undo_labels()).toEqual([CLEAR]);
+                expect(redo_labels()).toEqual([CLEAR]);
+                expect(warnings(post_message)).toEqual([]);
+            });
+
+            it('says the file was refreshing when it is refused again with no further refresh', async () => {
+                const { post_message } = await render_app();
+                await two_steps(post_message);
+
+                vi.useFakeTimers();
+                try {
+                    await undo_via_menu();
+                    await refresh();
+                    await refuse_prepare(post_message, 'document-changed');
+                    expect(prepares(post_message)).toHaveLength(2);
+                    await refuse_prepare(post_message, 'document-changed');
+                    expect(warnings(post_message)).toEqual([]);
+                    // Answered at the bound, from the press.
+                    await act(async () => { vi.advanceTimersByTime(5_000); });
+                } finally {
+                    vi.useRealTimers();
+                }
+
+                expect(prepares(post_message)).toHaveLength(2);
+                expect(warnings(post_message)).toEqual([
+                    'Undo did not run because the file was refreshing. Try again.',
+                ]);
+                expect(undo_labels()).toEqual([CLEAR, CLEAR]);
+                expect(props().gestures_admitted?.()).toBe(true);
+            });
+
+            it('waits for the delivery when the refusal arrives before it, and is tried again once it is applied', async () => {
+                const { post_message } = await render_app();
+                await two_steps(post_message);
+
+                await undo_via_menu();
+                await refuse_prepare(post_message, 'document-changed');
+                expect(prepares(post_message)).toHaveLength(1);
+                expect(warnings(post_message)).toEqual([]);
+                // Nothing new is recorded meanwhile.
+                expect(props().gestures_admitted?.()).toBe(false);
+
+                await refresh();
+                expect(prepares(post_message)).toHaveLength(2);
+                await complete_replay(post_message);
+                expect(undo_labels()).toEqual([CLEAR]);
+                expect(warnings(post_message)).toEqual([]);
+            });
+
+            it('is tried again after a delivery acknowledged and not applied (stale)', async () => {
+                const { post_message } = await render_app();
+                await two_steps(post_message);
+
+                await undo_via_menu();
+                await refuse_prepare(post_message, 'document-changed');
+                await dispatch_host_message(refresh_snapshot_message(make_meta(['Sheet1', 'Sheet2']), {
+                    identity: { authority: { fileId: 'file:test', revision: 0 } } as SnapshotExtra['identity'],
+                }));
+                expect(sent(post_message, 'snapshotApplied')).toMatchObject({ disposition: 'stale' });
+
+                expect(prepares(post_message)).toHaveLength(2);
+                expect(warnings(post_message)).toEqual([]);
+            });
+
+            it('says so at its bound, and posts nothing, when no delivery comes', async () => {
+                const { post_message } = await render_app();
+                await two_steps(post_message);
+                vi.useFakeTimers();
+                try {
+                    await undo_via_menu();
+                    await refuse_prepare(post_message, 'document-changed');
+                    await act(async () => { vi.advanceTimersByTime(4_999); });
+                    expect(warnings(post_message)).toEqual([]);
+                    await act(async () => { vi.advanceTimersByTime(1); });
+                } finally {
+                    vi.useRealTimers();
+                }
+
+                expect(prepares(post_message)).toHaveLength(1);
+                expect(warnings(post_message)).toEqual([
+                    'Undo did not run because the file was refreshing. Try again.',
+                ]);
+                expect(props().gestures_admitted?.()).toBe(true);
+            });
+
+            it('is tried again after a commit refused as expired, and not after one refused after its write', async () => {
+                const { post_message } = await render_app();
+                await two_steps(post_message);
+                const refuse_commit = async (reason: 'expired' | 'changed-after-write') => {
+                    const prepare = sent(post_message, 'prepareHistoryReplay');
+                    await dispatch_host_message({
+                        type: 'historyReplayPrepared',
+                        prepared: {
+                            requestId: prepare.request.requestId,
+                            replayId: prepare.request.replayId,
+                            leaseId: `lease-${reason}`,
+                            focusSheetIndex: 0,
+                            focus: prepare.request.focus,
+                            cells: [],
+                        },
+                    });
+                    const commit = sent(post_message, 'commitHistoryReplay');
+                    await refresh();
+                    await dispatch_host_message({
+                        type: 'historyReplayCommitRefused',
+                        refusal: {
+                            requestId: commit.request.requestId,
+                            replayId: commit.request.replayId,
+                            leaseId: commit.request.leaseId,
+                            mutationId: commit.request.mutationId,
+                            reason,
+                        },
+                    });
+                };
+
+                await undo_via_menu();
+                await refuse_commit('expired');
+                expect(prepares(post_message)).toHaveLength(2);
+                expect(warnings(post_message)).toEqual([]);
+
+                // The write is in the file: preparing it again would not be a
+                // second try at something that did not happen.
+                await refuse_commit('changed-after-write');
+                expect(prepares(post_message)).toHaveLength(2);
+                expect(warnings(post_message)).toEqual([
+                    'Undo did not run because the file was refreshing. Try again.',
+                ]);
+            });
+
+            it('admits work made before the retry\'s press, and refuses work made between it and a press held behind it', async () => {
+                const { post_message } = await render_app();
+                await two_steps(post_message);
+                const before_both = props().gesture_ticket!();
+
+                await undo_via_menu();
+                const between = props().gesture_ticket!();
+                await refresh();
+                await act(async () => {
+                    const prepare = sent(post_message, 'prepareHistoryReplay');
+                    window.dispatchEvent(new MessageEvent('message', {
+                        data: {
+                            type: 'historyReplayPrepareRefused',
+                            refusal: {
+                                requestId: prepare.request.requestId,
+                                replayId: prepare.request.replayId,
+                                reason: 'document-changed',
+                            },
+                        },
+                    }));
+                    for (let turn = 0; turn < 5; turn += 1) await Promise.resolve();
+                    window.dispatchEvent(new MessageEvent('message', {
+                        data: { type: 'editCommand', command: 'undo' },
+                    }));
+                    // Both slots are taken now: the retry's and the press held
+                    // behind it. The lower epoch, the retry's, governs.
+                    expect(props().with_gesture_ticket!(before_both, () => props().gestures_admitted!())).toBe(true);
+                    expect(props().with_gesture_ticket!(between, () => props().gestures_admitted!())).toBe(false);
+                    expect(props().gestures_admitted!()).toBe(false);
+                    // A continuation taken inside admitted work carries that work's
+                    // ticket, not the press's: it is still the earlier gesture.
+                    expect(props().with_gesture_ticket!(before_both, () => {
+                        const inherited = props().gesture_ticket!();
+                        return props().with_gesture_ticket!(inherited, () => props().gestures_admitted!());
+                    })).toBe(true);
+                });
+            });
+
+            it('holds a press made during the retry, and carries it out after, on the next entry', async () => {
+                const { post_message } = await render_app();
+                await two_steps(post_message);
+
+                await undo_via_menu();
+                await refresh();
+                await act(async () => {
+                    const prepare = sent(post_message, 'prepareHistoryReplay');
+                    window.dispatchEvent(new MessageEvent('message', {
+                        data: {
+                            type: 'historyReplayPrepareRefused',
+                            refusal: {
+                                requestId: prepare.request.requestId,
+                                replayId: prepare.request.replayId,
+                                reason: 'document-changed',
+                            },
+                        },
+                    }));
+                    // After the refusal's own continuation (a host message is a
+                    // task of its own), and before the window has rendered it.
+                    for (let turn = 0; turn < 5; turn += 1) await Promise.resolve();
+                    expect(props().history_press_held?.()).toBe(true);
+                    window.dispatchEvent(new MessageEvent('message', {
+                        data: { type: 'editCommand', command: 'undo' },
+                    }));
+                });
+
+                expect(prepares(post_message)).toHaveLength(2);
+                expect(props().history_press_held?.()).toBe(true);
+                await complete_replay(post_message);
+                expect(prepares(post_message)).toHaveLength(3);
+                await complete_replay(post_message);
+                expect(undo_labels()).toEqual([]);
+                expect(warnings(post_message)).toEqual([]);
+            });
+        });
+
+        it('says the same sentence once within two seconds, and again after', async () => {
+            const { post_message } = await render_app();
+            await record_highlight(post_message);
+            vi.useFakeTimers();
+            try {
+                for (let attempt = 0; attempt < 3; attempt += 1) {
+                    await undo_via_menu();
+                    await refuse_prepare(post_message, 'busy');
+                }
+                expect(warnings(post_message)).toEqual([
+                    'Undo did not run because another change is still being applied. Try again.',
+                ]);
+                await act(async () => { vi.advanceTimersByTime(2_000); });
+                await undo_via_menu();
+                await refuse_prepare(post_message, 'busy');
+                expect(warnings(post_message)).toHaveLength(2);
+            } finally {
+                vi.useRealTimers();
+            }
+        });
+
+        describe('what is refused while a press is held', () => {
+            const WAIT = 'Wait for the table view to finish updating.';
+
+            it('clears no highlights, and says so', async () => {
+                const { post_message } = await render_app();
+                await two_steps(post_message);
+                await undo_via_menu();
+                await undo_via_menu();
+                expect(props().history_press_held?.()).toBe(true);
+                post_message.mockClear();
+
+                await click_button('Highlight');
+                await click_button('Clear all highlights');
+                expect(sent(post_message, 'clearAllCellHighlights')).toBeUndefined();
+                expect(warnings(post_message)).toEqual([WAIT]);
+            });
+
+            it('adds no rows for Quick add or the composer, and says so; rows asked for before the press are added', async () => {
+                const { post_message } = await render_app();
+                await two_steps(post_message, { capabilities: { csvEditable: true, csvEditingSupported: true } });
+                await acquire_editing_session(post_message);
+                post_message.mockClear();
+
+                // Asked for before the press, under its ticket.
+                const ticket = props().gesture_ticket!();
+                await undo_via_menu();
+                await undo_via_menu();
+                expect(props().history_press_held?.()).toBe(true);
+                let before: unknown;
+                await act(async () => {
+                    before = props().with_gesture_ticket!(ticket, () => props().on_append_rows!(1));
+                });
+                expect(sent(post_message, 'requestAppendRows')).toBeDefined();
+                void before;
+                post_message.mockClear();
+
+                // Asked for during the hold.
+                let during: unknown;
+                await act(async () => { during = await props().on_append_rows!(1); });
+                expect(during).toBeUndefined();
+                expect(sent(post_message, 'requestAppendRows')).toBeUndefined();
+                expect(warnings(post_message)).toEqual([WAIT]);
+            });
+
+            it('drops a held press when a gesture made before it ends unrecorded in the grid, and not for one made after it', async () => {
+                const { post_message } = await render_app();
+                await two_steps(post_message);
+                const before = props().gesture_ticket!();
+                await undo_via_menu();
+                await undo_via_menu();
+                const after = props().gesture_ticket!();
+                expect(props().history_press_held?.()).toBe(true);
+
+                // Made after the press, and refused because of it: the press stays.
+                await act(async () => { props().on_gesture_unrecorded?.(after); });
+                expect(props().history_press_held?.()).toBe(true);
+                // Made before it (a delete whose session was refused, say).
+                await act(async () => { props().on_gesture_unrecorded?.(before); });
+                expect(props().history_press_held?.()).toBe(false);
+                await complete_replay(post_message);
+                expect(prepares(post_message)).toHaveLength(1);
+                // The person did not cancel anything: the dropped press is said.
+                expect(warnings(post_message)).toEqual([
+                    'Undo did not run because the change made before it was not applied.',
+                ]);
+            });
+
+            it('drops a held press when the grid does not install rows the host admitted for a gesture made before it', async () => {
+                const { post_message } = await render_app();
+                await two_steps(post_message, { capabilities: { csvEditable: true, csvEditingSupported: true } });
+                await acquire_editing_session(post_message);
+                post_message.mockClear();
+                let completion!: Promise<AppendRowsAdmission | undefined>;
+                await act(async () => { completion = props().on_append_rows!(1) as Promise<AppendRowsAdmission | undefined>; });
+                const request = sent(post_message, 'requestAppendRows');
+                expect(request).toBeDefined();
+                // Undo while the rows are being admitted: held behind them.
+                await undo_via_menu();
+                expect(props().history_press_held?.()).toBe(true);
+                await dispatch_host_message({
+                    type: 'appendRowsResult',
+                    requestId: request.requestId,
+                    sourceGeneration: 1,
+                    granted: true,
+                    rowIds: ['pending-a'],
+                    formatTemplate: { id: 'plain', format: { kind: 'none' } },
+                    appendBasis: {
+                        sourceRowCount: 1,
+                        provisionalStartRow: 1,
+                        columnCount: 1,
+                        schemaFingerprint: 'x',
+                    },
+                });
+                const admission = await completion;
+                expect(admission).toBeDefined();
+                // The grid finds the session moved on, and installs nothing.
+                await act(async () => { admission!.settle(false); });
+
+                expect(props().history_press_held?.()).toBe(false);
+                expect(prepares(post_message)).toEqual([]);
+                expect(undo_labels()).toEqual([CLEAR, CLEAR]);
+            });
+
+            it('says why rows asked for before the press were refused, then that the press did not run', async () => {
+                const { post_message } = await render_app();
+                await two_steps(post_message, { capabilities: { csvEditable: true, csvEditingSupported: true } });
+                await acquire_editing_session(post_message);
+                post_message.mockClear();
+                await act(async () => { void props().on_append_rows!(1); });
+                const request = sent(post_message, 'requestAppendRows');
+                await undo_via_menu();
+                expect(props().history_press_held?.()).toBe(true);
+                await dispatch_host_message({
+                    type: 'appendRowsResult',
+                    requestId: request.requestId,
+                    sourceGeneration: 1,
+                    granted: false,
+                    reason: 'Rows can\'t be appended right now.',
+                });
+
+                expect(props().history_press_held?.()).toBe(false);
+                expect(prepares(post_message)).toEqual([]);
+                expect(warnings(post_message)).toEqual([
+                    'Rows can\'t be appended right now.',
+                    'Undo did not run because the change made before it was not applied.',
+                ]);
+            });
+
+            it('says each dropped press, even two within two seconds', async () => {
+                const { post_message } = await render_app();
+                await two_steps(post_message);
+                const drop_one = async () => {
+                    const before = props().gesture_ticket!();
+                    await undo_via_menu();
+                    await undo_via_menu();
+                    expect(props().history_press_held?.()).toBe(true);
+                    await act(async () => { props().on_gesture_unrecorded?.(before); });
+                    expect(props().history_press_held?.()).toBe(false);
+                    await complete_replay(post_message);
+                };
+                await drop_one();
+                await redo_via_menu();
+                await complete_replay(post_message);
+                await drop_one();
+                expect(warnings(post_message)).toEqual([
+                    'Undo did not run because the change made before it was not applied.',
+                    'Undo did not run because the change made before it was not applied.',
+                ]);
+            });
+
+            it('still says a gesture\'s own wait sentence once in two seconds after a press is dropped', async () => {
+                const { post_message } = await render_app();
+                await two_steps(post_message);
+                const before = props().gesture_ticket!();
+                await undo_via_menu();
+                await undo_via_menu();
+                await act(async () => { props().on_history_hold_gesture?.(); });
+                await act(async () => { props().on_gesture_unrecorded?.(before); });
+                await act(async () => { props().on_history_hold_gesture?.(); });
+                expect(warnings(post_message)).toEqual([
+                    WAIT,
+                    'Undo did not run because the change made before it was not applied.',
+                ]);
+                // Remembered, not silenced: two seconds later it is said again.
+                const now = Date.now();
+                const clock = vi.spyOn(Date, 'now').mockReturnValue(now + 2_000);
+                try {
+                    await act(async () => { props().on_history_hold_gesture?.(); });
+                } finally {
+                    clock.mockRestore();
+                }
+                expect(warnings(post_message)).toEqual([
+                    WAIT,
+                    'Undo did not run because the change made before it was not applied.',
+                    WAIT,
+                ]);
+            });
+
+            it('keeps a press made in a new document when rows admitted in the replaced one are not installed', async () => {
+                const { post_message } = await render_app();
+                await two_steps(post_message, { capabilities: { csvEditable: true, csvEditingSupported: true } });
+                await acquire_editing_session(post_message);
+                post_message.mockClear();
+                let completion!: Promise<AppendRowsAdmission | undefined>;
+                await act(async () => { completion = props().on_append_rows!(1) as Promise<AppendRowsAdmission | undefined>; });
+                const request = sent(post_message, 'requestAppendRows');
+                await dispatch_host_message({
+                    type: 'appendRowsResult',
+                    requestId: request.requestId,
+                    sourceGeneration: 1,
+                    granted: true,
+                    rowIds: ['pending-a'],
+                    formatTemplate: { id: 'plain', format: { kind: 'none' } },
+                    appendBasis: { sourceRowCount: 1, provisionalStartRow: 1, columnCount: 1, schemaFingerprint: 'x' },
+                });
+                const admission = await completion;
+                expect(admission).toBeDefined();
+
+                // The document is replaced before the grid installs the rows, and
+                // two steps are made in the new one.
+                await dispatch_host_message(initial_snapshot_message(make_meta(['Other']), {
+                    generation: 5,
+                    sourceGeneration: 5,
+                }));
+                for (const revision of [10, 11]) {
+                    post_message.mockClear();
+                    await click_button('Highlight');
+                    await click_button('Clear all highlights');
+                    const clear = sent(post_message, 'clearAllCellHighlights');
+                    await dispatch_host_message({
+                        type: 'cellHighlightsChanged',
+                        requestId: clear.requestId,
+                        stateRevision: revision,
+                        physicalRevision: clear.snapshotIdentity.sourceBasis.physicalRevision,
+                        state: undefined,
+                        deltas: [{ sheetIndex: 0, sourceRow: 1, sourceColumn: 1, before: 'green', after: null }],
+                        sourceGeneration: 5,
+                    });
+                }
+                expect(undo_labels()).toEqual([CLEAR, CLEAR]);
+                post_message.mockClear();
+                await undo_via_menu();
+                await undo_via_menu();
+                expect(props().history_press_held?.()).toBe(true);
+
+                // The outgoing document's rows are not installed: not about this press.
+                await act(async () => { admission!.settle(false); });
+                expect(props().history_press_held?.()).toBe(true);
+                expect(warnings(post_message)).toEqual([]);
+            });
+
+            it('says once, for a key held down, that an editor will not open, and again after two seconds', async () => {
+                const { post_message } = await render_app();
+                await two_steps(post_message);
+                await undo_via_menu();
+                await undo_via_menu();
+                vi.useFakeTimers();
+                try {
+                    await act(async () => {
+                        props().on_history_hold_gesture?.();
+                        props().on_history_hold_gesture?.();
+                        props().on_history_hold_gesture?.();
+                    });
+                    expect(warnings(post_message)).toEqual([WAIT]);
+                    await act(async () => { vi.advanceTimersByTime(1_999); });
+                    await act(async () => { props().on_history_hold_gesture?.(); });
+                    expect(warnings(post_message)).toEqual([WAIT]);
+                    await act(async () => { vi.advanceTimersByTime(1); });
+                    await act(async () => { props().on_history_hold_gesture?.(); });
+                    expect(warnings(post_message)).toEqual([WAIT, WAIT]);
+                } finally {
+                    vi.useRealTimers();
+                }
+            });
+        });
+
+        describe('typed keys still on their way to an editor', () => {
+            afterEach(() => { grid_shell_mock.typing_held = false; });
+
+            it('answer a press still waiting for them at its bound, run nothing, and leave the older entry', async () => {
+                const { post_message } = await render_app();
+                await record_highlight(post_message);
+                grid_shell_mock.typing_held = true;
+                vi.useFakeTimers();
+                try {
+                    await undo_via_menu();
+                    await act(async () => { vi.advanceTimersByTime(5_000); });
+                } finally {
+                    vi.useRealTimers();
+                }
+                expect(warnings(post_message)).toEqual([
+                    'Undo did not run because another change is still being applied. Try again.',
+                ]);
+                expect(prepares(post_message)).toEqual([]);
+                expect(undo_labels()).toEqual([CLEAR]);
+                // The keys land later, with no press behind them.
+                grid_shell_mock.typing_held = false;
+                await act(async () => { props().on_held_typing_end?.(); });
+                expect(prepares(post_message)).toEqual([]);
+            });
+
+            it('keep their hold when a retry in front of them gives up, and the press then runs as an ordinary one', async () => {
+                const { post_message } = await render_app();
+                await two_steps(post_message);
+
+                vi.useFakeTimers();
+                try {
+                    await undo_via_menu();
+                    await act(async () => { vi.advanceTimersByTime(1_000); });
+                    grid_shell_mock.typing_held = true;
+                    await undo_via_menu();
+                    // The first press's replay is refused and no delivery
+                    // comes: said at its bound, and the retry ends. The keys'
+                    // press is not its, and keeps its own bound.
+                    await refuse_prepare(post_message, 'document-changed');
+                    await act(async () => { vi.advanceTimersByTime(4_000); });
+                } finally {
+                    vi.useRealTimers();
+                }
+                expect(warnings(post_message)).toEqual([
+                    'Undo did not run because the file was refreshing. Try again.',
+                ]);
+                expect(prepares(post_message)).toHaveLength(1);
+
+                grid_shell_mock.typing_held = false;
+                await act(async () => { props().on_held_typing_end?.(); });
+                expect(prepares(post_message)).toHaveLength(2);
+            });
+
+            it('bound a press sent on and then held behind a replay from the key press, not from the send-on', async () => {
+                const { post_message } = await render_app();
+                await two_steps(post_message);
+                vi.useFakeTimers();
+                try {
+                    await undo_via_menu();
+                    expect(prepares(post_message)).toHaveLength(1);
+                    grid_shell_mock.typing_held = true;
+                    await undo_via_menu();
+                    await act(async () => { vi.advanceTimersByTime(3_000); });
+                    // Nothing opened (the session was refused, say): an ordinary
+                    // press, held behind the replay still out.
+                    grid_shell_mock.typing_held = false;
+                    await act(async () => { props().on_held_typing_end?.(); });
+                    expect(props().history_press_held?.()).toBe(true);
+                    await act(async () => { vi.advanceTimersByTime(1_999); });
+                    expect(warnings(post_message)).toEqual([]);
+                    await act(async () => { vi.advanceTimersByTime(1); });
+                    expect(warnings(post_message)).toEqual([
+                        'Undo did not run because another change is still being applied. Try again.',
+                    ]);
+                } finally {
+                    vi.useRealTimers();
+                }
+                expect(prepares(post_message)).toHaveLength(1);
+            });
+        });
     });
 });
 
@@ -20896,6 +22309,13 @@ describe('view steps in history', () => {
     }
     const EDITABLE = { editor_offered: true, edits_admitted: true };
     const HELD = { editor_offered: false, edits_admitted: false };
+    /**
+     * A press of Undo or Redo is waiting. Not shown to the grid as a view
+     * request (the work the press waits for needs the grid editable); the
+     * grid asks `history_press_held` where an editor or a Save is asked for.
+     */
+    const PRESS_HELD = { editor_offered: true, edits_admitted: false };
+    const press_held = () => props().history_press_held?.() ?? false;
 
     async function open(
         post_message: ReturnType<typeof vi.fn>,
@@ -21232,7 +22652,7 @@ describe('view steps in history', () => {
             expect(redo_labels()).toEqual([]);
         });
 
-        it('waits, with a message, while the saved view is still being restored on its sheet', async () => {
+        it('waits, saying nothing, while the saved view is being restored on its sheet, and runs when it has been', async () => {
             const { post_message } = await render_app();
             await open(post_message);
             await change_view(post_message, { sort: SORT_ASC, filters: [] });
@@ -21247,14 +22667,79 @@ describe('view steps in history', () => {
 
             await undo();
 
+            // Held: a replay never replaces a request pending on its sheet.
             expect(posted(post_message, 'setTransform')).toEqual([]);
-            expect(warnings(post_message)).toEqual([
-                'Undo did not run because the table view is still updating. Try again.',
-            ]);
+            expect(warnings(post_message)).toEqual([]);
             expect(undo_labels()).toEqual(['Sort']);
-            // The restore is still the pending request: its answer installs.
+            expect(cells_editable()).toEqual(PRESS_HELD);
+            expect(press_held()).toBe(true);
+            // The restore is still the pending request: its answer installs,
+            // and the press is carried out against the view it left.
             await install(restore);
             expect(grid_stub().getAttribute('data-generation')).toBe(String(view_generation));
+
+            expect(posted(post_message, 'setTransform')).toHaveLength(1);
+            const replay = latest_transform_request(post_message);
+            expect(replay.intent).toBe('user');
+            expect(replay.state.sort).toEqual([]);
+            await install(replay);
+            expect(warnings(post_message)).toEqual([]);
+            expect(undo_labels()).toEqual([]);
+            expect(redo_labels()).toEqual(['Sort']);
+            expect(cells_editable()).toEqual(EDITABLE);
+            expect(press_held()).toBe(false);
+        });
+
+        it('stops rendering while that restore is pending: the drain does not wake itself', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await change_view(post_message, { sort: SORT_ASC, filters: [] });
+            await dispatch_host_message(refresh_snapshot_message(table_meta(), {
+                capabilities: CSV,
+                state: { transforms: [{ sort: SORT_ASC, filters: [], schema: SCHEMA }] },
+            }));
+            expect(latest_transform_request(post_message).intent).toBe('restore');
+
+            await undo();
+            expect(press_held()).toBe(true);
+            await act(async () => { await Promise.resolve(); });
+            const settled = grid_shell_mock.latest_props;
+            for (let turn = 0; turn < 5; turn += 1) {
+                await act(async () => { await Promise.resolve(); });
+            }
+            // No render since: the same props object the grid last got.
+            expect(grid_shell_mock.latest_props).toBe(settled);
+            expect(press_held()).toBe(true);
+        });
+
+        it('says so, and leaves the window usable, when that restore has not ended at the bound', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await change_view(post_message, { sort: SORT_ASC, filters: [] });
+            await dispatch_host_message(refresh_snapshot_message(table_meta(), {
+                capabilities: CSV,
+                state: { transforms: [{ sort: SORT_ASC, filters: [], schema: SCHEMA }] },
+            }));
+            expect(latest_transform_request(post_message).intent).toBe('restore');
+            post_message.mockClear();
+            vi.useFakeTimers();
+            try {
+                await undo();
+                await act(async () => { vi.advanceTimersByTime(4_999); });
+                expect(warnings(post_message)).toEqual([]);
+                expect(press_held()).toBe(true);
+                await act(async () => { vi.advanceTimersByTime(1); });
+
+                expect(warnings(post_message)).toEqual([
+                    'Undo did not run because the table view is still updating. Try again.',
+                ]);
+                expect(posted(post_message, 'setTransform')).toEqual([]);
+                expect(undo_labels()).toEqual(['Sort']);
+                expect(press_held()).toBe(false);
+                expect(vi.getTimerCount()).toBe(0);
+            } finally {
+                vi.useRealTimers();
+            }
         });
 
         it('moves the entry and says so when the host installs something else', async () => {
@@ -21295,7 +22780,7 @@ describe('view steps in history', () => {
             expect(redo_labels()).toEqual(['Sort']);
         });
 
-        it('says an edit undo has to wait while this window\'s own sort is in flight', async () => {
+        it('holds an undo while this window\'s own sort is in flight, and then undoes that sort', async () => {
             const { post_message } = await render_app();
             await open(post_message);
             await acquire_editing_session(post_message);
@@ -21321,14 +22806,25 @@ describe('view steps in history', () => {
 
             await undo();
 
-            expect(warnings(post_message)).toEqual([
-                'Undo did not run because the table view is still updating. Try again.',
-            ]);
+            // Held: the sort's step is recorded only when it installs, so a
+            // move made now would be followed by a recording that clears the
+            // redo it had just made.
+            expect(warnings(post_message)).toEqual([]);
             expect(posted(post_message, 'prepareHistoryReplay')).toEqual([]);
             expect(undo_labels()).toEqual(['Edit cell']);
-            // The sort's step then lands above the edit, in gesture order.
+            // The sort's step then lands above the edit, in gesture order,
+            // and the press undoes it: the last thing the person did before
+            // pressing.
             await install(request!);
+            expect(posted(post_message, 'prepareHistoryReplay')).toEqual([]);
+            const replay = latest_transform_request(post_message);
+            expect(replay.requestId).not.toBe(request!.requestId);
+            expect(replay.state.sort).toEqual([]);
             expect(undo_labels()).toEqual(['Edit cell', 'Sort']);
+            await install(replay);
+            expect(undo_labels()).toEqual(['Edit cell']);
+            expect(redo_labels()).toEqual(['Sort']);
+            expect(warnings(post_message)).toEqual([]);
         });
     });
 
@@ -21489,6 +22985,39 @@ describe('view steps in history', () => {
             expect(cells_editable()).toEqual(EDITABLE);
         });
 
+        it('that will not commit is said once for a held key that presses Undo of a view step', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await change_view(post_message, { sort: SORT_ASC, filters: [] });
+            grid_shell_mock.commit_live_edit.mockReturnValue(false);
+            post_message.mockClear();
+
+            await undo();
+            await undo();
+            await undo();
+
+            expect(warnings(post_message)).toEqual(['Finish or cancel the cell edit first.']);
+            expect(posted(post_message, 'setTransform')).toEqual([]);
+        });
+
+        it('whose commit leaves undo at a barrier says the barrier\'s message for the Undo of a view step', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await change_view(post_message, { sort: SORT_ASC, filters: [] });
+            grid_shell_mock.commit_live_edit.mockImplementationOnce(() => {
+                props().history_store!.install_structural_save_barrier();
+                return true;
+            });
+            post_message.mockClear();
+
+            await undo();
+
+            expect(posted(post_message, 'setTransform')).toEqual([]);
+            expect(warnings(post_message)).toHaveLength(1);
+            expect(warnings(post_message)[0]).toMatch(/^Can't undo past a save that inserted/);
+            expect(press_held()).toBe(false);
+        });
+
         it('is committed before Undo, which then undoes that edit and leaves the view step', async () => {
             const { post_message } = await render_app();
             await open(post_message);
@@ -21550,6 +23079,31 @@ describe('view steps in history', () => {
             expect(redo_labels()).toEqual([]);
         });
 
+        it('committed by Redo with a write it started still says Redo was replaced', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await change_view(post_message, { sort: SORT_ASC, filters: [] });
+            await undo();
+            await install(latest_transform_request(post_message));
+            expect(redo_labels()).toEqual(['Sort']);
+            // The commit records its edit and starts a write the window waits for.
+            grid_shell_mock.commit_live_edit.mockImplementationOnce(() => {
+                record_edit();
+                props().on_row_resize([{ start: 1, end: 1 }], 50, { gesture: false, on_result: () => {} });
+            });
+            post_message.mockClear();
+
+            await redo();
+
+            expect(posted(post_message, 'setTransform')).toEqual([]);
+            expect(warnings(post_message)).toEqual([
+                'Nothing to redo: the cell edit you just finished replaced it.',
+            ]);
+            expect(press_held()).toBe(false);
+            expect(undo_labels()).toEqual(['Edit cell']);
+            expect(redo_labels()).toEqual([]);
+        });
+
         it('whose commit leaves the window busy stops the gesture and the Undo, each with a message', async () => {
             const { post_message } = await render_app();
             await open(post_message);
@@ -21567,7 +23121,7 @@ describe('view steps in history', () => {
             expect(undo_labels()).toEqual(['Sort', 'Edit cell']);
         });
 
-        it('whose commit leaves the window busy stops the Undo of a view step, with a message', async () => {
+        it('whose commit leaves the window busy holds the Undo of a view step until the window is free', async () => {
             const { post_message } = await render_app();
             await open(post_message);
             await change_view(post_message, { sort: SORT_ASC, filters: [] });
@@ -21584,10 +23138,22 @@ describe('view steps in history', () => {
 
             expect(resize_started).toBe(true);
             expect(posted(post_message, 'setTransform')).toEqual([]);
-            expect(warnings(post_message)).toEqual([
-                'Undo did not run because another change is still being applied. Try again.',
-            ]);
+            expect(warnings(post_message)).toEqual([]);
             expect(undo_labels()).toEqual(['Sort']);
+            expect(press_held()).toBe(true);
+
+            // The write the fold started is answered: the press goes ahead.
+            const row = posted(post_message, 'setRowHeights').at(-1)!;
+            await dispatch_host_message({
+                type: 'rowHeightsChanged',
+                requestId: row.requestId!,
+                applied: true,
+                sourceGeneration: 1,
+            });
+            expect(posted(post_message, 'setTransform')).toHaveLength(1);
+            expect(latest_transform_request(post_message).state.sort).toEqual([]);
+            expect(warnings(post_message)).toEqual([]);
+            expect(press_held()).toBe(false);
         });
 
         it('is not folded by the install of a sort or of a replay, even where the fold would refuse', async () => {
@@ -21781,11 +23347,10 @@ describe('view steps in history', () => {
             await undo();
             expect(posted(post_message, 'setTransform')).toEqual([]);
             expect(warnings(post_message)).toEqual([]);
-            expect(cells_editable()).toEqual(HELD);
-            // A second press meanwhile is held, silently, like any press
-            // behind a replay in flight.
+            expect(cells_editable()).toEqual(PRESS_HELD);
+            expect(press_held()).toBe(true);
+            // A second press meanwhile is the same request: one step.
             await undo();
-            await redo();
             expect(posted(post_message, 'setTransform')).toEqual([]);
             expect(warnings(post_message)).toEqual([]);
 
@@ -21801,13 +23366,39 @@ describe('view steps in history', () => {
             expect(cells_editable()).toEqual(EDITABLE);
         });
 
+        it('keeps waiting through a delivery that is acknowledged and not applied', async () => {
+            const { post_message } = await render_app();
+            grid_shell_mock.commit_live_edit.mockImplementation((
+                options?: { fenced_empty_ok?: boolean },
+            ) => options?.fenced_empty_ok === true);
+            await sorted_then_released(post_message);
+
+            await undo();
+            expect(press_held()).toBe(true);
+            // Older than what the window shows: acknowledged, not applied.
+            await dispatch_host_message(refresh_snapshot_message(table_meta(), {
+                generation: view_generation,
+                sourceGeneration: 1,
+                reason: 'other',
+                capabilities: CSV,
+                identity: { authority: { fileId: 'file:test', revision: 0 } },
+            }));
+            expect(posted(post_message, 'snapshotApplied').at(-1)).toMatchObject({ disposition: 'stale' });
+            expect(posted(post_message, 'setTransform')).toEqual([]);
+            expect(press_held()).toBe(true);
+
+            await session_gone();
+            await vi.waitUntil(() => posted(post_message, 'setTransform').length === 1);
+            expect(warnings(post_message)).toEqual([]);
+        });
+
         it('gives up after a bound with a message, and leaves the window usable', async () => {
             const { post_message } = await render_app();
             await sorted_then_released(post_message);
             vi.useFakeTimers();
             try {
                 await undo();
-                expect(cells_editable()).toEqual(HELD);
+                expect(cells_editable()).toEqual(PRESS_HELD);
                 await act(async () => { vi.advanceTimersByTime(4_999); });
                 expect(warnings(post_message)).toEqual([]);
                 await act(async () => { vi.advanceTimersByTime(1); });
@@ -21959,20 +23550,37 @@ describe('view steps in history', () => {
             expect(cells_editable()).toEqual(EDITABLE);
         });
 
-        it('keeps a replay\'s entry, with a message, when the reload still shows the old rules', async () => {
+        it('tries a replay again when the reload still shows the old rules', async () => {
             const { post_message } = await render_app();
             await open(post_message);
             await change_view(post_message, { sort: SORT_ASC, filters: [] });
             await undo();
+            const overtaken = latest_transform_request(post_message);
             post_message.mockClear();
 
             await reload([SORTED]);
 
+            // The reload is the refresh the replay lost to, so the press is
+            // not answered with "the file was refreshing": it is tried again,
+            // behind the saved view the reload has the window re-install.
+            expect(warnings(post_message)).toEqual([]);
             expect(undo_labels()).toEqual(['Sort']);
-            expect(redo_labels()).toEqual([]);
-            expect(warnings(post_message)).toEqual([
-                'Undo did not run because the file was refreshing. Try again.',
-            ]);
+            expect(press_held()).toBe(true);
+            const restore = latest_transform_request(post_message);
+            expect(restore.intent).toBe('restore');
+            await install(restore);
+
+            const again = latest_transform_request(post_message);
+            expect(again.requestId).not.toBe(overtaken.requestId);
+            expect(again.intent).toBe('user');
+            expect(again.state.sort).toEqual([]);
+            expect(posted(post_message, 'setTransform')).toHaveLength(2);
+            await install(again);
+            expect(undo_labels()).toEqual([]);
+            expect(redo_labels()).toEqual(['Sort']);
+            expect(warnings(post_message)).toEqual([]);
+            expect(cells_editable()).toEqual(EDITABLE);
+            expect(press_held()).toBe(false);
         });
     });
 
@@ -22578,7 +24186,7 @@ describe('view steps in history', () => {
             expect(cells_editable()).toEqual(EDITABLE);
         });
 
-        it('keeps the entry of a replay it overtook, with a message, and the next Undo skips it', async () => {
+        it('tries a replay it overtook again, which skips the step as the next Undo would have', async () => {
             const { post_message } = await render_app();
             await open(post_message);
             await change_view(post_message, { sort: SORT_ASC, filters: [] });
@@ -22588,17 +24196,15 @@ describe('view steps in history', () => {
 
             await reload([undefined], other_columns());
 
-            expect(undo_labels()).toEqual(['Sort']);
-            expect(redo_labels()).toEqual([]);
-            expect(warnings(post_message)).toEqual([
-                'Undo did not run because the file was refreshing. Try again.',
-            ]);
-            post_message.mockClear();
-            await undo();
+            // Tried again against the columns the reload brought: nothing of
+            // the step applies to them, so it is skipped and moves on.
             expect(warnings(post_message)).toEqual([
                 'Undo skipped “Sort”: the columns of this worksheet changed since then.',
             ]);
+            expect(undo_labels()).toEqual([]);
             expect(redo_labels()).toEqual(['Sort']);
+            expect(posted(post_message, 'setTransform')).toEqual([]);
+            expect(press_held()).toBe(false);
         });
     });
 
@@ -22671,6 +24277,96 @@ describe('view steps in history', () => {
             });
             expect(undo_labels().at(-1)).toBe('Resize 2 rows');
         }
+
+        it('drops a press held behind a row resize the host applied under another source, which records nothing', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await change_view(post_message, { sort: SORT_ASC, filters: [] });
+            post_message.mockClear();
+
+            await resize_rows([{ start: 1, end: 1 }], 60);
+            await undo();
+            expect(press_held()).toBe(true);
+            await answer_row_heights(post_message, {
+                before: [{ start: 4, end: 4, height: null }],
+                source_generation: 7,
+            });
+
+            expect(undo_labels()).toEqual(['Sort']);
+            expect(posted(post_message, 'setTransform')).toEqual([]);
+            expect(press_held()).toBe(false);
+        });
+
+        it('drops a press held behind a column resize that a refresh of another source overtook', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await change_view(post_message, { sort: SORT_ASC, filters: [] });
+            post_message.mockClear();
+
+            await resize_columns([{ column: 1, width: 180 }]);
+            await undo();
+            expect(press_held()).toBe(true);
+            await reload([{ sort: SORT_ASC, filters: [], schema: SCHEMA }]);
+
+            expect(undo_labels()).toEqual(['Sort']);
+            expect(press_held()).toBe(false);
+            expect(posted(post_message, 'setTransform').filter((request) => request.intent === 'user')).toEqual([]);
+            // The resize said nothing of its own; the press is not left to vanish.
+            expect(warnings(post_message)).toEqual([
+                'Undo did not run because the change made before it was not applied.',
+            ]);
+        });
+
+        describe('a size replay the host does not answer', () => {
+            it('says so after as long as a lease lasts, keeps the request, and moves the entry once on a late answer', async () => {
+                const { post_message } = await render_app();
+                await open(post_message);
+                await resized_rows(post_message);
+                post_message.mockClear();
+                vi.useFakeTimers();
+                try {
+                    await undo();
+                    expect(row_height_writes(post_message)).toHaveLength(1);
+                    await act(async () => { vi.advanceTimersByTime(29_999); });
+                    expect(warnings(post_message)).toEqual([]);
+                    await act(async () => { vi.advanceTimersByTime(1); });
+                    expect(warnings(post_message)).toEqual([
+                        'Undo has not finished yet. If this window stays busy, reopen the file.',
+                    ]);
+                    expect(vi.getTimerCount()).toBe(0);
+                } finally {
+                    vi.useRealTimers();
+                }
+                expect(undo_labels()).toEqual(['Resize 2 rows']);
+                await answer_row_heights(post_message);
+                expect(undo_labels()).toEqual([]);
+                expect(redo_labels()).toEqual(['Resize 2 rows']);
+                await answer_row_heights(post_message);
+                expect(redo_labels()).toEqual(['Resize 2 rows']);
+                expect(warnings(post_message)).toHaveLength(1);
+            });
+
+            it('does the same for a width replay whose widths the columns already show', async () => {
+                const { post_message } = await render_app();
+                await open(post_message);
+                await resized_column(post_message);
+                post_message.mockClear();
+                vi.useFakeTimers();
+                try {
+                    await undo();
+                    expect(width_writes(post_message)).toHaveLength(1);
+                    await act(async () => { vi.advanceTimersByTime(30_000); });
+                } finally {
+                    vi.useRealTimers();
+                }
+                expect(warnings(post_message)).toEqual([
+                    'Undo has not finished yet. If this window stays busy, reopen the file.',
+                ]);
+                await answer_width_write(post_message, { stored: [undefined] });
+                expect(undo_labels()).toEqual([]);
+                expect(redo_labels()).toEqual(['Resize column']);
+            });
+        });
 
         describe('a column drag', () => {
             it('posts one request when it ends, and records what the host says it changed', async () => {
@@ -22962,7 +24658,7 @@ describe('view steps in history', () => {
                 expect(cells_editable()).toEqual(EDITABLE);
             });
 
-            it('keep the entry of a replay a reload overtook, with the message', async () => {
+            it('try a replay again when a reload overtook it', async () => {
                 const { post_message } = await render_app();
                 await open(post_message);
                 await resized_column(post_message);
@@ -22972,10 +24668,12 @@ describe('view steps in history', () => {
 
                 await reload([undefined], table_meta(), { state: { columnWidths: [{ 1: 180 }] } });
 
+                // Posted again, once, against what the reload brought.
+                expect(warnings(post_message)).toEqual([]);
                 expect(undo_labels()).toEqual(['Resize column']);
-                expect(redo_labels()).toEqual([]);
-                expect(warnings(post_message)).toEqual(['Undo did not run because the file was refreshing. Try again.']);
-                expect(cells_editable()).toEqual(EDITABLE);
+                expect(width_writes(post_message)).toHaveLength(1);
+                const again = latest_width_write(post_message);
+                expect(again.requestId).not.toBe(overtaken.requestId);
                 // A late answer to the overtaken request changes nothing.
                 await dispatch_host_message({
                     type: 'columnWidthsChanged',
@@ -22986,6 +24684,12 @@ describe('view steps in history', () => {
                 });
                 expect(undo_labels()).toEqual(['Resize column']);
                 expect(redo_labels()).toEqual([]);
+
+                await answer_width_write(post_message, { stored: [undefined] });
+                expect(undo_labels()).toEqual([]);
+                expect(redo_labels()).toEqual(['Resize column']);
+                expect(warnings(post_message)).toEqual([]);
+                expect(cells_editable()).toEqual(EDITABLE);
             });
         });
 
@@ -23359,18 +25063,24 @@ describe('view steps in history', () => {
                 expect(cells_editable()).toEqual(EDITABLE);
             });
 
-            it('keep the entry when a reload overtakes the request, with the message', async () => {
+            it('try the replay again when a reload overtakes the request', async () => {
                 const { post_message } = await render_app();
                 await open(post_message);
                 await resized_rows(post_message);
                 await undo();
+                const overtaken = row_height_writes(post_message).at(-1)!;
                 post_message.mockClear();
 
                 await reload([undefined]);
 
+                expect(warnings(post_message)).toEqual([]);
                 expect(undo_labels()).toEqual(['Resize 2 rows']);
-                expect(redo_labels()).toEqual([]);
-                expect(warnings(post_message)).toEqual(['Undo did not run because the file was refreshing. Try again.']);
+                expect(row_height_writes(post_message)).toHaveLength(1);
+                expect(row_height_writes(post_message)[0]!.requestId).not.toBe(overtaken.requestId);
+                await answer_row_heights(post_message);
+                expect(undo_labels()).toEqual([]);
+                expect(redo_labels()).toEqual(['Resize 2 rows']);
+                expect(warnings(post_message)).toEqual([]);
                 expect(cells_editable()).toEqual(EDITABLE);
             });
 
@@ -24231,11 +25941,14 @@ describe('view steps in history', () => {
                 try {
                     await undo();
                     expect(row_height_writes(post_message)).toHaveLength(1);
+                    // No wait for the session: the one timer is the watch
+                    // over a request the host has not answered yet.
+                    expect(vi.getTimerCount()).toBe(1);
+                    await answer_row_heights(post_message);
                     expect(vi.getTimerCount()).toBe(0);
                 } finally {
                     vi.useRealTimers();
                 }
-                await answer_row_heights(post_message);
                 await undo();
                 expect(width_writes(post_message)).toHaveLength(1);
                 await answer_width_write(post_message, { stored: [{ 1: 180 }] });
@@ -24307,6 +26020,304 @@ describe('view steps in history', () => {
             expect(posted(post_message, 'setColumnVisibility')).toEqual([]);
             expect(warnings(post_message)).toEqual([]);
             expect(undo_labels()).toEqual(['Sort']);
+        });
+    });
+
+    describe('a press held behind a view request', () => {
+        it('drops the held press when the replay it waits behind is cancelled, and says nothing', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await change_view(post_message, { sort: SORT_ASC, filters: [] });
+            await change_view(post_message, { sort: SORT_ASC, filters: [FILTER] });
+            post_message.mockClear();
+
+            await undo();
+            await undo();
+            expect(press_held()).toBe(true);
+            await click_button('Cancel');
+            const cancel = latest_transform_request(post_message);
+            expect(cancel.intent).toBe('cancel');
+            expect(press_held()).toBe(false);
+            await install(cancel);
+
+            // One cancel and no replay after it: the step the person stopped
+            // is not started again by the press behind it.
+            expect(posted(post_message, 'setTransform')).toHaveLength(2);
+            expect(undo_labels()).toEqual(['Sort', 'Filter']);
+            expect(redo_labels()).toEqual([]);
+            expect(warnings(post_message)).toEqual([]);
+            expect(cells_editable()).toEqual(EDITABLE);
+            // A press made after that undoes the filter.
+            await undo();
+            expect(latest_transform_request(post_message).state.filters).toEqual([]);
+        });
+
+        it('drops the held press when the replay it waits behind is refused', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await change_view(post_message, { sort: SORT_ASC, filters: [] });
+            await change_view(post_message, { sort: SORT_ASC, filters: [FILTER] });
+            await undo();
+            await install(latest_transform_request(post_message));
+            expect(redo_labels()).toEqual(['Filter']);
+            post_message.mockClear();
+
+            await undo();
+            const replay = latest_transform_request(post_message);
+            await redo();
+            expect(press_held()).toBe(true);
+            await refuse(replay);
+
+            expect(warnings(post_message)).toEqual([
+                'Can\'t undo “Sort”: The file is being saved.',
+            ]);
+            // The held Redo was for the stack as the Undo would have left it.
+            expect(posted(post_message, 'setTransform')).toHaveLength(1);
+            expect(undo_labels()).toEqual(['Sort']);
+            expect(redo_labels()).toEqual(['Filter']);
+            expect(press_held()).toBe(false);
+        });
+
+        it('drops a held Redo with the cancel, and does not redo the entry already on the redo stack', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await change_view(post_message, { sort: SORT_ASC, filters: [] });
+            await change_view(post_message, { sort: SORT_ASC, filters: [FILTER] });
+            await undo();
+            await install(latest_transform_request(post_message));
+            expect(redo_labels()).toEqual(['Filter']);
+            post_message.mockClear();
+
+            await undo();
+            await redo();
+            // The Redo was made after the Undo still in flight: held.
+            expect(press_held()).toBe(true);
+            await click_button('Cancel');
+            await install(latest_transform_request(post_message));
+
+            expect(posted(post_message, 'setTransform')).toHaveLength(2);
+            expect(undo_labels()).toEqual(['Sort']);
+            expect(redo_labels()).toEqual(['Filter']);
+            expect(warnings(post_message)).toEqual([]);
+        });
+
+        it('drops an Undo held behind the person\'s own sort with the cancel: the step under it stays', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await change_view(post_message, { sort: [], filters: [FILTER] });
+            post_message.mockClear();
+
+            const request = await ask(post_message, { sort: SORT_ASC, filters: [FILTER] });
+            expect(request).toBeDefined();
+            await undo();
+            expect(press_held()).toBe(true);
+            await click_button('Cancel');
+            await install(latest_transform_request(post_message));
+
+            expect(posted(post_message, 'setTransform')).toHaveLength(2);
+            expect(undo_labels()).toEqual(['Filter']);
+            expect(warnings(post_message)).toEqual([]);
+        });
+
+        it('drops an Undo held behind the person\'s own sort when the host refuses that sort: the step under it stays', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await change_view(post_message, { sort: [], filters: [FILTER] });
+            post_message.mockClear();
+
+            const request = await ask(post_message, { sort: SORT_ASC, filters: [FILTER] });
+            await undo();
+            expect(press_held()).toBe(true);
+            await refuse(request!);
+
+            // The sort's own refusal, then the press's: not carried out, and
+            // unlike a Cancel the person did not ask for that.
+            expect(warnings(post_message)).toEqual([
+                'Could not update the table view: The file is being saved.',
+                'Undo did not run because the change made before it was not applied.',
+            ]);
+            expect(posted(post_message, 'setTransform')).toHaveLength(1);
+            expect(undo_labels()).toEqual(['Filter']);
+            expect(press_held()).toBe(false);
+        });
+
+        it('keeps a press held for typed keys through a Cancel, and carries it out once the keys have landed', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await change_view(post_message, { sort: [], filters: [FILTER] });
+            await ask(post_message, { sort: SORT_ASC, filters: [FILTER] });
+            post_message.mockClear();
+            grid_shell_mock.typing_held = true;
+            try {
+                await undo();
+                await click_button('Cancel');
+                await install(latest_transform_request(post_message));
+            } finally {
+                grid_shell_mock.typing_held = false;
+            }
+            await act(async () => { props().on_held_typing_end?.(); });
+
+            const replay = latest_transform_request(post_message);
+            expect(replay.intent).toBe('user');
+            expect(replay.state.filters).toEqual([]);
+            expect(warnings(post_message)).toEqual([]);
+        });
+
+        it('is carried out when a sort it waits behind installs, and undoes that sort', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await change_view(post_message, { sort: [], filters: [FILTER] });
+            const request = await ask(post_message, { sort: SORT_ASC, filters: [FILTER] });
+            post_message.mockClear();
+
+            await undo();
+            // A Redo pressed after it cancels it; pressed again, held again.
+            await redo();
+            expect(press_held()).toBe(false);
+            await undo();
+            expect(press_held()).toBe(true);
+            await install(request!);
+
+            const replay = latest_transform_request(post_message);
+            expect(replay.state.sort).toEqual([]);
+            expect(replay.state.filters).toHaveLength(1);
+            await install(replay);
+            expect(undo_labels()).toEqual(['Filter']);
+            expect(redo_labels()).toEqual(['Sort']);
+            expect(warnings(post_message)).toEqual([]);
+        });
+    });
+
+    describe('a press made while a Save of this window is in flight', () => {
+        async function saving(post_message: ReturnType<typeof vi.fn>) {
+            await open(post_message);
+            await change_view(post_message, { sort: SORT_ASC, filters: [] });
+            await acquire_editing_session(post_message);
+            seed_mounted_store({ '1:0': { value: 'Alicia', base: 'Alice' } });
+            await act(async () => { props().on_save_request?.(); });
+            expect(posted(post_message, 'saveCsv')).toHaveLength(1);
+            const operation = props().save_operation as CsvSaveOperation;
+            expect(operation).toBeDefined();
+            post_message.mockClear();
+            return operation;
+        }
+
+        it('is held, says nothing, and is carried out after the Save', async () => {
+            const { post_message } = await render_app();
+            const operation = await saving(post_message);
+
+            await undo();
+            expect(posted(post_message, 'setTransform')).toEqual([]);
+            expect(warnings(post_message)).toEqual([]);
+            expect(press_held()).toBe(true);
+
+            await dispatch_host_message({
+                type: 'saveResult',
+                success: true,
+                lifecycle: { revision: 1, state: 'succeeded', operation },
+            });
+            await vi.waitUntil(() => posted(post_message, 'setTransform').length === 1);
+            expect(latest_transform_request(post_message).state.sort).toEqual([]);
+            expect(warnings(post_message)).toEqual([]);
+        });
+
+        it('says the file is still being saved at its bound when the Save has not ended', async () => {
+            const { post_message } = await render_app();
+            await saving(post_message);
+            vi.useFakeTimers();
+            try {
+                await undo();
+                await act(async () => { vi.advanceTimersByTime(5_000); });
+            } finally {
+                vi.useRealTimers();
+            }
+            expect(warnings(post_message)).toEqual([
+                'Undo did not run because the file is still being saved. Try again.',
+            ]);
+            expect(posted(post_message, 'setTransform')).toEqual([]);
+            expect(press_held()).toBe(false);
+        });
+    });
+
+    describe('a press made while a gesture waits for the editing session (A4)', () => {
+        it('is held until the claim is answered, then undoes the step on top; a gesture made after it waits too', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await change_view(post_message, { sort: SORT_ASC, filters: [] });
+            post_message.mockClear();
+
+            // Opening a row menu claims the session.
+            await request_edit_session();
+            expect(posted(post_message, 'requestEditSession')).toHaveLength(1);
+            await undo();
+            expect(warnings(post_message)).toEqual([]);
+            expect(posted(post_message, 'setTransform')).toEqual([]);
+            expect(press_held()).toBe(true);
+            // A gesture made after the press is not recorded under it.
+            expect(props().gestures_admitted?.()).toBe(false);
+
+            await dispatch_host_message({
+                type: 'editSessionResult',
+                granted: true,
+                editSessionId: 'menu-session',
+            });
+            await vi.waitUntil(() => posted(post_message, 'setTransform').length === 1);
+            const replay = latest_transform_request(post_message);
+            expect(replay.state.sort).toEqual([]);
+            await install(replay);
+            expect(undo_labels()).toEqual([]);
+            expect(redo_labels()).toEqual(['Sort']);
+            expect(warnings(post_message)).toEqual([]);
+            expect(props().gestures_admitted?.()).toBe(true);
+        });
+    });
+
+    describe('a column replay refused because a refresh was in transit (A2)', () => {
+        it('is written again, once, when a snapshot was applied between the post and the refusal', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await act(async () => props().on_hide_column?.(1));
+            await answer_column_write(post_message);
+            expect(undo_labels()).toEqual(['Hide column']);
+            post_message.mockClear();
+
+            await undo();
+            const first = latest_column_write(post_message);
+            // The host posts a delivery and then refuses the write named
+            // against the one before it.
+            await dispatch_host_message(refresh_snapshot_message(table_meta(), {
+                generation: 1,
+                sourceGeneration: 1,
+                capabilities: CSV,
+                // Still hidden: this delivery does not carry the write.
+                state: { columnVisibility: [{ hiddenColumns: [1], schema: SCHEMA }] },
+            }));
+            await answer_column_write(post_message, false);
+
+            expect(warnings(post_message)).toEqual([]);
+            expect(undo_labels()).toEqual(['Hide column']);
+            expect(posted(post_message, 'setColumnVisibility')).toHaveLength(2);
+            expect(latest_column_write(post_message).requestId).not.toBe(first.requestId);
+            await answer_column_write(post_message);
+            expect(undo_labels()).toEqual([]);
+            expect(redo_labels()).toEqual(['Hide column']);
+            expect(warnings(post_message)).toEqual([]);
+            expect(cells_editable()).toEqual(EDITABLE);
+        });
+
+        it('says the file was refreshing when no snapshot was applied since the post', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await act(async () => props().on_hide_column?.(1));
+            await answer_column_write(post_message);
+            post_message.mockClear();
+
+            await undo();
+            await answer_column_write(post_message, false);
+
+            expect(posted(post_message, 'setColumnVisibility')).toHaveLength(1);
+            expect(warnings(post_message)).toEqual(['Undo did not run because the file was refreshing. Try again.']);
+            expect(undo_labels()).toEqual(['Hide column']);
         });
     });
 });
@@ -24767,6 +26778,34 @@ describe('the header row as a step in history', () => {
                 expect(warnings(post_message)).toEqual([]);
             });
 
+            it('drops a press held behind it when one sheet lands unchanged and the next is refused', async () => {
+                const { post_message } = await render_app();
+                await open(post_message, book([AUTO, AUTO]));
+                record_header('Use row 1 as header', [[0, TURNED_ON]]);
+                await open_scope_menu('Header row scope');
+                await click_menu_item('Show first row as data on all 2 sheets');
+                const first = requests(post_message).at(-1)!;
+                expect(first.sheetIndex).toBe(0);
+                await undo();
+                expect(props().history_press_held?.()).toBe(true);
+                // Another window had already turned the first sheet's header off.
+                await answer(first, book([OFF, AUTO]), {
+                    change: { before: { mode: 'off' }, after: { mode: 'off' }, hidden: [], shown: [] },
+                });
+                const second = requests(post_message).at(-1)!;
+                expect(second.sheetIndex).toBe(1);
+                await answer(second, book([OFF, AUTO]), {
+                    outcome: 'rejected',
+                    error: 'The file is being saved.',
+                });
+
+                // Nothing recorded, and the press made for it is dropped, not
+                // carried out against the step under it.
+                expect(history_labels('undo')).toEqual(['Use row 1 as header']);
+                expect(requests(post_message).at(-1)).toBe(second);
+                expect(props().history_press_held?.()).toBe(false);
+            });
+
             it('records the sheets that changed before a refusal on the third', async () => {
                 const { post_message } = await render_app();
                 const third = await turn_off_all(post_message);
@@ -25157,6 +27196,23 @@ describe('the header row as a step in history', () => {
             expect(warnings(post_message)).toEqual([
                 'Reload this window to finish the header row change, then edit.',
             ]);
+            // A key held down says it once; a deliberate press two seconds
+            // later is told again.
+            await undo();
+            await redo();
+            expect(warnings(post_message)).toHaveLength(1);
+            const later = Date.now() + 2_000;
+            const clock = vi.spyOn(Date, 'now').mockReturnValue(later);
+            try {
+                await undo();
+            } finally {
+                clock.mockRestore();
+            }
+            expect(warnings(post_message)).toEqual([
+                'Reload this window to finish the header row change, then edit.',
+                'Reload this window to finish the header row change, then edit.',
+            ]);
+            expect(requests(post_message)).toEqual([]);
         });
 
         it('gives the grid its keyboard focus back when it had it, and not when it did not', async () => {
@@ -25227,22 +27283,25 @@ describe('the header row as a step in history', () => {
             expect(warnings(post_message)).toEqual([]);
         });
 
-        it('is replaced by a Redo pressed after it, which redoes the header step', async () => {
+        it('is cancelled by a Redo pressed after it: the header step is undone and nothing is redone', async () => {
             const { post_message } = await render_app();
             const first = await replay_in_flight(post_message);
 
+            // Undo, Undo, Redo: the two held presses add up to nothing, and
+            // the three to one Undo. (#389 replaced the held Undo with the
+            // Redo, which redid the step the first Undo took back.)
             await undo();
             await redo();
             await answer(first, book([OFF]), { change: { ...TURNED_ON, before: TURNED_ON.after, after: TURNED_ON.before } });
 
-            expect(requests(post_message).map((request) => request.target)).toEqual([
-                OFF_TARGET,
-                { mode: 'on', headerSourceRow: 0, hideRows: [], showRows: [] },
-            ]);
-            await answer(requests(post_message).at(-1)!, book([on(0)]), { change: TURNED_ON });
-            expect(history_labels('undo')).toEqual(['Turn off header row', 'Use row 1 as header']);
-            expect(history_labels('redo')).toEqual([]);
+            expect(requests(post_message).map((request) => request.target)).toEqual([OFF_TARGET]);
+            expect(history_labels('undo')).toEqual(['Turn off header row']);
+            expect(history_labels('redo')).toEqual(['Use row 1 as header']);
             expect(warnings(post_message)).toEqual([]);
+            expect(edits_admitted()).toBe(true);
+            // A third press is an ordinary one.
+            await undo();
+            expect(requests(post_message).map((request) => request.target)).toEqual([OFF_TARGET, AUTO_TARGET]);
         });
 
         it('is not carried out when the replay is refused', async () => {
@@ -25260,27 +27319,32 @@ describe('the header row as a step in history', () => {
             expect(edits_admitted()).toBe(true);
         });
 
-        it('is not carried out when the answer rides a snapshot this window does not install', async () => {
+        it('is carried out when the answer rides a snapshot this window does not install', async () => {
             const { post_message } = await render_app();
             const first = await replay_in_flight(post_message);
 
             await undo();
             // Older than what the window shows: its result counts, its
-            // contents are not installed.
+            // contents are not installed. The window already shows a later
+            // delivery, so a press made now runs against exactly the state
+            // the held press is carried out against (#389 dropped it).
             await answer(first, book([OFF]), {
                 change: { ...TURNED_ON, before: TURNED_ON.after, after: TURNED_ON.before },
             }, { identity: { authority: { fileId: 'file:test', revision: 0 } } });
 
-            // The step moved on the host's answer; the press is dropped,
-            // saying nothing, and the window is usable.
             expect(history_labels('undo')).toEqual(['Turn off header row']);
             expect(history_labels('redo')).toEqual(['Use row 1 as header']);
-            expect(requests(post_message)).toHaveLength(1);
+            expect(requests(post_message).map((request) => request.target)).toEqual([OFF_TARGET, AUTO_TARGET]);
+            expect(warnings(post_message)).toEqual([]);
+            expect(edits_admitted()).toBe(false);
+            await answer(requests(post_message).at(-1)!, book([AUTO]), { change: BACK_TO_AUTO });
+            expect(history_labels('undo')).toEqual([]);
+            expect(history_labels('redo')).toEqual(['Use row 1 as header', 'Turn off header row']);
             expect(warnings(post_message)).toEqual([]);
             expect(edits_admitted()).toBe(true);
         });
 
-        it('is not carried out when another snapshot is installed before the window has rendered the answer', async () => {
+        it('is carried out when another snapshot is installed before the window has rendered the answer', async () => {
             const { post_message } = await render_app();
             const first = await replay_in_flight(post_message);
 
@@ -25297,8 +27361,13 @@ describe('the header row as a step in history', () => {
             });
             await deliver_together(carrying, after);
 
+            // The later snapshot is later still than the one that carried the
+            // answer: the press is carried out against it.
             expect(history_labels('undo')).toEqual(['Turn off header row']);
-            expect(requests(post_message)).toHaveLength(1);
+            expect(requests(post_message).map((request) => request.target)).toEqual([OFF_TARGET, AUTO_TARGET]);
+            expect(warnings(post_message)).toEqual([]);
+            await answer(requests(post_message).at(-1)!, book([AUTO]), { change: BACK_TO_AUTO });
+            expect(history_labels('undo')).toEqual([]);
             expect(warnings(post_message)).toEqual([]);
             expect(edits_admitted()).toBe(true);
         });
@@ -25340,7 +27409,7 @@ describe('the header row as a step in history', () => {
                 expect(edits_admitted()).toBe(true);
             });
 
-            it('drops the press when a later snapshot is the one that took the worksheet away', async () => {
+            it('carries the press out when a later snapshot is the one that took the worksheet away', async () => {
                 const { post_message } = await render_app();
                 const first = await two_sheet_replay_with_a_press(post_message);
 
@@ -25363,17 +27432,24 @@ describe('the header row as a step in history', () => {
                     capabilities: EDITABLE,
                 }));
 
-                // The step moved; the window is not showing what the last
-                // answer left, so the press is dropped, saying nothing more.
+                // The step moved. The window shows a snapshot later than the
+                // one that carried the last answer, and a press made now would
+                // run against it: the held press is carried out (#389 dropped
+                // it), on the step under it.
                 expect(warnings(post_message)).toEqual([SKIPPED]);
-                expect(history_labels('undo')).toEqual(['Use row 1 as header']);
                 expect(history_labels('redo')).toEqual(['Show first row as data on all sheets']);
-                expect(requests(post_message)).toHaveLength(1);
+                expect(requests(post_message).map((request) => [request.sheetIndex, request.target]))
+                    .toEqual([[0, AUTO_TARGET], [0, OFF_TARGET]]);
+                await answer(requests(post_message).at(-1)!, book([OFF]), {
+                    change: { ...TURNED_ON, before: TURNED_ON.after, after: TURNED_ON.before },
+                });
+                expect(history_labels('undo')).toEqual([]);
+                expect(warnings(post_message)).toEqual([SKIPPED]);
                 expect(edits_admitted()).toBe(true);
             });
         });
 
-        it('admits no edit between the answer and the press it hands on, and takes a later press in its place', async () => {
+        it('admits no edit between the answer and the press it carries out, and is cancelled by a Redo pressed then', async () => {
             const { post_message } = await render_app();
             const first = await replay_in_flight(post_message);
 
@@ -25392,18 +27468,17 @@ describe('the header row as a step in history', () => {
                 }));
             });
 
+            // The fence is down, and the held press still admits nothing.
             expect(admitted_between).toBe(false);
-            // The Redo is the press carried out: the header step again.
-            expect(requests(post_message).map((request) => request.target)).toEqual([
-                OFF_TARGET,
-                { mode: 'on', headerSourceRow: 0, hideRows: [], showRows: [] },
-            ]);
-            await answer(requests(post_message).at(-1)!, book([on(0)]), { change: TURNED_ON });
+            // The Redo cancelled the held Undo: neither is carried out.
+            expect(requests(post_message).map((request) => request.target)).toEqual([OFF_TARGET]);
+            expect(history_labels('undo')).toEqual(['Turn off header row']);
+            expect(history_labels('redo')).toEqual(['Use row 1 as header']);
             expect(edits_admitted()).toBe(true);
             expect(warnings(post_message)).toEqual([]);
         });
 
-        it('says once that it waits for a header change that was asked for, before the fence and under it', async () => {
+        it('holds a press made while a header change is asked for, before the fence and under it, and undoes that change', async () => {
             const { post_message } = await render_app();
             await open(post_message, book([AUTO]));
             record_edit();
@@ -25414,26 +27489,165 @@ describe('the header row as a step in history', () => {
             expect(requests(post_message)).toEqual([]);
             expect(edits_admitted()).toBe(true);
 
+            // Held for the keys first, then for the header change: nothing
+            // said, nothing posted for the presses, one press for the two.
             await undo();
             await undo();
-            expect(warnings(post_message)).toEqual(['Wait for the header row change to finish, then edit.']);
+            expect(warnings(post_message)).toEqual([]);
 
             grid_shell_mock.editor_opening = false;
+            await act(async () => { (grid_shell_mock.latest_props as unknown as GridShellProps).on_held_typing_end?.(); });
             await vi.waitUntil(() => requests(post_message).length === 1);
             expect(edits_admitted()).toBe(false);
             await undo();
-            // One message for the one header change, and nothing moved.
-            expect(warnings(post_message)).toEqual(['Wait for the header row change to finish, then edit.']);
+            expect(warnings(post_message)).toEqual([]);
             expect(history_labels('undo')).toEqual(['Edit cell']);
             await answer(requests(post_message).at(-1)!, book([OFF]), { change: TURNED_OFF });
 
+            // The header change is recorded, and the held press undoes it:
+            // it was the last thing done before the press.
+            // (A gesture's request carries no target; a replay's does.)
+            expect(requests(post_message).map((request) => request.target)).toEqual([
+                undefined,
+                AUTO_TARGET,
+            ]);
             expect(history_labels('undo')).toEqual(['Edit cell', 'Turn off header row']);
             expect(history_labels('redo')).toEqual([]);
+            await answer(requests(post_message).at(-1)!, book([AUTO]), { change: BACK_TO_AUTO });
+            expect(history_labels('undo')).toEqual(['Edit cell']);
+            expect(history_labels('redo')).toEqual(['Turn off header row']);
+            expect(warnings(post_message)).toEqual([]);
+            expect(edits_admitted()).toBe(true);
+        });
+    });
+
+    describe('a header change asked for before a press', () => {
+        it('folds the open editor under its own ticket, goes through, and is what the press undoes', async () => {
+            const { post_message } = await render_app();
+            await open(post_message, book([AUTO]));
+            await acquire_editing_session(post_message);
+            // The open editor commits through the edit gate, as the real one does.
+            grid_shell_mock.commit_live_edit.mockImplementation(() => props().gestures_admitted?.() !== false);
+            // A row resize still out holds the header change back in its queue.
+            await act(async () => {
+                props().on_row_resize([{ start: 1, end: 1 }], 50, { gesture: true, on_result: () => {} });
+            });
+            const row = [...post_message.mock.calls].map(([message]) => message)
+                .filter((message: { type?: string }) => message?.type === 'setRowHeights').at(-1);
+            expect(row).toBeDefined();
+            await click_button('Header Row');
+            expect(requests(post_message)).toEqual([]);
+
+            await undo();
+            expect(props().history_press_held?.()).toBe(true);
+            grid_shell_mock.commit_live_edit.mockClear();
+            await dispatch_host_message({
+                type: 'rowHeightsChanged',
+                requestId: row.requestId,
+                applied: true,
+                sourceGeneration: 1,
+            });
+
+            // The fold was asked for before the press, and is admitted.
+            expect(grid_shell_mock.commit_live_edit).toHaveBeenCalled();
+            expect(warnings(post_message)).toEqual([]);
+            await vi.waitUntil(() => requests(post_message).length === 1);
+            await answer(requests(post_message).at(-1)!, book([OFF]), { change: TURNED_OFF });
+            // The header change is recorded, and the press undoes it.
+            expect(requests(post_message).at(-1)!.target).toEqual(AUTO_TARGET);
+            await answer(requests(post_message).at(-1)!, book([AUTO]), { change: BACK_TO_AUTO });
+            expect(history_labels('redo')).toEqual(['Turn off header row']);
+            expect(warnings(post_message)).toEqual([]);
+        });
+
+        it('drops a press held behind it when the header change is rejected and records nothing', async () => {
+            const { post_message } = await render_app();
+            await open(post_message, book([AUTO]));
+            await turn_off(post_message);
+            await act(async () => {
+                props().on_row_resize([{ start: 1, end: 1 }], 50, { gesture: true, on_result: () => {} });
+            });
+            const row = [...post_message.mock.calls].map(([message]) => message)
+                .filter((message: { type?: string }) => message?.type === 'setRowHeights').at(-1);
+            const before = requests(post_message).length;
+            await click_button('Header Row');
+            await undo();
+            expect(props().history_press_held?.()).toBe(true);
+            // The resize lands having changed nothing; the header change goes out.
+            await dispatch_host_message({
+                type: 'rowHeightsChanged',
+                requestId: row.requestId,
+                applied: true,
+                sourceGeneration: row.sourceGeneration,
+            });
+            await vi.waitUntil(() => requests(post_message).length === before + 1);
+            expect(props().history_press_held?.()).toBe(true);
+            await answer(requests(post_message).at(-1)!, book([OFF]), {
+                outcome: 'rejected',
+                error: 'The file is being saved.',
+            });
+
+            // Nothing recorded for the header change: the press is dropped,
+            // and the earlier header step is not undone.
+            expect(requests(post_message)).toHaveLength(before + 1);
+            expect(history_labels('undo')).toEqual(['Turn off header row']);
+            expect(props().history_press_held?.()).toBe(false);
+        });
+
+        it('ends a retry waiting behind it with the reload message when its result needs a reload', async () => {
+            const { post_message } = await render_app();
+            await open(post_message, book([AUTO]));
+            await acquire_editing_session(post_message);
+            record_edit();
+            const last = (type: string) => [...post_message.mock.calls].map(([message]) => message)
+                .filter((message: { type?: string }) => message?.type === type).at(-1);
+            await undo();
+            await vi.waitUntil(() => last('prepareHistoryReplay') !== undefined);
+            // Asked for while the Undo is out: queued behind it, as on the base.
+            await click_button('Header Row');
+            const before = requests(post_message).length;
+            const prepare = last('prepareHistoryReplay');
+            await dispatch_host_message({
+                type: 'historyReplayPrepareRefused',
+                refusal: {
+                    requestId: prepare.request.requestId,
+                    replayId: prepare.request.replayId,
+                    reason: 'document-changed',
+                },
+            });
+            // The Undo waits for its delivery; the header change goes out.
+            expect(warnings(post_message)).toEqual([]);
+            await vi.waitUntil(() => requests(post_message).length === before + 1);
+            await answer(requests(post_message).at(-1)!, book([OFF]), {
+                outcome: 'recovered',
+                reloadRequired: true,
+            });
+
+            expect(warnings(post_message)).toContain('Reload this window to finish the header row change, then edit.');
+            expect(warnings(post_message).some((message) => message.includes('refreshing'))).toBe(false);
+            expect(props().history_press_held?.()).toBe(false);
+        });
+
+        it('is not queued when clicked while a press is held, and says so', async () => {
+            const { post_message } = await render_app();
+            await open(post_message, book([AUTO]));
+            await turn_off(post_message);
+            await act(async () => {
+                props().on_row_resize([{ start: 1, end: 1 }], 50, { gesture: true, on_result: () => {} });
+            });
+            await undo();
+            expect(props().history_press_held?.()).toBe(true);
+
+            const before = requests(post_message).length;
+            await click_button('Header Row');
+
+            expect(requests(post_message)).toHaveLength(before);
+            expect(warnings(post_message)).toEqual(['Wait for the table view to finish updating.']);
         });
     });
 
     describe('before the request is posted', () => {
-        it('does not start while keys are owed to a cell', async () => {
+        it('waits while keys are owed to a cell, and starts once they have landed', async () => {
             const { post_message } = await render_app();
             await open(post_message, book([AUTO]));
             await turn_off(post_message);
@@ -25441,12 +27655,18 @@ describe('the header row as a step in history', () => {
 
             await undo();
 
-            expect(warnings(post_message)).toEqual([
-                'Undo did not run because another change is still being applied. Try again.',
-            ]);
+            // Held for the keys, which reserves nothing: their editor's
+            // commit must be admitted.
+            expect(warnings(post_message)).toEqual([]);
             expect(requests(post_message)).toEqual([]);
             expect(edits_admitted()).toBe(true);
             expect(history_labels('undo')).toEqual(['Turn off header row']);
+
+            // Nothing opened (the session was refused, say): an ordinary undo.
+            grid_shell_mock.editor_opening = false;
+            await act(async () => { (grid_shell_mock.latest_props as unknown as GridShellProps).on_held_typing_end?.(); });
+            expect(requests(post_message).map((request) => request.target)).toEqual([AUTO_TARGET]);
+            expect(warnings(post_message)).toEqual([]);
         });
 
         it('is fenced at once and waits, saying nothing, while the saved view is re-installed', async () => {

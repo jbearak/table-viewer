@@ -161,25 +161,22 @@ async function history(page: Page, command: 'undo' | 'redo', times = 1): Promise
 /**
  * Undo or redo a cell edit soon after a Save, and wait for `expected`.
  *
- * This allows for a race that has nothing to do with the header row. The file
- * watcher's refresh for the save can land while the edit is being replayed,
- * and the host then refuses the replay and says "… did not run because the
- * file was refreshing. Try again." The helper does what the message says.
- * Any other message fails, with its text.
+ * The file watcher's refresh for the save can land while the edit is being
+ * replayed. It finds the bytes the window already holds, and the press goes
+ * through: a refusal saying "the file was refreshing" here would be the bug
+ * this helper once had to work around, so it fails like any other message.
  */
 async function history_after_save(
     page: Page,
     command: 'undo' | 'redo',
     expected: Partial<Shown>,
 ): Promise<void> {
-    const try_again = `${command === 'undo' ? 'Undo' : 'Redo'} did not run because the file was refreshing. Try again.`;
     await history(page, command);
     const said: string[] = [];
     await expect.poll(async () => {
         for (const dialog of await take_dialogs(app!)) {
             const message = dialog.message ?? '';
-            if (message === try_again) await history(page, command);
-            else said.push(message);
+            said.push(message);
         }
         const now = await shown(page);
         const picked: Record<string, unknown> = {};

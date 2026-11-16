@@ -2071,6 +2071,57 @@ a new line char ""more quotes"" plus a tab  ."	https://google.com`)
         expect(document.body.contains(screen.getByDisplayValue("j"))).toBe(true);
     });
 
+    // The host's veto (GridShell answers true while a press of Undo or Redo
+    // is waiting): every gesture that opens an editor asks first, and one the
+    // host took opens nothing, not even the cell's own editor.
+    describe("A host that takes the overlay request: no editor for any gesture", () => {
+        const cell_b1: [number, number] = [300, 36 + 32 + 16]; // Col B, row 1
+        const gestures: Record<string, (canvas: HTMLElement) => void> = {
+            "a typed letter": canvas => {
+                fireEvent.keyDown(canvas, { keyCode: 74, key: "j" });
+                fireEvent.keyUp(canvas, { keyCode: 74, key: "j" });
+            },
+            Enter: canvas => {
+                fireEvent.keyDown(canvas, { keyCode: 13, key: "Enter" });
+                fireEvent.keyUp(canvas, { keyCode: 13, key: "Enter" });
+            },
+            "a double click": canvas => {
+                sendClick(canvas, { clientX: cell_b1[0], clientY: cell_b1[1] });
+            },
+        };
+        for (const [name, gesture] of Object.entries(gestures)) {
+            for (const taken of [true, false]) {
+                test(`${name} with the request ${taken ? "taken" : "declined"}`, async () => {
+                    vi.useFakeTimers();
+                    const request = vi.fn((_cell: Item, _initial: string | undefined) => taken);
+                    render(<DataEditor {...basicProps} onOverlayOpenRequest={request} />, {
+                        wrapper: Context,
+                    });
+                    prep();
+                    // A text cell that allows its overlay.
+                    expect(basicProps.getCellContent([1, 1])).toMatchObject({
+                        kind: GridCellKind.Text,
+                        allowOverlay: true,
+                    });
+
+                    const canvas = screen.getByTestId("data-grid-canvas");
+                    sendClick(canvas, { clientX: cell_b1[0], clientY: cell_b1[1] });
+                    expect(screen.queryAllByRole("textbox")).toHaveLength(0);
+
+                    gesture(canvas);
+
+                    expect(request).toHaveBeenCalledTimes(1);
+                    expect(request.mock.calls[0]![0]).toEqual([1, 1]);
+                    // Checked as the event returns: Glide mounts its overlay
+                    // inside the event's own dispatch.
+                    expect(screen.queryAllByRole("textbox")).toHaveLength(taken ? 0 : 1);
+                    await drainEventLoop();
+                    expect(screen.queryAllByRole("textbox")).toHaveLength(taken ? 0 : 1);
+                });
+            }
+        }
+    });
+
     test("Open overlay with keypress", async () => {
         vi.useFakeTimers();
         render(<DataEditor {...basicProps} />, {
