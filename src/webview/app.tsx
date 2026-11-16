@@ -9934,7 +9934,12 @@ export function App(): React.JSX.Element {
                 if (
                     refused
                     || !sheet_widths_equal(state_ref.current.columnWidths?.[index], sheet.posted)
-                ) set_auto_fit_for_sheet(index, false, undefined);
+                ) {
+                    set_auto_fit_for_sheet(index, false, undefined);
+                    // With the fit goes what its restore would put back on
+                    // the Pending Columns, as where a refresh ends Auto-fit.
+                    pending_auto_fit_snapshot_ref.current[index] = undefined;
+                }
             }
         };
         if (outcome.kind === 'applied') {

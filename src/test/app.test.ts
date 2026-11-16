@@ -19784,6 +19784,82 @@ describe('auto-fit with Pending Columns', () => {
         expect(pending_width()).toBe(90);
     });
 
+    it('ends the fit for a Pending Column too when a refusal follows a refresh', async () => {
+        // A refresh arrives while the fit, or the restore, is being stored,
+        // and the host then refuses it. The widths are the refresh's and
+        // Auto-fit is off either way; the Pending Column has to end on the
+        // side of "off", with nothing kept for a later restore to put back.
+        grid_shell_mock.auto_fit_result = { 0: 120 };
+        const { post_message } = await render_app();
+        const meta = make_meta(['Sheet1'], false);
+        const capabilities = { csvEditable: true, csvEditingSupported: true };
+        await dispatch_host_message(initial_snapshot_message(meta, { capabilities }));
+        await acquire_editing_session(post_message, 'adopted-session');
+        const store = (grid_shell_mock.latest_props as unknown as GridShellProps).pending_row_store!;
+        const set_pending_width = async (width: number) => {
+            const before = store.snapshot();
+            await act(async () => {
+                const staged = store.stage_replace('adopted-session', before, {
+                    ...before,
+                    columnLayout: {
+                        columns: [{ kind: 'source', sourceColumn: 0 }, { kind: 'pending', pendingColumnId: 'column-a' }],
+                        removedSourceColumns: [],
+                        discardedPendingColumns: [],
+                    },
+                    pendingColumns: [{
+                        id: 'column-a', header: 'New column', cells: {}, viewerWidth: width,
+                        format: { kind: 'none' }, createdOrder: 1,
+                    }],
+                });
+                staged!.commit();
+                staged!.notify();
+            });
+        };
+        /** A refresh of the same source, as one built before the pending write committed. */
+        const refresh = (width: number) => {
+            const { sheetIndex: _sheet_index, ...slot } = {
+                sheetIndex: 0, sheetName: 'Sheet1', cells: {}, ...store.snapshot(),
+            };
+            return dispatch_host_message(refresh_snapshot_message(meta, {
+                generation: 1,
+                sourceGeneration: 1,
+                reason: 'other',
+                capabilities: { ...capabilities, csvEditSessionId: 'adopted-session' },
+                state: { columnWidths: [{ 0: width }], pendingEdits: [slot] },
+            }));
+        };
+        const pending_width = () => store.snapshot().pendingColumns?.[0]?.viewerWidth;
+        const fitted = () => grid_shell_mock.latest_props!.auto_fit_active;
+        await set_pending_width(90);
+
+        // A fit, a refresh, the refusal: not fitted, and the width from before.
+        grid_shell_mock.pending_auto_fit_result = { 'column-a': 180 };
+        await click_button('Auto-fit Columns');
+        expect(pending_width()).toBe(180);
+        await refresh(100);
+        await answer_width_write(post_message, { applied: false });
+        expect(fitted()).toBe(false);
+        expect(pending_width()).toBe(90);
+
+        // The person then drags the Pending Column to 200, and fits again.
+        // Restore puts back 200, not the 90 from the fit that never was.
+        await set_pending_width(200);
+        grid_shell_mock.pending_auto_fit_result = { 'column-a': 240 };
+        await click_button('Auto-fit Columns');
+        await answer_width_write(post_message, { stored: [{ 0: 100 }] });
+        expect(fitted()).toBe(true);
+        expect(pending_width()).toBe(240);
+
+        // A restore, a refresh, the refusal: Auto-fit is off, so the Pending
+        // Column stays where the restore put it.
+        await click_button('Auto-fit Columns');
+        expect(pending_width()).toBe(200);
+        await refresh(100);
+        await answer_width_write(post_message, { applied: false });
+        expect(fitted()).toBe(false);
+        expect(pending_width()).toBe(200);
+    });
+
     it('does not start a fit while a highlight request holds the gesture slot, and says to wait', async () => {
         const { post_message } = await render_app();
         const meta = make_meta(['Sheet1'], false);
