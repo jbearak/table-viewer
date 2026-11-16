@@ -701,6 +701,8 @@ interface GridFocusRestoreState {
     sheet_index: number;
     generation: number;
     document_epoch: number;
+    /** Focus the toolbar when the grid, once mounted, has nothing to focus. */
+    or_toolbar?: true;
 }
 
 /**
@@ -2177,6 +2179,16 @@ export function App(): React.JSX.Element {
         restore_focus: () => void;
         origin: Exclude<TransformOrigin, 'restore'>;
     } | null>(null);
+    const filter_editor_ref = useRef(filter_editor);
+    filter_editor_ref.current = filter_editor;
+    /**
+     * Where the filter editor a refresh just closed was opened from. Nobody
+     * dismissed that editor, so nobody handed focus back: the effect that
+     * sees it gone does.
+     */
+    const filter_editor_closed_by_refresh_ref = useRef<
+        Exclude<TransformOrigin, 'restore'> | null
+    >(null);
     const [sheet_context_menu, set_sheet_context_menu] = useState<{
         // Null for a right-click on the tab strip's own background rather than on a
         // tab: the tab-orientation command applies to the strip, so it is offered
@@ -5014,7 +5026,9 @@ export function App(): React.JSX.Element {
                     const reloaded_column_names = source_changed
                         ? next_active_sheet?.columnNames ?? []
                         : undefined;
-                    set_filter_editor((editor) => {
+                    const filter_editor_after_snapshot = <Editor extends { column_index: number }>(
+                        editor: Editor | null,
+                    ): Editor | null => {
                         if (editor === null || filter_editor_columns_changed) return null;
                         if (reloaded_column_names === undefined) return editor;
                         const name = reloaded_column_names[editor.column_index];
@@ -5024,7 +5038,17 @@ export function App(): React.JSX.Element {
                                 === reloaded_column_names.lastIndexOf(name)
                             ? editor
                             : null;
-                    });
+                    };
+                    // Closing it here unmounts the control that held focus,
+                    // with nobody to hand focus back as a dismissal does.
+                    const filter_editor_shown = filter_editor_ref.current;
+                    if (
+                        filter_editor_shown !== null
+                        && filter_editor_after_snapshot(filter_editor_shown) === null
+                    ) {
+                        filter_editor_closed_by_refresh_ref.current = filter_editor_shown.origin;
+                    }
+                    set_filter_editor(filter_editor_after_snapshot);
                     if (source_changed) {
                         histogram_cache_ref.current.clear();
                         set_filter_histogram({ key: '', value: { status: 'loading' } });
@@ -6231,6 +6255,9 @@ export function App(): React.JSX.Element {
             }
             attempt += 1;
             if (attempt >= GRID_FOCUS_RESTORE_MAX_ATTEMPTS) {
+                // Reached with the document focused and no control holding
+                // focus: both were asked above, on this same attempt.
+                if (grid_focus_restore.or_toolbar) toolbar_focus_ref.current?.focus();
                 set_grid_focus_restore((current) => (
                     current === grid_focus_restore ? null : current
                 ));
@@ -8994,6 +9021,33 @@ export function App(): React.JSX.Element {
             filter_restore_timer_ref.current = undefined;
         }
     }, [filter_editor]);
+
+    // A refresh closed the editor (its column can now mean another one), and
+    // nobody dismissed it, so nobody handed focus back. The same hand-back as
+    // a dismissal's, by the tokens a refresh uses: such a refresh remounts
+    // the grid, which cannot take focus until it is mounted. To the grid, or
+    // to the toolbar when the grid has nothing to focus or a chip opened the
+    // editor; never from a control the person moved to. What opened the
+    // editor is not asked: the columns it belonged to changed under it.
+    useEffect(() => {
+        const origin = filter_editor_closed_by_refresh_ref.current;
+        if (origin === null) return;
+        filter_editor_closed_by_refresh_ref.current = null;
+        if (filter_editor !== null) return;
+        if (origin === 'grid') {
+            set_grid_focus_restore((current) => current ?? {
+                sheet_index: active_sheet_index,
+                generation: generation_ref.current,
+                document_epoch: document_epoch_ref.current,
+                or_toolbar: true,
+            });
+        } else {
+            set_toolbar_focus_restore((current) => current ?? {
+                sheet_index: active_sheet_index,
+                document_epoch: document_epoch_ref.current,
+            });
+        }
+    }, [active_sheet_index, filter_editor, set_grid_focus_restore]);
 
     const apply_filter_editor = useCallback((entry: FilterEntry) => {
         if (!filter_editor) return;

@@ -13785,6 +13785,102 @@ describe('sorting and filtering', () => {
 
             expect(document.querySelector('.filter-popover')).toBeNull();
         });
+
+        describe('closed by a refresh that changes its columns', () => {
+            // Nobody dismissed the editor, so nothing handed focus back, and
+            // the control that held it is unmounted with the editor.
+            const with_a_column_added = () => refresh_snapshot_message(
+                two_column_meta(['Name', 'Age', 'City']),
+            );
+
+            /** Open the editor from the grid, as a header menu's "Filter…" does, with focus in it. */
+            async function open_from_grid(focused = true) {
+                const has_focus = vi.spyOn(document, 'hasFocus').mockReturnValue(focused);
+                await render_app();
+                await dispatch_host_message(initial_snapshot_message(two_column_meta()));
+                grid_shell_mock.has_grid_focus.mockReturnValue(false);
+                await open_filter_with(vi.fn());
+                await type_filter_value('3');
+                grid_shell_mock.focus_grid.mockClear();
+                return has_focus;
+            }
+
+            it('gives focus to the grid', async () => {
+                await open_from_grid();
+
+                await dispatch_host_message(with_a_column_added());
+
+                expect(document.querySelector('.filter-popover')).toBeNull();
+                await vi.waitUntil(() => grid_shell_mock.focus_grid.mock.calls.length > 0);
+                expect(grid_shell_mock.focus_grid).toHaveBeenCalledOnce();
+            });
+
+            it('gives focus to the toolbar when the grid has nothing to focus', async () => {
+                await open_from_grid();
+                grid_shell_mock.focus_grid.mockReturnValue(false);
+
+                await dispatch_host_message(with_a_column_added());
+
+                const toolbar = document.querySelector('.toolbar') as HTMLElement;
+                await vi.waitUntil(() => document.activeElement === toolbar);
+            });
+
+            it('leaves focus on a control the person moved to', async () => {
+                await open_from_grid();
+
+                await dispatch_host_message(with_a_column_added());
+                expect(document.querySelector('.filter-popover')).toBeNull();
+                columns_trigger().focus();
+                // The hand-back asks whether the grid holds focus before it
+                // decides the person has moved on.
+                const asked = grid_shell_mock.has_grid_focus.mock.calls.length;
+                await vi.waitUntil(() => grid_shell_mock.has_grid_focus.mock.calls.length > asked);
+
+                expect(grid_shell_mock.focus_grid).not.toHaveBeenCalled();
+                expect(document.activeElement).toBe(columns_trigger());
+            });
+
+            it('takes no focus while the window does not have it', async () => {
+                const has_focus = await open_from_grid(false);
+
+                await dispatch_host_message(with_a_column_added());
+                expect(document.querySelector('.filter-popover')).toBeNull();
+                const asked = has_focus.mock.calls.length;
+                await vi.waitUntil(() => has_focus.mock.calls.length > asked);
+
+                expect(grid_shell_mock.focus_grid).not.toHaveBeenCalled();
+                expect(document.activeElement).toBe(document.body);
+            });
+
+            it('gives focus to the toolbar when a filter chip opened it', async () => {
+                vi.spyOn(document, 'hasFocus').mockReturnValue(true);
+                const { post_message } = await render_app();
+                await load_acknowledged_transform(post_message, {
+                    sort: [],
+                    filters: [{
+                        id: 'theirs', colIndex: 0, operator: 'equals', value: 'x',
+                        caseSensitive: false, enabled: true,
+                    }],
+                    schema: '["Sheet1",1,null]',
+                });
+                grid_shell_mock.has_grid_focus.mockReturnValue(false);
+                await act(async () => (
+                    document.querySelector('.filter-chip-body') as HTMLButtonElement
+                ).click());
+                expect(document.querySelector('.filter-popover')).not.toBeNull();
+                grid_shell_mock.focus_grid.mockClear();
+
+                // Another column: the filter is dropped and its chip with it.
+                await dispatch_host_message(refresh_snapshot_message(two_column_meta(), {
+                    generation: 3,
+                }));
+
+                expect(document.querySelector('.filter-popover')).toBeNull();
+                const toolbar = document.querySelector('.toolbar') as HTMLElement;
+                await vi.waitUntil(() => document.activeElement === toolbar);
+                expect(grid_shell_mock.focus_grid).not.toHaveBeenCalled();
+            });
+        });
     });
 
     describe('the name a column is shown by', () => {

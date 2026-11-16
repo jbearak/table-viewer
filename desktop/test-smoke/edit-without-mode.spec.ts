@@ -800,6 +800,27 @@ test('Filter… in a column menu opens a filter that stays open after the menu\'
     await expect(page.locator('.grid-shell-root')).toHaveAttribute('data-edit-session', 'none');
 });
 
+test('a filter editor closed by a change to the file\'s columns leaves keyboard focus in the grid', async () => {
+    const popover = await open_filter_from_header_menu(0);
+    await expect(popover).toBeVisible();
+    // Typing into it: focus is in the editor, as it is for a person.
+    await popover.locator('.filter-value-search').fill('Bo');
+    // The session the menu acquired holds nothing, and is let go.
+    await expect(page.locator('.grid-shell-root')).toHaveAttribute('data-edit-session', 'none');
+
+    // Another program rewrites the file with a column in front: the editor's
+    // column is no longer the one it named, so the refresh closes it. Nobody
+    // dismissed it, and the control that held focus is gone with it.
+    fs.writeFileSync(csv, 'Id,Name,Age,City\n1,Alice,30,New York\n2,Bob,25,London\n');
+    await expect(popover).toBeHidden({ timeout: 20_000 });
+    await expect(page.locator('thead th').first()).toHaveText('Id');
+
+    await expect.poll(() => page.evaluate(() => {
+        const active = document.activeElement;
+        return active !== null && active.closest('.grid-shell-root') !== null;
+    })).toBe(true);
+});
+
 test('a filter on a column with an unsaved edit in its first row is named by the column\'s header', async () => {
     await select_cell(1, 0);
     await page.keyboard.type('Ann');
