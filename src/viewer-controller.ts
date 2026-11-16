@@ -7718,12 +7718,20 @@ export function attach_viewer(
                     // What the session delivers must hold the write: read it
                     // back, install it again, and deliver it, since a
                     // delivery made meanwhile carried the material as it was.
+                    // After a replay commit in flight has settled: its answer,
+                    // posted as it settles, must reach the window before a
+                    // delivery that carries what it wrote.
                     if (!disposed) {
-                        void refresh_session_state_material().then(() => {
-                            if (!disposed) session.deliver_current_material();
-                        }, (refresh_error: unknown) => {
-                            console.warn('Reading back a committed state write failed', refresh_error);
-                        });
+                        const replay = active_replay_commit;
+                        void (replay === undefined
+                            ? Promise.resolve()
+                            : replay.then(() => undefined, () => undefined))
+                            .then(() => refresh_session_state_material())
+                            .then(() => {
+                                if (!disposed) session.deliver_current_material();
+                            }, (refresh_error: unknown) => {
+                                console.warn('Reading back a committed state write failed', refresh_error);
+                            });
                     }
                 }
                 return result.snapshot;
@@ -17861,15 +17869,17 @@ export function attach_viewer(
             // and projects the same retained authority the replay was checked
             // against. With the view current, the session that owns the lease
             // is the active one; after a view that moved, only if it still is.
-            // After a view that moved, also only while the source the lease
-            // was issued against is still the one installed: a reload seeds
-            // its own ledgers from durable state, which holds the write.
+            // A reload that kept the session rebases only the ledgers it
+            // has, so a missing one is made here too, for the source installed
+            // now: what the reload's rebase makes of an empty ledger.
             const lease_session_id = !view_moved_after_write
                 ? active_edit_session_id
                 : active_edit_session_id === payload.editSessionId
-                    && core?.source_generation === payload.sourceGeneration
                     ? payload.editSessionId
                     : undefined;
+            const ledger_generation = view_moved_after_write
+                ? core?.source_generation ?? payload.sourceGeneration
+                : payload.sourceGeneration;
             if (lease_session_id !== undefined) {
                 for (const structural of payload.structures) {
                     const target = canonical_worksheet_target({
@@ -17881,7 +17891,7 @@ export function attach_viewer(
                     if (!append_admission_ledgers.has(ledger_key)) {
                         append_admission_ledgers.set(
                             ledger_key,
-                            empty_append_admission_ledger(payload.sourceGeneration),
+                            empty_append_admission_ledger(ledger_generation),
                         );
                     }
                 }

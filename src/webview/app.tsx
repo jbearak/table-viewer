@@ -2564,6 +2564,10 @@ export function App(): React.JSX.Element {
                 if (current === JSON.stringify(accepted.desired)) continue;
                 if (view_moved && current !== JSON.stringify(accepted.expected)) {
                     const store = registry.pending_rows_for_sheet(accepted.resolvedSheetIndex).snapshot();
+                    // A delivery made from the written state, with conflicts
+                    // the host computed since: in place, conflicts kept.
+                    if (JSON.stringify({ ...store, conflicts: accepted.desired.conflicts })
+                        === JSON.stringify(accepted.desired)) continue;
                     // A delivery recomputed only the conflicts: the replay
                     // lands, with the conflicts the host has now.
                     if (JSON.stringify({ ...store, conflicts: accepted.expected.conflicts })

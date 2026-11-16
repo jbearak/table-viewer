@@ -1977,6 +1977,21 @@ describe('GridShell editing with no session held yet', () => {
         expect(grid_mock.props!.onPaste).toBe(false);
     });
 
+    it('answers a gesture waiting on the session no when its grid went away before the grant', async () => {
+        const { request, grant } = session_request();
+        await render_grid(undefined, { ...no_session, on_request_edit_session: request });
+        let admitted: unknown;
+        const admission = grid_mock.props!.onPasteAdmission!(Promise.resolve()) as Promise<unknown>;
+        void admission.then((answer) => { admitted = answer; });
+        expect(request).toHaveBeenCalledTimes(1);
+
+        // The grid goes away (another sheet, a reload) while the host answers.
+        await act(async () => root!.unmount());
+        root = null;
+        grant();
+        await vi.waitFor(() => expect(admitted).toBe(false));
+    });
+
     it('holds an editor request for the session and opens it on the grant, with what was typed', async () => {
         const { request, grant } = session_request();
         const overlay = open_editors_as_glide_does();

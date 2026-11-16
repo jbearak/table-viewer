@@ -411,6 +411,48 @@ describe('a replay whose view moves while its commit runs', () => {
         expect(snapshot_highlight(messages_of(panel, 'workbookSnapshot').at(-1)!.snapshot)).toBe('yellow');
     });
 
+    it('delivers the repaired state only after the answer, when recording the committed write fails', async () => {
+        // The repair runs while the replay that wrote is still to be
+        // answered. Its delivery must not reach the window first: the window
+        // would take the written state before the answer that moves history.
+        const { base, store } = hooked_store();
+        const compare_and_set = store.compare_and_set.bind(store);
+        // Set once the replay is prepared: only its write is broken.
+        let armed = false;
+        let broken = false;
+        let messages: unknown[] = [];
+        let messages_at_break = 0;
+        store.compare_and_set = async (...args) => {
+            const result = await compare_and_set(...args);
+            if (!armed || broken || result.type !== 'committed') return result;
+            broken = true;
+            messages_at_break = messages.length;
+            return { ...result, snapshot: { ...result.snapshot, state: null as never } };
+        };
+        const { panel } = open_csv_table(store);
+        messages = panel.__messages;
+        await ready(panel);
+        const prepared = await prepare_highlight(panel);
+        armed = true;
+        vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+        const answer = await commit(panel, prepared);
+        expect(broken).toBe(true);
+        expect(answer.type).toBe('historyReplayCommitted');
+        expect(durable_highlight(base)).toBe('yellow');
+        // Everything after the write, in order: the answer comes before any
+        // delivery that carries the write.
+        await vi.waitFor(() => expect(panel.__messages.slice(messages_at_break)
+            .some((message) => (message as { type?: string }).type === 'workbookSnapshot'
+                && snapshot_highlight((message as { snapshot: unknown }).snapshot) === 'yellow')).toBe(true));
+        const after = panel.__messages.slice(messages_at_break);
+        const answered_at = after.indexOf(answer);
+        const first_written = after.findIndex((message) => (message as { type?: string }).type === 'workbookSnapshot'
+            && snapshot_highlight((message as { snapshot: unknown }).snapshot) === 'yellow');
+        expect(answered_at).toBeGreaterThanOrEqual(0);
+        expect(answered_at).toBeLessThan(first_written);
+    });
+
     it('still answers conflict when the durable highlight differs from the one the replay expects', async () => {
         const { base, store } = hooked_store();
         const { panel } = open_csv_table(store);

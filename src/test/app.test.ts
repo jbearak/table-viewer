@@ -18844,6 +18844,7 @@ describe('undo and redo, from the keyboard and the desktop menu', () => {
     it.each([
         ['already in place, on any commit', 'desired', false, true],
         ['moved only in its conflicts, on a commit whose view moved after its write', 'conflicts', true, true],
+        ['already in place but for newer conflicts, on a commit whose view moved after its write', 'desired-conflicts', true, true],
         ['moved in its rows, on a commit whose view moved after its write', 'rows', true, false],
         ['moved in its rows and kept by this window, on a commit whose view moved after its write', 'rows-kept', true, false],
         ['moved only in its conflicts, on an ordinary commit', 'conflicts', false, false],
@@ -18924,6 +18925,16 @@ describe('undo and redo, from the keyboard and the desktop menu', () => {
         const desired = prepare.request.structures[0].desired;
         const moved = store_state === 'desired'
             ? desired
+            : store_state === 'desired-conflicts'
+                ? { ...desired, conflicts: [{
+                    reason: 'ambiguousPendingFormula' as const,
+                    pendingRowIds: [],
+                    tailRemovalIds: [],
+                    formulaCells: [{
+                        rowIdentity: { kind: 'source' as const, sourceRow: 0 },
+                        sourceColumn: 0,
+                    }],
+                }] }
             : store_state === 'rows' || store_state === 'rows-kept'
                 // The row gone, its append basis kept: neither where the
                 // replay found it nor where it leaves it.
@@ -18976,8 +18987,8 @@ describe('undo and redo, from the keyboard and the desktop menu', () => {
             expect(labels).toEqual([]);
             expect(sent(post_message, 'showWarning')).toBeUndefined();
             expect(pending_store.snapshot()).toEqual(
-                store_state === 'desired'
-                    ? desired
+                store_state === 'desired' || store_state === 'desired-conflicts'
+                    ? moved
                     // The replay lands, with the conflicts the host has now.
                     : { ...desired, conflicts: moved.conflicts },
             );
