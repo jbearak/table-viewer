@@ -10,6 +10,9 @@ import {
     value_only_overlay,
 } from '../webview/history-cell-state-model';
 import {
+    SIZE_WRITE_REFUSED_MESSAGE,
+    SIZE_WRITE_UNRESOLVED_MESSAGE,
+    UNRESOLVED_SAVE_SIZE_REASON,
     view_partly_applied_warning,
     view_replay_dropped_warning,
     view_replay_refusal_warning,
@@ -33,13 +36,16 @@ import {
     rekey_committed_tail_removal_history,
     rekey_saved_appended_row_history,
     view_step_change,
+    width_step_changes,
     type HistoryAction,
     type HistoryChange,
     type HistoryStackState,
 } from '../webview/history-stack-model';
 import { create_history_store } from '../webview/history-store';
 import {
+    column_widths_view_step,
     columns_view_step,
+    row_heights_view_step,
     transform_view_step,
     type ViewStep,
 } from '../webview/view-history-model';
@@ -258,6 +264,213 @@ describe('a view step in the stack', () => {
     });
 });
 
+const OTHER_SHEET: WorksheetTarget = { sheetIndex: 1, sheetName: 'More', worksheetId: 'rId2' };
+
+const resize_column_action = () => action_of(column_widths_view_step(
+    SHEET, [{ column: 2, before: null, after: 180 }],
+));
+const resize_rows_action = () => action_of(row_heights_view_step(
+    SHEET, { height: 60, before: [{ start: 0, end: 1, height: null }, { start: 4, end: 4, height: 30 }] },
+));
+/** "Restore column widths on all sheets": one action, one change per worksheet. */
+function restore_all_action(): HistoryAction {
+    const first = column_widths_view_step(SHEET, [{ column: 0, before: 90, after: null }], 'off')!;
+    const second = column_widths_view_step(OTHER_SHEET, [{ column: 1, before: 70, after: 120 }], 'off')!;
+    return {
+        label: first.label,
+        changes: [{ kind: 'view', delta: first.delta }, { kind: 'view', delta: second.delta }],
+    };
+}
+
+describe('a size step in the stack', () => {
+    it('is recorded with its label, clears redo, and moves between the stacks', () => {
+        let state = recorded(empty_history_stack(), { label: 'Edit cell', changes: [cell_change(1, 'a')] });
+        state = recorded(state, sort_action());
+        state = moved(state, 'undo');
+        expect(state.redoStack).toHaveLength(1);
+
+        state = recorded(state, resize_column_action());
+        expect(state.redoStack).toHaveLength(0);
+        state = recorded(state, resize_rows_action());
+        expect(state.undoStack.map((entry) => entry.action.label))
+            .toEqual(['Edit cell', 'Resize column', 'Resize 3 rows']);
+
+        const stored = state.undoStack[2].action;
+        const undone = moved(state, 'undo');
+        expect(undone.redoStack[0].action).toBe(stored);
+        expect(moved(undone, 'redo').undoStack[2].action).toBe(stored);
+    });
+
+    it('owns what it keeps, and keeps "no stored size" as null', () => {
+        const columns = [
+            { column: 0, before: null, after: 180 },
+            { column: 1, before: 90, after: null },
+        ];
+        const widths = action_of(column_widths_view_step(SHEET, columns, 'on'));
+        const runs = [{ start: 0, end: 4, height: null }, { start: 7, end: 7, height: 30 }];
+        const reset = action_of(row_heights_view_step(SHEET, { height: null, before: [{ start: 2, end: 2, height: 44 }] }));
+        const heights = action_of(row_heights_view_step(SHEET, { height: 60, before: runs }));
+        let state = recorded(empty_history_stack(), widths);
+        state = recorded(state, heights);
+        state = recorded(state, reset);
+
+        // The gesture's own arrays change afterwards; the stack's do not.
+        const given = (widths.changes[0] as Extract<HistoryChange, { kind: 'view' }>).delta;
+        if (given.slice !== 'columnWidths') throw new Error('expected a width delta');
+        (given.columns as { column: number; before: number | null; after: number | null }[]).push({
+            column: 9, before: 1, after: 2,
+        });
+        const given_rows = (heights.changes[0] as Extract<HistoryChange, { kind: 'view' }>).delta;
+        if (given_rows.slice !== 'rowHeights') throw new Error('expected a row-height delta');
+        (given_rows.before as { start: number; end: number; height: number | null }[]).length = 0;
+
+        expect(view_step_change(state.undoStack[0].action)!.delta).toEqual({
+            worksheet: SHEET,
+            slice: 'columnWidths',
+            columns: [
+                { column: 0, before: null, after: 180 },
+                { column: 1, before: 90, after: null },
+            ],
+            autoFit: 'on',
+        });
+        expect(view_step_change(state.undoStack[1].action)!.delta).toEqual({
+            worksheet: SHEET,
+            slice: 'rowHeights',
+            after: 60,
+            before: [{ start: 0, end: 4, height: null }, { start: 7, end: 7, height: 30 }],
+        });
+        expect(view_step_change(state.undoStack[2].action)!.delta).toEqual({
+            worksheet: SHEET,
+            slice: 'rowHeights',
+            after: null,
+            before: [{ start: 2, end: 2, height: 44 }],
+        });
+        for (const entry of state.undoStack) {
+            expect(Object.isFrozen(view_step_change(entry.action)!.delta)).toBe(true);
+        }
+    });
+
+    it('holds one width change per worksheet when a gesture spans worksheets', () => {
+        const action = restore_all_action();
+        const state = recorded(empty_history_stack(), action);
+        const kept = state.undoStack[0].action;
+        expect(kept.label).toBe('Restore column widths');
+        // Not a single-change view step, and still a width step as a whole.
+        expect(view_step_change(kept)).toBeUndefined();
+        expect(action_has_view_change(kept)).toBe(true);
+        expect(width_step_changes(kept)?.map((change) => change.delta.worksheet.sheetName))
+            .toEqual(['Data', 'More']);
+        expect(width_step_changes(kept)?.[1].delta.columns).toEqual([{ column: 1, before: 70, after: 120 }]);
+        // Anything else is not a width step.
+        expect(width_step_changes(sort_action())).toBeUndefined();
+        expect(width_step_changes(resize_rows_action())).toBeUndefined();
+        expect(width_step_changes({ label: 'x', changes: [action.changes[0], action.changes[0]] })).toBeUndefined();
+        expect(width_step_changes({ label: 'x', changes: [action.changes[0], cell_change(1, 'a')] })).toBeUndefined();
+    });
+
+    it('counts no cells, and costs by what it names', () => {
+        const one = measure_history_action(resize_column_action());
+        const many = measure_history_action(action_of(column_widths_view_step(
+            SHEET,
+            Array.from({ length: 500 }, (_u, column) => ({ column, before: null, after: 100 + column })),
+        )));
+        expect(one.cellCount).toBe(0);
+        expect(one.byteCost).toBeGreaterThan(0);
+        expect(many.byteCost).toBeGreaterThan(one.byteCost + 500);
+    });
+
+    it('stays far under the byte bound at the most rows a worksheet can hold heights for', () => {
+        // The worst case for runs: 10,000 rows, no two adjacent rows alike.
+        const before = Array.from({ length: 10_000 }, (_u, index) => ({
+            start: index * 2,
+            end: index * 2,
+            height: index % 2 === 0 ? null : 30 + (index % 7),
+        }));
+        const action = action_of(row_heights_view_step(SHEET, { height: 60, before }));
+        expect(action.label).toBe('Resize 10000 rows');
+        const cost = measure_history_action(action).byteCost;
+        expect(cost).toBeLessThan(DEFAULT_HISTORY_BOUNDS.hardMaxBytes / 4);
+        expect(record_history_action(empty_history_stack(), action).kind).toBe('recorded');
+        // A select-all resize of a long worksheet is one run.
+        const select_all = action_of(row_heights_view_step(
+            SHEET, { height: 60, before: [{ start: 0, end: 9_999, height: null }] },
+        ));
+        expect(measure_history_action(select_all).byteCost).toBeLessThan(2_000);
+    });
+
+    it('is one of the actions the count bound evicts', () => {
+        const bounds = { ...DEFAULT_HISTORY_BOUNDS, maxActions: 2 };
+        let state = empty_history_stack();
+        for (const action of [resize_column_action(), resize_rows_action(), sort_action()]) {
+            state = record_history_action(state, action, bounds).state;
+        }
+        expect(state.undoStack.map((entry) => entry.action.label)).toEqual(['Resize 3 rows', 'Sort']);
+    });
+
+    it('is carried unchanged when a save rebases the cells it wrote', () => {
+        let state = recorded(empty_history_stack(), { label: 'Edit cell', changes: [cell_change(1, 'a')] });
+        state = recorded(state, resize_column_action());
+        state = recorded(state, resize_rows_action());
+        state = recorded(state, restore_all_action());
+        const sizes = (from: HistoryStackState) => from.undoStack.slice(1).map((entry) => entry.action);
+        const before = sizes(state);
+
+        const rebased = rebase_saved_cell_history(state, [{
+            worksheet: SHEET,
+            sourceRow: 1,
+            sourceColumn: 0,
+            value: history_value('a'),
+        }]);
+
+        expect(rebased).not.toBe(state);
+        expect(sizes(rebased)).toEqual(before);
+    });
+
+    it('is carried unchanged when a save gives an added row its place in the file', () => {
+        const pending = { id: 'pending-0', cells: {}, formatTemplateId: 'plain', createdOrder: 1 };
+        const added: HistoryAction = {
+            label: 'Add row',
+            changes: [{
+                kind: 'pendingRows',
+                delta: {
+                    worksheet: SHEET,
+                    before: { formatTemplates: [], appendedRows: [], tailRemovals: [], conflicts: [] },
+                    after: {
+                        formatTemplates: [{ id: 'plain', format: { kind: 'none' } }],
+                        appendedRows: [pending],
+                        tailRemovals: [],
+                        conflicts: [],
+                    },
+                },
+            }],
+        };
+        let state = recorded(empty_history_stack(), resize_rows_action());
+        state = recorded(state, added);
+        state = recorded(state, resize_column_action());
+
+        const rekeyed = rekey_saved_appended_row_history(state, [{
+            worksheet: SHEET,
+            pendingRowId: 'pending-0',
+            sourceRow: 4,
+            savedFingerprint: 'fingerprint',
+            savedRow: { cells: {}, format: { kind: 'none' } },
+        }]);
+
+        expect(rekeyed).not.toBe(state);
+        expect(rekeyed.undoStack[1].action.changes.map((change) => change.kind)).toEqual(['tailRemoval']);
+        expect(rekeyed.undoStack[0].action).toEqual(state.undoStack[0].action);
+        expect(rekeyed.undoStack[2].action).toEqual(state.undoStack[2].action);
+    });
+
+    it('is dropped with everything else by the structural-save barrier', () => {
+        let state = recorded(empty_history_stack(), resize_column_action());
+        state = recorded(state, resize_rows_action());
+        state = install_structural_save_barrier(state);
+        expect(state.undoStack).toHaveLength(0);
+        expect(peek_history(state, 'undo')).toMatchObject({ kind: 'blocked' });
+    });
+});
+
 describe('a view step under a Header Row change', () => {
     it('is carried as it is when the body start moved', () => {
         const store = create_history_store(undefined, { body_start: () => 0 });
@@ -266,6 +479,17 @@ describe('a view step under a Header Row change', () => {
         const entry = store.snapshot().undoStack[0];
         const result = entry_for_current_header(entry, () => ({ bodyStart: 3, sourceRowCount: 10 }));
         expect(result).toEqual({ ok: true, entry });
+    });
+
+    it('carries a size step as it is: its rows are source rows, which a Header Row change leaves alone', () => {
+        const store = create_history_store(undefined, { body_start: () => 0 });
+        for (const action of [resize_rows_action(), resize_column_action(), restore_all_action()]) {
+            store.stage_record(action).commit();
+        }
+        for (const entry of store.snapshot().undoStack) {
+            expect(entry_for_current_header(entry, () => ({ bodyStart: 3, sourceRowCount: 10 })))
+                .toEqual({ ok: true, entry });
+        }
     });
 });
 
@@ -280,6 +504,56 @@ describe('the Edit menu for a view step', () => {
         expect(history_menu_projection(state, false)).toMatchObject({
             undoLabel: 'Sort', redoAvailable: true, redoLabel: 'Hide 3 rows',
         });
+    });
+});
+
+describe('the Edit menu for a size step', () => {
+    it('names each kind of step in both directions', () => {
+        const labels = [
+            action_of(column_widths_view_step(SHEET, [{ column: 0, before: null, after: 90 }])),
+            action_of(column_widths_view_step(SHEET, [
+                { column: 0, before: 90, after: 120 },
+                { column: 1, before: null, after: 120 },
+                { column: 2, before: null, after: 120 },
+            ])),
+            action_of(column_widths_view_step(SHEET, [{ column: 0, before: 120, after: 64 }], 'on')),
+            action_of(column_widths_view_step(SHEET, [{ column: 0, before: 64, after: 120 }], 'off')),
+            action_of(row_heights_view_step(SHEET, { height: 60, before: [{ start: 3, end: 3, height: null }] })),
+            action_of(row_heights_view_step(SHEET, { height: 60, before: [{ start: 0, end: 2, height: null }] })),
+            action_of(row_heights_view_step(SHEET, { height: null, before: [{ start: 3, end: 3, height: 60 }] })),
+            action_of(row_heights_view_step(SHEET, { height: null, before: [{ start: 0, end: 2, height: 60 }] })),
+        ];
+        expect(labels.map((action) => action.label)).toEqual([
+            'Resize column',
+            'Resize 3 columns',
+            'Auto-fit columns',
+            'Restore column widths',
+            'Resize row',
+            'Resize 3 rows',
+            'Reset row height',
+            'Reset 3 row heights',
+        ]);
+        let state = empty_history_stack();
+        for (const action of labels) state = recorded(state, action);
+        expect(history_menu_projection(state, false)).toMatchObject({
+            undoAvailable: true, undoLabel: 'Reset 3 row heights', redoAvailable: false,
+        });
+        state = moved(moved(state, 'undo'), 'undo');
+        expect(history_menu_projection(state, false)).toMatchObject({
+            undoLabel: 'Resize 3 rows', redoAvailable: true, redoLabel: 'Reset row height',
+        });
+    });
+});
+
+describe('a size step and the cell replay protocol', () => {
+    it('is never built into a prepare request', () => {
+        for (const action of [resize_column_action(), resize_rows_action(), restore_all_action()]) {
+            const state = recorded(empty_history_stack(), action);
+            expect(build_prepare_request(state.undoStack[0], 'undo', {
+                read_overlay: () => absent_overlay(),
+                next_id: (prefix) => `${prefix}-1`,
+            })).toBeUndefined();
+        }
     });
 });
 
@@ -362,6 +636,21 @@ describe('what a view replay says', () => {
             .toBe('Sheet “Data”: Undo skipped “Hide row”: rows above the header row stay hidden.');
         expect(view_skip_warning('redo', 'Hide row', ['too-many-hidden'], true))
             .toBe('Redo skipped “Hide row”: too many rows would be hidden.');
+    });
+
+    it('says what a size step left out, and why a size write did not land', () => {
+        expect(view_skip_warning('undo', 'Resize 3 columns', ['columns-gone'], false))
+            .toBe('Undo skipped part of “Resize 3 columns”: columns that are no longer in the worksheet were left out.');
+        expect(view_skip_warning('redo', 'Restore column widths', ['sheets-gone'], false))
+            .toBe('Redo skipped part of “Restore column widths”: worksheets that are no longer in the workbook were left out.');
+        expect(view_skip_warning('redo', 'Resize 3 rows', ['too-many-heights'], true))
+            .toBe('Redo skipped “Resize 3 rows”: too many rows would have a custom height.');
+        expect(view_skip_warning('undo', 'Resize row', ['rows-gone'], true, 'Data'))
+            .toBe('Sheet “Data”: Undo skipped “Resize row”: rows that are no longer in the worksheet were left out.');
+        expect(SIZE_WRITE_REFUSED_MESSAGE).toBe('Could not resize because the file was refreshing. Try again.');
+        expect(SIZE_WRITE_UNRESOLVED_MESSAGE).toBe('Could not resize: choose whether your last save finished first.');
+        expect(view_replay_refusal_warning('undo', 'Resize column', UNRESOLVED_SAVE_SIZE_REASON))
+            .toBe("Can't undo “Resize column”: choose whether your last save finished first.");
     });
 
     it('says when a replay landed short or outside history', () => {

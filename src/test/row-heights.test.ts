@@ -5,13 +5,16 @@ import {
     MAX_ROW_HEIGHT_PX,
     MIN_ROW_HEIGHT_PX,
     clamp_row_height,
+    display_rows_have_custom_height,
     mapped_row_height_overlays,
     natural_row_height,
     resolved_row_height,
     retained_row_height_overlay,
     row_height,
+    row_height_layers_after_answer,
     row_height_layers_for_delivery,
     row_height_layers_with,
+    row_height_order_marker,
     set_row_height,
     span_height,
     type RowHeightLayer,
@@ -517,5 +520,75 @@ describe('the optimistic row-height overlay', () => {
             const previous = [overlay(4), undefined];
             expect(mapped_row_height_overlays(previous, (entry) => entry)).toBe(previous);
         });
+    });
+});
+
+describe('a layer and the answer to its request', () => {
+    const layers: RowHeightLayer[] = [
+        { rows: [{ start: 0, end: 2 }], height: 60, requestId: 'first' },
+        { rows: [{ start: 5, end: 5 }], height: 40 },
+        { rows: [{ start: 1, end: 1 }], height: 80, requestId: 'second' },
+        { rows: [{ start: 7, end: 7 }], height: 30 },
+    ];
+
+    it('refused, retires the layer painted for the request, and only that one', () => {
+        expect(row_height_layers_after_answer(layers, 'first', false)).toEqual([layers[1], layers[2], layers[3]]);
+        expect(row_height_layers_after_answer(layers, 'second', false)).toEqual([layers[0], layers[1], layers[3]]);
+    });
+
+    it('applied, retires every layer older than the request too, and none newer', () => {
+        expect(row_height_layers_after_answer(layers, 'first', true)).toEqual([layers[1], layers[2], layers[3]]);
+        expect(row_height_layers_after_answer(layers, 'second', true)).toEqual([layers[3]]);
+    });
+
+    it('returns the same layers when none holds the request\'s place', () => {
+        expect(row_height_layers_after_answer(layers, 'unknown', true)).toBe(layers);
+        expect(row_height_layers_after_answer(layers, 'unknown', false)).toBe(layers);
+        expect(row_height_layers_after_answer([], 'first', true)).toEqual([]);
+    });
+});
+
+describe('the place of a request that paints nothing (a reset, an undo or redo)', () => {
+    const painted: RowHeightLayer = { rows: [{ start: 1, end: 1 }], height: 54 };
+    const marker = row_height_order_marker('reset');
+
+    it('paints no row and offers no reset', () => {
+        expect(resolved_row_height({}, [marker], 0)).toBe(DEFAULT_ROW_HEIGHT_PX);
+        expect(resolved_row_height({ 1: 60 }, [painted, marker], 1)).toBe(54);
+        expect(display_rows_have_custom_height({}, [marker], { start: 0, end: 2 ** 40 })).toBe(false);
+    });
+
+    it('is never what a delivery agrees with, so a delivery retires nothing on its account', () => {
+        const layers = [painted, marker];
+        expect(row_height_layers_for_delivery(layers, {})).toBe(layers);
+        expect(row_height_layers_for_delivery(layers, { 3: 40 })).toBe(layers);
+    });
+
+    it('goes with its answer, and applied takes the older layers with it', () => {
+        const newer: RowHeightLayer = { rows: [{ start: 4, end: 4 }], height: 70 };
+        expect(row_height_layers_after_answer([painted, marker, newer], 'reset', true)).toEqual([newer]);
+        expect(row_height_layers_after_answer([painted, marker, newer], 'reset', false)).toEqual([painted, newer]);
+    });
+});
+
+describe('whether rows show a custom height (what offers Reset row height)', () => {
+    it('is true for a height the projection names inside the interval', () => {
+        expect(display_rows_have_custom_height({ 4: 60 }, undefined, { start: 4, end: 4 })).toBe(true);
+        expect(display_rows_have_custom_height({ 4: 60 }, undefined, { start: 0, end: 9 })).toBe(true);
+        expect(display_rows_have_custom_height({ 4: 60 }, [], { start: 5, end: 9 })).toBe(false);
+        expect(display_rows_have_custom_height({}, undefined, { start: 0, end: 9 })).toBe(false);
+    });
+
+    it('is true for a height an unanswered resize paints over the interval', () => {
+        const layers: RowHeightLayer[] = [{ rows: [{ start: 3, end: 6 }], height: 60, requestId: 'drag' }];
+        expect(display_rows_have_custom_height({}, layers, { start: 6, end: 8 })).toBe(true);
+        expect(display_rows_have_custom_height({}, layers, { start: 0, end: 3 })).toBe(true);
+        expect(display_rows_have_custom_height({}, layers, { start: 7, end: 8 })).toBe(false);
+    });
+
+    it('does not walk a select-all interval', () => {
+        // Would not return in a test's time if it visited every row.
+        expect(display_rows_have_custom_height({ 12: 60 }, undefined, { start: 0, end: 2 ** 40 })).toBe(true);
+        expect(display_rows_have_custom_height({}, undefined, { start: 0, end: 2 ** 40 })).toBe(false);
     });
 });

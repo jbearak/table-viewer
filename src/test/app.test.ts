@@ -33,6 +33,7 @@ import {
     history_value,
     value_only_overlay,
 } from '../webview/history-cell-state-model';
+import { view_step_change, width_step_changes } from '../webview/history-stack-model';
 import { rebase_pending_edits_for_header } from '../header-rebase';
 import { delete_rows } from '../webview/pending-row-store';
 
@@ -325,7 +326,7 @@ vi.mock('../webview/grid-shell', () => ({
                 'button',
                 {
                     className: 'stub-resize',
-                    onClick: () => props.on_column_resize(2, 222),
+                    onClick: () => props.on_columns_resized([{ column: 2, width: 222 }]),
                 },
                 'resize'
             ),
@@ -408,6 +409,7 @@ vi.mock('../webview/grid-shell', () => ({
                             { start: 8, end: 8 },
                         ],
                         50,
+                        { gesture: true },
                     ),
                 },
                 'row-resize'
@@ -422,6 +424,7 @@ vi.mock('../webview/grid-shell', () => ({
                     onClick: () => props.on_row_resize(
                         [{ start: 0, end: MAX_PERSISTED_ROW_HEIGHTS }],
                         50,
+                        { gesture: true },
                     ),
                 },
                 'row-resize-over-cap'
@@ -767,6 +770,103 @@ async function answer_column_write(
         applied,
         sourceGeneration: source_generation ?? request.sourceGeneration,
     });
+}
+
+function width_writes(post_message: ReturnType<typeof vi.fn>) {
+    return post_message.mock.calls
+        .map((call) => call[0] as WebviewMessage)
+        .filter((message): message is Extract<WebviewMessage, { type: 'setColumnWidths' }> => (
+            message.type === 'setColumnWidths'
+        ));
+}
+
+function latest_width_write(post_message: ReturnType<typeof vi.fn>) {
+    const request = width_writes(post_message).at(-1);
+    expect(request).toBeDefined();
+    return request!;
+}
+
+/**
+ * The host's answer to the latest column width write.
+ *
+ * Applied, its `change` is what the write changed against `stored`, the
+ * widths the host held before it (by sheet index; nothing stored by default),
+ * as the host builds it.
+ */
+async function answer_width_write(
+    post_message: ReturnType<typeof vi.fn>,
+    options: {
+        applied?: boolean;
+        stored?: readonly (Readonly<Record<number, number>> | undefined)[];
+        refused?: 'unresolved';
+        source_generation?: number;
+    } = {},
+) {
+    const request = latest_width_write(post_message);
+    const applied = options.applied ?? true;
+    await dispatch_host_message({
+        type: 'columnWidthsChanged',
+        requestId: request.requestId,
+        applied,
+        sourceGeneration: options.source_generation ?? request.sourceGeneration,
+        ...(applied
+            ? {
+                change: request.sheets.flatMap((sheet) => {
+                    const stored = options.stored?.[sheet.sheetIndex];
+                    const columns = sheet.widths.flatMap(({ column, width }) => {
+                        const before = stored?.[column] ?? null;
+                        return before === width ? [] : [{ column, before, after: width }];
+                    });
+                    return columns.length === 0 ? [] : [{ sheetIndex: sheet.sheetIndex, columns }];
+                }),
+            }
+            : {}),
+        ...(options.refused === undefined ? {} : { refused: options.refused }),
+    });
+}
+
+function row_height_writes(post_message: ReturnType<typeof vi.fn>) {
+    return post_message.mock.calls
+        .map((call) => call[0] as WebviewMessage)
+        .filter((message): message is Extract<
+            WebviewMessage,
+            { type: 'setRowHeights' | 'setSourceRowHeights' }
+        > => message.type === 'setRowHeights' || message.type === 'setSourceRowHeights');
+}
+
+/** The host's answer to the latest row-height request, a resize or a replay. */
+async function answer_row_heights(
+    post_message: ReturnType<typeof vi.fn>,
+    options: {
+        applied?: boolean;
+        /** What the write changed, for a resize: the source rows and what each held. */
+        before?: readonly { start: number; end: number; height: number | null }[];
+        refused?: 'limit' | 'unresolved';
+        source_generation?: number;
+    } = {},
+) {
+    const request = row_height_writes(post_message).at(-1);
+    expect(request?.requestId).toEqual(expect.any(String));
+    const applied = options.applied ?? true;
+    await dispatch_host_message({
+        type: 'rowHeightsChanged',
+        requestId: request!.requestId!,
+        sheetIndex: request!.sheetIndex,
+        applied,
+        sourceGeneration: options.source_generation ?? request!.sourceGeneration,
+        ...(applied && request!.type === 'setRowHeights'
+            ? { change: { height: request!.height, before: options.before ?? [] } }
+            : {}),
+        ...(options.refused === undefined ? {} : { refused: options.refused }),
+    });
+}
+
+/** The labels on one of the history stacks, oldest first. */
+function history_labels(direction: 'undo' | 'redo'): string[] {
+    const history = (grid_shell_mock.latest_props as unknown as GridShellProps)
+        .history_store!.snapshot();
+    return (direction === 'undo' ? history.undoStack : history.redoStack)
+        .map((entry) => entry.action.label);
 }
 
 async function flush_focus_restore() {
@@ -1609,9 +1709,8 @@ describe('workbook snapshot hydration', () => {
         expect(grid_stub().getAttribute('data-sheet-index')).toBe('0');
         // Orientation now lives on the tab strip: the rail is what shows it applied.
         expect(container!.querySelector('.sheet-tabs-vertical')).not.toBeNull();
-        await act(async () => {
-            (container!.querySelector('.stub-resize') as HTMLButtonElement).click();
-        });
+        // Any layout change posts the window's whole state.
+        await click_button('Formatting');
         expect(post_message.mock.calls.map((call) => call[0])
             .filter((message) => message.type === 'stateChanged').at(-1))
             .toMatchObject({
@@ -1994,6 +2093,42 @@ describe('formatting toggle', () => {
         const last = post_message.mock.calls.at(-1)![0];
         expect(last.type).toBe('stateChanged');
         expect(last.state.showFormatting[0]).toBe(false);
+    });
+
+    it('builds its next layout change on the delivery that followed its write, after a refresh from before it', async () => {
+        // The host stored "raw values" while a refresh built before that write
+        // was on its way, and that refresh still says "formatted". The host
+        // follows such a write with a delivery that carries it. The window's
+        // next whole-state message is a difference from the last snapshot it
+        // applied, so it has to be that delivery's, or scrolling next would
+        // also turn formatting back on.
+        const { post_message } = await render_app();
+        const meta = make_meta(['First', 'Second']);
+        await dispatch_host_message(initial_snapshot_message(meta));
+        await click_button('Formatting');
+        const same_source = (show_formatting: boolean[]) => refresh_snapshot_message(meta, {
+            generation: 1,
+            sourceGeneration: 1,
+            reason: 'other',
+            state: { showFormatting: show_formatting },
+        });
+
+        await dispatch_host_message(same_source([true, true]));
+        const following = same_source([false, true]);
+        await dispatch_host_message(following);
+        // What the person chose is still what the sheet shows.
+        expect(grid_stub().getAttribute('data-show-formatting')).toBe('false');
+        post_message.mockClear();
+
+        await click_orientation_toggle();
+
+        const next = post_message.mock.calls
+            .map((call) => call[0] as WebviewMessage)
+            .filter((message): message is Extract<WebviewMessage, { type: 'stateChanged' }> => (
+                message.type === 'stateChanged'
+            )).at(-1);
+        expect(next?.state.showFormatting?.[0]).toBe(false);
+        expect(next?.snapshotIdentity).toEqual(following.snapshot.identity);
     });
 
     it('restores saved formatting from initial snapshot state', async () => {
@@ -2976,13 +3111,9 @@ describe('Excel first-row header toggle', () => {
             capabilities: EDITABLE,
             sourceGeneration: 1,
         }));
-        const resize = grid_shell_mock.latest_props!.on_row_resize as (
-            rows: readonly { start: number; end: number }[],
-            height: number,
-            on_result?: (applied: boolean) => void,
-        ) => void;
+        const resize = (grid_shell_mock.latest_props as unknown as GridShellProps).on_row_resize;
         const on_result = vi.fn();
-        await act(async () => { resize([{ start: 0, end: 1 }], 40, on_result); });
+        await act(async () => { resize([{ start: 0, end: 1 }], 40, { gesture: true, on_result }); });
         const request = post_message.mock.calls
             .map(([message]) => message as { type?: string; requestId?: string })
             .find((message) => message.type === 'setRowHeights');
@@ -3980,9 +4111,8 @@ describe('Excel first-row header toggle', () => {
         // Active sheet and tab orientation remain local view choices, but the
         // persisted snapshot is authoritative until this tab changes them.
         expect(grid_stub().getAttribute('data-sheet-index')).toBe('0');
-        await act(async () => {
-            (container!.querySelector('.stub-resize') as HTMLButtonElement).click();
-        });
+        // Any layout change posts the window's whole state.
+        await click_button('Formatting');
         expect(post_message.mock.calls
             .map((call) => call[0] as WebviewMessage)
             .filter((message) => message.type === 'stateChanged')
@@ -3991,7 +4121,7 @@ describe('Excel first-row header toggle', () => {
                 state: {
                     activeSheetIndex: 1,
                     tabOrientation: 'vertical',
-                    columnWidths: [{ 2: 222 }, { 0: 222 }],
+                    columnWidths: [undefined, { 0: 222 }],
                     scrollPosition: [undefined, { top: 300, left: 25 }],
                 },
             });
@@ -4466,10 +4596,14 @@ describe('column width persistence', () => {
         expect(JSON.parse(grid_stub().getAttribute('data-col-widths')!)).toEqual({
             2: 222,
         });
-        // And it is persisted under the active sheet's column-width slot.
-        const last = post_message.mock.calls.at(-1)![0];
-        expect(last.type).toBe('stateChanged');
-        expect(last.state.columnWidths[0]).toEqual({ 2: 222 });
+        // And the host is asked to store it, by sheet and source column, in a
+        // request it answers. Nothing goes through `stateChanged`.
+        expect(post_message.mock.calls.map((call) => call[0])).toEqual([{
+            type: 'setColumnWidths',
+            requestId: expect.any(String),
+            sourceGeneration: 1,
+            sheets: [{ sheetIndex: 0, sheetName: 'Sheet1', widths: [{ column: 2, width: 222 }] }],
+        }]);
     });
 
     it('restores saved column widths from initial snapshot state', async () => {
@@ -4734,6 +4868,7 @@ describe('column visibility projection', () => {
             0: 120,
             1: 220,
         });
+        await answer_width_write(post_message, { stored: [{ 0: 80, 1: 90 }] });
 
         post_message.mockClear();
         await open_columns();
@@ -4813,7 +4948,9 @@ describe('row height persistence', () => {
         // The durable write is the host's, so all the webview posts is the request —
         // display intervals plus the pair of generations that make them meaningful. No
         // `stateChanged`: heights are not a layout patch leaf any more, and the webview
-        // holds no copy of the durable map to send.
+        // holds no copy of the durable map to send. A resize the person made carries
+        // an id: the host's answer says which source rows changed, which is its step
+        // in undo history.
         expect(post_message).toHaveBeenCalledOnce();
         expect(post_message.mock.calls.at(-1)![0]).toEqual({
             type: 'setRowHeights',
@@ -4826,6 +4963,7 @@ describe('row height persistence', () => {
             height: 50,
             generation: 4,
             sourceGeneration: 7,
+            requestId: expect.any(String),
         });
         // Meanwhile the resize is visible immediately, as an overlay over the delivered
         // projection rather than in it: nothing durable has come back yet.
@@ -4838,6 +4976,7 @@ describe('row height persistence', () => {
                     { start: 8, end: 8 },
                 ],
                 height: 50,
+                requestId: expect.any(String),
             }]);
     });
 
@@ -5000,6 +5139,8 @@ describe('row height persistence', () => {
             { start: 8, end: 8 },
         ],
         height: 50,
+        // Tagged with its request: the host's answer retires it.
+        requestId: expect.any(String),
     }];
 
     it('does not paint one sheet\'s pending resize on another sheet', async () => {
@@ -5182,13 +5323,23 @@ describe('row height persistence', () => {
     });
 
     it('keeps the overlay when an install on its own sheet permutes nothing', async () => {
-        const { post_message } = await pending_resize();
+        // The filter is requested first: while a resize is pending this window
+        // starts no other view change. (The grid's stub posts the resize
+        // without asking, where the real grid would hold the drag back.)
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1', 'Other']), {
+            generation: 4,
+            sourceGeneration: 7,
+        }));
         await act(async () => {
             (container!.querySelector('.stub-inactive-filter-transform') as HTMLButtonElement)
                 .click();
         });
         const restore = latest_transform_request(post_message);
         expect(restore.sheetIndex).toBe(0);
+        await act(async () => {
+            (container!.querySelector('.stub-row-resize') as HTMLButtonElement).click();
+        });
 
         // The other side of the same gate. This install changed the rules — so the view
         // generation moves, and the ack carries it — but produced no permutation over a
@@ -5379,6 +5530,12 @@ describe('merges', () => {
 });
 
 describe('auto-fit state', () => {
+    beforeEach(() => {
+        // No editing session is held in these tests and nothing is open in the
+        // grid, which is when a fit owed to a worksheet may land.
+        grid_shell_mock.session_busy = false;
+    });
+
     it('clears auto-fit state when a new workbook loads', async () => {
         await render_app();
         await dispatch_host_message(initial_snapshot_message(make_meta(['First'])));
@@ -5398,13 +5555,14 @@ describe('auto-fit state', () => {
     it('fits the sheets it could not measure when each is opened', async () => {
         // Fitting reads the mounted grid's loaded rows, so a sheet nobody has opened
         // has nothing to measure; "all sheets" marks it and it fits on arrival.
-        await render_app();
+        const { post_message } = await render_app();
         await dispatch_host_message(initial_snapshot_message(make_meta(['A', 'B'])));
 
         await open_scope_menu('Auto-fit scope');
         await click_menu_item('Auto-fit columns on all 2 sheets');
         expect(get_button('Auto-fit Columns').classList.contains('active')).toBe(true);
         expect(JSON.parse(grid_stub().getAttribute('data-col-widths')!)).toEqual({ 0: 120 });
+        await answer_width_write(post_message);
 
         // A newly mounted sheet has not received its first row page yet. The initial
         // deferred pass therefore has nothing to measure and must remain queued.
@@ -5423,11 +5581,14 @@ describe('auto-fit state', () => {
                 .toEqual({ 0: 220 });
             expect(get_button('Auto-fit Columns').classList.contains('active')).toBe(true);
         });
+        // Owed until the host says the fit was written.
+        expect(grid_shell_mock.latest_props?.on_auto_fit_sample_change).toBeDefined();
+        await answer_width_write(post_message);
         expect(grid_shell_mock.latest_props?.on_auto_fit_sample_change).toBeUndefined();
     });
 
     it('keeps an owed fit when hidden columns become visible', async () => {
-        await render_app();
+        const { post_message } = await render_app();
         const meta = make_meta(['A', 'B']);
         await dispatch_host_message(initial_snapshot_message(meta, {
             state: {
@@ -5440,6 +5601,7 @@ describe('auto-fit state', () => {
 
         await open_scope_menu('Auto-fit scope');
         await click_menu_item('Auto-fit columns on all 2 sheets');
+        await answer_width_write(post_message);
 
         grid_shell_mock.auto_fit_result = null;
         await click_sheet_tab('B');
@@ -5450,6 +5612,7 @@ describe('auto-fit state', () => {
         await click_button('Show all');
         expect(JSON.parse(grid_stub().getAttribute('data-projection')!)).toEqual([0]);
         expect(grid_shell_mock.latest_props?.on_auto_fit_sample_change).toBeDefined();
+        await answer_column_write(post_message);
 
         grid_shell_mock.auto_fit_result = { 0: 220 };
         await notify_auto_fit_sample_change();
@@ -5461,11 +5624,12 @@ describe('auto-fit state', () => {
     });
 
     it('cancels an owed fit when the user resizes before rows arrive', async () => {
-        await render_app();
+        const { post_message } = await render_app();
         await dispatch_host_message(initial_snapshot_message(make_meta(['A', 'B'])));
 
         await open_scope_menu('Auto-fit scope');
         await click_menu_item('Auto-fit columns on all 2 sheets');
+        await answer_width_write(post_message);
 
         grid_shell_mock.auto_fit_result = null;
         await click_sheet_tab('B');
@@ -5476,6 +5640,7 @@ describe('auto-fit state', () => {
         });
         expect(JSON.parse(grid_stub().getAttribute('data-col-widths')!)).toEqual({ 2: 222 });
         expect(grid_shell_mock.latest_props?.on_auto_fit_sample_change).toBeUndefined();
+        await answer_width_write(post_message);
 
         // Returning after rows become measurable must preserve the direct resize,
         // rather than redeeming the now-cancelled fit over it.
@@ -5530,12 +5695,13 @@ describe('auto-fit state', () => {
     });
 
     it('does not replace original widths when auto-fit-all is repeated', async () => {
-        await render_app();
+        const { post_message } = await render_app();
         await dispatch_host_message(initial_snapshot_message(make_meta(['A', 'B'])));
 
         await open_scope_menu('Auto-fit scope');
         await click_menu_item('Auto-fit columns on all 2 sheets');
         expect(JSON.parse(grid_stub().getAttribute('data-col-widths')!)).toEqual({ 0: 120 });
+        await answer_width_write(post_message);
 
         // B is still owed, so the action remains available. Repeating it must not
         // treat A's fitted widths as the restore point for a second fit.
@@ -5631,6 +5797,7 @@ describe('auto-fit state', () => {
 
         await open_scope_menu('Auto-fit scope');
         await click_menu_item('Auto-fit columns on all 2 sheets');
+        await answer_width_write(post_message);
         grid_shell_mock.auto_fit_result = null;
         await click_sheet_tab('B');
         const restore = latest_transform_request(post_message);
@@ -5690,6 +5857,7 @@ describe('auto-fit state', () => {
 
         await open_scope_menu('Auto-fit scope');
         await click_menu_item('Auto-fit columns on all 2 sheets');
+        await answer_width_write(post_message);
         grid_shell_mock.auto_fit_result = null;
         await click_sheet_tab('B');
         expect(grid_shell_mock.latest_props?.on_auto_fit_sample_change).toBeDefined();
@@ -5712,6 +5880,7 @@ describe('auto-fit state', () => {
 
         await open_scope_menu('Auto-fit scope');
         await click_menu_item('Auto-fit columns on all 2 sheets');
+        await answer_width_write(post_message);
         grid_shell_mock.auto_fit_result = null;
         await click_sheet_tab('B');
 
@@ -5735,11 +5904,12 @@ describe('auto-fit state', () => {
     });
 
     it('preserves sibling fits owed across another sheet mapping change', async () => {
-        await render_app();
+        const { post_message } = await render_app();
         await dispatch_host_message(initial_snapshot_message(make_meta(['A', 'B', 'C'])));
 
         await open_scope_menu('Auto-fit scope');
         await click_menu_item('Auto-fit columns on all 3 sheets');
+        await answer_width_write(post_message);
 
         // The core generation is workbook-wide, but only A's mapping changed. B and C
         // still name the same rows and must remain queued.
@@ -5832,7 +6002,7 @@ describe('auto-fit state', () => {
         expect(JSON.parse(grid_stub().getAttribute('data-col-widths')!)).toEqual({ 0: 200 });
     });
 
-    it('drops auto-fit when a refresh reinstalls widths that predate the fit', async () => {
+    it('drops auto-fit when a refresh brings widths other than the fit', async () => {
         grid_shell_mock.auto_fit_result = { 0: 200 };
         const { post_message } = await render_app();
         await dispatch_host_message(initial_snapshot_message(
@@ -5845,11 +6015,11 @@ describe('auto-fit state', () => {
 
         await click_button('Auto-fit Columns');
         expect(get_button('Auto-fit Columns').classList.contains('active')).toBe(true);
+        await answer_width_write(post_message, { stored: [{ 0: 80 }] });
 
         await acquire_editing_session(post_message);
-        // The host read its state before the fitted-width write landed, so the
-        // refresh reverts the columns. The toggle must not claim fitted columns
-        // the grid no longer has.
+        // The fit was written; another window has since set the column back. The
+        // toggle must not claim fitted columns the grid no longer has.
         await dispatch_host_message(refresh_snapshot_message(
             make_meta(['Sheet1'], false),
             {
@@ -5871,6 +6041,70 @@ describe('auto-fit state', () => {
         // A single click re-fits rather than restoring the widths already shown.
         await click_button('Auto-fit Columns');
         expect(JSON.parse(grid_stub().getAttribute('data-col-widths')!)).toEqual({ 0: 200 });
+    });
+
+    it('keeps auto-fit when a refresh from before the fit was written straddles its write', async () => {
+        grid_shell_mock.auto_fit_result = { 0: 200 };
+        const { post_message } = await render_app();
+        const meta = make_meta(['Sheet1'], false);
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            state: { columnWidths: [{ 0: 80 }] },
+        }));
+        await click_button('Auto-fit Columns');
+        const refresh = (width: number, delivery: number) => refresh_snapshot_message(meta, {
+            generation: 1,
+            sourceGeneration: 1,
+            reason: 'other',
+            state: { columnWidths: [{ 0: width }] },
+            identity: {
+                deliveryId: delivery,
+                authority: { fileId: 'file:test', revision: 1 },
+                stateRevision: delivery,
+                sourceBasis: { physicalRevision: 1, projectionRevision: 0 },
+            },
+        });
+
+        // Built before the fit committed, so it differs by construction. While
+        // the write is pending that is not a reason to end Auto-fit.
+        await dispatch_host_message(refresh(80, 2));
+        expect(JSON.parse(grid_stub().getAttribute('data-col-widths')!)).toEqual({ 0: 80 });
+        expect(get_button('Auto-fit Columns').classList.contains('active')).toBe(true);
+        // The delivery behind it carries the written widths, then the answer.
+        await dispatch_host_message(refresh(200, 3));
+        await answer_width_write(post_message, { stored: [{ 0: 80 }] });
+        expect(JSON.parse(grid_stub().getAttribute('data-col-widths')!)).toEqual({ 0: 200 });
+        expect(get_button('Auto-fit Columns').classList.contains('active')).toBe(true);
+        expect(history_labels('undo')).toEqual(['Auto-fit columns']);
+
+        // And the toolbar still restores the widths the fit replaced.
+        await click_button('Auto-fit Columns');
+        expect(JSON.parse(grid_stub().getAttribute('data-col-widths')!)).toEqual({ 0: 80 });
+    });
+
+    it('ends auto-fit when another window wrote a fitted column before the fit was answered', async () => {
+        grid_shell_mock.auto_fit_result = { 0: 200 };
+        const { post_message } = await render_app();
+        const meta = make_meta(['Sheet1'], false);
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            state: { columnWidths: [{ 0: 80 }] },
+        }));
+        await click_button('Auto-fit Columns');
+        // The fit committed, another window then set the column to 300, and the
+        // delivery ahead of the answer carries that.
+        await dispatch_host_message(refresh_snapshot_message(meta, {
+            generation: 1,
+            sourceGeneration: 1,
+            reason: 'other',
+            state: { columnWidths: [{ 0: 300 }] },
+        }));
+        expect(get_button('Auto-fit Columns').classList.contains('active')).toBe(true);
+        await answer_width_write(post_message, { stored: [{ 0: 80 }] });
+
+        // The widths are the delivery's, and they are not a fit.
+        expect(JSON.parse(grid_stub().getAttribute('data-col-widths')!)).toEqual({ 0: 300 });
+        expect(get_button('Auto-fit Columns').classList.contains('active')).toBe(false);
+        // The write did happen, so it is a step.
+        expect(history_labels('undo')).toEqual(['Auto-fit columns']);
     });
 
     it('clears auto-fit when a same-source refresh reports a new view generation', async () => {
@@ -15370,6 +15604,7 @@ describe('an applied transform across a refresh', () => {
         expect(get_button('Auto-fit Columns').classList.contains('active')).toBe(true);
         expect(JSON.parse(grid_stub().getAttribute('data-col-widths')!))
             .toEqual({ 0: 200 });
+        await answer_width_write(post_message, { stored: [{ 0: 80 }] });
         post_message.mockClear();
         return { post_message };
     }
@@ -19443,11 +19678,258 @@ describe('auto-fit with Pending Columns', () => {
         await click_button('Auto-fit Columns');
         expect(store.snapshot().pendingColumns?.[0]?.viewerWidth).toBe(180);
         expect(grid_shell_mock.latest_props!.auto_fit_active).toBe(true);
+        await answer_width_write(post_message);
         await click_button('Auto-fit Columns');
         expect(store.snapshot().pendingColumns?.[0]?.viewerWidth).toBe(90);
     });
 
-    it('defers a Pending Column fit while a highlight request holds the gesture slot', async () => {
+    it('still puts a Pending Column\'s width back after a drag the host refused', async () => {
+        // A drag ends Auto-fit and with it the widths Restore would put back.
+        // Refused, the drag did not happen: Auto-fit is on again, and Restore
+        // still knows the Pending Column's width from before the fit.
+        grid_shell_mock.auto_fit_result = { 0: 120 };
+        const { post_message } = await render_app();
+        const meta = make_meta(['Sheet1'], false);
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        await acquire_editing_session(post_message, 'refused-session');
+        const store = (grid_shell_mock.latest_props as unknown as GridShellProps).pending_row_store!;
+        const before = store.snapshot();
+        await act(async () => {
+            const staged = store.stage_replace('refused-session', before, {
+                ...before,
+                columnLayout: {
+                    columns: [{ kind: 'source', sourceColumn: 0 }, { kind: 'pending', pendingColumnId: 'column-a' }],
+                    removedSourceColumns: [],
+                    discardedPendingColumns: [],
+                },
+                pendingColumns: [{
+                    id: 'column-a', header: 'New column', cells: {}, viewerWidth: 90,
+                    format: { kind: 'none' }, createdOrder: 1,
+                }],
+            });
+            staged!.commit();
+            staged!.notify();
+        });
+        grid_shell_mock.pending_auto_fit_result = { 'column-a': 180 };
+        await click_button('Auto-fit Columns');
+        await answer_width_write(post_message);
+        expect(store.snapshot().pendingColumns?.[0]?.viewerWidth).toBe(180);
+
+        await click_stub_button('.stub-resize');
+        expect(grid_shell_mock.latest_props!.auto_fit_active).toBe(false);
+        await answer_width_write(post_message, { applied: false });
+        expect(grid_shell_mock.latest_props!.auto_fit_active).toBe(true);
+
+        await click_button('Auto-fit Columns');
+        expect(store.snapshot().pendingColumns?.[0]?.viewerWidth).toBe(90);
+    });
+
+    it('puts a Pending Column\'s width back when the host refuses the fit, or the restore', async () => {
+        // Auto-fit sizes a Pending Column at once, with the saved columns it
+        // asks the host to store. Refused, the saved columns spring back and
+        // the toolbar with them; the Pending Column has to follow.
+        grid_shell_mock.auto_fit_result = { 0: 120 };
+        const { post_message } = await render_app();
+        const meta = make_meta(['Sheet1'], false);
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        await acquire_editing_session(post_message, 'refusal-session');
+        const store = (grid_shell_mock.latest_props as unknown as GridShellProps).pending_row_store!;
+        const before = store.snapshot();
+        await act(async () => {
+            const staged = store.stage_replace('refusal-session', before, {
+                ...before,
+                columnLayout: {
+                    columns: [{ kind: 'source', sourceColumn: 0 }, { kind: 'pending', pendingColumnId: 'column-a' }],
+                    removedSourceColumns: [],
+                    discardedPendingColumns: [],
+                },
+                pendingColumns: [{
+                    id: 'column-a', header: 'New column', cells: {}, viewerWidth: 90,
+                    format: { kind: 'none' }, createdOrder: 1,
+                }],
+            });
+            staged!.commit();
+            staged!.notify();
+        });
+        grid_shell_mock.pending_auto_fit_result = { 'column-a': 180 };
+        const pending_width = () => store.snapshot().pendingColumns?.[0]?.viewerWidth;
+        const fitted = () => grid_shell_mock.latest_props!.auto_fit_active;
+
+        // A fit the host refuses: not fitted, and the width from before it.
+        await click_button('Auto-fit Columns');
+        expect(pending_width()).toBe(180);
+        await answer_width_write(post_message, { applied: false });
+        expect(fitted()).toBe(false);
+        expect(pending_width()).toBe(90);
+
+        // A fit that lands, then a restore the host refuses: still fitted.
+        await click_button('Auto-fit Columns');
+        await answer_width_write(post_message);
+        expect(pending_width()).toBe(180);
+        await click_button('Auto-fit Columns');
+        expect(pending_width()).toBe(90);
+        await answer_width_write(post_message, { applied: false });
+        expect(fitted()).toBe(true);
+        expect(pending_width()).toBe(180);
+
+        // And the restore, pressed again and stored, still knows the width
+        // from before the fit.
+        await click_button('Auto-fit Columns');
+        await answer_width_write(post_message, { stored: [{ 0: 120 }] });
+        expect(fitted()).toBe(false);
+        expect(pending_width()).toBe(90);
+    });
+
+    it('ends the fit for a Pending Column too when a refusal follows a refresh', async () => {
+        // A refresh arrives while the fit, or the restore, is being stored,
+        // and the host then refuses it. The widths are the refresh's and
+        // Auto-fit is off either way; the Pending Column has to end on the
+        // side of "off", with nothing kept for a later restore to put back.
+        grid_shell_mock.auto_fit_result = { 0: 120 };
+        const { post_message } = await render_app();
+        const meta = make_meta(['Sheet1'], false);
+        const capabilities = { csvEditable: true, csvEditingSupported: true };
+        await dispatch_host_message(initial_snapshot_message(meta, { capabilities }));
+        await acquire_editing_session(post_message, 'adopted-session');
+        const store = (grid_shell_mock.latest_props as unknown as GridShellProps).pending_row_store!;
+        const set_pending_width = async (width: number) => {
+            const before = store.snapshot();
+            await act(async () => {
+                const staged = store.stage_replace('adopted-session', before, {
+                    ...before,
+                    columnLayout: {
+                        columns: [{ kind: 'source', sourceColumn: 0 }, { kind: 'pending', pendingColumnId: 'column-a' }],
+                        removedSourceColumns: [],
+                        discardedPendingColumns: [],
+                    },
+                    pendingColumns: [{
+                        id: 'column-a', header: 'New column', cells: {}, viewerWidth: width,
+                        format: { kind: 'none' }, createdOrder: 1,
+                    }],
+                });
+                staged!.commit();
+                staged!.notify();
+            });
+        };
+        /** A refresh of the same source, as one built before the pending write committed. */
+        const refresh = (width: number) => {
+            const { sheetIndex: _sheet_index, ...slot } = {
+                sheetIndex: 0, sheetName: 'Sheet1', cells: {}, ...store.snapshot(),
+            };
+            return dispatch_host_message(refresh_snapshot_message(meta, {
+                generation: 1,
+                sourceGeneration: 1,
+                reason: 'other',
+                capabilities: { ...capabilities, csvEditSessionId: 'adopted-session' },
+                state: { columnWidths: [{ 0: width }], pendingEdits: [slot] },
+            }));
+        };
+        const pending_width = () => store.snapshot().pendingColumns?.[0]?.viewerWidth;
+        const fitted = () => grid_shell_mock.latest_props!.auto_fit_active;
+        await set_pending_width(90);
+
+        // A fit, a refresh, the refusal: not fitted, and the width from before.
+        grid_shell_mock.pending_auto_fit_result = { 'column-a': 180 };
+        await click_button('Auto-fit Columns');
+        expect(pending_width()).toBe(180);
+        await refresh(100);
+        await answer_width_write(post_message, { applied: false });
+        expect(fitted()).toBe(false);
+        expect(pending_width()).toBe(90);
+
+        // The person then drags the Pending Column to 200, and fits again.
+        // Restore puts back 200, not the 90 from the fit that never was.
+        await set_pending_width(200);
+        grid_shell_mock.pending_auto_fit_result = { 'column-a': 240 };
+        await click_button('Auto-fit Columns');
+        await answer_width_write(post_message, { stored: [{ 0: 100 }] });
+        expect(fitted()).toBe(true);
+        expect(pending_width()).toBe(240);
+
+        // A restore, a refresh, the refusal: Auto-fit is off, so the Pending
+        // Column stays where the restore put it.
+        await click_button('Auto-fit Columns');
+        expect(pending_width()).toBe(200);
+        await refresh(100);
+        await answer_width_write(post_message, { applied: false });
+        expect(fitted()).toBe(false);
+        expect(pending_width()).toBe(200);
+    });
+
+    it('puts back a worksheet whose fit sized only a Pending Column when "restore on all sheets" is refused', async () => {
+        // Sheet1's fit measured only a Pending Column, so it asked the host
+        // for nothing; Sheet2's fit is stored. "Restore on all sheets" asks
+        // the host for Sheet2 alone. Refused, it did not happen on either
+        // worksheet: Sheet1 is fitted again too, at its fitted width.
+        grid_shell_mock.auto_fit_result = null;
+        const { post_message } = await render_app();
+        const meta = make_meta(['Sheet1', 'Sheet2'], false);
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        await acquire_editing_session(post_message, 'mixed-session');
+        const store = (grid_shell_mock.latest_props as unknown as GridShellProps).pending_row_store!;
+        const before = store.snapshot();
+        await act(async () => {
+            const staged = store.stage_replace('mixed-session', before, {
+                ...before,
+                columnLayout: {
+                    columns: [{ kind: 'source', sourceColumn: 0 }, { kind: 'pending', pendingColumnId: 'column-a' }],
+                    removedSourceColumns: [],
+                    discardedPendingColumns: [],
+                },
+                pendingColumns: [{
+                    id: 'column-a', header: 'New column', cells: {}, viewerWidth: 90,
+                    format: { kind: 'none' }, createdOrder: 1,
+                }],
+            });
+            staged!.commit();
+            staged!.notify();
+        });
+        const pending_width = () => store.snapshot().pendingColumns?.[0]?.viewerWidth;
+        const fitted = () => grid_shell_mock.latest_props!.auto_fit_active;
+        grid_shell_mock.pending_auto_fit_result = { 'column-a': 180 };
+        await click_button('Auto-fit Columns');
+        expect(width_writes(post_message)).toEqual([]);
+        expect(fitted()).toBe(true);
+        expect(pending_width()).toBe(180);
+        grid_shell_mock.pending_auto_fit_result = {};
+        grid_shell_mock.auto_fit_result = { 0: 120 };
+        await click_button('Sheet2');
+        await click_button('Auto-fit Columns');
+        await answer_width_write(post_message);
+        expect(fitted()).toBe(true);
+
+        await open_scope_menu('Auto-fit scope');
+        await click_menu_item('Restore original widths on all 2 sheets');
+
+        expect(latest_width_write(post_message).sheets).toEqual([
+            { sheetIndex: 1, sheetName: 'Sheet2', widths: [{ column: 0, width: null }] },
+        ]);
+        expect(fitted()).toBe(false);
+        expect(pending_width()).toBe(90);
+        await answer_width_write(post_message, { applied: false });
+        expect(fitted()).toBe(true);
+        await click_button('Sheet1');
+        expect(fitted()).toBe(true);
+        expect(pending_width()).toBe(180);
+
+        // Restored again and stored, both worksheets end restored, and
+        // Sheet1 still knows the width from before its fit.
+        await open_scope_menu('Auto-fit scope');
+        await click_menu_item('Restore original widths on all 2 sheets');
+        await answer_width_write(post_message, { stored: [undefined, { 0: 120 }] });
+        expect(fitted()).toBe(false);
+        expect(pending_width()).toBe(90);
+        await click_button('Sheet2');
+        expect(fitted()).toBe(false);
+    });
+
+    it('does not start a fit while a highlight request holds the gesture slot, and says to wait', async () => {
         const { post_message } = await render_app();
         const meta = make_meta(['Sheet1'], false);
         const snapshot = initial_snapshot_message(meta, {
@@ -19478,9 +19960,15 @@ describe('auto-fit with Pending Columns', () => {
         const request = post_message.mock.calls.map((call) => call[0])
             .find((message) => message?.type === 'clearAllCellHighlights');
         grid_shell_mock.pending_auto_fit_result = { 'column-a': 180 };
+        post_message.mockClear();
         await click_button('Auto-fit Columns');
-        // No write into the Pending Changes while the request is out.
+        // A size gesture like a drag: not started while the window is busy, and
+        // the person is told. No write into the Pending Changes, none posted.
         expect(store.snapshot().pendingColumns?.[0]?.viewerWidth).toBe(90);
+        expect(grid_shell_mock.latest_props!.auto_fit_active).toBe(false);
+        expect(post_message.mock.calls.map((call) => call[0])).toEqual([
+            { type: 'showWarning', message: 'Wait for the table view to finish updating.' },
+        ]);
         await dispatch_host_message({
             type: 'cellHighlightsChanged',
             requestId: request.requestId,
@@ -19489,8 +19977,12 @@ describe('auto-fit with Pending Columns', () => {
             state: undefined,
             sourceGeneration: snapshot.snapshot.sourceGeneration,
         });
-        // The deferred fit lands once the slot is free.
-        await vi.waitUntil(() => store.snapshot().pendingColumns?.[0]?.viewerWidth === 180);
+        // Nothing was owed: the slot coming free fits nothing.
+        expect(store.snapshot().pendingColumns?.[0]?.viewerWidth).toBe(90);
+        expect(width_writes(post_message)).toEqual([]);
+        // Pressed again, it fits.
+        await click_button('Auto-fit Columns');
+        expect(store.snapshot().pendingColumns?.[0]?.viewerWidth).toBe(180);
     });
 
     it('takes a new baseline for a Pending Column after another width invalidates the fit', async () => {
@@ -19524,6 +20016,7 @@ describe('auto-fit with Pending Columns', () => {
         grid_shell_mock.pending_auto_fit_result = { 'column-a': 180 };
         await click_button('Auto-fit Columns');
         expect(store.snapshot().pendingColumns?.[0]?.viewerWidth).toBe(180);
+        await answer_width_write(post_message);
         // The host's widths differ from the fit (another panel resized), which
         // ends the fit: 180 is now simply the column's width.
         const { sheetIndex: _sheet_index, ...slot } = { sheetIndex: 0, sheetName: 'Sheet1', cells: {}, ...store.snapshot() };
@@ -19539,6 +20032,7 @@ describe('auto-fit with Pending Columns', () => {
         grid_shell_mock.pending_auto_fit_result = { 'column-a': 240 };
         await click_button('Auto-fit Columns');
         expect(store.snapshot().pendingColumns?.[0]?.viewerWidth).toBe(240);
+        await answer_width_write(post_message, { stored: [{ 0: 333 }] });
         await click_button('Auto-fit Columns');
         expect(store.snapshot().pendingColumns?.[0]?.viewerWidth).toBe(180);
     });
@@ -20812,7 +21306,7 @@ describe('view steps in history', () => {
             // The commit records its edit and starts a write the window waits for.
             const busy_commit = () => {
                 record_edit();
-                props().on_row_resize([{ start: 1, end: 1 }], 50, () => {});
+                props().on_row_resize([{ start: 1, end: 1 }], 50, { gesture: false, on_result: () => {} });
             };
             grid_shell_mock.commit_live_edit.mockImplementationOnce(busy_commit);
             post_message.mockClear();
@@ -20830,7 +21324,7 @@ describe('view steps in history', () => {
             grid_shell_mock.commit_live_edit.mockImplementationOnce(() => {
                 // Nothing recorded, so the view step is still on top, but a
                 // tracked write is now in flight.
-                props().on_row_resize([{ start: 1, end: 1 }], 50, () => {});
+                props().on_row_resize([{ start: 1, end: 1 }], 50, { gesture: false, on_result: () => {} });
                 resize_started = true;
             });
             post_message.mockClear();
@@ -21854,6 +22348,1667 @@ describe('view steps in history', () => {
                 'Undo skipped “Sort”: the columns of this worksheet changed since then.',
             ]);
             expect(redo_labels()).toEqual(['Sort']);
+        });
+    });
+
+    describe('column widths and row heights', () => {
+        const widths_shown = () => JSON.parse(grid_stub().getAttribute('data-col-widths')!) as Record<string, number>;
+        const row_overlay = () => JSON.parse(grid_stub().getAttribute('data-row-height-overlay')!) as unknown;
+        const auto_fit_on = () => get_button('Auto-fit Columns').classList.contains('active');
+
+        /** A finished column-width gesture, as the grid reports it once it was admitted. */
+        async function resize_columns(changes: { column: number; width: number }[]) {
+            await act(async () => {
+                if (props().size_gesture_may_start?.() === false) return;
+                props().on_columns_resized(changes);
+            });
+        }
+
+        /** A finished row drag or a reset (`height: null`), as the grid reports it once admitted. */
+        async function resize_rows(
+            rows: { start: number; end: number }[],
+            height: number | null,
+            on_result?: (applied: boolean) => void,
+        ) {
+            await act(async () => {
+                if (props().size_gesture_may_start?.() === false) return;
+                props().on_row_resize(rows, height, { gesture: true, ...(on_result ? { on_result } : {}) });
+            });
+        }
+
+        /** A same-source refresh carrying `widths`, as the delivery ahead of an answer does. */
+        function deliver_widths(
+            widths: (Record<number, number> | undefined)[],
+            meta: WorkbookMeta = table_meta(),
+            extra: SnapshotExtra = {},
+        ) {
+            return dispatch_host_message(refresh_snapshot_message(meta, {
+                generation: view_generation,
+                sourceGeneration: 1,
+                reason: 'other',
+                capabilities: CSV,
+                ...extra,
+                state: { columnWidths: widths, ...extra.state },
+            }));
+        }
+
+        /** A same-source refresh carrying a row-height projection. */
+        function deliver_heights(projection: (Record<number, number> | undefined)[]) {
+            return dispatch_host_message(refresh_snapshot_message(table_meta(), {
+                generation: view_generation,
+                sourceGeneration: 1,
+                reason: 'other',
+                capabilities: CSV,
+                rowHeightProjection: projection,
+            }));
+        }
+
+        /** One recorded "Resize column": column 1 from no stored width to 180. */
+        async function resized_column(post_message: ReturnType<typeof vi.fn>) {
+            await resize_columns([{ column: 1, width: 180 }]);
+            await deliver_widths([{ 1: 180 }]);
+            await answer_width_write(post_message);
+            expect(undo_labels().at(-1)).toBe('Resize column');
+        }
+
+        /** One recorded "Resize 2 rows": display rows 1..2, source rows 4 and 5 (30 before). */
+        async function resized_rows(post_message: ReturnType<typeof vi.fn>) {
+            await resize_rows([{ start: 1, end: 2 }], 60);
+            await deliver_heights([{ 1: 60, 2: 60 }]);
+            await answer_row_heights(post_message, {
+                before: [{ start: 4, end: 4, height: null }, { start: 5, end: 5, height: 30 }],
+            });
+            expect(undo_labels().at(-1)).toBe('Resize 2 rows');
+        }
+
+        describe('a column drag', () => {
+            it('posts one request when it ends, and records what the host says it changed', async () => {
+                const { post_message } = await render_app();
+                await open(post_message, { state: { columnWidths: [{ 0: 100 }] } });
+
+                await resize_columns([{ column: 0, width: 130 }, { column: 1, width: 130 }, { column: 2, width: 130 }]);
+
+                // Shown at once; one request names all three; no step yet.
+                expect(widths_shown()).toEqual({ 0: 130, 1: 130, 2: 130 });
+                expect(width_writes(post_message)).toEqual([{
+                    type: 'setColumnWidths',
+                    requestId: expect.any(String),
+                    sourceGeneration: 1,
+                    sheets: [{
+                        sheetIndex: 0,
+                        sheetName: 'Sheet1',
+                        widths: [{ column: 0, width: 130 }, { column: 1, width: 130 }, { column: 2, width: 130 }],
+                    }],
+                }]);
+                expect(posted(post_message, 'stateChanged')).toEqual([]);
+                expect(undo_labels()).toEqual([]);
+                expect(cells_editable()).toEqual(HELD);
+
+                // The host held 100 for column 0 and, unknown to this window,
+                // 130 already for column 2: the step is the two it changed.
+                await deliver_widths([{ 0: 130, 1: 130, 2: 130 }]);
+                await answer_width_write(post_message, { stored: [{ 0: 100, 2: 130 }] });
+
+                expect(undo_labels()).toEqual(['Resize 2 columns']);
+                expect(view_step_change(history().undoStack[0].action)!.delta).toEqual({
+                    worksheet: { sheetIndex: 0, sheetName: 'Sheet1' },
+                    slice: 'columnWidths',
+                    columns: [
+                        { column: 0, before: 100, after: 130 },
+                        { column: 1, before: null, after: 130 },
+                    ],
+                });
+                expect(cells_editable()).toEqual(EDITABLE);
+                // A resize is not an edit: nothing is unsaved, no session was asked for.
+                expect(get_button('Save').getAttribute('aria-disabled')).toBe('true');
+                expect(posted(post_message, 'requestEditSession')).toEqual([]);
+            });
+
+            it('records nothing, and keeps Redo, when the host changed nothing', async () => {
+                const { post_message } = await render_app();
+                await open(post_message);
+                await change_view(post_message, { sort: SORT_ASC, filters: [] });
+                await undo();
+                await install(latest_transform_request(post_message));
+                expect(redo_labels()).toEqual(['Sort']);
+
+                // Another window had already stored this width.
+                await resize_columns([{ column: 1, width: 180 }]);
+                await deliver_widths([{ 1: 180 }]);
+                await answer_width_write(post_message, { stored: [{ 1: 180 }] });
+
+                expect(undo_labels()).toEqual([]);
+                expect(redo_labels()).toEqual(['Sort']);
+                expect(widths_shown()).toEqual({ 1: 180 });
+                expect(warnings(post_message)).toEqual([]);
+            });
+
+            it('clears Redo when it is recorded, like any new step', async () => {
+                const { post_message } = await render_app();
+                await open(post_message);
+                await change_view(post_message, { sort: SORT_ASC, filters: [] });
+                await undo();
+                await install(latest_transform_request(post_message));
+
+                await resized_column(post_message);
+
+                expect(undo_labels()).toEqual(['Resize column']);
+                expect(redo_labels()).toEqual([]);
+            });
+
+            it('reports nothing for a commit of no columns', async () => {
+                const { post_message } = await render_app();
+                await open(post_message);
+                await resize_columns([]);
+                expect(width_writes(post_message)).toEqual([]);
+                expect(cells_editable()).toEqual(EDITABLE);
+            });
+
+            it('puts the widths back, with the reason, when the host did not write them', async () => {
+                const { post_message } = await render_app();
+                await open(post_message, { state: { columnWidths: [{ 0: 100 }] } });
+
+                await resize_columns([{ column: 0, width: 130 }, { column: 1, width: 130 }]);
+                expect(widths_shown()).toEqual({ 0: 130, 1: 130 });
+                await answer_width_write(post_message, { applied: false });
+
+                expect(widths_shown()).toEqual({ 0: 100 });
+                expect(undo_labels()).toEqual([]);
+                expect(warnings(post_message)).toEqual(['Could not resize because the file was refreshing. Try again.']);
+                expect(cells_editable()).toEqual(EDITABLE);
+            });
+
+            it('says to answer the save notice when that is why the host refused', async () => {
+                const { post_message } = await render_app();
+                await open(post_message);
+
+                await resize_columns([{ column: 0, width: 130 }]);
+                await answer_width_write(post_message, { applied: false, refused: 'unresolved' });
+
+                expect(widths_shown()).toEqual({});
+                expect(warnings(post_message)).toEqual([
+                    'Could not resize: choose whether your last save finished first.',
+                ]);
+            });
+
+            it('leaves the widths a snapshot brought meanwhile when the host did not write them', async () => {
+                const { post_message } = await render_app();
+                await open(post_message, { state: { columnWidths: [{ 0: 100 }] } });
+
+                await resize_columns([{ column: 0, width: 130 }]);
+                // Another window's width arrives while the write is pending.
+                await deliver_widths([{ 0: 300 }]);
+                await answer_width_write(post_message, { applied: false });
+
+                // Not put back to 100: the widths are already the host's.
+                expect(widths_shown()).toEqual({ 0: 300 });
+                expect(undo_labels()).toEqual([]);
+            });
+
+            it('ends Auto-fit, and undoing it puts the fitted widths back without turning Auto-fit on', async () => {
+                grid_shell_mock.auto_fit_result = { 0: 120, 1: 90 };
+                const { post_message } = await render_app();
+                await open(post_message);
+                await click_button('Auto-fit Columns');
+                await deliver_widths([{ 0: 120, 1: 90 }]);
+                await answer_width_write(post_message);
+                expect(auto_fit_on()).toBe(true);
+
+                await resize_columns([{ column: 1, width: 200 }]);
+                await deliver_widths([{ 0: 120, 1: 200 }]);
+                await answer_width_write(post_message, { stored: [{ 0: 120, 1: 90 }] });
+                expect(auto_fit_on()).toBe(false);
+                expect(undo_labels()).toEqual(['Auto-fit columns', 'Resize column']);
+
+                await undo();
+                expect(latest_width_write(post_message).sheets[0].widths).toEqual([{ column: 1, width: 90 }]);
+                await deliver_widths([{ 0: 120, 1: 90 }]);
+                await answer_width_write(post_message, { stored: [{ 0: 120, 1: 200 }] });
+
+                expect(widths_shown()).toEqual({ 0: 120, 1: 90 });
+                expect(auto_fit_on()).toBe(false);
+                expect(redo_labels()).toEqual(['Resize column']);
+            });
+
+            it('records nothing when its worksheet was removed by a reload before the answer', async () => {
+                const { post_message } = await render_app();
+                await open(post_message, {}, table_meta(['Sheet1', 'Sheet2']));
+                await click_button('Sheet2');
+                await resize_columns([{ column: 1, width: 180 }]);
+
+                // The same source, one worksheet fewer: the write stays pending.
+                await deliver_widths([undefined], table_meta(['Sheet1']));
+                await answer_width_write(post_message);
+
+                expect(undo_labels()).toEqual([]);
+                expect(cells_editable()).toEqual(EDITABLE);
+            });
+        });
+
+        describe('undo and redo of a width step', () => {
+            it('post the step\'s other side and move when the host answers', async () => {
+                const { post_message } = await render_app();
+                await open(post_message, { state: { columnWidths: [{ 0: 100 }] } });
+                await resize_columns([{ column: 0, width: 130 }, { column: 1, width: 130 }]);
+                await deliver_widths([{ 0: 130, 1: 130 }]);
+                await answer_width_write(post_message, { stored: [{ 0: 100 }] });
+                post_message.mockClear();
+
+                await undo();
+
+                // Column 0 back to 100, column 1 back to no stored width.
+                expect(width_writes(post_message)).toEqual([expect.objectContaining({
+                    sheets: [{
+                        sheetIndex: 0,
+                        sheetName: 'Sheet1',
+                        widths: [{ column: 0, width: 100 }, { column: 1, width: null }],
+                    }],
+                })]);
+                expect(widths_shown()).toEqual({ 0: 100 });
+                // Not moved until the host says so.
+                expect(undo_labels()).toEqual(['Resize 2 columns']);
+                expect(cells_editable()).toEqual(HELD);
+                await deliver_widths([{ 0: 100 }]);
+                await answer_width_write(post_message, { stored: [{ 0: 130, 1: 130 }] });
+                expect(undo_labels()).toEqual([]);
+                expect(redo_labels()).toEqual(['Resize 2 columns']);
+                expect(cells_editable()).toEqual(EDITABLE);
+
+                await redo();
+                expect(latest_width_write(post_message).sheets[0].widths)
+                    .toEqual([{ column: 0, width: 130 }, { column: 1, width: 130 }]);
+                await deliver_widths([{ 0: 130, 1: 130 }]);
+                await answer_width_write(post_message, { stored: [{ 0: 100 }] });
+                expect(undo_labels()).toEqual(['Resize 2 columns']);
+                expect(redo_labels()).toEqual([]);
+                expect(widths_shown()).toEqual({ 0: 130, 1: 130 });
+                expect(warnings(post_message)).toEqual([]);
+                // Neither needed an editing session.
+                expect(posted(post_message, 'requestEditSession')).toEqual([]);
+            });
+
+            it('moves when the host had nothing left to change', async () => {
+                const { post_message } = await render_app();
+                await open(post_message);
+                await resized_column(post_message);
+
+                await undo();
+                // Another window already took the width away.
+                await deliver_widths([undefined]);
+                await answer_width_write(post_message, { stored: [undefined] });
+
+                expect(redo_labels()).toEqual(['Resize column']);
+                expect(warnings(post_message)).toEqual([]);
+            });
+
+            it('stay in place, with the reason, when the host did not write them', async () => {
+                const { post_message } = await render_app();
+                await open(post_message);
+                await resized_column(post_message);
+                post_message.mockClear();
+
+                await undo();
+                expect(widths_shown()).toEqual({});
+                await answer_width_write(post_message, { applied: false });
+
+                expect(undo_labels()).toEqual(['Resize column']);
+                expect(redo_labels()).toEqual([]);
+                expect(widths_shown()).toEqual({ 1: 180 });
+                expect(warnings(post_message)).toEqual(['Undo did not run because the file was refreshing. Try again.']);
+
+                post_message.mockClear();
+                await undo();
+                await answer_width_write(post_message, { applied: false, refused: 'unresolved' });
+                expect(undo_labels()).toEqual(['Resize column']);
+                expect(warnings(post_message)).toEqual([
+                    'Can\'t undo “Resize column”: choose whether your last save finished first.',
+                ]);
+                expect(cells_editable()).toEqual(EDITABLE);
+            });
+
+            it('leave out a column that is no longer in the worksheet, and say so', async () => {
+                const { post_message } = await render_app();
+                await open(post_message);
+                await resize_columns([{ column: 0, width: 130 }, { column: 2, width: 130 }]);
+                await deliver_widths([{ 0: 130, 2: 130 }]);
+                await answer_width_write(post_message);
+                // A reload brings a worksheet with two columns.
+                const narrower = table_meta();
+                narrower.sheets[0].columnCount = 2;
+                narrower.sheets[0].columnNames = ['Name', 'Value'];
+                await reload([undefined], narrower, { state: { columnWidths: [{ 0: 130 }] } });
+                post_message.mockClear();
+
+                await undo();
+                expect(latest_width_write(post_message).sheets[0].widths).toEqual([{ column: 0, width: null }]);
+                await answer_width_write(post_message, { stored: [{ 0: 130 }] });
+
+                expect(redo_labels()).toEqual(['Resize 2 columns']);
+                expect(warnings(post_message)).toEqual([
+                    'Undo skipped part of “Resize 2 columns”: columns that are no longer in the worksheet were left out.',
+                ]);
+            });
+
+            it('skip a step whose every column is gone, with the message, and move on', async () => {
+                const { post_message } = await render_app();
+                await open(post_message);
+                await resize_columns([{ column: 2, width: 130 }]);
+                await deliver_widths([{ 2: 130 }]);
+                await answer_width_write(post_message);
+                const narrower = table_meta();
+                narrower.sheets[0].columnCount = 2;
+                narrower.sheets[0].columnNames = ['Name', 'Value'];
+                await reload([undefined], narrower);
+                post_message.mockClear();
+
+                await undo();
+
+                expect(width_writes(post_message)).toEqual([]);
+                expect(redo_labels()).toEqual(['Resize column']);
+                expect(warnings(post_message)).toEqual([
+                    'Undo skipped “Resize column”: columns that are no longer in the worksheet were left out.',
+                ]);
+                expect(cells_editable()).toEqual(EDITABLE);
+            });
+
+            it('keep the entry of a replay a reload overtook, with the message', async () => {
+                const { post_message } = await render_app();
+                await open(post_message);
+                await resized_column(post_message);
+                await undo();
+                const overtaken = latest_width_write(post_message);
+                post_message.mockClear();
+
+                await reload([undefined], table_meta(), { state: { columnWidths: [{ 1: 180 }] } });
+
+                expect(undo_labels()).toEqual(['Resize column']);
+                expect(redo_labels()).toEqual([]);
+                expect(warnings(post_message)).toEqual(['Undo did not run because the file was refreshing. Try again.']);
+                expect(cells_editable()).toEqual(EDITABLE);
+                // A late answer to the overtaken request changes nothing.
+                await dispatch_host_message({
+                    type: 'columnWidthsChanged',
+                    requestId: overtaken.requestId,
+                    applied: true,
+                    sourceGeneration: overtaken.sourceGeneration,
+                    change: [{ sheetIndex: 0, columns: [{ column: 1, before: 180, after: null }] }],
+                });
+                expect(undo_labels()).toEqual(['Resize column']);
+                expect(redo_labels()).toEqual([]);
+            });
+        });
+
+        describe('a row drag', () => {
+            it('records the source rows and prior heights the host answers with', async () => {
+                const { post_message } = await render_app();
+                await open(post_message);
+
+                await resize_rows([{ start: 1, end: 2 }], 60);
+
+                expect(row_height_writes(post_message)).toEqual([{
+                    type: 'setRowHeights',
+                    sheetIndex: 0,
+                    rows: [{ start: 1, end: 2 }],
+                    height: 60,
+                    generation: 1,
+                    sourceGeneration: 1,
+                    requestId: expect.any(String),
+                }]);
+                expect(undo_labels()).toEqual([]);
+                expect(cells_editable()).toEqual(HELD);
+
+                await deliver_heights([{ 1: 60, 2: 60 }]);
+                await answer_row_heights(post_message, {
+                    before: [{ start: 4, end: 4, height: null }, { start: 5, end: 5, height: 30 }],
+                });
+
+                expect(undo_labels()).toEqual(['Resize 2 rows']);
+                expect(view_step_change(history().undoStack[0].action)!.delta).toEqual({
+                    worksheet: { sheetIndex: 0, sheetName: 'Sheet1' },
+                    slice: 'rowHeights',
+                    after: 60,
+                    before: [{ start: 4, end: 4, height: null }, { start: 5, end: 5, height: 30 }],
+                });
+                expect(row_overlay()).toBeNull();
+                expect(cells_editable()).toEqual(EDITABLE);
+                expect(get_button('Save').getAttribute('aria-disabled')).toBe('true');
+            });
+
+            it('records nothing when the host changed nothing, or did not write', async () => {
+                const { post_message } = await render_app();
+                await open(post_message);
+
+                await resize_rows([{ start: 1, end: 1 }], 60);
+                await answer_row_heights(post_message, { before: [] });
+                expect(undo_labels()).toEqual([]);
+
+                await resize_rows([{ start: 1, end: 1 }], 70);
+                await answer_row_heights(post_message, { applied: false });
+                expect(undo_labels()).toEqual([]);
+                expect(warnings(post_message)).toEqual([]);
+
+                await resize_rows([{ start: 1, end: 1 }], 80);
+                await answer_row_heights(post_message, { applied: false, refused: 'unresolved' });
+                expect(undo_labels()).toEqual([]);
+                expect(warnings(post_message)).toEqual([
+                    'Could not resize: choose whether your last save finished first.',
+                ]);
+                expect(cells_editable()).toEqual(EDITABLE);
+            });
+
+            it('does not record the row a committed multi-line edit grows', async () => {
+                const { post_message } = await render_app();
+                await open(post_message);
+
+                await act(async () => props().on_row_resize([{ start: 1, end: 1 }], 60, { gesture: false }));
+
+                // Unanswered and not a view request: cells stay editable.
+                expect(row_height_writes(post_message)).toEqual([expect.not.objectContaining({
+                    requestId: expect.anything(),
+                })]);
+                expect(cells_editable()).toEqual(EDITABLE);
+                expect(undo_labels()).toEqual([]);
+            });
+
+            it('removes its painted height on a refusal, so a later undo shows what the host delivers', async () => {
+                const { post_message } = await render_app();
+                await open(post_message);
+                await resized_rows(post_message);
+
+                // A second drag of row 1 the host refuses.
+                await resize_rows([{ start: 1, end: 1 }], 90);
+                expect(row_overlay()).toEqual([{ rows: [{ start: 1, end: 1 }], height: 90, requestId: expect.any(String) }]);
+                await answer_row_heights(post_message, { applied: false });
+                expect(row_overlay()).toBeNull();
+
+                // Undo of the first drag: the delivery's heights are what shows.
+                await undo();
+                await deliver_heights([{ 2: 30 }]);
+                await answer_row_heights(post_message);
+                expect(JSON.parse(grid_stub().getAttribute('data-row-heights')!)).toEqual({ 2: 30 });
+                expect(row_overlay()).toBeNull();
+                expect(redo_labels()).toEqual(['Resize 2 rows']);
+            });
+
+            it('removes its painted height when another window\'s height for the row arrived first', async () => {
+                const { post_message } = await render_app();
+                await open(post_message);
+
+                await resize_rows([{ start: 1, end: 1 }], 60);
+                // The write landed, another window then set 75, and the
+                // delivery ahead of the answer carries that.
+                await deliver_heights([{ 1: 75 }]);
+                expect(row_overlay()).not.toBeNull();
+                await answer_row_heights(post_message, { before: [{ start: 4, end: 4, height: null }] });
+
+                expect(row_overlay()).toBeNull();
+                expect(JSON.parse(grid_stub().getAttribute('data-row-heights')!)).toEqual({ 1: 75 });
+                expect(undo_labels()).toEqual(['Resize row']);
+            });
+
+            it('tells the grid whether the host wrote it, for the Pending Rows of the same drag', async () => {
+                const { post_message } = await render_app();
+                await open(post_message);
+                const results: boolean[] = [];
+
+                await resize_rows([{ start: 1, end: 1 }], 60, (applied) => results.push(applied));
+                await answer_row_heights(post_message, { before: [{ start: 4, end: 4, height: null }] });
+                await resize_rows([{ start: 1, end: 1 }], 70, (applied) => results.push(applied));
+                await answer_row_heights(post_message, { applied: false });
+
+                expect(results).toEqual([true, false]);
+            });
+        });
+
+        describe('Reset row height', () => {
+            it('posts a reset, paints nothing ahead of the host, and records what was reset', async () => {
+                const { post_message } = await render_app();
+                await open(post_message, { rowHeightProjection: [{ 1: 60, 2: 60 }] });
+
+                await resize_rows([{ start: 0, end: 5 }], null);
+
+                expect(row_height_writes(post_message)).toEqual([expect.objectContaining({
+                    type: 'setRowHeights',
+                    rows: [{ start: 0, end: 5 }],
+                    height: null,
+                })]);
+                expect(row_overlay()).toBeNull();
+                await deliver_heights([undefined]);
+                await answer_row_heights(post_message, { before: [{ start: 4, end: 5, height: 60 }] });
+
+                expect(undo_labels()).toEqual(['Reset 2 row heights']);
+                expect(view_step_change(history().undoStack[0].action)!.delta).toMatchObject({
+                    slice: 'rowHeights',
+                    after: null,
+                    before: [{ start: 4, end: 5, height: 60 }],
+                });
+
+                // Undo sets the two rows back to 60; redo removes the heights again.
+                await undo();
+                expect(row_height_writes(post_message).at(-1)).toEqual({
+                    type: 'setSourceRowHeights',
+                    requestId: expect.any(String),
+                    sheetIndex: 0,
+                    sheetName: 'Sheet1',
+                    sourceGeneration: 1,
+                    rows: [{ start: 4, end: 5, height: 60 }],
+                });
+                await answer_row_heights(post_message);
+                await redo();
+                expect(row_height_writes(post_message).at(-1)).toMatchObject({
+                    type: 'setSourceRowHeights',
+                    rows: [{ start: 4, end: 5, height: null }],
+                });
+                await answer_row_heights(post_message);
+                expect(undo_labels()).toEqual(['Reset 2 row heights']);
+            });
+
+            /** The row a committed edit grows: painted at once, its write not answered. */
+            async function grow_row(row: number, height: number) {
+                await act(async () => {
+                    props().on_row_resize([{ start: row, end: row }], height, { gesture: false });
+                });
+            }
+
+            it('takes down a height painted for a write the host never stored', async () => {
+                // The row an edit grows is painted at once and its write is
+                // not answered. Refused at the limit, nothing is stored, so
+                // no delivery agrees with the paint and Reset is offered for
+                // a height that is only on screen. The reset changes nothing
+                // stored, and still has to leave the row as the host has it.
+                const { post_message } = await render_app();
+                await open(post_message);
+                await grow_row(1, 54);
+                const painted = { rows: [{ start: 1, end: 1 }], height: 54 };
+                expect(row_overlay()).toEqual([painted]);
+
+                await resize_rows([{ start: 1, end: 1 }], null);
+
+                // Nothing changes ahead of the host.
+                expect((row_overlay() as unknown[])[0]).toEqual(painted);
+                await answer_row_heights(post_message);
+                expect(row_overlay()).toBeNull();
+                expect(undo_labels()).toEqual([]);
+            });
+
+            it('leaves a painted height alone when the host refuses the reset', async () => {
+                const { post_message } = await render_app();
+                await open(post_message);
+                await grow_row(1, 54);
+
+                await resize_rows([{ start: 1, end: 1 }], null);
+                await answer_row_heights(post_message, { applied: false, refused: 'unresolved' });
+
+                expect(row_overlay()).toEqual([{ rows: [{ start: 1, end: 1 }], height: 54 }]);
+            });
+
+            it('leaves a height painted after the reset was posted', async () => {
+                // That write reaches the host after the reset, so the reset's
+                // answer says nothing about it. The one painted before goes.
+                const { post_message } = await render_app();
+                await open(post_message, { rowHeightProjection: [{ 1: 60 }] });
+                await grow_row(2, 40);
+
+                await resize_rows([{ start: 1, end: 2 }], null);
+                const reset = row_height_writes(post_message).at(-1)!;
+                await grow_row(1, 54);
+                await deliver_heights([undefined]);
+                await dispatch_host_message({
+                    type: 'rowHeightsChanged',
+                    requestId: reset.requestId!,
+                    sheetIndex: 0,
+                    applied: true,
+                    sourceGeneration: reset.sourceGeneration,
+                    change: { height: null, before: [{ start: 4, end: 4, height: 60 }] },
+                });
+
+                expect(row_overlay()).toEqual([{ rows: [{ start: 1, end: 1 }], height: 54 }]);
+                expect(undo_labels()).toEqual(['Reset row height']);
+            });
+
+            it('is "Reset row height" for one row', async () => {
+                const { post_message } = await render_app();
+                await open(post_message, { rowHeightProjection: [{ 1: 60 }] });
+                await resize_rows([{ start: 1, end: 1 }], null);
+                await answer_row_heights(post_message, { before: [{ start: 4, end: 4, height: 60 }] });
+                expect(undo_labels()).toEqual(['Reset row height']);
+            });
+        });
+
+        describe('undo and redo of a row step', () => {
+            it('show what the host delivers over a height painted for a write it never stored', async () => {
+                const { post_message } = await render_app();
+                await open(post_message);
+                await resized_rows(post_message);
+                // An edit then grows row 1, and the host refuses that write
+                // at the limit: painted, not stored, never answered.
+                await act(async () => {
+                    props().on_row_resize([{ start: 1, end: 1 }], 80, { gesture: false });
+                });
+                expect(row_overlay()).toEqual([{ rows: [{ start: 1, end: 1 }], height: 80 }]);
+
+                await undo();
+                await deliver_heights([{ 2: 30 }]);
+                await answer_row_heights(post_message);
+
+                expect(row_overlay()).toBeNull();
+                expect(JSON.parse(grid_stub().getAttribute('data-row-heights')!)).toEqual({ 2: 30 });
+                expect(redo_labels()).toEqual(['Resize 2 rows']);
+
+                // A replay the host refuses takes nothing down.
+                await act(async () => {
+                    props().on_row_resize([{ start: 1, end: 1 }], 80, { gesture: false });
+                });
+                await redo();
+                await answer_row_heights(post_message, { applied: false });
+                expect(row_overlay()).toEqual([{ rows: [{ start: 1, end: 1 }], height: 80 }]);
+                expect(redo_labels()).toEqual(['Resize 2 rows']);
+            });
+
+            it('post the heights by source row and move when the host answers', async () => {
+                const { post_message } = await render_app();
+                await open(post_message);
+                await resized_rows(post_message);
+                post_message.mockClear();
+
+                await undo();
+
+                // Each run back to what it held: row 4 to none, row 5 to 30.
+                expect(row_height_writes(post_message)).toEqual([{
+                    type: 'setSourceRowHeights',
+                    requestId: expect.any(String),
+                    sheetIndex: 0,
+                    sheetName: 'Sheet1',
+                    sourceGeneration: 1,
+                    rows: [{ start: 4, end: 4, height: null }, { start: 5, end: 5, height: 30 }],
+                }]);
+                expect(undo_labels()).toEqual(['Resize 2 rows']);
+                expect(cells_editable()).toEqual(HELD);
+                await answer_row_heights(post_message);
+                expect(redo_labels()).toEqual(['Resize 2 rows']);
+                expect(cells_editable()).toEqual(EDITABLE);
+
+                // Redo sets every row of the step to its height, run by run.
+                await redo();
+                expect(row_height_writes(post_message).at(-1)).toMatchObject({
+                    type: 'setSourceRowHeights',
+                    rows: [{ start: 4, end: 4, height: 60 }, { start: 5, end: 5, height: 60 }],
+                });
+                await answer_row_heights(post_message);
+                expect(undo_labels()).toEqual(['Resize 2 rows']);
+                expect(warnings(post_message)).toEqual([]);
+                expect(posted(post_message, 'requestEditSession')).toEqual([]);
+            });
+
+            it('are skipped, with the message, when the worksheet would hold too many heights', async () => {
+                const { post_message } = await render_app();
+                await open(post_message);
+                await resized_rows(post_message);
+                await undo();
+                await answer_row_heights(post_message);
+                post_message.mockClear();
+
+                await redo();
+                await answer_row_heights(post_message, { applied: false, refused: 'limit' });
+
+                // Moved all the same: it never stands in the way of an older step.
+                expect(undo_labels()).toEqual(['Resize 2 rows']);
+                expect(redo_labels()).toEqual([]);
+                expect(warnings(post_message)).toEqual([
+                    'Redo skipped “Resize 2 rows”: too many rows would have a custom height.',
+                ]);
+            });
+
+            it('stay in place, with the reason, when the host did not write them', async () => {
+                const { post_message } = await render_app();
+                await open(post_message);
+                await resized_rows(post_message);
+                post_message.mockClear();
+
+                await undo();
+                await answer_row_heights(post_message, { applied: false });
+                expect(undo_labels()).toEqual(['Resize 2 rows']);
+                expect(warnings(post_message)).toEqual(['Undo did not run because the file was refreshing. Try again.']);
+
+                post_message.mockClear();
+                await undo();
+                await answer_row_heights(post_message, { applied: false, refused: 'unresolved' });
+                expect(undo_labels()).toEqual(['Resize 2 rows']);
+                expect(warnings(post_message)).toEqual([
+                    'Can\'t undo “Resize 2 rows”: choose whether your last save finished first.',
+                ]);
+                expect(cells_editable()).toEqual(EDITABLE);
+            });
+
+            it('keep the entry when a reload overtakes the request, with the message', async () => {
+                const { post_message } = await render_app();
+                await open(post_message);
+                await resized_rows(post_message);
+                await undo();
+                post_message.mockClear();
+
+                await reload([undefined]);
+
+                expect(undo_labels()).toEqual(['Resize 2 rows']);
+                expect(redo_labels()).toEqual([]);
+                expect(warnings(post_message)).toEqual(['Undo did not run because the file was refreshing. Try again.']);
+                expect(cells_editable()).toEqual(EDITABLE);
+            });
+
+            it('leave out rows that are no longer in the worksheet, and say so', async () => {
+                const { post_message } = await render_app();
+                await open(post_message);
+                await resized_rows(post_message);
+                const shorter = table_meta();
+                shorter.sheets[0].rowCount = 5;
+                shorter.sheets[0].sourceRowCount = 5;
+                await reload([undefined], shorter);
+                post_message.mockClear();
+
+                await undo();
+                expect(row_height_writes(post_message).at(-1)).toMatchObject({
+                    rows: [{ start: 4, end: 4, height: null }],
+                });
+                await answer_row_heights(post_message);
+
+                expect(redo_labels()).toEqual(['Resize 2 rows']);
+                expect(warnings(post_message)).toEqual([
+                    'Undo skipped part of “Resize 2 rows”: rows that are no longer in the worksheet were left out.',
+                ]);
+            });
+        });
+
+        describe('Auto-fit', () => {
+            beforeEach(() => {
+                // Nothing is open in the grid, which is when an owed fit may land.
+                grid_shell_mock.session_busy = false;
+            });
+            const two_sheets = () => table_meta(['Sheet1', 'Sheet2']);
+            const fit_is_owed_here = () => props().on_auto_fit_sample_change !== undefined;
+            async function fit_all(post_message: ReturnType<typeof vi.fn>) {
+                await open_scope_menu('Auto-fit scope');
+                await click_menu_item('Auto-fit columns on all 2 sheets');
+                // The active worksheet's fit, written and answered.
+                await deliver_widths([{ 0: 120 }], two_sheets());
+                await answer_width_write(post_message);
+            }
+
+            it('on and off are steps, and walking history leaves the toolbar as each gesture left it', async () => {
+                grid_shell_mock.auto_fit_result = { 0: 120, 1: 90 };
+                const { post_message } = await render_app();
+                await open(post_message, { state: { columnWidths: [{ 0: 80 }] } });
+
+                await click_button('Auto-fit Columns');
+                expect(latest_width_write(post_message).sheets[0].widths)
+                    .toEqual([{ column: 0, width: 120 }, { column: 1, width: 90 }]);
+                expect(auto_fit_on()).toBe(true);
+                await deliver_widths([{ 0: 120, 1: 90 }]);
+                await answer_width_write(post_message, { stored: [{ 0: 80 }] });
+                expect(undo_labels()).toEqual(['Auto-fit columns']);
+                expect(view_step_change(history().undoStack[0].action)!.delta).toMatchObject({
+                    columns: [{ column: 0, before: 80, after: 120 }, { column: 1, before: null, after: 90 }],
+                    autoFit: 'on',
+                });
+
+                await click_button('Auto-fit Columns');
+                // The fit gave column 1 a width it did not have: the restore removes it.
+                expect(latest_width_write(post_message).sheets[0].widths)
+                    .toEqual([{ column: 0, width: 80 }, { column: 1, width: null }]);
+                expect(auto_fit_on()).toBe(false);
+                await deliver_widths([{ 0: 80 }]);
+                await answer_width_write(post_message, { stored: [{ 0: 120, 1: 90 }] });
+                expect(undo_labels()).toEqual(['Auto-fit columns', 'Restore column widths']);
+                expect(view_step_change(history().undoStack[1].action)!.delta).toMatchObject({
+                    columns: [{ column: 0, before: 120, after: 80 }, { column: 1, before: 90, after: null }],
+                    autoFit: 'off',
+                });
+
+                // Undo of the restore: fitted again, Auto-fit on.
+                await undo();
+                await deliver_widths([{ 0: 120, 1: 90 }]);
+                await answer_width_write(post_message, { stored: [{ 0: 80 }] });
+                expect(widths_shown()).toEqual({ 0: 120, 1: 90 });
+                expect(auto_fit_on()).toBe(true);
+                // Undo of the fit: the widths before it, Auto-fit off.
+                await undo();
+                await deliver_widths([{ 0: 80 }]);
+                await answer_width_write(post_message, { stored: [{ 0: 120, 1: 90 }] });
+                expect(widths_shown()).toEqual({ 0: 80 });
+                expect(auto_fit_on()).toBe(false);
+                // Redo of the fit: on.
+                await redo();
+                await deliver_widths([{ 0: 120, 1: 90 }]);
+                await answer_width_write(post_message, { stored: [{ 0: 80 }] });
+                expect(auto_fit_on()).toBe(true);
+                // Redo of the restore: off.
+                await redo();
+                await deliver_widths([{ 0: 80 }]);
+                await answer_width_write(post_message, { stored: [{ 0: 120, 1: 90 }] });
+                expect(auto_fit_on()).toBe(false);
+                expect(widths_shown()).toEqual({ 0: 80 });
+                expect(undo_labels()).toEqual(['Auto-fit columns', 'Restore column widths']);
+                expect(warnings(post_message)).toEqual([]);
+
+                // After "undo of restore", the toolbar restores the pre-fit widths.
+                await undo();
+                await deliver_widths([{ 0: 120, 1: 90 }]);
+                await answer_width_write(post_message, { stored: [{ 0: 80 }] });
+                await click_button('Auto-fit Columns');
+                expect(latest_width_write(post_message).sheets[0].widths)
+                    .toEqual([{ column: 0, width: 80 }, { column: 1, width: null }]);
+            });
+
+            it('that changes no stored width is no step, in either direction', async () => {
+                grid_shell_mock.auto_fit_result = { 0: 120 };
+                const { post_message } = await render_app();
+                await open(post_message, { state: { columnWidths: [{ 0: 120 }] } });
+
+                // The window cannot know the host holds what it shows, so it
+                // asks; the host says nothing changed.
+                await click_button('Auto-fit Columns');
+                expect(latest_width_write(post_message).sheets[0].widths).toEqual([{ column: 0, width: 120 }]);
+                await answer_width_write(post_message, { stored: [{ 0: 120 }] });
+                expect(auto_fit_on()).toBe(true);
+                await click_button('Auto-fit Columns');
+                expect(latest_width_write(post_message).sheets[0].widths).toEqual([{ column: 0, width: 120 }]);
+                await answer_width_write(post_message, { stored: [{ 0: 120 }] });
+                expect(auto_fit_on()).toBe(false);
+
+                expect(width_writes(post_message)).toHaveLength(2);
+                expect(undo_labels()).toEqual([]);
+                expect(cells_editable()).toEqual(EDITABLE);
+            });
+
+            it('asks for every fitted and every restored width, whatever this window shows', async () => {
+                // This window shows 120 and 80. Another window has since
+                // stored 250 for the first column, and this one has not been
+                // told. The fit measures 120 and 90: leaving out the column
+                // that looks fitted here would keep the other window's 250.
+                grid_shell_mock.auto_fit_result = { 0: 120, 1: 90 };
+                const { post_message } = await render_app();
+                await open(post_message, { state: { columnWidths: [{ 0: 120, 1: 80 }] } });
+
+                await click_button('Auto-fit Columns');
+                expect(latest_width_write(post_message).sheets[0].widths)
+                    .toEqual([{ column: 0, width: 120 }, { column: 1, width: 90 }]);
+                await deliver_widths([{ 0: 120, 1: 90 }]);
+                await answer_width_write(post_message, { stored: [{ 0: 250, 1: 80 }] });
+                // Both columns were written, the sheet is fitted, and the
+                // step is what the host changed.
+                expect(auto_fit_on()).toBe(true);
+                expect(view_step_change(history().undoStack[0].action)!.delta).toMatchObject({
+                    columns: [{ column: 0, before: 250, after: 120 }, { column: 1, before: 80, after: 90 }],
+                    autoFit: 'on',
+                });
+
+                // The restore likewise names every width it puts back.
+                await click_button('Auto-fit Columns');
+                expect(latest_width_write(post_message).sheets[0].widths)
+                    .toEqual([{ column: 0, width: 120 }, { column: 1, width: 80 }]);
+                await deliver_widths([{ 0: 120, 1: 80 }]);
+                await answer_width_write(post_message, { stored: [{ 0: 120, 1: 90 }] });
+                expect(auto_fit_on()).toBe(false);
+                expect(view_step_change(history().undoStack[1].action)!.delta).toMatchObject({
+                    columns: [{ column: 1, before: 90, after: 80 }],
+                    autoFit: 'off',
+                });
+            });
+
+            it('put back, with its widths, when the host did not write the fit', async () => {
+                grid_shell_mock.auto_fit_result = { 0: 120 };
+                const { post_message } = await render_app();
+                await open(post_message, { state: { columnWidths: [{ 0: 80 }] } });
+
+                await click_button('Auto-fit Columns');
+                expect(auto_fit_on()).toBe(true);
+                await answer_width_write(post_message, { applied: false });
+
+                expect(auto_fit_on()).toBe(false);
+                expect(widths_shown()).toEqual({ 0: 80 });
+                expect(undo_labels()).toEqual([]);
+                expect(warnings(post_message)).toEqual(['Could not resize because the file was refreshing. Try again.']);
+            });
+
+            it('from the toolbar is not started, and says to wait, while the window is busy', async () => {
+                grid_shell_mock.auto_fit_result = { 0: 120 };
+                const { post_message } = await render_app();
+                await open(post_message);
+
+                // A row resize is still being written.
+                await resize_rows([{ start: 1, end: 1 }], 60);
+                await click_button('Auto-fit Columns');
+                expect(auto_fit_on()).toBe(false);
+                expect(width_writes(post_message)).toEqual([]);
+                // And nothing is owed for later.
+                expect(fit_is_owed_here()).toBe(false);
+                await answer_row_heights(post_message, { before: [{ start: 4, end: 4, height: null }] });
+                expect(width_writes(post_message)).toEqual([]);
+
+                // The same for turning it off.
+                await click_button('Auto-fit Columns');
+                await answer_width_write(post_message);
+                expect(auto_fit_on()).toBe(true);
+                await resize_rows([{ start: 1, end: 1 }], 70);
+                await click_button('Auto-fit Columns');
+                expect(auto_fit_on()).toBe(true);
+                expect(width_writes(post_message)).toHaveLength(1);
+                expect(warnings(post_message)).toEqual([
+                    'Wait for the table view to finish updating.',
+                    'Wait for the table view to finish updating.',
+                ]);
+            });
+
+            it('on all sheets fits each worksheet when it is opened, one step each, undone newest first', async () => {
+                grid_shell_mock.auto_fit_result = { 0: 120 };
+                const { post_message } = await render_app();
+                await open(post_message, {}, two_sheets());
+
+                await fit_all(post_message);
+                expect(undo_labels()).toEqual(['Auto-fit columns']);
+                await click_button('Sheet2');
+                await vi.waitFor(() => expect(width_writes(post_message)).toHaveLength(2));
+                expect(latest_width_write(post_message).sheets).toEqual([
+                    { sheetIndex: 1, sheetName: 'Sheet2', widths: [{ column: 0, width: 120 }] },
+                ]);
+                await deliver_widths([{ 0: 120 }, { 0: 120 }], two_sheets());
+                await answer_width_write(post_message);
+                expect(undo_labels()).toEqual(['Auto-fit columns', 'Auto-fit columns']);
+                expect(fit_is_owed_here()).toBe(false);
+
+                // Undo: Sheet2's fit, the worksheet on screen.
+                await undo();
+                expect(latest_width_write(post_message).sheets).toEqual([
+                    { sheetIndex: 1, sheetName: 'Sheet2', widths: [{ column: 0, width: null }] },
+                ]);
+                await deliver_widths([{ 0: 120 }, undefined], two_sheets());
+                await answer_width_write(post_message, { stored: [{ 0: 120 }, { 0: 120 }] });
+                // Undo: Sheet1's, which is shown first.
+                await undo();
+                expect(grid_stub().getAttribute('data-sheet-index')).toBe('0');
+                expect(latest_width_write(post_message).sheets).toEqual([
+                    { sheetIndex: 0, sheetName: 'Sheet1', widths: [{ column: 0, width: null }] },
+                ]);
+                await deliver_widths([undefined, undefined], two_sheets());
+                await answer_width_write(post_message, { stored: [{ 0: 120 }] });
+
+                expect(undo_labels()).toEqual([]);
+                expect(redo_labels()).toEqual(['Auto-fit columns', 'Auto-fit columns']);
+                expect(auto_fit_on()).toBe(false);
+                expect(warnings(post_message)).toEqual([]);
+            });
+
+            it('undone drops the fits still owed to other worksheets', async () => {
+                grid_shell_mock.auto_fit_result = { 0: 120 };
+                const { post_message } = await render_app();
+                await open(post_message, {}, two_sheets());
+                await fit_all(post_message);
+
+                await undo();
+                await deliver_widths([undefined], two_sheets());
+                await answer_width_write(post_message, { stored: [{ 0: 120 }] });
+                await click_button('Sheet2');
+                await act(async () => { await Promise.resolve(); });
+
+                // Sheet2 is not fitted on arrival: the person took the fit back.
+                expect(width_writes(post_message)).toHaveLength(2);
+                expect(fit_is_owed_here()).toBe(false);
+                expect(auto_fit_on()).toBe(false);
+            });
+
+            it('owed to a worksheet waits while there is something to redo, and lands once there is not', async () => {
+                grid_shell_mock.auto_fit_result = { 0: 120 };
+                const { post_message } = await render_app();
+                await open(post_message, {}, two_sheets());
+                await fit_all(post_message);
+                // A drag on Sheet1, then its undo: Redo is available.
+                await resize_columns([{ column: 1, width: 180 }]);
+                await answer_width_write(post_message, { stored: [{ 0: 120 }] });
+                await undo();
+                await answer_width_write(post_message, { stored: [{ 0: 120, 1: 180 }] });
+                expect(redo_labels()).toEqual(['Resize column']);
+                const before = width_writes(post_message).length;
+
+                await click_button('Sheet2');
+                await act(async () => { await Promise.resolve(); });
+                // Fitting now would record a step and discard that redo while
+                // the person did nothing but look at another worksheet.
+                expect(width_writes(post_message)).toHaveLength(before);
+                expect(fit_is_owed_here()).toBe(true);
+                expect(redo_labels()).toEqual(['Resize column']);
+
+                // Redo goes back to Sheet1 and empties Redo.
+                await redo();
+                await answer_width_write(post_message, { stored: [{ 0: 120 }] });
+                expect(redo_labels()).toEqual([]);
+                await click_button('Sheet2');
+                await vi.waitFor(() => expect(latest_width_write(post_message).sheets[0].sheetName).toBe('Sheet2'));
+                await answer_width_write(post_message);
+                expect(undo_labels()).toEqual(['Auto-fit columns', 'Resize column', 'Auto-fit columns']);
+            });
+
+            it('owed to a worksheet does not close an open cell editor: it waits for it', async () => {
+                grid_shell_mock.auto_fit_result = { 0: 120 };
+                const { post_message } = await render_app();
+                await open(post_message, {}, two_sheets());
+                await fit_all(post_message);
+                grid_shell_mock.commit_live_edit.mockClear();
+
+                // An editor is open on Sheet2 when it is shown.
+                grid_shell_mock.session_busy = true;
+                await click_button('Sheet2');
+                await notify_auto_fit_sample_change();
+                expect(width_writes(post_message)).toHaveLength(1);
+                expect(grid_shell_mock.commit_live_edit).not.toHaveBeenCalled();
+
+                // It closes without a change.
+                grid_shell_mock.session_busy = false;
+                await act(async () => props().on_edit_session_idle?.());
+                expect(width_writes(post_message)).toHaveLength(2);
+                expect(grid_shell_mock.commit_live_edit).not.toHaveBeenCalled();
+            });
+
+            it('owed and refused for an unanswered save says nothing and is not retried until the notice is answered', async () => {
+                grid_shell_mock.auto_fit_result = { 0: 120 };
+                const { post_message } = await render_app();
+                await open(post_message, {}, two_sheets());
+                await fit_all(post_message);
+                await click_button('Sheet2');
+                await vi.waitFor(() => expect(width_writes(post_message)).toHaveLength(2));
+
+                // The host refuses it for a save whose outcome is not known,
+                // and shows the notice that asks.
+                await dispatch_host_message({
+                    type: 'structuralSaveUnresolved',
+                    notice: { saveId: 'save-1', message: 'Did the save finish?', suggestion: 'finished' },
+                });
+                await answer_width_write(post_message, { applied: false, refused: 'unresolved' });
+                expect(warnings(post_message)).toEqual([]);
+                expect(fit_is_owed_here()).toBe(true);
+
+                // A refresh ends the hold a refusal starts, and rows keep
+                // arriving; while the notice stands the host would refuse
+                // again, so nothing is posted.
+                await deliver_widths([{ 0: 120 }], two_sheets());
+                await notify_auto_fit_sample_change();
+                await notify_auto_fit_sample_change();
+                expect(width_writes(post_message)).toHaveLength(2);
+
+                // The person answers the notice: one request, one step.
+                await dispatch_host_message({ type: 'structuralSaveUnresolved', notice: null });
+                await vi.waitFor(() => expect(width_writes(post_message)).toHaveLength(3));
+                await answer_width_write(post_message);
+                expect(fit_is_owed_here()).toBe(false);
+                expect(width_writes(post_message)).toHaveLength(3);
+                expect(undo_labels()).toEqual(['Auto-fit columns', 'Auto-fit columns']);
+                expect(warnings(post_message)).toEqual([]);
+            });
+
+            it('owed and refused says nothing, and is tried again only after the next snapshot', async () => {
+                grid_shell_mock.auto_fit_result = { 0: 120 };
+                const { post_message } = await render_app();
+                await open(post_message, {}, two_sheets());
+                await fit_all(post_message);
+                await click_button('Sheet2');
+                await vi.waitFor(() => expect(width_writes(post_message)).toHaveLength(2));
+
+                await answer_width_write(post_message, { applied: false });
+                // Nobody pressed anything, so nothing is said; the widths and
+                // the toolbar are as before, and the fit is still owed.
+                expect(warnings(post_message)).toEqual([]);
+                expect(auto_fit_on()).toBe(false);
+                expect(widths_shown()).toEqual({});
+                expect(fit_is_owed_here()).toBe(true);
+                // Further renders and row deliveries do not retry it: what
+                // refused it has not changed.
+                await notify_auto_fit_sample_change();
+                await notify_auto_fit_sample_change();
+                expect(width_writes(post_message)).toHaveLength(2);
+
+                await deliver_widths([{ 0: 120 }], two_sheets());
+                await vi.waitFor(() => expect(width_writes(post_message)).toHaveLength(3));
+                await answer_width_write(post_message);
+                expect(undo_labels()).toEqual(['Auto-fit columns', 'Auto-fit columns']);
+                expect(fit_is_owed_here()).toBe(false);
+            });
+
+            it('restore leaves alone a width kept for a column the worksheet no longer has', async () => {
+                // Widths are kept by position. The worksheet has lost its third
+                // column since the fit, and the host refuses a request that
+                // names a column it does not have.
+                grid_shell_mock.auto_fit_result = { 0: 120, 2: 90 };
+                const { post_message } = await render_app();
+                await open(post_message);
+                await click_button('Auto-fit Columns');
+                await answer_width_write(post_message);
+                const narrower = table_meta();
+                narrower.sheets[0].columnCount = 2;
+                narrower.sheets[0].columnNames = ['Name', 'Value'];
+                await deliver_widths([{ 0: 120, 2: 90 }], narrower);
+                expect(auto_fit_on()).toBe(true);
+
+                await click_button('Auto-fit Columns');
+
+                expect(latest_width_write(post_message).sheets).toEqual([
+                    { sheetIndex: 0, sheetName: 'Sheet1', widths: [{ column: 0, width: null }] },
+                ]);
+                await answer_width_write(post_message, { stored: [{ 0: 120, 2: 90 }] });
+                expect(auto_fit_on()).toBe(false);
+                expect(undo_labels()).toEqual(['Auto-fit columns', 'Restore column widths']);
+            });
+
+            it('still owes its fits after a drag, a restore, or an undo that the host refused', async () => {
+                // Each of the three drops fits that are owed on its way to the
+                // write. Refused, it did not happen, and neither did that.
+                grid_shell_mock.auto_fit_result = null;
+                const { post_message } = await render_app();
+                await open(post_message, {}, two_sheets());
+                // Nothing can be measured yet: both worksheets are owed a fit.
+                await open_scope_menu('Auto-fit scope');
+                await click_menu_item('Auto-fit columns on all 2 sheets');
+                expect(fit_is_owed_here()).toBe(true);
+
+                // A drag on the worksheet that is owed one.
+                await resize_columns([{ column: 1, width: 180 }]);
+                expect(fit_is_owed_here()).toBe(false);
+                await answer_width_write(post_message, { applied: false });
+                expect(fit_is_owed_here()).toBe(true);
+                expect(widths_shown()).toEqual({});
+
+                // Sheet1 is fitted once it can be measured; Sheet2 stays owed.
+                grid_shell_mock.auto_fit_result = { 0: 120 };
+                await notify_auto_fit_sample_change();
+                await vi.waitFor(() => expect(width_writes(post_message)).toHaveLength(2));
+                await answer_width_write(post_message);
+                expect(undo_labels()).toEqual(['Auto-fit columns']);
+                const sheet2_is_owed = async () => {
+                    grid_shell_mock.auto_fit_result = null;
+                    await click_button('Sheet2');
+                    const owed = fit_is_owed_here();
+                    await click_button('Sheet1');
+                    grid_shell_mock.auto_fit_result = { 0: 120 };
+                    return owed;
+                };
+                expect(await sheet2_is_owed()).toBe(true);
+
+                // "Restore on all sheets", refused: Sheet1 is fitted again and
+                // Sheet2 is still owed its fit.
+                await open_scope_menu('Auto-fit scope');
+                await click_menu_item('Restore original widths on all 2 sheets');
+                await answer_width_write(post_message, { applied: false });
+                expect(auto_fit_on()).toBe(true);
+                expect(widths_shown()).toEqual({ 0: 120 });
+                expect(await sheet2_is_owed()).toBe(true);
+
+                // Undo of the fit, refused: the same.
+                await undo();
+                await answer_width_write(post_message, { applied: false });
+                expect(auto_fit_on()).toBe(true);
+                expect(undo_labels()).toEqual(['Auto-fit columns']);
+                expect(await sheet2_is_owed()).toBe(true);
+            });
+
+            it('on all sheets, and restore on all sheets, change nothing and say to wait while the window is busy', async () => {
+                grid_shell_mock.auto_fit_result = { 0: 120 };
+                const { post_message } = await render_app();
+                await open(post_message, {}, two_sheets());
+
+                // A column drag is still being written.
+                await resize_columns([{ column: 1, width: 180 }]);
+                await open_scope_menu('Auto-fit scope');
+                await click_menu_item('Auto-fit columns on all 2 sheets');
+                expect(warnings(post_message)).toEqual(['Wait for the table view to finish updating.']);
+                expect(width_writes(post_message)).toHaveLength(1);
+                await answer_width_write(post_message);
+                // No worksheet was left owed a fit.
+                await click_button('Sheet2');
+                await act(async () => { await Promise.resolve(); });
+                expect(fit_is_owed_here()).toBe(false);
+                expect(width_writes(post_message)).toHaveLength(1);
+                await click_button('Sheet1');
+
+                // Fit all: Sheet1 fitted, Sheet2 owed. Then a drag still being
+                // written when "restore on all sheets" is chosen.
+                await open_scope_menu('Auto-fit scope');
+                await click_menu_item('Auto-fit columns on all 2 sheets');
+                await answer_width_write(post_message, { stored: [{ 1: 180 }] });
+                await resize_columns([{ column: 2, width: 150 }]);
+                post_message.mockClear();
+                await open_scope_menu('Auto-fit scope');
+                await click_menu_item('Restore original widths on all 2 sheets');
+                expect(warnings(post_message)).toEqual(['Wait for the table view to finish updating.']);
+                expect(width_writes(post_message)).toEqual([]);
+                await dispatch_host_message({
+                    type: 'columnWidthsChanged',
+                    requestId: 'none',
+                    applied: true,
+                    sourceGeneration: 1,
+                    change: [],
+                });
+                // Sheet2's fit is still owed.
+                await click_button('Sheet2');
+                expect(fit_is_owed_here()).toBe(true);
+            });
+
+            it('restored on all sheets is one request and one step, undone and redone as one', async () => {
+                grid_shell_mock.auto_fit_result = { 0: 120 };
+                const { post_message } = await render_app();
+                await open(post_message, { state: { columnWidths: [{ 0: 80 }, undefined] } }, two_sheets());
+                await open_scope_menu('Auto-fit scope');
+                await click_menu_item('Auto-fit columns on all 2 sheets');
+                await deliver_widths([{ 0: 120 }, undefined], two_sheets());
+                await answer_width_write(post_message, { stored: [{ 0: 80 }] });
+                await click_button('Sheet2');
+                await vi.waitFor(() => expect(width_writes(post_message)).toHaveLength(2));
+                await deliver_widths([{ 0: 120 }, { 0: 120 }], two_sheets());
+                await answer_width_write(post_message, { stored: [{ 0: 120 }] });
+                post_message.mockClear();
+
+                await open_scope_menu('Auto-fit scope');
+                await click_menu_item('Restore original widths on all 2 sheets');
+
+                expect(width_writes(post_message)).toEqual([expect.objectContaining({
+                    sheets: [
+                        { sheetIndex: 0, sheetName: 'Sheet1', widths: [{ column: 0, width: 80 }] },
+                        { sheetIndex: 1, sheetName: 'Sheet2', widths: [{ column: 0, width: null }] },
+                    ],
+                })]);
+                await deliver_widths([{ 0: 80 }, undefined], two_sheets());
+                await answer_width_write(post_message, { stored: [{ 0: 120 }, { 0: 120 }] });
+                expect(undo_labels()).toEqual(['Auto-fit columns', 'Auto-fit columns', 'Restore column widths']);
+                const restore = history().undoStack[2].action;
+                expect(width_step_changes(restore)?.map((change) => [
+                    change.delta.worksheet.sheetName,
+                    change.delta.columns,
+                    change.delta.autoFit,
+                ])).toEqual([
+                    ['Sheet1', [{ column: 0, before: 120, after: 80 }], 'off'],
+                    ['Sheet2', [{ column: 0, before: 120, after: null }], 'off'],
+                ]);
+
+                await undo();
+                expect(latest_width_write(post_message).sheets).toEqual([
+                    { sheetIndex: 0, sheetName: 'Sheet1', widths: [{ column: 0, width: 120 }] },
+                    { sheetIndex: 1, sheetName: 'Sheet2', widths: [{ column: 0, width: 120 }] },
+                ]);
+                await deliver_widths([{ 0: 120 }, { 0: 120 }], two_sheets());
+                await answer_width_write(post_message, { stored: [{ 0: 80 }] });
+                expect(redo_labels()).toEqual(['Restore column widths']);
+                // Both worksheets are fitted again.
+                expect(auto_fit_on()).toBe(true);
+                await click_button('Sheet1');
+                expect(auto_fit_on()).toBe(true);
+            });
+
+            it('leaves out a worksheet of a several-sheet step that is gone, and is unavailable when all are', async () => {
+                grid_shell_mock.auto_fit_result = { 0: 120 };
+                const { post_message } = await render_app();
+                await open(post_message, { state: { columnWidths: [{ 0: 80 }, { 0: 70 }] } }, two_sheets());
+                await open_scope_menu('Auto-fit scope');
+                await click_menu_item('Auto-fit columns on all 2 sheets');
+                await answer_width_write(post_message, { stored: [{ 0: 80 }] });
+                await click_button('Sheet2');
+                await vi.waitFor(() => expect(width_writes(post_message)).toHaveLength(2));
+                await answer_width_write(post_message, { stored: [{ 0: 80 }, { 0: 70 }] });
+                await open_scope_menu('Auto-fit scope');
+                await click_menu_item('Restore original widths on all 2 sheets');
+                await answer_width_write(post_message, { stored: [{ 0: 120 }, { 0: 120 }] });
+                expect(undo_labels().at(-1)).toBe('Restore column widths');
+
+                // A reload without Sheet2.
+                await reload([undefined], table_meta(['Sheet1']), { state: { columnWidths: [{ 0: 80 }] } });
+                post_message.mockClear();
+                await undo();
+                expect(latest_width_write(post_message).sheets).toEqual([
+                    { sheetIndex: 0, sheetName: 'Sheet1', widths: [{ column: 0, width: 120 }] },
+                ]);
+                await answer_width_write(post_message, { stored: [{ 0: 80 }] });
+                expect(redo_labels()).toEqual(['Restore column widths']);
+                expect(warnings(post_message)).toEqual([
+                    'Undo skipped part of “Restore column widths”: worksheets that are no longer in the workbook were left out.',
+                ]);
+
+                // A reload with neither worksheet.
+                await reload([undefined], table_meta(['Other']));
+                post_message.mockClear();
+                await redo();
+                expect(width_writes(post_message)).toEqual([]);
+                expect(redo_labels()).toEqual(['Restore column widths']);
+                expect(warnings(post_message)).toEqual([
+                    'Redo is unavailable: the change it would apply can no longer be reached.',
+                ]);
+            });
+        });
+
+        describe('one at a time', () => {
+            it('does not start a size gesture behind a pending sort, or a sort behind a pending size write', async () => {
+                const { post_message } = await render_app();
+                await open(post_message);
+
+                const sort = await ask(post_message, { sort: SORT_ASC, filters: [] });
+                await resize_columns([{ column: 1, width: 180 }]);
+                await resize_rows([{ start: 1, end: 1 }], 60);
+                expect(width_writes(post_message)).toEqual([]);
+                expect(row_height_writes(post_message)).toEqual([]);
+                await install(sort!);
+
+                await resize_columns([{ column: 1, width: 180 }]);
+                expect(await ask(post_message, { sort: [], filters: [] })).toBeUndefined();
+                await resize_columns([{ column: 2, width: 150 }]);
+                await resize_rows([{ start: 1, end: 1 }], 60);
+                expect(width_writes(post_message)).toHaveLength(1);
+                expect(row_height_writes(post_message)).toEqual([]);
+                await answer_width_write(post_message);
+
+                await resize_rows([{ start: 1, end: 1 }], 60);
+                expect(await ask(post_message, { sort: [], filters: [] })).toBeUndefined();
+                await act(async () => props().on_hide_column?.(1));
+                await resize_columns([{ column: 2, width: 150 }]);
+                expect(posted(post_message, 'setColumnVisibility')).toEqual([]);
+                expect(width_writes(post_message)).toHaveLength(1);
+                await answer_row_heights(post_message, { before: [{ start: 4, end: 4, height: null }] });
+
+                expect(warnings(post_message)).toEqual(Array.from(
+                    { length: 8 },
+                    () => 'Wait for the table view to finish updating.',
+                ));
+                expect(undo_labels()).toEqual(['Sort', 'Resize column', 'Resize row']);
+                expect(cells_editable()).toEqual(EDITABLE);
+            });
+
+            it('holds Undo and Redo behind a pending size write, saying nothing', async () => {
+                const { post_message } = await render_app();
+                await open(post_message);
+                await resized_column(post_message);
+                await resize_rows([{ start: 1, end: 1 }], 60);
+                post_message.mockClear();
+
+                await undo();
+                await redo();
+
+                expect(width_writes(post_message)).toEqual([]);
+                expect(warnings(post_message)).toEqual([]);
+                expect(undo_labels()).toEqual(['Resize column']);
+            });
+
+            it('does not start a size gesture, or replay a size step, while a save is in flight', async () => {
+                const { post_message } = await render_app();
+                await open(post_message);
+                await resized_column(post_message);
+                await acquire_editing_session(post_message);
+                await report_grid_editing(true, true, [], undefined, true);
+                post_message.mockClear();
+
+                await resize_columns([{ column: 2, width: 150 }]);
+                await resize_rows([{ start: 1, end: 1 }], 60);
+                await undo();
+
+                expect(width_writes(post_message)).toEqual([]);
+                expect(row_height_writes(post_message)).toEqual([]);
+                expect(undo_labels()).toEqual(['Resize column']);
+                expect(warnings(post_message).slice(0, 2)).toEqual([
+                    'Wait for the table view to finish updating.',
+                    'Wait for the table view to finish updating.',
+                ]);
+            });
+
+            it.each([
+                ['a width write that is applied', 'width', async (post_message: ReturnType<typeof vi.fn>) => {
+                    await answer_width_write(post_message);
+                }],
+                ['a width write that is refused', 'width', async (post_message: ReturnType<typeof vi.fn>) => {
+                    await answer_width_write(post_message, { applied: false });
+                }],
+                ['a width write a reload overtakes', 'width', async () => {
+                    await reload([undefined]);
+                }],
+                ['a width write another document replaces', 'width', async () => {
+                    await dispatch_host_message(initial_snapshot_message(table_meta(), {
+                        capabilities: CSV,
+                        identity: { authority: { fileId: 'file:other', revision: 1 } },
+                    }));
+                }],
+                ['a row write that is applied', 'rows', async (post_message: ReturnType<typeof vi.fn>) => {
+                    await answer_row_heights(post_message, { before: [{ start: 4, end: 4, height: null }] });
+                }],
+                ['a row write that is refused', 'rows', async (post_message: ReturnType<typeof vi.fn>) => {
+                    await answer_row_heights(post_message, { applied: false });
+                }],
+                ['a row write a reload overtakes', 'rows', async () => {
+                    await reload([undefined]);
+                }],
+                ['a row write another document replaces', 'rows', async () => {
+                    await dispatch_host_message(initial_snapshot_message(table_meta(), {
+                        capabilities: CSV,
+                        identity: { authority: { fileId: 'file:other', revision: 1 } },
+                    }));
+                }],
+            ])('leaves cells editable after %s', async (_name, kind, leave) => {
+                const { post_message } = await render_app();
+                await open(post_message);
+                if (kind === 'width') await resize_columns([{ column: 1, width: 180 }]);
+                else await resize_rows([{ start: 1, end: 1 }], 60);
+                expect(cells_editable()).toEqual(HELD);
+
+                await leave(post_message);
+
+                expect(cells_editable()).toEqual(EDITABLE);
+            });
+        });
+
+        describe('a refresh while a size write is pending', () => {
+            it('of another source generation settles a gesture as nothing recorded, and ignores its late answer', async () => {
+                const { post_message } = await render_app();
+                await open(post_message);
+                await resize_columns([{ column: 1, width: 180 }]);
+                const request = latest_width_write(post_message);
+                await resize_rows([{ start: 1, end: 1 }], 60);
+                post_message.mockClear();
+
+                // The reload carries what the host holds: the width did land.
+                await reload([undefined], table_meta(), { state: { columnWidths: [{ 1: 180 }] } });
+
+                expect(undo_labels()).toEqual([]);
+                expect(warnings(post_message)).toEqual([]);
+                expect(widths_shown()).toEqual({ 1: 180 });
+                await dispatch_host_message({
+                    type: 'columnWidthsChanged',
+                    requestId: request.requestId,
+                    applied: true,
+                    sourceGeneration: 1,
+                    change: [{ sheetIndex: 0, columns: [{ column: 1, before: null, after: 180 }] }],
+                });
+                expect(undo_labels()).toEqual([]);
+                expect(cells_editable()).toEqual(EDITABLE);
+            });
+
+            it('that opens another document abandons the write, and its late answer is ignored', async () => {
+                const { post_message } = await render_app();
+                await open(post_message);
+                await resize_columns([{ column: 1, width: 180 }]);
+                const request = latest_width_write(post_message);
+
+                await dispatch_host_message(initial_snapshot_message(table_meta(), {
+                    capabilities: CSV,
+                    identity: { authority: { fileId: 'file:other', revision: 1 } },
+                }));
+                await dispatch_host_message({
+                    type: 'columnWidthsChanged',
+                    requestId: request.requestId,
+                    applied: false,
+                    sourceGeneration: 1,
+                });
+
+                expect(undo_labels()).toEqual([]);
+                expect(widths_shown()).toEqual({});
+                expect(warnings(post_message)).toEqual([]);
+            });
+
+            it('of the same source built before the write keeps the gesture pending, and its answer records it', async () => {
+                const { post_message } = await render_app();
+                await open(post_message, { state: { columnWidths: [{ 1: 100 }] } });
+                await resize_columns([{ column: 1, width: 180 }]);
+
+                // Built before the write committed: it still says 100.
+                await deliver_widths([{ 1: 100 }]);
+                expect(cells_editable()).toEqual(HELD);
+                // The delivery behind it, then the answer.
+                await deliver_widths([{ 1: 180 }]);
+                await answer_width_write(post_message, { stored: [{ 1: 100 }] });
+
+                expect(widths_shown()).toEqual({ 1: 180 });
+                expect(undo_labels()).toEqual(['Resize column']);
+            });
+        });
+
+        describe('an open cell editor', () => {
+            it('is committed before a resize is written, so its edit is under the resize', async () => {
+                const { post_message } = await render_app();
+                await open(post_message);
+                await acquire_editing_session(post_message);
+                grid_shell_mock.commit_live_edit.mockImplementationOnce(() => record_edit());
+                post_message.mockClear();
+
+                await resize_columns([{ column: 1, width: 180 }]);
+
+                expect(grid_shell_mock.commit_live_edit).toHaveBeenCalledTimes(1);
+                expect(grid_shell_mock.commit_live_edit).toHaveBeenCalledWith({ fenced_empty_ok: true });
+                expect(undo_labels()).toEqual(['Edit cell']);
+                await answer_width_write(post_message);
+                expect(undo_labels()).toEqual(['Edit cell', 'Resize column']);
+
+                grid_shell_mock.commit_live_edit.mockImplementationOnce(() => record_edit('again'));
+                await resize_rows([{ start: 1, end: 1 }], 60);
+                await answer_row_heights(post_message, { before: [{ start: 4, end: 4, height: null }] });
+                expect(undo_labels()).toEqual(['Edit cell', 'Resize column', 'Edit cell', 'Resize row']);
+            });
+
+            it('that will not commit stops a resize, a reset, and Auto-fit, with a message', async () => {
+                grid_shell_mock.auto_fit_result = { 0: 120 };
+                const { post_message } = await render_app();
+                await open(post_message);
+                grid_shell_mock.commit_live_edit.mockReturnValue(false);
+
+                await resize_columns([{ column: 1, width: 180 }]);
+                await resize_rows([{ start: 1, end: 1 }], 60);
+                await resize_rows([{ start: 1, end: 1 }], null);
+                await click_button('Auto-fit Columns');
+
+                expect(width_writes(post_message)).toEqual([]);
+                expect(row_height_writes(post_message)).toEqual([]);
+                expect(auto_fit_on()).toBe(false);
+                expect(warnings(post_message)).toEqual(Array.from(
+                    { length: 4 },
+                    () => 'Finish or cancel the cell edit first.',
+                ));
+                expect(cells_editable()).toEqual(EDITABLE);
+            });
+        });
+
+        describe('Save', () => {
+            it.each([
+                ['a column width', async () => resize_columns([{ column: 1, width: 180 }]),
+                    async (post_message: ReturnType<typeof vi.fn>) => answer_width_write(post_message)],
+                ['a row height', async () => resize_rows([{ start: 1, end: 1 }], 60),
+                    async (post_message: ReturnType<typeof vi.fn>) => answer_row_heights(
+                        post_message, { before: [{ start: 4, end: 4, height: null }] },
+                    )],
+            ])('waits, with a message, while %s is being written', async (_name, gesture, answer) => {
+                const { post_message } = await render_app();
+                await open(post_message);
+                await acquire_editing_session(post_message);
+                seed_mounted_store({ '1:0': { value: 'Alicia', base: 'Alice' } });
+                await gesture();
+                const said = warnings(post_message).length;
+
+                // An answer after a save that renumbered rows or columns would
+                // be recorded in the numbering from before it.
+                await act(async () => { props().on_save_request?.(); });
+                expect(posted(post_message, 'saveCsv')).toEqual([]);
+                expect(warnings(post_message).slice(said)).toEqual(['Wait for the table view to finish updating.']);
+
+                await answer(post_message);
+                await act(async () => { props().on_save_request?.(); });
+                expect(posted(post_message, 'saveCsv')).toHaveLength(1);
+            });
+        });
+
+        describe('while this window\'s editing session is being let go', () => {
+            it('Undo of a size step is posted at once: a size write passes no editing admission', async () => {
+                const { post_message } = await render_app();
+                grid_shell_mock.commit_live_edit.mockImplementation((
+                    options?: { fenced_empty_ok?: boolean },
+                ) => options?.fenced_empty_ok === true);
+                await open(post_message);
+                await acquire_editing_session(post_message);
+                await resize_columns([{ column: 1, width: 180 }]);
+                await answer_width_write(post_message);
+                await resize_rows([{ start: 1, end: 2 }], 60);
+                await answer_row_heights(post_message, { before: [{ start: 4, end: 5, height: null }] });
+                // The grid has no more use for the session and the window lets it go.
+                await release_idle_edit_session();
+                expect(posted(post_message, 'releaseEditSession')).toHaveLength(1);
+                post_message.mockClear();
+                vi.useFakeTimers();
+                try {
+                    await undo();
+                    expect(row_height_writes(post_message)).toHaveLength(1);
+                    expect(vi.getTimerCount()).toBe(0);
+                } finally {
+                    vi.useRealTimers();
+                }
+                await answer_row_heights(post_message);
+                await undo();
+                expect(width_writes(post_message)).toHaveLength(1);
+                await answer_width_write(post_message, { stored: [{ 1: 180 }] });
+                expect(redo_labels()).toEqual(['Resize 2 rows', 'Resize column']);
+                expect(warnings(post_message)).toEqual([]);
+            });
+        });
+
+        describe('with edits and other view steps', () => {
+            it('undoes and redoes an edit, a column resize, a sort, and a row resize in order', async () => {
+                const { post_message } = await render_app();
+                await open(post_message);
+                record_edit();
+                await resize_columns([{ column: 1, width: 180 }]);
+                await answer_width_write(post_message);
+                await change_view(post_message, { sort: SORT_ASC, filters: [] });
+                await resize_rows([{ start: 1, end: 2 }], 60);
+                await answer_row_heights(post_message, { before: [{ start: 4, end: 5, height: null }] });
+                expect(undo_labels()).toEqual(['Edit cell', 'Resize column', 'Sort', 'Resize 2 rows']);
+                post_message.mockClear();
+                const sent = () => post_message.mock.calls
+                    .map((call) => (call[0] as WebviewMessage).type)
+                    .filter((type) => type === 'setSourceRowHeights' || type === 'setTransform'
+                        || type === 'setColumnWidths' || type === 'requestEditSession');
+
+                await undo();
+                await answer_row_heights(post_message);
+                await undo();
+                await install(latest_transform_request(post_message));
+                await undo();
+                await answer_width_write(post_message, { stored: [{ 1: 180 }] });
+                expect(sent()).toEqual(['setSourceRowHeights', 'setTransform', 'setColumnWidths']);
+                expect(undo_labels()).toEqual(['Edit cell']);
+                expect(redo_labels()).toEqual(['Resize 2 rows', 'Sort', 'Resize column']);
+                // The fourth is the edit, through the cell path, which starts
+                // by asking for an editing session.
+                await undo();
+                await vi.waitUntil(() => posted(post_message, 'requestEditSession').length === 1);
+                await dispatch_host_message({ type: 'editSessionResult', granted: false });
+                expect(undo_labels()).toEqual(['Edit cell']);
+                post_message.mockClear();
+
+                await redo();
+                await answer_width_write(post_message);
+                await redo();
+                await install(latest_transform_request(post_message));
+                await redo();
+                await answer_row_heights(post_message);
+                expect(sent()).toEqual(['setColumnWidths', 'setTransform', 'setSourceRowHeights']);
+                expect(undo_labels()).toEqual(['Edit cell', 'Resize column', 'Sort', 'Resize 2 rows']);
+                expect(redo_labels()).toEqual([]);
+            });
         });
     });
 

@@ -24,19 +24,16 @@ function normalized(
 }
 
 describe('layout state patches', () => {
-    it('derives only changed layout leaves in deterministic sheet and key order', () => {
+    it('derives only changed layout leaves', () => {
         const basis = normalized({
-            // Sheet 2's map is identical in both, which is the canary `rowHeights`
-            // carried before the leaf was removed: a map that did not change must
-            // produce no entry at all, not an empty one.
-            columnWidths: [{ 10: 110, 2: 102 }, { 0: 90 }, { 4: 24 }],
-            scrollPosition: [{ top: 1, left: 2 }],
+            scrollPosition: [{ top: 1, left: 2 }, { top: 7, left: 8 }],
             pendingEdits: sheet_edits({ '0:0': 'draft' }),
             excelFirstRowHeaders: { Sheet1: 'on' },
         });
         const incoming = normalized({
-            columnWidths: [{ 10: 210, 2: 102 }, { 0: 90, 3: 93 }, { 4: 24 }],
-            scrollPosition: [{ top: 5, left: 6 }],
+            // Sheet 1's position is the same in both: a leaf that did not change
+            // produces no entry at all.
+            scrollPosition: [{ top: 5, left: 6 }, { top: 7, left: 8 }],
             activeSheetIndex: 1,
             tabOrientation: 'vertical',
             pendingEdits: sheet_edits({ '0:0': 'stale' }),
@@ -46,10 +43,6 @@ describe('layout state patches', () => {
         const patch = derive_layout_state_patch(basis, incoming);
 
         expect(patch).toEqual({
-            columnWidths: [
-                { sheetIndex: 0, entries: [{ key: 10, change: { type: 'set', value: 210 } }] },
-                { sheetIndex: 1, entries: [{ key: 3, change: { type: 'set', value: 93 } }] },
-            ],
             scrollPosition: [{
                 sheetIndex: 0,
                 change: { type: 'set', value: { top: 5, left: 6 } },
@@ -59,7 +52,24 @@ describe('layout state patches', () => {
             tabOrientation: { type: 'set', value: 'vertical' },
         });
         expect(Object.isFrozen(patch)).toBe(true);
-        expect(Object.isFrozen(patch.columnWidths[0].entries[0])).toBe(true);
+        expect(Object.isFrozen(patch.scrollPosition[0])).toBe(true);
+    });
+
+    it('never patches column widths, whatever the panel copy holds', () => {
+        // A width is written by `setColumnWidths`, which names its columns and is
+        // answered. A `stateChanged` still carries the window's widths (the window
+        // draws columns from them), and must not be able to write them: it is
+        // refused whenever a delivery is in flight and has no answer for undo
+        // history to record from.
+        const basis = normalized({ columnWidths: [{ 0: 100, 1: 110 }, { 0: 200 }] });
+        const incoming = normalized({ columnWidths: [{ 0: 125, 2: 32 }] });
+
+        const patch = derive_layout_state_patch(basis, incoming);
+
+        expect('columnWidths' in patch).toBe(false);
+        expect(layout_state_patch_is_empty(patch)).toBe(true);
+        const latest: PerFileState = { columnWidths: [{ 0: 100, 1: 150 }, { 0: 240 }] };
+        expect(apply_layout_state_patch(latest, patch)).toBe(latest);
     });
 
     it('never patches row heights, however far the panel copy has drifted', () => {
@@ -93,19 +103,15 @@ describe('layout state patches', () => {
         expect(apply_layout_state_patch(latest, patch)).toBe(latest);
     });
 
-    it('merges disjoint sheet and numeric-map changes into the latest durable state', () => {
-        const basis = normalized({
-            columnWidths: [{ 0: 100 }, { 0: 200 }],
-        });
-        const incoming = normalized({
-            // Key 2 is a pure addition beside the change to key 0 — the other half of
-            // what the removed `rowHeights` leaf used to cover here.
-            columnWidths: [{ 0: 125, 2: 32 }, { 0: 200 }],
-        });
-        const patch = derive_layout_state_patch(basis, incoming);
+    it('merges a changed leaf into the latest durable state and leaves its peers alone', () => {
+        const patch = derive_layout_state_patch(
+            normalized({ scrollPosition: [{ top: 1, left: 2 }] }),
+            normalized({ scrollPosition: [{ top: 9, left: 2 }] }),
+        );
         const latest: PerFileState = {
             columnWidths: [{ 0: 100, 1: 150 }, { 0: 240 }],
             rowHeights: [{ 0: 20 }, { 1: 41 }],
+            scrollPosition: [{ top: 1, left: 2 }, { top: 3, left: 4 }],
             pendingEdits: sheet_edits({ '0:0': 'peer' }),
             excelFirstRowHeaders: { Sheet1: 'off' },
             cellHighlights: {
@@ -119,45 +125,13 @@ describe('layout state patches', () => {
 
         const merged = apply_layout_state_patch(latest, patch);
 
-        expect(merged.columnWidths).toEqual([
-            { 0: 125, 1: 150, 2: 32 },
-            { 0: 240 },
-        ]);
-        // Untouched by the patch, and the trailing sheet the panel never saw survives.
+        // The sheet the panel never scrolled keeps its position.
+        expect(merged.scrollPosition).toEqual([{ top: 9, left: 2 }, { top: 3, left: 4 }]);
+        expect(merged.columnWidths).toBe(latest.columnWidths);
         expect(merged.rowHeights).toBe(latest.rowHeights);
         expect(sheet_cells(merged.pendingEdits)).toEqual({ '0:0': 'peer' });
         expect(merged.excelFirstRowHeaders).toEqual({ Sheet1: 'off' });
         expect(merged.cellHighlights).toBe(latest.cellHighlights);
-    });
-
-    it('deletes only basis-known keys and preserves concurrent additions', () => {
-        const basis = normalized({
-            columnWidths: [{ 0: 100, 1: 110 }],
-        });
-        const incoming = normalized({
-            columnWidths: [{ 1: 110 }],
-        });
-        const patch = derive_layout_state_patch(basis, incoming);
-        // Row heights the panel would have deleted stand: same shape as the columnWidths
-        // case below, and the whole point of the leaf being gone.
-        const merged = apply_layout_state_patch({
-            columnWidths: [{ 0: 100, 1: 110, 2: 120 }],
-            rowHeights: [{ 0: 20, 1: 30 }],
-        }, patch);
-
-        expect(merged.columnWidths).toEqual([{ 1: 110, 2: 120 }]);
-        expect(merged.rowHeights).toEqual([{ 0: 20, 1: 30 }]);
-    });
-
-    it('collapses emptied maps to undefined without truncating unrelated sheets', () => {
-        const basis = normalized({ columnWidths: [{ 0: 100 }] });
-        const incoming = normalized();
-        const patch = derive_layout_state_patch(basis, incoming);
-        const merged = apply_layout_state_patch({
-            columnWidths: [{ 0: 100 }, { 0: 200 }],
-        }, patch);
-
-        expect(merged.columnWidths).toEqual([undefined, { 0: 200 }]);
     });
 
     it('treats scroll positions atomically per sheet and null orientation as a value', () => {
@@ -188,7 +162,7 @@ describe('layout state patches', () => {
     });
 
     it('returns the current object for an empty or already-satisfied patch', () => {
-        const state = normalized({ columnWidths: [{ 0: 100 }] });
+        const state = normalized({ scrollPosition: [{ top: 1, left: 2 }] });
         const empty = derive_layout_state_patch(state, state);
         expect(layout_state_patch_is_empty(empty)).toBe(true);
         expect(apply_layout_state_patch(state, empty)).toBe(state);
@@ -292,20 +266,21 @@ describe('every persisted leaf is classified', () => {
      * - **panel-owned** — written by the webview into `state_ref` and pushed with
      *   `persist_immediate()`. Must have a `LayoutStatePatch` leaf, or it is lost.
      * - **host-owned** — written by a dedicated message (`setTransform`,
-     *   `setColumnVisibility`, `setRowHeights`, the highlight commands). Must *not*
-     *   have a patch leaf, which is what stops a webview overwriting a map it cannot
-     *   correctly key.
+     *   `setColumnVisibility`, `setColumnWidths`, `setRowHeights`, the highlight
+     *   commands). Must *not* have a patch leaf, which is what stops a webview
+     *   overwriting a map it cannot correctly key, or writing one with a message
+     *   that has no answer.
      *
      * Adding a leaf to `PerFileState` without listing it here fails this test.
      */
     const PANEL_OWNED = [
-        'columnWidths',
         'scrollPosition',
         'activeSheetIndex',
         'tabOrientation',
         'showFormatting',
     ] as const;
     const HOST_OWNED = [
+        'columnWidths',
         'rowHeights',
         'transforms',
         'columnVisibility',

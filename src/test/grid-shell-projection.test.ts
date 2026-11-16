@@ -337,7 +337,7 @@ function props(overrides: Partial<GridShellProps> = {}): GridShellProps {
             hidden_count: 1,
         },
         column_widths: { 0: 100, 1: 150, 2: 200 },
-        on_column_resize: vi.fn(),
+        on_columns_resized: vi.fn(),
         row_heights: {},
         on_row_resize: vi.fn(),
         merges: [],
@@ -2211,8 +2211,8 @@ describe('GridShell git compare painting', () => {
 
 describe('GridShell column projection', () => {
     it('builds displayed columns and reads/resizes canonical source columns', async () => {
-        const on_column_resize = vi.fn();
-        await render_grid(props({ on_column_resize }));
+        const on_columns_resized = vi.fn();
+        await render_grid(props({ on_columns_resized }));
 
         const columns = grid_mock.props!.columns as Array<{
             id: string;
@@ -2232,10 +2232,295 @@ describe('GridShell column projection', () => {
             (cell: [number, number]) => { data: string };
         expect(get_cell_content([1, 0]).data).toBe('source-c');
 
-        const on_column_resize_grid = grid_mock.props!.onColumnResize as
+        // A drag of display column 1, which is source column 2: nothing is
+        // reported while the border moves, and the end reports it once.
+        const resize = grid_mock.props!.onColumnResize as
             (column: unknown, size: number, display_column: number) => void;
-        on_column_resize_grid({}, 222, 1);
-        expect(on_column_resize).toHaveBeenCalledWith(2, 222);
+        const resize_start = grid_mock.props!.onColumnResizeStart as typeof resize;
+        const resize_end = grid_mock.props!.onColumnResizeEnd as typeof resize;
+        await act(async () => {
+            resize_start({}, 200, 1);
+            resize({}, 222, 1);
+        });
+        expect(on_columns_resized).not.toHaveBeenCalled();
+        expect((grid_mock.props!.columns as Array<{ id: string; width: number }>)
+            .map(({ id, width }) => [id, width])).toEqual([['s:0', 100], ['s:2', 222]]);
+        await act(async () => resize_end({}, 222, 1));
+        expect(on_columns_resized).toHaveBeenCalledExactlyOnceWith([{ column: 2, width: 222 }]);
+        // The draft is gone; the width is App's to give back.
+        expect((grid_mock.props!.columns as Array<{ id: string; width: number }>)
+            .map(({ id, width }) => [id, width])).toEqual([['s:0', 100], ['s:2', 200]]);
+    });
+
+    describe('a column-width gesture', () => {
+        type Resize = (column: unknown, size: number, display_column: number) => void;
+        const all_columns = {
+            visible_to_source: [0, 1, 2],
+            source_to_visible: [0, 1, 2],
+            hidden_count: 0,
+        };
+        const callbacks = () => ({
+            start: grid_mock.props!.onColumnResizeStart as Resize,
+            resize: grid_mock.props!.onColumnResize as Resize,
+            end: grid_mock.props!.onColumnResizeEnd as Resize,
+        });
+        const shown_widths = () => (grid_mock.props!.columns as Array<{ id: string; width: number }>)
+            .map(({ id, width }) => [id, width]);
+
+        it('commits every column of a fanned-out drag once, though no render separates the calls', async () => {
+            const on_columns_resized = vi.fn();
+            await render_grid(props({ on_columns_resized, column_projection: all_columns }));
+            const { start, resize, end } = callbacks();
+            // What Glide does on the mouse-up of a drag inside a three-column
+            // selection, in one task: the pressed column's last width, the
+            // same width for the other two, then an end for each.
+            await act(async () => {
+                start({}, 100, 0);
+                resize({}, 130, 0);
+                resize({}, 130, 1);
+                resize({}, 130, 2);
+                end({}, 130, 0);
+                end({}, 130, 1);
+                end({}, 130, 2);
+            });
+            expect(on_columns_resized).toHaveBeenCalledExactlyOnceWith([
+                { column: 0, width: 130 },
+                { column: 1, width: 130 },
+                { column: 2, width: 130 },
+            ]);
+            expect(shown_widths()).toEqual([['s:0', 100], ['s:1', 150], ['s:2', 200]]);
+        });
+
+        it('commits nothing for a press and release that did not move the border', async () => {
+            const on_columns_resized = vi.fn();
+            const size_gesture_may_start = vi.fn(() => true);
+            await render_grid(props({ on_columns_resized, size_gesture_may_start, column_projection: all_columns }));
+            const { start, resize, end } = callbacks();
+            // A click on a border inside a three-column selection: Glide
+            // still fans the pressed column's own width out to the others.
+            await act(async () => {
+                start({}, 100, 0);
+                resize({}, 100, 1);
+                resize({}, 100, 2);
+                end({}, 100, 0);
+                end({}, 100, 1);
+                end({}, 100, 2);
+            });
+            expect(on_columns_resized).not.toHaveBeenCalled();
+            expect(size_gesture_may_start).not.toHaveBeenCalled();
+            // The other two columns keep their own widths on screen too.
+            expect(shown_widths()).toEqual([['s:0', 100], ['s:1', 150], ['s:2', 200]]);
+        });
+
+        /** A press somewhere in the window that is not on a column border. */
+        const press_elsewhere = () => { window.dispatchEvent(new Event('pointerdown')); };
+        /** A press on a column's border and its release, without moving: what Glide reports for a click there. */
+        const click_border = (display_column: number, width: number) => {
+            const { start, end } = callbacks();
+            window.dispatchEvent(new Event('pointerdown'));
+            start({}, width, display_column);
+            end({}, width, display_column);
+        };
+        /** A double-click on a column's border, as Glide reports it: two clicks, then the fit. */
+        const double_click_border = async (display_column: number, start_width: number, fitted: number) => {
+            const { resize, end } = callbacks();
+            await act(async () => {
+                click_border(display_column, start_width);
+                click_border(display_column, start_width);
+                // The fit arrives with no press open.
+                resize({}, fitted, display_column);
+                end({}, fitted, display_column);
+            });
+        };
+
+        it('commits a double-click\'s fit once', async () => {
+            const on_columns_resized = vi.fn();
+            await render_grid(props({ on_columns_resized, column_projection: all_columns }));
+            await double_click_border(1, 150, 77);
+            expect(on_columns_resized).toHaveBeenCalledExactlyOnceWith([{ column: 1, width: 77 }]);
+            // A fit that lands on the width this window shows is still
+            // reported: the host may hold another, and says if nothing changed.
+            on_columns_resized.mockClear();
+            await double_click_border(1, 150, 150);
+            expect(on_columns_resized).toHaveBeenCalledExactlyOnceWith([{ column: 1, width: 150 }]);
+        });
+
+        it('reports every column of a fanned-out drag, also one already shown at the new width', async () => {
+            // Columns 0 and 1 are selected and shown at 100 and 150; column
+            // 0's border is dragged to 150. Another window may have stored
+            // another width for column 1 since, so it is asked for too.
+            const on_columns_resized = vi.fn();
+            await render_grid(props({ on_columns_resized, column_projection: all_columns }));
+            const { start, resize, end } = callbacks();
+            await act(async () => {
+                start({}, 100, 0);
+                resize({}, 150, 0);
+                resize({}, 150, 1);
+                end({}, 150, 0);
+                end({}, 150, 1);
+            });
+            expect(on_columns_resized).toHaveBeenCalledExactlyOnceWith([
+                { column: 0, width: 150 },
+                { column: 1, width: 150 },
+            ]);
+        });
+
+        it('takes no fit from one click on a border, however soon after another click', async () => {
+            // Glide calls any mouse-up within half a second of another one a
+            // double-click, wherever the other was, and fits the column whose
+            // border the pointer is on.
+            const on_columns_resized = vi.fn();
+            await render_grid(props({ on_columns_resized, column_projection: all_columns }));
+            const { resize, end } = callbacks();
+            await act(async () => {
+                press_elsewhere();
+                click_border(1, 150);
+                resize({}, 77, 1);
+                end({}, 77, 1);
+            });
+            expect(on_columns_resized).not.toHaveBeenCalled();
+            expect(shown_widths()).toEqual([['s:0', 100], ['s:1', 150], ['s:2', 200]]);
+
+            // Nor from a click on one border and then one on another.
+            await act(async () => {
+                click_border(0, 100);
+                resize({}, 71, 0);
+                end({}, 71, 0);
+            });
+            expect(on_columns_resized).not.toHaveBeenCalled();
+        });
+
+        it('takes no fit from two clicks on a border with a click somewhere else between them', async () => {
+            // A border, a header, the border again, all within half a second:
+            // Glide reads the last release as a double-click from the header
+            // click before it. The two border clicks are not one.
+            const on_columns_resized = vi.fn();
+            await render_grid(props({ on_columns_resized, column_projection: all_columns }));
+            const { resize, end } = callbacks();
+            await act(async () => {
+                click_border(1, 150);
+                press_elsewhere();
+                click_border(1, 150);
+                resize({}, 77, 1);
+                end({}, 77, 1);
+            });
+            expect(on_columns_resized).not.toHaveBeenCalled();
+
+            // A double-click right after that still fits.
+            await double_click_border(1, 150, 77);
+            expect(on_columns_resized).toHaveBeenCalledExactlyOnceWith([{ column: 1, width: 77 }]);
+        });
+
+        it('does not take the fit Glide asks for when a drag is released soon after another click', async () => {
+            // Glide calls a mouse-up a double-click when it follows any other
+            // mouse-up by under half a second, and then fits the column whose
+            // border the pointer is on: the one just dragged. The drag is the
+            // gesture; the fit would replace its width, or be a second request
+            // refused behind the first.
+            const on_columns_resized = vi.fn();
+            const size_gesture_may_start = vi.fn(() => true);
+            await render_grid(props({ on_columns_resized, size_gesture_may_start, column_projection: all_columns }));
+            const { start, resize, end } = callbacks();
+            await act(async () => {
+                press_elsewhere();
+                window.dispatchEvent(new Event('pointerdown'));
+                start({}, 100, 0);
+                resize({}, 160, 0);
+                end({}, 160, 0);
+                // The fit, from the same mouse-up.
+                resize({}, 71, 0);
+                end({}, 71, 0);
+            });
+            expect(on_columns_resized).toHaveBeenCalledExactlyOnceWith([{ column: 0, width: 160 }]);
+            expect(size_gesture_may_start).toHaveBeenCalledOnce();
+            expect(shown_widths()).toEqual([['s:0', 100], ['s:1', 150], ['s:2', 200]]);
+
+            // Nor is a drag and then one click on the same border a double-click.
+            on_columns_resized.mockClear();
+            await act(async () => {
+                click_border(0, 100);
+                resize({}, 71, 0);
+                end({}, 71, 0);
+            });
+            expect(on_columns_resized).not.toHaveBeenCalled();
+
+            // A real double-click still fits.
+            await double_click_border(0, 100, 71);
+            expect(on_columns_resized).toHaveBeenCalledExactlyOnceWith([{ column: 0, width: 71 }]);
+        });
+
+        const with_pending_column = async (overrides: Partial<GridShellProps>) => {
+            const pending = create_pending_row_store({ session_id: 'session-1' });
+            const before = pending.snapshot();
+            pending.stage_replace('session-1', before, {
+                ...before,
+                columnLayout: {
+                    columns: [
+                        { kind: 'source', sourceColumn: 0 },
+                        { kind: 'pending', pendingColumnId: 'c1' },
+                        { kind: 'source', sourceColumn: 1 },
+                        { kind: 'source', sourceColumn: 2 },
+                    ],
+                    removedSourceColumns: [],
+                    discardedPendingColumns: [],
+                },
+                pendingColumns: [{ id: 'c1', header: 'New column', cells: {}, format: { kind: 'none' }, createdOrder: 1 }],
+            })!.commit();
+            await render_grid(props({
+                editing_session_held: true,
+                edit_activation_id: 1,
+                csv_editable: true,
+                edit_session_id: 'session-1',
+                pending_row_store: pending,
+                column_projection: all_columns,
+                ...overrides,
+            }));
+            return pending;
+        };
+        /** A drag of display column 0 over a selection of it, the Pending Column, and source column 1. */
+        const drag_three = async () => {
+            const { start, resize, end } = callbacks();
+            await act(async () => {
+                start({}, 100, 0);
+                resize({}, 130, 0);
+                resize({}, 130, 1);
+                resize({}, 130, 2);
+                end({}, 130, 0);
+                end({}, 130, 1);
+                end({}, 130, 2);
+            });
+        };
+
+        it('stores a Pending Column of the gesture and reports the saved columns', async () => {
+            const on_columns_resized = vi.fn();
+            const size_gesture_may_start = vi.fn(() => true);
+            const pending = await with_pending_column({ on_columns_resized, size_gesture_may_start });
+            expect(shown_widths().map(([id]) => id)).toEqual(['s:0', 'p:c1', 's:1', 's:2']);
+
+            await drag_three();
+
+            expect(size_gesture_may_start).toHaveBeenCalledOnce();
+            expect(pending.snapshot().pendingColumns?.[0]?.viewerWidth).toBe(130);
+            expect(on_columns_resized).toHaveBeenCalledExactlyOnceWith([
+                { column: 0, width: 130 },
+                { column: 1, width: 130 },
+            ]);
+        });
+
+        it('stores and reports nothing when the gesture is not admitted, and asks once', async () => {
+            const on_columns_resized = vi.fn();
+            const size_gesture_may_start = vi.fn(() => false);
+            const pending = await with_pending_column({ on_columns_resized, size_gesture_may_start });
+            const before = shown_widths();
+
+            await drag_three();
+
+            expect(size_gesture_may_start).toHaveBeenCalledOnce();
+            expect(on_columns_resized).not.toHaveBeenCalled();
+            expect(pending.snapshot().pendingColumns?.[0]?.viewerWidth).toBeUndefined();
+            // No draft is left drawn, for the saved columns or the Pending one.
+            expect(shown_widths()).toEqual(before);
+        });
     });
 
     it('notifies App when a deferred auto-fit becomes measurable', async () => {
@@ -7015,9 +7300,11 @@ describe('GridShell stable rows during an edit session', () => {
         // Exactly once, for the same reason as the forced-commit case below: one commit
         // must produce one durable host write, and `auto_grow_row_for_text` now has two
         // callers between which a double post is the plausible regression.
+        // Not a resize the person made: it is no step in undo history.
         expect(on_row_resize).toHaveBeenCalledExactlyOnceWith(
             [{ start: 0, end: 0 }],
             expected_grown_height,
+            { gesture: false },
         );
     });
 
@@ -7044,9 +7331,11 @@ describe('GridShell stable rows during an edit session', () => {
         const on_row_resize = vi.fn();
         await commit_multiline(false, on_row_resize);
 
+        // Not a resize the person made: it is no step in undo history.
         expect(on_row_resize).toHaveBeenCalledExactlyOnceWith(
             [{ start: 0, end: 0 }],
             expected_grown_height,
+            { gesture: false },
         );
     });
 
@@ -7128,6 +7417,7 @@ describe('GridShell stable rows during an edit session', () => {
         expect(on_row_resize).toHaveBeenCalledExactlyOnceWith(
             [{ start: 1, end: 1 }],
             expected_grown_height,
+            { gesture: false },
         );
     });
 
@@ -7176,6 +7466,7 @@ describe('GridShell stable rows during an edit session', () => {
         expect(from_default).toHaveBeenCalledWith(
             [{ start: 0, end: 0 }],
             MAX_ROW_HEIGHT_PX,
+            { gesture: false },
         );
 
         const already_capped = vi.fn();
@@ -7239,9 +7530,11 @@ describe('GridShell row resizing', () => {
         act(() => on_resize_end(3, 52));
         expect(on_row_resize).toHaveBeenCalledOnce();
         // Coalesced into display-row intervals: 1 alone, then 3–4.
+        // A drag is a gesture: it is answered and becomes a step.
         expect(on_row_resize).toHaveBeenCalledWith(
             [{ start: 1, end: 1 }, { start: 3, end: 4 }],
             52,
+            { gesture: true },
         );
     });
 
@@ -7314,7 +7607,7 @@ describe('GridShell row resizing', () => {
         expect(on_row_resize).not.toHaveBeenCalled();
         act(() => on_resize_end(2, 48));
         expect(on_row_resize).toHaveBeenCalledOnce();
-        expect(on_row_resize).toHaveBeenCalledWith([{ start: 2, end: 2 }], 48);
+        expect(on_row_resize).toHaveBeenCalledWith([{ start: 2, end: 2 }], 48, { gesture: true });
         expect(grid_mock.update_cells).not.toHaveBeenCalled();
     });
 
@@ -9798,9 +10091,9 @@ describe('row Insert in the row-gutter menu', () => {
     it('resizes an inserted row together with the source rows selected around it', async () => {
         const on_row_resize = vi.fn((
             _intervals: unknown,
-            _height: number,
-            finish?: (applied: boolean) => void,
-        ) => finish?.(true));
+            _height: number | null,
+            options: { gesture: boolean; on_result?: (applied: boolean) => void },
+        ) => options.on_result?.(true));
         const { pending } = await insert_after_first({ on_row_resize });
         const on_selection_change = grid_mock.props!.onGridSelectionChange as (selection: unknown) => void;
         // Display rows 0 (source 0), 1 (inserted), 2 (source 1).
@@ -9817,6 +10110,134 @@ describe('row Insert in the row-gutter menu', () => {
         expect(pending.snapshot().appendedRows).toEqual([
             expect.objectContaining({ id: 'ins-a', viewerRowHeight: 48 }),
         ]);
+    });
+
+    const drag_rows_around_inserted = async () => {
+        const on_selection_change = grid_mock.props!.onGridSelectionChange as (selection: unknown) => void;
+        // Display rows 0 (source 0), 1 (inserted), 2 (source 1).
+        await act(async () => on_selection_change({ columns: compact([]), rows: compact([0, 1, 2]) }));
+        const on_resize_start = grid_mock.row_resize_props!.on_resize_start as
+            (row: number, height: number) => void;
+        const on_resize = grid_mock.row_resize_props!.on_resize as (row: number, height: number) => void;
+        const on_resize_end = grid_mock.row_resize_props!.on_resize_end as (row: number, height: number) => void;
+        act(() => on_resize_start(1, 24));
+        act(() => on_resize(1, 48));
+        act(() => on_resize_end(1, 48));
+    };
+
+    it('asks whether a row drag may start before it stages the inserted row', async () => {
+        // Admission can commit an open editor, and a cell of the inserted row
+        // committed after the stage would invalidate it: the answer comes
+        // first, with nothing staged and nothing posted.
+        const on_row_resize = vi.fn((
+            _intervals: unknown,
+            _height: number | null,
+            options: { gesture: boolean; on_result?: (applied: boolean) => void },
+        ) => options.on_result?.(true));
+        const seen: unknown[] = [];
+        let pending_store: ReturnType<typeof create_pending_row_store> | undefined;
+        const size_gesture_may_start = vi.fn(() => {
+            seen.push({
+                posted: on_row_resize.mock.calls.length,
+                height: pending_store?.snapshot().appendedRows[0]?.viewerRowHeight,
+            });
+            return true;
+        });
+        const { pending } = await insert_after_first({ on_row_resize, size_gesture_may_start });
+        pending_store = pending;
+
+        await drag_rows_around_inserted();
+
+        expect(seen).toEqual([{ posted: 0, height: undefined }]);
+        expect(on_row_resize).toHaveBeenCalledOnce();
+        expect(pending.snapshot().appendedRows[0]).toMatchObject({ id: 'ins-a', viewerRowHeight: 48 });
+    });
+
+    it('stages and posts nothing for a row drag that is not admitted', async () => {
+        const on_row_resize = vi.fn();
+        const size_gesture_may_start = vi.fn(() => false);
+        const { pending } = await insert_after_first({ on_row_resize, size_gesture_may_start });
+
+        await drag_rows_around_inserted();
+
+        expect(size_gesture_may_start).toHaveBeenCalledOnce();
+        expect(on_row_resize).not.toHaveBeenCalled();
+        expect(pending.snapshot().appendedRows[0]?.viewerRowHeight).toBeUndefined();
+    });
+
+    it('offers Reset row height for saved rows that show a custom height, and posts a reset', async () => {
+        const on_row_resize = vi.fn();
+        const size_gesture_may_start = vi.fn(() => true);
+        await render_grid(structure_props({
+            pending_row_store: create_pending_row_store({ session_id: 'session' }),
+            row_heights: { 2: 60 },
+            on_row_resize,
+            size_gesture_may_start,
+        }));
+        // A row at the default height: no item.
+        await open_row_menu(0);
+        expect(menu_item('Reset row height')).toBeUndefined();
+
+        // The row that has one.
+        await open_row_menu(2);
+        await act(async () => menu_item('Reset row height')!.click());
+        expect(size_gesture_may_start).toHaveBeenCalledOnce();
+        expect(on_row_resize).toHaveBeenCalledExactlyOnceWith([{ start: 2, end: 2 }], null, { gesture: true });
+
+        // A selection that includes it: the label counts the selected rows.
+        on_row_resize.mockClear();
+        const on_selection_change = grid_mock.props!.onGridSelectionChange as (selection: unknown) => void;
+        await act(async () => on_selection_change({ columns: compact([]), rows: compact([1, 2, 3]) }));
+        await open_row_menu(2);
+        await act(async () => menu_item('Reset 3 row heights')!.click());
+        expect(on_row_resize).toHaveBeenCalledExactlyOnceWith([{ start: 1, end: 3 }], null, { gesture: true });
+    });
+
+    it('resets the rows the menu was opened on when an inserted row sits above them', async () => {
+        // Display rows 0 (source 0), 1 (inserted), 2 (source 1), 3 (source 2).
+        // The host knows nothing of the inserted row: to it source row 1 is
+        // display row 1, and that is the row whose height it holds.
+        const on_row_resize = vi.fn();
+        await insert_after_first({ on_row_resize, row_heights: { 1: 60 } });
+
+        // The row under the inserted one is the one with the custom height.
+        const get_row_height = grid_mock.props!.rowHeight as (row: number) => number;
+        expect([0, 2, 3].map(get_row_height)).toEqual([24, 60, 24]);
+        await open_row_menu(3);
+        expect(menu_item('Reset row height')).toBeUndefined();
+        await act(async () => { document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' })); });
+
+        await open_row_menu(2);
+        await act(async () => menu_item('Reset row height')!.click());
+
+        expect(on_row_resize).toHaveBeenCalledExactlyOnceWith([{ start: 1, end: 1 }], null, { gesture: true });
+    });
+
+    it('resets every saved row of a selection that spans an inserted row, and leaves the inserted row alone', async () => {
+        const on_row_resize = vi.fn();
+        const { pending } = await insert_after_first({ on_row_resize, row_heights: { 0: 50, 1: 60 } });
+        const on_selection_change = grid_mock.props!.onGridSelectionChange as (selection: unknown) => void;
+        await act(async () => on_selection_change({ columns: compact([]), rows: compact([0, 1, 2]) }));
+
+        await open_row_menu(2);
+        await act(async () => menu_item('Reset 2 row heights')!.click());
+
+        // Source rows 0 and 1 are the host's display rows 0 and 1.
+        expect(on_row_resize).toHaveBeenCalledExactlyOnceWith([{ start: 0, end: 1 }], null, { gesture: true });
+        expect(pending.snapshot().appendedRows[0]?.viewerRowHeight).toBeUndefined();
+    });
+
+    it('does not post a reset that is not admitted', async () => {
+        const on_row_resize = vi.fn();
+        await render_grid(structure_props({
+            pending_row_store: create_pending_row_store({ session_id: 'session' }),
+            row_heights: { 2: 60 },
+            on_row_resize,
+            size_gesture_may_start: () => false,
+        }));
+        await open_row_menu(2);
+        await act(async () => menu_item('Reset row height')!.click());
+        expect(on_row_resize).not.toHaveBeenCalled();
     });
 
     const keep_at_end = async (pending: ReturnType<typeof create_pending_row_store>) => {

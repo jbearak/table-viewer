@@ -93,6 +93,37 @@ describe('row context menu model', () => {
         ]);
     });
 
+    it('offers Reset row height only when given, between Hide and Copy, counting the rows it is given', () => {
+        const base = {
+            selected_row_count: 3,
+            can_hide_rows: true,
+            can_promote_row_to_header: false,
+            on_hide_rows: vi.fn(),
+            on_promote_row_to_header: vi.fn(),
+            on_copy_rows: vi.fn(),
+        };
+        const labels_of = (props: Parameters<typeof row_context_menu_items>[0]) =>
+            row_context_menu_items(props).flatMap((item) => item.kind === 'separator' ? [] : [item.label]);
+        // No row of the selection has a custom height: no item.
+        expect(labels_of(base)).toEqual(['Hide 3 rows', 'Copy 3 rows']);
+
+        const on_reset_row_heights = vi.fn();
+        expect(labels_of({ ...base, on_reset_row_heights }))
+            .toEqual(['Hide 3 rows', 'Reset 3 row heights', 'Copy 3 rows']);
+        // One of the three selected rows is a saved row; Pending Rows keep theirs.
+        expect(labels_of({ ...base, on_reset_row_heights, reset_row_count: 1 }))
+            .toEqual(['Hide 3 rows', 'Reset row height', 'Copy 3 rows']);
+        expect(labels_of({ ...base, selected_row_count: 1, on_reset_row_heights }))
+            .toEqual(['Hide row', 'Reset row height', 'Copy row']);
+
+        const reset = row_context_menu_items({ ...base, on_reset_row_heights })
+            .find((item) => item.kind !== 'separator' && item.label === 'Reset 3 row heights');
+        if (!reset || reset.kind === 'separator' || reset.kind === 'submenu') throw new Error('no reset item');
+        reset.on_click({} as never);
+        expect(on_reset_row_heights).toHaveBeenCalledTimes(1);
+        expect(base.on_hide_rows).not.toHaveBeenCalled();
+    });
+
     it('offers Excel row promotion independently of a multi-row selection', () => {
         expect(labels(3, true, true)).toEqual([
             'Use row as header', 'Hide 3 rows', 'Copy 3 rows',

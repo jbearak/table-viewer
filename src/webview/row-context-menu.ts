@@ -17,6 +17,13 @@ export interface RowContextMenuModelProps {
     /** Shown but not yet admitted: the session the menu acquires is on its way. */
     promote_row_disabled?: boolean;
     on_hide_rows: () => void;
+    /**
+     * Remove the custom height of the saved rows the menu acts on. Present
+     * when at least one of them shows a custom height.
+     */
+    on_reset_row_heights?: () => void;
+    /** How many saved rows the reset names. */
+    reset_row_count?: number;
     on_promote_row_to_header: () => void;
     on_copy_rows: () => void;
     pending_row_count?: number;
@@ -89,6 +96,15 @@ export function row_context_menu_items(props: RowContextMenuModelProps): MenuIte
             !props.can_hide_rows,
             props.hide_rows_disabled_reason,
         ));
+    }
+    if (props.on_reset_row_heights !== undefined) {
+        const reset_row_count = Math.max(1, props.reset_row_count ?? selected_row_count);
+        items.push({
+            label: reset_row_count === 1
+                ? 'Reset row height'
+                : `Reset ${reset_row_count} row heights`,
+            on_click: () => props.on_reset_row_heights?.(),
+        });
     }
     items.push({
         label: selected_row_count === 1 ? 'Copy row' : `Copy ${selected_row_count} rows`,

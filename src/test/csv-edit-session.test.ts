@@ -1192,7 +1192,7 @@ describe('CSV edit sessions', () => {
             snapshotIdentity: first.identity,
             state: {
                 ...first.state,
-                columnWidths: [{ 0: 177 }],
+                scrollPosition: [{ top: 177, left: 0 }],
                 activeSheetIndex: 0,
             },
         });
@@ -1206,7 +1206,7 @@ describe('CSV edit sessions', () => {
         await panel.__receive({ type: 'ready' });
         const replay = latest_snapshot(panel);
         expect(replay.identity.stateRevision).toBeGreaterThan(first.identity.stateRevision);
-        expect(replay.state.columnWidths).toEqual([{ 0: 177 }]);
+        expect(replay.state.scrollPosition).toEqual([{ top: 177, left: 0 }]);
         expect(replay.generation).toBe(first.generation);
         expect(replay.sourceGeneration).toBe(first.sourceGeneration);
         expect(replay.identity.sourceBasis).toEqual(first.identity.sourceBasis);
@@ -1244,14 +1244,14 @@ describe('CSV edit sessions', () => {
             type: 'stateChanged',
             sourceGeneration: first.sourceGeneration,
             snapshotIdentity: first.identity,
-            state: { ...first.state, columnWidths: [{ 0: 166 }] },
+            state: { ...first.state, scrollPosition: [{ top: 166, left: 0 }] },
         });
         expect(panel.__messages).toHaveLength(before);
 
         await panel.__receive({ type: 'ready' });
         const replay = latest_snapshot(panel);
         expect(replay.identity.stateRevision).toBe(2);
-        expect(replay.state.columnWidths).toEqual([{ 0: 166 }]);
+        expect(replay.state.scrollPosition).toEqual([{ top: 166, left: 0 }]);
         // The peer's height leaf survived this panel's layout write. Observed through the
         // projection, because `state.rowHeights` is no longer on the wire (see
         // `NormalizedPerFileState`) — the durable map is still there, which is what the
@@ -1262,7 +1262,7 @@ describe('CSV edit sessions', () => {
     it('derives initial intent from the exact ACK and preserves unseen peer layout', async () => {
         const file_path = '/tmp/exact-acked-layout-basis.csv';
         const versioned = state_store({
-            columnWidths: [{ 0: 100 }],
+            scrollPosition: [{ top: 100, left: 0 }],
             rowHeights: [{ 0: 20 }],
         });
         const panel = open_csv_table(uri(file_path), versioned.store);
@@ -1273,7 +1273,7 @@ describe('CSV edit sessions', () => {
             file_path,
             versioned.revision(file_path),
             {
-                columnWidths: [{ 0: 100 }],
+                scrollPosition: [{ top: 100, left: 0 }],
                 rowHeights: [{ 0: 30 }],
             },
         );
@@ -1294,17 +1294,17 @@ describe('CSV edit sessions', () => {
             snapshotIdentity: visibility_snapshot.identity,
             state: {
                 ...visibility_snapshot.state,
-                columnWidths: [{ 0: 120 }],
+                scrollPosition: [{ top: 120, left: 0 }],
             },
         });
 
-        expect(versioned.get_state(file_path).columnWidths).toEqual([{ 0: 120 }]);
+        expect(versioned.get_state(file_path).scrollPosition).toEqual([{ top: 120, left: 0 }]);
         expect(versioned.get_state(file_path).rowHeights).toEqual([{ 0: 30 }]);
     });
 
     it('skips empty and already-satisfied CAS while advancing the rolling basis', async () => {
         const file_path = '/tmp/layout-semantic-noop.csv';
-        const versioned = state_store({ columnWidths: [{ 0: 100 }] });
+        const versioned = state_store({ scrollPosition: [{ top: 100, left: 0 }] });
         let compare_attempts = 0;
         const store: FileStateStore = {
             ...versioned.store,
@@ -1328,26 +1328,26 @@ describe('CSV edit sessions', () => {
         const peer = await versioned.store.compare_and_set(
             file_path,
             versioned.revision(file_path),
-            { columnWidths: [{ 0: 120 }] },
+            { scrollPosition: [{ top: 120, left: 0 }] },
         );
         expect(peer.type).toBe('committed');
         await panel.__receive({
             type: 'stateChanged',
             sourceGeneration: acknowledged.sourceGeneration,
             snapshotIdentity: acknowledged.identity,
-            state: { ...acknowledged.state, columnWidths: [{ 0: 120 }] },
+            state: { ...acknowledged.state, scrollPosition: [{ top: 120, left: 0 }] },
         });
         expect(compare_attempts).toBe(0);
-        expect(versioned.get_state(file_path).columnWidths).toEqual([{ 0: 120 }]);
+        expect(versioned.get_state(file_path).scrollPosition).toEqual([{ top: 120, left: 0 }]);
 
         await panel.__receive({
             type: 'stateChanged',
             sourceGeneration: acknowledged.sourceGeneration,
             snapshotIdentity: acknowledged.identity,
-            state: { ...acknowledged.state, columnWidths: [{ 0: 100 }] },
+            state: { ...acknowledged.state, scrollPosition: [{ top: 100, left: 0 }] },
         });
         expect(compare_attempts).toBe(1);
-        expect(versioned.get_state(file_path).columnWidths).toEqual([{ 0: 100 }]);
+        expect(versioned.get_state(file_path).scrollPosition).toEqual([{ top: 100, left: 0 }]);
     });
 
     it('merges disjoint layout changes from two tabs that read the same revision', async () => {
@@ -1382,7 +1382,7 @@ describe('CSV edit sessions', () => {
                 snapshotIdentity: first_snapshot.identity,
                 state: {
                     ...first_snapshot.state,
-                    columnWidths: [{ 0: 144 }],
+                    showFormatting: [false],
                 },
             }),
             second.__receive({
@@ -1390,9 +1390,7 @@ describe('CSV edit sessions', () => {
                 sourceGeneration: second_snapshot.sourceGeneration,
                 snapshotIdentity: second_snapshot.identity,
                 // A different leaf on a different sheet, which is what makes the two
-                // writes disjoint. This was `rowHeights` before heights became
-                // host-owned and left `LayoutStatePatch` altogether; `scrollPosition` is
-                // the remaining per-sheet leaf a panel may still patch.
+                // writes disjoint.
                 state: {
                     ...second_snapshot.state,
                     scrollPosition: [undefined, { top: 41, left: 0 }],
@@ -1400,7 +1398,7 @@ describe('CSV edit sessions', () => {
             }),
         ]);
 
-        expect(versioned.get_state(file_path).columnWidths).toEqual([{ 0: 144 }]);
+        expect(versioned.get_state(file_path).showFormatting).toEqual([false]);
         expect(versioned.get_state(file_path).scrollPosition).toEqual([
             undefined,
             { top: 41, left: 0 },
@@ -1410,7 +1408,7 @@ describe('CSV edit sessions', () => {
     it('retries one fixed layout patch after a CAS conflict without losing peer state', async () => {
         const file_path = '/tmp/layout-patch-conflict.csv';
         const versioned = state_store({
-            columnWidths: [{ 0: 100 }],
+            scrollPosition: [{ top: 100, left: 0 }],
             excelFirstRowHeaders: { Sheet1: 'on' },
         });
         let inject_conflict = true;
@@ -1423,7 +1421,8 @@ describe('CSV edit sessions', () => {
                         path,
                         expected,
                         {
-                            columnWidths: [{ 0: 100, 1: 155 }],
+                            scrollPosition: [{ top: 100, left: 0 }],
+                            columnWidths: [{ 1: 155 }],
                             rowHeights: [{ 0: 37 }],
                             excelFirstRowHeaders: { Sheet1: 'off' },
                         },
@@ -1448,24 +1447,23 @@ describe('CSV edit sessions', () => {
             snapshotIdentity: initial.identity,
             state: {
                 ...initial.state,
-                columnWidths: [{ 0: 120 }],
+                scrollPosition: [{ top: 120, left: 0 }],
             },
         });
 
-        expect(versioned.get_state(file_path).columnWidths).toEqual([{
-            0: 120,
-            1: 155,
-        }]);
+        expect(versioned.get_state(file_path).scrollPosition).toEqual([{ top: 120, left: 0 }]);
+        expect(versioned.get_state(file_path).columnWidths).toEqual([{ 1: 155 }]);
         expect(versioned.get_state(file_path).rowHeights).toEqual([{ 0: 37 }]);
         expect(versioned.get_state(file_path).excelFirstRowHeaders).toEqual({
             Sheet1: 'off',
         });
     });
 
-    it('preserves concurrent per-sheet keys when the panel deletes its known values', async () => {
+    it('preserves a peer\'s leaves when the panel deletes its own', async () => {
         const file_path = '/tmp/layout-map-deletions.csv';
         const versioned = state_store({
-            columnWidths: [{ 0: 100 }, { 0: 200 }],
+            scrollPosition: [{ top: 100, left: 0 }, { top: 200, left: 0 }],
+            columnWidths: [{ 0: 100 }],
             rowHeights: [{ 0: 20 }],
         });
         const panel = open_csv_table(uri(file_path), versioned.store, two_sheet_profile());
@@ -1475,7 +1473,8 @@ describe('CSV edit sessions', () => {
             file_path,
             versioned.revision(file_path),
             {
-                columnWidths: [{ 0: 100, 1: 150 }, { 0: 200 }],
+                scrollPosition: [{ top: 100, left: 0 }, { top: 200, left: 0 }],
+                columnWidths: [{ 0: 100, 1: 150 }],
                 rowHeights: [{ 0: 20, 1: 31 }],
             },
         );
@@ -1487,19 +1486,21 @@ describe('CSV edit sessions', () => {
             snapshotIdentity: initial.identity,
             state: {
                 ...initial.state,
-                columnWidths: [undefined, { 0: 220 }],
+                scrollPosition: [undefined, { top: 220, left: 0 }],
+                columnWidths: [],
                 rowHeights: [],
             },
         });
 
-        expect(versioned.get_state(file_path).columnWidths).toEqual([
-            { 1: 150 },
-            { 0: 220 },
+        expect(versioned.get_state(file_path).scrollPosition).toEqual([
+            undefined,
+            { top: 220, left: 0 },
         ]);
-        // Untouched: the panel sent an emptied `rowHeights` and it changed nothing,
-        // because heights are host-owned and no longer a patchable leaf. Kept as the
-        // canary for that — the `columnWidths` assertion above is the same shape for a
-        // leaf the panel *may* delete, so the two together say which is which.
+        // Untouched: the panel sent emptied `columnWidths` and `rowHeights` and they
+        // changed nothing, because both are host-owned and not patchable leaves. Kept
+        // as the canary for that — the `scrollPosition` assertion above is the same
+        // shape for a leaf the panel *may* delete, so together they say which is which.
+        expect(versioned.get_state(file_path).columnWidths).toEqual([{ 0: 100, 1: 150 }]);
         expect(versioned.get_state(file_path).rowHeights).toEqual([{ 0: 20, 1: 31 }]);
     });
 
@@ -1527,14 +1528,14 @@ describe('CSV edit sessions', () => {
             type: 'stateChanged',
             sourceGeneration: initial.sourceGeneration,
             snapshotIdentity: initial.identity,
-            state: { ...initial.state, columnWidths: [{ 0: 140 }] },
+            state: { ...initial.state, scrollPosition: [{ top: 140, left: 0 }] },
         });
         await first_started.promise;
         const second = panel.__receive({
             type: 'stateChanged',
             sourceGeneration: initial.sourceGeneration,
             snapshotIdentity: initial.identity,
-            state: { ...initial.state, columnWidths: [{ 0: 180 }] },
+            state: { ...initial.state, scrollPosition: [{ top: 180, left: 0 }] },
         });
         await flush_promises();
         expect(attempts).toBe(1);
@@ -1542,7 +1543,7 @@ describe('CSV edit sessions', () => {
         release_first.resolve();
         await Promise.all([first, second]);
         expect(attempts).toBe(2);
-        expect(versioned.get_state(file_path).columnWidths).toEqual([{ 0: 180 }]);
+        expect(versioned.get_state(file_path).scrollPosition).toEqual([{ top: 180, left: 0 }]);
     });
 
     it('rejects stale layout sources and aborts an in-flight write after disposal', async () => {
@@ -1576,7 +1577,7 @@ describe('CSV edit sessions', () => {
             type: 'stateChanged',
             sourceGeneration: initial.sourceGeneration + 1,
             snapshotIdentity: initial.identity,
-            state: { ...initial.state, columnWidths: [{ 0: 120 }] },
+            state: { ...initial.state, scrollPosition: [{ top: 120, left: 0 }] },
         });
         await panel.__receive({
             type: 'stateChanged',
@@ -1588,7 +1589,7 @@ describe('CSV edit sessions', () => {
                     revision: initial.identity.authority.revision + 1,
                 },
             },
-            state: { ...initial.state, columnWidths: [{ 0: 130 }] },
+            state: { ...initial.state, scrollPosition: [{ top: 130, left: 0 }] },
         });
         expect(compare_attempts).toBe(0);
 
@@ -1597,14 +1598,14 @@ describe('CSV edit sessions', () => {
             type: 'stateChanged',
             sourceGeneration: initial.sourceGeneration,
             snapshotIdentity: initial.identity,
-            state: { ...initial.state, columnWidths: [{ 0: 140 }] },
+            state: { ...initial.state, scrollPosition: [{ top: 140, left: 0 }] },
         });
         await read_started.promise;
         panel.dispose();
         read_gate.resolve();
         await pending;
 
-        expect(versioned.get_state(file_path).columnWidths).toBeUndefined();
+        expect(versioned.get_state(file_path).scrollPosition).toBeUndefined();
     });
 
     it('cannot restore pending edits after save clearing and a new ready epoch', async () => {
@@ -4085,11 +4086,11 @@ describe('CSV edit sessions', () => {
             snapshotIdentity: first_snapshot.identity,
             state: {
                 ...first_snapshot.state,
-                columnWidths: [{ 0: 177 }],
+                scrollPosition: [{ top: 177, left: 0 }],
             },
         });
         expect(state.get_state(file_path)).toMatchObject({
-            columnWidths: [{ 0: 177 }],
+            scrollPosition: [{ top: 177, left: 0 }],
             cellHighlights: {
                 sheets: [{ cells: { '0:0': 'yellow', '2:0': 'pink' } }],
             },
@@ -4602,10 +4603,10 @@ describe('CSV edit sessions', () => {
                 type: 'stateChanged',
                 sourceGeneration: ready.sourceGeneration,
                 snapshotIdentity: ready.identity,
-                state: { columnWidths: [{ 0: 77 }] },
+                state: { scrollPosition: [{ top: 77, left: 0 }] },
             });
             await flush_promises();
-            expect(versioned.get_state(file_path).columnWidths).toEqual([{ 0: 77 }]);
+            expect(versioned.get_state(file_path).scrollPosition).toEqual([{ top: 77, left: 0 }]);
             expect(posts_since(panel, from)).toEqual([]);
             resume.resolve();
             await visibility;
@@ -4616,7 +4617,7 @@ describe('CSV edit sessions', () => {
             expect(posts_since(panel, from)).toEqual(['workbookSnapshot', 'columnVisibilityChanged']);
             expect(answers(panel)).toEqual([expect.objectContaining({ applied: true })]);
             expect(latest_snapshot(panel).state.columnVisibility).toEqual([hidden]);
-            expect(latest_snapshot(panel).state.columnWidths).toEqual([{ 0: 77 }]);
+            expect(latest_snapshot(panel).state.scrollPosition).toEqual([{ top: 77, left: 0 }]);
         });
 
         it('keeps a layout change that was queued behind another layout write when the columns were written', async () => {
@@ -4633,7 +4634,7 @@ describe('CSV edit sessions', () => {
                 ...queued,
                 async compare_and_set(path, expected, next, validate, basis) {
                     const result = await queued.compare_and_set(path, expected, next, validate, basis);
-                    if (hold && next.columnWidths?.[0]?.[0] === 50 && result.type === 'committed') {
+                    if (hold && next.scrollPosition?.[0]?.top === 50 && result.type === 'committed') {
                         hold = false;
                         first_committed.resolve();
                         await resume_first.promise;
@@ -4653,11 +4654,11 @@ describe('CSV edit sessions', () => {
             await panel.__receive({ type: 'ready' });
             const ready = latest_snapshot(panel);
             const from = panel.__messages.length;
-            const layout = (width: number) => ({
+            const layout = (top: number) => ({
                 type: 'stateChanged',
                 sourceGeneration: ready.sourceGeneration,
                 snapshotIdentity: ready.identity,
-                state: { columnWidths: [{ 0: width }] },
+                state: { scrollPosition: [{ top, left: 0 }] },
             });
 
             const first = panel.__receive(layout(50));
@@ -4676,12 +4677,12 @@ describe('CSV edit sessions', () => {
             await Promise.all([first, second, visibility]);
             await flush_promises();
 
-            expect(versioned.get_state(file_path).columnWidths).toEqual([{ 0: 77 }]);
+            expect(versioned.get_state(file_path).scrollPosition).toEqual([{ top: 77, left: 0 }]);
             expect(versioned.get_state(file_path).columnVisibility).toEqual([hidden]);
             expect(posts_since(panel, from)).toEqual(['workbookSnapshot', 'columnVisibilityChanged']);
             expect(answers(panel)).toEqual([expect.objectContaining({ applied: true })]);
             expect(latest_snapshot(panel).state.columnVisibility).toEqual([hidden]);
-            expect(latest_snapshot(panel).state.columnWidths).toEqual([{ 0: 77 }]);
+            expect(latest_snapshot(panel).state.scrollPosition).toEqual([{ top: 77, left: 0 }]);
         });
     });
 
@@ -9131,13 +9132,13 @@ describe('CSV edit sessions', () => {
             type: 'stateChanged',
             sourceGeneration: first.sourceGeneration,
             snapshotIdentity: first.identity,
-            state: { ...first.state, pendingEdits: pending, columnWidths: [{ 0: 133 }] },
+            state: { ...first.state, pendingEdits: pending, scrollPosition: [{ top: 133, left: 0 }] },
         });
         expect(sheet_cells(state.get_state(file_path).pendingEdits)).toBeUndefined();
         await panel.__receive({ type: 'ready' });
         const replay = latest_snapshot(panel);
         expect(sheet_cells(replay.state.pendingEdits)).toBeUndefined();
-        expect(replay.state.columnWidths).toEqual([{ 0: 133 }]);
+        expect(replay.state.scrollPosition).toEqual([{ top: 133, left: 0 }]);
     });
 
     it('rejects current and stale transform injections at the preview host boundary', async () => {

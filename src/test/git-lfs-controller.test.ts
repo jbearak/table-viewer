@@ -17,6 +17,7 @@ import {
     csv_table_profile,
     type ViewerControllerOptions,
 } from '../viewer-controller';
+import type { PerFileState } from '../types';
 import type { UnresolvedLfsObject } from '../viewer-snapshot';
 import { with_in_memory_authority_transactions } from '../state-authority';
 import { versioned_state_store } from './helpers/versioned-state-store';
@@ -683,6 +684,96 @@ describe('a compare original that is an LFS pointer', () => {
         await resolve(panel);
         expect(await latest_lfs(panel, (value) => value?.failure !== undefined))
             .toMatchObject({ side: 'original', failure: { reason: 'failed' } });
+    });
+});
+
+describe('a failed download explained while a layout change waits', () => {
+    it('keeps the layout change, and delivers it after the explanation', async () => {
+        // The compare window shows the table while the original side is still
+        // a pointer, so the person can scroll in it. One layout write is being
+        // stored and a second waits behind it when the download fails. The
+        // rebuild that would carry the explanation adopts nothing (the file
+        // has grown past what the panel opens), so the explanation is
+        // delivered on the source already shown, from outside the layout
+        // queue. That used to make the host refuse the waiting change for
+        // naming the snapshot before it.
+        //
+        // When the rebuild does adopt a source, the waiting change is refused
+        // as one made on the contents before it, like any change that meets a
+        // reload; that is not what this covers.
+        serve('original');
+        const versioned = versioned_state_store();
+        let committed!: () => void;
+        const first_committed = new Promise<void>((done) => { committed = done; });
+        let release!: () => void;
+        const released = new Promise<void>((done) => { release = done; });
+        let hold = true;
+        // Gated outside the per-file queue: the first write has left that
+        // queue and still occupies the layout queue.
+        const queued = with_in_memory_authority_transactions(versioned.store);
+        const store: typeof queued = {
+            ...queued,
+            async compare_and_set(path, expected, next, validate, basis) {
+                const result = await queued.compare_and_set(path, expected, next, validate, basis);
+                if (hold && next.scrollPosition?.[0]?.top === 50 && result.type === 'committed') {
+                    hold = false;
+                    committed();
+                    await released;
+                }
+                return result;
+            },
+        };
+        const panel = vscode_mock.window.createWebviewPanel('tableViewer.editor', 'table');
+        const controller = attach_viewer(
+            panel as unknown as Parameters<typeof attach_viewer>[0],
+            vscode_mock.Uri.file('/tmp/data.csv') as unknown as vscode.Uri,
+            store,
+            csv_table_profile(),
+            fake_viewer_host,
+            { compare: { originalUri: vscode_mock.Uri.file('/tmp/original.csv') as unknown as vscode.Uri } },
+        );
+        panel.onDidDispose(() => controller.dispose());
+        await panel.__receive({ type: 'ready' });
+        await latest_lfs(panel, (value) => value !== undefined);
+        const latest = () => posted(panel, 'workbookSnapshot').at(-1)!.snapshot as {
+            sourceGeneration: number;
+            identity: unknown;
+            state: PerFileState;
+        };
+        // Acknowledged here, not left to the mock panel's own turn: a layout
+        // change is refused until the snapshot it names is acknowledged.
+        const ready = latest();
+        await panel.__receive({ type: 'snapshotApplied', identity: ready.identity, disposition: 'applied' });
+        const layout = (state: PerFileState) => panel.__receive({
+            type: 'stateChanged',
+            sourceGeneration: ready.sourceGeneration,
+            snapshotIdentity: ready.identity,
+            state: { ...ready.state, ...state },
+        });
+
+        const first = layout({ scrollPosition: [{ top: 50, left: 0 }] });
+        await first_committed;
+        const second = layout({ scrollPosition: [{ top: 77, left: 0 }], showFormatting: [false] });
+        fake_git_lfs.smudge_outcomes.push({ type: 'failed', reason: 'failed' });
+        vscode_mock.__setStatImplementation(async () => ({ size: 4096 * 1024 * 1024, mtime: 9 }));
+        await resolve(panel);
+        await latest_lfs(panel, (value) => value?.failure !== undefined);
+        expect(latest().sourceGeneration).toBe(ready.sourceGeneration);
+        const explained = posted(panel, 'workbookSnapshot').length;
+        expect(latest().state.showFormatting).not.toEqual([false]);
+
+        release();
+        await Promise.all([first, second]);
+        await vi.waitFor(() => expect(posted(panel, 'workbookSnapshot').length).toBeGreaterThan(explained));
+
+        const durable = versioned.get_state('/tmp/data.csv') as PerFileState;
+        expect(durable.scrollPosition).toEqual([{ top: 77, left: 0 }]);
+        expect(durable.showFormatting).toEqual([false]);
+        // The window ends on a snapshot with the layout change, and still
+        // with the explanation.
+        expect(latest().state.scrollPosition).toEqual([{ top: 77, left: 0 }]);
+        expect(latest().state.showFormatting).toEqual([false]);
+        expect(await latest_lfs(panel)).toMatchObject({ side: 'original', failure: { reason: 'failed' } });
     });
 });
 

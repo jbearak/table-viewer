@@ -124,7 +124,7 @@ export function header_wait_warning(
         + `${remedy} to ${direction} it.`;
 }
 
-// ---- View steps (a sort, a filter, hidden rows, hidden columns) ----
+// ---- View steps (a sort, a filter, hidden rows, hidden columns, column widths, row heights) ----
 
 /** A view gesture that cannot start while another one of this window is in flight. */
 export const VIEW_GESTURE_WAIT_MESSAGE = 'Wait for the table view to finish updating.';
@@ -135,6 +135,19 @@ export const FOLD_REFUSED_MESSAGE = 'Finish or cancel the cell edit first.';
 /** Redo, after committing the open cell editor cleared what there was to redo. */
 export const REDO_REPLACED_BY_FOLD_MESSAGE =
     'Nothing to redo: the cell edit you just finished replaced it.';
+
+/** A resize or Auto-fit change the host did not write. */
+export const SIZE_WRITE_REFUSED_MESSAGE =
+    'Could not resize because the file was refreshing. Try again.';
+
+/**
+ * What stands in the way of a size write on a worksheet restructured by a
+ * save the person has not said finished or not.
+ */
+export const UNRESOLVED_SAVE_SIZE_REASON = 'choose whether your last save finished first.';
+
+/** A resize the host refused for that reason. */
+export const SIZE_WRITE_UNRESOLVED_MESSAGE = `Could not resize: ${UNRESOLVED_SAVE_SIZE_REASON}`;
 
 /** A column hide or show the host did not write. */
 export const COLUMN_WRITE_REFUSED_MESSAGE =
@@ -183,6 +196,9 @@ const VIEW_SKIP_TEXT: Readonly<Record<ViewSkipReason, string>> = {
     'header-row': "the header row can't be hidden",
     'rows-gone': 'rows that are no longer in the worksheet were left out',
     'too-many-hidden': 'too many rows would be hidden',
+    'columns-gone': 'columns that are no longer in the worksheet were left out',
+    'sheets-gone': 'worksheets that are no longer in the workbook were left out',
+    'too-many-heights': 'too many rows would have a custom height',
 };
 
 /**

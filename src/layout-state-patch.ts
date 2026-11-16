@@ -6,16 +6,6 @@ export type LayoutValueChange<T> =
     | { readonly type: 'set'; readonly value: T }
     | { readonly type: 'delete' };
 
-export interface LayoutNumericEntryPatch {
-    readonly key: number;
-    readonly change: LayoutValueChange<number>;
-}
-
-export interface LayoutNumericMapPatch {
-    readonly sheetIndex: number;
-    readonly entries: readonly LayoutNumericEntryPatch[];
-}
-
 export interface LayoutSheetPatch<T> {
     readonly sheetIndex: number;
     readonly change: LayoutValueChange<T>;
@@ -24,7 +14,15 @@ export interface LayoutSheetPatch<T> {
 /**
  * The layout leaves a `stateChanged` message may write.
  *
- * `rowHeights` is deliberately not among them, alongside `transforms`,
+ * `columnWidths` is not among them. A width is written by `setColumnWidths`, which
+ * names the columns and widths it means and is answered: a `stateChanged` carries
+ * a whole state for the host to diff against the snapshot the window last
+ * acknowledged, so it is refused whenever a delivery is in flight, and it has no
+ * answer for undo history to record or move on. The window still holds the widths
+ * (it draws columns from them, and deliveries carry them); it cannot write them
+ * from here.
+ *
+ * `rowHeights` is deliberately not among them either, alongside `transforms`,
  * `columnVisibility` and `cellHighlights`: all four are host-owned, and a patch leaf is
  * exactly the mechanism by which a webview could overwrite one. For heights that is not
  * a hypothetical. Durable heights are keyed by canonical source row
@@ -41,7 +39,6 @@ export interface LayoutSheetPatch<T> {
  * would have been derived *from*.
  */
 export interface LayoutStatePatch {
-    readonly columnWidths: readonly LayoutNumericMapPatch[];
     readonly scrollPosition: readonly LayoutSheetPatch<ScrollPosition>[];
     /**
      * Per-sheet choice between formatted and raw cell values.
@@ -55,51 +52,6 @@ export interface LayoutStatePatch {
     readonly showFormatting: readonly LayoutSheetPatch<boolean>[];
     readonly activeSheetIndex?: LayoutValueChange<number>;
     readonly tabOrientation?: LayoutValueChange<'horizontal' | 'vertical' | null>;
-}
-
-type NumericMap = Record<number, number>;
-
-function canonical_numeric_keys(value: NumericMap | undefined): number[] {
-    if (!value) return [];
-    return Object.keys(value).flatMap((key) => {
-        const numeric = Number(key);
-        return Number.isSafeInteger(numeric)
-            && numeric >= 0
-            && String(numeric) === key
-            ? [numeric]
-            : [];
-    }).sort((left, right) => left - right);
-}
-
-function derive_numeric_map_patches(
-    basis: readonly (NumericMap | undefined)[],
-    incoming: readonly (NumericMap | undefined)[],
-): LayoutNumericMapPatch[] {
-    const patches: LayoutNumericMapPatch[] = [];
-    const sheet_count = Math.max(basis.length, incoming.length);
-    for (let sheet_index = 0; sheet_index < sheet_count; sheet_index += 1) {
-        const before = basis[sheet_index];
-        const after = incoming[sheet_index];
-        const keys = [...new Set([
-            ...canonical_numeric_keys(before),
-            ...canonical_numeric_keys(after),
-        ])].sort((left, right) => left - right);
-        const entries: LayoutNumericEntryPatch[] = [];
-        for (const key of keys) {
-            const before_has = before !== undefined
-                && Object.prototype.hasOwnProperty.call(before, key);
-            const after_has = after !== undefined
-                && Object.prototype.hasOwnProperty.call(after, key);
-            if (before_has === after_has && (!after_has || before![key] === after![key])) {
-                continue;
-            }
-            entries.push(after_has
-                ? { key, change: { type: 'set', value: after![key] } }
-                : { key, change: { type: 'delete' } });
-        }
-        if (entries.length > 0) patches.push({ sheetIndex: sheet_index, entries });
-    }
-    return patches;
 }
 
 function scroll_positions_equal(
@@ -157,10 +109,6 @@ export function derive_layout_state_patch(
     incoming: Readonly<NormalizedPerFileState>,
 ): Readonly<LayoutStatePatch> {
     const patch: LayoutStatePatch = {
-        columnWidths: derive_numeric_map_patches(
-            basis.columnWidths,
-            incoming.columnWidths,
-        ),
         scrollPosition: derive_scroll_patches(
             basis.scrollPosition,
             incoming.scrollPosition,
@@ -192,45 +140,10 @@ export function derive_layout_state_patch(
 export function layout_state_patch_is_empty(
     patch: Readonly<LayoutStatePatch>,
 ): boolean {
-    return patch.columnWidths.length === 0
-        && patch.scrollPosition.length === 0
+    return patch.scrollPosition.length === 0
         && patch.showFormatting.length === 0
         && patch.activeSheetIndex === undefined
         && patch.tabOrientation === undefined;
-}
-
-function apply_numeric_map_patches(
-    current: (NumericMap | undefined)[] | undefined,
-    patches: readonly LayoutNumericMapPatch[],
-): (NumericMap | undefined)[] | undefined {
-    let result = current;
-    for (const patch of patches) {
-        const existing = result?.[patch.sheetIndex];
-        let next_map = existing;
-        for (const entry of patch.entries) {
-            if (entry.change.type === 'delete') {
-                if (
-                    next_map === undefined
-                    || !Object.prototype.hasOwnProperty.call(next_map, entry.key)
-                ) continue;
-                const cloned = { ...next_map };
-                delete cloned[entry.key];
-                next_map = Object.keys(cloned).length === 0 ? undefined : cloned;
-            } else {
-                if (
-                    next_map !== undefined
-                    && Object.prototype.hasOwnProperty.call(next_map, entry.key)
-                    && next_map[entry.key] === entry.change.value
-                ) continue;
-                next_map = { ...(next_map ?? {}), [entry.key]: entry.change.value };
-            }
-        }
-        if (next_map === existing) continue;
-        const cloned = [...(result ?? [])];
-        cloned[patch.sheetIndex] = next_map;
-        result = cloned;
-    }
-    return result;
 }
 
 function apply_scroll_patches(
@@ -275,13 +188,6 @@ export function apply_layout_state_patch(
     patch: Readonly<LayoutStatePatch>,
 ): PerFileState {
     let result = current as PerFileState;
-    const column_widths = apply_numeric_map_patches(
-        current.columnWidths,
-        patch.columnWidths,
-    );
-    if (column_widths !== current.columnWidths) {
-        result = { ...result, columnWidths: column_widths };
-    }
     const scroll_position = apply_scroll_patches(
         current.scrollPosition,
         patch.scrollPosition,

@@ -1,4 +1,7 @@
 import type { SizedGridColumn } from './glide-data-grid';
+import { clamp_column_width, MAX_COLUMN_WIDTH_PX } from './column-widths';
+
+export { clamp_column_width, MAX_COLUMN_WIDTH_PX, MIN_COLUMN_WIDTH_PX } from './column-widths';
 
 /**
  * Pure grid-geometry helpers for the Glide renderer (Phase C). No DOM, no
@@ -15,8 +18,6 @@ export const PAGE_SIZE = 100;
  *  scrolled partly under the header never paints over the column letters. */
 export const HEADER_HEIGHT_PX = 36;
 
-export const MIN_COLUMN_WIDTH_PX = 40;
-export const MAX_COLUMN_WIDTH_PX = 3200;
 /** Auto-fit should reveal useful content without letting one long value take
  *  over the viewport. Manual resizing retains the larger limit above. */
 export const MAX_AUTO_FIT_COLUMN_WIDTH_PX = MAX_COLUMN_WIDTH_PX / 4;
@@ -42,11 +43,6 @@ export function get_needed_page_starts(
     const starts: number[] = [];
     for (let s = first; s <= last; s += size) starts.push(s);
     return starts;
-}
-
-/** Clamp a column width to the renderer's allowed range. */
-export function clamp_column_width(width: number): number {
-    return Math.max(MIN_COLUMN_WIDTH_PX, Math.min(MAX_COLUMN_WIDTH_PX, width));
 }
 
 /** Spreadsheet column label for a 0-based index: 0→A, 25→Z, 26→AA, 702→AAA. */

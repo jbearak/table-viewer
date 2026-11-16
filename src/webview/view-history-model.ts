@@ -1,6 +1,6 @@
 /**
- * View steps: a sort, a filter, hidden rows, or hidden columns as one undoable
- * gesture.
+ * View steps: a sort, a filter, hidden rows, hidden columns, column widths, or
+ * row heights as one undoable gesture.
  *
  * A view step stores only what its gesture changed. Sort and filters are small
  * ordered lists, stored whole, before and after. Hidden rows and hidden
@@ -17,11 +17,22 @@
  * A view step never stands in the way of an older step. The parts of it that
  * cannot apply now, for a reason this window can see, are skipped and named;
  * the entry still moves. See `transform_replay_target`.
+ *
+ * Sizes (column widths, row heights) are members too, each with the value it
+ * held before and after. They are recorded from what the host says its write
+ * changed, never from what this window believed: a window's own sizes can be
+ * stale (another window's write is not sent to it), and only the host knows
+ * which source rows a row gesture touched. Sizes are positional and have no
+ * schema: nothing re-associates a stored width when column names change.
  */
 
 import {
     MAX_PERSISTED_HIDDEN_ROWS,
+    type ColumnWidthChange,
+    type ColumnWidthsSheetRequest,
     type FilterEntry,
+    type RowHeightsChange,
+    type SourceRowHeightRun,
     type SheetTransformState,
     type SortKey,
     type WorksheetTarget,
@@ -58,7 +69,38 @@ export interface ColumnsViewDelta extends MemberTransition {
     readonly schema: string;
 }
 
-export type ViewHistoryDelta = TransformViewDelta | ColumnsViewDelta;
+/** What a gesture did to a worksheet's Auto-fit, when it was the toggle itself. */
+export type AutoFitChange = 'on' | 'off';
+
+/** Stored widths of source columns of one worksheet. */
+export interface ColumnWidthsViewDelta {
+    readonly worksheet: WorksheetTarget;
+    readonly slice: 'columnWidths';
+    /** The source columns the write changed, ascending. `null`: no stored width. */
+    readonly columns: readonly ColumnWidthChange[];
+    /** Set when the gesture turned Auto-fit on or off for the worksheet. */
+    readonly autoFit?: AutoFitChange;
+}
+
+/** Custom heights of source rows of one worksheet. */
+export interface RowHeightsViewDelta {
+    readonly worksheet: WorksheetTarget;
+    readonly slice: 'rowHeights';
+    /** What the gesture set on every row it changed. `null`: a reset. */
+    readonly after: number | null;
+    /**
+     * The rows the write changed and what each held before, as ascending,
+     * disjoint runs of consecutive source rows with one prior height.
+     * `null`: no custom height.
+     */
+    readonly before: readonly SourceRowHeightRun[];
+}
+
+export type ViewHistoryDelta =
+    | TransformViewDelta
+    | ColumnsViewDelta
+    | ColumnWidthsViewDelta
+    | RowHeightsViewDelta;
 
 /** A view gesture ready to record: its Edit-menu label and its one change. */
 export interface ViewStep {
@@ -74,7 +116,10 @@ export type ViewSkipReason =
     | 'rows-above-header'
     | 'header-row'
     | 'rows-gone'
-    | 'too-many-hidden';
+    | 'too-many-hidden'
+    | 'columns-gone'
+    | 'sheets-gone'
+    | 'too-many-heights';
 
 type TransformRules = Pick<SheetTransformState, 'sort' | 'filters' | 'hiddenRows'>;
 
@@ -248,6 +293,9 @@ const SKIP_ORDER: readonly ViewSkipReason[] = [
     'header-row',
     'rows-gone',
     'too-many-hidden',
+    'sheets-gone',
+    'columns-gone',
+    'too-many-heights',
 ];
 
 function ordered_skips(found: ReadonlySet<ViewSkipReason>): ViewSkipReason[] {
@@ -351,4 +399,162 @@ export function columns_replay_target(
     }
     const hidden = sorted_unique(next);
     return { hidden, skipped: [], changes: !lists_equal(hidden, live) };
+}
+
+// ---- Sizes: column widths and row heights ----
+
+/** How many rows the runs cover. */
+function run_row_count(runs: readonly SourceRowHeightRun[]): number {
+    let count = 0;
+    for (const run of runs) count += run.end - run.start + 1;
+    return count;
+}
+
+/**
+ * The step of one worksheet's width write, from what the host says it
+ * changed; undefined when it changed nothing.
+ *
+ * The label is the toggle's when the gesture was the Auto-fit toggle, and
+ * otherwise counts the columns: a drag, a fanned-out drag, a double-click fit.
+ */
+export function column_widths_view_step(
+    worksheet: WorksheetTarget,
+    columns: readonly ColumnWidthChange[],
+    auto_fit?: AutoFitChange,
+): ViewStep | undefined {
+    const changed = columns
+        .filter((entry) => entry.before !== entry.after)
+        .sort((left, right) => left.column - right.column);
+    if (changed.length === 0) return undefined;
+    return {
+        label: column_widths_label(changed.length, auto_fit),
+        delta: {
+            worksheet,
+            slice: 'columnWidths',
+            columns: changed.map(({ column, before, after }) => ({ column, before, after })),
+            ...(auto_fit === undefined ? {} : { autoFit: auto_fit }),
+        },
+    };
+}
+
+/** The Edit-menu label of a width gesture that changed `count` columns in all. */
+export function column_widths_label(count: number, auto_fit?: AutoFitChange): string {
+    if (auto_fit === 'on') return 'Auto-fit columns';
+    if (auto_fit === 'off') return 'Restore column widths';
+    return `Resize ${plural(count, 'column', 'columns')}`;
+}
+
+/**
+ * The step of a row resize or reset, from what the host says its write
+ * changed; undefined when it changed nothing.
+ */
+export function row_heights_view_step(
+    worksheet: WorksheetTarget,
+    change: RowHeightsChange,
+): ViewStep | undefined {
+    const rows = run_row_count(change.before);
+    if (rows === 0) return undefined;
+    const label = change.height === null
+        ? rows === 1 ? 'Reset row height' : `Reset ${rows} row heights`
+        : `Resize ${plural(rows, 'row', 'rows')}`;
+    return {
+        label,
+        delta: {
+            worksheet,
+            slice: 'rowHeights',
+            after: change.height,
+            before: change.before.map(({ start, end, height }) => ({ start, end, height })),
+        },
+    };
+}
+
+export interface ColumnWidthsReplayTarget {
+    /** The widths to ask for: the step's side for each of its columns still in the worksheet. */
+    readonly widths: ColumnWidthsSheetRequest['widths'];
+    readonly skipped: readonly ViewSkipReason[];
+}
+
+/**
+ * The widths a width step's replay asks for on its worksheet.
+ *
+ * Member by member, from the step alone: undo asks for each column's `before`,
+ * redo for its `after`; `null` removes the stored width. Columns the step never
+ * touched are not named and keep what they have. A column the worksheet no
+ * longer has is left out. Whether anything is left to change is the host's to
+ * say: this window's widths can be stale.
+ */
+export function column_widths_replay_target(
+    delta: ColumnWidthsViewDelta,
+    direction: ViewDirection,
+    column_count: number,
+): ColumnWidthsReplayTarget {
+    const widths: { column: number; width: number | null }[] = [];
+    let gone = false;
+    for (const entry of delta.columns) {
+        if (entry.column >= column_count) {
+            gone = true;
+            continue;
+        }
+        widths.push({
+            column: entry.column,
+            width: direction === 'undo' ? entry.before : entry.after,
+        });
+    }
+    return { widths, skipped: gone ? ['columns-gone'] : [] };
+}
+
+/**
+ * What a width step's replay leaves of Auto-fit on its worksheet: `'on'` (with
+ * the worksheet's widths just before the replay wrote as the widths to
+ * restore), or `'off'`.
+ *
+ * Walking history leaves the toolbar as the gesture left it. Only the two
+ * gestures that are the toggle are tracked; every other width write ends
+ * Auto-fit, as a drag does.
+ */
+export function auto_fit_after_width_replay(
+    delta: ColumnWidthsViewDelta,
+    direction: ViewDirection,
+): AutoFitChange {
+    if (delta.autoFit === undefined) return 'off';
+    const turned_on = delta.autoFit === 'on';
+    return (direction === 'redo') === turned_on ? 'on' : 'off';
+}
+
+export interface RowHeightsReplayTarget {
+    /** The runs to write, clipped to the worksheet. */
+    readonly rows: readonly SourceRowHeightRun[];
+    readonly skipped: readonly ViewSkipReason[];
+}
+
+/**
+ * The heights a row-height step's replay asks for.
+ *
+ * Undo sets each run back to the height it held (`null` removes the custom
+ * height); redo sets every row to the step's height. Rows the worksheet no
+ * longer has are left out. Rows above or at a promoted Header Row are written
+ * like any other: a height is keyed by source row, and a promotion renumbers
+ * none.
+ */
+export function row_heights_replay_target(
+    delta: RowHeightsViewDelta,
+    direction: ViewDirection,
+    source_row_count: number,
+): RowHeightsReplayTarget {
+    const rows: SourceRowHeightRun[] = [];
+    let gone = false;
+    for (const run of delta.before) {
+        if (run.start >= source_row_count) {
+            gone = true;
+            continue;
+        }
+        const end = Math.min(run.end, source_row_count - 1);
+        if (end !== run.end) gone = true;
+        rows.push({
+            start: run.start,
+            end,
+            height: direction === 'undo' ? run.height : delta.after,
+        });
+    }
+    return { rows, skipped: gone ? ['rows-gone'] : [] };
 }

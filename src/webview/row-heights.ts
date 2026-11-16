@@ -177,9 +177,18 @@ export function set_row_height(
  * bounded by the number of *in-flight* resizes rather than by the sheet.
  */
 export interface RowHeightLayer {
-    /** Inclusive display-row intervals, disjoint and ascending. */
+    /**
+     * Inclusive display-row intervals, disjoint and ascending. None, for the
+     * place of a request that paints nothing (`row_height_order_marker`).
+     */
     readonly rows: readonly Readonly<DisplayRowInterval>[];
     readonly height: number;
+    /**
+     * The request this layer was painted for, when that request is answered.
+     * Its answer retires the layer, whatever it says: see
+     * `row_height_layers_after_answer`.
+     */
+    readonly requestId?: string;
 }
 
 /**
@@ -321,6 +330,76 @@ export function resolved_row_height(
 }
 
 /**
+ * The layers left once the request `request_id` has been answered.
+ *
+ * The host delivers what is stored before it answers, so from the answer on
+ * the rows show the projection and the layer has nothing left to stand in
+ * for. Value-based reconciliation (`row_height_layers_for_delivery`) cannot
+ * retire two kinds of layer, and each would mask a height a later undo
+ * restores: one whose write was refused, and one whose write landed and was
+ * then overtaken by another window's write to the same row before the
+ * delivery was built.
+ *
+ * Applied, the answer retires every layer older than the request as well.
+ * The host writes in the order the requests were posted (the ordering
+ * argument at `row_height_layers_for_delivery`), so each older write was
+ * settled before this one, and the delivery ahead of this answer carries
+ * whatever it stored. An older layer still standing is then one no delivery
+ * agreed with: a write the host refused, painting a height nothing holds,
+ * over rows whose stored heights this request may just have changed. Refused,
+ * the host delivered nothing for this request, so only its own layer goes.
+ *
+ * Returns `layers` itself when none holds the request's place.
+ */
+export function row_height_layers_after_answer(
+    layers: readonly RowHeightLayer[],
+    request_id: string,
+    applied: boolean,
+): readonly RowHeightLayer[] {
+    const index = layers.findIndex((layer) => layer.requestId === request_id);
+    if (index === -1) return layers;
+    return applied
+        ? layers.slice(index + 1)
+        : [...layers.slice(0, index), ...layers.slice(index + 1)];
+}
+
+/**
+ * The place, among a worksheet's layers, of a request that paints nothing: a
+ * reset, or the replay of a row-height step.
+ *
+ * Which rows such a request changes, and to what, is the host's to say, so
+ * there is no height to paint ahead of it. It still has a place in the order
+ * the writes were posted, and its applied answer retires what is older
+ * (`row_height_layers_after_answer`). A layer with no rows holds that place:
+ * it paints no row, offers no reset, and no delivery agrees with it.
+ */
+export function row_height_order_marker(request_id: string): RowHeightLayer {
+    return { rows: [], height: DEFAULT_ROW_HEIGHT_PX, requestId: request_id };
+}
+
+/**
+ * Whether any display row of `interval` shows a custom height: one the
+ * projection names, or one an overlay layer paints. Walks the projection's
+ * entries, never the interval, which can be a select-all.
+ */
+export function display_rows_have_custom_height(
+    overrides: RowHeightOverrides,
+    layers: readonly RowHeightLayer[] | undefined,
+    interval: Readonly<DisplayRowInterval>,
+): boolean {
+    for (const layer of layers ?? []) {
+        for (const rows of layer.rows) {
+            if (rows.start <= interval.end && rows.end >= interval.start) return true;
+        }
+    }
+    for (const key in overrides) {
+        const row = Number(key);
+        if (row >= interval.start && row <= interval.end) return true;
+    }
+    return false;
+}
+
+/**
  * Whether `row` falls in one of a layer's intervals, by binary search.
  *
  * Linear here is not merely untidy, it misses a frame. The intervals are disjoint and
@@ -381,6 +460,9 @@ function projection_agrees_with_layer(
     overrides: RowHeightOverrides,
     layer: RowHeightLayer,
 ): boolean {
+    // A layer with no rows says nothing a projection could agree with: it
+    // holds a request's place (`row_height_order_marker`).
+    if (layer.rows.length === 0) return false;
     let matched = 0;
     for (const [key, height] of Object.entries(overrides)) {
         if (height !== layer.height) continue;
@@ -418,10 +500,19 @@ export function row_height_layers_with(
  * The layers still worth keeping once `overrides` has been delivered for the sheet
  * they belong to: those the delivery does not already agree with.
  *
- * This is the *value*-based reconciliation that replaces a request id. Nothing
- * correlates a `setRowHeights` with the delivery that answers it, and nothing needs
- * to: a projection that already names these rows at this height has answered,
- * whichever write produced it.
+ * This is reconciliation by *value*. A projection that already names these rows at this
+ * height has answered, whichever write produced it.
+ *
+ * It is not the only way a layer goes. A resize or reset a person makes carries a request
+ * id and is answered, and the answer retires its layer whatever it says, with every older
+ * layer when the write was applied (`row_height_layers_after_answer`). What reconciliation
+ * by value still does:
+ *
+ * - retire the layer of the one write that is not answered, the row a committed
+ *   multi-line edit grows;
+ * - retire an answered resize's layer as soon as the delivery ahead of its answer agrees,
+ *   which is the ordinary case and spares a frame of two sources for one height;
+ * - retire the layers older than one a delivery agrees with (below).
  *
  * Not a substitute for discarding the overlay on a generation change, which callers
  * must still do — a delivery on a *new* permutation says nothing about display rows
@@ -434,9 +525,9 @@ export function row_height_layers_with(
  * independently, and that is not an optimization — asking independently is a bug once
  * layers overlap:
  *
- * 1. A resize is refused on the accumulated-map bound. Nothing will ever agree with its
- *    layer (see the residue below), so it stays.
- * 2. The user resizes an *overlapping* row, and that one is persisted and delivered. An
+ * 1. An unanswered write is refused on the accumulated-map bound. Nothing will ever agree
+ *    with its layer (see the residue below), so it stays.
+ * 2. An *overlapping* row is then resized, and that one is persisted and delivered. An
  *    independent filter drops the newer, agreed layer and keeps the older refused one.
  * 3. `resolved_row_height` resolves newest-first, so the surviving older layer is now the
  *    newest one naming those rows: it paints its refused height *over* the height that was
@@ -444,15 +535,17 @@ export function row_height_layers_with(
  *    reconciliation would have caused exactly the failure it exists to prevent.
  *
  * What licenses dropping the older ones is that webview→host resize writes are strictly
- * ordered. `postMessage` preserves order and the host's `setRowHeights` handler reaches
- * `enqueue_layout_write` synchronously, before its first await, so requests join the single
- * serialized layout-write tail in the order they were posted; layers are appended in that
- * same order, in the same synchronous block that posts. So by the time a write for layer
- * *N* has been processed, every write older than *N* has been processed too, and each of
- * those older requests is therefore already dead: either it was persisted (so the delivery
- * that carries *N* carries it too, unless something later overwrote it — in which case the
- * newer durable value is precisely what should win) or it was refused (so its intent never
- * became durable, and it must not keep painting).
+ * ordered. `postMessage` preserves order and the host's `setRowHeights` and
+ * `setSourceRowHeights` handlers each reach `enqueue_layout_write` synchronously, before
+ * their first await, so requests join the single serialized layout-write tail in the order
+ * they were posted; layers are appended in that same order, in the same synchronous block
+ * that posts, and so is the place of a reset or a replay, which paints nothing
+ * (`row_height_order_marker`). So by the time a write for layer *N* has been processed,
+ * every write older than *N* has been processed too, and each of those older requests is
+ * therefore already dead: either it was persisted (so the delivery that carries *N*
+ * carries it too, unless something later overwrote it — in which case the newer durable
+ * value is precisely what should win) or it was refused (so its intent never became
+ * durable, and it must not keep painting).
  *
  * The one gap in that argument, stated rather than papered over: agreement is by value, so
  * a delivery can agree with layer *N* without *N*'s own write having run — a sibling panel
@@ -465,33 +558,33 @@ export function row_height_layers_with(
  *
  * ## The one residue this leaves, and why it is left
  *
- * Reconciling by value means a layer is kept until a delivery *agrees* with it, which is
- * right for the ordinary case (the answer has not arrived yet) and wrong for exactly one:
- * a write the host refused on the accumulated-map bound
- * (`MAX_PERSISTED_ROW_HEIGHTS`). No delivery will ever agree with that layer, because
- * nothing was persisted and the refusal path delivers nothing at all; so it sits over the
- * projection, showing a height no file holds, until the view generation next moves and the
- * whole overlay is discarded — or until a *newer* layer is answered, which retires it along
- * with everything else that old (see above). The user does learn what happened — the host
- * warns, naming the limit — but the row they dragged keeps its new size on screen meanwhile.
+ * Only the unanswered write has it. Reconciling by value keeps a layer until a delivery
+ * *agrees* with it, which is right while the write is on its way and wrong for exactly one
+ * outcome: the host refused it on the accumulated-map bound (`MAX_PERSISTED_ROW_HEIGHTS`).
+ * No delivery will ever agree with that layer, because nothing was persisted; so it sits
+ * over the projection, showing a height no file holds, until the view generation next
+ * moves and the whole overlay is discarded — or until a *newer* layer is agreed with, or a
+ * newer request is answered as applied (a resize, a reset, an undo or redo of a row-height
+ * step), either of which retires it along with everything else that old (see above). The
+ * user does learn what happened — the host warns, naming the limit — but the row the edit
+ * grew keeps its new size on screen meanwhile.
  *
- * Three fixes were considered and all three cost more than the residue:
+ * A person's own resize does not leave it: its answer says the write was refused and
+ * retires the layer. The row an edit grows is not answered because it is not a gesture:
+ * it holds the edit gate, not the cells' editors, and records no step. Two other ways out
+ * were considered for it and cost more than the residue:
  *
- * - *Tell the webview it was refused.* A refusal reply is a new protocol message on the
- *   hot path of every drag, and every reader of it would then have to reason about a
- *   reply arriving after the generation it named has gone. A whole round-trip shape for a
- *   stale rectangle.
- * - *Predict it here.* The webview never holds the durable map — that is the point of the
- *   design — and cannot recover its size from the projection, which omits every source
- *   row the installed view does not show. Any estimate would sometimes drop a layer whose
- *   write actually succeeded, turning a cosmetic residue into a visible flicker on the
- *   common path.
+ * - *Predict the refusal here.* The webview never holds the durable map — that is the
+ *   point of the design — and cannot recover its size from the projection, which omits
+ *   every source row the installed view does not show. Any estimate would sometimes drop
+ *   a layer whose write actually succeeded, turning a cosmetic residue into a visible
+ *   flicker on the common path.
  * - *Drop the layer on any delivery that disagrees.* This is the tempting one-liner and
  *   it is wrong: the common case for "delivered, disagrees" is a delivery provoked by
- *   something else (a sibling's write, an edit commit) racing ahead of the answer to this
- *   resize. Dropping then makes every in-flight resize flicker.
+ *   something else (a sibling's write, an edit commit) racing ahead of this write's own.
+ *   Dropping then makes every in-flight resize flicker.
  *
- * Deferring the write for a retry is not on the list: replaying a refused user request is
+ * Deferring the write for a retry is not on the list: replaying a refused request is
  * forbidden by design, and the request would be refused again anyway — the bound it hit
  * does not lift on its own.
  */

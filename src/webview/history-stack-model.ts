@@ -50,7 +50,11 @@ import {
     type HistoryValue,
     type SavedCellContent,
 } from './history-cell-state-model';
-import type { MemberTransition, ViewHistoryDelta } from './view-history-model';
+import type {
+    ColumnWidthsViewDelta,
+    MemberTransition,
+    ViewHistoryDelta,
+} from './view-history-model';
 
 /**
  * A cell highlight moving under one gesture.
@@ -145,21 +149,52 @@ export type HistoryChange =
     | { readonly kind: 'rowLayout'; readonly delta: RowLayoutHistoryDelta }
     | { readonly kind: 'columnLayout'; readonly delta: ColumnLayoutHistoryDelta }
     /**
-     * A sort, a filter, hidden rows, or hidden columns: view state, not
-     * content. A view step is an action holding exactly one such change. It
-     * needs no editing session, and replay re-issues the view request the
-     * gesture used instead of the cell replay protocol (see
-     * `view-history-model.ts`).
+     * A sort, a filter, hidden rows, hidden columns, column widths, or row
+     * heights: view state, not content. A view step is an action holding
+     * exactly one such change, except a column-width step made on several
+     * worksheets at once, which holds one per worksheet
+     * (`width_step_changes`). It needs no editing session, and replay
+     * re-issues the view request the gesture used instead of the cell replay
+     * protocol (see `view-history-model.ts`).
      */
     | { readonly kind: 'view'; readonly delta: ViewHistoryDelta };
 
 /** The view arm. */
 export type ViewHistoryChange = Extract<HistoryChange, { kind: 'view' }>;
 
-/** The change of a view step, or undefined for any other action. */
+/**
+ * The change of a view step that holds one change, or undefined for any
+ * other action, a column-width step on several worksheets included: that one
+ * is read with `width_step_changes`.
+ */
 export function view_step_change(action: HistoryAction): ViewHistoryChange | undefined {
     const change = action.changes.length === 1 ? action.changes[0] : undefined;
     return change?.kind === 'view' ? change : undefined;
+}
+
+/**
+ * The changes of a column-width step, one per worksheet, or undefined for
+ * any other action.
+ *
+ * Every other view step is exactly one change. One width gesture writes
+ * several worksheets at once (restore widths on all sheets), and it is one
+ * action holding one `columnWidths` change per worksheet, which is how an
+ * action spans worksheets anywhere else in history.
+ */
+export function width_step_changes(
+    action: HistoryAction,
+): readonly (ViewHistoryChange & { readonly delta: ColumnWidthsViewDelta })[] | undefined {
+    if (action.changes.length === 0) return undefined;
+    const changes: (ViewHistoryChange & { readonly delta: ColumnWidthsViewDelta })[] = [];
+    const worksheets = new Set<string>();
+    for (const change of action.changes) {
+        if (change.kind !== 'view' || change.delta.slice !== 'columnWidths') return undefined;
+        const key = worksheet_target_key(change.delta.worksheet);
+        if (worksheets.has(key)) return undefined;
+        worksheets.add(key);
+        changes.push(change as ViewHistoryChange & { readonly delta: ColumnWidthsViewDelta });
+    }
+    return changes;
 }
 
 /** Whether an action holds a view change, alone (a view step) or not. */
@@ -3163,6 +3198,42 @@ function own_view_history_delta(
         shown: numbers(transition.shown),
     });
     const worksheet = owner.own_worksheet_target(delta.worksheet);
+    // A size step's numbers, each charged as it is copied, at the same rate
+    // as the lists above. A size holds `null` for "no stored width" and "no
+    // custom height", which `Number(…)` would turn into 0.
+    let size_numbers_copied = 0;
+    const size = (value: number | null): number | null => {
+        if (size_numbers_copied % VIEW_NUMBERS_PER_RUN === 0) owner.charge_run();
+        size_numbers_copied += 1;
+        return value === null ? null : Number(value);
+    };
+    const index = (value: number): number => size(value) ?? 0;
+    if (delta.slice === 'columnWidths') {
+        return Object.freeze({
+            worksheet,
+            slice: 'columnWidths',
+            columns: Object.freeze(delta.columns.map((entry) => Object.freeze({
+                column: index(entry.column),
+                before: size(entry.before),
+                after: size(entry.after),
+            }))),
+            ...(delta.autoFit === undefined
+                ? {}
+                : { autoFit: delta.autoFit === 'on' ? 'on' as const : 'off' as const }),
+        });
+    }
+    if (delta.slice === 'rowHeights') {
+        return Object.freeze({
+            worksheet,
+            slice: 'rowHeights',
+            after: size(delta.after),
+            before: Object.freeze(delta.before.map((run) => Object.freeze({
+                start: index(run.start),
+                end: index(run.end),
+                height: size(run.height),
+            }))),
+        });
+    }
     const schema = owner.own_string(String(delta.schema));
     if (delta.slice === 'columns') {
         return Object.freeze({ worksheet, slice: 'columns', schema, ...members(delta) });

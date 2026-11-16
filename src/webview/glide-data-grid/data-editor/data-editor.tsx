@@ -2309,6 +2309,10 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
                         getCellRenderer
                     );
                     onColumnResize?.(inputCol, newCol.width, col, newCol.width);
+                    // Fork change: a fit is a whole resize gesture, so it ends like
+                    // one. Without the end call the consumer cannot tell a finished
+                    // fit from a drag still in progress.
+                    onColumnResizeEnd?.(inputCol, newCol.width, col, newCol.width);
                 }
             }
         },
@@ -2319,6 +2323,7 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
             mergedTheme,
             minColumnWidth,
             onColumnResize,
+            onColumnResizeEnd,
             rowMarkerOffset,
             rows,
             getCellRenderer,
