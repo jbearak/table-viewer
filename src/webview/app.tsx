@@ -5499,14 +5499,21 @@ export function App(): React.JSX.Element {
                         // delivered one either way: what the sheets show has
                         // to be the same choice, or the Formatting button
                         // would say one thing and the next layout change store
-                        // another. The same array when nothing changed.
+                        // another. The same array when nothing changed, asked
+                        // of every sheet by index: a toggle on a later sheet
+                        // leaves holes before it, which `every` would skip.
                         const next_show_formatting = authoritative_state.showFormatting ?? [];
-                        set_show_formatting_by_sheet((shown) => (
-                            shown.length === next_show_formatting.length
-                            && shown.every((value, index) => value === next_show_formatting[index])
-                                ? shown
-                                : next_show_formatting
-                        ));
+                        set_show_formatting_by_sheet((shown) => {
+                            if (shown.length !== next_show_formatting.length) {
+                                return next_show_formatting;
+                            }
+                            for (let index = 0; index < shown.length; index += 1) {
+                                if (shown[index] !== next_show_formatting[index]) {
+                                    return next_show_formatting;
+                                }
+                            }
+                            return shown;
+                        });
                         set_transforms(next_transforms);
                         set_column_visibility(next_column_visibility);
                         set_active_sheet_index(next_active_sheet_index);

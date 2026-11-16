@@ -2166,6 +2166,29 @@ describe('formatting toggle', () => {
         expect(stored?.state.showFormatting).toEqual([true, true]);
     });
 
+    it('shows another window\'s choice for a sheet this window never set, after setting a later one', async () => {
+        // Turning formatting off on the second sheet alone leaves the first
+        // with no choice of its own here. Another window then turns the
+        // first sheet's off as well.
+        await render_app();
+        const meta = make_meta(['First', 'Second']);
+        await dispatch_host_message(initial_snapshot_message(meta));
+        await click_sheet_tab('Second');
+        await click_button('Formatting');
+        expect(grid_stub().getAttribute('data-show-formatting')).toBe('false');
+
+        await dispatch_host_message(refresh_snapshot_message(meta, {
+            generation: 1,
+            sourceGeneration: 1,
+            reason: 'other',
+            state: { showFormatting: [false, false] },
+        }));
+
+        expect(grid_stub().getAttribute('data-show-formatting')).toBe('false');
+        await click_sheet_tab('First');
+        expect(grid_stub().getAttribute('data-show-formatting')).toBe('false');
+    });
+
     it('restores saved formatting from initial snapshot state', async () => {
         // Reloading the same file after an external edit keeps the choice, rather
         // than snapping every sheet back to formatted.
