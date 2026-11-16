@@ -375,31 +375,33 @@ describe('a replay whose view moves while its commit runs', () => {
             broken = true;
             return { ...result, snapshot: { ...result.snapshot, state: null as never } };
         };
+        // The state read back to repair the session is held until the
+        // answer has gone out: the read `refresh_session_state_material`
+        // makes, picked out by its caller.
+        let release_read!: () => void;
+        const read_held = new Promise<void>((resolve) => { release_read = resolve; });
+        const read = store.read.bind(store);
+        let held = false;
+        store.read = async (...args) => {
+            if (!held && new Error().stack?.includes('refresh_session_state_material')) {
+                held = true;
+                await read_held;
+            }
+            return read(...args);
+        };
         const { panel } = open_csv_table(store);
         await ready(panel);
         const prepared = await prepare_highlight(panel);
         broken = false;
         vi.spyOn(console, 'warn').mockImplementation(() => {});
 
-        // The state read back to repair the session (the first read after
-        // the broken write) is held until the answer has gone out.
-        let release_read!: () => void;
-        const read_held = new Promise<void>((resolve) => { release_read = resolve; });
-        const read = store.read.bind(store);
-        let held = false;
-        store.read = async (...args) => {
-            if (broken && !held) {
-                held = true;
-                await read_held;
-            }
-            return read(...args);
-        };
 
         const answer = await commit(panel, prepared);
 
         expect(broken).toBe(true);
         expect(answer.type).toBe('historyReplayCommitted');
         expect(durable_highlight(base)).toBe('yellow');
+        await vi.waitFor(() => expect(held).toBe(true));
 
         // Once the read lands, a delivery carries the write.
         const delivered_before = messages_of(panel, 'workbookSnapshot').length;
