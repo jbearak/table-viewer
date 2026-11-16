@@ -31,6 +31,7 @@ const CONTENT = 'h\nc\na\nb\n';
 const SHEET = { sheetIndex: 0, sheetName: 'Sheet1' };
 
 type Panel = ReturnType<typeof vscode_mock.window.createWebviewPanel>;
+type AuthorityStore = ReturnType<typeof with_in_memory_authority_transactions>;
 
 function deferred() {
     let resolve!: () => void;
@@ -46,7 +47,7 @@ async function settle(panel: Panel): Promise<void> {
     }
 }
 
-function open_csv(store: FileStateStore): Panel {
+function open_csv(store: AuthorityStore): Panel {
     const panel = vscode_mock.window.createWebviewPanel('tableViewer.editor', 'table');
     const controller = attach_viewer(
         panel as unknown as Parameters<typeof attach_viewer>[0],

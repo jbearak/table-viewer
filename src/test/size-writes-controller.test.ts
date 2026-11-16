@@ -36,6 +36,7 @@ const file_path = '/tmp/size-writes-controller.csv';
 const CSV = 'h,i\nc,1\na,2\nb,3\n';
 
 type Panel = ReturnType<typeof vscode_mock.window.createWebviewPanel>;
+type AuthorityStore = ReturnType<typeof with_in_memory_authority_transactions>;
 
 function deferred() {
     let resolve!: () => void;
@@ -44,7 +45,7 @@ function deferred() {
 }
 
 /** Open the CSV over `store`. `store` is used as given, so a test can gate it outside the per-file queue. */
-function open_csv(store: FileStateStore): Panel {
+function open_csv(store: AuthorityStore): Panel {
     const panel = vscode_mock.window.createWebviewPanel('tableViewer.editor', 'table');
     const controller = attach_viewer(
         panel as unknown as Parameters<typeof attach_viewer>[0],
@@ -87,7 +88,7 @@ class TwoSheetSource implements DataSource {
     close(): void {}
 }
 
-function open_two_sheets(store: FileStateStore): Panel {
+function open_two_sheets(store: AuthorityStore): Panel {
     const panel = vscode_mock.window.createWebviewPanel('tableViewer.editor', 'table');
     const controller = attach_viewer(
         panel as unknown as Parameters<typeof attach_viewer>[0],

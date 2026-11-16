@@ -119,7 +119,7 @@ describe('row context menu model', () => {
         const reset = row_context_menu_items({ ...base, on_reset_row_heights })
             .find((item) => item.kind !== 'separator' && item.label === 'Reset 3 row heights');
         if (!reset || reset.kind === 'separator' || reset.kind === 'submenu') throw new Error('no reset item');
-        reset.on_click();
+        reset.on_click({} as never);
         expect(on_reset_row_heights).toHaveBeenCalledTimes(1);
         expect(base.on_hide_rows).not.toHaveBeenCalled();
     });
