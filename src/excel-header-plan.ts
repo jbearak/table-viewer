@@ -6,6 +6,7 @@ import {
 } from './data-source/excel-header-source';
 import type { ExcelHeaderOverride, SheetMeta, WorkbookMeta } from './data-source/interface';
 import type {
+    ExcelHeaderChange,
     PerFileState,
     SheetColumnVisibilityState,
     SheetTransformState,
@@ -14,6 +15,7 @@ import type {
 } from './types';
 import {
     MAX_PERSISTED_HIDDEN_ROWS,
+    excel_header_side,
     pending_changes_for_sheet,
     sanitize_excel_header_active,
     sanitize_excel_header_overrides,
@@ -22,6 +24,14 @@ import {
 } from './types';
 import { normalize_complete_per_file_state } from './viewer-snapshot';
 import { rebase_pending_edits_for_header } from './header-rebase';
+import {
+    first_non_hidden_source_row,
+    hidden_row_difference,
+    hidden_rows_after_header_change,
+    hidden_rows_before_header,
+    in_range_rows,
+    type HiddenRowChange,
+} from './header-hidden-rows';
 import { header_body_start } from './worksheet-layout';
 
 export interface ExcelCandidateStatePlan {
@@ -42,6 +52,13 @@ export interface ExcelOverrideStatePlan {
      * not to be written.
      */
     refusal?: string;
+    /**
+     * What writing `state` changes for the worksheet: its Header Row before
+     * and after, and the source rows hidden and shown. Taken from the durable
+     * state this plan read, so it is the write's own difference whatever the
+     * asking window believed.
+     */
+    change: ExcelHeaderChange;
 }
 
 /** Pure legacy/current state normalization shared by every planning retry. */
@@ -327,11 +344,23 @@ export function plan_excel_override_state(
     input: ExcelHeaderPlanningInput,
     sheet_index: number,
     sheet_name: string,
-    override: ExcelHeaderOverride,
+    /** `'auto'` removes the worksheet's override: the detector decides again. */
+    override: ExcelHeaderOverride | 'auto',
     options?: {
         clearHiddenRows?: boolean;
-        headerSourceRow?: number;
+        /**
+         * The source row to use as the Header Row. `null`, with
+         * `hiddenRowChange` only: "on, with no row to use", every row hidden.
+         */
+        headerSourceRow?: number | null;
         targetInput?: ExcelHeaderPlanningInput;
+        /**
+         * A header target's rows to hide and show (a header step's replay).
+         * With it the worksheet's hidden rows are computed from the durable
+         * ones by `hidden_rows_after_header_change` and always written, the
+         * leaf removed when the set is empty. A gesture never sets it.
+         */
+        hiddenRowChange?: HiddenRowChange;
         /**
          * The append schema fingerprint of a projected sheet, for the rebased
          * `appendBasis`. Host-only: it hashes with node's crypto.
@@ -339,10 +368,17 @@ export function plan_excel_override_state(
         appendSchemaFingerprint?: (sheet: SheetMeta) => string;
     },
 ): ExcelOverrideStatePlan | undefined {
+    const hidden_row_change = options?.hiddenRowChange;
     if (
         (options?.clearHiddenRows && override !== 'off')
         || (options?.headerSourceRow !== undefined && override !== 'on')
         || (options?.clearHiddenRows && options.headerSourceRow !== undefined)
+        || (options?.clearHiddenRows && hidden_row_change !== undefined)
+        // Without a named row the header would be wherever the set leaves it.
+        || (override === 'on' && hidden_row_change !== undefined
+            && options?.headerSourceRow === undefined)
+        // "On, with no row" is a target's state: only one says which rows hide.
+        || (options?.headerSourceRow === null && hidden_row_change === undefined)
     ) return undefined;
     const planning_sheet = input.sheets[sheet_index];
     if (!planning_sheet || planning_sheet.name !== sheet_name) return undefined;
@@ -353,6 +389,7 @@ export function plan_excel_override_state(
         excelFirstRowHeaders,
         sheet_name,
     ) ? excelFirstRowHeaders[sheet_name] : undefined;
+    const next_override = override === 'auto' ? undefined : override;
     if (
         (current_override === 'on' || override === 'on')
         && Object.prototype.hasOwnProperty.call(
@@ -369,42 +406,88 @@ export function plan_excel_override_state(
     const old_sheet = project_excel_header_sheet(planning_sheet, current_override);
     let next_planning_sheet = planning_sheet;
     let transforms = current.transforms;
-    if (options?.headerSourceRow !== undefined) {
-        const target_sheet = options.targetInput?.sheets[sheet_index];
+    /** Write the worksheet's hidden rows, removing the leaf when there are none. */
+    const write_hidden_rows = (hidden_rows: readonly number[]) => {
+        const existing = transforms?.[sheet_index];
+        if (hidden_rows.length === 0) {
+            if (existing?.hiddenRows === undefined) return;
+            transforms = [...(transforms ?? [])];
+            const { hiddenRows: _hidden_rows, ...retained } = existing;
+            transforms[sheet_index] = transform_has_entries(retained) ? retained : undefined;
+            return;
+        }
+        transforms = [...(transforms ?? [])];
+        const retained = existing ?? {
+            sort: [],
+            filters: [],
+            schema: transform_schema_for_sheet(old_sheet),
+        };
+        transforms[sheet_index] = { ...retained, hiddenRows: [...hidden_rows] };
+    };
+    const header_source_row = options?.headerSourceRow;
+    // A target: the set is computed from the durable hidden rows as they are
+    // now, so another window's hides survive and a conflict retry re-applies
+    // it to the fresher state. Always written: a replay can show rows under
+    // an explicit header, and leaving the old rows in place would put the
+    // header at the wrong row.
+    let computed_hidden_rows: number[] | undefined;
+    if (hidden_row_change !== undefined) {
+        computed_hidden_rows = hidden_rows_after_header_change(
+            current.transforms?.[sheet_index]?.hiddenRows,
+            {
+                ...hidden_row_change,
+                sourceRowCount: planning_sheet.sourceRowCount,
+                ...(header_source_row === undefined ? {} : { headerSourceRow: header_source_row }),
+                limit: MAX_PERSISTED_HIDDEN_ROWS,
+            },
+        );
+        if (computed_hidden_rows === undefined) return undefined;
+    }
+    if (typeof header_source_row === 'number') {
+        const target_sheet = options?.targetInput?.sheets[sheet_index];
         if (
             !target_sheet
             || target_sheet.name !== planning_sheet.name
             || target_sheet.rowCount !== planning_sheet.rowCount
             || target_sheet.sourceRowCount !== planning_sheet.sourceRowCount
             || target_sheet.columnCount !== planning_sheet.columnCount
-            || target_sheet.manualHeaderSourceRow !== options.headerSourceRow
+            || target_sheet.manualHeaderSourceRow !== header_source_row
             || target_sheet.manualHeaderRow === undefined
         ) return undefined;
-        const hidden_rows = hidden_rows_before_header(
+        // A gesture's promotion refuses a header row that is itself hidden,
+        // which a display row never is. A target took the row out above.
+        const hidden_rows = computed_hidden_rows ?? hidden_rows_before_header(
             current.transforms?.[sheet_index]?.hiddenRows,
-            options.headerSourceRow,
+            header_source_row,
             planning_sheet.sourceRowCount,
+            MAX_PERSISTED_HIDDEN_ROWS,
         );
         if (
             !hidden_rows
             || first_non_hidden_source_row(
                 planning_sheet.sourceRowCount,
                 hidden_rows,
-            ) !== options.headerSourceRow
+            ) !== header_source_row
         ) return undefined;
-        if (hidden_rows.length > 0) {
-            transforms = [...(transforms ?? [])];
-            const retained = transforms[sheet_index] ?? {
-                sort: [],
-                filters: [],
-                schema: transform_schema_for_sheet(old_sheet),
-            };
-            transforms[sheet_index] = { ...retained, hiddenRows: hidden_rows };
-        }
+        if (computed_hidden_rows !== undefined) write_hidden_rows(hidden_rows);
+        // A gesture can only hide more, so an empty set leaves the leaf as it is.
+        else if (hidden_rows.length > 0) write_hidden_rows(hidden_rows);
         next_planning_sheet = target_sheet;
+    } else if (computed_hidden_rows !== undefined) {
+        write_hidden_rows(computed_hidden_rows);
+        if (header_source_row === null) {
+            // "On, with no row to use": every row is hidden, so the sheet has
+            // no manual candidate, whatever the asking panel's source held.
+            next_planning_sheet = {
+                ...planning_sheet,
+                manualHeaderRow: undefined,
+                manualHeaderSourceRow: undefined,
+            };
+        }
     }
-    const new_sheet = project_excel_header_sheet(next_planning_sheet, override);
-    excelFirstRowHeaders[sheet_name] = override;
+    const new_sheet = project_excel_header_sheet(next_planning_sheet, next_override);
+    if (next_override === undefined) delete excelFirstRowHeaders[sheet_name];
+    else excelFirstRowHeaders[sheet_name] = next_override;
     const excelFirstRowHeaderActive = sanitize_excel_header_active(
         current.excelFirstRowHeaderActive,
     );
@@ -430,11 +513,17 @@ export function plan_excel_override_state(
         : undefined;
     const scrollPosition = [...(current.scrollPosition ?? [])];
     scrollPosition[sheet_index] = undefined;
-    if (options?.clearHiddenRows && transforms?.[sheet_index]?.hiddenRows) {
-        transforms = [...transforms];
-        const { hiddenRows: _hidden_rows, ...retained } = transforms[sheet_index]!;
-        transforms[sheet_index] = transform_has_entries(retained) ? retained : undefined;
-    }
+    if (options?.clearHiddenRows) write_hidden_rows([]);
+    // Reduced to rows the worksheet has on both sides, so a stale row the
+    // durable state still holds past its end is never reported as shown.
+    const change: ExcelHeaderChange = {
+        before: excel_header_side(old_sheet.excelFirstRowHeader!),
+        after: excel_header_side(new_sheet.excelFirstRowHeader!),
+        ...hidden_row_difference(
+            in_range_rows(current.transforms?.[sheet_index]?.hiddenRows, planning_sheet.sourceRowCount),
+            in_range_rows(transforms?.[sheet_index]?.hiddenRows, planning_sheet.sourceRowCount),
+        ),
+    };
 
     // The worksheet's Pending Changes move with its body start, in this same
     // write: the header and the slot that matches it are stored together.
@@ -462,6 +551,7 @@ export function plan_excel_override_state(
                 newSheet: new_sheet,
                 state: current,
                 refusal: rebased.message,
+                change,
             };
         }
         if (rebased.slot !== slot) {
@@ -473,6 +563,7 @@ export function plan_excel_override_state(
     return {
         oldSheet: old_sheet,
         newSheet: new_sheet,
+        change,
         state: {
             ...current,
             ...(pendingEdits === current.pendingEdits ? {} : { pendingEdits }),
@@ -608,51 +699,6 @@ function migrate_display_keyed_row_heights(
         migrated[display_row + 1] = height;
     }
     return migrated;
-}
-
-function hidden_rows_before_header(
-    current: readonly number[] | undefined,
-    header_source_row: number,
-    source_row_count: number,
-): number[] | undefined {
-    if (
-        !Number.isInteger(header_source_row)
-        || header_source_row < 0
-        || header_source_row >= source_row_count
-    ) return undefined;
-    const suffix: number[] = [];
-    let previous = -1;
-    for (const row of current ?? []) {
-        if (!Number.isInteger(row) || row < 0 || row >= source_row_count) continue;
-        if (row === header_source_row) return undefined;
-        if (row > header_source_row && row !== previous) suffix.push(row);
-        previous = row;
-    }
-    if (header_source_row + suffix.length > MAX_PERSISTED_HIDDEN_ROWS) {
-        return undefined;
-    }
-    const hidden_rows = Array.from(
-        { length: header_source_row },
-        (_, row) => row,
-    );
-    for (const row of suffix) hidden_rows.push(row);
-    return hidden_rows;
-}
-
-function first_non_hidden_source_row(
-    source_row_count: number,
-    hidden_rows: readonly number[] | undefined,
-): number | undefined {
-    // Header authority is only constructed over the physical XLS/XLSX sources,
-    // whose canonical source IDs are their zero-based physical row positions.
-    if (!Array.isArray(hidden_rows)) return source_row_count > 0 ? 0 : undefined;
-    let candidate = 0;
-    for (const row of hidden_rows) {
-        if (!Number.isInteger(row) || row < candidate) continue;
-        if (row !== candidate) break;
-        candidate += 1;
-    }
-    return candidate < source_row_count ? candidate : undefined;
 }
 
 function compatible_sheet(left: SheetMeta, right: SheetMeta): boolean {

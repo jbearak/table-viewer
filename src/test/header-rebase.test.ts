@@ -2,11 +2,13 @@ import { describe, expect, it } from 'vitest';
 import {
     HEADER_REBASE_CONFLICT_MESSAGE,
     HEADER_REBASE_HIDDEN_CELL_MESSAGE,
+    HEADER_REBASE_HIDDEN_CELL_NO_HEADER_MESSAGE,
     HEADER_REBASE_NEW_HEADER_CELL_MESSAGE,
     HEADER_REBASE_OLD_HEADER_CELL_MESSAGE,
     HEADER_REBASE_PENDING_COLUMN_MESSAGE,
     HEADER_REBASE_PREFIX_MESSAGE,
     HEADER_REBASE_TRANSFORMED_MESSAGE,
+    HEADER_REBASE_TRANSFORMED_NO_HEADER_MESSAGE,
     header_rebase_slot_refusal,
     rebase_pending_column_for_header,
     rebase_pending_edits_for_header,
@@ -253,6 +255,48 @@ describe('rebase_pending_edits_for_header', () => {
         expect(rebase_pending_edits_for_header(slot({ rowLayout: deleted(1, 8) }), {
             from: 1, to: 4, sourceRowCount: ROWS, hiddenAfter: [0, 1, 2],
         }).ok).toBe(true);
+    });
+
+    // Restoring "on, with no row to use" from "off" hides rows while the body
+    // starts at 0 on both sides.
+    it('asks the two hidden-row refusals when the body start is unchanged and rows are newly hidden', () => {
+        const hides = { from: 0, to: 0, sourceRowCount: ROWS, hiddenBefore: [9], hiddenAfter: [0, 1, 9] };
+        expect(rebase_pending_edits_for_header(slot({ cells: { '1:0': 'x' } }), hides))
+            .toEqual({ ok: false, message: HEADER_REBASE_HIDDEN_CELL_NO_HEADER_MESSAGE });
+        const inserted = layout_ok(insert_rows(
+            source_row_layout(0, ROWS),
+            { kind: 'source', sourceRow: 8 },
+            'after',
+            ['p'],
+        ));
+        expect(rebase_pending_edits_for_header(slot({ rowLayout: inserted }), hides))
+            .toEqual({ ok: false, message: HEADER_REBASE_TRANSFORMED_NO_HEADER_MESSAGE });
+        // A cell on a row that was hidden already, and a deleted row: carried.
+        const carried = slot({ cells: { '9:0': 'x', '5:0': 'y' }, rowLayout: deleted(0, 8) });
+        const result = rebase_pending_edits_for_header(carried, hides);
+        expect(result.ok && result.slot).toBe(carried);
+    });
+
+    it('returns the slot as it is when the body start is unchanged and no row is newly hidden, whatever it holds', () => {
+        const inserted = layout_ok(insert_rows(
+            source_row_layout(0, ROWS),
+            { kind: 'source', sourceRow: 8 },
+            'after',
+            ['p'],
+        ));
+        const given = slot({
+            cells: { '0:0': 'x', '1:0': 'y' },
+            rowLayout: inserted,
+            conflicts: [{ reason: 'structuralBasisChanged' }] as HeaderRebaseSlot['conflicts'],
+        });
+        for (const context of [
+            { from: 0, to: 0, sourceRowCount: ROWS, hiddenBefore: [0, 1], hiddenAfter: [0, 1] },
+            { from: 0, to: 0, sourceRowCount: ROWS, hiddenBefore: [0, 1], hiddenAfter: [] },
+            { from: 3, to: 3, sourceRowCount: ROWS, hiddenBefore: [0, 1, 5], hiddenAfter: [0, 1] },
+        ]) {
+            const result = rebase_pending_edits_for_header(given, context);
+            expect(result.ok && result.slot).toBe(given);
+        }
     });
 
     it('refuses a recorded layout conflict, a basis authored at another body start, and a live Pending Column', () => {

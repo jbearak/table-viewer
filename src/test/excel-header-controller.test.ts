@@ -302,6 +302,13 @@ describe('Excel workbook snapshot controller', () => {
             type: 'excelFirstRowHeader',
             requestId: 'fast',
             outcome: 'applied',
+            // What the write changed, for the asking window's undo history.
+            change: {
+                before: { mode: 'auto', row: 0 },
+                after: { mode: 'off' },
+                hidden: [],
+                shown: [],
+            },
         });
     });
 

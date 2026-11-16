@@ -13,6 +13,7 @@ import {
     plan_excel_override_state,
 } from '../excel-header-plan';
 import { transform_schema_for_sheet, type PerFileState } from '../types';
+import { hidden_rows_after_header_change } from '../header-hidden-rows';
 
 const text = (raw: string): RenderedCell => ({
     raw, formatted: raw, bold: false, italic: false, rawType: 'string',
@@ -752,6 +753,276 @@ describe('pure Excel header state planning', () => {
             sort: [{ colIndex: 1, direction: 'asc' }],
             filters: [],
             schema: transform_schema_for_sheet(plan.newSheet),
+        });
+    });
+
+    describe('a header target (a header step\'s replay)', () => {
+        const rows = [
+            [text('Report'), text('')],
+            [text('Notes'), text('')],
+            [text('Name'), text('Age')],
+            [text('Alice'), number(30)],
+            [text('Archived'), number(99)],
+        ];
+        const hidden = (rows_hidden: number[], sheet = source('off', rows).meta().sheets[0]) => ([{
+            sort: [],
+            filters: [],
+            hiddenRows: rows_hidden,
+            schema: transform_schema_for_sheet(sheet),
+        }]);
+
+        it("'auto' removes the override and projects what the detector found", () => {
+            const ds = source('off');
+            const plan = plan_excel_override_state(
+                { excelFirstRowHeaders: { People: 'off', Other: 'on' } },
+                ds.planning_input(), 0, 'People', 'auto',
+                { hiddenRowChange: { hide: [], show: [] } },
+            )!;
+            expect(plan.state.excelFirstRowHeaders).toEqual({ Other: 'on' });
+            expect(plan.newSheet.excelFirstRowHeader).toMatchObject({ mode: 'auto', active: true });
+            expect(plan.state.excelFirstRowHeaderActive).toMatchObject({ People: true });
+            expect(plan.change).toEqual({
+                before: { mode: 'off' }, after: { mode: 'auto', row: 0 }, hidden: [], shown: [],
+            });
+        });
+
+        it("undoing a promotion: 'off' and the rows it hid shown, the others kept", () => {
+            const ds = source('on', rows, [[0, 1, 4]]);
+            const plan = plan_excel_override_state(
+                { excelFirstRowHeaders: { People: 'on' }, transforms: hidden([0, 1, 4], ds.meta().sheets[0]) },
+                ds.planning_input(), 0, 'People', 'off',
+                { hiddenRowChange: { hide: [], show: [0, 1] } },
+            )!;
+            expect(plan.newSheet.excelFirstRowHeader).toMatchObject({ mode: 'off', active: false });
+            expect(plan.state.transforms?.[0]?.hiddenRows).toEqual([4]);
+            expect(plan.change).toEqual({
+                before: { mode: 'on', row: 2 }, after: { mode: 'off' }, hidden: [], shown: [0, 1],
+            });
+        });
+
+        it("redoing a promotion: 'on' at the row, the rows above hidden, the row itself not, rows below kept", () => {
+            const ds = source('off', rows, [[4]]);
+            const current = { excelFirstRowHeaders: { People: 'off' as const }, transforms: hidden([4]) };
+            const plan = plan_excel_override_state(current, ds.planning_input(), 0, 'People', 'on', {
+                headerSourceRow: 2,
+                targetInput: ds.planning_input_for_header_source('People', 2),
+                hiddenRowChange: { hide: [0, 1], show: [] },
+            })!;
+            expect(plan.newSheet).toMatchObject({
+                columnNames: ['Name', 'Age'],
+                excelFirstRowHeader: { mode: 'on', active: true, sourceRow: 2 },
+            });
+            expect(plan.state.transforms?.[0]?.hiddenRows).toEqual([0, 1, 4]);
+            // What the window predicts is what the planner writes.
+            expect(plan.state.transforms?.[0]?.hiddenRows).toEqual(hidden_rows_after_header_change([4], {
+                hide: [0, 1], show: [], sourceRowCount: 5, headerSourceRow: 2, limit: 1_000_000,
+            }));
+            expect(plan.change).toEqual({
+                before: { mode: 'off' }, after: { mode: 'on', row: 2 }, hidden: [0, 1], shown: [],
+            });
+        });
+
+        it("shows rows under 'on' at row 0: the leaf is removed and the header is row 0", () => {
+            // Undo "Use row 3 as header" made from a header turned on by hand at row 1.
+            const ds = source('on', rows, [[0, 1]]);
+            const plan = plan_excel_override_state(
+                { excelFirstRowHeaders: { People: 'on' }, transforms: hidden([0, 1], ds.meta().sheets[0]) },
+                ds.planning_input(), 0, 'People', 'on',
+                {
+                    headerSourceRow: 0,
+                    targetInput: ds.planning_input_for_header_source('People', 0),
+                    hiddenRowChange: { hide: [], show: [0, 1] },
+                },
+            )!;
+            expect(plan.newSheet.excelFirstRowHeader).toMatchObject({ mode: 'on', active: true, sourceRow: 0 });
+            expect(plan.state.transforms?.[0]).toBeUndefined();
+            expect(plan.change).toEqual({
+                before: { mode: 'on', row: 2 }, after: { mode: 'on', row: 0 }, hidden: [], shown: [0, 1],
+            });
+        });
+
+        it('names a row that is hidden now as the header', () => {
+            const ds = source('off', rows, [[2]]);
+            const plan = plan_excel_override_state(
+                { excelFirstRowHeaders: { People: 'off' }, transforms: hidden([2]) },
+                ds.planning_input(), 0, 'People', 'on',
+                {
+                    headerSourceRow: 2,
+                    targetInput: ds.planning_input_for_header_source('People', 2),
+                    hiddenRowChange: { hide: [], show: [] },
+                },
+            )!;
+            expect(plan.newSheet.excelFirstRowHeader).toMatchObject({ active: true, sourceRow: 2 });
+            expect(plan.state.transforms?.[0]?.hiddenRows).toEqual([0, 1]);
+        });
+
+        it('is applied to durable hidden rows the caller did not name, and reports only its own', () => {
+            // Another window hid row 4; this panel's source does not know.
+            const ds = source('off', rows);
+            const plan = plan_excel_override_state(
+                { excelFirstRowHeaders: { People: 'off' }, transforms: hidden([4]) },
+                ds.planning_input(), 0, 'People', 'on',
+                {
+                    headerSourceRow: 2,
+                    targetInput: ds.planning_input_for_header_source('People', 2),
+                    hiddenRowChange: { hide: [0, 1], show: [] },
+                },
+            )!;
+            expect(plan.state.transforms?.[0]?.hiddenRows).toEqual([0, 1, 4]);
+            expect(plan.change.hidden).toEqual([0, 1]);
+            expect(plan.change.shown).toEqual([]);
+        });
+
+        it('leaves a durable hidden row past the end of the worksheet out of both lists of the change', () => {
+            const ds = source('off', rows);
+            const plan = plan_excel_override_state(
+                { excelFirstRowHeaders: { People: 'off' }, transforms: hidden([3, 40]) },
+                ds.planning_input(), 0, 'People', 'off',
+                { hiddenRowChange: { hide: [1], show: [3] } },
+            )!;
+            expect(plan.change).toMatchObject({ hidden: [1], shown: [3] });
+            expect(plan.state.transforms?.[0]?.hiddenRows).toEqual([1]);
+        });
+
+        it("'on' with no row to use: accepted with every row hidden, the sheet on and not active", () => {
+            const ds = source('off', rows);
+            const plan = plan_excel_override_state(
+                { excelFirstRowHeaders: { People: 'off' } },
+                ds.planning_input(), 0, 'People', 'on',
+                { headerSourceRow: null, hiddenRowChange: { hide: [0, 1, 2, 3, 4], show: [] } },
+            )!;
+            expect(plan.newSheet.excelFirstRowHeader).toMatchObject({ mode: 'on', active: false });
+            expect(plan.state.excelFirstRowHeaders).toEqual({ People: 'on' });
+            expect(plan.state.transforms?.[0]?.hiddenRows).toEqual([0, 1, 2, 3, 4]);
+            expect(plan.change).toEqual({
+                before: { mode: 'off' }, after: { mode: 'on' }, hidden: [0, 1, 2, 3, 4], shown: [],
+            });
+            // With empty lists, over rows that are hidden already.
+            const all_hidden = source('off', rows, [[0, 1, 2, 3, 4]]);
+            const again = plan_excel_override_state(
+                { excelFirstRowHeaders: { People: 'off' }, transforms: hidden([0, 1, 2, 3, 4]) },
+                all_hidden.planning_input(), 0, 'People', 'on',
+                { headerSourceRow: null, hiddenRowChange: { hide: [], show: [] } },
+            )!;
+            expect(again.newSheet.excelFirstRowHeader).toMatchObject({ mode: 'on', active: false });
+            expect(again.state.transforms?.[0]?.hiddenRows).toEqual([0, 1, 2, 3, 4]);
+        });
+
+        it('refuses what a target may not ask for', () => {
+            const ds = source('off', rows);
+            const current = { excelFirstRowHeaders: { People: 'off' as const } };
+            const plan = (override: 'on' | 'off' | 'auto', options: Parameters<typeof plan_excel_override_state>[5]) =>
+                plan_excel_override_state(current, ds.planning_input(), 0, 'People', override, options);
+            // "On, with no row" while a row would be left showing.
+            expect(plan('on', { headerSourceRow: null, hiddenRowChange: { hide: [0, 1], show: [] } }))
+                .toBeUndefined();
+            // "On, with no row" is a target's state only.
+            expect(plan('on', { headerSourceRow: null })).toBeUndefined();
+            // 'on' with rows and no row named: the header would be wherever the set leaves it.
+            expect(plan('on', { hiddenRowChange: { hide: [0], show: [] } })).toBeUndefined();
+            // A row with anything but 'on'.
+            expect(plan('auto', { headerSourceRow: 2, hiddenRowChange: { hide: [], show: [] } }))
+                .toBeUndefined();
+            expect(plan('off', { headerSourceRow: null, hiddenRowChange: { hide: [], show: [] } }))
+                .toBeUndefined();
+            // Unhide all is a gesture's; a target says which rows.
+            expect(plan('off', { clearHiddenRows: true, hiddenRowChange: { hide: [], show: [] } }))
+                .toBeUndefined();
+        });
+
+        it('rebases the Pending Changes in the same plan, and a rebase refusal refuses it', () => {
+            const ds = source('on', rows, [[0, 1]]);
+            const state = (cells: Record<string, unknown>): PerFileState => ({
+                excelFirstRowHeaders: { People: 'on' },
+                transforms: hidden([0, 1], ds.meta().sheets[0]),
+                pendingEdits: [{ sheetName: 'People', cells } as never],
+            });
+            const undo = { hiddenRowChange: { hide: [], show: [0, 1] } };
+            const carried = plan_excel_override_state(
+                state({ '3:0': { value: 'Alicia', base: 'Alice' } }),
+                ds.planning_input(), 0, 'People', 'off', undo,
+            )!;
+            expect(carried.refusal).toBeUndefined();
+            expect(carried.state.pendingEdits?.[0]).toMatchObject({
+                cells: { '3:0': { value: 'Alicia', base: 'Alice' } },
+            });
+            const current = state({ '2:1': { value: 'Years', base: 'Age' } });
+            const refused = plan_excel_override_state(current, ds.planning_input(), 0, 'People', 'off', undo)!;
+            expect(refused.refusal).toBe(
+                'Save first: the header row has unsaved changes, and it would stop being the header row.',
+            );
+            expect(refused.state).toBe(current);
+        });
+
+        it('refuses "on, with no row" over an unsaved cell on a row it would hide', () => {
+            const ds = source('off', rows);
+            const current: PerFileState = {
+                excelFirstRowHeaders: { People: 'off' },
+                pendingEdits: [{ sheetName: 'People', cells: { '3:0': { value: 'Alicia', base: 'Alice' } } } as never],
+            };
+            const refused = plan_excel_override_state(
+                current, ds.planning_input(), 0, 'People', 'on',
+                { headerSourceRow: null, hiddenRowChange: { hide: [0, 1, 2, 3, 4], show: [] } },
+            )!;
+            expect(refused.refusal).toBe('Save first: rows that would be hidden have unsaved changes.');
+            expect(refused.state).toBe(current);
+        });
+
+        // What a gesture's write changed, and the target that takes it back.
+        it.each([
+            {
+                name: 'the toggle, off',
+                before: { override: 'on' as const, hidden: [] as number[] },
+                gesture: ['off', undefined] as const,
+            },
+            {
+                name: 'the toggle, on',
+                before: { override: 'off' as const, hidden: [] as number[] },
+                gesture: ['on', undefined] as const,
+            },
+            {
+                name: 'use row as header',
+                before: { override: 'off' as const, hidden: [4] },
+                gesture: ['on', { headerSourceRow: 2 }] as const,
+            },
+            {
+                name: 'Unhide all on a promoted header',
+                before: { override: 'on' as const, hidden: [0, 1, 4] },
+                gesture: ['off', { clearHiddenRows: true }] as const,
+            },
+        ])('the undo target after $name gives back the state before', ({ before, gesture }) => {
+            const start: PerFileState = {
+                excelFirstRowHeaders: { People: before.override },
+                ...(before.hidden.length === 0 ? {} : { transforms: hidden(before.hidden) }),
+            };
+            const ds = source(before.override, rows, [before.hidden]);
+            const [override, options] = gesture;
+            const made = plan_excel_override_state(start, ds.planning_input(), 0, 'People', override, {
+                ...options,
+                ...(options !== undefined && 'headerSourceRow' in options
+                    ? { targetInput: ds.planning_input_for_header_source('People', options.headerSourceRow) }
+                    : {}),
+            })!;
+            expect(made.refusal).toBeUndefined();
+            const { change } = made;
+            const after_hidden = made.state.transforms?.[0]?.hiddenRows ?? [];
+            const then = source(override, rows, [after_hidden]);
+            const row = change.before.mode === 'on' ? change.before.row ?? null : undefined;
+            const undone = plan_excel_override_state(
+                made.state, then.planning_input(), 0, 'People', change.before.mode,
+                {
+                    ...(row === undefined ? {} : { headerSourceRow: row }),
+                    ...(typeof row === 'number'
+                        ? { targetInput: then.planning_input_for_header_source('People', row) }
+                        : {}),
+                    hiddenRowChange: { hide: change.shown, show: change.hidden },
+                },
+            )!;
+            expect(undone.state.excelFirstRowHeaders).toEqual(start.excelFirstRowHeaders);
+            expect(undone.state.transforms?.[0]?.hiddenRows ?? []).toEqual(before.hidden);
+            expect(undone.change).toEqual({
+                before: change.after, after: change.before, hidden: change.shown, shown: change.hidden,
+            });
         });
     });
 

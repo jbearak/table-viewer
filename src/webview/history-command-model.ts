@@ -199,6 +199,8 @@ const VIEW_SKIP_TEXT: Readonly<Record<ViewSkipReason, string>> = {
     'columns-gone': 'columns that are no longer in the worksheet were left out',
     'sheets-gone': 'worksheets that are no longer in the workbook were left out',
     'too-many-heights': 'too many rows would have a custom height',
+    'header-unavailable': "the header row can't be restored on this worksheet",
+    'header-row-gone': 'the row it used as the header row is no longer in the worksheet',
 };
 
 /**

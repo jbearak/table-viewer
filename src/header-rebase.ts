@@ -71,6 +71,12 @@ export const HEADER_REBASE_TRANSFORMED_MESSAGE =
     'Save or discard inserted and moved rows to choose this header row.';
 export const HEADER_REBASE_PREFIX_MESSAGE =
     'Save or discard the row changes above this row to use it as the header row.';
+// The two hidden-row refusals where the change hides rows and no row is the
+// Header Row afterwards, so there is no header row to speak of.
+export const HEADER_REBASE_HIDDEN_CELL_NO_HEADER_MESSAGE =
+    'Save first: rows that would be hidden have unsaved changes.';
+export const HEADER_REBASE_TRANSFORMED_NO_HEADER_MESSAGE =
+    'Save or discard inserted and moved rows before these rows are hidden.';
 
 function cell_row(key: string): number | undefined {
     const separator = key.indexOf(':');
@@ -123,13 +129,36 @@ function intersects(
  *    off layout projection, the rule "Hide rows" already follows;
  *  - when the body start moves down, rows leaving the body that are not an
  *    untouched prefix of the layout.
+ *
+ * When the body start does not move there is nothing to carry, and the slot
+ * is returned as it is, with one exception. A header target can hide rows
+ * without moving the body start (restoring "on, with no row to use" from
+ * "off": the body starts at 0 on both sides). The two hidden-row refusals are
+ * then still asked, and nothing else is. No gesture hides rows without moving
+ * the body start, so this refuses nothing that was accepted before.
  */
 export function rebase_pending_edits_for_header<T extends HeaderRebaseSlot>(
     slot: T,
     context: HeaderRebaseContext,
 ): HeaderRebaseResult<T> {
     const { from, to, sourceRowCount } = context;
-    if (from === to) return { ok: true, slot };
+    if (from === to) {
+        const hidden_before = new Set(context.hiddenBefore ?? []);
+        const newly_hidden = new Set(
+            (context.hiddenAfter ?? []).filter((row) => !hidden_before.has(row)),
+        );
+        if (newly_hidden.size === 0) return { ok: true, slot };
+        for (const key of Object.keys(slot.cells)) {
+            const row = cell_row(key);
+            if (row !== undefined && newly_hidden.has(row)) {
+                return { ok: false, message: HEADER_REBASE_HIDDEN_CELL_NO_HEADER_MESSAGE };
+            }
+        }
+        if (has_inserted_or_moved_rows(slot.rowLayout)) {
+            return { ok: false, message: HEADER_REBASE_TRANSFORMED_NO_HEADER_MESSAGE };
+        }
+        return { ok: true, slot };
+    }
     if (
         !Number.isSafeInteger(from) || !Number.isSafeInteger(to)
         || from < 0 || to < 0 || from > sourceRowCount || to > sourceRowCount

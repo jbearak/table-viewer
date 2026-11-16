@@ -24,6 +24,7 @@ import {
 } from './resource-identity';
 import type { ExcelHeaderOverride } from './data-source/interface';
 import { normalize_host_state, plan_excel_override_state } from './excel-header-plan';
+import type { HiddenRowChange } from './header-hidden-rows';
 import type {
     AuthorityFileStateStore,
     AuthorityTransactionFinalizeResult,
@@ -34,6 +35,7 @@ import type {
 } from './state';
 import type {
     CellHighlightState,
+    ExcelHeaderChange,
     HighlightCellDelta,
     PerFileState,
 } from './types';
@@ -114,13 +116,24 @@ export interface ExcelHeaderOperationReceipt extends ProjectionAuthorityCommitRe
     readonly sheetName: string;
     /** The worksheet's stable identity when it has one: a reload can rename or move it. */
     readonly worksheetId?: string;
-    readonly override: ExcelHeaderOverride;
+    /** `'auto'`: the worksheet's override was removed. */
+    readonly override: ExcelHeaderOverride | 'auto';
     readonly originToken: symbol;
+    /**
+     * What this write changed for the worksheet, taken across the
+     * compare-and-set. A subscriber sees only the committed state, and the
+     * state it replaced may already have held another window's change.
+     */
+    readonly change: ExcelHeaderChange;
 }
 
 export type ExcelHeaderCommitResult =
     | { readonly type: 'committed'; readonly receipt: ExcelHeaderOperationReceipt }
-    | { readonly type: 'indeterminate'; readonly error: string }
+    /**
+     * `change` is present when the commit is established and only what
+     * followed it failed. Absent, the header may or may not have been stored.
+     */
+    | { readonly type: 'indeterminate'; readonly error: string; readonly change?: ExcelHeaderChange }
     | { readonly type: 'rejected'; readonly error: string };
 
 export interface CommitExcelHeaderCommand {
@@ -128,10 +141,13 @@ export interface CommitExcelHeaderCommand {
     readonly sheetIndex: number;
     readonly sheetName: string;
     readonly worksheetId?: string;
-    readonly override: ExcelHeaderOverride;
+    readonly override: ExcelHeaderOverride | 'auto';
     readonly clearHiddenRows?: boolean;
-    readonly headerSourceRow?: number;
+    /** `null`, with `hiddenRowChange`: "on, with no row to use". */
+    readonly headerSourceRow?: number | null;
     readonly targetPlanningInput?: ExcelHeaderPlanningInput;
+    /** A header target's rows to hide and show; see `plan_excel_override_state`. */
+    readonly hiddenRowChange?: HiddenRowChange;
     readonly originToken: symbol;
     readonly expectedPhysicalRevision: number;
     readonly expectedPhysicalDigest?: string;
@@ -1099,9 +1115,19 @@ export function acquire_file_coordinator(
             // Past this point a failure may have written the header, so it is
             // indeterminate rather than refused.
             let finalization_started = false;
+            // Set once the commit is established: finalization answered
+            // `finalized`, or reconciliation proved `committed`. Every
+            // indeterminate answer after that carries it, because the write
+            // is known to be this request's. Before it, nothing says who wrote
+            // what the durable state holds.
+            let established_change: ExcelHeaderChange | undefined;
             const indeterminate = (error: string): ExcelHeaderCommitResult => {
                 recovery_required = true;
-                return { type: 'indeterminate', error };
+                return {
+                    type: 'indeterminate',
+                    error,
+                    ...(established_change === undefined ? {} : { change: established_change }),
+                };
             };
             try {
                 await register_store(entry, identity, state_store);
@@ -1207,6 +1233,9 @@ export function acquire_file_coordinator(
                             clearHiddenRows: command.clearHiddenRows,
                             headerSourceRow: command.headerSourceRow,
                             targetInput: command.targetPlanningInput,
+                            ...(command.hiddenRowChange === undefined
+                                ? {}
+                                : { hiddenRowChange: command.hiddenRowChange }),
                             ...(command.appendSchemaFingerprint === undefined
                                 ? {}
                                 : { appendSchemaFingerprint: command.appendSchemaFingerprint }),
@@ -1337,6 +1366,7 @@ export function acquire_file_coordinator(
                         if (rejected) return rejected;
                         continue;
                     }
+                    established_change = plan.change;
                     let inspected;
                     try {
                         inspected = await command.stateStore.inspect_authority_transaction(
@@ -1409,6 +1439,7 @@ export function acquire_file_coordinator(
                             : { worksheetId: command.worksheetId }),
                         override: command.override,
                         originToken: command.originToken,
+                        change: plan.change,
                     });
                     return { type: 'committed', receipt };
                 }

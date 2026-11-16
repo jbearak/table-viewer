@@ -143,6 +143,7 @@ import {
 import {
     EMPTY_TRANSFORM,
     MAX_PERSISTED_HIDDEN_ROWS,
+    excel_header_target_request_valid,
     MAX_PERSISTED_ROW_HEIGHTS,
     type ColumnWidthChange,
     type ColumnWidthsSheetChange,
@@ -175,6 +176,7 @@ import {
     type CellHighlightColor,
     type CsvDirtyMap,
     type CsvDirtyEntry,
+    type ExcelHeaderChange,
     dirty_entries_equal,
     dirty_entry_link_changed,
     dirty_entry_value_changed,
@@ -9506,18 +9508,26 @@ export function attach_viewer(
         readonly sheetName: string;
         readonly worksheetId?: string;
         readonly error?: string;
+        /**
+         * What the request's write changed, when the commit is established:
+         * from its receipt, or from an indeterminate answer given after the
+         * commit. Absent when nothing says the write happened.
+         */
+        readonly change?: ExcelHeaderChange;
     } | undefined;
 
     function park_header_settlement(
         request_id: string,
         sheet: { readonly name: string; readonly worksheetId?: string },
         error?: string,
+        change?: ExcelHeaderChange,
     ): void {
         header_settlement_waiter = {
             requestId: request_id,
             sheetName: sheet.name,
             ...(sheet.worksheetId === undefined ? {} : { worksheetId: sheet.worksheetId }),
             ...(error === undefined ? {} : { error }),
+            ...(change === undefined ? {} : { change }),
         };
     }
 
@@ -9551,6 +9561,7 @@ export function attach_viewer(
             requestId: waiter.requestId,
             outcome: 'recovered',
             ...(waiter.error === undefined ? {} : { error: waiter.error }),
+            ...(waiter.change === undefined ? {} : { change: waiter.change }),
         }, { deliver: false });
     }
 
@@ -9601,6 +9612,7 @@ export function attach_viewer(
                                 type: 'excelFirstRowHeader',
                                 requestId: receipt.requestId,
                                 outcome: 'applied',
+                                change: receipt.change,
                             });
                         }
                         continue;
@@ -9615,6 +9627,7 @@ export function attach_viewer(
                                 requestId: receipt.requestId,
                                 outcome: 'recovered',
                                 error: 'A newer workbook projection was already active.',
+                                change: receipt.change,
                             });
                         }
                         continue;
@@ -9692,6 +9705,7 @@ export function attach_viewer(
                                     type: 'excelFirstRowHeader',
                                     requestId: receipt.requestId,
                                     outcome: 'applied',
+                                    change: receipt.change,
                                 }, { deliver: false });
                             }
                             const material = core.snapshot_material();
@@ -9751,6 +9765,7 @@ export function attach_viewer(
                                     : { worksheetId: receipt.worksheetId }),
                             },
                             'The header setting was saved after rebuilding the workbook view.',
+                            receipt.change,
                         );
                     }
                     schedule_header_refresh();
@@ -9766,6 +9781,7 @@ export function attach_viewer(
                                     : { worksheetId: receipt.worksheetId }),
                             },
                             'The header setting was saved after rebuilding the workbook view.',
+                            receipt.change,
                         );
                     }
                     schedule_header_refresh();
@@ -13804,6 +13820,16 @@ export function attach_viewer(
                     fail('First-row headers are only available for Excel worksheets.');
                     return;
                 }
+                // A header step's replay: the header state to install, by
+                // source row, with the hidden rows to change in the same write.
+                const target = msg.target;
+                if (
+                    target !== undefined
+                    && !excel_header_target_request_valid({ ...msg, target })
+                ) {
+                    fail('The requested header change is invalid.');
+                    return;
+                }
                 if (
                     !session.acknowledged_current()
                     || source_authority.authorityRevision
@@ -13847,11 +13873,34 @@ export function attach_viewer(
                     fail('The requested row restoration does not match the active header.');
                     return;
                 }
-                let header_source_row: number | undefined;
+                let header_source_row: number | null | undefined;
                 let target_planning_input: ReturnType<
                     ExcelHeaderDataSource['planning_input_for_header_source']
                 >;
-                if (msg.headerRow !== undefined) {
+                if (target !== undefined) {
+                    // Source rows, so neither rule about the view applies:
+                    // not "clear sorting and filtering first", which guards a
+                    // display row, and not "no first row to use", which asks
+                    // about the rows hidden now where a target says which row
+                    // is the header, or that none is.
+                    if (target.mode === 'on') header_source_row = target.headerSourceRow;
+                    if (typeof header_source_row === 'number') {
+                        if (header_source_row > MAX_PERSISTED_HIDDEN_ROWS) {
+                            fail('Too many rows precede the selected header row.');
+                            return;
+                        }
+                        // Read from the physical source, so a row that is
+                        // hidden now can be named.
+                        target_planning_input = source.planning_input_for_header_source(
+                            msg.sheetName,
+                            header_source_row,
+                        );
+                        if (!target_planning_input) {
+                            fail('The selected row is no longer available.');
+                            return;
+                        }
+                    }
+                } else if (msg.headerRow !== undefined) {
                     if (
                         !msg.enabled
                         || msg.unhideAll === true
@@ -13895,7 +13944,7 @@ export function attach_viewer(
                         return;
                     }
                 }
-                if (msg.enabled && !header.available) {
+                if (target === undefined && msg.enabled && !header.available) {
                     fail('This worksheet has no first row to use as column names.');
                     return;
                 }
@@ -13949,7 +13998,7 @@ export function attach_viewer(
                         ...(command_worksheet_id === undefined
                             ? {}
                             : { worksheetId: command_worksheet_id }),
-                        override: msg.enabled ? 'on' : 'off',
+                        override: target?.mode ?? (msg.enabled ? 'on' : 'off'),
                         originToken: excel_header_subscriber_token,
                         expectedPhysicalRevision: expected_physical_revision,
                         expectedPhysicalDigest: expected_physical_digest,
@@ -13957,6 +14006,17 @@ export function attach_viewer(
                         clearHiddenRows: msg.unhideAll === true,
                         headerSourceRow: header_source_row,
                         targetPlanningInput: target_planning_input,
+                        // Always for a target, with empty lists when it
+                        // names no rows, so every target is planned by the
+                        // one rule; never for a gesture.
+                        ...(target === undefined
+                            ? {}
+                            : {
+                                hiddenRowChange: {
+                                    hide: target.hideRows ?? [],
+                                    show: target.showRows ?? [],
+                                },
+                            }),
                         stateStore: durable_state_store,
                     });
                     if (result.type === 'indeterminate' && !disposed) {
@@ -13968,7 +14028,7 @@ export function attach_viewer(
                             ...(command_worksheet_id === undefined
                                 ? {}
                                 : { worksheetId: command_worksheet_id }),
-                        }, result.error);
+                        }, result.error, result.change);
                     } else if (result.type === 'rejected' && !disposed) {
                         // Admission is asked again at every commit step; a refusal
                         // there for edit-session work is as transient as at entry.

@@ -56,12 +56,14 @@ import {
     type TransformIntent,
     type ViewBasis,
     type WorksheetTarget,
+    type ExcelHeaderTarget,
     type WorksheetPendingChanges,
     type ColumnWidthsSheetChange,
 } from '../types';
 import type { WorkbookMeta } from '../data-source/interface';
 import { header_body_start } from '../worksheet-layout';
 import { header_rebase_slot_refusal } from '../header-rebase';
+import { in_range_rows } from '../header-hidden-rows';
 import {
     advance_pending_append_basis,
     assert_pending_changes_encoded_bound,
@@ -248,6 +250,10 @@ import {
     column_widths_view_step,
     columns_replay_target,
     columns_view_step,
+    header_replay_target,
+    header_step_label,
+    header_view_delta,
+    ordered_skips,
     overtaken_transform_step,
     row_heights_replay_target,
     row_heights_view_step,
@@ -255,6 +261,7 @@ import {
     transform_slices_equal,
     transform_view_step,
     type AutoFitChange,
+    type HeaderViewDelta,
     type TransformViewDelta,
     type ViewHistoryDelta,
     type ViewSkipReason,
@@ -284,6 +291,7 @@ import {
     action_has_view_change,
     view_step_change,
     width_step_changes,
+    header_step_changes,
     retained_pending_row_authorities,
     is_structural_history_change,
     retained_saved_append_authorities,
@@ -537,14 +545,57 @@ function action_is_size_step(action: HistoryEntry['action']): boolean {
 interface ExcelHeaderQueueSheet {
     readonly name: string;
     readonly worksheet_id?: string;
+    /**
+     * A header step's replay: the header state to install on this sheet, by
+     * source row. A gesture's request is the queue's own, the same for every
+     * sheet; a replay's differs sheet by sheet.
+     */
+    readonly target?: ExcelHeaderTarget;
 }
 
 function excel_header_queue_sheet(
     sheet: { readonly name: string; readonly worksheetId?: string },
+    target?: ExcelHeaderTarget,
 ): ExcelHeaderQueueSheet {
-    return sheet.worksheetId === undefined
-        ? { name: sheet.name }
-        : { name: sheet.name, worksheet_id: sheet.worksheetId };
+    return {
+        name: sheet.name,
+        ...(sheet.worksheetId === undefined ? {} : { worksheet_id: sheet.worksheetId }),
+        ...(target === undefined ? {} : { target }),
+    };
+}
+
+/**
+ * One run of the header queue, from the gesture or the Undo that started it
+ * to its end: what becomes one step in history, or the one step a replay
+ * moves.
+ *
+ * A mutable object in a ref of its own, not a field of the queue: the queue
+ * is replaced by a spread at every step and the request in flight keeps an
+ * old one, while what the run collects has to survive all of that.
+ */
+interface HeaderRun {
+    /** A header step's replay; absent for a gesture. */
+    readonly replay?: ViewReplay;
+    /** The worksheet a replay's messages name. */
+    readonly worksheet?: WorksheetTarget;
+    /** Replay only: an Undo or Redo pressed while it ran, carried out after it. */
+    then?: HistoryDirection;
+    /** What the host says each settled request changed, one per worksheet. */
+    readonly changes: HeaderViewDelta[];
+    /** Replay only: how many of its requests the host committed. */
+    landed: number;
+    /** Replay only: skip reasons, the ones found while the run was under way included. */
+    readonly skipped: Set<ViewSkipReason>;
+    /**
+     * Replay only: why a posted sheet did not land. `silent`: the person is
+     * told by what the queue already says (a result that needs a reload).
+     */
+    failed?:
+        | { readonly reason: string }
+        | { readonly wait: ViewReplayWait }
+        | { readonly silent: true };
+    /** The delivery id of the snapshot that carried the last result this run received. */
+    last_delivery?: number;
 }
 
 /** Where the queued sheet is now, or -1 once it is gone. */
@@ -557,6 +608,19 @@ function excel_header_queue_sheet_index(
             ? sheet.worksheetId === target.worksheet_id
             : sheet.name === target.name
     ));
+}
+
+/** What starts the header queue: a gesture's request, or a header step's replay. */
+interface HeaderQueueRequest {
+    readonly enabled: boolean;
+    readonly unhide_all?: boolean;
+    readonly header_row?: number;
+    readonly sheets: readonly number[];
+    readonly grid_focus_sheet_index?: number;
+    /** A replay: the target of each sheet in `sheets`, and the entry it moves. */
+    readonly targets?: ReadonlyMap<number, ExcelHeaderTarget>;
+    readonly replay?: ViewReplay;
+    readonly worksheet?: WorksheetTarget;
 }
 
 /** Header Row changes still owed, one sheet per host request. See `drain_excel_header_queue`. */
@@ -1652,14 +1716,14 @@ export function App(): React.JSX.Element {
      *
      * `whole` is true when nothing of the step was applied (every part was
      * skipped). `partly` is true when the host installed something other than
-     * what the replay asked for.
+     * what the replay asked for. Answers whether the entry moved.
      */
     const land_view_replay = useCallback((
         replay: ViewReplay,
         worksheet: WorksheetTarget,
         whole: boolean,
         partly = false,
-    ) => {
+    ): boolean => {
         const move = history_store_ref.current!.stage_move(replay.direction, replay.entry);
         commit_staged_transaction([move]);
         const label = replay.entry.action.label;
@@ -1670,7 +1734,7 @@ export function App(): React.JSX.Element {
                 type: 'showWarning',
                 message: view_replay_dropped_warning(replay.direction),
             });
-            return;
+            return false;
         }
         if (replay.skipped.length > 0) {
             // In a workbook with several worksheets the message says which one.
@@ -1689,6 +1753,7 @@ export function App(): React.JSX.Element {
                 message: view_partly_applied_warning(replay.direction, label),
             });
         }
+        return true;
     }, []);
 
     /**
@@ -2463,6 +2528,26 @@ export function App(): React.JSX.Element {
             value.toString(36)).join('-'),
     );
     const pending_excel_header_ref = useRef<string | null>(null);
+    /** The header queue's run in progress; see `HeaderRun` and `end_header_run`. */
+    const header_run_ref = useRef<HeaderRun | null>(null);
+    /**
+     * A press remembered during a header step's replay, between that replay
+     * moving its entry and the effect that carries the press out. The header
+     * fence stays up for as long as this is set, so nothing can be recorded
+     * and no other history command can run in between.
+     */
+    const header_handoff_ref = useRef<{
+        readonly direction: HistoryDirection;
+        readonly delivery: number;
+    } | null>(null);
+    const [header_handoff_tick, set_header_handoff_tick] = useState(0);
+    /**
+     * The delivery id of the last snapshot whose `meta` this window adopted.
+     * Written where the snapshot handler adopts it, which is after every
+     * early return of that handler; `last_applied_snapshot_ref` is written
+     * before them and so cannot say a snapshot was installed.
+     */
+    const installed_snapshot_delivery_ref = useRef<number | null>(null);
     // The header fence (see `lower_header_fence`): raised by the gesture that
     // asks for a Header Row change, lowered by its last result. A ref for the
     // gesture gates, which read it synchronously; the state re-renders.
@@ -2483,9 +2568,18 @@ export function App(): React.JSX.Element {
     // The edit warning last shown for this fence, so a burst of keys says it
     // once; cleared when the fence drops.
     const header_edit_warning_ref = useRef<string | null>(null);
-    /** Say why an edit gesture does nothing while the header fence is up. */
-    const warn_edit_waits_for_header = useCallback(() => {
-        if (!header_fence_ref.current) return;
+    /**
+     * Say why an edit gesture does nothing while the header fence is up.
+     *
+     * `before_fence`: also speak while a header change is asked for and its
+     * fence has not risen yet. Undo and Redo wait from the moment a header
+     * gesture is asked: one that ran in that gap would move first, and the
+     * header step recorded when the change settles would clear the redo it
+     * had just made. Once per header change either way, so a held key gets
+     * one message and not one per repeat.
+     */
+    const warn_edit_waits_for_header = useCallback((before_fence = false) => {
+        if (!header_fence_ref.current && !before_fence) return;
         const message = header_reload_required_ref.current
             ? 'Reload this window to finish the header row change, then edit.'
             : 'Wait for the header row change to finish, then edit.';
@@ -2496,7 +2590,7 @@ export function App(): React.JSX.Element {
     const [header_fence, set_header_fence] = useState(false);
     // The header queue's verdict on a header result; see `drain_excel_header_queue`.
     const header_result_handler_ref = useRef<
-        (result: ExcelHeaderSnapshotResult) => 'report' | 'retry' | 'handled'
+        (result: ExcelHeaderSnapshotResult, delivery: number) => 'report' | 'retry' | 'handled'
     >(() => 'report');
     // Counts `snapshotApplied` acknowledgements, so a retried header request
     // can wait for the refresh its rejection was about to be acknowledged.
@@ -4149,7 +4243,10 @@ export function App(): React.JSX.Element {
                     pending_excel_header_unhide_ref.current = false;
                     pending_excel_header_promote_ref.current = false;
                     set_pending_excel_header(null);
-                    const queue_verdict = header_result_handler_ref.current(result);
+                    const queue_verdict = header_result_handler_ref.current(
+                        result,
+                        snapshot.identity.deliveryId,
+                    );
                     if (queue_verdict !== 'report') return;
                     if (result.outcome === 'rejected') {
                         set_excel_header_status(restoring_rows
@@ -4998,6 +5095,7 @@ export function App(): React.JSX.Element {
                     // `lfs_resolving`.
                     set_unresolved_lfs(snapshot.configuration.unresolvedLfs);
                     meta_ref.current = snapshot.meta;
+                    installed_snapshot_delivery_ref.current = snapshot.identity.deliveryId;
                     set_meta(snapshot.meta);
                     const source_changed =
                         snapshot.presentation === 'initial'
@@ -6868,6 +6966,8 @@ export function App(): React.JSX.Element {
             readonly auto_fit_extras_before?: AutoFitExtras;
         },
     ) => boolean) | null>(null);
+    /** `enqueue_excel_header_change`, which is declared further down. */
+    const enqueue_excel_header_change_ref = useRef<((request: HeaderQueueRequest) => boolean) | null>(null);
     /** `post_column_visibility`, which is declared further down. */
     const post_column_visibility_ref = useRef<((
         sheet_index: number,
@@ -6992,14 +7092,104 @@ export function App(): React.JSX.Element {
             }
             return;
         }
+        const header_changes = header_step_changes(entry.action);
+        if (header_changes !== undefined && sheets !== undefined) {
+            // A header step is replayed through the header queue, like the
+            // gesture that made it: the host carries the worksheet's unsaved
+            // changes to the restored header in the same durable write.
+            //
+            // Not while keys are still owed to a cell (the state a gesture's
+            // drain waits out): the fence about to rise would swallow them.
+            if (
+                save_in_flight_ref.current
+                || edit_session_pending
+                || pending_excel_header_ref.current !== null
+                || editing_ref.current?.typing_pending() === true
+            ) {
+                say_wait('applying');
+                return;
+            }
+            const skipped = new Set<ViewSkipReason>();
+            const targets = new Map<number, ExcelHeaderTarget>();
+            const present: number[] = [];
+            for (const { delta: header_delta } of header_changes) {
+                const index = worksheet_target_index(sheets, header_delta.worksheet);
+                const sheet = index === undefined ? undefined : sheets[index];
+                if (index === undefined || sheet === undefined) {
+                    skipped.add('sheets-gone');
+                    continue;
+                }
+                present.push(index);
+                if (sheet.excelFirstRowHeader === undefined) {
+                    skipped.add('header-unavailable');
+                    continue;
+                }
+                // Built from the step, member by member, and never compared
+                // with what this window shows: whether anything is left to
+                // change is the host's to say. The hidden rows this window
+                // holds only predict two outcomes that are skipped here
+                // instead of asked for.
+                const plan = header_replay_target(header_delta, direction, {
+                    sourceRowCount: sheet.sourceRowCount,
+                    hiddenRows: in_range_rows(
+                        state_ref.current.transforms?.[index]?.hiddenRows,
+                        sheet.sourceRowCount,
+                    ),
+                });
+                for (const reason of plan.skipped) skipped.add(reason);
+                if (plan.target !== undefined) targets.set(index, plan.target);
+            }
+            // Undo shows a worksheet its step belongs to.
+            let shown = active_sheet_index;
+            if (present.length > 0 && !present.includes(active_sheet_index)) {
+                if (!handle_sheet_select(present[0]!)) {
+                    say_wait('applying');
+                    return;
+                }
+                shown = present[0]!;
+            }
+            const named = present.length === 0 ? undefined : sheets[present[0]!];
+            const worksheet: WorksheetTarget = named === undefined
+                ? header_changes[0]!.delta.worksheet
+                : {
+                    sheetIndex: present[0]!,
+                    sheetName: named.name,
+                    ...(named.worksheetId === undefined ? {} : { worksheetId: named.worksheetId }),
+                };
+            const replay: ViewReplay = { entry, direction, skipped: ordered_skips(skipped) };
+            if (targets.size === 0) {
+                // Every worksheet was left out or skipped. The entry moves all
+                // the same: a header step never stands in the way of an older
+                // step.
+                land_view_replay(replay, worksheet, true);
+                wake_header_drain();
+                return;
+            }
+            // There is no "already in place" shortcut: a sheet that has a
+            // target is always asked for, and if the durable state already
+            // holds it the host's write changes nothing and says so.
+            enqueue_excel_header_change_ref.current?.({
+                enabled: false,
+                sheets: [...targets.keys()],
+                targets,
+                replay,
+                worksheet,
+                // The result remounts the grid; if it had keyboard focus, it
+                // takes it back, so a held Undo keeps arriving at the window.
+                ...(grid_focus_ref.current?.has_focus() === true
+                    ? { grid_focus_sheet_index: shown }
+                    : {}),
+            });
+            return;
+        }
         const change = view_step_change(entry.action);
         if (change === undefined || sheets === undefined) {
             say_unavailable();
             return;
         }
         const delta = change.delta;
-        if (delta.slice === 'columnWidths') {
-            // Unreachable: a width step is handled above.
+        if (delta.slice === 'columnWidths' || delta.slice === 'header') {
+            // Unreachable: a width step and a header step are handled above.
             say_unavailable();
             return;
         }
@@ -7196,6 +7386,26 @@ export function App(): React.JSX.Element {
         const coordinator = replay_coordinator_ref.current;
         if (coordinator === null) return;
         const replay_document = history_document_ref.current;
+        // A header step's replay is in flight. The press is carried out after
+        // it: it is not run now, which could start the same step twice or
+        // reach the entry under it before the step has moved, and it is not
+        // dropped. One slot; a later press replaces an earlier one.
+        const header_run = header_run_ref.current;
+        if (header_run?.replay !== undefined) {
+            header_run.then = direction;
+            return;
+        }
+        const handoff = header_handoff_ref.current;
+        if (handoff !== null) {
+            header_handoff_ref.current = { ...handoff, direction };
+            return;
+        }
+        // A header gesture of this window is asked for and its fence has not
+        // risen yet.
+        if (excel_header_queue_ref.current !== null || pending_excel_header_ref.current !== null) {
+            warn_edit_waits_for_header(true);
+            return;
+        }
         if (!history_free()) {
             // Says nothing unless the header fence is what holds edits.
             warn_edit_waits_for_header();
@@ -7916,6 +8126,10 @@ export function App(): React.JSX.Element {
         // The sheet whose grid should regain focus after an authoritative remount.
         // Undefined for grid- and state-strip-originated header commands.
         grid_focus_sheet_index?: number,
+        // A header step's replay: the header state to install, by source row.
+        // Not display-keyed, so only the wait for a transform request in
+        // flight applies to it.
+        target?: ExcelHeaderTarget,
     ) => {
         const sheet = meta?.sheets[target_sheet_index];
         const header = sheet?.excelFirstRowHeader;
@@ -7963,9 +8177,10 @@ export function App(): React.JSX.Element {
             type: 'setExcelFirstRowHeader',
             sheetIndex: target_sheet_index,
             sheetName: sheet.name,
-            enabled,
+            enabled: target === undefined ? enabled : target.mode === 'on',
             ...(unhide_all ? { unhideAll: true } : {}),
             ...(header_row !== undefined ? { headerRow: header_row } : {}),
+            ...(target === undefined ? {} : { target }),
             requestId: request_id,
             generation: generation_ref.current,
             sourceGeneration: source_generation_ref.current,
@@ -7997,6 +8212,8 @@ export function App(): React.JSX.Element {
         readonly queue: ExcelHeaderQueue;
         readonly sheet: ExcelHeaderQueueSheet;
         readonly posted_snapshot: number;
+        /** The worksheet the request was posted for, for its step's change. */
+        readonly worksheet: WorksheetTarget;
     } | null>(null);
     const header_timer_refs = useRef<ReturnType<typeof setTimeout>[]>([]);
     const schedule_header_wake = useCallback((delay: number) => {
@@ -8016,6 +8233,26 @@ export function App(): React.JSX.Element {
      * all of it. Reversible and separate from the close barrier's latch.
      */
     const lower_header_fence = useCallback(() => {
+        // A run still open here was not ended where its queue ended: the
+        // document was replaced under it. It is abandoned, saying nothing.
+        const abandoned = header_run_ref.current;
+        header_run_ref.current = null;
+        if (abandoned?.replay !== undefined && pending_excel_header_ref.current !== null) {
+            // A replay's request already posted is dropped with it. Its
+            // answer can still arrive (a new document of the same file leaves
+            // the request pending), and it would be reported as a gesture's,
+            // about an Undo whose history is gone; until then the pending
+            // request would keep every header control, transform request,
+            // and view replay refused. With nothing pending the late answer
+            // matches no request and is ignored.
+            pending_excel_header_grid_focus_ref.current.delete(pending_excel_header_ref.current);
+            pending_excel_header_ref.current = null;
+            pending_excel_header_unhide_ref.current = false;
+            pending_excel_header_promote_ref.current = false;
+            set_pending_excel_header(null);
+            set_excel_header_status('');
+        }
+        header_handoff_ref.current = null;
         header_fence_ref.current = false;
         header_reload_required_ref.current = false;
         header_edit_warning_ref.current = null;
@@ -8027,25 +8264,117 @@ export function App(): React.JSX.Element {
     }, [replace_excel_header_queue]);
     lower_header_fence_ref.current = lower_header_fence;
 
+    /**
+     * End the header queue's run, where the queue ends.
+     *
+     * A gesture's run records what the host says its requests changed, as one
+     * step, however the queue ended: a header change that happened is never
+     * left without a step. (So the sheets of an all-sheets gesture that
+     * changed before a refusal are recorded.) With no editing session and
+     * nothing marked unsaved, like any view step.
+     *
+     * A replay's run moves its entry when no request it posted failed, and
+     * otherwise leaves the entry where it is and says why. History moves only
+     * here, on the host's answer.
+     *
+     * For a result this runs before the snapshot that carried it is applied.
+     * So a header entry is stamped with the body start from before its own
+     * change (`HistoryEntry.bodyStarts`); nothing reads that field for a
+     * view-only entry.
+     *
+     * Answers `'handoff'` when a press was remembered during a replay that
+     * moved its entry: the caller then leaves the header fence up, and the
+     * effect below lowers it and carries the press out.
+     */
+    const end_header_run = (
+        failure?: { readonly reason: string },
+    ): 'handoff' | undefined => {
+        const run = header_run_ref.current;
+        if (run === null) return undefined;
+        header_run_ref.current = null;
+        if (run.replay === undefined) {
+            if (run.changes.length === 0) return undefined;
+            const record = history_store_ref.current!.stage_record({
+                label: header_step_label(run.changes),
+                changes: run.changes.map((delta) => ({ kind: 'view' as const, delta })),
+            });
+            commit_staged_transaction([record]);
+            return undefined;
+        }
+        // A replay shows none of a gesture's status lines.
+        set_excel_header_status('');
+        const { direction, entry } = run.replay;
+        const failed = failure ?? run.failed;
+        if (failed !== undefined) {
+            if ('reason' in failed) {
+                show_warning(view_replay_refusal_warning(direction, entry.action.label, failed.reason));
+            } else if ('wait' in failed) {
+                show_warning(view_replay_wait_warning(failed.wait, direction));
+            }
+            return undefined;
+        }
+        const moved = land_view_replay(
+            { ...run.replay, skipped: ordered_skips(run.skipped) },
+            run.worksheet ?? entry.action.changes[0]!.delta.worksheet,
+            run.landed === 0,
+        );
+        if (!moved || run.then === undefined || run.last_delivery === undefined) return undefined;
+        header_handoff_ref.current = { direction: run.then, delivery: run.last_delivery };
+        set_header_handoff_tick((tick) => tick + 1);
+        return 'handoff';
+    };
+    /** End the run and the queue with it. */
+    const finish_header_queue = (failure?: { readonly reason: string }) => {
+        if (end_header_run(failure) !== 'handoff') {
+            lower_header_fence();
+            return;
+        }
+        // The fence stays up with the queue gone, the state a result that
+        // needs a reload already leaves, so the drain does not lower it.
+        header_in_flight_ref.current = null;
+        for (const timer of header_timer_refs.current) clearTimeout(timer);
+        header_timer_refs.current = [];
+        replace_excel_header_queue(null);
+    };
+    /**
+     * Carry out the press remembered during a header step's replay.
+     *
+     * After the render that follows the replay's last result, and only if
+     * the snapshot that carried that result is the last one this window
+     * installed: then the stack, the header, and the grid are the ones the
+     * result left. Otherwise the press is dropped, saying nothing: the
+     * window may not be showing the header the entry under the step was made
+     * with, and a held key sends another press anyway.
+     */
+    useEffect(() => {
+        const handoff = header_handoff_ref.current;
+        if (handoff === null) return;
+        lower_header_fence_ref.current();
+        if (installed_snapshot_delivery_ref.current !== handoff.delivery) return;
+        void run_history_command_ref.current(handoff.direction);
+    }, [header_handoff_tick]);
+
     const drain_excel_header_queue = () => {
         const queue = excel_header_queue_ref.current;
         if (queue === null || pending_excel_header_ref.current !== null) return;
         const [next_sheet] = queue.sheets;
+        const run = header_run_ref.current;
         if (next_sheet === undefined) {
-            lower_header_fence();
+            finish_header_queue();
             return;
         }
         const current_sheets = meta_ref.current?.sheets ?? [];
         const next_sheet_index = excel_header_queue_sheet_index(current_sheets, next_sheet);
         if (next_sheet_index < 0) {
             // The worksheet left the workbook while the request waited.
+            if (run?.replay !== undefined) run.skipped.add('sheets-gone');
             replace_excel_header_queue({ ...queue, sheets: queue.sheets.slice(1) });
             return;
         }
         if (queue.header_row !== undefined && generation_ref.current !== queue.generation) {
             // The display row it names belongs to a view that has since changed.
             set_excel_header_status('Header row was not updated.');
-            lower_header_fence();
+            finish_header_queue();
             return;
         }
         const now = Date.now();
@@ -8080,7 +8409,7 @@ export function App(): React.JSX.Element {
                 && editing_ref.current?.commit_live_edit() === false
             ) {
                 set_excel_header_status('Header row was not updated.');
-                replace_excel_header_queue(null);
+                finish_header_queue();
                 return;
             }
             header_fence_ref.current = true;
@@ -8098,12 +8427,16 @@ export function App(): React.JSX.Element {
             }
             if (pending_changes_durability.has_unacknowledged(session)) {
                 if (now - (current.ack_wait_started ?? now) >= HEADER_ACK_WAIT_MS) {
-                    host_bridge.postMessage({
-                        type: 'showWarning',
-                        message: 'Could not change the header row: unsaved changes are still being stored. Try again.',
-                    });
-                    set_excel_header_status('Header row was not updated.');
-                    lower_header_fence();
+                    const reason = 'unsaved changes are still being stored. Try again.';
+                    if (run?.replay === undefined) {
+                        host_bridge.postMessage({
+                            type: 'showWarning',
+                            message: `Could not change the header row: ${reason}`,
+                        });
+                        set_excel_header_status('Header row was not updated.');
+                    }
+                    // A replay says it as its own refusal.
+                    finish_header_queue({ reason });
                 }
                 return;
             }
@@ -8120,16 +8453,27 @@ export function App(): React.JSX.Element {
             grid_focus_sheet_index === undefined || grid_focus_sheet_index < 0
                 ? undefined
                 : grid_focus_sheet_index,
+            next_sheet.target,
         );
         if (result === 'wait') return;
         if (result === 'skip') {
+            // The worksheet stopped offering a Header Row while it waited.
+            if (run?.replay !== undefined) run.skipped.add('header-unavailable');
             replace_excel_header_queue({ ...current, sheets: current.sheets.slice(1) });
             return;
         }
+        const posted_sheet = current_sheets[next_sheet_index]!;
         header_in_flight_ref.current = {
             queue: current,
             sheet: next_sheet,
             posted_snapshot: snapshot_applied_seq_ref.current,
+            worksheet: {
+                sheetIndex: next_sheet_index,
+                sheetName: posted_sheet.name,
+                ...(posted_sheet.worksheetId === undefined
+                    ? {}
+                    : { worksheetId: posted_sheet.worksheetId }),
+            },
         };
         replace_excel_header_queue({ ...current, sheets: current.sheets.slice(1) });
         const posted = pending_excel_header_ref.current;
@@ -8152,12 +8496,22 @@ export function App(): React.JSX.Element {
      * wait; a result that needs a reload keeps the fence up; anything else ends
      * the request, and a refusal ends the whole queue.
      */
-    header_result_handler_ref.current = (result) => {
+    header_result_handler_ref.current = (result, delivery) => {
         const in_flight = header_in_flight_ref.current;
         header_in_flight_ref.current = null;
         if (in_flight === null) return 'report';
+        const run = header_run_ref.current;
+        const replaying = run?.replay !== undefined;
+        // A replay answers for itself: none of a gesture's status lines or
+        // warnings are shown for it.
+        const report = replaying ? 'handled' as const : 'report' as const;
+        if (run !== null) run.last_delivery = delivery;
         if (result.reloadRequired === true) {
             header_reload_required_ref.current = true;
+            // What changed before this is recorded; a replay's entry stays,
+            // and the reload message below is what the person is told.
+            if (run !== null) run.failed ??= { silent: true };
+            end_header_run();
             replace_excel_header_queue(null);
             set_excel_header_status('Reload this window to finish the header row change.');
             host_bridge.postMessage({
@@ -8167,9 +8521,16 @@ export function App(): React.JSX.Element {
             });
             return 'handled';
         }
+        // A replay answered `recovered` with no change: the host cannot say
+        // whether this request wrote anything. Asking again is right either
+        // way. The same target, applied to the durable state as it now is,
+        // changes nothing if the first write was in fact stored and does the
+        // work if it was not, and the answer to that request says which.
+        const unsettled_replay = replaying
+            && result.outcome === 'recovered'
+            && result.change === undefined;
         if (
-            result.outcome === 'rejected'
-            && result.transient === true
+            ((result.outcome === 'rejected' && result.transient === true) || unsettled_replay)
             && in_flight.queue.retries < HEADER_TRANSIENT_RETRIES
             && (in_flight.queue.header_row === undefined
                 || generation_ref.current === in_flight.queue.generation)
@@ -8186,11 +8547,27 @@ export function App(): React.JSX.Element {
             return 'retry';
         }
         if (result.outcome === 'rejected') {
-            lower_header_fence();
-            return 'report';
+            if (run !== null) {
+                run.failed ??= { reason: result.error ?? 'The header row was not updated.' };
+            }
+            finish_header_queue();
+            return report;
         }
-        if ((excel_header_queue_ref.current?.sheets.length ?? 0) === 0) lower_header_fence();
-        return 'report';
+        if (run !== null) {
+            if (result.change !== undefined) {
+                // The write was committed, and this is what it changed.
+                run.landed += 1;
+                const delta = header_view_delta(in_flight.worksheet, result.change);
+                if (delta !== undefined) run.changes.push(delta);
+            } else if (replaying) {
+                // Still `recovered` with no change after the retries. The
+                // queue goes on to its remaining sheets, as after any
+                // `recovered`; the entry will stay.
+                run.failed ??= { wait: 'refreshing' };
+            }
+        }
+        if ((excel_header_queue_ref.current?.sheets.length ?? 0) === 0) finish_header_queue();
+        return report;
     };
 
     /**
@@ -8198,19 +8575,17 @@ export function App(): React.JSX.Element {
      * can't carry, then queue the request. The drain folds an open editor and
      * raises the header fence once earlier admitted work has finished.
      */
-    const enqueue_excel_header_change = useCallback((request: {
-        readonly enabled: boolean;
-        readonly unhide_all?: boolean;
-        readonly header_row?: number;
-        readonly sheets: readonly number[];
-        readonly grid_focus_sheet_index?: number;
-    }): boolean => {
+    const enqueue_excel_header_change = useCallback((request: HeaderQueueRequest): boolean => {
         if (
             excel_header_queue_ref.current !== null
             || pending_excel_header_ref.current !== null
             || header_fence_ref.current
         ) return false;
         const sheets = meta_ref.current?.sheets ?? [];
+        const { replay } = request;
+        // The refusals that depend only on the worksheet's unsaved changes,
+        // which need no round trip: a layout conflict notice, a live new
+        // column. The host runs the full rebase in the write.
         for (const sheet_index of request.sheets) {
             const sheet = sheets[sheet_index];
             if (sheet === undefined) continue;
@@ -8224,7 +8599,13 @@ export function App(): React.JSX.Element {
             if (refusal !== undefined) {
                 host_bridge.postMessage({
                     type: 'showWarning',
-                    message: `Could not change the header row: ${refusal}`,
+                    message: replay === undefined
+                        ? `Could not change the header row: ${refusal}`
+                        : view_replay_refusal_warning(
+                            replay.direction,
+                            replay.entry.action.label,
+                            refusal,
+                        ),
                 });
                 return false;
             }
@@ -8232,24 +8613,43 @@ export function App(): React.JSX.Element {
         const grid_focus_sheet = request.grid_focus_sheet_index === undefined
             ? undefined
             : sheets[request.grid_focus_sheet_index];
+        header_run_ref.current = {
+            ...(replay === undefined ? {} : { replay }),
+            ...(request.worksheet === undefined ? {} : { worksheet: request.worksheet }),
+            changes: [],
+            landed: 0,
+            skipped: new Set(replay?.skipped ?? []),
+        };
+        if (replay !== undefined) {
+            // A replay raises the header fence at once: what the drain does
+            // first for a gesture is already done (the open editor was folded
+            // before the replay started, and it did not start while keys
+            // were owed to a cell), and from this instant no edit may be
+            // recorded and no cell opens.
+            header_fence_ref.current = true;
+            set_header_fence(true);
+        }
         replace_excel_header_queue({
             enabled: request.enabled,
             unhide_all: request.unhide_all === true,
             ...(request.header_row === undefined ? {} : { header_row: request.header_row }),
             sheets: request.sheets.flatMap((sheet_index) => {
                 const sheet = sheets[sheet_index];
-                return sheet === undefined ? [] : [excel_header_queue_sheet(sheet)];
+                return sheet === undefined
+                    ? []
+                    : [excel_header_queue_sheet(sheet, request.targets?.get(sheet_index))];
             }),
             ...(grid_focus_sheet === undefined
                 ? {}
                 : { grid_focus_sheet: excel_header_queue_sheet(grid_focus_sheet) }),
             generation: generation_ref.current,
             retries: 0,
-            fenced: false,
+            fenced: replay !== undefined,
             flushed: false,
         });
         return true;
     }, [replace_excel_header_queue]);
+    enqueue_excel_header_change_ref.current = enqueue_excel_header_change;
 
     const handle_toggle_excel_header = useCallback(() => {
         const header = meta?.sheets[active_sheet_index]?.excelFirstRowHeader;

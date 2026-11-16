@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import {
     MAX_PERSISTED_HIDDEN_ROWS,
+    excel_header_side,
+    type ExcelHeaderChange,
     type FilterEntry,
     type SheetTransformState,
 } from '../types';
@@ -13,12 +15,16 @@ import {
     columns_view_step,
     row_heights_replay_target,
     row_heights_view_step,
+    header_replay_target,
+    header_step_label,
+    header_view_delta,
     overtaken_transform_step,
     transform_replay_target,
     transform_slices_equal,
     transform_view_step,
     type ColumnWidthsViewDelta,
     type ColumnsViewDelta,
+    type HeaderViewDelta,
     type RowHeightsViewDelta,
     type TransformViewDelta,
 } from '../webview/view-history-model';
@@ -492,5 +498,144 @@ describe('a row-height write as a view step', () => {
             rows: [],
             skipped: ['rows-gone'],
         });
+    });
+});
+
+describe('the Header Row as a view step', () => {
+    const change = (partial: Partial<ExcelHeaderChange>): ExcelHeaderChange => ({
+        before: { mode: 'off' },
+        after: { mode: 'off' },
+        hidden: [],
+        shown: [],
+        ...partial,
+    });
+    const delta = (partial: Partial<ExcelHeaderChange>): HeaderViewDelta =>
+        header_view_delta(SHEET, change(partial))!;
+    const sheet = (hiddenRows: readonly number[] = [], sourceRowCount = 10) =>
+        ({ sourceRowCount, hiddenRows });
+
+    it('reads a side from each shape of the header metadata', () => {
+        expect(excel_header_side({ mode: 'auto', active: true })).toEqual({ mode: 'auto', row: 0 });
+        expect(excel_header_side({ mode: 'auto', active: false })).toEqual({ mode: 'auto' });
+        expect(excel_header_side({ mode: 'on', active: true, sourceRow: 3 })).toEqual({ mode: 'on', row: 3 });
+        expect(excel_header_side({ mode: 'on', active: true })).toEqual({ mode: 'on', row: 0 });
+        expect(excel_header_side({ mode: 'on', active: false })).toEqual({ mode: 'on' });
+        expect(excel_header_side({ mode: 'off', active: false })).toEqual({ mode: 'off' });
+    });
+
+    it('is no step when the write changed nothing', () => {
+        expect(header_view_delta(SHEET, change({}))).toBeUndefined();
+        expect(header_view_delta(SHEET, change({
+            before: { mode: 'on', row: 2 }, after: { mode: 'on', row: 2 },
+        }))).toBeUndefined();
+    });
+
+    it('holds both sides whole and the hidden rows as members', () => {
+        expect(delta({
+            before: { mode: 'auto', row: 0 },
+            after: { mode: 'on', row: 3 },
+            hidden: [2, 0, 1],
+        })).toEqual({
+            worksheet: SHEET,
+            slice: 'header',
+            before: { mode: 'auto', row: 0 },
+            after: { mode: 'on', row: 3 },
+            hiddenRows: { hidden: [0, 1, 2], shown: [] },
+        });
+        expect(delta({ before: { mode: 'on', row: 0 }, after: { mode: 'off' } }).hiddenRows)
+            .toBeUndefined();
+    });
+
+    it('labels each gesture', () => {
+        const use = delta({ after: { mode: 'on', row: 2 }, hidden: [0, 1] });
+        const off = delta({ before: { mode: 'on', row: 0 } });
+        const unhide = delta({ before: { mode: 'on', row: 2 }, shown: [0, 1] });
+        expect(header_step_label([use])).toBe('Use row 3 as header');
+        expect(header_step_label([delta({ after: { mode: 'on', row: 0 } })])).toBe('Use row 1 as header');
+        expect(header_step_label([off])).toBe('Turn off header row');
+        expect(header_step_label([unhide])).toBe('Unhide rows');
+        expect(header_step_label([use, use])).toBe('Use first row as header on all sheets');
+        expect(header_step_label([off, off])).toBe('Show first row as data on all sheets');
+        expect(header_step_label([use, off])).toBe('Change header row');
+    });
+
+    it('undoing "use row as header" asks for the side before and shows the rows it hid', () => {
+        const step = delta({ before: { mode: 'off' }, after: { mode: 'on', row: 2 }, hidden: [0, 1] });
+        expect(header_replay_target(step, 'undo', sheet([0, 1]))).toEqual({
+            target: { mode: 'off', hideRows: [], showRows: [0, 1] },
+            skipped: [],
+        });
+        expect(header_replay_target(step, 'redo', sheet())).toEqual({
+            target: { mode: 'on', headerSourceRow: 2, hideRows: [0, 1], showRows: [] },
+            skipped: [],
+        });
+    });
+
+    it('never compares: the target is the same whatever the window shows', () => {
+        const step = delta({ before: { mode: 'off' }, after: { mode: 'on', row: 2 }, hidden: [0, 1] });
+        const already = header_replay_target(step, 'undo', sheet());
+        expect(already).toEqual(header_replay_target(step, 'undo', sheet([0, 1])));
+        expect(already.target).toBeDefined();
+    });
+
+    it('an automatic side restores the detector and names no row', () => {
+        const step = delta({ before: { mode: 'auto', row: 0 }, after: { mode: 'off' } });
+        const { target } = header_replay_target(step, 'undo', sheet());
+        expect(target).toEqual({ mode: 'auto', hideRows: [], showRows: [] });
+        expect(target && 'headerSourceRow' in target).toBe(false);
+        // Its row is the detector's, so a worksheet with no rows left does not skip it.
+        expect(header_replay_target(step, 'undo', sheet([], 0)))
+            .toEqual({ target: { mode: 'auto', hideRows: [], showRows: [] }, skipped: [] });
+    });
+
+    it('undoing Unhide all puts the header and every hidden row back in one target', () => {
+        const step = delta({ before: { mode: 'on', row: 3 }, after: { mode: 'off' }, shown: [0, 1, 2, 7] });
+        expect(header_replay_target(step, 'undo', sheet()).target).toEqual({
+            mode: 'on', headerSourceRow: 3, hideRows: [0, 1, 2, 7], showRows: [],
+        });
+        expect(header_replay_target(step, 'redo', sheet([0, 1, 2, 7])).target).toEqual({
+            mode: 'off', hideRows: [], showRows: [0, 1, 2, 7],
+        });
+    });
+
+    it('an explicit side with no row is asked for as null, with its rows', () => {
+        const step = delta({ before: { mode: 'on' }, after: { mode: 'off' }, shown: [0, 1, 2] });
+        expect(header_replay_target(step, 'undo', sheet([], 3))).toEqual({
+            target: { mode: 'on', headerSourceRow: null, hideRows: [0, 1, 2], showRows: [] },
+            skipped: [],
+        });
+        // The worksheet has a row the step never knew: "on, with no row" cannot be had.
+        expect(header_replay_target(step, 'undo', sheet([], 4)))
+            .toEqual({ skipped: ['header-unavailable'] });
+        // With no rows to change (the header was turned off over hidden rows).
+        const toggled = delta({ before: { mode: 'on' }, after: { mode: 'off' } });
+        expect(header_replay_target(toggled, 'undo', sheet([0, 1, 2], 3)).target)
+            .toEqual({ mode: 'on', headerSourceRow: null, hideRows: [], showRows: [] });
+    });
+
+    it('skips the worksheet when the row it used as the header is gone', () => {
+        const step = delta({ before: { mode: 'on', row: 8 }, after: { mode: 'off' } });
+        expect(header_replay_target(step, 'undo', sheet([], 5)))
+            .toEqual({ skipped: ['header-row-gone'] });
+        expect(header_replay_target(step, 'redo', sheet([], 5)).target)
+            .toEqual({ mode: 'off', hideRows: [], showRows: [] });
+    });
+
+    it('leaves out rows to hide that the worksheet no longer has', () => {
+        const step = delta({ before: { mode: 'on', row: 1 }, after: { mode: 'off' }, shown: [0, 6, 9] });
+        expect(header_replay_target(step, 'undo', sheet([], 7))).toEqual({
+            target: { mode: 'on', headerSourceRow: 1, hideRows: [0, 6], showRows: [] },
+            skipped: ['rows-gone'],
+        });
+    });
+
+    it('skips the worksheet when more rows would be hidden than can be stored', () => {
+        const count = MAX_PERSISTED_HIDDEN_ROWS + 10;
+        const step = delta({
+            before: { mode: 'on', row: MAX_PERSISTED_HIDDEN_ROWS + 1 },
+            after: { mode: 'off' },
+        });
+        expect(header_replay_target(step, 'undo', sheet([], count)))
+            .toEqual({ skipped: ['too-many-hidden'] });
     });
 });

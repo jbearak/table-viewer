@@ -1,6 +1,6 @@
 /**
- * View steps: a sort, a filter, hidden rows, hidden columns, column widths, or
- * row heights as one undoable gesture.
+ * View steps: a sort, a filter, hidden rows, hidden columns, column widths,
+ * row heights, or the Header Row as one undoable gesture.
  *
  * A view step stores only what its gesture changed. Sort and filters are small
  * ordered lists, stored whole, before and after. Hidden rows and hidden
@@ -24,12 +24,24 @@
  * stale (another window's write is not sent to it), and only the host knows
  * which source rows a row gesture touched. Sizes are positional and have no
  * schema: nothing re-associates a stored width when column names change.
+ *
+ * The Header Row is a step too. Its two sides are stored whole (one small
+ * value per worksheet) and the hidden rows that changed with it as members,
+ * both from what the host says its write changed. It has no schema: a header
+ * change is what changes the schema. See `header_replay_target`.
  */
 
+import {
+    first_non_hidden_source_row,
+    hidden_rows_after_header_change,
+} from '../header-hidden-rows';
 import {
     MAX_PERSISTED_HIDDEN_ROWS,
     type ColumnWidthChange,
     type ColumnWidthsSheetRequest,
+    type ExcelHeaderChange,
+    type ExcelHeaderSide,
+    type ExcelHeaderTarget,
     type FilterEntry,
     type RowHeightsChange,
     type SourceRowHeightRun,
@@ -96,11 +108,22 @@ export interface RowHeightsViewDelta {
     readonly before: readonly SourceRowHeightRun[];
 }
 
+/** The Header Row of one worksheet, and the hidden rows that changed with it. */
+export interface HeaderViewDelta {
+    readonly worksheet: WorksheetTarget;
+    readonly slice: 'header';
+    readonly before: ExcelHeaderSide;
+    readonly after: ExcelHeaderSide;
+    /** Canonical source rows the change hid and showed. */
+    readonly hiddenRows?: MemberTransition;
+}
+
 export type ViewHistoryDelta =
     | TransformViewDelta
     | ColumnsViewDelta
     | ColumnWidthsViewDelta
-    | RowHeightsViewDelta;
+    | RowHeightsViewDelta
+    | HeaderViewDelta;
 
 /** A view gesture ready to record: its Edit-menu label and its one change. */
 export interface ViewStep {
@@ -119,7 +142,9 @@ export type ViewSkipReason =
     | 'too-many-hidden'
     | 'columns-gone'
     | 'sheets-gone'
-    | 'too-many-heights';
+    | 'too-many-heights'
+    | 'header-unavailable'
+    | 'header-row-gone';
 
 type TransformRules = Pick<SheetTransformState, 'sort' | 'filters' | 'hiddenRows'>;
 
@@ -296,9 +321,12 @@ const SKIP_ORDER: readonly ViewSkipReason[] = [
     'sheets-gone',
     'columns-gone',
     'too-many-heights',
+    'header-unavailable',
+    'header-row-gone',
 ];
 
-function ordered_skips(found: ReadonlySet<ViewSkipReason>): ViewSkipReason[] {
+/** Skip reasons in the order they are said, each once. */
+export function ordered_skips(found: ReadonlySet<ViewSkipReason>): ViewSkipReason[] {
     return SKIP_ORDER.filter((reason) => found.has(reason));
 }
 
@@ -557,4 +585,135 @@ export function row_heights_replay_target(
         });
     }
     return { rows, skipped: gone ? ['rows-gone'] : [] };
+}
+
+// ---- The Header Row ----
+
+/**
+ * The header change of one worksheet as a step's change, from what the host
+ * says its write changed; undefined when it changed nothing.
+ */
+export function header_view_delta(
+    worksheet: WorksheetTarget,
+    change: ExcelHeaderChange,
+): HeaderViewDelta | undefined {
+    const hidden = sorted_unique(change.hidden);
+    const shown = sorted_unique(change.shown);
+    const rows_changed = hidden.length > 0 || shown.length > 0;
+    if (
+        change.before.mode === change.after.mode
+        && change.before.row === change.after.row
+        && !rows_changed
+    ) return undefined;
+    const side = (from: ExcelHeaderSide): ExcelHeaderSide => (
+        from.row === undefined ? { mode: from.mode } : { mode: from.mode, row: from.row }
+    );
+    return {
+        worksheet,
+        slice: 'header',
+        before: side(change.before),
+        after: side(change.after),
+        ...(rows_changed ? { hiddenRows: { hidden, shown } } : {}),
+    };
+}
+
+/**
+ * The Edit-menu label of a header step, from its changes, one per worksheet.
+ *
+ * The two all-sheets labels are the menu items' own words. "Unhide rows" is
+ * the label the same button records when no header is in the way.
+ */
+export function header_step_label(deltas: readonly HeaderViewDelta[]): string {
+    if (deltas.length === 1) {
+        const [delta] = deltas;
+        if (delta!.after.row !== undefined) return `Use row ${delta!.after.row + 1} as header`;
+        return (delta!.hiddenRows?.shown.length ?? 0) > 0 ? 'Unhide rows' : 'Turn off header row';
+    }
+    if (deltas.length > 1 && deltas.every((delta) => delta.after.row !== undefined)) {
+        return 'Use first row as header on all sheets';
+    }
+    if (deltas.length > 1 && deltas.every((delta) => delta.after.row === undefined)) {
+        return 'Show first row as data on all sheets';
+    }
+    return 'Change header row';
+}
+
+/** What replay needs to know about a worksheet as this window holds it now. */
+export interface HeaderReplaySheet {
+    /** Source rows. */
+    readonly sourceRowCount: number;
+    /** The hidden rows this window holds for the worksheet. They can be stale. */
+    readonly hiddenRows: readonly number[];
+}
+
+export interface HeaderReplayTarget {
+    /** What to ask the host for; absent when the whole worksheet is skipped. */
+    readonly target?: ExcelHeaderTarget;
+    readonly skipped: readonly ViewSkipReason[];
+}
+
+/**
+ * The header state a header step's replay asks for on one worksheet.
+ *
+ * Member by member, from the step alone, and never compared with what the
+ * window shows: the side wanted is the step's other side, whole; the rows it
+ * hid are shown and the rows it showed are hidden. Whether anything is left
+ * to change is the host's to say, because this window's hidden rows can be
+ * stale. A row goes with an explicit header only: an automatic side restores
+ * the detector's choice, and an explicit side with no row ("on, with every row
+ * hidden") is asked for as `null`.
+ *
+ * Skipped, so that a refusal by the host cannot park the entry over something
+ * this window can see:
+ *  - rows to hide that the worksheet no longer has are left out;
+ *  - the row the step used as the Header Row is no longer in the worksheet;
+ *  - more rows would be hidden than can be stored;
+ *  - "on, with no row" on a worksheet that would be left with a row showing.
+ * The last two are predicted from the hidden rows this window holds. If those
+ * were stale and the host refuses after all, the entry stays with the host's
+ * reason, the host refreshes this window, and the next press predicts from
+ * what is there.
+ */
+export function header_replay_target(
+    delta: HeaderViewDelta,
+    direction: ViewDirection,
+    sheet: HeaderReplaySheet,
+): HeaderReplayTarget {
+    const wanted = direction === 'undo' ? delta.before : delta.after;
+    const { hide, show } = replay_members(
+        delta.hiddenRows ?? { hidden: [], shown: [] },
+        direction,
+    );
+    if (wanted.mode === 'on' && wanted.row !== undefined && wanted.row >= sheet.sourceRowCount) {
+        return { skipped: ['header-row-gone'] };
+    }
+    const skipped = new Set<ViewSkipReason>();
+    const hide_rows = hide.filter((row) => row < sheet.sourceRowCount);
+    if (hide_rows.length !== hide.length) skipped.add('rows-gone');
+    const header_source_row = wanted.mode === 'on' ? wanted.row ?? null : undefined;
+    const left = hidden_rows_after_header_change(sheet.hiddenRows, {
+        hide: hide_rows,
+        show,
+        sourceRowCount: sheet.sourceRowCount,
+        ...(typeof header_source_row === 'number' ? { headerSourceRow: header_source_row } : {}),
+        limit: MAX_PERSISTED_HIDDEN_ROWS,
+    });
+    if (left === undefined) {
+        return { skipped: ordered_skips(skipped.add('too-many-hidden')) };
+    }
+    if (
+        header_source_row === null
+        && first_non_hidden_source_row(sheet.sourceRowCount, left) !== undefined
+    ) {
+        return { skipped: ordered_skips(skipped.add('header-unavailable')) };
+    }
+    return {
+        target: {
+            mode: wanted.mode,
+            ...(header_source_row === undefined ? {} : { headerSourceRow: header_source_row }),
+            hideRows: hide_rows,
+            showRows: [...show],
+        },
+        skipped: ordered_skips(skipped),
+    };
 }
