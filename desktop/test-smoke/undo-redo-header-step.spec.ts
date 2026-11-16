@@ -171,6 +171,8 @@ async function history_after_save(
     page: Page,
     command: 'undo' | 'redo',
     expected: Partial<Shown>,
+    // Messages that may be said and are not this test's subject.
+    beside_the_point: readonly string[] = [],
 ): Promise<void> {
     const try_again = `${command === 'undo' ? 'Undo' : 'Redo'} did not run because the file was refreshing. Try again.`;
     await history(page, command);
@@ -178,7 +180,7 @@ async function history_after_save(
     await expect.poll(async () => {
         for (const dialog of await take_dialogs(app!)) {
             if (dialog.message === try_again) await history(page, command);
-            else said.push(dialog.message ?? '');
+            else if (!beside_the_point.includes(dialog.message ?? '')) said.push(dialog.message ?? '');
         }
         const now = await shown(page);
         const picked: Record<string, unknown> = {};
@@ -750,4 +752,109 @@ test('a header step under a saved edit that was undone says to save first, and g
     await expect.poll(() => saved(file)).toEqual(off_body);
     await history(page, 'undo');
     await expect_shown(page, { headers: ['name', 'qty'], body: FRUIT, undo: 'Undo', redo: 'Redo Turn off header row' });
+});
+
+// The three walks on which a header step waits for a Save. Undoing or redoing
+// an edit that was already saved leaves its cell unsaved against the file, and
+// the host does not carry an unsaved cell onto the header row, off it, or
+// under it. Each step stays where it is, says "Save first", and goes through
+// once the file is saved.
+
+test('header, rename, Save, Undo, Undo: the header step waits while the header row has an unsaved name', async () => {
+    const { file, page } = await open_file('walk-rename.xlsx', workbook(sheet('Data', TITLED)));
+    await use_row_as_header(page, 1);
+    await expect_shown(page, { headers: ['name', 'qty'], body: FRUIT, undo: 'Undo Use row 2 as header' });
+    await choose(await open_column_menu(page, 0), 'Rename column…');
+    const rename = page.getByRole('dialog', { name: 'Rename column' });
+    await rename.getByLabel('Column name').fill('title');
+    await rename.getByRole('button', { name: 'Rename' }).click();
+    await expect(rename).toHaveCount(0);
+    await expect_shown(page, { headers: ['title', 'qty'], undo: 'Undo Rename column' });
+    await save_changes(page);
+    await expect.poll(() => saved(file)).toEqual(['1|2', 'title|qty', ...FRUIT]);
+
+    // The saved name is undone: the header cell is unsaved against the file.
+    // (Where the app says the undone cell went is not what this test is about.)
+    await history_after_save(
+        page,
+        'undo',
+        { headers: ['name', 'qty'], undo: 'Undo Use row 2 as header', redo: 'Redo Rename column' },
+        ['The change was undone, but the affected cells are hidden by the current view.'],
+    );
+    await expect(save_button(page)).toHaveClass(/has-unsaved/);
+
+    await history(page, 'undo');
+    await expect_shown(
+        page,
+        { headers: ['name', 'qty'], body: FRUIT, undo: 'Undo Use row 2 as header', redo: 'Redo Rename column' },
+        ["Can't undo “Use row 2 as header”: Save first: the header row has unsaved changes, "
+            + 'and it would stop being the header row.'],
+    );
+
+    await save_changes(page);
+    await expect.poll(() => saved(file)).toEqual(TITLED_BODY);
+    await history(page, 'undo');
+    await expect_shown(page, { headers: NO_HEADER, body: TITLED_BODY, undo: 'Undo', redo: 'Redo Use row 2 as header' });
+});
+
+test('edit, Save, header, Undo, Undo, Save, Redo, Redo: the header step waits while the row it would use has an unsaved cell', async () => {
+    const { file, page } = await open_file('walk-redo.xlsx', workbook(sheet('Data', TITLED)));
+    await expect_shown(page, { headers: NO_HEADER, body: TITLED_BODY });
+    await type_into_cell(page, 1, 1, 'title');
+    const edited = ['1|2', 'title|qty', ...FRUIT];
+    await save_changes(page);
+    await expect.poll(() => saved(file)).toEqual(edited);
+    await use_row_as_header(page, 1);
+    await expect_shown(page, { headers: ['title', 'qty'], body: FRUIT, undo: 'Undo Use row 2 as header' });
+
+    await history(page, 'undo');
+    await expect_shown(page, { headers: NO_HEADER, body: edited, undo: 'Undo Edit cell' });
+    await history_after_save(page, 'undo', { headers: NO_HEADER, body: TITLED_BODY, undo: 'Undo', redo: 'Redo Edit cell' });
+    // The file goes back to what it was, so the edit, redone, is unsaved.
+    await save_changes(page);
+    await expect.poll(() => saved(file)).toEqual(TITLED_BODY);
+    await history_after_save(page, 'redo', { headers: NO_HEADER, body: edited, undo: 'Undo Edit cell', redo: 'Redo Use row 2 as header' });
+    await expect(save_button(page)).toHaveClass(/has-unsaved/);
+
+    await history(page, 'redo');
+    await expect_shown(
+        page,
+        { headers: NO_HEADER, body: edited, undo: 'Undo Edit cell', redo: 'Redo Use row 2 as header' },
+        ["Can't redo “Use row 2 as header”: Save first: the row that would become the header row "
+            + 'has unsaved changes.'],
+    );
+
+    await save_changes(page);
+    await expect.poll(() => saved(file)).toEqual(edited);
+    await history(page, 'redo');
+    await expect_shown(page, { headers: ['title', 'qty'], body: FRUIT, undo: 'Undo Use row 2 as header', redo: 'Redo' });
+});
+
+test('Unhide all, edit a shown row, Save, Undo, Undo: the step waits while a row it would hide has an unsaved cell', async () => {
+    const { file, page } = await open_file('walk-unhide.xlsx', workbook(sheet('Data', TITLED)));
+    await use_row_as_header(page, 1);
+    await expect_shown(page, { headers: ['name', 'qty'], body: FRUIT });
+    await unhide_all(page);
+    await expect_shown(page, { headers: NO_HEADER, body: TITLED_BODY, undo: 'Undo Unhide rows' });
+    // Row 1 was hidden above the header until now.
+    await type_into_cell(page, 1, 0, '9');
+    const edited = ['9|2', ...TITLED_BODY.slice(1)];
+    await save_changes(page);
+    await expect.poll(() => saved(file)).toEqual(edited);
+
+    await history_after_save(page, 'undo', { headers: NO_HEADER, body: TITLED_BODY, undo: 'Undo Unhide rows', redo: 'Redo Edit cell' });
+    await expect(save_button(page)).toHaveClass(/has-unsaved/);
+
+    await history(page, 'undo');
+    await expect_shown(
+        page,
+        { headers: NO_HEADER, body: TITLED_BODY, undo: 'Undo Unhide rows', redo: 'Redo Edit cell' },
+        ["Can't undo “Unhide rows”: Save first: rows that would be hidden above the header row "
+            + 'have unsaved changes.'],
+    );
+
+    await save_changes(page);
+    await expect.poll(() => saved(file)).toEqual(TITLED_BODY);
+    await history(page, 'undo');
+    await expect_shown(page, { headers: ['name', 'qty'], body: FRUIT, undo: 'Undo Use row 2 as header', redo: 'Redo Unhide rows' });
 });

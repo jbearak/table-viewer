@@ -25538,15 +25538,24 @@ describe('the header row as a step in history', () => {
     // saved and then undone, or redone, leaves its cell unsaved against the
     // file, on a row the header step would turn into the header row, out of
     // it, or hide. The host's rebase refuses; the step waits for a Save.
+    //
+    // The walks themselves run against the real app in
+    // `desktop/test-smoke/undo-redo-header-step.spec.ts`. Here each starts
+    // from the state its walk leaves (a held session, the walk's cell
+    // unsaved, the step above already in Redo) and checks the window's part:
+    // it publishes that cell and waits for the host to hold it, asks for the
+    // exact target, and leaves the step in place on the refusal. The host is
+    // this test, and it answers with what the real rebase says of what the
+    // window published.
     describe('across a Save: a cell left unsaved where the header step would move it', () => {
         const ROW_2: ExcelHeaderChange = {
             before: { mode: 'off' }, after: { mode: 'on', row: 1 }, hidden: [0], shown: [],
         };
 
-        /** As after the Undo or Redo of an edit that had been saved: a held session, one cell unsaved. */
-        async function leave_a_cell_unsaved(post_message: ReturnType<typeof vi.fn>) {
+        /** As after the Undo or Redo of an edit that had been saved: a held session, that cell unsaved. */
+        async function leave_unsaved(post_message: ReturnType<typeof vi.fn>, source_cell: string) {
             await acquire_editing_session(post_message);
-            seed_mounted_store({ '0:0': { value: 'typed', base: 'saved' } });
+            seed_mounted_store({ [source_cell]: { value: 'typed', base: 'saved' } });
             post_message.mockClear();
         }
 
@@ -25557,26 +25566,32 @@ describe('the header row as a step in history', () => {
             moved.notify();
         }
 
-        /** The press: the stores are published, the host says it holds them, and the request goes out. */
+        /**
+         * The press. A session is held, so the stores are published first
+         * (after the Save, the emptied one) and nothing is asked until the
+         * host says it holds them. Answers the request, and what the host's
+         * rebase says of the published changes for this header change.
+         */
         async function press(
             post_message: ReturnType<typeof vi.fn>,
             command: 'undo' | 'redo',
-            unsaved = false,
+            change: { from: number; to: number; hiddenBefore: number[]; hiddenAfter: number[] },
         ) {
             const before = requests(post_message).length;
+            const published_before = posted(post_message, 'pendingEditsChanged').length;
             await (command === 'undo' ? undo() : redo());
-            // With a cell unsaved, the request waits: the host must hold
-            // the cell to judge the header change against it.
-            if (unsaved) expect(requests(post_message)).toHaveLength(before);
-            if (requests(post_message).length === before) {
-                await dispatch_host_message({
-                    type: 'pendingEditsAcknowledged',
-                    editSessionId: 'test-edit-session',
-                    sequence: last_publication_sequence(post_message),
-                });
-            }
+            expect(requests(post_message)).toHaveLength(before);
+            const publications = posted(post_message, 'pendingEditsChanged').slice(published_before);
+            expect(publications.map((message) => message.sheetIndex)).toEqual([0]);
+            const cells = publications[0].edits ?? {};
+            const judged = rebase_pending_edits_for_header({ cells }, { ...change, sourceRowCount: 6 });
+            await dispatch_host_message({
+                type: 'pendingEditsAcknowledged',
+                editSessionId: 'test-edit-session',
+                sequence: publications[0].sequence,
+            });
             expect(requests(post_message)).toHaveLength(before + 1);
-            return requests(post_message).at(-1)!;
+            return { request: requests(post_message).at(-1)!, cells: Object.keys(cells), judged };
         }
 
         /** What a Save leaves: nothing unsaved. */
@@ -25591,16 +25606,23 @@ describe('the header row as a step in history', () => {
             await install_saved_view(post_message);
             record_header('Use row 2 as header', [[0, ROW_2]]);
             record_edit('Rename column');
-            // Saved, then undone: the header cell is unsaved against the file.
+            // Saved, then undone: the header cell, on row 2, is unsaved against the file.
             undone();
-            await leave_a_cell_unsaved(post_message);
+            await leave_unsaved(post_message, '1:0');
+            const back = { from: 2, to: 0, hiddenBefore: [0], hiddenAfter: [] };
 
-            const refused = await press(post_message, 'undo', true);
-            expect(refused.target).toEqual({ mode: 'off', hideRows: [], showRows: [0] });
-            await answer(refused, promoted, {
-                outcome: 'rejected',
-                error: 'Save first: the header row has unsaved changes, and it would stop being the header row.',
-            }, { capabilities: HELD, state: { transforms: [hiding(promoted, [0])] } });
+            const refused = await press(post_message, 'undo', back);
+            expect(refused.cells).toEqual(['1:0']);
+            expect(refused.request.target).toEqual({ mode: 'off', hideRows: [], showRows: [0] });
+            expect(refused.judged).toEqual({
+                ok: false,
+                message: 'Save first: the header row has unsaved changes, and it would stop being the header row.',
+            });
+            if (refused.judged.ok) throw new Error('not refused');
+            await answer(refused.request, promoted, { outcome: 'rejected', error: refused.judged.message }, {
+                capabilities: HELD,
+                state: { transforms: [hiding(promoted, [0])] },
+            });
             await install_saved_view(post_message);
 
             expect(warnings(post_message)).toEqual([
@@ -25613,9 +25635,11 @@ describe('the header row as a step in history', () => {
 
             save();
             post_message.mockClear();
-            const retried = await press(post_message, 'undo');
-            expect(retried.target).toEqual({ mode: 'off', hideRows: [], showRows: [0] });
-            await answer(retried, book([OFF]), {
+            const retried = await press(post_message, 'undo', back);
+            expect(retried.cells).toEqual([]);
+            expect(retried.judged.ok).toBe(true);
+            expect(retried.request.target).toEqual({ mode: 'off', hideRows: [], showRows: [0] });
+            await answer(retried.request, book([OFF]), {
                 change: { before: ROW_2.after, after: ROW_2.before, hidden: [], shown: [0] },
             }, { capabilities: HELD });
             expect(history_labels('undo')).toEqual([]);
@@ -25629,18 +25653,24 @@ describe('the header row as a step in history', () => {
             await open(post_message, book([OFF]));
             record_edit();
             record_header('Use row 2 as header', [[0, ROW_2]]);
-            // Both undone, a Save, and the edit redone: its cell is unsaved again.
+            // Both undone, a Save, and the edit redone: its cell, on row 2, is unsaved again.
             undone();
-            await leave_a_cell_unsaved(post_message);
+            await leave_unsaved(post_message, '1:0');
             expect(history_labels('undo')).toEqual(['Edit cell']);
             expect(history_labels('redo')).toEqual(['Use row 2 as header']);
+            const forward = { from: 0, to: 2, hiddenBefore: [], hiddenAfter: [0] };
 
-            const refused = await press(post_message, 'redo', true);
-            expect(refused.target).toEqual({ mode: 'on', headerSourceRow: 1, hideRows: [0], showRows: [] });
-            await answer(refused, book([OFF]), {
-                outcome: 'rejected',
-                error: 'Save first: the row that would become the header row has unsaved changes.',
-            }, { capabilities: HELD });
+            const refused = await press(post_message, 'redo', forward);
+            expect(refused.cells).toEqual(['1:0']);
+            expect(refused.request.target).toEqual({ mode: 'on', headerSourceRow: 1, hideRows: [0], showRows: [] });
+            expect(refused.judged).toEqual({
+                ok: false,
+                message: 'Save first: the row that would become the header row has unsaved changes.',
+            });
+            if (refused.judged.ok) throw new Error('not refused');
+            await answer(refused.request, book([OFF]), { outcome: 'rejected', error: refused.judged.message }, {
+                capabilities: HELD,
+            });
 
             expect(warnings(post_message)).toEqual([
                 'Can\'t redo “Use row 2 as header”: '
@@ -25652,10 +25682,11 @@ describe('the header row as a step in history', () => {
 
             save();
             post_message.mockClear();
-            const retried = await press(post_message, 'redo');
-            expect(retried.target).toEqual({ mode: 'on', headerSourceRow: 1, hideRows: [0], showRows: [] });
+            const retried = await press(post_message, 'redo', forward);
+            expect(retried.judged.ok).toBe(true);
+            expect(retried.request.target).toEqual({ mode: 'on', headerSourceRow: 1, hideRows: [0], showRows: [] });
             const promoted = book([on(1)]);
-            await answer(retried, promoted, { change: ROW_2 }, {
+            await answer(retried.request, promoted, { change: ROW_2 }, {
                 capabilities: HELD,
                 state: { transforms: [hiding(promoted, [0])] },
             });
@@ -25669,15 +25700,22 @@ describe('the header row as a step in history', () => {
             await open(post_message, book([OFF]));
             record_header('Unhide rows', [[0, ROW_3_UNDONE]]);
             record_edit();
+            // Saved, then undone: the cell on row 1, which the step would hide again, is unsaved.
             undone();
-            await leave_a_cell_unsaved(post_message);
+            await leave_unsaved(post_message, '0:0');
+            const back = { from: 0, to: 3, hiddenBefore: [], hiddenAfter: [0, 1] };
 
-            const refused = await press(post_message, 'undo', true);
-            expect(refused.target).toEqual({ mode: 'on', headerSourceRow: 2, hideRows: [0, 1], showRows: [] });
-            await answer(refused, book([OFF]), {
-                outcome: 'rejected',
-                error: 'Save first: rows that would be hidden above the header row have unsaved changes.',
-            }, { capabilities: HELD });
+            const refused = await press(post_message, 'undo', back);
+            expect(refused.cells).toEqual(['0:0']);
+            expect(refused.request.target).toEqual({ mode: 'on', headerSourceRow: 2, hideRows: [0, 1], showRows: [] });
+            expect(refused.judged).toEqual({
+                ok: false,
+                message: 'Save first: rows that would be hidden above the header row have unsaved changes.',
+            });
+            if (refused.judged.ok) throw new Error('not refused');
+            await answer(refused.request, book([OFF]), { outcome: 'rejected', error: refused.judged.message }, {
+                capabilities: HELD,
+            });
 
             expect(warnings(post_message)).toEqual([
                 'Can\'t undo “Unhide rows”: '
@@ -25689,9 +25727,10 @@ describe('the header row as a step in history', () => {
 
             save();
             post_message.mockClear();
-            const retried = await press(post_message, 'undo');
+            const retried = await press(post_message, 'undo', back);
+            expect(retried.judged.ok).toBe(true);
             const promoted = book([on(2)]);
-            await answer(retried, promoted, { change: ROW_3 }, {
+            await answer(retried.request, promoted, { change: ROW_3 }, {
                 capabilities: HELD,
                 state: { transforms: [hiding(promoted, [0, 1])] },
             });
