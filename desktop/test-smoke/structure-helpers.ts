@@ -195,7 +195,10 @@ export async function install_applied_snapshot_capture(app: ElectronApplication)
 /** The highest file revision the viewer has applied, -1 before any. */
 export async function applied_revision(app: ElectronApplication): Promise<number> {
     const revisions = await app.evaluate(() =>
-        (globalThis as typeof globalThis & AppliedSnapshotGlobals).__tableViewerSmokeAppliedRevisions ?? []);
+        (globalThis as typeof globalThis & AppliedSnapshotGlobals).__tableViewerSmokeAppliedRevisions);
+    if (revisions === undefined) {
+        throw new Error('Call install_applied_snapshot_capture when the app is launched.');
+    }
     return Math.max(-1, ...revisions);
 }
 
