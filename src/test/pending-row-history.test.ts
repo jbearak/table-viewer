@@ -1042,6 +1042,20 @@ describe('layout history arms', () => {
                 .toEqual([{ ...a, viewerRowHeight: 60 }]);
         });
 
+        it('undoes and redoes an inserted Pending Column made wider since, as it does a row', () => {
+            const column = { id: 'wide', header: 'wide', cells: {}, format: { kind: 'none' as const }, createdOrder: 1 };
+            const inserted = planned(insert_columns(state([]), structure_context(), { kind: 'source', sourceColumn: 0 },
+                'after', [column]));
+            const action = recorded({ label: 'Insert column', changes: [inserted.change] });
+            const widened: PendingStructuralChanges = {
+                ...inserted.next,
+                pendingColumns: inserted.next.pendingColumns!.map((entry) => ({ ...entry, viewerWidth: 240 })),
+            };
+            const undone = replay(action, 'undo', widened);
+            expect(undone).toEqual(own_pending_structural_changes(state([])));
+            expect(replay(action, 'redo', undone)).toEqual(inserted.next);
+        });
+
         it('still refuses a row whose content changed', () => {
             const inserted = planned(insert_rows(state([]), structure_context(), { kind: 'source', sourceRow: 0 },
                 'before', ['ins'], template, 1));

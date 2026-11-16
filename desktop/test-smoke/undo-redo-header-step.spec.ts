@@ -165,33 +165,27 @@ async function history(page: Page, command: 'undo' | 'redo', times = 1): Promise
  * watcher's refresh for the save can land while the edit is being replayed,
  * and the host then refuses the replay and says "… did not run because the
  * file was refreshing. Try again." The helper does what the message says.
- * A message in `also_said` is waited for and set aside. Any other message
- * fails, with its text.
+ * Any other message fails, with its text.
  */
 async function history_after_save(
     page: Page,
     command: 'undo' | 'redo',
     expected: Partial<Shown>,
-    // Messages the app says here that are not this test's subject. Each is
-    // waited for, so none can arrive later and be read as something else.
-    also_said: readonly string[] = [],
 ): Promise<void> {
     const try_again = `${command === 'undo' ? 'Undo' : 'Redo'} did not run because the file was refreshing. Try again.`;
     await history(page, command);
     const said: string[] = [];
-    const awaited = new Set(also_said);
     await expect.poll(async () => {
         for (const dialog of await take_dialogs(app!)) {
             const message = dialog.message ?? '';
             if (message === try_again) await history(page, command);
-            else if (also_said.includes(message)) awaited.delete(message);
             else said.push(message);
         }
         const now = await shown(page);
         const picked: Record<string, unknown> = {};
         for (const key of Object.keys(expected) as (keyof Shown)[]) picked[key] = now[key];
-        return { ...picked, dialogs: [...said], awaited: [...awaited] };
-    }).toEqual({ ...expected, dialogs: [], awaited: [] });
+        return { ...picked, dialogs: [...said] };
+    }).toEqual({ ...expected, dialogs: [] });
 }
 
 interface Remembered {
@@ -765,6 +759,27 @@ test('a header step under a saved edit that was undone says to save first, and g
 // under it. Each step stays where it is, says "Save first", and goes through
 // once the file is saved.
 
+test('a saved rename is undone and redone where it can be seen, with no message', async () => {
+    const { file, page } = await open_file('rename-saved.xlsx', workbook(sheet('Data', DETECTED)));
+    await expect_shown(page, { headers: ['name', 'qty'], body: FRUIT, undo: 'Undo', redo: 'Redo' });
+    await choose(await open_column_menu(page, 0), 'Rename column…');
+    const rename = page.getByRole('dialog', { name: 'Rename column' });
+    await rename.getByLabel('Column name').fill('item');
+    await rename.getByRole('button', { name: 'Rename' }).click();
+    await expect(rename).toHaveCount(0);
+    await expect_shown(page, { headers: ['item', 'qty'], undo: 'Undo Rename column' });
+    await save_changes(page);
+    await expect.poll(() => saved(file)).toEqual(['item|qty', ...FRUIT]);
+
+    // The name goes back in the column header, on screen: nothing to say
+    // about cells hidden by the view.
+    await history_after_save(page, 'undo', { headers: ['name', 'qty'], body: FRUIT, undo: 'Undo', redo: 'Redo Rename column' });
+    await expect(save_button(page)).toHaveClass(/has-unsaved/);
+    // A message the Undo said late would be caught here.
+    await history(page, 'redo');
+    await expect_shown(page, { headers: ['item', 'qty'], body: FRUIT, undo: 'Undo Rename column', redo: 'Redo' });
+});
+
 test('header, rename, Save, Undo, Undo: the header step waits while the header row has an unsaved name', async () => {
     const { file, page } = await open_file('walk-rename.xlsx', workbook(sheet('Data', TITLED)));
     await use_row_as_header(page, 1);
@@ -779,13 +794,12 @@ test('header, rename, Save, Undo, Undo: the header step waits while the header r
     await expect.poll(() => saved(file)).toEqual(['1|2', 'title|qty', ...FRUIT]);
 
     // The saved name is undone: the header cell is unsaved against the file.
-    // The app also says the undone cell is hidden by the view, every time; the
-    // message is waited for here so that it is not read as the next step's.
+    // The name goes back where it can be seen, so nothing is said; a message
+    // arriving late is caught by the next step's wait, which allows only its own.
     await history_after_save(
         page,
         'undo',
         { headers: ['name', 'qty'], undo: 'Undo Use row 2 as header', redo: 'Redo Rename column' },
-        ['The change was undone, but the affected cells are hidden by the current view.'],
     );
     await expect(save_button(page)).toHaveClass(/has-unsaved/);
 
