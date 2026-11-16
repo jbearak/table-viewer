@@ -19002,6 +19002,86 @@ describe('undo and redo, from the keyboard and the desktop menu', () => {
         }
     });
 
+    it('stages a structural undo that changes only conflicts, from the store where the replay found it', async () => {
+        const { post_message } = await render_app();
+        const meta = make_meta(['Sheet1'], false);
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        await acquire_editing_session(post_message, 'conflict-only-session');
+        const props = grid_shell_mock.latest_props as unknown as GridShellProps;
+        const pending_store = props.pending_row_store!;
+        const conflicts = [{
+            reason: 'ambiguousPendingFormula' as const,
+            pendingRowIds: [],
+            tailRemovalIds: [],
+            formulaCells: [{
+                rowIdentity: { kind: 'source' as const, sourceRow: 0 },
+                sourceColumn: 0,
+            }],
+        }];
+        const with_conflict = { ...pending_store.snapshot(), conflicts };
+        const resolved = { ...with_conflict, conflicts: [] };
+        await act(async () => {
+            expect(pending_store.install({ session_id: 'conflict-only-session' }, resolved)).toBe(true);
+        });
+        // The gesture that resolved the conflict, recorded as its own step.
+        const record = props.history_store!.stage_record({
+            label: 'Edit cell',
+            changes: [{
+                kind: 'pendingRows',
+                delta: {
+                    worksheet: { sheetIndex: 0, sheetName: 'Sheet1' },
+                    before: with_conflict,
+                    after: resolved,
+                },
+            }],
+        });
+        expect(record.commit()).toBe(true);
+        record.notify();
+        post_message.mockClear();
+
+        await undo_via_menu();
+        await vi.waitUntil(() => sent(post_message, 'prepareHistoryReplay') !== undefined);
+        const prepare = sent(post_message, 'prepareHistoryReplay');
+        const structures = prepare.request.structures.map((structure: object) => ({
+            ...structure,
+            resolvedSheetIndex: 0,
+        }));
+        await dispatch_host_message({
+            type: 'historyReplayPrepared',
+            prepared: {
+                requestId: prepare.request.requestId,
+                replayId: prepare.request.replayId,
+                leaseId: 'conflict-only-lease',
+                focusSheetIndex: 0,
+                focus: prepare.request.focus,
+                cells: [],
+                structures,
+            },
+        });
+        const commit = sent(post_message, 'commitHistoryReplay');
+        await dispatch_host_message({
+            type: 'historyReplayCommitted',
+            committed: {
+                requestId: commit.request.requestId,
+                replayId: commit.request.replayId,
+                leaseId: commit.request.leaseId,
+                mutationId: commit.request.mutationId,
+                sourceGeneration: 1,
+                cells: [],
+                structures,
+                focusSheetIndex: 0,
+                focus: prepare.request.focus,
+                displayFocus: null,
+            },
+        });
+
+        // The conflict is back, with history moved.
+        expect(pending_store.snapshot().conflicts).toEqual(conflicts);
+        expect(props.history_store!.snapshot().undoStack).toEqual([]);
+    });
+
     it('routes structural-only undo and redo through the host transaction', async () => {
         const { post_message } = await render_app();
         const meta = make_meta(['Sheet1', 'Sheet2'], false);

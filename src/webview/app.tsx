@@ -2557,17 +2557,20 @@ export function App(): React.JSX.Element {
                     desired: { ...current, conflicts: accepted.desiredConflicts },
                 });
             } else {
-                const current = JSON.stringify(
-                    registry.pending_rows_for_sheet(accepted.resolvedSheetIndex).snapshot(),
-                );
+                const store = registry.pending_rows_for_sheet(accepted.resolvedSheetIndex).snapshot();
+                const current = JSON.stringify(store);
                 // Already in place stages nothing, as for a host-derived arm:
                 // exactly, or with conflicts the host computed since (a
                 // delivery made from the written state, before this answer or
                 // before an answer re-sent after a lost one). Conflicts kept.
+                // Not a store still where the replay found it: an arm that
+                // changes only conflicts would read as in place there.
                 if (current === JSON.stringify(accepted.desired)) continue;
-                const store = registry.pending_rows_for_sheet(accepted.resolvedSheetIndex).snapshot();
-                if (JSON.stringify({ ...store, conflicts: accepted.desired.conflicts })
-                    === JSON.stringify(accepted.desired)) continue;
+                if (
+                    current !== JSON.stringify(accepted.expected)
+                    && JSON.stringify({ ...store, conflicts: accepted.desired.conflicts })
+                        === JSON.stringify(accepted.desired)
+                ) continue;
                 if (view_moved && current !== JSON.stringify(accepted.expected)) {
                     // A delivery recomputed only the conflicts: the replay
                     // lands, with the conflicts the host has now.

@@ -7726,7 +7726,12 @@ export function attach_viewer(
                         void (replay === undefined
                             ? Promise.resolve()
                             : replay.then(() => undefined, () => undefined))
-                            .then(() => refresh_session_state_material())
+                            .then(async () => {
+                                // The wait can outlast the panel: a disposed
+                                // one reads and touches nothing.
+                                if (disposed) return;
+                                await refresh_session_state_material();
+                            })
                             .then(() => {
                                 if (!disposed) session.deliver_current_material();
                             }, (refresh_error: unknown) => {
