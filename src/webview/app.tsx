@@ -274,6 +274,7 @@ import {
 } from './history-menu-projection';
 import {
     history_focus_request,
+    replay_focus_is_shown_header,
     type HistoryFocusOutcome,
     type PendingHistoryFocus,
 } from './history-focus-model';
@@ -6778,6 +6779,20 @@ export function App(): React.JSX.Element {
             && accepted.entry.action.changes.every((change) => (
                 is_structural_history_change(change)
             ));
+        // A change to a Header Row has no display row: the row is the column
+        // headers. Where one of them is on screen the change is in view, and
+        // the grid keeps the keyboard as it does after a structural replay.
+        const focus_sheet = meta_ref.current?.sheets[accepted.committed.focusSheetIndex];
+        const landed_in_shown_header = display_focus === null
+            && focus_sheet !== undefined
+            && replay_focus_is_shown_header(
+                accepted.committed.focus,
+                focus_sheet,
+                hidden_source_columns(
+                    state_ref.current.columnVisibility?.[accepted.committed.focusSheetIndex],
+                    focus_sheet.columnCount,
+                ),
+            );
         if (display_focus !== null) {
             const request = history_focus_request(
                 history_focus_sequence_ref.current += 1,
@@ -6789,7 +6804,7 @@ export function App(): React.JSX.Element {
             );
             history_focus_ref.current = request;
             set_history_focus(request);
-        } else if (!structural_only) {
+        } else if (!structural_only && !landed_in_shown_header) {
             // Every touched row is filtered out of the view. The replay succeeded;
             // there is simply nowhere truthful for the cursor to go.
             host_bridge.postMessage({

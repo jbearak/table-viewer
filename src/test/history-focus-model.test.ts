@@ -6,6 +6,7 @@ import {
     history_flash_covers,
     history_flash_damage,
     history_focus_request,
+    replay_focus_is_shown_header,
     resolve_history_focus,
     type HistoryFocusView,
     type PendingHistoryFocus,
@@ -162,5 +163,42 @@ describe('history_focus_request', () => {
             mappingGeneration: 2,
         });
         expect(Object.isFrozen(built)).toBe(true);
+    });
+});
+
+describe('replay_focus_is_shown_header', () => {
+    const focus = (row_start: number, row_end: number, column_start = 1, column_end = 1) => ({
+        sourceRowStart: row_start,
+        sourceRowEnd: row_end,
+        sourceColumnStart: column_start,
+        sourceColumnEnd: column_end,
+    });
+    const header = (active: boolean, sourceRow?: number) => ({
+        excelFirstRowHeader: { active, ...(sourceRow === undefined ? {} : { sourceRow }) },
+    });
+
+    it('is the header row of a sheet whose header is on, with its column shown', () => {
+        expect(replay_focus_is_shown_header(focus(0, 0), header(true), [])).toBe(true);
+        expect(replay_focus_is_shown_header(focus(2, 2), header(true, 2), [])).toBe(true);
+    });
+
+    it('is not a row of data', () => {
+        expect(replay_focus_is_shown_header(focus(1, 1), header(true), [])).toBe(false);
+        expect(replay_focus_is_shown_header(focus(0, 0), header(true, 2), [])).toBe(false);
+        // The header row and a row under it.
+        expect(replay_focus_is_shown_header(focus(0, 1), header(true), [])).toBe(false);
+    });
+
+    it('is not row 0 where the header is off, or the sheet has none', () => {
+        expect(replay_focus_is_shown_header(focus(0, 0), header(false), [])).toBe(false);
+        expect(replay_focus_is_shown_header(focus(0, 0), {}, [])).toBe(false);
+        expect(replay_focus_is_shown_header(focus(0, 0), undefined, [])).toBe(false);
+    });
+
+    it('needs one of its columns on screen', () => {
+        expect(replay_focus_is_shown_header(focus(0, 0), header(true), [1])).toBe(false);
+        expect(replay_focus_is_shown_header(focus(0, 0, 1, 2), header(true), [1])).toBe(true);
+        expect(replay_focus_is_shown_header(focus(0, 0, 1, 2), header(true), [1, 2])).toBe(false);
+        expect(replay_focus_is_shown_header(focus(0, 0), header(true), [0, 2])).toBe(true);
     });
 });

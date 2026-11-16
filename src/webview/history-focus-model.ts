@@ -63,6 +63,38 @@ export interface HistoryFocusView {
 }
 
 /**
+ * Whether a replay landed in column headers that are on screen: every row it
+ * touched on its focus sheet is that worksheet's Header Row, and at least one
+ * of the columns it touched is not hidden.
+ *
+ * The host answers such a replay with no display focus, because a Header Row
+ * is not a row of the body. That is not "hidden by the current view": the
+ * name changed where the person can see it. A header whose every column is
+ * hidden is not on screen, the rule `resolve_history_focus` applies to a focus
+ * it can place.
+ */
+export function replay_focus_is_shown_header(
+    focus: {
+        readonly sourceRowStart: number;
+        readonly sourceRowEnd: number;
+        readonly sourceColumnStart: number;
+        readonly sourceColumnEnd: number;
+    },
+    sheet: { readonly excelFirstRowHeader?: { readonly active?: boolean; readonly sourceRow?: number } } | undefined,
+    hidden_columns: readonly number[],
+): boolean {
+    const header = sheet?.excelFirstRowHeader;
+    if (header?.active !== true) return false;
+    const header_row = header.sourceRow ?? 0;
+    if (focus.sourceRowStart !== header_row || focus.sourceRowEnd !== header_row) return false;
+    const hidden = new Set(hidden_columns);
+    for (let column = focus.sourceColumnStart; column <= focus.sourceColumnEnd; column += 1) {
+        if (!hidden.has(column)) return true;
+    }
+    return false;
+}
+
+/**
  * The display region a focus request names in the view the renderer holds now.
  *
  * Columns are projected HERE and not by the host: column visibility is

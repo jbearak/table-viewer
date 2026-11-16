@@ -84,27 +84,63 @@ function without_column_widths(changes: PendingStructuralChanges): PendingStruct
 }
 
 /**
- * A whole-slot snapshot as replay compares it: without column widths (view
- * state) and without the append basis. The basis is the host's record of what
+ * A Pending Row's height is view state in the same way: a drag of its border
+ * is stored on the row and records no history. Replay compares rows without
+ * it, and a row the replay keeps keeps the height it has now.
+ */
+function without_row_height(row: PendingAppendedRow): PendingAppendedRow {
+    if (row.viewerRowHeight === undefined) return row;
+    const { viewerRowHeight: _height, ...rest } = row;
+    return rest;
+}
+
+function with_current_height(
+    row: PendingAppendedRow,
+    current: PendingAppendedRow | undefined,
+): PendingAppendedRow {
+    // A row the replay brings back has no current height: it keeps its own.
+    if (current === undefined) return row;
+    const height = current.viewerRowHeight;
+    if (height === row.viewerRowHeight) return row;
+    const rest = without_row_height(row);
+    return height === undefined ? rest : { ...rest, viewerRowHeight: height };
+}
+
+function without_row_heights(changes: PendingStructuralChanges): PendingStructuralChanges {
+    if (!changes.appendedRows.some((row) => row.viewerRowHeight !== undefined)) return changes;
+    return { ...changes, appendedRows: changes.appendedRows.map(without_row_height) };
+}
+
+/**
+ * A whole-slot snapshot as replay compares it: without column widths and row
+ * heights (view state) and without the append basis. The basis is the host's record of what
  * it admitted, a high-water count and a schema fingerprint, not something the
  * user changed; the host fills in the value a replay installs, so a recorded
  * one that has since been advanced is not a difference.
  */
 function comparable_snapshot(changes: PendingStructuralChanges): PendingStructuralChanges {
-    const { appendBasis: _basis, ...rest } = without_column_widths(changes);
+    const { appendBasis: _basis, ...rest } = without_row_heights(without_column_widths(changes));
     return rest;
 }
 
-/** `desired` with every Pending Column `current` also holds at its current width. */
-function with_current_widths(
+/**
+ * `desired` with every Pending Column `current` also holds at its current
+ * width, and every Pending Row at its current height.
+ */
+function with_current_sizes(
     desired: PendingStructuralChanges,
     current: PendingStructuralChanges,
 ): PendingStructuralChanges {
-    if (desired.pendingColumns === undefined) return desired;
+    const rows_now = new Map(current.appendedRows.map((row) => [row.id, row]));
+    const rows = desired.appendedRows.map((row) => with_current_height(row, rows_now.get(row.id)));
+    const sized: PendingStructuralChanges = rows.some((row, index) => row !== desired.appendedRows[index])
+        ? { ...desired, appendedRows: rows }
+        : desired;
+    if (sized.pendingColumns === undefined) return sized;
     const now = new Map((current.pendingColumns ?? []).map((column) => [column.id, column]));
     return {
-        ...desired,
-        pendingColumns: desired.pendingColumns.map((column) => with_current_width(column, now.get(column.id))),
+        ...sized,
+        pendingColumns: sized.pendingColumns.map((column) => with_current_width(column, now.get(column.id))),
     };
 }
 
@@ -175,7 +211,10 @@ function with_layout_change(
     const desired_layout = direction === 'undo' ? delta.before : delta.after;
     const current_layout = axis === 'rows' ? current.rowLayout : current.columnLayout;
     if (layout_json(current_layout, axis) !== layout_json(expected_layout, axis)) return undefined;
-    const rows = swap_entries(pending_rows(current), delta.pendingRows, direction);
+    const rows = swap_entries<PendingAppendedRow>(pending_rows(current), delta.pendingRows, direction, {
+        comparable: without_row_height,
+        keep: with_current_height,
+    });
     const columns = swap_entries<PendingColumn>(current.pendingColumns ?? [], delta.pendingColumns, direction, {
         comparable: without_column_width,
         keep: with_current_width,
@@ -350,14 +389,17 @@ export function plan_pending_row_history_replay(
             );
             const current = index < 0 ? null : pending_rows(state.current)[index];
             if (
-                !equal(current, expected)
+                !equal(
+                    current === null ? null : without_row_height(current),
+                    expected === null ? null : without_row_height(expected),
+                )
                 || (expected_index !== null && (index < 0 ? null : index) !== expected_index)
             ) {
                 return { kind: 'refused', reason: 'conflict' };
             }
             const next = with_row(
                 state.current,
-                desired,
+                desired === null || current === null ? desired : with_current_height(desired, current),
                 change.delta.pendingRowId,
                 desired_index,
                 change.delta.formatTemplates,
@@ -378,7 +420,7 @@ export function plan_pending_row_history_replay(
             if (!equal(comparable_snapshot(state.current), comparable_snapshot(expected))) {
                 return { kind: 'refused', reason: 'conflict' };
             }
-            state.current = with_current_widths(desired, state.current);
+            state.current = with_current_sizes(desired, state.current);
             continue;
         }
         const expected = direction === 'undo' ? change.delta.after : change.delta.before;

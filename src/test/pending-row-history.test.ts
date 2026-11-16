@@ -11,6 +11,7 @@ import {
     insert_columns,
     insert_rows,
     move_columns,
+    move_rows,
     type StructureResult,
     type WorksheetStructureContext,
 } from '../webview/pending-row-store';
@@ -961,6 +962,101 @@ describe('layout history arms', () => {
             maxActions: 10, maxCells: 1_000, softMaxBytes: small_cost * 2, hardMaxBytes: small_cost * 2,
         });
         expect(outcome.kind).toBe('refused');
+    });
+
+    describe('a Pending Row whose height was dragged since the action', () => {
+        // A row's height is view state, stored on the row with no history
+        // entry of its own, as a Pending Column's width is.
+        const tall = (changes: PendingStructuralChanges, id: string, height: number): PendingStructuralChanges => ({
+            ...changes,
+            appendedRows: changes.appendedRows.map((candidate) => candidate.id === id
+                ? { ...candidate, viewerRowHeight: height }
+                : candidate),
+        });
+        const height_of = (changes: PendingStructuralChanges, id: string) =>
+            changes.appendedRows.find((candidate) => candidate.id === id)?.viewerRowHeight;
+
+        it('undoes an insert, and redoes it without the height', () => {
+            const inserted = planned(insert_rows(state([]), structure_context(), { kind: 'source', sourceRow: 0 },
+                'before', ['ins'], template, 1));
+            const action = recorded({ label: 'Insert row', changes: [inserted.change] });
+            const undone = replay(action, 'undo', tall(inserted.next, 'ins', 60));
+            expect(undone).toEqual(own_pending_structural_changes(state([])));
+            expect(replay(action, 'redo', undone)).toEqual(inserted.next);
+        });
+
+        it('undoes and redoes an append', () => {
+            const a = row('a', 1);
+            const action: HistoryAction = { label: 'Add row', changes: [row_change('a', null, a, null, 0)] };
+            const undone = replay(action, 'undo', tall(state([a]), 'a', 60));
+            expect(undone.appendedRows).toEqual([]);
+            expect(replay(action, 'redo', undone).appendedRows).toEqual([a]);
+        });
+
+        it('keeps the height a row has now through an edit of the row', () => {
+            const before = row('a', 1, 'old');
+            const after = row('a', 1, 'new');
+            const action: HistoryAction = { label: 'Edit cell', changes: [row_change('a', before, after, 0, 0)] };
+            const undone = replay(action, 'undo', tall(state([after]), 'a', 60));
+            expect(undone.appendedRows).toEqual([{ ...before, viewerRowHeight: 60 }]);
+            const redone = replay(action, 'redo', tall(undone, 'a', 44));
+            expect(redone.appendedRows).toEqual([{ ...after, viewerRowHeight: 44 }]);
+        });
+
+        it('undoes and redoes a move, the row keeping the height it has now', () => {
+            const inserted = planned(insert_rows(state([]), structure_context(), { kind: 'source', sourceRow: 0 },
+                'before', ['ins'], template, 1)).next;
+            const moved = planned(move_rows(inserted, structure_context(),
+                [{ kind: 'pending', pendingRowId: 'ins' }], 'end'));
+            const action = recorded({ label: 'Move row', changes: [moved.change] });
+            const undone = replay(action, 'undo', tall(moved.next, 'ins', 60));
+            expect(undone).toEqual(own_pending_structural_changes(tall(inserted, 'ins', 60)));
+            expect(replay(action, 'redo', tall(undone, 'ins', 44)))
+                .toEqual(own_pending_structural_changes(tall(moved.next, 'ins', 44)));
+        });
+
+        it('redoes a delete of a row made taller after the delete was undone', () => {
+            const inserted = planned(insert_rows(state([]), structure_context(), { kind: 'source', sourceRow: 0 },
+                'before', ['ins'], template, 1)).next;
+            const deleted = planned(delete_rows(tall(inserted, 'ins', 30), structure_context(),
+                [{ kind: 'pending', pendingRowId: 'ins' }]));
+            const action = recorded({ label: 'Delete row', changes: [deleted.change] });
+            // Brought back, the row has the height it was deleted with.
+            const undone = replay(action, 'undo', deleted.next);
+            expect(height_of(undone, 'ins')).toBe(30);
+            expect(replay(action, 'redo', tall(undone, 'ins', 60))).toEqual(deleted.next);
+        });
+
+        it('replays a whole-slot change, a row both sides hold keeping the height it has now', () => {
+            const a = row('a', 1, 'kept');
+            const b = row('b', 2, 'dropped');
+            const before = state([a, b]);
+            const after = state([a]);
+            const action: HistoryAction = {
+                label: 'Discard rows',
+                changes: [{ kind: 'pendingRows', delta: { worksheet, before, after } }],
+            };
+            const undone = replay(action, 'undo', tall(after, 'a', 60));
+            expect(undone.appendedRows).toEqual([{ ...a, viewerRowHeight: 60 }, b]);
+            expect(replay(action, 'redo', tall(undone, 'b', 44)).appendedRows)
+                .toEqual([{ ...a, viewerRowHeight: 60 }]);
+        });
+
+        it('still refuses a row whose content changed', () => {
+            const inserted = planned(insert_rows(state([]), structure_context(), { kind: 'source', sourceRow: 0 },
+                'before', ['ins'], template, 1));
+            const action = recorded({ label: 'Insert row', changes: [inserted.change] });
+            const typed: PendingStructuralChanges = {
+                ...tall(inserted.next, 'ins', 60),
+                appendedRows: inserted.next.appendedRows.map((candidate) => ({
+                    ...candidate,
+                    viewerRowHeight: 60,
+                    cells: { 0: { value: 'typed', valueEditOrder: 9 } },
+                })),
+            };
+            expect(plan_pending_row_history_replay(action, 'undo', () => typed))
+                .toEqual({ kind: 'refused', reason: 'conflict' });
+        });
     });
 
     it('keeps admissions alive for rows a layout arm created, discarded, or tombstoned', () => {
