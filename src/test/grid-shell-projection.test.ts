@@ -2338,10 +2338,31 @@ describe('GridShell column projection', () => {
             await render_grid(props({ on_columns_resized, column_projection: all_columns }));
             await double_click_border(1, 150, 77);
             expect(on_columns_resized).toHaveBeenCalledExactlyOnceWith([{ column: 1, width: 77 }]);
-            // A fit that lands on the width the column already has is nothing.
+            // A fit that lands on the width this window shows is still
+            // reported: the host may hold another, and says if nothing changed.
             on_columns_resized.mockClear();
             await double_click_border(1, 150, 150);
-            expect(on_columns_resized).not.toHaveBeenCalled();
+            expect(on_columns_resized).toHaveBeenCalledExactlyOnceWith([{ column: 1, width: 150 }]);
+        });
+
+        it('reports every column of a fanned-out drag, also one already shown at the new width', async () => {
+            // Columns 0 and 1 are selected and shown at 100 and 150; column
+            // 0's border is dragged to 150. Another window may have stored
+            // another width for column 1 since, so it is asked for too.
+            const on_columns_resized = vi.fn();
+            await render_grid(props({ on_columns_resized, column_projection: all_columns }));
+            const { start, resize, end } = callbacks();
+            await act(async () => {
+                start({}, 100, 0);
+                resize({}, 150, 0);
+                resize({}, 150, 1);
+                end({}, 150, 0);
+                end({}, 150, 1);
+            });
+            expect(on_columns_resized).toHaveBeenCalledExactlyOnceWith([
+                { column: 0, width: 150 },
+                { column: 1, width: 150 },
+            ]);
         });
 
         it('takes no fit from one click on a border, however soon after another click', async () => {

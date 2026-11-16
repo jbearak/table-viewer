@@ -11874,11 +11874,14 @@ export function GridShell({
                 set_pending_column_width_drafts((current) => current.size === 0 ? current : new Map());
             }
             if (gesture.press !== undefined && !gesture.moved) return;
+            // Every saved column the gesture sized is reported, whatever
+            // width this window shows for it: its copy can be behind what
+            // another window stored, and a column left out for looking right
+            // here would keep that other width. Whether anything changed, and
+            // so whether there is a step, is the host's answer.
             const source_changes: { column: number; width: number }[] = [];
             for (const [column, draft] of gesture.source) {
-                const width = clamp_column_width(draft);
-                const shown = clamp_column_width(column_widths[column] ?? DEFAULT_COLUMN_WIDTH_PX);
-                if (width !== shown) source_changes.push({ column, width });
+                source_changes.push({ column, width: clamp_column_width(draft) });
             }
             source_changes.sort((left, right) => left.column - right.column);
             const before = pending_store.snapshot();
@@ -11911,7 +11914,7 @@ export function GridShell({
             }
             if (source_changes.length > 0) on_columns_resized(source_changes);
         },
-        [column_widths, edit_session_id, on_columns_resized, pending_store, size_gesture_may_start],
+        [edit_session_id, on_columns_resized, pending_store, size_gesture_may_start],
     );
 
     /**
