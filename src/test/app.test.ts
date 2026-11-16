@@ -18666,17 +18666,34 @@ describe('undo and redo, from the keyboard and the desktop menu', () => {
         expect(sent(post_message, 'showWarning')).toBeUndefined();
     });
 
-    it('lets an edit wait for a restore of the saved view instead of refusing it', async () => {
+    it('lets an edit wait for a restore of the saved view that leaves the view where it is', async () => {
         const { post_message, restore } = await saved_edit_with_restore_pending();
         const props = grid_shell_mock.latest_props as unknown as GridShellProps;
         let granted: Promise<boolean> | undefined;
         await act(async () => { granted = props.on_request_edit_session!(); });
         expect(sent(post_message, 'requestEditSession')).toBeUndefined();
         expect(sent(post_message, 'showWarning')).toBeUndefined();
-        await acknowledge_transform(restore, 3);
+        await acknowledge_transform(restore, 2);
         await vi.waitUntil(() => sent(post_message, 'requestEditSession') !== undefined);
         expect(sent(post_message, 'showWarning')).toBeUndefined();
         void granted;
+    });
+
+    it('refuses an edit, saying why, when the restore it waited for moved the view under it', async () => {
+        const { post_message, restore } = await saved_edit_with_restore_pending();
+        const props = grid_shell_mock.latest_props as unknown as GridShellProps;
+        let granted: boolean | undefined;
+        let asked!: Promise<void>;
+        await act(async () => { asked = props.on_request_edit_session!().then((value) => { granted = value; }); });
+        // A new generation: the grid holding the gesture's keys is remounted.
+        await acknowledge_transform(restore, 3);
+        await act(async () => { await asked; });
+        expect(granted).toBe(false);
+        expect(sent(post_message, 'requestEditSession')).toBeUndefined();
+        expect(post_message.mock.calls.map((call) => call[0] as WebviewMessage)
+            .filter((message) => message.type === 'showWarning')
+            .map((message) => (message as { message: string }).message))
+            .toEqual(['Wait for sorting and filtering to finish before editing.']);
     });
 
     it('reports a refusal on the press that had to acquire a session', async () => {

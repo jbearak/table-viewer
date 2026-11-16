@@ -187,10 +187,11 @@ type DurableRowHeightsProvider = (sheet_names: readonly string[]) => {
 
 /**
  * Told, just before a transform's answer (`transformInstalled` or
- * `transformRefused`) is handed to the webview, which request it answers.
- * The webview may act on the answer before the post's promise settles.
+ * `transformRefused`) is handed to the webview, which request it answers,
+ * and whether it installed. The webview may act on the answer before the
+ * post's promise settles.
  */
-type TransformAnswered = (sheet_index: number, request_id: string) => void;
+type TransformAnswered = (sheet_index: number, request_id: string, installed: boolean) => void;
 
 type RowWindowServed = (
     msg: Extract<WebviewMessage, { type: 'requestRows' }>,
@@ -2164,7 +2165,11 @@ export class ViewerPanelCore {
             || (receiver_epoch !== undefined && receiver_epoch !== this.receiver_epoch)
         ) return Promise.resolve(false);
         if (message.type === 'transformInstalled' || message.type === 'transformRefused') {
-            this.on_transform_answered?.(message.sheetIndex, message.requestId);
+            this.on_transform_answered?.(
+                message.sheetIndex,
+                message.requestId,
+                message.type === 'transformInstalled',
+            );
         }
         return Promise.resolve(this.panel.webview.postMessage(message));
     }

@@ -9728,6 +9728,7 @@ export function App(): React.JSX.Element {
         // for one that joins a request already out.
         if (!quiet && pending_edit_request_ref.current === null) {
             const document = history_document_ref.current;
+            const generation = generation_ref.current;
             const deadline = Date.now() + HISTORY_PRESS_HOLD_MS;
             const restoring = (sheet_index: number, origin?: TransformOrigin) => (
                 origin ?? pending_transform_origins_ref.current[sheet_index]
@@ -9737,6 +9738,16 @@ export function App(): React.JSX.Element {
                 if (wait === 'clear' || wait === 'past-bound') break;
                 if (await wait === 'replaced') return false;
                 if (held()) return true;
+            }
+            // A restore that moved the view remounted the grid that holds the
+            // gesture's keys: nothing is left to open an editor for, so the
+            // edit is refused with the reason, as it was before it could wait.
+            if (generation_ref.current !== generation) {
+                host_bridge.postMessage({
+                    type: 'showWarning',
+                    message: 'Wait for sorting and filtering to finish before editing.',
+                });
+                return false;
             }
         }
         if (held()) return true;

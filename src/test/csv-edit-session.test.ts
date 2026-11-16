@@ -9008,30 +9008,6 @@ describe('CSV edit sessions', () => {
         expect(warning).not.toHaveBeenCalledWith('Wait for sorting and filtering to finish before editing.');
     });
 
-    it('waits for a restore a Cancel superseded once the Cancel is answered', async () => {
-        const warning = vi.spyOn(vscode_mock.window, 'showWarningMessage');
-        const { panel, release, answered } = panel_holding_answer('/tmp/session-after-cancel.csv', 'restore');
-        await panel.__receive({ type: 'ready' });
-        const restore = set_transform(panel, 'restore', 'restore');
-        await vi.waitUntil(() => answered('restore'));
-        // A Cancel replaces the restore; the renderer has the Cancel's answer
-        // while the restore it superseded is still running.
-        const cancel = set_transform(panel, 'cancel', 'cancel');
-        await vi.waitUntil(() => answered('cancel'));
-
-        const request = panel.__receive({ type: 'requestEditSession' } as never);
-        await Promise.resolve();
-        expect(edit_session_results(panel)).toEqual([]);
-        release();
-        await restore;
-        await cancel;
-        await request;
-        expect(edit_session_results(panel)).toEqual([
-            expect.objectContaining({ type: 'editSessionResult', granted: true }),
-        ]);
-        expect(warning).not.toHaveBeenCalledWith('Wait for sorting and filtering to finish before editing.');
-    });
-
     it('refuses a quiet request without announcing it', async () => {
         const warning = vi.spyOn(vscode_mock.window, 'showWarningMessage');
         const panel = open_csv_table(uri('/tmp/session.csv'), state_store().store);

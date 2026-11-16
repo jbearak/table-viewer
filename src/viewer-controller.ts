@@ -3131,23 +3131,24 @@ export function attach_viewer(
     // durable state and holding the transform admission until it ends.
     const answered_transform_authorities = new Set<TransformAuthority>();
     /**
-     * The renderer is being told the answer to `request_id` on `sheet_index`:
-     * that transform, and any earlier one on the sheet it superseded (a
-     * restore a Cancel replaced, still observing its cancellation), are done
-     * as far as the renderer knows. Marked before the post settles, because
-     * the renderer may ask for a session as soon as the answer arrives.
+     * The renderer is being told the answer to `request_id` on `sheet_index`.
+     * That transform is done as far as the renderer knows; and if it
+     * installed, so is every earlier one on the sheet, which its install
+     * superseded (a restore a Cancel replaced, still observing its
+     * cancellation). Marked before the post settles, because the renderer may
+     * ask for a session as soon as the answer arrives.
+     *
+     * A refusal supersedes nothing: an earlier transform is still running. An
+     * answer to a request that was never admitted marks nothing at all. In
+     * both cases the session refusal below stands for what is still running,
+     * as it always has.
      */
-    function note_transform_answered(sheet_index: number, request_id: string): void {
+    function note_transform_answered(sheet_index: number, request_id: string, installed: boolean): void {
         const on_sheet = [...transform_authorities].filter(([message]) => message.sheetIndex === sheet_index);
         const answered_at = on_sheet.findIndex(([message]) => message.requestId === request_id);
-        // An answer to a request that was refused before it was admitted marks
-        // nothing: what is still running on the sheet was not superseded by
-        // work that ran, and a session waiting for it could wait out a whole
-        // sort. The refusal below then stands, as it always has.
         if (answered_at < 0) return;
-        for (const [, authority] of on_sheet.slice(0, answered_at + 1)) {
-            answered_transform_authorities.add(authority);
-        }
+        const answered = installed ? on_sheet.slice(0, answered_at + 1) : [on_sheet[answered_at]!];
+        for (const [, authority] of answered) answered_transform_authorities.add(authority);
     }
     const transform_commit_barriers = new Set<TransformAuthority>();
     let load_seq = 0;
