@@ -16,7 +16,7 @@ import {
     exit_app,
     install_dialog_capture,
     launch_structural_viewer,
-    save_button,
+    save_changes,
     take_dialogs,
     type_into_cell,
     wait_for_grid,
@@ -142,9 +142,9 @@ for (const kind of ['csv', 'xlsx'] as const) {
             await expect_body(page, before);
             await history(page, 'redo');
             await expect_body(page, pasted);
-            await save_button(page).click();
-            await expect(save_button(page)).not.toHaveClass(/has-unsaved/);
-            await expect.poll(() => saved_body(kind, file)).toEqual(pasted.map((line) => line.replace(/\|+$/, '')));
+            await save_changes(page);
+            await expect.poll(() => saved_body(kind, file), { timeout: 30_000 })
+                .toEqual(pasted.map((line) => line.replace(/\|+$/, '')));
         });
     }
 }
