@@ -22647,6 +22647,7 @@ describe('view steps in history', () => {
                 await open(post_message);
                 await resized_column(post_message);
                 await undo();
+                const overtaken = latest_width_write(post_message);
                 post_message.mockClear();
 
                 await reload([undefined], table_meta(), { state: { columnWidths: [{ 1: 180 }] } });
@@ -22658,12 +22659,13 @@ describe('view steps in history', () => {
                 // A late answer to the overtaken request changes nothing.
                 await dispatch_host_message({
                     type: 'columnWidthsChanged',
-                    requestId: 'widths:gone:1',
+                    requestId: overtaken.requestId,
                     applied: true,
-                    sourceGeneration: 1,
-                    change: [],
+                    sourceGeneration: overtaken.sourceGeneration,
+                    change: [{ sheetIndex: 0, columns: [{ column: 1, before: 180, after: null }] }],
                 });
                 expect(undo_labels()).toEqual(['Resize column']);
+                expect(redo_labels()).toEqual([]);
             });
         });
 

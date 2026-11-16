@@ -526,10 +526,10 @@ export function row_height_layers_with(
  * outcome: the host refused it on the accumulated-map bound (`MAX_PERSISTED_ROW_HEIGHTS`).
  * No delivery will ever agree with that layer, because nothing was persisted; so it sits
  * over the projection, showing a height no file holds, until the view generation next
- * moves and the whole overlay is discarded — or until a *newer* layer is answered or
- * agreed with, which retires it along with everything else that old (see above). The user
- * does learn what happened — the host warns, naming the limit — but the row the edit grew
- * keeps its new size on screen meanwhile.
+ * moves and the whole overlay is discarded — or until a *newer* layer is agreed with,
+ * which retires it along with everything else that old (see above). The user does learn
+ * what happened — the host warns, naming the limit — but the row the edit grew keeps its
+ * new size on screen meanwhile.
  *
  * A person's own resize does not leave it: its answer says the write was refused and
  * retires the layer. The row an edit grows is not answered because it is not a gesture:

@@ -14923,11 +14923,11 @@ export function attach_viewer(
              * preview has no business making. A row height changes nothing about row
              * identity or membership — it is layout, in the same class as `columnWidths` and
              * `scrollPosition`, which preview already persists because neither
-             * `setColumnWidths` nor `persist_layout_state` has a preview guard. Refusing here would have made
-             * this PR the first thing to stop layout persisting in preview, and it would
-             * have done it *silently*: the webview still mounts the resize overlay in
-             * preview and still paints the new height optimistically, so the row would have
-             * looked resized until the next delivery quietly reverted it.
+             * `setColumnWidths` nor `persist_layout_state` has a preview guard. Refusing
+             * here would have made this PR the first thing to stop layout persisting in
+             * preview, and it would have done it *silently*: the webview still mounts the
+             * resize overlay in preview and still paints the new height optimistically, so
+             * the row would have looked resized until the next delivery quietly reverted it.
              */
             case 'setRowHeights': {
                 const message = structuredClone(msg);
