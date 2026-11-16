@@ -3911,12 +3911,16 @@ export function App(): React.JSX.Element {
             }
 
             if (msg.type === 'rowHeightsChanged') {
+                // No entry: the row a committed edit grew, which nothing
+                // waits on, or a request a refresh of another source dropped.
+                // Its layer, if one still stands, is retired like any other.
                 const pending = pending_row_resize_requests_ref.current.get(msg.requestId);
-                if (pending === undefined) return;
-                pending_row_resize_requests_ref.current.delete(msg.requestId);
-                sync_view_request_pending();
+                if (pending !== undefined) {
+                    pending_row_resize_requests_ref.current.delete(msg.requestId);
+                    sync_view_request_pending();
+                }
                 const applied = msg.applied
-                    && msg.sourceGeneration === pending.sourceGeneration
+                    && (pending === undefined || msg.sourceGeneration === pending.sourceGeneration)
                     && msg.sourceGeneration === source_generation_ref.current;
                 // Any answer retires the layer painted for this request. The
                 // host delivers what is stored before it answers, so from
@@ -3938,6 +3942,7 @@ export function App(): React.JSX.Element {
                         return layers.length === 0 ? undefined : { ...overlay, layers };
                     },
                 ));
+                if (pending === undefined) return;
                 pending.finish?.(applied);
                 if (pending.replay !== undefined && pending.worksheet !== undefined) {
                     const { replay, worksheet } = pending;
@@ -10314,14 +10319,17 @@ export function App(): React.JSX.Element {
             // clamps (`row-resize-model`), so this is the case that should not arise
             // rather than one that does.
             const clamped = height === null ? null : clamp_row_height(height);
-            const request_id = !gesture && on_result === undefined
-                ? undefined
-                : [
-                    'row-resize',
-                    highlight_request_prefix_ref.current,
-                    ++row_resize_request_seq_ref.current,
-                ].join(':');
-            if (request_id !== undefined) {
+            // Every write is answered, so a refused one never leaves its
+            // height painted. Only a gesture, or a write Pending Rows wait on,
+            // is also waited for here: the row a committed edit grows holds
+            // no gate and records no step, so its answer finds no entry and
+            // retires its layer.
+            const request_id = [
+                'row-resize',
+                highlight_request_prefix_ref.current,
+                ++row_resize_request_seq_ref.current,
+            ].join(':');
+            if (gesture || on_result !== undefined) {
                 const sheet = meta_ref.current?.sheets[active_sheet_index];
                 pending_row_resize_requests_ref.current.set(request_id, {
                     sourceGeneration: source_generation_ref.current,
@@ -10345,29 +10353,26 @@ export function App(): React.JSX.Element {
                 height: clamped,
                 generation: generation_ref.current,
                 sourceGeneration: source_generation_ref.current,
-                ...(request_id === undefined ? {} : { requestId: request_id }),
+                requestId: request_id,
             });
             // Posted either way, but painted optimistically only when the host can
             // actually keep it. Over the cap the host refuses the whole request and warns
             // the owner, delivering nothing — so an overlay layer for it would have no
             // delivery to reconcile against and would show a height nothing persisted
-            // until the generation next moved. Better to let the row spring back as the
+            // until its answer arrived. Better to let the row spring back as the
             // drag ends, which is the truth.
             //
             // The same cap applied to the *accumulated* durable map is a refusal this
             // panel cannot predict: it never holds that map, and the projection is not a
-            // proxy for its size. The user is told (the host warns, naming the limit).
-            // For a resize that is answered, which is every one a person makes, the
-            // answer retires the layer painted below and the row springs back. Only
-            // the unanswered write, the row a committed edit grows, leaves its layer
-            // with nothing behind it until the generation next moves; reasoning at
-            // `row_height_layers_for_delivery`.
+            // proxy for its size. The user is told (the host warns, naming the limit),
+            // and the answer retires the layer painted below, so the row springs back:
+            // a resize a person made, and the row a committed edit grew alike.
             //
             // A reset paints nothing ahead of the host either: which rows hold a
             // custom height is the host's to say, and they change with its delivery.
             // It only takes its place among the heights already painted.
             if (clamped === null) {
-                if (request_id !== undefined) mark_row_height_request(active_sheet_index, request_id);
+                mark_row_height_request(active_sheet_index, request_id);
                 return;
             }
             if (requested_rows > MAX_PERSISTED_ROW_HEIGHTS) return;
@@ -10376,7 +10381,7 @@ export function App(): React.JSX.Element {
                 const layer: RowHeightLayer = {
                     rows,
                     height: clamped,
-                    ...(request_id === undefined ? {} : { requestId: request_id }),
+                    requestId: request_id,
                 };
                 const existing = previous[active_sheet_index];
                 const next = [...previous];

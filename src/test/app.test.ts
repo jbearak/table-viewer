@@ -22837,12 +22837,35 @@ describe('view steps in history', () => {
 
                 await act(async () => props().on_row_resize([{ start: 1, end: 1 }], 60, { gesture: false }));
 
-                // Unanswered and not a view request: cells stay editable.
-                expect(row_height_writes(post_message)).toEqual([expect.not.objectContaining({
-                    requestId: expect.anything(),
+                // Answered, and still not a view request: cells stay editable.
+                expect(row_height_writes(post_message)).toEqual([expect.objectContaining({
+                    requestId: expect.any(String),
                 })]);
                 expect(cells_editable()).toEqual(EDITABLE);
+                await answer_row_heights(post_message, { before: [] });
+                expect(cells_editable()).toEqual(EDITABLE);
                 expect(undo_labels()).toEqual([]);
+            });
+
+            it('takes down the height painted for the row an edit grew when the host refuses to keep it', async () => {
+                // At the limit of custom heights the host stores nothing and
+                // delivers nothing, so only its answer can say the paint is
+                // not a height the file holds.
+                const { post_message } = await render_app();
+                await open(post_message);
+
+                await act(async () => props().on_row_resize([{ start: 1, end: 1 }], 60, { gesture: false }));
+                expect(row_overlay()).toEqual([
+                    { rows: [{ start: 1, end: 1 }], height: 60, requestId: expect.any(String) },
+                ]);
+
+                await answer_row_heights(post_message, { applied: false, refused: 'limit' });
+
+                expect(row_overlay()).toBeNull();
+                expect(undo_labels()).toEqual([]);
+                // The host said why; the window adds nothing.
+                expect(warnings(post_message)).toEqual([]);
+                expect(cells_editable()).toEqual(EDITABLE);
             });
 
             it('removes its painted height on a refusal, so a later undo shows what the host delivers', async () => {
@@ -22938,7 +22961,7 @@ describe('view steps in history', () => {
                 expect(undo_labels()).toEqual(['Reset 2 row heights']);
             });
 
-            /** The row a committed edit grows: painted at once, its write not answered. */
+            /** The row a committed edit grows: painted at once, its answer still to come. */
             async function grow_row(row: number, height: number) {
                 await act(async () => {
                     props().on_row_resize([{ start: row, end: row }], height, { gesture: false });
@@ -22946,15 +22969,15 @@ describe('view steps in history', () => {
             }
 
             it('takes down a height painted for a write the host never stored', async () => {
-                // The row an edit grows is painted at once and its write is
-                // not answered. Refused at the limit, nothing is stored, so
-                // no delivery agrees with the paint and Reset is offered for
-                // a height that is only on screen. The reset changes nothing
-                // stored, and still has to leave the row as the host has it.
+                // The row an edit grows is painted at once. While its answer
+                // is on the way, Reset is offered for a height that is only
+                // on screen. A reset the host applies was written after it,
+                // so it leaves the row as the host has it, whatever became
+                // of the growth.
                 const { post_message } = await render_app();
                 await open(post_message);
                 await grow_row(1, 54);
-                const painted = { rows: [{ start: 1, end: 1 }], height: 54 };
+                const painted = { rows: [{ start: 1, end: 1 }], height: 54, requestId: expect.any(String) };
                 expect(row_overlay()).toEqual([painted]);
 
                 await resize_rows([{ start: 1, end: 1 }], null);
@@ -22974,7 +22997,9 @@ describe('view steps in history', () => {
                 await resize_rows([{ start: 1, end: 1 }], null);
                 await answer_row_heights(post_message, { applied: false, refused: 'unresolved' });
 
-                expect(row_overlay()).toEqual([{ rows: [{ start: 1, end: 1 }], height: 54 }]);
+                expect(row_overlay()).toEqual([
+                    { rows: [{ start: 1, end: 1 }], height: 54, requestId: expect.any(String) },
+                ]);
             });
 
             it('leaves a height painted after the reset was posted', async () => {
@@ -22997,7 +23022,9 @@ describe('view steps in history', () => {
                     change: { height: null, before: [{ start: 4, end: 4, height: 60 }] },
                 });
 
-                expect(row_overlay()).toEqual([{ rows: [{ start: 1, end: 1 }], height: 54 }]);
+                expect(row_overlay()).toEqual([
+                    { rows: [{ start: 1, end: 1 }], height: 54, requestId: expect.any(String) },
+                ]);
                 expect(undo_labels()).toEqual(['Reset row height']);
             });
 
@@ -23015,12 +23042,13 @@ describe('view steps in history', () => {
                 const { post_message } = await render_app();
                 await open(post_message);
                 await resized_rows(post_message);
-                // An edit then grows row 1, and the host refuses that write
-                // at the limit: painted, not stored, never answered.
+                // An edit then grows row 1, and the host has not answered
+                // that write yet: painted, and nothing says it is stored.
                 await act(async () => {
                     props().on_row_resize([{ start: 1, end: 1 }], 80, { gesture: false });
                 });
-                expect(row_overlay()).toEqual([{ rows: [{ start: 1, end: 1 }], height: 80 }]);
+                const grown = { rows: [{ start: 1, end: 1 }], height: 80, requestId: expect.any(String) };
+                expect(row_overlay()).toEqual([grown]);
 
                 await undo();
                 await deliver_heights([{ 2: 30 }]);
@@ -23036,7 +23064,7 @@ describe('view steps in history', () => {
                 });
                 await redo();
                 await answer_row_heights(post_message, { applied: false });
-                expect(row_overlay()).toEqual([{ rows: [{ start: 1, end: 1 }], height: 80 }]);
+                expect(row_overlay()).toEqual([grown]);
                 expect(redo_labels()).toEqual(['Resize 2 rows']);
             });
 
