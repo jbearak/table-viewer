@@ -305,7 +305,7 @@ import {
     default_row_height_for_font,
     line_height_for_font,
     natural_row_height,
-    display_rows_have_custom_height,
+    custom_height_row_count,
     resolved_row_height,
     type RowHeightLayer,
     type RowHeightOverrides,
@@ -12514,6 +12514,11 @@ export function GridShell({
                     || selected_removal_rows.size > 0;
                 const structure = structure_items(row_menu.structure
                     && { axis: 'rows', selection: row_menu.structure });
+                const reset_row_count = custom_height_row_count(
+                    row_heights,
+                    row_height_overlay,
+                    row_menu.source_display_rows,
+                );
                 return (
                     <ContextMenu
                         x={row_menu.x}
@@ -12558,18 +12563,12 @@ export function GridShell({
                                 || promote_row_to_header_waits,
                             on_hide_rows: () => on_hide_rows(row_menu.source_display_rows),
                             // Offered when a saved row of the selection shows a
-                            // custom height. Pending Rows keep theirs.
-                            ...(row_menu.source_display_rows.some((interval) =>
-                                display_rows_have_custom_height(
-                                    row_heights,
-                                    row_height_overlay,
-                                    interval,
-                                ))
+                            // custom height, and counts the rows that do: the
+                            // rows the reset changes, as its step in undo
+                            // history counts them. Pending Rows keep theirs.
+                            ...(reset_row_count > 0
                                 ? {
-                                    reset_row_count: row_menu.source_display_rows.reduce(
-                                        (count, interval) => count + interval.end - interval.start + 1,
-                                        0,
-                                    ),
+                                    reset_row_count,
                                     // The menu's rows are the host's display
                                     // rows already, as Hide rows posts them.
                                     on_reset_row_heights: () => {

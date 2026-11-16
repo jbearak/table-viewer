@@ -376,26 +376,71 @@ export function row_height_order_marker(request_id: string): RowHeightLayer {
     return { rows: [], height: DEFAULT_ROW_HEIGHT_PX, requestId: request_id };
 }
 
+/** Ascending, disjoint runs covering the same rows as `intervals`, in whatever order those came. */
+function merged_intervals(
+    intervals: readonly Readonly<DisplayRowInterval>[],
+): DisplayRowInterval[] {
+    const sorted = intervals
+        .filter((interval) => interval.start <= interval.end)
+        .map((interval) => ({ start: interval.start, end: interval.end }))
+        .sort((left, right) => left.start - right.start);
+    const merged: DisplayRowInterval[] = [];
+    for (const interval of sorted) {
+        const previous = merged[merged.length - 1];
+        if (previous === undefined || interval.start > previous.end + 1) merged.push(interval);
+        else previous.end = Math.max(previous.end, interval.end);
+    }
+    return merged;
+}
+
 /**
- * Whether any display row of `interval` shows a custom height: one the
- * projection names, or one an overlay layer paints. Walks the projection's
- * entries, never the interval, which can be a select-all.
+ * How many display rows of `intervals` show a custom height: one the
+ * projection names, or one an overlay layer paints.
+ *
+ * These are the rows a reset of `intervals` changes, as far as this window
+ * can tell, so it is what the row menu's Reset item counts: the step the
+ * reset records counts the rows the host says it changed
+ * (`row_heights_view_step`), and the two should read alike. Zero is what
+ * withholds the item.
+ *
+ * Walks the projection's entries and the layers' runs, never the rows of
+ * `intervals`, which can be a select-all.
  */
-export function display_rows_have_custom_height(
+export function custom_height_row_count(
     overrides: RowHeightOverrides,
     layers: readonly RowHeightLayer[] | undefined,
-    interval: Readonly<DisplayRowInterval>,
-): boolean {
+    intervals: readonly Readonly<DisplayRowInterval>[],
+): number {
+    const selected = merged_intervals(intervals);
+    // The rows of the selection a layer paints. Layers can overlap one
+    // another, and a painted row can be one the projection names as well.
+    const painted: DisplayRowInterval[] = [];
     for (const layer of layers ?? []) {
-        for (const rows of layer.rows) {
-            if (rows.start <= interval.end && rows.end >= interval.start) return true;
+        let index = 0;
+        for (const run of layer.rows) {
+            while (index < selected.length && selected[index].end < run.start) index += 1;
+            for (
+                let within = index;
+                within < selected.length && selected[within].start <= run.end;
+                within += 1
+            ) {
+                painted.push({
+                    start: Math.max(run.start, selected[within].start),
+                    end: Math.min(run.end, selected[within].end),
+                });
+            }
         }
     }
+    const painted_runs = merged_intervals(painted);
+    let count = 0;
+    for (const run of painted_runs) count += run.end - run.start + 1;
     for (const key in overrides) {
         const row = Number(key);
-        if (row >= interval.start && row <= interval.end) return true;
+        if (intervals_contain_row(selected, row) && !intervals_contain_row(painted_runs, row)) {
+            count += 1;
+        }
     }
-    return false;
+    return count;
 }
 
 /**
@@ -415,11 +460,19 @@ export function display_rows_have_custom_height(
  * `selected_display_row_intervals`, which coalesces and merges before returning.
  */
 function layer_contains_row(layer: RowHeightLayer, row: number): boolean {
+    return intervals_contain_row(layer.rows, row);
+}
+
+/** Whether `row` falls in one of `intervals`, which are ascending and disjoint. */
+function intervals_contain_row(
+    intervals: readonly Readonly<DisplayRowInterval>[],
+    row: number,
+): boolean {
     let low = 0;
-    let high = layer.rows.length - 1;
+    let high = intervals.length - 1;
     while (low <= high) {
         const mid = (low + high) >> 1;
-        const interval = layer.rows[mid];
+        const interval = intervals[mid];
         if (row < interval.start) high = mid - 1;
         else if (row > interval.end) low = mid + 1;
         else return true;

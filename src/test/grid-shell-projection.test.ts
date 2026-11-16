@@ -10221,13 +10221,33 @@ describe('row Insert in the row-gutter menu', () => {
         expect(size_gesture_may_start).toHaveBeenCalledOnce();
         expect(on_row_resize).toHaveBeenCalledExactlyOnceWith([{ start: 2, end: 2 }], null, { gesture: true });
 
-        // A selection that includes it: the label counts the selected rows.
+        // A selection that includes it: the reset names every selected row,
+        // and the label counts the one that has a height to lose, as the
+        // step in undo history will ("Undo Reset row height").
         on_row_resize.mockClear();
         const on_selection_change = grid_mock.props!.onGridSelectionChange as (selection: unknown) => void;
         await act(async () => on_selection_change({ columns: compact([]), rows: compact([1, 2, 3]) }));
         await open_row_menu(2);
-        await act(async () => menu_item('Reset 3 row heights')!.click());
+        expect(menu_item('Reset 3 row heights')).toBeUndefined();
+        await act(async () => menu_item('Reset row height')!.click());
         expect(on_row_resize).toHaveBeenCalledExactlyOnceWith([{ start: 1, end: 3 }], null, { gesture: true });
+    });
+
+    it('counts the selected rows that show a custom height in the Reset row height label', async () => {
+        await render_grid(structure_props({
+            pending_row_store: create_pending_row_store({ session_id: 'session' }),
+            // Rows 1 and 3 stored; row 2 painted by a resize not yet answered.
+            row_heights: { 1: 50, 3: 60 },
+            row_height_overlay: [{ rows: [{ start: 2, end: 3 }], height: 70, requestId: 'drag' }],
+            on_row_resize: vi.fn(),
+            size_gesture_may_start: () => true,
+        }));
+        const on_selection_change = grid_mock.props!.onGridSelectionChange as (selection: unknown) => void;
+        await act(async () => on_selection_change({ columns: compact([]), rows: compact([0, 1, 2]) }));
+        await open_row_menu(1);
+        // Row 0 has none; row 3 is not selected.
+        expect(menu_button_labels().filter((label) => label.startsWith('Reset')))
+            .toEqual(['Reset 2 row heights']);
     });
 
     it('resets the rows the menu was opened on when an inserted row sits above them', async () => {

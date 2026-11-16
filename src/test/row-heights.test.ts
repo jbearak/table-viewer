@@ -5,7 +5,7 @@ import {
     MAX_ROW_HEIGHT_PX,
     MIN_ROW_HEIGHT_PX,
     clamp_row_height,
-    display_rows_have_custom_height,
+    custom_height_row_count,
     mapped_row_height_overlays,
     natural_row_height,
     resolved_row_height,
@@ -555,7 +555,7 @@ describe('the place of a request that paints nothing (a reset, an undo or redo)'
     it('paints no row and offers no reset', () => {
         expect(resolved_row_height({}, [marker], 0)).toBe(DEFAULT_ROW_HEIGHT_PX);
         expect(resolved_row_height({ 1: 60 }, [painted, marker], 1)).toBe(54);
-        expect(display_rows_have_custom_height({}, [marker], { start: 0, end: 2 ** 40 })).toBe(false);
+        expect(custom_height_row_count({}, [marker], [{ start: 0, end: 2 ** 40 }])).toBe(0);
     });
 
     it('is never what a delivery agrees with, so a delivery retires nothing on its account', () => {
@@ -571,24 +571,45 @@ describe('the place of a request that paints nothing (a reset, an undo or redo)'
     });
 });
 
-describe('whether rows show a custom height (what offers Reset row height)', () => {
-    it('is true for a height the projection names inside the interval', () => {
-        expect(display_rows_have_custom_height({ 4: 60 }, undefined, { start: 4, end: 4 })).toBe(true);
-        expect(display_rows_have_custom_height({ 4: 60 }, undefined, { start: 0, end: 9 })).toBe(true);
-        expect(display_rows_have_custom_height({ 4: 60 }, [], { start: 5, end: 9 })).toBe(false);
-        expect(display_rows_have_custom_height({}, undefined, { start: 0, end: 9 })).toBe(false);
+describe('how many rows show a custom height (what Reset row height offers and counts)', () => {
+    it('counts the heights the projection names inside the rows', () => {
+        expect(custom_height_row_count({ 4: 60 }, undefined, [{ start: 4, end: 4 }])).toBe(1);
+        expect(custom_height_row_count({ 4: 60, 7: 30, 12: 30 }, undefined, [{ start: 0, end: 9 }])).toBe(2);
+        expect(custom_height_row_count({ 4: 60 }, [], [{ start: 5, end: 9 }])).toBe(0);
+        expect(custom_height_row_count({}, undefined, [{ start: 0, end: 9 }])).toBe(0);
     });
 
-    it('is true for a height an unanswered resize paints over the interval', () => {
+    it('counts the rows an unanswered resize paints, clipped to the rows asked about', () => {
         const layers: RowHeightLayer[] = [{ rows: [{ start: 3, end: 6 }], height: 60, requestId: 'drag' }];
-        expect(display_rows_have_custom_height({}, layers, { start: 6, end: 8 })).toBe(true);
-        expect(display_rows_have_custom_height({}, layers, { start: 0, end: 3 })).toBe(true);
-        expect(display_rows_have_custom_height({}, layers, { start: 7, end: 8 })).toBe(false);
+        expect(custom_height_row_count({}, layers, [{ start: 6, end: 8 }])).toBe(1);
+        expect(custom_height_row_count({}, layers, [{ start: 0, end: 3 }])).toBe(1);
+        expect(custom_height_row_count({}, layers, [{ start: 0, end: 9 }])).toBe(4);
+        expect(custom_height_row_count({}, layers, [{ start: 7, end: 8 }])).toBe(0);
     });
 
-    it('does not walk a select-all interval', () => {
+    it('counts a row once when a layer paints over a stored height, or two layers paint it', () => {
+        const layers: RowHeightLayer[] = [
+            { rows: [{ start: 3, end: 6 }], height: 60, requestId: 'first' },
+            { rows: [{ start: 5, end: 8 }], height: 70, requestId: 'second' },
+        ];
+        // Rows 3 to 8 painted; row 4 stored as well; row 10 stored only.
+        expect(custom_height_row_count({ 4: 40, 10: 40 }, layers, [{ start: 0, end: 20 }])).toBe(7);
+    });
+
+    it('takes the rows in any order, as several runs', () => {
+        const layers: RowHeightLayer[] = [
+            { rows: [{ start: 1, end: 2 }, { start: 20, end: 29 }], height: 60, requestId: 'drag' },
+        ];
+        expect(custom_height_row_count(
+            { 5: 40, 16: 40, 40: 40 },
+            layers,
+            [{ start: 15, end: 22 }, { start: 0, end: 5 }],
+        )).toBe(2 + 3 + 2);
+    });
+
+    it('does not walk a select-all', () => {
         // Would not return in a test's time if it visited every row.
-        expect(display_rows_have_custom_height({ 12: 60 }, undefined, { start: 0, end: 2 ** 40 })).toBe(true);
-        expect(display_rows_have_custom_height({}, undefined, { start: 0, end: 2 ** 40 })).toBe(false);
+        expect(custom_height_row_count({ 12: 60 }, undefined, [{ start: 0, end: 2 ** 40 }])).toBe(1);
+        expect(custom_height_row_count({}, undefined, [{ start: 0, end: 2 ** 40 }])).toBe(0);
     });
 });
