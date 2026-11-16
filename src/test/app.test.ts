@@ -177,10 +177,9 @@ vi.mock('../webview/grid-shell', () => ({
             const handle = {
                 generation: props.generation,
                 has_focus: () => grid_shell_mock.has_grid_focus(),
-                focus: () => {
-                    grid_shell_mock.focus_grid();
-                    return true;
-                },
+                // True unless a test makes `focus_grid` answer false: a grid
+                // with nothing to focus (every column hidden).
+                focus: () => (grid_shell_mock.focus_grid() as unknown) !== false,
                 pending_active_cell: () => grid_shell_mock.pending_active_cell(),
                 source_active_cell: () => grid_shell_mock.source_active_cell(),
             };
@@ -13224,6 +13223,393 @@ describe('sorting and filtering', () => {
         const new_request = latest_histogram_request(post_message);
         expect(new_request).toMatchObject({ generation: 2, sourceGeneration: 2 });
         expect(new_request.requestId).not.toBe(old_request.requestId);
+    });
+
+    describe('an open filter editor when a snapshot arrives', () => {
+        function two_column_meta(names: string[] = ['Name', 'Age']): WorkbookMeta {
+            const meta = make_meta(['Sheet1']);
+            meta.sheets[0] = {
+                ...meta.sheets[0],
+                columnCount: names.length,
+                columnNames: names,
+            };
+            return meta;
+        }
+
+        /** Two columns with no header: nothing but position says which is which. */
+        function unnamed_two_column_meta(): WorkbookMeta {
+            const meta = make_meta(['Sheet1']);
+            meta.sheets[0] = { ...meta.sheets[0], columnCount: 2 };
+            return meta;
+        }
+
+        async function type_filter_value(text: string) {
+            const input = document.querySelector(
+                'input[aria-label="Filter value"]',
+            ) as HTMLInputElement;
+            expect(input).not.toBeNull();
+            await act(async () => {
+                Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!
+                    .set!.call(input, text);
+                input.dispatchEvent(new Event('input', { bubbles: true }));
+            });
+        }
+
+        const filter_value = () => (document.querySelector(
+            'input[aria-label="Filter value"]',
+        ) as HTMLInputElement | null)?.value;
+
+        it.each([
+            ['named', () => two_column_meta()],
+            ['unnamed', () => unnamed_two_column_meta()],
+        ])('stays open, with what was typed, when the session a header menu acquired is released (%s columns)', async (_name, meta_of) => {
+            // "Filter…" in a column's menu: the menu acquired an editing session,
+            // the editor opens, and the session, holding nothing, is let go. The
+            // host answers the release with a snapshot of the same file and view.
+            const { post_message } = await render_app();
+            await dispatch_host_message(initial_snapshot_message(meta_of(), {
+                capabilities: { csvEditable: true, csvEditingSupported: true },
+            }));
+            await acquire_editing_session(post_message);
+            await open_grid_filter(0);
+            await type_filter_value('Bob');
+            await release_idle_edit_session();
+            expect(post_message).toHaveBeenCalledWith(
+                expect.objectContaining({ type: 'releaseEditSession' }),
+            );
+
+            await dispatch_host_message(workbook_snapshot_message(meta_of(), {
+                presentation: 'refresh',
+                reason: 'other',
+                capabilities: { csvEditable: true, csvEditingSupported: true },
+            }));
+
+            expect(document.querySelector('.filter-popover')).not.toBeNull();
+            expect(filter_value()).toBe('Bob');
+            post_message.mockClear();
+            await click_button('Apply');
+            expect(latest_transform_request(post_message).state.filters[0]).toMatchObject({
+                colIndex: 0,
+                operator: 'contains',
+                value: 'Bob',
+            });
+        });
+
+        it('stays open, with what was typed, across a reload that keeps a column named only once', async () => {
+            const { post_message } = await render_app();
+            await dispatch_host_message(initial_snapshot_message(two_column_meta()));
+            post_message.mockClear();
+            await open_grid_filter(1);
+            const old_request = latest_histogram_request(post_message);
+            await type_filter_value('3');
+
+            const reloaded = two_column_meta();
+            reloaded.sheets[0].rowCount = 9;
+            reloaded.sheets[0].sourceRowCount = 9;
+            post_message.mockClear();
+            await dispatch_host_message(refresh_snapshot_message(reloaded));
+
+            expect(document.querySelector('.filter-popover-colname')?.textContent).toBe('Age');
+            expect(filter_value()).toBe('3');
+            // The values are asked for again, from the reloaded file, and an
+            // answer about the old one is not shown.
+            const new_request = latest_histogram_request(post_message);
+            expect(new_request).toMatchObject({ columnIndex: 1, generation: 2, sourceGeneration: 2 });
+            expect(new_request.requestId).not.toBe(old_request.requestId);
+            await dispatch_host_message({
+                type: 'filterHistogram', sheetIndex: 0, columnIndex: 1,
+                requestId: old_request.requestId, generation: 1, sourceGeneration: 1,
+                bins: [{ lo: 0, hi: 1, count: 7 }],
+            });
+            await act(async () => {
+                (document.querySelector('#filter-condition') as HTMLSelectElement).value = 'between';
+                document.querySelector('#filter-condition')!
+                    .dispatchEvent(new Event('change', { bubbles: true }));
+            });
+            expect(document.querySelectorAll('.filter-histogram-bar')).toHaveLength(0);
+            await dispatch_host_message({
+                type: 'filterHistogram', sheetIndex: 0, columnIndex: 1,
+                requestId: new_request.requestId, generation: 2, sourceGeneration: 2,
+                bins: [{ lo: 0, hi: 1, count: 7 }],
+            });
+            expect(document.querySelectorAll('.filter-histogram-bar')).toHaveLength(1);
+            await act(async () => {
+                (document.querySelector('#filter-condition') as HTMLSelectElement).value = 'contains';
+                document.querySelector('#filter-condition')!
+                    .dispatchEvent(new Event('change', { bubbles: true }));
+            });
+            post_message.mockClear();
+            await click_button('Apply');
+            const request = latest_transform_request(post_message);
+            expect(request).toMatchObject({ generation: 2, sourceGeneration: 2 });
+            expect(request.state.filters[0]).toMatchObject({ colIndex: 1, value: '3' });
+        });
+
+        type OpenFilter = (
+            source_column: number,
+            anchor: { left: number; top: number },
+            restore_focus: () => void,
+        ) => void;
+        const open_filter_with = (restore_focus: () => void) => act(async () => (
+            grid_shell_mock.latest_props!.on_open_filter as OpenFilter
+        )(1, { left: 20, top: 20 }, restore_focus));
+        const press_escape = () => act(async () => {
+            document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+        });
+
+        /** Open from the grid, then reload with the same columns: the grid is remounted. */
+        async function open_then_remount_grid() {
+            vi.spyOn(document, 'hasFocus').mockReturnValue(true);
+            await render_app();
+            await dispatch_host_message(initial_snapshot_message(two_column_meta()));
+            const first_mount = grid_stub().getAttribute('data-mount-id');
+            // Focus is in the editor, not in the grid, as it is for a person.
+            grid_shell_mock.has_grid_focus.mockReturnValue(false);
+            // What the grid that opened the editor hands over: once that grid
+            // is unmounted, calling it focuses nothing.
+            const restore_to_unmounted_grid = vi.fn();
+            await open_filter_with(restore_to_unmounted_grid);
+            await type_filter_value('3');
+            await dispatch_host_message(refresh_snapshot_message(two_column_meta()));
+            expect(grid_stub().getAttribute('data-mount-id')).not.toBe(first_mount);
+            expect(filter_value()).toBe('3');
+            grid_shell_mock.focus_grid.mockClear();
+            return restore_to_unmounted_grid;
+        }
+
+        it.each([
+            ['Cancel', () => click_button('Cancel')],
+            ['Escape', press_escape],
+        ])('gives focus to the grid mounted now when %s follows a reload that remounted it', async (_name, dismiss) => {
+            const restore_to_unmounted_grid = await open_then_remount_grid();
+
+            await dismiss();
+            await vi.waitUntil(() => restore_to_unmounted_grid.mock.calls.length > 0);
+
+            expect(document.querySelector('.filter-popover')).toBeNull();
+            expect(grid_shell_mock.focus_grid).toHaveBeenCalledOnce();
+        });
+
+        it('leaves focus on a control the person moved to before it was handed back', async () => {
+            const restore_to_unmounted_grid = await open_then_remount_grid();
+
+            await act(async () => {
+                document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+                columns_trigger().focus();
+            });
+            await vi.waitUntil(() => restore_to_unmounted_grid.mock.calls.length > 0);
+
+            expect(grid_shell_mock.focus_grid).not.toHaveBeenCalled();
+            expect(document.activeElement).toBe(columns_trigger());
+        });
+
+        it('leaves focus where the opener\'s own callback put it when the grid was not remounted', async () => {
+            vi.spyOn(document, 'hasFocus').mockReturnValue(true);
+            await render_app();
+            await dispatch_host_message(initial_snapshot_message(two_column_meta()));
+            grid_shell_mock.has_grid_focus.mockReturnValue(false);
+            // The mounted grid's callback focuses it.
+            const restore = vi.fn(() => {
+                grid_stub().tabIndex = -1;
+                grid_stub().focus();
+            });
+            await open_filter_with(restore);
+            grid_shell_mock.focus_grid.mockClear();
+
+            await click_button('Cancel');
+            await vi.waitUntil(() => restore.mock.calls.length > 0);
+
+            expect(document.activeElement).toBe(grid_stub());
+            expect(grid_shell_mock.focus_grid).not.toHaveBeenCalled();
+        });
+
+        it('gives focus to the toolbar when the chip that opened it is gone', async () => {
+            // Opened from a filter's chip; another window then removes that
+            // filter, which leaves the columns alone and unmounts the chip.
+            vi.spyOn(document, 'hasFocus').mockReturnValue(true);
+            const { post_message } = await render_app();
+            await load_acknowledged_transform(post_message, {
+                sort: [],
+                filters: [{
+                    id: 'theirs', colIndex: 0, operator: 'equals', value: 'x',
+                    caseSensitive: false, enabled: true,
+                }],
+                schema: '["Sheet1",1,null]',
+            });
+            grid_shell_mock.has_grid_focus.mockReturnValue(false);
+            await act(async () => (
+                document.querySelector('.filter-chip-body') as HTMLButtonElement
+            ).click());
+            expect(document.querySelector('.filter-popover')).not.toBeNull();
+
+            await dispatch_host_message(refresh_snapshot_message(make_meta(['Sheet1']), {
+                generation: 3,
+                sourceGeneration: 1,
+            }));
+            expect(document.querySelector('.filter-chip-body')).toBeNull();
+            expect(document.querySelector('.filter-popover')).not.toBeNull();
+            grid_shell_mock.focus_grid.mockClear();
+
+            await click_button('Cancel');
+            const toolbar = document.querySelector('.toolbar') as HTMLElement;
+            await vi.waitUntil(() => document.activeElement === toolbar);
+
+            expect(grid_shell_mock.focus_grid).not.toHaveBeenCalled();
+        });
+
+        it.each([
+            ['has no header', () => unnamed_two_column_meta()],
+            ['shares its name with another column', () => two_column_meta(['Total', 'Total'])],
+            ['has an empty name', () => two_column_meta(['Name', ''])],
+        ])('closes at new file contents when its column %s', async (_name, meta_of) => {
+            // A save in another window, or a rewrite of the file, can make
+            // such columns trade places and leave the count and the names as
+            // they were: column 1 may now be the other column.
+            await render_app();
+            await dispatch_host_message(initial_snapshot_message(meta_of()));
+            await open_grid_filter(1);
+            await type_filter_value('3');
+
+            await dispatch_host_message(refresh_snapshot_message(meta_of()));
+
+            expect(document.querySelector('.filter-popover')).toBeNull();
+        });
+
+        it('gives focus to the toolbar when the grid has nothing to focus', async () => {
+            // Another window hid every column: the grid is mounted and has no
+            // cell to take focus.
+            const restore_to_unmounted_grid = await open_then_remount_grid();
+            grid_shell_mock.focus_grid.mockReturnValue(false);
+
+            await click_button('Cancel');
+            const toolbar = document.querySelector('.toolbar') as HTMLElement;
+            await vi.waitUntil(() => document.activeElement === toolbar);
+
+            expect(restore_to_unmounted_grid).toHaveBeenCalledOnce();
+        });
+
+        it.each([
+            ['renames a column', () => refresh_snapshot_message(two_column_meta(['Name', 'Years']))],
+            ['adds a column', () => refresh_snapshot_message(two_column_meta(['Name', 'Age', 'City']))],
+            ['is another worksheet under the same name and columns', () => {
+                const meta = two_column_meta();
+                meta.sheets[0].worksheetId = '9';
+                return refresh_snapshot_message(meta);
+            }],
+            ['loads a document', () => initial_snapshot_message(two_column_meta(), {
+                generation: 2,
+                sourceGeneration: 2,
+            })],
+        ])('closes when the snapshot %s', async (_name, snapshot) => {
+            await render_app();
+            const meta = two_column_meta();
+            meta.sheets[0].worksheetId = '7';
+            await dispatch_host_message(initial_snapshot_message(meta));
+            await open_grid_filter(1);
+            await type_filter_value('3');
+
+            const next = snapshot();
+            if (next.snapshot.meta.sheets[0].worksheetId === undefined) {
+                next.snapshot.meta.sheets[0].worksheetId = '7';
+            }
+            await dispatch_host_message(next);
+
+            expect(document.querySelector('.filter-popover')).toBeNull();
+        });
+    });
+
+    describe('the name a column is shown by', () => {
+        const EDITABLE = { csvEditable: true, csvEditingSupported: true };
+        const FILTER_ON_NAME = {
+            id: 'name-filter', colIndex: 0, operator: 'contains' as const, value: 'Bob',
+            caseSensitive: false, enabled: true,
+        };
+
+        function people_meta(header?: 'on' | 'off'): WorkbookMeta {
+            const meta = make_meta(['people'], false);
+            meta.sheets[0] = {
+                ...meta.sheets[0],
+                rowCount: 3,
+                sourceRowCount: header === 'on' ? 4 : 3,
+                columnCount: 2,
+                columnNames: header === 'off' ? undefined : ['Name', 'Age'],
+                ...(header === undefined ? {} : {
+                    excelFirstRowHeader: {
+                        mode: header,
+                        detected: true,
+                        active: header === 'on',
+                        available: true,
+                    },
+                }),
+            };
+            return meta;
+        }
+
+        /** Open on a sort and a filter of column 0, then edit source row 0's cell there. */
+        async function load_sorted_filtered_and_edit_first_row(meta: WorkbookMeta) {
+            const { post_message } = await render_app();
+            await dispatch_host_message(initial_snapshot_message(meta, {
+                capabilities: EDITABLE,
+                state: {
+                    transforms: [{
+                        sort: [{ colIndex: 0, direction: 'asc' }],
+                        filters: [FILTER_ON_NAME],
+                        schema: JSON.stringify([
+                            'people', 2, meta.sheets[0].columnNames ?? null,
+                        ]),
+                    }],
+                },
+            }));
+            await acknowledge_transform(latest_transform_request(post_message), 2);
+            await acquire_editing_session(post_message);
+            seed_mounted_store({ '0:0': { value: 'Ann', base: 'Alice' } });
+        }
+
+        /** The names shown for column 0: sort chip, filter chip, filter editor, Columns list. */
+        async function shown_names() {
+            const names = {
+                sort: document.querySelector('.sort-chip-name')?.textContent,
+                filter: document.querySelector('.filter-chip-body')?.textContent,
+                editor: '' as string | null | undefined,
+                columns: '' as string | null | undefined,
+            };
+            await open_grid_filter(0);
+            names.editor = document.querySelector('.filter-popover-colname')?.textContent;
+            await click_button('Cancel');
+            await open_columns();
+            names.columns = document.querySelector('.column-visibility-name')?.textContent;
+            return names;
+        }
+
+        it('is the header in a .csv, whatever is unsaved in the first row of data', async () => {
+            await load_sorted_filtered_and_edit_first_row(people_meta());
+            expect(await shown_names()).toEqual({
+                sort: 'Name',
+                filter: 'Name contains “Bob”',
+                editor: 'Name',
+                columns: 'Name',
+            });
+        });
+
+        it('is the column letter with the Header Row off, whatever is unsaved in row 1', async () => {
+            await load_sorted_filtered_and_edit_first_row(people_meta('off'));
+            expect(await shown_names()).toEqual({
+                sort: 'A',
+                filter: 'A contains “Bob”',
+                editor: 'A',
+                columns: 'A',
+            });
+        });
+
+        it('is the unsaved header cell with the Header Row on', async () => {
+            await load_sorted_filtered_and_edit_first_row(people_meta('on'));
+            expect(await shown_names()).toEqual({
+                sort: 'Ann',
+                filter: 'Ann contains “Bob”',
+                editor: 'Ann',
+                columns: 'Ann',
+            });
+        });
     });
 
     it('disables transform controls while an edit-session request is pending', async () => {

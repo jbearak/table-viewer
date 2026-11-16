@@ -4710,10 +4710,44 @@ export function App(): React.JSX.Element {
                     set_unresolved_lfs(snapshot.configuration.unresolvedLfs);
                     meta_ref.current = snapshot.meta;
                     set_meta(snapshot.meta);
-                    set_filter_editor(null);
                     const source_changed =
                         snapshot.presentation === 'initial'
                         || source_generation_ref.current !== snapshot.sourceGeneration;
+                    // An open filter editor names a column of the active
+                    // worksheet by position, so it ends when that position can
+                    // mean another column: another document, another worksheet,
+                    // or a change of the worksheet's columns (the rule that drops
+                    // installed filters, and the one the Columns menu closes by).
+                    // It also ends at new file contents when the column has no
+                    // name of its own to say it is still the one: columns with
+                    // no header, or sharing a name, can trade places in a save
+                    // or a rewrite and leave the schema as it was.
+                    // Any other snapshot leaves it open with what the person has
+                    // typed. One always follows "Filter…" in a header menu: the
+                    // menu acquired an editing session, and its idle release is
+                    // delivered as a snapshot a moment after the editor opens.
+                    const filter_editor_columns_changed =
+                        snapshot.presentation === 'initial'
+                        || next_active_sheet_index !== active_sheet_index
+                        || active_sheet_changed
+                        || previous_active_sheet === undefined
+                        || next_active_sheet === undefined
+                        || transform_schema_for_sheet(previous_active_sheet)
+                            !== transform_schema_for_sheet(next_active_sheet);
+                    const reloaded_column_names = source_changed
+                        ? next_active_sheet?.columnNames ?? []
+                        : undefined;
+                    set_filter_editor((editor) => {
+                        if (editor === null || filter_editor_columns_changed) return null;
+                        if (reloaded_column_names === undefined) return editor;
+                        const name = reloaded_column_names[editor.column_index];
+                        return name !== undefined
+                            && name !== ''
+                            && reloaded_column_names.indexOf(name)
+                                === reloaded_column_names.lastIndexOf(name)
+                            ? editor
+                            : null;
+                    });
                     if (source_changed) {
                         histogram_cache_ref.current.clear();
                         set_filter_histogram({ key: '', value: { status: 'loading' } });
@@ -8440,6 +8474,7 @@ export function App(): React.JSX.Element {
 
     const close_filter_editor = useCallback((restore_focus = true) => {
         const restore = filter_editor?.restore_focus;
+        const opened_from_grid = filter_editor?.origin === 'grid';
         set_filter_editor(null);
         if (filter_restore_timer_ref.current !== undefined) {
             window.clearTimeout(filter_restore_timer_ref.current);
@@ -8448,6 +8483,18 @@ export function App(): React.JSX.Element {
             filter_restore_timer_ref.current = window.setTimeout(() => {
                 filter_restore_timer_ref.current = undefined;
                 restore?.();
+                // The editor can outlive what opened it: a reload that keeps
+                // the columns remounts the grid, and another window can remove
+                // the filter whose chip opened it. The opener's callback then
+                // reaches nothing, and focus goes to the grid mounted now, or
+                // to the toolbar when there is no grid to take it (every
+                // column hidden). Only when nothing holds focus: the person
+                // may already have moved it.
+                if (
+                    !has_surviving_focus_target()
+                    && document.hasFocus()
+                    && !(opened_from_grid && grid_focus_ref.current?.focus() === true)
+                ) toolbar_focus_ref.current?.focus();
             }, 0);
         } else {
             filter_restore_timer_ref.current = undefined;
@@ -9808,11 +9855,17 @@ export function App(): React.JSX.Element {
         ? transform_schema_for_sheet(current_sheet)
         : '';
     const current_header_row = current_sheet?.excelFirstRowHeader?.sourceRow ?? 0;
+    // An unsaved edit names a column only where the worksheet has a header row
+    // of cells: with the Header Row on. Anywhere else (a .csv, or the Header
+    // Row off) source row 0 is a row of data, and an edit there is not a rename.
+    const current_header_row_active = current_sheet?.excelFirstRowHeader?.active === true;
     const current_pending_header_names = Array.from(
         { length: current_sheet?.columnCount ?? 0 },
-        (_, index) => edit_session_registry_ref.current!
-            .for_sheet(active_sheet_index)
-            .get(`${current_header_row}:${index}`)?.value.trim(),
+        (_, index) => current_header_row_active
+            ? edit_session_registry_ref.current!
+                .for_sheet(active_sheet_index)
+                .get(`${current_header_row}:${index}`)?.value.trim()
+            : undefined,
     );
     const current_pending_header_signature = JSON.stringify(current_pending_header_names);
     const column_names = useMemo(() => Array.from(
@@ -10984,7 +11037,9 @@ export function App(): React.JSX.Element {
             />
             {filter_editor && (
                 <FilterPopover
-                    key={`${source_generation_ref.current}:${active_sheet_index}:${filter_editor.column_index}`}
+                    // Not keyed by the source generation: a reload that keeps
+                    // the columns keeps the editor, and its draft with it.
+                    key={`${active_sheet_index}:${filter_editor.column_index}`}
                     column_index={filter_editor.column_index}
                     column_name={column_names[filter_editor.column_index]
                         ?? `Column ${filter_editor.column_index + 1}`}

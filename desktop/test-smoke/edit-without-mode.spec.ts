@@ -11,6 +11,7 @@ import * as path from 'path';
 import { test, expect } from '@playwright/test';
 import type { ElectronApplication, Page } from '@playwright/test';
 import { isolated_user_data, launch_app, repo_dir } from './smoke-helpers';
+import { open_column_menu } from './structure-helpers';
 import { build_fixture_xlsx } from '../../src/test/helpers/xlsx-structure-fixture';
 
 const GRID_CANVAS = '[data-testid="data-grid-canvas"]';
@@ -737,4 +738,90 @@ test('a Tab on the grid that adds a row before any session lets go of the sessio
     await expect(rows).toHaveCount(3);
     await expect_nothing_unsaved();
     await expect(root_el).toHaveAttribute('data-edit-session', 'none');
+});
+
+/** The body rows the grid shows, as `a|b|c`. */
+const shown_rows = () => page.evaluate(() => [...document.querySelectorAll('tbody tr')].map((line) =>
+    [...line.querySelectorAll('td')].map((data) => data.textContent ?? '').join('|')));
+
+/** The state strip's text: the filter chips, among others. */
+const strip = () => page.evaluate(() =>
+    ((document.querySelector('.state-strip') as HTMLElement | null)?.innerText ?? '').replace(/\s+/g, ' ').trim());
+
+/** Choose "Filter…" in a column's header menu (`column` from 0) and return the filter editor it opens. */
+async function open_filter_from_header_menu(column: number) {
+    const menu = await open_column_menu(page, column);
+    // Opening the menu is what acquires the session, when none is held.
+    await expect(page.locator('.grid-shell-root')).toHaveAttribute('data-edit-session', 'held');
+    await menu.getByRole('menuitem', { name: /^Filter…/ }).click();
+    await expect(menu).toHaveCount(0);
+    return page.locator('.filter-popover');
+}
+
+/** Fill in the open filter editor with "contains `text`" and apply it. */
+async function apply_contains(text: string): Promise<void> {
+    const popover = page.locator('.filter-popover');
+    await popover.locator('#filter-condition').selectOption('contains');
+    await popover.getByLabel('Filter value').fill(text);
+    await popover.getByRole('button', { name: 'Apply' }).click();
+    await expect(popover).toBeHidden();
+}
+
+test('Filter… in a column menu opens a filter that stays open after the menu\'s session is let go', async () => {
+    // What the host last said about the session: it answers the release with
+    // a snapshot that names none, and until then refuses a sort or filter.
+    await page.evaluate(() => {
+        const seen = window as typeof window & { __smokeHostSession?: string | null };
+        window.addEventListener('message', (event) => {
+            const data = event.data as {
+                type?: string;
+                snapshot?: { capabilities?: { csvEditSessionId?: string } };
+            } | null;
+            if (data?.type !== 'workbookSnapshot') return;
+            seen.__smokeHostSession = data.snapshot?.capabilities?.csvEditSessionId ?? null;
+        });
+    });
+    const popover = await open_filter_from_header_menu(0);
+
+    // Nothing is unsaved, so the session the menu acquired is released, and
+    // the release is delivered to the window as a snapshot.
+    await expect.poll(() => page.evaluate(() => ({
+        window: document.querySelector('.grid-shell-root')?.getAttribute('data-edit-session'),
+        host: (window as typeof window & { __smokeHostSession?: string | null }).__smokeHostSession,
+    }))).toEqual({ window: 'none', host: null });
+    await expect(popover).toBeVisible();
+    await expect(popover.locator('.filter-popover-colname')).toHaveText('Name');
+
+    await apply_contains('li');
+    await expect.poll(strip).toContain('Name contains “li”');
+    await expect.poll(shown_rows).toEqual(['Alice|30|New York', 'Charlie|35|Paris']);
+    // A filter is a view: there is nothing to save, and no session is held.
+    await expect_nothing_unsaved();
+    await expect(page.locator('.grid-shell-root')).toHaveAttribute('data-edit-session', 'none');
+});
+
+test('a filter on a column with an unsaved edit in its first row is named by the column\'s header', async () => {
+    await select_cell(1, 0);
+    await page.keyboard.type('Ann');
+    await page.keyboard.press('Enter');
+    await expect(editor()).toBeHidden();
+    await expect(cell(1, 0)).toHaveText('Ann');
+    await expect(save()).toHaveClass(/has-unsaved/);
+
+    // The unsaved edit keeps the session, so the menu acquires none and
+    // nothing is released: the editor has only to name its column.
+    const popover = await open_filter_from_header_menu(0);
+    await expect(popover).toBeVisible();
+    await expect(popover.locator('.filter-popover-colname')).toHaveText('Name');
+    await apply_contains('Bob');
+    await expect.poll(strip).toContain('Name contains “Bob”');
+    await expect.poll(shown_rows).toEqual(['Bob|25|London']);
+
+    // The chip's own editor and the Columns list name it the same way.
+    await page.locator('.filter-chip-body').click();
+    await expect(popover.locator('.filter-popover-colname')).toHaveText('Name');
+    await popover.getByRole('button', { name: 'Cancel' }).click();
+    await expect(popover).toBeHidden();
+    await page.locator('.column-visibility-trigger').click();
+    await expect(page.locator('.column-visibility-name').first()).toHaveText('Name');
 });
