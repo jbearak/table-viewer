@@ -317,6 +317,8 @@ const ROW_RESIZE_TOLERANCE_PX = 5;
 /** A finished press on a column border. */
 interface BorderPress {
     readonly display_column: number;
+    /** The column that stood at `display_column` when it was pressed. */
+    readonly key: string | undefined;
     /** Whether the press moved the border. */
     readonly dragged: boolean;
     /** Which press in the window it was, counting every press anywhere. */
@@ -325,13 +327,16 @@ interface BorderPress {
 
 /**
  * Whether the last two presses on a column border were a double-click on
- * `display_column`'s border: both on it, neither dragging it, and no other
- * press anywhere in the window between them. How close in time they were is
+ * `display_column`'s border: both on it, both on the column `key` names (the
+ * one there now: an Undo or Redo can move columns between two clicks),
+ * neither dragging it, and no other press anywhere in the window between
+ * them. How close in time they were is
  * Glide's to judge: it asks for a fit only within its double-click time.
  */
 function border_was_double_clicked(
     presses: readonly BorderPress[],
     display_column: number,
+    key: string | undefined,
 ): boolean {
     const [last, previous] = presses;
     return last !== undefined
@@ -340,6 +345,9 @@ function border_was_double_clicked(
         && !previous.dragged
         && last.display_column === display_column
         && previous.display_column === display_column
+        && key !== undefined
+        && last.key === key
+        && previous.key === key
         && last.ordinal === previous.ordinal + 1;
 }
 
@@ -11882,7 +11890,11 @@ export function GridShell({
                 // A resize with no press open is a fit. Glide asks for one
                 // more often than a person double-clicks a border; one that
                 // is not taken ends with no gesture open.
-                if (!border_was_double_clicked(border_presses_ref.current, display_column)) return;
+                if (!border_was_double_clicked(
+                    border_presses_ref.current,
+                    display_column,
+                    projected_columns_ref.current[display_column]?.key,
+                )) return;
                 border_presses_ref.current = [];
                 gesture = {
                     moved: false,
@@ -11941,13 +11953,13 @@ export function GridShell({
                 border_presses_ref.current = [
                     {
                         display_column: gesture.press.display_column,
+                        // The column pressed, which a release with the
+                        // columns moved under it no longer finds there.
+                        key: gesture.keys[gesture.press.display_column],
                         // A drag discarded because the columns moved under it
-                        // was still a drag, not a click, and a press with the
-                        // columns moved under it was on the column that stood
-                        // there before: neither is half of a double-click.
-                        dragged: gesture.moved
-                            || gesture.discarded
-                            || !column_resize_keys_unchanged(gesture),
+                        // was still a drag, not a click: it is no half of a
+                        // double-click.
+                        dragged: gesture.moved || gesture.discarded,
                         ordinal: gesture.press.ordinal,
                     },
                     ...border_presses_ref.current.slice(0, 1),

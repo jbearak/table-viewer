@@ -2631,6 +2631,28 @@ describe('GridShell column projection', () => {
             expect(on_columns_resized).not.toHaveBeenCalled();
         });
 
+        it('takes no fit from two clicks at one border position with the columns moved between them', async () => {
+            // A click on column A's border, an Undo moves column B to where A
+            // was, a click there: one click on each column, no double-click.
+            const on_columns_resized = vi.fn();
+            const initial = props({ on_columns_resized, column_projection: all_columns });
+            const GridShell = await render_grid(initial);
+            await act(async () => click_border(0, 100));
+            await act(async () => {
+                root!.render(React.createElement(GridShell, { ...initial, column_projection: swapped }));
+            });
+            await act(async () => {
+                click_border(0, 150);
+                callbacks().resize({}, 71, 0);
+                callbacks().end({}, 71, 0);
+            });
+            expect(on_columns_resized).not.toHaveBeenCalled();
+
+            // A double-click on the column there now still fits it.
+            await double_click_border(0, 150, 71);
+            expect(on_columns_resized).toHaveBeenCalledExactlyOnceWith([{ column: 1, width: 71 }]);
+        });
+
         it('commits no fit when the columns change places during it', async () => {
             // A fit's calls come in one handler, so this cannot happen from
             // Glide; the fit takes the columns' places all the same.
