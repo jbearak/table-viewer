@@ -250,8 +250,8 @@ export function mapped_row_height_overlays(
  * guaranteed not to disagree — and a disagreement here is user-visible in both
  * directions. Host accepts and webview discards: the row snaps back at the end of the
  * drag and then silently springs to its new height when the write is delivered. Host
- * refuses and webview keeps: the row shows a height no file holds until the generation
- * next moves.
+ * refuses and webview keeps: the row shows a height no file holds until the refusal's
+ * answer arrives.
  *
  * ## Why the generation alone is not enough
  *

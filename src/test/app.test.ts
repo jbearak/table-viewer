@@ -5413,7 +5413,7 @@ describe('row height persistence', () => {
         });
         // But not painted: the host refuses the whole request and delivers nothing, so a
         // layer for it would have no delivery to reconcile against and would show a
-        // height no file holds until the generation next moved. Springing back as the
+        // height no file holds until its answer arrived. Springing back as the
         // drag ends is the truth.
         expect(grid_stub().getAttribute('data-row-height-overlay')).toBe('null');
     });
