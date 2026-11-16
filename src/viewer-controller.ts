@@ -3146,7 +3146,8 @@ export function attach_viewer(
      * waiting for: a reconciliation installed a saved view, or the source
      * changed. Work still running for those requests is then, as far as the
      * renderer knows, done, and a session request waits it out rather than
-     * being refused for it.
+     * being refused for it. Records the view as offered at once; returns the
+     * callback that moves the baseline, to call once the post is accepted.
      */
     function note_snapshot_posted(snapshot: { readonly generation: number; readonly sourceGeneration: number }): () => void {
         const view = { generation: snapshot.generation, sourceGeneration: snapshot.sourceGeneration };
@@ -13542,9 +13543,10 @@ export function attach_viewer(
         // renderer. Usually the renderer drops this request when it applies
         // that snapshot (or already has). If an install already moved the
         // renderer to that view, it keeps the request until it is answered and
-        // asks for no session meanwhile, so marking it here changes nothing
-        // there. Either way a session request waits this out rather than being
-        // refused for it. Do not narrow this to snapshots the renderer saw move.
+        // asks for no session meanwhile, so marking it here has no effect on
+        // that renderer's requests. Either way a session request waits this
+        // out rather than being refused for it. Do not narrow this to
+        // snapshots the renderer saw move.
         if (
             last_offered_view !== undefined
             && (message.generation < last_offered_view.generation
