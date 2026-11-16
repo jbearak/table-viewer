@@ -16,6 +16,7 @@ import { CompactSelection } from '../webview/glide-data-grid';
 import { webview_formula_workbook } from '../webview/formula-anchor-model';
 import { EMPTY_PENDING_STRUCTURAL_CHANGES } from '../pending-changes';
 import type { EditingHandle, GridFocusHandle } from '../webview/grid-shell';
+import type { RowHeightLayer } from '../webview/row-heights';
 import {
     create_edit_session_store,
     type EditSessionStore,
@@ -271,6 +272,7 @@ async function render_grid(
         on_request_edit_session?: (quiet?: boolean) => Promise<boolean>;
         on_edit_session_idle?: () => void;
         row_heights?: Record<number, number>;
+        row_height_overlay?: readonly RowHeightLayer[];
         grid_focus_ref?: React.MutableRefObject<GridFocusHandle | null>;
         formula_anchor_workbook?: ReturnType<typeof webview_formula_workbook>;
     } = {},
@@ -2751,6 +2753,22 @@ describe('GridShell row heights handed to the grid', () => {
         const row_height = grid_mock.props!.rowHeight;
         expect(row_height).toBeTypeOf('function');
         expect((row_height as (row: number) => number)(0)).toBe(60);
+    });
+
+    it('hands the grid a function while a resize is painted ahead of the host', async () => {
+        await render_grid(undefined, {
+            row_height_overlay: [{ rows: [{ start: 0, end: 0 }], height: 60, requestId: 'drag' }],
+        });
+        const row_height = grid_mock.props!.rowHeight;
+        expect(row_height).toBeTypeOf('function');
+        expect((row_height as (row: number) => number)(0)).toBe(60);
+    });
+
+    it('keeps the number while the only layer holds the place of a reset and paints no row', async () => {
+        await render_grid(undefined, {
+            row_height_overlay: [{ rows: [], height: 24, requestId: 'reset' }],
+        });
+        expect(grid_mock.props!.rowHeight).toBeTypeOf('number');
     });
 });
 

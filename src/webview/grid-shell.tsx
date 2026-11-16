@@ -7792,7 +7792,9 @@ export function GridShell({
      */
     const uniform_row_height = useMemo((): number | undefined => {
         if (row_resize_preview) return undefined;
-        if (row_height_overlay !== undefined && row_height_overlay.length > 0) return undefined;
+        // A layer with no rows paints none: it holds the place of a reset or
+        // an undo among the layers (`row_height_order_marker`).
+        if (row_height_overlay?.some((layer) => layer.rows.length > 0)) return undefined;
         if (has_pending_structural_changes(pending_rows)) return undefined;
         for (const row in row_heights) {
             if (Object.hasOwn(row_heights, row)) return undefined;

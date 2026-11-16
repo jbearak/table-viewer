@@ -535,15 +535,17 @@ export function row_height_layers_with(
  *    reconciliation would have caused exactly the failure it exists to prevent.
  *
  * What licenses dropping the older ones is that webview→host resize writes are strictly
- * ordered. `postMessage` preserves order and the host's `setRowHeights` handler reaches
- * `enqueue_layout_write` synchronously, before its first await, so requests join the single
- * serialized layout-write tail in the order they were posted; layers are appended in that
- * same order, in the same synchronous block that posts. So by the time a write for layer
- * *N* has been processed, every write older than *N* has been processed too, and each of
- * those older requests is therefore already dead: either it was persisted (so the delivery
- * that carries *N* carries it too, unless something later overwrote it — in which case the
- * newer durable value is precisely what should win) or it was refused (so its intent never
- * became durable, and it must not keep painting).
+ * ordered. `postMessage` preserves order and the host's `setRowHeights` and
+ * `setSourceRowHeights` handlers each reach `enqueue_layout_write` synchronously, before
+ * their first await, so requests join the single serialized layout-write tail in the order
+ * they were posted; layers are appended in that same order, in the same synchronous block
+ * that posts, and so is the place of a reset or a replay, which paints nothing
+ * (`row_height_order_marker`). So by the time a write for layer *N* has been processed,
+ * every write older than *N* has been processed too, and each of those older requests is
+ * therefore already dead: either it was persisted (so the delivery that carries *N*
+ * carries it too, unless something later overwrote it — in which case the newer durable
+ * value is precisely what should win) or it was refused (so its intent never became
+ * durable, and it must not keep painting).
  *
  * The one gap in that argument, stated rather than papered over: agreement is by value, so
  * a delivery can agree with layer *N* without *N*'s own write having run — a sibling panel
