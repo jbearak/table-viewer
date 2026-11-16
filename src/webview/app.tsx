@@ -9566,7 +9566,10 @@ export function App(): React.JSX.Element {
             // (behind the replay it could not follow): not sent. Ended as a
             // result that needs a reload ends it, saying only this. (A
             // replay's run would end the same way, its entry left where it
-            // is; the press gate refuses one before it is queued.)
+            // is; the press gate refuses one before it is queued.) Never with
+            // a header result that needs a reload: that result empties the
+            // queue, and nothing is queued under its fence, so lowering the
+            // header fence here cannot clear it.
             if (run !== null) run.failed = { silent: true };
             set_excel_header_status('Header row was not updated.');
             say_history(REOPEN_REQUIRED_MESSAGE);

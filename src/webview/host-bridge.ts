@@ -218,7 +218,11 @@ export const publication_fence = {
      * A new document replaced the stores these publications were of, so
      * nothing will retry them. Left outstanding, one the host dropped would
      * hold every wait for acknowledgement for ever. The sequence itself is
-     * kept: the host refuses one that goes back.
+     * kept: the host refuses one that goes back. The dedupe memory is kept
+     * too: within one renderer a new document under the same session comes
+     * only from the host switching the panel to another file, and forgetting
+     * it would post an echo of the hydrated stores, which the failed-save
+     * guard in GridShell exists to prevent.
      */
     forget_outstanding(): void {
         for (const channel of pending_edit_channels.values()) {
