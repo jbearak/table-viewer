@@ -817,7 +817,7 @@ export interface ExcelHeaderTarget {
  * Whether a `setExcelFirstRowHeader` request that carries a `target` is well
  * formed. A target replaces the gesture's `unhideAll` and `headerRow`; its
  * `enabled` restates the mode; a source row goes with `'on'` and only with it;
- * and the two row lists name each row at most once between them.
+ * and no row is in both row lists. (A row may repeat within one list.)
  */
 export function excel_header_target_request_valid(request: {
     readonly enabled: boolean;

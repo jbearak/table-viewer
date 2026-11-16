@@ -647,6 +647,8 @@ interface ExcelHeaderQueue {
     /** Every store was published for this request. */
     readonly flushed: boolean;
     readonly ack_wait_started?: number;
+    /** Set for a header step's replay: what the disabled controls say meanwhile. */
+    readonly replay?: HistoryDirection;
 }
 
 /** How long a header change waits for the host to acknowledge the session's publications. */
@@ -6968,6 +6970,28 @@ export function App(): React.JSX.Element {
     ) => boolean) | null>(null);
     /** `enqueue_excel_header_change`, which is declared further down. */
     const enqueue_excel_header_change_ref = useRef<((request: HeaderQueueRequest) => boolean) | null>(null);
+    /**
+     * What stops a Header Row change on these worksheets before it is asked
+     * for: the refusals that depend only on a worksheet's unsaved changes and
+     * need no round trip (a layout conflict notice, a live new column). The
+     * host runs the full rebase in the write.
+     */
+    const header_change_refusal = useCallback((sheet_indices: readonly number[]): string | undefined => {
+        const sheets = meta_ref.current?.sheets ?? [];
+        for (const sheet_index of sheet_indices) {
+            const sheet = sheets[sheet_index];
+            if (sheet === undefined) continue;
+            const refusal = header_rebase_slot_refusal(
+                {
+                    cells: {},
+                    ...edit_session_registry_ref.current!.pending_rows_for_sheet(sheet_index).snapshot(),
+                },
+                header_body_start(sheet.excelFirstRowHeader),
+            );
+            if (refusal !== undefined) return refusal;
+        }
+        return undefined;
+    }, []);
     /** `post_column_visibility`, which is declared further down. */
     const post_column_visibility_ref = useRef<((
         sheet_index: number,
@@ -7138,6 +7162,13 @@ export function App(): React.JSX.Element {
                 });
                 for (const reason of plan.skipped) skipped.add(reason);
                 if (plan.target !== undefined) targets.set(index, plan.target);
+            }
+            // Refused before the window moves to the step's worksheet: a step
+            // that stays where it is leaves the person where they are.
+            const refusal = header_change_refusal([...targets.keys()]);
+            if (refusal !== undefined) {
+                show_warning(view_replay_refusal_warning(direction, entry.action.label, refusal));
+                return;
             }
             // Undo shows a worksheet its step belongs to.
             let shown = active_sheet_index;
@@ -7359,6 +7390,7 @@ export function App(): React.JSX.Element {
         active_sheet_index,
         edit_session_pending,
         handle_sheet_select,
+        header_change_refusal,
         land_view_replay,
         mark_row_height_request,
         preview_mode,
@@ -8509,8 +8541,9 @@ export function App(): React.JSX.Element {
         if (result.reloadRequired === true) {
             header_reload_required_ref.current = true;
             // What changed before this is recorded; a replay's entry stays,
-            // and the reload message below is what the person is told.
-            if (run !== null) run.failed ??= { silent: true };
+            // and the reload message below is what the person is told, in
+            // place of anything an earlier sheet left to say.
+            if (run !== null) run.failed = { silent: true };
             end_header_run();
             replace_excel_header_queue(null);
             set_excel_header_status('Reload this window to finish the header row change.');
@@ -8548,7 +8581,9 @@ export function App(): React.JSX.Element {
         }
         if (result.outcome === 'rejected') {
             if (run !== null) {
-                run.failed ??= { reason: result.error ?? 'The header row was not updated.' };
+                // The host's reason, also over an earlier sheet's "the file
+                // was refreshing": trying again would meet this refusal.
+                run.failed = { reason: result.error ?? 'The header row was not updated.' };
             }
             finish_header_queue();
             return report;
@@ -8583,32 +8618,19 @@ export function App(): React.JSX.Element {
         ) return false;
         const sheets = meta_ref.current?.sheets ?? [];
         const { replay } = request;
-        // The refusals that depend only on the worksheet's unsaved changes,
-        // which need no round trip: a layout conflict notice, a live new
-        // column. The host runs the full rebase in the write.
-        for (const sheet_index of request.sheets) {
-            const sheet = sheets[sheet_index];
-            if (sheet === undefined) continue;
-            const refusal = header_rebase_slot_refusal(
-                {
-                    cells: {},
-                    ...edit_session_registry_ref.current!.pending_rows_for_sheet(sheet_index).snapshot(),
-                },
-                header_body_start(sheet.excelFirstRowHeader),
-            );
-            if (refusal !== undefined) {
-                host_bridge.postMessage({
-                    type: 'showWarning',
-                    message: replay === undefined
-                        ? `Could not change the header row: ${refusal}`
-                        : view_replay_refusal_warning(
-                            replay.direction,
-                            replay.entry.action.label,
-                            refusal,
-                        ),
-                });
-                return false;
-            }
+        const refusal = header_change_refusal(request.sheets);
+        if (refusal !== undefined) {
+            host_bridge.postMessage({
+                type: 'showWarning',
+                message: replay === undefined
+                    ? `Could not change the header row: ${refusal}`
+                    : view_replay_refusal_warning(
+                        replay.direction,
+                        replay.entry.action.label,
+                        refusal,
+                    ),
+            });
+            return false;
         }
         const grid_focus_sheet = request.grid_focus_sheet_index === undefined
             ? undefined
@@ -8646,9 +8668,10 @@ export function App(): React.JSX.Element {
             retries: 0,
             fenced: replay !== undefined,
             flushed: false,
+            ...(replay === undefined ? {} : { replay: replay.direction }),
         });
         return true;
-    }, [replace_excel_header_queue]);
+    }, [header_change_refusal, replace_excel_header_queue]);
     enqueue_excel_header_change_ref.current = enqueue_excel_header_change;
 
     const handle_toggle_excel_header = useCallback(() => {
@@ -11747,6 +11770,8 @@ export function App(): React.JSX.Element {
     const excel_header_disabled_reason = !excel_header_candidate_available
         && !excel_header?.active
         ? 'This sheet has no first row to use as column names.'
+        : excel_header_queue?.replay !== undefined
+        ? `${excel_header_queue.replay === 'undo' ? 'Undoing' : 'Redoing'} a header row change…`
         : excel_header_pending
         ? pending_excel_header_unhide_ref.current
             ? 'Restoring rows…'

@@ -622,6 +622,10 @@ export function header_view_delta(
  *
  * The two all-sheets labels are the menu items' own words. "Unhide rows" is
  * the label the same button records when no header is in the way.
+ *
+ * The label follows what changed, not which control was used: an all-sheets
+ * item that found every worksheet but one already there records one change,
+ * and reads as that worksheet's own step.
  */
 export function header_step_label(deltas: readonly HeaderViewDelta[]): string {
     if (deltas.length === 1) {

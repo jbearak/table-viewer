@@ -24926,6 +24926,72 @@ describe('the header row as a step in history', () => {
             expect(warnings(post_message)).toEqual([]);
         });
 
+        it('gives the host\'s refusal of a later sheet, not an earlier sheet\'s "the file was refreshing"', async () => {
+            const { post_message } = await render_app();
+            await open(post_message, book([OFF, OFF]));
+            record_header('Show first row as data on all sheets', [[0, TURNED_OFF], [1, TURNED_OFF]]);
+
+            await undo();
+            for (let attempt = 0; attempt < 4; attempt += 1) {
+                await answer(requests(post_message).at(-1)!, book([AUTO, OFF]), { outcome: 'recovered' });
+            }
+            const second = requests(post_message).at(-1)!;
+            expect(second.sheetIndex).toBe(1);
+            await answer(second, book([AUTO, OFF]), {
+                outcome: 'rejected',
+                error: 'Save first: the row that would become the header row has unsaved changes.',
+            });
+
+            // Trying again would meet the same refusal, so that is what is said.
+            expect(warnings(post_message)).toEqual([
+                'Can\'t undo “Show first row as data on all sheets”: '
+                + 'Save first: the row that would become the header row has unsaved changes.',
+            ]);
+            expect(history_labels('undo')).toEqual(['Show first row as data on all sheets']);
+            expect(edits_admitted()).toBe(true);
+        });
+
+        it('says only that a reload is needed when an earlier sheet could not say what it wrote', async () => {
+            const { post_message } = await render_app();
+            await open(post_message, book([OFF, OFF]));
+            record_header('Show first row as data on all sheets', [[0, TURNED_OFF], [1, TURNED_OFF]]);
+
+            await undo();
+            for (let attempt = 0; attempt < 4; attempt += 1) {
+                await answer(requests(post_message).at(-1)!, book([AUTO, OFF]), { outcome: 'recovered' });
+            }
+            await answer(requests(post_message).at(-1)!, book([AUTO, OFF]), {
+                outcome: 'recovered',
+                reloadRequired: true,
+            });
+
+            expect(warnings(post_message)).toEqual(['Reload this window to keep editing this file.']);
+            expect(history_labels('undo')).toEqual(['Show first row as data on all sheets']);
+        });
+
+        it('says on the disabled Header Row control that a header change is being undone or redone', async () => {
+            const { post_message } = await render_app();
+            await open(post_message, book([AUTO]));
+            await turn_off(post_message);
+            const tooltip = async () => {
+                const button = get_button('Header Row');
+                await act(async () => {
+                    button.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+                });
+                const text = document.querySelector('[role="tooltip"]')?.textContent;
+                await act(async () => {
+                    button.dispatchEvent(new MouseEvent('mouseout', { bubbles: true }));
+                });
+                return text;
+            };
+
+            await undo();
+            expect(await tooltip()).toBe('Undoing a header row change…');
+            await answer(requests(post_message).at(-1)!, book([AUTO]), { change: BACK_TO_AUTO });
+            await redo();
+            expect(await tooltip()).toBe('Redoing a header row change…');
+        });
+
         it('leaves the step and keeps the fence when the answer needs a reload', async () => {
             const { post_message } = await render_app();
             await open(post_message, book([AUTO]));
@@ -25003,7 +25069,10 @@ describe('the header row as a step in history', () => {
             await answer(first, book([OFF]), { change: { ...TURNED_ON, before: TURNED_ON.after, after: TURNED_ON.before } });
 
             // Exactly one further undo, on the step under it. The snapshot
-            // that carried the answer is installed: the header shown is off.
+            // that carried the answer was installed with the fence still up
+            // (nothing returned early under it): the window shows that
+            // snapshot's generation and its header, which is off.
+            expect(grid_stub().getAttribute('data-generation')).toBe(String(generation));
             expect(get_button('Header Row').getAttribute('aria-pressed')).toBe('false');
             expect(requests(post_message).map((request) => request.target)).toEqual([OFF_TARGET, AUTO_TARGET]);
             expect(history_labels('undo')).toEqual(['Turn off header row']);
@@ -25092,6 +25161,76 @@ describe('the header row as a step in history', () => {
             expect(requests(post_message)).toHaveLength(1);
             expect(warnings(post_message)).toEqual([]);
             expect(edits_admitted()).toBe(true);
+        });
+
+        describe('when the queue ends in the drain, its last worksheet gone before its request', () => {
+            const SKIPPED = 'Undo skipped part of “Show first row as data on all sheets”: '
+                + 'worksheets that are no longer in the workbook were left out.';
+
+            /** [Use row 1 as header, an all-sheets step], Undo of the top one in flight, and Undo pressed again. */
+            async function two_sheet_replay_with_a_press(post_message: ReturnType<typeof vi.fn>) {
+                await open(post_message, book([OFF, OFF]));
+                record_header('Use row 1 as header', [[0, TURNED_ON]]);
+                record_header('Show first row as data on all sheets', [[0, TURNED_OFF], [1, TURNED_OFF]]);
+                await undo();
+                const [first] = requests(post_message);
+                expect(first).toMatchObject({ sheetIndex: 0, target: AUTO_TARGET });
+                await undo();
+                return first;
+            }
+
+            it('carries the press out when the snapshot that carried the last answer is still the one installed', async () => {
+                const { post_message } = await render_app();
+                const first = await two_sheet_replay_with_a_press(post_message);
+
+                // The answer's own snapshot no longer has the second worksheet.
+                await answer(first, book([AUTO]), { change: BACK_TO_AUTO });
+
+                expect(warnings(post_message)).toEqual([SKIPPED]);
+                expect(history_labels('redo')).toEqual(['Show first row as data on all sheets']);
+                // The remembered Undo, on the step under it.
+                expect(requests(post_message).map((request) => [request.sheetIndex, request.target]))
+                    .toEqual([[0, AUTO_TARGET], [0, OFF_TARGET]]);
+                expect(history_labels('undo')).toEqual(['Use row 1 as header']);
+                expect(edits_admitted()).toBe(false);
+                await answer(requests(post_message).at(-1)!, book([OFF]), {
+                    change: { ...TURNED_ON, before: TURNED_ON.after, after: TURNED_ON.before },
+                });
+                expect(history_labels('undo')).toEqual([]);
+                expect(edits_admitted()).toBe(true);
+            });
+
+            it('drops the press when a later snapshot is the one that took the worksheet away', async () => {
+                const { post_message } = await render_app();
+                const first = await two_sheet_replay_with_a_press(post_message);
+
+                // The answer brings a saved view to re-install, which holds
+                // the second worksheet's request back.
+                const answered = book([AUTO, OFF]);
+                await answer(first, answered, { change: BACK_TO_AUTO }, {
+                    state: { transforms: [hiding(answered, [4]), undefined] },
+                });
+                expect(requests(post_message)).toHaveLength(1);
+                expect(history_labels('undo')).toEqual([
+                    'Use row 1 as header',
+                    'Show first row as data on all sheets',
+                ]);
+                // Then a refresh without the second worksheet.
+                generation += 1;
+                await dispatch_host_message(refresh_snapshot_message(book([AUTO]), {
+                    generation,
+                    sourceGeneration: generation,
+                    capabilities: EDITABLE,
+                }));
+
+                // The step moved; the window is not showing what the last
+                // answer left, so the press is dropped, saying nothing more.
+                expect(warnings(post_message)).toEqual([SKIPPED]);
+                expect(history_labels('undo')).toEqual(['Use row 1 as header']);
+                expect(history_labels('redo')).toEqual(['Show first row as data on all sheets']);
+                expect(requests(post_message)).toHaveLength(1);
+                expect(edits_admitted()).toBe(true);
+            });
         });
 
         it('admits no edit between the answer and the press it hands on, and takes a later press in its place', async () => {
@@ -25250,6 +25389,74 @@ describe('the header row as a step in history', () => {
             } finally {
                 vi.useRealTimers();
             }
+        });
+
+        it('waits, saying nothing, behind the release of this window\'s editing session, and then asks', async () => {
+            const { post_message } = await render_app();
+            // The fence an exiting session raises: a fold refuses under it
+            // unless told that nothing open is fine.
+            grid_shell_mock.commit_live_edit.mockImplementation((
+                options?: { fenced_empty_ok?: boolean },
+            ) => options?.fenced_empty_ok === true);
+            await open(post_message, book([OFF]));
+            await acquire_editing_session(post_message);
+            record_header('Turn off header row', [[0, TURNED_OFF]]);
+            // As after the Undo that took back the last unsaved edit: the
+            // window lets the session go.
+            await release_idle_edit_session();
+            expect(posted(post_message, 'releaseEditSession')).toHaveLength(1);
+            post_message.mockClear();
+
+            await undo();
+            expect(requests(post_message)).toEqual([]);
+            expect(warnings(post_message)).toEqual([]);
+            expect(edits_admitted()).toBe(false);
+
+            // The host's snapshot once the session is gone.
+            await dispatch_host_message(refresh_snapshot_message(book([OFF]), {
+                generation: 1,
+                sourceGeneration: 1,
+                reason: 'other',
+                capabilities: EDITABLE,
+            }));
+            await vi.waitUntil(() => requests(post_message).length === 1);
+
+            expect(requests(post_message)[0].target).toEqual(AUTO_TARGET);
+            expect(grid_stub().getAttribute('data-editing-session-held')).toBe('false');
+            await answer(requests(post_message)[0], book([AUTO]), { change: BACK_TO_AUTO });
+            expect(history_labels('redo')).toEqual(['Turn off header row']);
+            expect(warnings(post_message)).toEqual([]);
+            expect(edits_admitted()).toBe(true);
+        });
+
+        it('is refused for a conflict on another worksheet without leaving the worksheet on screen', async () => {
+            const { post_message } = await render_app();
+            await open(post_message, book([OFF, OFF]));
+            await acquire_editing_session(post_message);
+            await click_sheet_tab('S2');
+            act(() => {
+                expect(props().pending_row_store!.reconcile({ session_id: 'test-edit-session' }, {
+                    formatTemplates: [],
+                    appendedRows: [],
+                    tailRemovals: [],
+                    conflicts: [{ reason: 'structuralBasisChanged', pendingRowIds: [], tailRemovalIds: [] }],
+                })).toBe(true);
+            });
+            await click_sheet_tab('S1');
+            expect(grid_stub().getAttribute('data-sheet-index')).toBe('0');
+            record_header('Turn off header row', [[1, TURNED_OFF]]);
+            post_message.mockClear();
+
+            await undo();
+
+            expect(warnings(post_message)).toEqual([
+                'Can\'t undo “Turn off header row”: '
+                + 'Resolve the row and column changes notice before changing the header row.',
+            ]);
+            // The step stays, and so does the person.
+            expect(grid_stub().getAttribute('data-sheet-index')).toBe('0');
+            expect(requests(post_message)).toEqual([]);
+            expect(history_labels('undo')).toEqual(['Turn off header row']);
         });
 
         it('says what stops it when the worksheet\'s row changes are in conflict, and queues nothing', async () => {
