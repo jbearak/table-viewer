@@ -2756,9 +2756,10 @@ describe('GridShell editing with no session held yet', () => {
 
 describe('GridShell when App pauses edits, or its publications are fenced', () => {
     it('closes the editor without committing what it holds', async () => {
-        // App pauses edits at once when it says the view no longer matches
-        // the file: an editor open then would otherwise commit into a store
-        // that is never sent.
+        // Pins existing behaviour the reopen fence relies on (the
+        // `editable_cells` layout effect): App pauses edits when it says the
+        // view no longer matches the file, and an editor open then would
+        // otherwise commit into a store that is never sent.
         const store = create_edit_session_store({ session_id: 'session-1' });
         const { rerender } = await render_grid(undefined, { edit_session: store, generation: 1 });
         const clip = document.createElement('div');

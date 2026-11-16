@@ -1910,8 +1910,9 @@ export function App(): React.JSX.Element {
      */
     const raise_reopen_fence = useCallback(() => {
         reopen_required_ref.current = true;
-        // In this render, so the grid closes an open editor without
-        // committing it (its `editable_cells` layout effect).
+        // In the render that follows (a task later at most), the grid closes
+        // an open editor without committing it (its `editable_cells` layout
+        // effect); until then the barrier refuses its commit.
         set_reopen_required(true);
         publication_fence.raise();
         // A Header Row change queued behind the replay ends now.
@@ -3856,7 +3857,13 @@ export function App(): React.JSX.Element {
         // App-owned store that survives generation-keyed GridShell remounts.
         const editing = editing_ref.current;
         editing?.stop_edit_admission();
-        if (editing?.commit_live_edit_at_close_barrier() === false) {
+        // Under the publication fence nothing folded would reach the host, and
+        // until the render after the fence rose closes it an open editor's
+        // fold is refused like any edit: it is left as it is.
+        if (
+            !publication_fence.is_raised()
+            && editing?.commit_live_edit_at_close_barrier() === false
+        ) {
             throw new Error('The open cell edit exceeds the pending-changes limit.');
         }
         await new Promise<void>((resolve) => queueMicrotask(resolve));
@@ -4053,11 +4060,10 @@ export function App(): React.JSX.Element {
     }, [clear_save_verdict, csv_edit_session_id, fence_edit_session_exit, refused_for_reopen]);
 
     const begin_save_operation = useCallback((): CsvSaveOperation | undefined => {
-        // Both refusals come before anything a Save starts (the notices
-        // below): nothing is asked of the file.
+        // Both fences refuse before anything a Save starts (the notices
+        // below), with a session or without one: nothing is asked of the file.
         // A window that no longer matches its file would save its own stores,
-        // which disagree with it, over the file. Said with a session or
-        // without one.
+        // which disagree with it, over the file.
         if (reopen_required_ref.current) {
             host_bridge.postMessage({ type: 'showWarning', message: REOPEN_REQUIRED_SAVE_MESSAGE });
             return undefined;
@@ -4068,13 +4074,13 @@ export function App(): React.JSX.Element {
             warn_save_waits_for_header();
             return undefined;
         }
-        if (!csv_edit_session_id || save_projection_ref.current.operation) return undefined;
         // A conflict notice's dismissal is occurrence-scoped: Save is the
         // user's explicit request to see whether the condition still blocks
         // persistence. Dismissed formula warnings stay dismissed.
         set_dismissed_notices((current) => [...current].some(is_conflict_dismissal)
             ? new Set([...current].filter((key) => !is_conflict_dismissal(key)))
             : current);
+        if (!csv_edit_session_id || save_projection_ref.current.operation) return undefined;
         // And for a view change still being written. A size or column write
         // posted just before Save could be answered after a structural save
         // has renumbered rows and columns and cut history off, and its step

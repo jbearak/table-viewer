@@ -4241,7 +4241,7 @@ export function GridShell({
         if (gestures_admitted !== undefined && !gestures_admitted()) {
             // Said while a press of Undo or Redo is waiting, or while App
             // pauses edits (a pending row's highlight is an edit of its store).
-            if (!refused_for_history_press() && edits_paused) on_edit_paused_gesture?.();
+            if (!refused_for_history_press() && edits_held_by_pause) on_edit_paused_gesture?.();
             return false;
         }
         const target = current_highlight_selection();
@@ -4407,7 +4407,7 @@ export function GridShell({
     }, [
         current_highlight_selection,
         edit_session_id,
-        edits_paused,
+        edits_held_by_pause,
         gestures_admitted,
         history_capture,
         on_edit_paused_gesture,

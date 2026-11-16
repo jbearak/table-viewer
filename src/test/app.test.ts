@@ -25057,6 +25057,18 @@ describe('view steps in history', () => {
                     expect(answer).toMatchObject({ editSessionId: 'first-session', highestProducedSequence: 0 });
                 });
 
+                it('answers a close whose open editor the barrier refuses, before the grid has closed it', async () => {
+                    const { post_message } = await render_app();
+                    await diverge(post_message);
+                    // The render that closes the editor has not happened yet:
+                    // its fold is refused like any edit.
+                    grid_shell_mock.commit_live_edit_at_close_barrier.mockReturnValue(false);
+                    const answer = await flush(post_message, 'close-with-editor');
+                    expect(answer).toMatchObject({ editSessionId: 'first-session', highestProducedSequence: 0 });
+                    expect(posted(post_message, 'pendingChangesFlushFailed')).toEqual([]);
+                    expect(publications(post_message)).toEqual([]);
+                });
+
                 it('refuses Save, edits, Undo and Redo with one message', async () => {
                     const { post_message } = await render_app();
                     await diverge(post_message);
