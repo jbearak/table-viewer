@@ -314,6 +314,31 @@ import {
 
 /** Pixel proximity to a row border that arms the resize strip. */
 const ROW_RESIZE_TOLERANCE_PX = 5;
+/** The longest a double-click's two releases may be apart. Glide's own threshold. */
+const BORDER_DOUBLE_CLICK_MS = 500;
+
+/**
+ * Whether the last two presses on a column border were a double-click on
+ * `display_column`'s border: both on it, neither dragging it, released within
+ * the double-click time of each other.
+ */
+function border_was_double_clicked(
+    presses: readonly {
+        readonly display_column: number;
+        readonly dragged: boolean;
+        readonly ended_at: number;
+    }[],
+    display_column: number,
+): boolean {
+    const [last, previous] = presses;
+    return last !== undefined
+        && previous !== undefined
+        && !last.dragged
+        && !previous.dragged
+        && last.display_column === display_column
+        && previous.display_column === display_column
+        && last.ended_at - previous.ended_at <= BORDER_DOUBLE_CLICK_MS;
+}
 
 /**
  * Vertical overscroll reserved while the dock is offered. The launcher sits
@@ -3081,6 +3106,13 @@ export function GridShell({
      * anything, so state would hand the end call the widths of the render
      * before. The drafts are drawn through the revision counter below.
      */
+    interface BorderPress {
+        readonly display_column: number;
+        /** Whether the press moved the border. */
+        readonly dragged: boolean;
+        /** When it was released, in `performance.now()` time. */
+        readonly ended_at: number;
+    }
     interface ColumnResizeGesture {
         /**
          * The pressed border: its column and the width that column had.
@@ -3096,6 +3128,17 @@ export function GridShell({
         readonly pending: Map<string, number>;
     }
     const column_resize_ref = useRef<ColumnResizeGesture | null>(null);
+    /**
+     * The last two presses on a column border, newest first.
+     *
+     * Glide calls a mouse-up a double-click when it follows any other
+     * mouse-up, anywhere, by under half a second, and on a column border it
+     * then fits the column. So a click on a border soon after a click on a
+     * cell would fit the column, and a drag released that soon would be
+     * followed by a fit of the column just dragged. A fit is taken only from a
+     * double-click on the border itself: see `border_was_double_clicked`.
+     */
+    const border_presses_ref = useRef<readonly BorderPress[]>([]);
     const [source_column_draft_revision, set_source_column_draft_revision] = useState(0);
     const shown_column_widths = useMemo(() => {
         const drafts = column_resize_ref.current?.source;
@@ -11750,6 +11793,11 @@ export function GridShell({
         (_column: GridColumn, new_size: number, display_column: number) => {
             let gesture = column_resize_ref.current;
             if (gesture === null) {
+                // A resize with no press open is a fit. Glide asks for one
+                // more often than a person double-clicks a border; one that
+                // is not taken ends with no gesture open.
+                if (!border_was_double_clicked(border_presses_ref.current, display_column)) return;
+                border_presses_ref.current = [];
                 gesture = { moved: false, source: new Map(), pending: new Map() };
                 column_resize_ref.current = gesture;
             }
@@ -11796,6 +11844,16 @@ export function GridShell({
             const gesture = column_resize_ref.current;
             if (gesture === null) return;
             column_resize_ref.current = null;
+            if (gesture.press !== undefined) {
+                border_presses_ref.current = [
+                    {
+                        display_column: gesture.press.display_column,
+                        dragged: gesture.moved,
+                        ended_at: performance.now(),
+                    },
+                    ...border_presses_ref.current.slice(0, 1),
+                ];
+            }
             if (gesture.source.size > 0) {
                 set_source_column_draft_revision((revision) => revision + 1);
             }

@@ -178,7 +178,7 @@ export async function save_changes(page: Page): Promise<void> {
  * The grid canvas's box. A save that changes the rows (a move, a delete)
  * remounts the grid, so the canvas can be briefly absent; wait for the new one.
  */
-async function canvas_box(page: Page): Promise<{ x: number; y: number }> {
+export async function canvas_box(page: Page): Promise<{ x: number; y: number }> {
     let box: { x: number; y: number } | null = null;
     await expect.poll(async () => {
         box = await page.locator(GRID_CANVAS).first().boundingBox();

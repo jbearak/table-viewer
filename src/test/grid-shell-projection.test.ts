@@ -2312,23 +2312,114 @@ describe('GridShell column projection', () => {
             expect(shown_widths()).toEqual([['s:0', 100], ['s:1', 150], ['s:2', 200]]);
         });
 
-        it('commits a fit, which arrives with no press open, once', async () => {
+        /** A double-click on a column's border, as Glide reports it: two presses that do not move, then the fit. */
+        const double_click_border = async (display_column: number, start_width: number, fitted: number) => {
+            const { start, resize, end } = callbacks();
+            await act(async () => {
+                start({}, start_width, display_column);
+                end({}, start_width, display_column);
+                start({}, start_width, display_column);
+                end({}, start_width, display_column);
+                // The fit arrives with no press open.
+                resize({}, fitted, display_column);
+                end({}, fitted, display_column);
+            });
+        };
+
+        it('commits a double-click\'s fit once', async () => {
             const on_columns_resized = vi.fn();
             await render_grid(props({ on_columns_resized, column_projection: all_columns }));
-            const { resize, end } = callbacks();
-            // A double-click on a border: the press has already ended.
-            await act(async () => {
-                resize({}, 77, 1);
-                end({}, 77, 1);
-            });
+            await double_click_border(1, 150, 77);
             expect(on_columns_resized).toHaveBeenCalledExactlyOnceWith([{ column: 1, width: 77 }]);
             // A fit that lands on the width the column already has is nothing.
             on_columns_resized.mockClear();
+            await double_click_border(1, 150, 150);
+            expect(on_columns_resized).not.toHaveBeenCalled();
+        });
+
+        it('takes no fit from one click on a border, however soon after another click', async () => {
+            // Glide calls any mouse-up within half a second of another one a
+            // double-click, wherever the other was, and fits the column whose
+            // border the pointer is on.
+            const on_columns_resized = vi.fn();
+            await render_grid(props({ on_columns_resized, column_projection: all_columns }));
+            const { start, resize, end } = callbacks();
             await act(async () => {
-                resize({}, 150, 1);
+                start({}, 150, 1);
                 end({}, 150, 1);
+                resize({}, 77, 1);
+                end({}, 77, 1);
             });
             expect(on_columns_resized).not.toHaveBeenCalled();
+            expect(shown_widths()).toEqual([['s:0', 100], ['s:1', 150], ['s:2', 200]]);
+
+            // Nor from a click on one border and then one on another.
+            await act(async () => {
+                start({}, 100, 0);
+                end({}, 100, 0);
+                resize({}, 71, 0);
+                end({}, 71, 0);
+            });
+            expect(on_columns_resized).not.toHaveBeenCalled();
+        });
+
+        it('takes no fit from two clicks on a border that are not a double-click', async () => {
+            const on_columns_resized = vi.fn();
+            await render_grid(props({ on_columns_resized, column_projection: all_columns }));
+            const { start, resize, end } = callbacks();
+            const now = vi.spyOn(performance, 'now');
+            try {
+                now.mockReturnValue(1_000);
+                await act(async () => { start({}, 150, 1); end({}, 150, 1); });
+                // The second, a second later, right after a click somewhere else.
+                now.mockReturnValue(2_000);
+                await act(async () => {
+                    start({}, 150, 1);
+                    end({}, 150, 1);
+                    resize({}, 77, 1);
+                    end({}, 77, 1);
+                });
+                expect(on_columns_resized).not.toHaveBeenCalled();
+            } finally {
+                now.mockRestore();
+            }
+        });
+
+        it('does not take the fit Glide asks for when a drag is released soon after another click', async () => {
+            // Glide calls a mouse-up a double-click when it follows any other
+            // mouse-up by under half a second, and then fits the column whose
+            // border the pointer is on: the one just dragged. The drag is the
+            // gesture; the fit would replace its width, or be a second request
+            // refused behind the first.
+            const on_columns_resized = vi.fn();
+            const size_gesture_may_start = vi.fn(() => true);
+            await render_grid(props({ on_columns_resized, size_gesture_may_start, column_projection: all_columns }));
+            const { start, resize, end } = callbacks();
+            await act(async () => {
+                start({}, 100, 0);
+                resize({}, 160, 0);
+                end({}, 160, 0);
+                // The fit, from the same mouse-up.
+                resize({}, 71, 0);
+                end({}, 71, 0);
+            });
+            expect(on_columns_resized).toHaveBeenCalledExactlyOnceWith([{ column: 0, width: 160 }]);
+            expect(size_gesture_may_start).toHaveBeenCalledOnce();
+            expect(shown_widths()).toEqual([['s:0', 100], ['s:1', 150], ['s:2', 200]]);
+
+            // Nor is a drag and then one click on the same border a double-click.
+            on_columns_resized.mockClear();
+            await act(async () => {
+                start({}, 100, 0);
+                end({}, 100, 0);
+                resize({}, 71, 0);
+                end({}, 71, 0);
+            });
+            expect(on_columns_resized).not.toHaveBeenCalled();
+
+            // A real double-click still fits.
+            await double_click_border(0, 100, 71);
+            expect(on_columns_resized).toHaveBeenCalledExactlyOnceWith([{ column: 0, width: 71 }]);
         });
 
         const with_pending_column = async (overrides: Partial<GridShellProps>) => {
