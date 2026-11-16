@@ -57,6 +57,7 @@ import {
     type ViewBasis,
     type WorksheetTarget,
     type WorksheetPendingChanges,
+    type ColumnWidthsSheetChange,
 } from '../types';
 import type { WorkbookMeta } from '../data-source/interface';
 import { header_body_start } from '../worksheet-layout';
@@ -226,6 +227,9 @@ import {
     COLUMN_WRITE_REFUSED_MESSAGE,
     FOLD_REFUSED_MESSAGE,
     REDO_REPLACED_BY_FOLD_MESSAGE,
+    SIZE_WRITE_REFUSED_MESSAGE,
+    SIZE_WRITE_UNRESOLVED_MESSAGE,
+    UNRESOLVED_SAVE_SIZE_REASON,
     VIEW_GESTURE_WAIT_MESSAGE,
     header_wait_warning,
     history_refusal_warning,
@@ -238,13 +242,21 @@ import {
     type ViewReplayWait,
 } from './history-command-model';
 import {
+    auto_fit_after_width_replay,
+    column_widths_label,
+    column_widths_replay_target,
+    column_widths_view_step,
     columns_replay_target,
     columns_view_step,
     overtaken_transform_step,
+    row_heights_replay_target,
+    row_heights_view_step,
     transform_replay_target,
     transform_slices_equal,
     transform_view_step,
+    type AutoFitChange,
     type TransformViewDelta,
+    type ViewHistoryDelta,
     type ViewSkipReason,
     type ViewStep,
 } from './view-history-model';
@@ -271,6 +283,7 @@ import {
     peek_history,
     action_has_view_change,
     view_step_change,
+    width_step_changes,
     retained_pending_row_authorities,
     is_structural_history_change,
     retained_saved_append_authorities,
@@ -312,6 +325,7 @@ import {
     retained_row_height_overlay,
     row_height_layers_for_delivery,
     row_height_layers_with,
+    row_height_layers_without_request,
     type RowHeightLayer,
     type RowHeightOverlay,
 } from './row-heights';
@@ -405,6 +419,85 @@ interface PendingColumnWrite {
     readonly replay?: ViewReplay;
     /** A snapshot has adopted column visibility since the write was posted. */
     snapshotAdopted: boolean;
+}
+
+/** One worksheet of a column-width write awaiting `columnWidthsChanged`. */
+interface PendingWidthSheet {
+    readonly worksheet: WorksheetTarget;
+    /** What the window showed for each column it asked to change, to put back on a refusal. */
+    readonly shown: readonly { readonly column: number; readonly width: number | null }[];
+    /**
+     * The sheet's whole width map as the window showed it right after the
+     * post. If a snapshot was adopted while the write was pending and the
+     * widths are no longer this, something else wrote them and Auto-fit ends.
+     */
+    readonly posted: Readonly<Record<number, number>> | undefined;
+    /** Auto-fit for the sheet before the write, put back on a refusal. */
+    readonly autoFitBefore: {
+        readonly active: boolean;
+        readonly snapshot: Record<number, number> | undefined;
+    };
+    /** What the gesture did to Auto-fit, for its step. */
+    readonly autoFit?: AutoFitChange;
+}
+
+/**
+ * The one column-width write awaiting `columnWidthsChanged`: a resize, a fit,
+ * a restore, or a width step's replay.
+ */
+interface PendingWidthWrite {
+    readonly requestId: string;
+    readonly sourceGeneration: number;
+    readonly sheets: readonly PendingWidthSheet[];
+    readonly replay?: ViewReplay;
+    /**
+     * A fit owed to a worksheet, applied when it could be: nobody pressed
+     * anything, so a refusal says nothing and the fit stays owed.
+     */
+    readonly owed: boolean;
+    /** A snapshot has adopted column widths since the write was posted. */
+    snapshotAdopted: boolean;
+}
+
+/** A row-height request awaiting `rowHeightsChanged`. */
+interface PendingRowResize {
+    readonly sourceGeneration: number;
+    /** The worksheet by identity: its step is recorded for it, wherever it sits by then. */
+    readonly worksheet: WorksheetTarget | undefined;
+    /** A resize or reset the person made, which records a step when it lands. */
+    readonly gesture: boolean;
+    /** A row-height step's replay, which moves its entry when it lands. */
+    readonly replay?: ViewReplay;
+    /** The Pending Rows half of a mixed resize, committed or dropped with the answer. */
+    readonly finish?: (applied: boolean) => void;
+}
+
+/** How a column-width write ended. */
+type WidthWriteOutcome =
+    /** The durable state holds it; `change` is what the host says the write changed. */
+    | { readonly kind: 'applied'; readonly change: readonly ColumnWidthsSheetChange[] }
+    /** Nothing was written. `unresolved`: a structural save the person has not resolved. */
+    | { readonly kind: 'refused'; readonly unresolved: boolean }
+    /** A refresh of another source arrived first; the write's own answer no longer matches. */
+    | { readonly kind: 'overtaken' };
+
+/** One worksheet of a column-width write to post. */
+interface WidthWriteSheet {
+    readonly sheet_index: number;
+    readonly widths: readonly { readonly column: number; readonly width: number | null }[];
+    /** Auto-fit for the sheet from the post on: on with the widths to restore, or off. */
+    readonly auto_fit:
+        | { readonly active: true; readonly snapshot: Record<number, number> | undefined }
+        | { readonly active: false };
+    /** What the gesture did to Auto-fit, for its step. */
+    readonly auto_fit_change?: AutoFitChange;
+}
+
+/** Whether an action is a column-width or row-height step. */
+function action_is_size_step(action: HistoryEntry['action']): boolean {
+    return action.changes.length > 0 && action.changes.every((change) =>
+        change.kind === 'view'
+        && (change.delta.slice === 'columnWidths' || change.delta.slice === 'rowHeights'));
 }
 
 /**
@@ -954,6 +1047,13 @@ export function App(): React.JSX.Element {
         readonly (RowHeightOverlay | undefined)[]
     >(NO_ROW_HEIGHT_OVERLAYS);
     const [auto_fit_active, set_auto_fit_active] = useState<boolean[]>([]);
+    /**
+     * Whether history has something to redo, and how many snapshots have been
+     * applied: what a fit still owed to a worksheet waits on, read into state
+     * so the retry runs again when either moves.
+     */
+    const [redo_available, set_redo_available] = useState(false);
+    const [applied_snapshot_count, set_applied_snapshot_count] = useState(0);
     const [auto_fit_snapshot, set_auto_fit_snapshot] = useState<
         (Record<number, number> | undefined)[]
     >([]);
@@ -1603,10 +1703,16 @@ export function App(): React.JSX.Element {
      * records, taken where the snapshot handler drops them and settled once it
      * has adopted the snapshot's state.
      */
+    /** `settle_width_write`, which is declared with the width gestures further down. */
+    const settle_width_write_ref = useRef<(
+        pending: PendingWidthWrite,
+        outcome: WidthWriteOutcome,
+    ) => void>(() => {});
     const overtaken_view_requests_ref = useRef<{
         views: PendingViewTransform[];
         column: PendingColumnWrite | null;
-    }>({ views: [], column: null });
+        width: PendingWidthWrite | null;
+    }>({ views: [], column: null, width: null });
 
     /**
      * When a refresh overtakes a pending view request, the refresh decides
@@ -1635,9 +1741,9 @@ export function App(): React.JSX.Element {
      * columns.
      */
     const settle_overtaken_view_requests = useCallback(() => {
-        const { views, column } = overtaken_view_requests_ref.current;
-        if (views.length === 0 && column === null) return;
-        overtaken_view_requests_ref.current = { views: [], column: null };
+        const { views, column, width } = overtaken_view_requests_ref.current;
+        if (views.length === 0 && column === null && width === null) return;
+        overtaken_view_requests_ref.current = { views: [], column: null, width: null };
         const sheets = meta_ref.current?.sheets ?? [];
         for (const pending of views) {
             const index = worksheet_target_index(sheets, pending.worksheet);
@@ -1692,6 +1798,11 @@ export function App(): React.JSX.Element {
                 ) === JSON.stringify(hidden_source_columns(column.after, sheet.columnCount));
             settle_column_write(column, landed, 'snapshot');
         }
+        // A width write cannot be judged by what the refresh shows: its step
+        // is what the host says it changed, and that answer no longer
+        // matches. Nothing is recorded; a replay says so and stays (pressing
+        // again is right whether or not it landed).
+        if (width !== null) settle_width_write_ref.current(width, { kind: 'overtaken' });
         // A settled replay renders nothing; a queued header change waits on it.
         wake_header_drain();
     }, [land_view_replay, record_view_step, settle_column_write]);
@@ -2381,6 +2492,7 @@ export function App(): React.JSX.Element {
      */
     const pending_view_transforms_ref = useRef<(PendingViewTransform | undefined)[]>([]);
     const pending_column_write_ref = useRef<PendingColumnWrite | null>(null);
+    const pending_width_write_ref = useRef<PendingWidthWrite | null>(null);
     /** A view replay holding its turn while this window's editing session is on its way out. */
     const view_replay_wait_ref = useRef<{ readonly finish: (go: boolean) => void } | null>(null);
     /**
@@ -2390,11 +2502,21 @@ export function App(): React.JSX.Element {
      * that sets or clears one of them, so no exit can leave it up.
      */
     const [view_request_pending, set_view_request_pending] = useState(false);
-    const view_request_is_pending = useCallback((): boolean => (
-        pending_view_transforms_ref.current.some((pending) => pending !== undefined)
-        || pending_column_write_ref.current !== null
-        || view_replay_wait_ref.current !== null
-    ), []);
+    const view_request_is_pending = useCallback((): boolean => {
+        if (
+            pending_view_transforms_ref.current.some((pending) => pending !== undefined)
+            || pending_column_write_ref.current !== null
+            || pending_width_write_ref.current !== null
+            || view_replay_wait_ref.current !== null
+        ) return true;
+        // A row resize, reset, or row-height replay. The row a committed
+        // edit grows is not one: it holds the edit gate, as it always has,
+        // and not the cells' editors.
+        for (const pending of pending_row_resize_requests_ref.current.values()) {
+            if (pending.gesture || pending.replay !== undefined) return true;
+        }
+        return false;
+    }, []);
     const sync_view_request_pending = useCallback(() => {
         set_view_request_pending(view_request_is_pending());
     }, [view_request_is_pending]);
@@ -2836,10 +2958,7 @@ export function App(): React.JSX.Element {
         readonly pendingGesture?: PendingHostGesture;
     } | null>(null);
     const row_resize_request_seq_ref = useRef(0);
-    const pending_row_resize_requests_ref = useRef(new Map<
-        string,
-        { readonly sourceGeneration: number; readonly finish: (applied: boolean) => void }
-    >());
+    const pending_row_resize_requests_ref = useRef(new Map<string, PendingRowResize>());
     const last_highlight_state_revision_ref = useRef(0);
 
     const { persist_immediate } = use_state_sync(
@@ -3151,6 +3270,14 @@ export function App(): React.JSX.Element {
             warn_save_waits_for_header();
             return undefined;
         }
+        // And for a view change still being written. A size or column write
+        // posted just before Save could be answered after a structural save
+        // has renumbered rows and columns and cut history off, and its step
+        // would be recorded in the numbering from before the save.
+        if (view_request_is_pending()) {
+            host_bridge.postMessage({ type: 'showWarning', message: VIEW_GESTURE_WAIT_MESSAGE });
+            return undefined;
+        }
         const sheets = meta_ref.current?.sheets ?? [];
         const preflight = edit_session_registry_ref.current!
             .collect_dirty_worksheets(sheets);
@@ -3204,7 +3331,7 @@ export function App(): React.JSX.Element {
         save_in_flight_ref.current = true;
         host_bridge.postMessage({ type: 'saveCsv', operation });
         return operation;
-    }, [csv_edit_session_id]);
+    }, [csv_edit_session_id, view_request_is_pending]);
 
     const reset_save_projection = useCallback(() => {
         save_projection_ref.current = INITIAL_CSV_SAVE_PROJECTION;
@@ -3737,12 +3864,103 @@ export function App(): React.JSX.Element {
                 const pending = pending_row_resize_requests_ref.current.get(msg.requestId);
                 if (pending === undefined) return;
                 pending_row_resize_requests_ref.current.delete(msg.requestId);
-                pending.finish(
-                    msg.applied
+                sync_view_request_pending();
+                // Any answer retires the layer painted for this request. The
+                // host delivers what is stored before it answers, so from
+                // here the row shows the projection. A layer left standing
+                // (a refused write, or one another window overtook before the
+                // delivery was built) would mask the height a later undo
+                // restores.
+                set_row_height_overlay((previous) => mapped_row_height_overlays(
+                    previous,
+                    (overlay) => {
+                        const layers = row_height_layers_without_request(
+                            overlay.layers,
+                            msg.requestId,
+                        );
+                        if (layers === overlay.layers) return overlay;
+                        return layers.length === 0 ? undefined : { ...overlay, layers };
+                    },
+                ));
+                const applied = msg.applied
                     && msg.sourceGeneration === pending.sourceGeneration
-                    && msg.sourceGeneration === source_generation_ref.current,
-                );
+                    && msg.sourceGeneration === source_generation_ref.current;
+                pending.finish?.(applied);
+                if (pending.replay !== undefined && pending.worksheet !== undefined) {
+                    const { replay, worksheet } = pending;
+                    if (applied) {
+                        land_view_replay(replay, worksheet, false);
+                    } else if (!msg.applied && msg.refused === 'limit') {
+                        // A rule, not a race, and one this window cannot
+                        // predict: the step is skipped and moves on, so it
+                        // never stands in the way of an older one.
+                        land_view_replay(
+                            { ...replay, skipped: [...replay.skipped, 'too-many-heights'] },
+                            worksheet,
+                            true,
+                        );
+                    } else if (!msg.applied && msg.refused === 'unresolved') {
+                        host_bridge.postMessage({
+                            type: 'showWarning',
+                            message: view_replay_refusal_warning(
+                                replay.direction,
+                                replay.entry.action.label,
+                                UNRESOLVED_SAVE_SIZE_REASON,
+                            ),
+                        });
+                    } else {
+                        host_bridge.postMessage({
+                            type: 'showWarning',
+                            message: view_replay_wait_warning('refreshing', replay.direction),
+                        });
+                    }
+                } else if (pending.gesture) {
+                    if (applied && msg.change !== undefined && pending.worksheet !== undefined) {
+                        // The step is what the host says the write changed:
+                        // which source rows, and what each held.
+                        const sheets = meta_ref.current?.sheets ?? [];
+                        const index = worksheet_target_index(sheets, pending.worksheet);
+                        const sheet = index === undefined ? undefined : sheets[index];
+                        if (sheet !== undefined && index !== undefined) {
+                            record_view_step(row_heights_view_step(
+                                {
+                                    sheetIndex: index,
+                                    sheetName: sheet.name,
+                                    ...(sheet.worksheetId === undefined
+                                        ? {}
+                                        : { worksheetId: sheet.worksheetId }),
+                                },
+                                msg.change,
+                            ));
+                        }
+                    } else if (!msg.applied && msg.refused === 'unresolved') {
+                        host_bridge.postMessage({
+                            type: 'showWarning',
+                            message: SIZE_WRITE_UNRESOLVED_MESSAGE,
+                        });
+                    }
+                }
                 // A refusal renders nothing; a queued header change waits on this.
+                wake_header_drain();
+            }
+
+            if (msg.type === 'columnWidthsChanged') {
+                const pending = pending_width_write_ref.current;
+                if (pending === null || pending.requestId !== msg.requestId) return;
+                // Applied under another source generation: a snapshot of that
+                // source is on its way and settles it. (One that already
+                // arrived has, and the write is not pending.)
+                if (
+                    msg.applied
+                    && (msg.sourceGeneration !== pending.sourceGeneration
+                        || msg.sourceGeneration !== source_generation_ref.current)
+                ) return;
+                pending_width_write_ref.current = null;
+                sync_view_request_pending();
+                settle_width_write_ref.current(pending, msg.applied
+                    ? { kind: 'applied', change: msg.change ?? [] }
+                    : { kind: 'refused', unresolved: msg.refused === 'unresolved' });
+                // A settled write renders nothing; a queued header change waits on it.
                 wake_header_drain();
             }
 
@@ -4304,7 +4522,8 @@ export function App(): React.JSX.Element {
                         // answer finds no pending request.
                         pending_view_transforms_ref.current = [];
                         pending_column_write_ref.current = null;
-                        overtaken_view_requests_ref.current = { views: [], column: null };
+                        pending_width_write_ref.current = null;
+                        overtaken_view_requests_ref.current = { views: [], column: null, width: null };
                         view_replay_wait_ref.current?.finish(false);
                         sync_view_request_pending();
                         // And any replay still in flight was planned against the
@@ -4820,8 +5039,36 @@ export function App(): React.JSX.Element {
                             && pending.sourceGeneration === snapshot.sourceGeneration
                         ) continue;
                         pending_row_resize_requests_ref.current.delete(request_id);
-                        pending.finish(false);
+                        pending.finish?.(false);
+                        // This window holds no durable heights, so the refresh
+                        // cannot say whether the write landed. A gesture
+                        // records nothing. A replay's entry stays, and
+                        // pressing again is right either way: it writes from
+                        // the step, not from a comparison.
+                        if (pending.replay !== undefined && snapshot.presentation !== 'initial') {
+                            host_bridge.postMessage({
+                                type: 'showWarning',
+                                message: view_replay_wait_warning(
+                                    'refreshing',
+                                    pending.replay.direction,
+                                ),
+                            });
+                        }
                     }
+                    // A pending width write: a refresh of another source
+                    // overtook it; a refresh of the same source has adopted
+                    // widths while it was pending, which its answer needs to
+                    // know.
+                    const pending_width_write = pending_width_write_ref.current;
+                    if (pending_width_write !== null) {
+                        if (pending_width_write.sourceGeneration !== snapshot.sourceGeneration) {
+                            pending_width_write_ref.current = null;
+                            overtaken_view_requests_ref.current.width = pending_width_write;
+                        } else if (snapshot.presentation !== 'initial') {
+                            pending_width_write.snapshotAdopted = true;
+                        }
+                    }
+                    sync_view_request_pending();
                     // A pending column write: a refresh of another source
                     // generation overtook it and decides whether it landed
                     // (settled below, once the snapshot's state is adopted); a
@@ -4893,12 +5140,27 @@ export function App(): React.JSX.Element {
                         const incoming = refresh_authoritative_state!.columnWidths;
                         const local = state_ref.current.columnWidths ?? [];
                         const width_count = Math.max(incoming.length, local.length);
+                        // Not for a sheet whose widths this window is writing:
+                        // a refresh captured before that commit differs by
+                        // construction, and the delivery behind it carries the
+                        // written widths. The write's settlement applies this
+                        // rule to those sheets (`settle_width_write`).
+                        const written_sheets = new Set(
+                            (pending_width_write_ref.current?.sheets ?? []).flatMap((sheet) => {
+                                const index = worksheet_target_index(
+                                    snapshot.meta.sheets,
+                                    sheet.worksheet,
+                                );
+                                return index === undefined ? [] : [index];
+                            }),
+                        );
                         const changed_widths = Array.from(
                             { length: width_count },
-                            (_unused, index) => !sheet_widths_equal(
-                                incoming[index],
-                                local[index],
-                            ),
+                            (_unused, index) => !written_sheets.has(index)
+                                && !sheet_widths_equal(
+                                    incoming[index],
+                                    local[index],
+                                ),
                         );
                         const stale = auto_fit_active_ref.current
                             .map((active, index) => active && changed_widths[index]);
@@ -5389,6 +5651,9 @@ export function App(): React.JSX.Element {
                     // View requests this snapshot overtook, judged by the state
                     // it has just installed.
                     settle_overtaken_view_requests();
+                    // A fit the host refused may be tried again now.
+                    owed_fit_held_ref.current = new Set();
+                    set_applied_snapshot_count((count) => count + 1);
                     // Acknowledge the exact delivered identity before an optional
                     // corrective CAS write.
                     snapshot_applied_seq_ref.current += 1;
@@ -6130,6 +6395,7 @@ export function App(): React.JSX.Element {
         () => base_gestures_admitted()
             && view_replay_wait_ref.current === null
             && pending_column_write_ref.current === null
+            && pending_width_write_ref.current === null
             && !pending_view_transforms_ref.current.some((pending) => pending?.replay !== undefined),
         [base_gestures_admitted],
     );
@@ -6466,6 +6732,9 @@ export function App(): React.JSX.Element {
         const unsubscribe = history_store_ref.current!.subscribe(() => {
             publish_history_menu_state();
             publish_retained_saved_append_authorities();
+            set_redo_available(
+                peek_history(history_store_ref.current!.snapshot(), 'redo').kind === 'available',
+            );
         });
         const unsubscribe_edit_session = edit_session_registry_ref.current!.subscribe(
             publish_retained_saved_append_authorities,
@@ -6485,6 +6754,11 @@ export function App(): React.JSX.Element {
         direction: HistoryDirection,
         after_release_wait?: boolean,
     ) => Promise<void>>(async () => {});
+    /** `post_column_widths`, which is declared further down. */
+    const post_column_widths_ref = useRef<((
+        sheets: readonly WidthWriteSheet[],
+        options?: { readonly replay?: ViewReplay; readonly owed?: boolean },
+    ) => boolean) | null>(null);
     /** `post_column_visibility`, which is declared further down. */
     const post_column_visibility_ref = useRef<((
         sheet_index: number,
@@ -6516,13 +6790,100 @@ export function App(): React.JSX.Element {
             const message = history_refusal_warning('unavailable', direction, undefined);
             if (message !== null) show_warning(message);
         };
-        const change = view_step_change(entry.action);
         const sheets = meta_ref.current?.sheets;
+        const width_changes = width_step_changes(entry.action);
+        if (width_changes !== undefined && sheets !== undefined) {
+            // The windows in which a write would be refused anyway, or would
+            // be answered after a save had renumbered what it names.
+            if (
+                save_in_flight_ref.current
+                || edit_session_pending
+                || pending_excel_header_ref.current !== null
+            ) {
+                say_wait('applying');
+                return;
+            }
+            // Member by member, from the step alone: each column gets the
+            // step's other side, and columns it never touched keep what they
+            // have. Whether anything is left to change is the host's to say,
+            // since this window's widths can be stale. A worksheet or a
+            // column that is gone is left out, with a message.
+            const skipped = new Set<ViewSkipReason>();
+            const writes: WidthWriteSheet[] = [];
+            const present: number[] = [];
+            let first_worksheet: WorksheetTarget | undefined;
+            let undoes_a_fit = false;
+            for (const { delta: width_delta } of width_changes) {
+                const index = worksheet_target_index(sheets, width_delta.worksheet);
+                const sheet = index === undefined ? undefined : sheets[index];
+                if (index === undefined || sheet === undefined) {
+                    skipped.add('sheets-gone');
+                    continue;
+                }
+                present.push(index);
+                first_worksheet ??= {
+                    sheetIndex: index,
+                    sheetName: sheet.name,
+                    ...(sheet.worksheetId === undefined ? {} : { worksheetId: sheet.worksheetId }),
+                };
+                const target = column_widths_replay_target(width_delta, direction, sheet.columnCount);
+                for (const reason of target.skipped) skipped.add(reason);
+                if (target.widths.length === 0) continue;
+                if (width_delta.autoFit === 'on' && direction === 'undo') undoes_a_fit = true;
+                // Walking history leaves the toolbar as the gesture left it:
+                // Auto-fit on again restores to the widths the sheet has just
+                // before this replay writes, which in order are the ones the
+                // fit replaced.
+                const current = state_ref.current.columnWidths?.[index];
+                writes.push({
+                    sheet_index: index,
+                    widths: target.widths,
+                    auto_fit: auto_fit_after_width_replay(width_delta, direction) === 'on'
+                        ? { active: true, snapshot: current ? { ...current } : undefined }
+                        : { active: false },
+                });
+            }
+            if (first_worksheet === undefined) {
+                say_unavailable();
+                return;
+            }
+            const replay: ViewReplay = {
+                entry,
+                direction,
+                skipped: (['sheets-gone', 'columns-gone'] as const)
+                    .filter((reason) => skipped.has(reason)),
+            };
+            // Undo shows a worksheet its step belongs to.
+            if (!present.includes(active_sheet_index) && !handle_sheet_select(present[0]!)) {
+                say_wait('applying');
+                return;
+            }
+            if (writes.length === 0) {
+                // Every member was left out.
+                land_view_replay(replay, first_worksheet, true);
+                wake_header_drain();
+                return;
+            }
+            // Taking a fit back: a fit still owed to another worksheet would
+            // be the opposite of what the person asked.
+            if (undoes_a_fit) update_pending_auto_fit_sheets(EMPTY_PENDING_AUTO_FIT);
+            for (const write of writes) {
+                pending_auto_fit_snapshot_ref.current[write.sheet_index] = undefined;
+            }
+            if (post_column_widths_ref.current?.(writes, { replay }) !== true) say_wait('refreshing');
+            return;
+        }
+        const change = view_step_change(entry.action);
         if (change === undefined || sheets === undefined) {
             say_unavailable();
             return;
         }
         const delta = change.delta;
+        if (delta.slice === 'columnWidths') {
+            // Unreachable: a width step is handled above.
+            say_unavailable();
+            return;
+        }
         const index = worksheet_target_index(sheets, delta.worksheet);
         const sheet = index === undefined ? undefined : sheets[index];
         if (index === undefined || sheet === undefined) {
@@ -6617,6 +6978,41 @@ export function App(): React.JSX.Element {
                 baseline: live,
                 target: plan.target,
                 replay: { ...replay, delta },
+            });
+            return;
+        }
+        if (delta.slice === 'rowHeights') {
+            // Undo sets each run back to what it held; redo sets every row
+            // to the step's height. Posted by source row: this window holds
+            // no durable heights, so "already in place" is the host's to
+            // say, and its no-op success moves the entry.
+            const target = row_heights_replay_target(delta, direction, sheet.sourceRowCount);
+            const replay: ViewReplay = { entry, direction, skipped: target.skipped };
+            if (!show_sheet()) return;
+            if (target.rows.length === 0) {
+                land_view_replay(replay, worksheet, true);
+                wake_header_drain();
+                return;
+            }
+            const request_id = [
+                'row-heights',
+                highlight_request_prefix_ref.current,
+                ++row_resize_request_seq_ref.current,
+            ].join(':');
+            pending_row_resize_requests_ref.current.set(request_id, {
+                sourceGeneration: source_generation_ref.current,
+                worksheet,
+                gesture: false,
+                replay,
+            });
+            sync_view_request_pending();
+            host_bridge.postMessage({
+                type: 'setSourceRowHeights',
+                requestId: request_id,
+                sheetIndex: index,
+                sheetName: sheet.name,
+                sourceGeneration: source_generation_ref.current,
+                rows: target.rows,
             });
             return;
         }
@@ -6719,9 +7115,14 @@ export function App(): React.JSX.Element {
             // is applied. Holding the turn also holds off the idle-session
             // release, which is safe: the fence is only ever raised together
             // with the release or discard post, so that is already on its way.
+            //
+            // A size step does not wait: the wait exists because the host's
+            // transform admission refuses while a session is released, and a
+            // width or row-height write passes no such admission.
             const session_id = csv_edit_session_id_ref.current;
             if (
                 !after_release_wait
+                && !action_is_size_step(initial.entry.action)
                 && session_id !== undefined
                 && renderer_publication_fenced_session_ref.current === session_id
             ) {
@@ -8017,8 +8418,11 @@ export function App(): React.JSX.Element {
         const fold = fold_before_view_request();
         if (fold === 'refused') return false;
         const column_write = pending_column_write_ref.current;
+        const width_write = pending_width_write_ref.current;
         if (
             (column_write !== null && column_write.replay === undefined)
+            || (width_write !== null && width_write.replay === undefined)
+            || [...pending_row_resize_requests_ref.current.values()].some((pending) => pending.gesture)
             || pending_view_transforms_ref.current.some((pending, index) => (
                 pending !== undefined
                 && pending.replay === undefined
@@ -8028,8 +8432,10 @@ export function App(): React.JSX.Element {
             show_warning(VIEW_GESTURE_WAIT_MESSAGE);
             return false;
         }
+        // A column gesture, like a size gesture, does not start during a save:
+        // a structural save renumbers the columns its step would name.
         const blocked = transform_sheet_index === undefined
-            ? !edit_gestures_admitted()
+            ? save_in_flight_ref.current || !edit_gestures_admitted()
             : transform_request_blocked();
         // With nothing folded this refusal is silent, as it always was (a
         // click behind a save or a replay in flight). After a fold it is not:
@@ -9323,6 +9729,267 @@ export function App(): React.JSX.Element {
         }
     }, []);
 
+    /** Set a worksheet's Auto-fit: on with the widths its restore puts back, or off. */
+    const set_auto_fit_for_sheet = useCallback((
+        sheet_index: number,
+        active: boolean,
+        snapshot: Record<number, number> | undefined,
+    ) => {
+        const next_active = [...auto_fit_active_ref.current];
+        const next_snapshot = [...auto_fit_snapshot_ref.current];
+        next_active[sheet_index] = active;
+        next_snapshot[sheet_index] = active ? snapshot : undefined;
+        auto_fit_active_ref.current = next_active;
+        auto_fit_snapshot_ref.current = next_snapshot;
+        set_auto_fit_active(next_active);
+        set_auto_fit_snapshot(next_snapshot);
+    }, []);
+
+    const width_write_seq_ref = useRef(0);
+    /**
+     * Sheets whose owed fit the host refused, held until the next snapshot is
+     * applied: retrying under the conditions that refused it would post and
+     * be refused in a loop.
+     */
+    const owed_fit_held_ref = useRef<ReadonlySet<number>>(new Set());
+    /**
+     * Show column widths at once and ask the host to make them durable,
+     * keeping the pending write its answer settles. Answers false when it
+     * could not be posted.
+     *
+     * The one writer behind a border drag, a double-click fit, Auto-fit on
+     * and off, and a width step's replay. A width is not written through
+     * `stateChanged`: that message has no answer and is refused whenever a
+     * delivery is in flight. History never moves, and no step is recorded,
+     * on a write that may not have happened, and the step is what the host
+     * says it changed (`settle_width_write`).
+     */
+    const post_column_widths = useCallback((
+        sheets: readonly WidthWriteSheet[],
+        options: { readonly replay?: ViewReplay; readonly owed?: boolean } = {},
+    ): boolean => {
+        const meta_sheets = meta_ref.current?.sheets;
+        if (meta_sheets === undefined || sheets.length === 0) return false;
+        if (sheets.some((entry) => meta_sheets[entry.sheet_index] === undefined)) return false;
+        const widths = [...(state_ref.current.columnWidths ?? [])];
+        const pending_sheets: PendingWidthSheet[] = [];
+        for (const entry of sheets) {
+            const sheet = meta_sheets[entry.sheet_index]!;
+            const before = widths[entry.sheet_index];
+            const next: Record<number, number> = { ...(before ?? {}) };
+            const shown: { column: number; width: number | null }[] = [];
+            for (const { column, width } of entry.widths) {
+                shown.push({
+                    column,
+                    width: before !== undefined && Object.prototype.hasOwnProperty.call(before, column)
+                        ? before[column]
+                        : null,
+                });
+                if (width === null) delete next[column];
+                else next[column] = width;
+            }
+            const posted = Object.keys(next).length === 0 ? undefined : next;
+            widths[entry.sheet_index] = posted;
+            pending_sheets.push({
+                worksheet: {
+                    sheetIndex: entry.sheet_index,
+                    sheetName: sheet.name,
+                    ...(sheet.worksheetId === undefined ? {} : { worksheetId: sheet.worksheetId }),
+                },
+                shown,
+                posted,
+                autoFitBefore: {
+                    active: auto_fit_active_ref.current[entry.sheet_index] === true,
+                    snapshot: auto_fit_snapshot_ref.current[entry.sheet_index],
+                },
+                ...(entry.auto_fit_change === undefined ? {} : { autoFit: entry.auto_fit_change }),
+            });
+        }
+        state_ref.current = { ...state_ref.current, columnWidths: widths };
+        set_column_widths(widths);
+        for (const entry of sheets) {
+            set_auto_fit_for_sheet(
+                entry.sheet_index,
+                entry.auto_fit.active,
+                entry.auto_fit.active ? entry.auto_fit.snapshot : undefined,
+            );
+        }
+        const request_id = [
+            'widths',
+            highlight_request_prefix_ref.current,
+            ++width_write_seq_ref.current,
+        ].join(':');
+        pending_width_write_ref.current = {
+            requestId: request_id,
+            sourceGeneration: source_generation_ref.current,
+            sheets: pending_sheets,
+            ...(options.replay === undefined ? {} : { replay: options.replay }),
+            owed: options.owed === true,
+            snapshotAdopted: false,
+        };
+        sync_view_request_pending();
+        host_bridge.postMessage({
+            type: 'setColumnWidths',
+            requestId: request_id,
+            sourceGeneration: source_generation_ref.current,
+            sheets: sheets.map((entry) => ({
+                sheetIndex: entry.sheet_index,
+                sheetName: meta_sheets[entry.sheet_index]!.name,
+                widths: entry.widths.map(({ column, width }) => ({ column, width })),
+            })),
+        });
+        return true;
+    }, [set_auto_fit_for_sheet, sync_view_request_pending]);
+
+    /**
+     * Settle a column-width write.
+     *
+     * Applied: a gesture records its step from what the host says it changed
+     * (one change per worksheet, in one action), and nothing when it changed
+     * nothing; a replay moves its entry. Neither writes the view: after the
+     * post only a snapshot changes what the sheet shows, and the delivery
+     * ahead of the answer carried what is durable.
+     *
+     * Refused: nothing was written. The columns and Auto-fit are put back,
+     * unless a snapshot has adopted widths since the post; then the widths
+     * are already the host's.
+     *
+     * While the write was pending, the snapshot handler did not apply "a
+     * refresh whose widths differ ends Auto-fit" to these sheets, because a
+     * refresh captured before the commit differs by construction. It is
+     * applied here: if a snapshot was adopted and a sheet's widths are no
+     * longer what the window showed after the post, something else wrote them.
+     */
+    const settle_width_write = useCallback((
+        pending: PendingWidthWrite,
+        outcome: WidthWriteOutcome,
+    ) => {
+        const meta_sheets = meta_ref.current?.sheets ?? [];
+        const index_of = (sheet: PendingWidthSheet) => worksheet_target_index(meta_sheets, sheet.worksheet);
+        if (outcome.kind === 'overtaken') {
+            if (pending.replay !== undefined) {
+                show_warning(view_replay_wait_warning('refreshing', pending.replay.direction));
+            }
+            return;
+        }
+        const end_superseded_auto_fit = (refused: boolean) => {
+            if (!pending.snapshotAdopted) return;
+            for (const sheet of pending.sheets) {
+                const index = index_of(sheet);
+                if (index === undefined) continue;
+                if (
+                    refused
+                    || !sheet_widths_equal(state_ref.current.columnWidths?.[index], sheet.posted)
+                ) set_auto_fit_for_sheet(index, false, undefined);
+            }
+        };
+        if (outcome.kind === 'applied') {
+            end_superseded_auto_fit(false);
+            if (pending.owed) {
+                for (const sheet of pending.sheets) {
+                    const index = index_of(sheet);
+                    if (index !== undefined) cancel_pending_auto_fit_for_sheet(index);
+                }
+            }
+            if (pending.replay !== undefined) {
+                land_view_replay(pending.replay, pending.sheets[0]!.worksheet, false);
+                return;
+            }
+            const changes: { kind: 'view'; delta: ViewHistoryDelta }[] = [];
+            let columns = 0;
+            let auto_fit: AutoFitChange | undefined;
+            for (const sheet_change of outcome.change) {
+                const sheet = meta_sheets[sheet_change.sheetIndex];
+                // A worksheet a reload removed since the post has no step.
+                const pending_sheet = pending.sheets.find(
+                    (candidate) => index_of(candidate) === sheet_change.sheetIndex,
+                );
+                if (sheet === undefined || pending_sheet === undefined) continue;
+                const step = column_widths_view_step(
+                    {
+                        sheetIndex: sheet_change.sheetIndex,
+                        sheetName: sheet.name,
+                        ...(sheet.worksheetId === undefined ? {} : { worksheetId: sheet.worksheetId }),
+                    },
+                    sheet_change.columns,
+                    pending_sheet.autoFit,
+                );
+                if (step === undefined) continue;
+                changes.push({ kind: 'view', delta: step.delta });
+                columns += sheet_change.columns.length;
+                auto_fit ??= pending_sheet.autoFit;
+            }
+            if (changes.length === 0) return;
+            const record = history_store_ref.current!.stage_record({
+                label: column_widths_label(columns, auto_fit),
+                changes,
+            });
+            commit_staged_transaction([record]);
+            return;
+        }
+        if (pending.snapshotAdopted) {
+            end_superseded_auto_fit(true);
+        } else {
+            const widths = [...(state_ref.current.columnWidths ?? [])];
+            for (const sheet of pending.sheets) {
+                const index = index_of(sheet);
+                if (index === undefined) continue;
+                const next: Record<number, number> = { ...(widths[index] ?? {}) };
+                for (const { column, width } of sheet.shown) {
+                    if (width === null) delete next[column];
+                    else next[column] = width;
+                }
+                widths[index] = Object.keys(next).length === 0 ? undefined : next;
+                set_auto_fit_for_sheet(index, sheet.autoFitBefore.active, sheet.autoFitBefore.snapshot);
+            }
+            state_ref.current = { ...state_ref.current, columnWidths: widths };
+            set_column_widths(widths);
+        }
+        if (pending.owed) {
+            // Nobody pressed anything, so nothing is said; the fit stays owed
+            // and waits for the next snapshot.
+            const held = new Set(owed_fit_held_ref.current);
+            for (const sheet of pending.sheets) {
+                const index = index_of(sheet);
+                if (index !== undefined) held.add(index);
+            }
+            owed_fit_held_ref.current = held;
+            return;
+        }
+        if (pending.replay !== undefined) {
+            show_warning(outcome.unresolved
+                ? view_replay_refusal_warning(
+                    pending.replay.direction,
+                    pending.replay.entry.action.label,
+                    UNRESOLVED_SAVE_SIZE_REASON,
+                )
+                : view_replay_wait_warning('refreshing', pending.replay.direction));
+        } else {
+            show_warning(outcome.unresolved ? SIZE_WRITE_UNRESOLVED_MESSAGE : SIZE_WRITE_REFUSED_MESSAGE);
+        }
+    }, [cancel_pending_auto_fit_for_sheet, land_view_replay, set_auto_fit_for_sheet, show_warning]);
+    settle_width_write_ref.current = settle_width_write;
+    post_column_widths_ref.current = post_column_widths;
+
+    /**
+     * Whether a resize, reset, or Auto-fit change the person just made may be
+     * written now, having folded the open editor.
+     *
+     * A size gesture is a view gesture: one at a time, and never while a save
+     * is in flight (a structural save renumbers the rows and columns a size
+     * names and cuts history off, and an answer arriving after it would
+     * record a step in the old numbering). Refused, it always says why: a
+     * border that springs back needs a reason.
+     */
+    const size_gesture_may_start = useCallback((): boolean => {
+        if (fold_before_view_request() === 'refused') return false;
+        if (save_in_flight_ref.current || !edit_gestures_admitted()) {
+            show_warning(VIEW_GESTURE_WAIT_MESSAGE);
+            return false;
+        }
+        return true;
+    }, [edit_gestures_admitted, fold_before_view_request, show_warning]);
+
     const column_write_seq_ref = useRef(0);
     /**
      * Show one worksheet's columns as `after` and ask the host to make it
@@ -9439,31 +10106,28 @@ export function App(): React.JSX.Element {
         ));
     }, [update_column_visibility]);
 
-    const handle_column_resize = useCallback(
-        (col: number, width: number) => {
-            set_column_widths((prev) => {
-                const next = [...prev];
-                const sheet_widths = { ...(next[active_sheet_index] ?? {}) };
-                sheet_widths[col] = width;
-                next[active_sheet_index] = sheet_widths;
-                state_ref.current = {
-                    ...state_ref.current,
-                    columnWidths: [...next],
-                };
-                persist_immediate();
-                return next;
-            });
+    /**
+     * A finished column-width gesture on the active sheet: a border drag (with
+     * the columns it was fanned out to) or a double-click fit. One write, and
+     * one step in undo history once the host has applied it.
+     *
+     * GridShell asked `size_gesture_may_start` before reporting it.
+     */
+    const handle_columns_resized = useCallback(
+        (changes: readonly { readonly column: number; readonly width: number }[]) => {
+            if (changes.length === 0) return;
             // A direct resize supersedes both active and still-pending auto-fit.
-            // Keep the current widths and discard any restore snapshot or owed fit.
+            // Keep the current widths, Pending Columns' too, and discard any
+            // restore snapshot or owed fit.
             cancel_pending_auto_fit_for_sheet(active_sheet_index);
-            deactivate_auto_fit_for_sheet(active_sheet_index);
+            pending_auto_fit_snapshot_ref.current[active_sheet_index] = undefined;
+            post_column_widths([{
+                sheet_index: active_sheet_index,
+                widths: changes,
+                auto_fit: { active: false },
+            }]);
         },
-        [
-            active_sheet_index,
-            cancel_pending_auto_fit_for_sheet,
-            deactivate_auto_fit_for_sheet,
-            persist_immediate,
-        ]
+        [active_sheet_index, cancel_pending_auto_fit_for_sheet, post_column_widths],
     );
 
     /**
@@ -9481,10 +10145,20 @@ export function App(): React.JSX.Element {
     const handle_row_resize = useCallback(
         (
             rows: readonly DisplayRowInterval[],
-            height: number,
-            on_result?: (applied: boolean) => void,
+            // `null` resets the rows: each loses its custom height.
+            height: number | null,
+            { gesture, on_result }: {
+                /**
+                 * A resize or reset the person made. It is answered, and its
+                 * step in undo history is what the answer says changed: only
+                 * the host knows which source rows these display rows are and
+                 * what they held. The row a committed edit grows is not one.
+                 */
+                readonly gesture: boolean;
+                readonly on_result?: (applied: boolean) => void;
+            },
         ) => {
-            if (!Number.isFinite(height)) {
+            if (height !== null && !Number.isFinite(height)) {
                 on_result?.(false);
                 return;
             }
@@ -9502,19 +10176,27 @@ export function App(): React.JSX.Element {
             // stores, and the layer would sit there masking it. The drag itself already
             // clamps (`row-resize-model`), so this is the case that should not arise
             // rather than one that does.
-            const clamped = clamp_row_height(height);
-            const request_id = on_result === undefined
+            const clamped = height === null ? null : clamp_row_height(height);
+            const request_id = !gesture && on_result === undefined
                 ? undefined
                 : [
                     'row-resize',
                     highlight_request_prefix_ref.current,
                     ++row_resize_request_seq_ref.current,
                 ].join(':');
-            if (request_id !== undefined && on_result !== undefined) {
+            if (request_id !== undefined) {
+                const sheet = meta_ref.current?.sheets[active_sheet_index];
                 pending_row_resize_requests_ref.current.set(request_id, {
                     sourceGeneration: source_generation_ref.current,
-                    finish: on_result,
+                    worksheet: sheet === undefined ? undefined : {
+                        sheetIndex: active_sheet_index,
+                        sheetName: sheet.name,
+                        ...(sheet.worksheetId === undefined ? {} : { worksheetId: sheet.worksheetId }),
+                    },
+                    gesture,
+                    ...(on_result === undefined ? {} : { finish: on_result }),
                 });
+                sync_view_request_pending();
             }
             host_bridge.postMessage({
                 type: 'setRowHeights',
@@ -9542,9 +10224,17 @@ export function App(): React.JSX.Element {
             // the limit); the stale rectangle is accepted rather than bought off with a
             // refusal message on the hot path of every drag. Reasoning in full at
             // `row_height_layers_for_delivery`.
-            if (requested_rows > MAX_PERSISTED_ROW_HEIGHTS) return;
+            //
+            // A reset paints nothing ahead of the host either: which rows hold a
+            // custom height is the host's to say, and they change with its delivery.
+            if (clamped === null || requested_rows > MAX_PERSISTED_ROW_HEIGHTS) return;
             set_row_height_overlay((previous) => {
-                const layer: RowHeightLayer = { rows, height: clamped };
+                // Tagged with its request: the answer retires it, whatever it says.
+                const layer: RowHeightLayer = {
+                    rows,
+                    height: clamped,
+                    ...(request_id === undefined ? {} : { requestId: request_id }),
+                };
                 const existing = previous[active_sheet_index];
                 const next = [...previous];
                 // Appended to this sheet's own overlay, and every other sheet's is left
@@ -9580,7 +10270,7 @@ export function App(): React.JSX.Element {
                 return next;
             });
         },
-        [active_sheet_index]
+        [active_sheet_index, sync_view_request_pending]
     );
 
     /**
@@ -9591,17 +10281,16 @@ export function App(): React.JSX.Element {
      * the all-sheets action, and the deferred pass below — run against whichever grid
      * is mounted at the time. Returns false when there was nothing to measure.
      */
-    const apply_auto_fit_to_active_sheet = useCallback(() => {
+    const apply_auto_fit_to_active_sheet = useCallback((
+        // A fit owed to this sheet and applied now that it can be: nobody
+        // pressed anything. It stays owed until its write is answered.
+        owed = false,
+    ): 'nothing-to-measure' | 'posted' | 'unchanged' => {
         const fitted = auto_fit_ref.current?.();
         const pending_fitted = pending_auto_fit_ref.current?.() ?? {};
         const pending_ids = Object.keys(pending_fitted);
-        if (!fitted && pending_ids.length === 0) return false;
+        if (!fitted && pending_ids.length === 0) return 'nothing-to-measure';
         const sheet_index = active_sheet_index;
-        // Pending Column widths live in the Pending Changes, which a held
-        // gesture (a highlight awaiting the host) has staged against: a write
-        // now would make that gesture's commit fail half-applied. The caller
-        // keeps the fit owed until the slot is free.
-        if (pending_ids.length > 0 && !base_gestures_admitted()) return false;
         if (pending_ids.length > 0) {
             const before = new Map((edit_session_registry_ref.current!
                 .pending_rows_for_sheet(sheet_index).snapshot().pendingColumns ?? [])
@@ -9613,99 +10302,105 @@ export function App(): React.JSX.Element {
             pending_auto_fit_snapshot_ref.current[sheet_index] = snapshot;
             write_pending_column_widths(sheet_index, pending_fitted);
         }
-        const current_widths = column_widths[sheet_index];
-        set_auto_fit_snapshot((prev) => {
-            const next = [...prev];
-            // Only if this sheet has no snapshot yet. A second fit over an already
-            // fitted sheet must not overwrite the original widths with fitted ones,
-            // or "restore" would restore the fit.
-            if (next[sheet_index] === undefined) {
-                next[sheet_index] = current_widths ? { ...current_widths } : undefined;
-            }
-            auto_fit_snapshot_ref.current = next;
-            return next;
-        });
-        set_column_widths((prev) => {
-            const next = [...prev];
-            next[sheet_index] = { ...(next[sheet_index] ?? {}), ...(fitted ?? {}) };
-            state_ref.current = { ...state_ref.current, columnWidths: [...next] };
-            persist_immediate();
-            return next;
-        });
-        set_auto_fit_active((prev) => {
-            const next = [...prev];
-            next[sheet_index] = true;
-            auto_fit_active_ref.current = next;
-            return next;
-        });
-        return true;
+        const current_widths = state_ref.current.columnWidths?.[sheet_index];
+        // The widths a restore puts back: the ones this fit replaces, unless
+        // the sheet is already fitted. A second fit over a fitted sheet must
+        // not overwrite the original widths with fitted ones, or "restore"
+        // would restore the fit.
+        const snapshot = auto_fit_snapshot_ref.current[sheet_index]
+            ?? (current_widths ? { ...current_widths } : undefined);
+        const widths = Object.entries(fitted ?? {})
+            .map(([column, width]) => ({ column: Number(column), width }))
+            .filter(({ column, width }) => current_widths?.[column] !== width);
+        if (widths.length === 0) {
+            // Every column already has its fitted width: nothing to write, so
+            // no step. The toolbar still turns on.
+            set_auto_fit_for_sheet(sheet_index, true, snapshot);
+            return 'unchanged';
+        }
+        post_column_widths([{
+            sheet_index,
+            widths,
+            auto_fit: { active: true, snapshot },
+            auto_fit_change: 'on',
+        }], { owed });
+        return 'posted';
     }, [
         active_sheet_index,
-        column_widths,
-        base_gestures_admitted,
-        persist_immediate,
+        post_column_widths,
+        set_auto_fit_for_sheet,
         write_pending_column_widths,
     ]);
 
     /**
-     * Put the named sheets back on the widths their fit replaced.
+     * Put the named sheets back on the widths their fit replaced: one write
+     * for all of them, and one step.
      *
      * Serves both the button, which passes the active sheet alone, and the all-sheets
      * menu item. Sheets that were never fitted are skipped rather than blanked, so
      * passing every index is safe.
+     *
+     * A sheet's restore replaces its whole width map with the snapshot, so a
+     * column the fit gave a width and that had none before loses it. The
+     * request says that column by column: the snapshot's width for every
+     * column in it, and no width for every column that has one now and is
+     * not in the snapshot.
      */
     const restore_widths_for_sheets = useCallback((indices: readonly number[]) => {
         const fitted = indices.filter((index) => auto_fit_active_ref.current[index]);
         if (fitted.length === 0) return;
-        // As a fit, a restore that writes Pending Column widths waits for a
-        // held gesture rather than break it.
-        if (
-            fitted.some((index) => pending_auto_fit_snapshot_ref.current[index] !== undefined)
-            && !base_gestures_admitted()
-        ) return;
         for (const index of fitted) {
             const pending = pending_auto_fit_snapshot_ref.current[index];
             pending_auto_fit_snapshot_ref.current[index] = undefined;
             if (pending !== undefined) write_pending_column_widths(index, pending);
         }
-        set_column_widths((prev) => {
-            const next = [...prev];
-            for (const index of fitted) next[index] = auto_fit_snapshot_ref.current[index];
-            state_ref.current = { ...state_ref.current, columnWidths: [...next] };
-            persist_immediate();
-            return next;
-        });
-        set_auto_fit_active((prev) => {
-            const next = [...prev];
-            for (const index of fitted) next[index] = false;
-            auto_fit_active_ref.current = next;
-            return next;
-        });
-        set_auto_fit_snapshot((prev) => {
-            const next = [...prev];
-            for (const index of fitted) next[index] = undefined;
-            auto_fit_snapshot_ref.current = next;
-            return next;
-        });
-    }, [base_gestures_admitted, persist_immediate, write_pending_column_widths]);
+        const writes: WidthWriteSheet[] = [];
+        for (const index of fitted) {
+            const current = state_ref.current.columnWidths?.[index] ?? {};
+            const snapshot = auto_fit_snapshot_ref.current[index] ?? {};
+            const widths: { column: number; width: number | null }[] = [];
+            for (const [key, width] of Object.entries(snapshot)) {
+                const column = Number(key);
+                if (current[column] !== width) widths.push({ column, width });
+            }
+            for (const key of Object.keys(current)) {
+                if (!Object.prototype.hasOwnProperty.call(snapshot, key)) {
+                    widths.push({ column: Number(key), width: null });
+                }
+            }
+            if (widths.length === 0) {
+                // Already on the widths the fit replaced: nothing to write.
+                set_auto_fit_for_sheet(index, false, undefined);
+                continue;
+            }
+            widths.sort((left, right) => left.column - right.column);
+            writes.push({
+                sheet_index: index,
+                widths,
+                auto_fit: { active: false },
+                auto_fit_change: 'off',
+            });
+        }
+        if (writes.length > 0) post_column_widths(writes);
+    }, [post_column_widths, set_auto_fit_for_sheet, write_pending_column_widths]);
 
+    /**
+     * The toolbar's Auto-fit: fit the active sheet, or put its widths back.
+     * A size gesture like a drag: while the window is not free it is not
+     * started, and says so.
+     */
     const handle_toggle_auto_fit = useCallback(() => {
-        if (auto_fit_active[active_sheet_index]) {
+        if (!size_gesture_may_start()) return;
+        if (auto_fit_active_ref.current[active_sheet_index]) {
             restore_widths_for_sheets([active_sheet_index]);
-        } else if (!apply_auto_fit_to_active_sheet() && !base_gestures_admitted()) {
-            // Held off for a gesture in flight: owe the fit, as the all-sheets
-            // action owes one to a sheet it cannot measure yet.
-            update_pending_auto_fit_sheets((prev) => (
-                prev.has(active_sheet_index) ? prev : new Set([...prev, active_sheet_index])
-            ));
+        } else {
+            apply_auto_fit_to_active_sheet();
         }
     }, [
         active_sheet_index,
         apply_auto_fit_to_active_sheet,
-        auto_fit_active,
-        base_gestures_admitted,
         restore_widths_for_sheets,
-        update_pending_auto_fit_sheets,
+        size_gesture_may_start,
     ]);
 
     const auto_fit_waits_for_transform = useCallback((sheet_index: number) => {
@@ -9728,16 +10423,41 @@ export function App(): React.JSX.Element {
         );
     }, [meta, pending_transforms, preview_mode, sheet_views, transforms]);
 
+    /**
+     * Apply the fit "Auto-fit columns on all sheets" owes the active sheet,
+     * once it can be.
+     *
+     * The fit is a step like any other, and nobody is pressing anything when
+     * it lands. So it waits until the window is free, no cell editor or menu
+     * is open (it never folds one), and there is nothing to redo: recording
+     * it would discard that redo at a moment the person did nothing. A fit
+     * the host refused waits for the next snapshot, and none is tried while
+     * an unresolved structural save stands, which keeps refusing until the
+     * person answers it (the window is told that one exists, not which
+     * worksheets it restructured, so this holds back more than the host
+     * would refuse).
+     */
     const try_apply_pending_auto_fit = useCallback(() => {
         if (!pending_auto_fit_sheets_ref.current.has(active_sheet_index)) return;
         if (auto_fit_waits_for_transform(active_sheet_index)) return;
-        if (!apply_auto_fit_to_active_sheet()) return;
-        cancel_pending_auto_fit_for_sheet(active_sheet_index);
+        if (
+            save_in_flight_ref.current
+            || !edit_gestures_admitted()
+            || editing_ref.current?.session_busy() === true
+            || structural_save_notice !== null
+            || owed_fit_held_ref.current.has(active_sheet_index)
+            || peek_history(history_store_ref.current!.snapshot(), 'redo').kind === 'available'
+        ) return;
+        const outcome = apply_auto_fit_to_active_sheet(true);
+        // A posted fit stays owed until the host says it was applied.
+        if (outcome === 'unchanged') cancel_pending_auto_fit_for_sheet(active_sheet_index);
     }, [
         active_sheet_index,
         apply_auto_fit_to_active_sheet,
         auto_fit_waits_for_transform,
         cancel_pending_auto_fit_for_sheet,
+        edit_gestures_admitted,
+        structural_save_notice,
     ]);
 
     useEffect(() => {
@@ -9749,12 +10469,21 @@ export function App(): React.JSX.Element {
         // retry directly through GridShell's notification prop.
         generation,
         load_epoch,
-        // A fit owed while a highlight held the gesture slot.
+        // What an owed fit waits for: a free window (no highlight, view
+        // request, or save in flight), no open editor, nothing to redo, and
+        // after a refusal the next applied snapshot.
         highlight_request_pending,
+        view_request_pending,
+        editing_status,
+        save_operation,
+        redo_available,
+        applied_snapshot_count,
         try_apply_pending_auto_fit,
     ]);
 
     const handle_auto_fit_all_sheets = useCallback(() => {
+        // Asked first: refused, no sheet is owed a fit.
+        if (!size_gesture_may_start()) return;
         const sheets = meta?.sheets ?? [];
         const can_eventually_measure = (index: number) => {
             const sheet = sheets[index];
@@ -9769,7 +10498,7 @@ export function App(): React.JSX.Element {
         const fitted_active = auto_fit_active_ref.current[active_sheet_index]
             || (can_eventually_measure(active_sheet_index)
                 && !auto_fit_waits_for_transform(active_sheet_index)
-                && apply_auto_fit_to_active_sheet());
+                && apply_auto_fit_to_active_sheet() !== 'nothing-to-measure');
         update_pending_auto_fit_sheets(new Set(
             sheets.map((_sheet, index) => index)
                 .filter((index) => can_eventually_measure(index)
@@ -9783,16 +10512,19 @@ export function App(): React.JSX.Element {
         auto_fit_waits_for_transform,
         meta,
         sheet_views,
+        size_gesture_may_start,
         update_pending_auto_fit_sheets,
     ]);
 
     /** Restore every sheet's pre-fit widths, and drop any fit still owed. */
     const handle_restore_widths_all_sheets = useCallback(() => {
+        // Asked first: refused, the fits still owed stay owed.
+        if (!size_gesture_may_start()) return;
         update_pending_auto_fit_sheets(EMPTY_PENDING_AUTO_FIT);
         restore_widths_for_sheets(
             Array.from({ length: meta?.sheets.length ?? 0 }, (_, index) => index),
         );
-    }, [meta, restore_widths_for_sheets, update_pending_auto_fit_sheets]);
+    }, [meta, restore_widths_for_sheets, size_gesture_may_start, update_pending_auto_fit_sheets]);
 
     const current_sheet = meta?.sheets[active_sheet_index];
     // Discarded tombstones a stored Formula Anchor names must survive a
@@ -10746,7 +11478,8 @@ export function App(): React.JSX.Element {
             cell_focus={cell_focus}
             on_cell_focus_applied={handle_cell_focus_applied}
             column_widths={column_widths[active_sheet_index] ?? {}}
-            on_column_resize={handle_column_resize}
+            on_columns_resized={handle_columns_resized}
+            size_gesture_may_start={size_gesture_may_start}
             // The host's display-keyed projection for this sheet — never `{}` under a
             // permutation, which is what the old `transform_active ? {} : …` did to keep a
             // display-keyed durable map from naming the wrong rows. The projection is

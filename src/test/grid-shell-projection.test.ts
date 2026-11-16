@@ -337,7 +337,7 @@ function props(overrides: Partial<GridShellProps> = {}): GridShellProps {
             hidden_count: 1,
         },
         column_widths: { 0: 100, 1: 150, 2: 200 },
-        on_column_resize: vi.fn(),
+        on_columns_resized: vi.fn(),
         row_heights: {},
         on_row_resize: vi.fn(),
         merges: [],
@@ -2211,8 +2211,8 @@ describe('GridShell git compare painting', () => {
 
 describe('GridShell column projection', () => {
     it('builds displayed columns and reads/resizes canonical source columns', async () => {
-        const on_column_resize = vi.fn();
-        await render_grid(props({ on_column_resize }));
+        const on_columns_resized = vi.fn();
+        await render_grid(props({ on_columns_resized }));
 
         const columns = grid_mock.props!.columns as Array<{
             id: string;
@@ -2232,10 +2232,24 @@ describe('GridShell column projection', () => {
             (cell: [number, number]) => { data: string };
         expect(get_cell_content([1, 0]).data).toBe('source-c');
 
-        const on_column_resize_grid = grid_mock.props!.onColumnResize as
+        // A drag of display column 1, which is source column 2: nothing is
+        // reported while the border moves, and the end reports it once.
+        const resize = grid_mock.props!.onColumnResize as
             (column: unknown, size: number, display_column: number) => void;
-        on_column_resize_grid({}, 222, 1);
-        expect(on_column_resize).toHaveBeenCalledWith(2, 222);
+        const resize_start = grid_mock.props!.onColumnResizeStart as typeof resize;
+        const resize_end = grid_mock.props!.onColumnResizeEnd as typeof resize;
+        await act(async () => {
+            resize_start({}, 200, 1);
+            resize({}, 222, 1);
+        });
+        expect(on_columns_resized).not.toHaveBeenCalled();
+        expect((grid_mock.props!.columns as Array<{ id: string; width: number }>)
+            .map(({ id, width }) => [id, width])).toEqual([['s:0', 100], ['s:2', 222]]);
+        await act(async () => resize_end({}, 222, 1));
+        expect(on_columns_resized).toHaveBeenCalledExactlyOnceWith([{ column: 2, width: 222 }]);
+        // The draft is gone; the width is App's to give back.
+        expect((grid_mock.props!.columns as Array<{ id: string; width: number }>)
+            .map(({ id, width }) => [id, width])).toEqual([['s:0', 100], ['s:2', 200]]);
     });
 
     it('notifies App when a deferred auto-fit becomes measurable', async () => {
@@ -9798,9 +9812,9 @@ describe('row Insert in the row-gutter menu', () => {
     it('resizes an inserted row together with the source rows selected around it', async () => {
         const on_row_resize = vi.fn((
             _intervals: unknown,
-            _height: number,
-            finish?: (applied: boolean) => void,
-        ) => finish?.(true));
+            _height: number | null,
+            options: { gesture: boolean; on_result?: (applied: boolean) => void },
+        ) => options.on_result?.(true));
         const { pending } = await insert_after_first({ on_row_resize });
         const on_selection_change = grid_mock.props!.onGridSelectionChange as (selection: unknown) => void;
         // Display rows 0 (source 0), 1 (inserted), 2 (source 1).

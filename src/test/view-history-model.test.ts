@@ -5,13 +5,21 @@ import {
     type SheetTransformState,
 } from '../types';
 import {
+    auto_fit_after_width_replay,
+    column_widths_label,
+    column_widths_replay_target,
+    column_widths_view_step,
     columns_replay_target,
     columns_view_step,
+    row_heights_replay_target,
+    row_heights_view_step,
     overtaken_transform_step,
     transform_replay_target,
     transform_slices_equal,
     transform_view_step,
+    type ColumnWidthsViewDelta,
     type ColumnsViewDelta,
+    type RowHeightsViewDelta,
     type TransformViewDelta,
 } from '../webview/view-history-model';
 
@@ -310,5 +318,179 @@ describe('hidden columns as a view step', () => {
         const hide = delta([], [3]);
         expect(columns_replay_target(hide, 'undo', [3], { schema: 'schema-2', columnCount: 6 }))
             .toEqual({ hidden: [3], skipped: ['columns-changed'], changes: false });
+    });
+});
+
+describe('a column-width write as a view step', () => {
+    function width_delta(
+        columns: ColumnWidthsViewDelta['columns'],
+        auto_fit?: 'on' | 'off',
+    ): ColumnWidthsViewDelta {
+        const step = column_widths_view_step(SHEET, columns, auto_fit);
+        if (step?.delta.slice !== 'columnWidths') throw new Error('expected a width step');
+        return step.delta;
+    }
+
+    it('records what the host says changed, ascending, and labels it by count', () => {
+        expect(column_widths_view_step(SHEET, [
+            { column: 4, before: null, after: 180 },
+            { column: 1, before: 120, after: 90 },
+        ])).toEqual({
+            label: 'Resize 2 columns',
+            delta: {
+                worksheet: SHEET,
+                slice: 'columnWidths',
+                columns: [
+                    { column: 1, before: 120, after: 90 },
+                    { column: 4, before: null, after: 180 },
+                ],
+            },
+        });
+        expect(column_widths_view_step(SHEET, [{ column: 0, before: 100, after: null }])?.label)
+            .toBe('Resize column');
+    });
+
+    it('records nothing for a write that changed nothing', () => {
+        expect(column_widths_view_step(SHEET, [])).toBeUndefined();
+        // The host reports only changed columns; one that somehow did not is dropped.
+        expect(column_widths_view_step(SHEET, [{ column: 0, before: 100, after: 100 }])).toBeUndefined();
+        expect(column_widths_view_step(SHEET, [{ column: 0, before: null, after: null }])).toBeUndefined();
+    });
+
+    it('is named by the toggle when the gesture was the Auto-fit toggle', () => {
+        const columns = [{ column: 0, before: null, after: 64 }, { column: 1, before: 200, after: 88 }];
+        expect(column_widths_view_step(SHEET, columns, 'on')).toMatchObject({
+            label: 'Auto-fit columns',
+            delta: { autoFit: 'on' },
+        });
+        expect(column_widths_view_step(SHEET, columns, 'off')?.label).toBe('Restore column widths');
+        // Several worksheets in one gesture share one label, counted across them.
+        expect(column_widths_label(5)).toBe('Resize 5 columns');
+        expect(column_widths_label(5, 'off')).toBe('Restore column widths');
+    });
+
+    it('replays each of its columns to the other side, null removing the stored width', () => {
+        const delta = width_delta([
+            { column: 1, before: 120, after: 90 },
+            { column: 4, before: null, after: 180 },
+        ]);
+        expect(column_widths_replay_target(delta, 'undo', 6)).toEqual({
+            widths: [{ column: 1, width: 120 }, { column: 4, width: null }],
+            skipped: [],
+        });
+        expect(column_widths_replay_target(delta, 'redo', 6)).toEqual({
+            widths: [{ column: 1, width: 90 }, { column: 4, width: 180 }],
+            skipped: [],
+        });
+    });
+
+    it('leaves out a column the worksheet no longer has, and says so', () => {
+        const delta = width_delta([
+            { column: 1, before: 120, after: 90 },
+            { column: 4, before: null, after: 180 },
+        ]);
+        expect(column_widths_replay_target(delta, 'undo', 4)).toEqual({
+            widths: [{ column: 1, width: 120 }],
+            skipped: ['columns-gone'],
+        });
+        expect(column_widths_replay_target(delta, 'redo', 1)).toEqual({
+            widths: [],
+            skipped: ['columns-gone'],
+        });
+    });
+
+    it('leaves Auto-fit as the gesture left it, in both directions', () => {
+        const columns = [{ column: 0, before: 100, after: 64 }];
+        const fit = width_delta(columns, 'on');
+        const restore = width_delta(columns, 'off');
+        const drag = width_delta(columns);
+        expect(auto_fit_after_width_replay(fit, 'undo')).toBe('off');
+        expect(auto_fit_after_width_replay(fit, 'redo')).toBe('on');
+        expect(auto_fit_after_width_replay(restore, 'undo')).toBe('on');
+        expect(auto_fit_after_width_replay(restore, 'redo')).toBe('off');
+        // Any other width write ends Auto-fit, as the drag itself did.
+        expect(auto_fit_after_width_replay(drag, 'undo')).toBe('off');
+        expect(auto_fit_after_width_replay(drag, 'redo')).toBe('off');
+    });
+});
+
+describe('a row-height write as a view step', () => {
+    function height_delta(
+        height: number | null,
+        before: RowHeightsViewDelta['before'],
+    ): RowHeightsViewDelta {
+        const step = row_heights_view_step(SHEET, { height, before });
+        if (step?.delta.slice !== 'rowHeights') throw new Error('expected a row-height step');
+        return step.delta;
+    }
+
+    it('records the height set and what each changed row held, labelled by the rows', () => {
+        expect(row_heights_view_step(SHEET, {
+            height: 60,
+            before: [{ start: 2, end: 2, height: null }],
+        })).toEqual({
+            label: 'Resize row',
+            delta: {
+                worksheet: SHEET,
+                slice: 'rowHeights',
+                after: 60,
+                before: [{ start: 2, end: 2, height: null }],
+            },
+        });
+        expect(row_heights_view_step(SHEET, {
+            height: 60,
+            before: [{ start: 0, end: 3, height: null }, { start: 9, end: 9, height: 40 }],
+        })?.label).toBe('Resize 5 rows');
+    });
+
+    it('labels a reset, and records nothing for a write that changed nothing', () => {
+        expect(row_heights_view_step(SHEET, {
+            height: null,
+            before: [{ start: 4, end: 4, height: 60 }],
+        })?.label).toBe('Reset row height');
+        expect(row_heights_view_step(SHEET, {
+            height: null,
+            before: [{ start: 4, end: 5, height: 60 }, { start: 7, end: 7, height: 30 }],
+        })?.label).toBe('Reset 3 row heights');
+        expect(row_heights_view_step(SHEET, { height: 60, before: [] })).toBeUndefined();
+    });
+
+    it('undoes each run to what it held and redoes every row to the height set', () => {
+        const delta = height_delta(60, [
+            { start: 0, end: 3, height: null },
+            { start: 9, end: 9, height: 40 },
+        ]);
+        expect(row_heights_replay_target(delta, 'undo', 100)).toEqual({
+            rows: [{ start: 0, end: 3, height: null }, { start: 9, end: 9, height: 40 }],
+            skipped: [],
+        });
+        expect(row_heights_replay_target(delta, 'redo', 100)).toEqual({
+            rows: [{ start: 0, end: 3, height: 60 }, { start: 9, end: 9, height: 60 }],
+            skipped: [],
+        });
+    });
+
+    it('undoes a reset by putting the heights back and redoes it by removing them', () => {
+        const delta = height_delta(null, [{ start: 4, end: 5, height: 60 }]);
+        expect(row_heights_replay_target(delta, 'undo', 100).rows)
+            .toEqual([{ start: 4, end: 5, height: 60 }]);
+        expect(row_heights_replay_target(delta, 'redo', 100).rows)
+            .toEqual([{ start: 4, end: 5, height: null }]);
+    });
+
+    it('leaves out rows the worksheet no longer has, clipping a run that straddles the end', () => {
+        const delta = height_delta(60, [
+            { start: 0, end: 3, height: null },
+            { start: 8, end: 12, height: 40 },
+            { start: 20, end: 20, height: null },
+        ]);
+        expect(row_heights_replay_target(delta, 'undo', 10)).toEqual({
+            rows: [{ start: 0, end: 3, height: null }, { start: 8, end: 9, height: 40 }],
+            skipped: ['rows-gone'],
+        });
+        expect(row_heights_replay_target(delta, 'redo', 0)).toEqual({
+            rows: [],
+            skipped: ['rows-gone'],
+        });
     });
 });

@@ -180,6 +180,12 @@ export interface RowHeightLayer {
     /** Inclusive display-row intervals, disjoint and ascending. */
     readonly rows: readonly Readonly<DisplayRowInterval>[];
     readonly height: number;
+    /**
+     * The request this layer was painted for, when that request is answered.
+     * Its answer retires the layer, whatever it says: see
+     * `row_height_layers_without_request`.
+     */
+    readonly requestId?: string;
 }
 
 /**
@@ -318,6 +324,48 @@ export function resolved_row_height(
         }
     }
     return row_height(overrides, row, default_height);
+}
+
+/**
+ * The layers left once the request `request_id` has been answered.
+ *
+ * The host delivers what is stored before it answers, so from the answer on
+ * the rows show the projection and the layer has nothing left to stand in
+ * for. Value-based reconciliation (`row_height_layers_for_delivery`) cannot
+ * retire two kinds of layer, and each would mask a height a later undo
+ * restores: one whose write was refused, and one whose write landed and was
+ * then overtaken by another window's write to the same row before the
+ * delivery was built. Returns `layers` itself when none matches.
+ */
+export function row_height_layers_without_request(
+    layers: readonly RowHeightLayer[],
+    request_id: string,
+): readonly RowHeightLayer[] {
+    return layers.some((layer) => layer.requestId === request_id)
+        ? layers.filter((layer) => layer.requestId !== request_id)
+        : layers;
+}
+
+/**
+ * Whether any display row of `interval` shows a custom height: one the
+ * projection names, or one an overlay layer paints. Walks the projection's
+ * entries, never the interval, which can be a select-all.
+ */
+export function display_rows_have_custom_height(
+    overrides: RowHeightOverrides,
+    layers: readonly RowHeightLayer[] | undefined,
+    interval: Readonly<DisplayRowInterval>,
+): boolean {
+    for (const layer of layers ?? []) {
+        for (const rows of layer.rows) {
+            if (rows.start <= interval.end && rows.end >= interval.start) return true;
+        }
+    }
+    for (const key in overrides) {
+        const row = Number(key);
+        if (row >= interval.start && row <= interval.end) return true;
+    }
+    return false;
 }
 
 /**

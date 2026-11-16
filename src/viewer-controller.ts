@@ -144,6 +144,11 @@ import {
     EMPTY_TRANSFORM,
     MAX_PERSISTED_HIDDEN_ROWS,
     MAX_PERSISTED_ROW_HEIGHTS,
+    type ColumnWidthChange,
+    type ColumnWidthsSheetChange,
+    type DisplayRowInterval,
+    type RowHeightsChange,
+    type SourceRowHeightRun,
     has_any_pending_edits,
     own_wire_pending_changes,
     pending_changes_for_sheet,
@@ -294,6 +299,7 @@ import { AppendAdmissionTemplateAuthorityStore } from './append-admission-templa
 // `sanitize_transform_state` and `sanitize_column_visibility_state` above already cross
 // this boundary.
 import { clamp_row_height } from './webview/row-heights';
+import { clamp_column_width } from './webview/grid-model';
 import {
     apply_cell_highlight_patch,
     cell_highlight_states_equal,
@@ -746,6 +752,60 @@ const PENDING_EDIT_FLUSH_TIMEOUT_MS = 2_000;
 const ROW_HEIGHT_LIMIT_WARNING =
     'Too many resized rows to persist: a sheet may keep at most '
     + `${MAX_PERSISTED_ROW_HEIGHTS.toLocaleString('en-US')} custom row heights.`;
+
+/**
+ * Source rows and the height each held, as ascending runs of consecutive rows
+ * with one height. A select-all of rows that had no custom height is one run.
+ */
+function source_row_height_runs(
+    rows: readonly (readonly [source_row: number, height: number | null])[],
+): SourceRowHeightRun[] {
+    const sorted = [...rows].sort((left, right) => left[0] - right[0]);
+    const runs: { start: number; end: number; height: number | null }[] = [];
+    for (const [source_row, height] of sorted) {
+        const last = runs[runs.length - 1];
+        if (last !== undefined && last.end === source_row - 1 && last.height === height) {
+            last.end = source_row;
+        } else if (last === undefined || last.end !== source_row) {
+            runs.push({ start: source_row, end: source_row, height });
+        }
+    }
+    return runs;
+}
+
+/** Inclusive intervals sorted and merged, so membership can be searched. */
+function merged_display_intervals(
+    intervals: readonly DisplayRowInterval[],
+): DisplayRowInterval[] {
+    const sorted = [...intervals].sort((left, right) => left.start - right.start);
+    const merged: DisplayRowInterval[] = [];
+    for (const interval of sorted) {
+        const last = merged[merged.length - 1];
+        if (last !== undefined && interval.start <= last.end + 1) {
+            if (interval.end > last.end) last.end = interval.end;
+        } else {
+            merged.push({ start: interval.start, end: interval.end });
+        }
+    }
+    return merged;
+}
+
+/** Whether `row` is in one of `intervals`, which are ascending and disjoint. */
+function display_intervals_contain(
+    intervals: readonly DisplayRowInterval[],
+    row: number,
+): boolean {
+    let low = 0;
+    let high = intervals.length - 1;
+    while (low <= high) {
+        const middle = (low + high) >> 1;
+        const interval = intervals[middle];
+        if (row < interval.start) high = middle - 1;
+        else if (row > interval.end) low = middle + 1;
+        else return true;
+    }
+    return false;
+}
 const COMPARE_DIFF_INCOMPLETE_WARNING =
     'Table Viewer could not compare some visible cells. Unhighlighted cells may still differ.';
 const MAX_SAVED_APPEND_AUTHORITIES = 100_000;
@@ -7627,11 +7687,87 @@ export function attach_viewer(
         return write;
     }
 
+    /**
+     * What a `stateChanged` needs from the moment it arrived.
+     *
+     * A `stateChanged` carries the window's whole state, and the snapshot
+     * identity it names says what that state is a difference *from*. Only
+     * that identity's acknowledged state can answer, and it stops being
+     * available the moment any delivery clears the acknowledged identity
+     * (an edit-state notification, a transform reconciliation, a history
+     * replay's result, a Header Row result, an LFS failure: none of them
+     * knows a layout write is waiting). So it is read when the message
+     * arrives, which the dispatcher reaches synchronously, and kept with the
+     * queued write. A message already stale on arrival is refused here.
+     */
+    interface LayoutWriteArrival {
+        readonly receiver_epoch: number;
+        /**
+         * The acknowledged state for the message's identity, when
+         * `layout_basis` was not already for it. Immutable; one copy per
+         * identity, shared by the messages that name it.
+         */
+        readonly origin?: Readonly<NormalizedPerFileState>;
+    }
+    let layout_origin: {
+        readonly identity: WorkbookSnapshotIdentity;
+        readonly state: Readonly<NormalizedPerFileState>;
+    } | undefined;
+
+    function capture_layout_write_arrival(
+        message: StateChangedMessage,
+        expected_authority: number,
+    ): LayoutWriteArrival | undefined {
+        if (!layout_write_is_current(message, expected_authority)) return undefined;
+        const receiver_epoch = session.current_receiver_epoch;
+        if (
+            layout_basis
+            && same_snapshot_identity(layout_basis.identity, message.snapshotIdentity)
+        ) return { receiver_epoch };
+        if (
+            !layout_origin
+            || !same_snapshot_identity(layout_origin.identity, message.snapshotIdentity)
+        ) {
+            const acknowledged_state = session.acknowledged_state_snapshot(
+                message.snapshotIdentity,
+            );
+            if (!acknowledged_state) return undefined;
+            layout_origin = {
+                identity: structuredClone(message.snapshotIdentity),
+                state: acknowledged_state,
+            };
+        }
+        return { receiver_epoch, origin: layout_origin.state };
+    }
+
+    /**
+     * Whether a layout write that was current when it arrived may still be
+     * applied: the host-side facts only. The acknowledged identity is not
+     * asked again. The write is explicit leaf changes merged into the
+     * durable state as it is then, so a delivery since its arrival
+     * invalidates nothing about it; a reload or another source does.
+     */
+    function layout_write_may_apply(
+        message: StateChangedMessage,
+        expected_authority: number,
+        arrival: LayoutWriteArrival,
+    ): boolean {
+        return !disposed
+            && core !== undefined
+            && session.current_receiver_epoch === arrival.receiver_epoch
+            && file_coordinator.state_write_is_current(expected_authority)
+            && source_authority.authorityRevision === expected_authority
+            && message.snapshotIdentity.authority.revision === expected_authority
+            && message.sourceGeneration === core.source_generation;
+    }
+
     async function persist_layout_state(
         message: StateChangedMessage,
         expected_authority: number,
+        arrival: LayoutWriteArrival,
     ): Promise<void> {
-        if (!layout_write_is_current(message, expected_authority) || !source) return;
+        const may_apply = () => layout_write_may_apply(message, expected_authority, arrival);
+        if (!may_apply() || !source) return;
         const write_basis: FileStateWriteBasis = {
             expectedAuthorityRevision: expected_authority,
             expectedPhysicalRevision: source_authority.physicalRevision,
@@ -7642,35 +7778,26 @@ export function attach_viewer(
             !layout_basis
             || !same_snapshot_identity(layout_basis.identity, message.snapshotIdentity)
         ) {
-            const acknowledged_state = session.acknowledged_state_snapshot(
-                message.snapshotIdentity,
-            );
-            if (!acknowledged_state) return;
+            if (!arrival.origin) return;
             layout_basis = {
                 identity: structuredClone(message.snapshotIdentity),
-                state: complete_normalized_per_file_state(
-                    acknowledged_state,
-                    sheets,
-                ),
+                state: complete_normalized_per_file_state(arrival.origin, sheets),
             };
         }
+        // Derived here, on the tail, against a basis that advances only when
+        // a write lands: a write queued behind one that failed carries the
+        // leaf the failed one lost, and one queued behind one that landed
+        // does not repeat it.
         const basis = layout_basis;
         const incoming = complete_normalized_per_file_state(message.state, sheets);
-        const derived = derive_layout_state_patch(basis.state, incoming);
-        // Column widths are keyed by source column, so an unresolved
-        // structural save's affected sheets keep theirs as stored.
-        const patch = unresolved_structural_sheet_names.size === 0 ? derived : {
-            ...derived,
-            columnWidths: derived.columnWidths.filter((entry) =>
-                !unresolved_structural_sheet(entry.sheetIndex)),
-        };
+        const patch = derive_layout_state_patch(basis.state, incoming);
         const next_basis = complete_normalized_per_file_state(
             apply_layout_state_patch(basis.state, patch),
             sheets,
         );
         let reconciled = false;
-        await update_file_state((current) => {
-            if (!layout_write_is_current(message, expected_authority)) return current;
+        const committed = await update_file_state((current) => {
+            if (!may_apply()) return current;
             reconciled = true;
             const sheets = source?.meta().sheets;
             if (!sheets) return current;
@@ -7707,14 +7834,196 @@ export function attach_viewer(
                 }
                 : current;
             return apply_layout_state_patch(host_state, patch);
-        }, source.meta().sheets, () => layout_write_is_current(message, expected_authority), write_basis);
-        if (
-            reconciled
-            && layout_basis === basis
-            && layout_write_is_current(message, expected_authority)
-        ) {
+        }, source.meta().sheets, may_apply, write_basis);
+        // The identity is not re-asked here either: a write that landed
+        // under a delivery still moved the durable state, and the next write
+        // for this identity has to be derived against that.
+        if (reconciled && layout_basis === basis && may_apply()) {
             basis.state = next_basis;
         }
+        // A delivery since this message arrived was built before this write
+        // committed, and the window adopts a delivery's layout into the state
+        // its next message is a difference of. Bring it back to what is
+        // durable. Last on this write's turn of the tail, so a write waiting
+        // behind is not affected: what it needed was read when it arrived.
+        if (committed !== undefined && !disposed) {
+            const acknowledged = session.acknowledged_identity();
+            if (
+                acknowledged === undefined
+                || !same_snapshot_identity(message.snapshotIdentity, acknowledged)
+            ) session.deliver_current_material();
+        }
+    }
+
+    /** The host-side facts a column-width or row-height write depends on, read when its request arrives. */
+    interface SizeWriteAuthority {
+        readonly receiver_epoch: number;
+        readonly write_basis: FileStateWriteBasis & {
+            readonly expectedPhysicalRevision: number;
+            readonly expectedProjectionRevision: number;
+        };
+    }
+
+    function capture_size_write_authority(): SizeWriteAuthority {
+        return {
+            receiver_epoch: session.current_receiver_epoch,
+            write_basis: {
+                expectedAuthorityRevision: source_authority.authorityRevision,
+                expectedPhysicalRevision: source_authority.physicalRevision,
+                expectedProjectionRevision: source_authority.projectionRevision,
+            },
+        };
+    }
+
+    /**
+     * Whether a size write still targets the file revision and source it was
+     * composed against. Host-side facts only, and no snapshot identity: a
+     * size request names the columns or rows it means, so there is no whole
+     * state to diff against what the window had acknowledged, and a delivery
+     * in flight is no reason to refuse it. (`setRowHeights` adds the
+     * generation range its display rows need.)
+     */
+    function size_write_is_current(
+        authority: SizeWriteAuthority,
+        source_generation: number,
+    ): boolean {
+        return !disposed
+            && session.current_receiver_epoch === authority.receiver_epoch
+            && core !== undefined
+            && source_generation === core.source_generation
+            // `state_write_is_current` is the term that catches a refresh in
+            // progress: the coordinator's authority advances before the new
+            // source is adopted. The comparison beside it is half of the pair
+            // every durable write here asks.
+            && file_coordinator.state_write_is_current(
+                authority.write_basis.expectedAuthorityRevision,
+            )
+            && source_authority.authorityRevision
+                === authority.write_basis.expectedAuthorityRevision;
+    }
+
+    /**
+     * Show the window what is durable after a size write that committed or
+     * found nothing to change.
+     *
+     * One step on the layout tail: read the durable state, install it, and
+     * deliver what the session holds. Read and installed first because a
+     * write that changed nothing installs nothing (`update_file_state`
+     * returns before it would), and a panel whose copy is stale (another
+     * window wrote the sizes) would be sent that copy again. Delivered
+     * whether or not the request is still current: a refresh captured before
+     * the commit can be in transit with the old sizes, and the window adopts
+     * a refresh's sizes. On the tail because a delivery clears the
+     * acknowledged identity, which a `stateChanged` arriving meanwhile needs.
+     *
+     * Never throws: the write's verdict is settled before this runs, and a
+     * failure here must not change the answer.
+     */
+    async function deliver_after_size_write(authority: SizeWriteAuthority): Promise<void> {
+        try {
+            await enqueue_layout_write(async () => {
+                if (disposed) return;
+                try {
+                    if (
+                        file_coordinator.state_write_is_current(
+                            authority.write_basis.expectedAuthorityRevision,
+                        )
+                        && source_authority.authorityRevision
+                            === authority.write_basis.expectedAuthorityRevision
+                    ) {
+                        const fresh = await read_file_state(false);
+                        if (!disposed) update_session_state_material(fresh, false);
+                    }
+                } catch (error) {
+                    log_sanitized_failure('Failed to read the state a size write left', error);
+                }
+                if (!disposed) session.deliver_current_material();
+            });
+        } catch (error) {
+            log_sanitized_failure('Failed to deliver after a size write', error);
+        }
+    }
+
+    /**
+     * The rows a row-height write targets and the height each should hold
+     * (`null`: none), given the worksheet's stored heights.
+     */
+    type RowHeightPlan = (
+        existing: Readonly<Record<number, number>> | undefined,
+    ) => Iterable<readonly [source_row: number, height: number | null]>;
+
+    /**
+     * Durably set or remove custom row heights on one worksheet.
+     *
+     * The one write behind a resize (display rows, mapped by the caller), a
+     * reset, and a replay by source row. `applied` is true when the
+     * compare-and-set committed or every target already held its height;
+     * `before` is what the committed write changed, as runs of source rows
+     * with the height each held.
+     *
+     * The bound is on what the worksheet ends up holding, checked as growth:
+     * a write that leaves the count where it was or lower is never refused,
+     * so a map from before the bound existed can still be edited and emptied.
+     */
+    async function write_row_heights(
+        sheet_index: number,
+        is_current: () => boolean,
+        write_basis: FileStateWriteBasis,
+        plan: RowHeightPlan,
+    ): Promise<{
+        readonly applied: boolean;
+        readonly before: readonly SourceRowHeightRun[];
+        readonly refused_at_bound: boolean;
+    }> {
+        // Each is the verdict of the updater's last run: it runs again once
+        // per losing compare-and-set.
+        let refused_at_bound = false;
+        let unchanged = false;
+        let before: SourceRowHeightRun[] = [];
+        const committed = await enqueue_layout_write(async () => {
+            if (!is_current()) return undefined;
+            return update_file_state((current) => {
+                if (!is_current()) return current;
+                refused_at_bound = false;
+                unchanged = false;
+                before = [];
+                const rowHeights = [...(current.rowHeights ?? [])];
+                const existing = rowHeights[sheet_index];
+                const next: Record<number, number> = { ...(existing ?? {}) };
+                const changed: [row: number, prior: number | null][] = [];
+                for (const [source_row, height] of plan(existing)) {
+                    const prior = Object.prototype.hasOwnProperty.call(next, source_row)
+                        ? next[source_row]
+                        : null;
+                    if (prior === height) continue;
+                    if (height === null) delete next[source_row];
+                    else next[source_row] = height;
+                    changed.push([source_row, prior]);
+                }
+                // A resize ending on the height the rows already have is a
+                // success that writes nothing.
+                if (changed.length === 0) {
+                    unchanged = true;
+                    return current;
+                }
+                const next_count = Object.keys(next).length;
+                if (
+                    next_count > MAX_PERSISTED_ROW_HEIGHTS
+                    && next_count > Object.keys(existing ?? {}).length
+                ) {
+                    refused_at_bound = true;
+                    return current;
+                }
+                before = source_row_height_runs(changed);
+                rowHeights[sheet_index] = next_count === 0 ? undefined : next;
+                return { ...current, rowHeights };
+            }, undefined, is_current, write_basis);
+        });
+        return {
+            applied: committed !== undefined || unchanged,
+            before: committed === undefined ? [] : before,
+            refused_at_bound,
+        };
     }
 
     type EditStateWriteResult =
@@ -13448,8 +13757,12 @@ export function attach_viewer(
             case 'stateChanged': {
                 const expected_authority = source_authority.authorityRevision;
                 const message = structuredClone(msg);
+                // Before any await: what the message is a difference from
+                // can only be read while its identity is the acknowledged one.
+                const arrival = capture_layout_write_arrival(message, expected_authority);
+                if (arrival === undefined) return;
                 await enqueue_layout_write(
-                    () => persist_layout_state(message, expected_authority),
+                    () => persist_layout_state(message, expected_authority, arrival),
                 );
                 return;
             }
@@ -14524,13 +14837,18 @@ export function attach_viewer(
                 return;
             }
             /**
-             * Durably record one height for every row of a completed resize.
+             * Durably record one height for every row of a completed resize, or remove
+             * the custom height of every named row (`height: null`, a reset).
              *
              * The write is `setColumnVisibility`'s shape — a currency predicate re-asked
              * across every await, `update_file_state`, then an *explicit* delivery,
              * because `update_file_state`'s own `update_session_state_material` does not
              * deliver and the display-keyed projection the webview renders from is
-             * recomputed only when something is delivered. The display→source mapping and
+             * recomputed only when something is delivered.
+             *
+             * A request that carries an id is answered on every exit, a throw included:
+             * the window holds its other gestures until the answer, and records the
+             * resize in undo history from it. `applied` is decided by the write alone. The display→source mapping and
              * the generation pair guarding it are `hideRows`'s, because the request names
              * rows in a coordinate space only one specific permutation defines.
              *
@@ -14554,21 +14872,20 @@ export function attach_viewer(
              * The half that is *not* taken is `msg.snapshotIdentity` and the acknowledged
              * identity it is compared against. That is a fact the webview echoes back, and
              * gating on it means dropping requests because a delivery happened to be in
-             * flight. `stateChanged` can afford that because a dropped one loses nothing —
-             * `state_ref` still holds the value and the next debounced persist resends it.
-             * The webview no longer holds durable heights, so here a drop is the resize
-             * gone for good. Hence the asymmetry: host-side authority facts yes, echoed
-             * snapshot identity no.
+             * flight. The webview holds no durable heights, so a drop is the resize gone
+             * for good. Hence: host-side authority facts yes, echoed snapshot identity no.
+             * (`stateChanged` needs the identity, to know what its whole state is a
+             * difference from, and reads it when the message arrives.)
              *
              * Serialized through `enqueue_layout_write` so it cannot interleave with
              * `persist_layout_state`. Both write the same durable document through
              * read-modify-write CAS loops, and while `rowHeights` is no longer a layout
              * patch leaf, the two still touch peer leaves of one object; running them on
-             * one tail is how `columnWidths` and `scrollPosition` already avoid trading
-             * CAS retries with each other.
+             * one tail keeps them from trading CAS retries with each other.
              *
-             * The stale-generation rejections are silent, and that is a decision. There is
-             * no refusal message and deliberately no deferred replay — replaying a resize
+             * A stale generation shows no warning, and that is a decision (an answered
+             * request is told `applied: false`). There is deliberately no deferred replay
+             * — replaying a resize
              * against a moved view resizes whatever rows now sit at those display
              * positions. Nor is a message needed: the delivery that moved the generation
              * is what makes the webview's generation differ from the one it posted, so the
@@ -14593,27 +14910,18 @@ export function attach_viewer(
              */
             case 'setRowHeights': {
                 const message = structuredClone(msg);
-                const receiver_epoch = session.current_receiver_epoch;
-                const settle_resize = (applied: boolean): void => {
-                    if (
-                        message.requestId === undefined
-                        || disposed
-                        || session.current_receiver_epoch !== receiver_epoch
-                    ) return;
-                    void post_to_receiver({
-                        type: 'rowHeightsChanged',
-                        requestId: message.requestId,
-                        sheetIndex: message.sheetIndex,
-                        applied,
-                        sourceGeneration: core?.source_generation
-                            ?? message.sourceGeneration,
-                    }, receiver_epoch);
-                };
-                const expected_authority = source_authority.authorityRevision;
-                const expected_physical_revision = source_authority.physicalRevision;
-                const expected_projection_revision = source_authority.projectionRevision;
-                const resize_is_current = () => !disposed
-                    && session.current_receiver_epoch === receiver_epoch
+                const authority = capture_size_write_authority();
+                // What the answer says. Settled by the write and by nothing after
+                // it; every exit below, a throw included, answers this.
+                let answer: {
+                    applied: boolean;
+                    change?: RowHeightsChange;
+                    refused?: 'limit' | 'unresolved';
+                } = { applied: false };
+                const resize_is_current = () => size_write_is_current(
+                    authority,
+                    message.sourceGeneration,
+                )
                     // A *range* on the generation rather than equality, and the only
                     // predicate in this file that asks it that way. The generation is
                     // core-wide but a permutation is per sheet, so equality refuses
@@ -14642,266 +14950,325 @@ export function attach_viewer(
                     // composed it against.
                     && core !== undefined
                     && message.generation >= core.mapping_generation(message.sheetIndex)
-                    && message.generation <= core.generation
-                    && message.sourceGeneration === core.source_generation
-                    // `state_write_is_current` is the term that actually catches the
-                    // refresh window; probing found it sufficient on its own, because the
-                    // coordinator's authority advances first and monotonically. The
-                    // `source_authority` comparison beside it is unfalsifiable here for
-                    // that same reason — it is read *from* `source_authority` above, and
-                    // anything that advances that has already advanced the coordinator
-                    // past `expected_authority`. Kept because it is half of the pair every
-                    // other durable write in this file asks (`layout_write_is_current`,
-                    // `setColumnVisibility`), and a predicate that agrees with its
-                    // neighbours is worth more than one term less.
-                    && file_coordinator.state_write_is_current(expected_authority)
-                    && source_authority.authorityRevision === expected_authority;
-                if (!core || !source || !resize_is_current()) {
-                    settle_resize(false);
-                    return;
-                }
-                if (!source.meta().sheets[message.sheetIndex]) {
-                    settle_resize(false);
-                    return;
-                }
-                if (unresolved_structural_sheet(message.sheetIndex)) {
-                    settle_resize(false);
-                    return;
-                }
-                if (!Number.isFinite(message.height)) {
-                    settle_resize(false);
-                    return;
-                }
-                // Clamped before anything durable is touched, so no arithmetic slip in
-                // the webview can persist a zero- or negative-height row — a row the
-                // user would then have no visible edge left to drag back.
-                const height = clamp_row_height(message.height);
-                // Counted from the intervals *before* mapping, which is the only place it
-                // can usefully be counted: `map_display_rows_to_source` allocates two
-                // `Uint32Array`s the size of the request, so a select-all on a
-                // ten-million-row sheet has already cost 80MB by the time a post-mapping
-                // check could look at it.
-                let requested_rows = 0;
-                for (const interval of message.rows) {
-                    if (
-                        !Number.isInteger(interval.start)
-                        || !Number.isInteger(interval.end)
-                        || interval.end < interval.start
-                    ) {
-                        settle_resize(false);
+                    && message.generation <= core.generation;
+                try {
+                    if (!core || !source || !resize_is_current()) return;
+                    if (!source.meta().sheets[message.sheetIndex]) return;
+                    if (unresolved_structural_sheet(message.sheetIndex)) {
+                        answer = { applied: false, refused: 'unresolved' };
                         return;
                     }
-                    requested_rows += interval.end - interval.start + 1;
-                }
-                // Only reachable from an empty `rows` array — every interval that gets
-                // past the validation above contributes at least one row. Unfalsifiable
-                // through the webview, which never posts one (`grid-shell` falls back to
-                // the single dragged row and `app` counts before posting), so it is a
-                // guard against a malformed message rather than against a caller. Kept on
-                // that basis: without it the write proceeds to `update_file_state`, finds
-                // nothing to change, and takes the no-op-success path — which delivers,
-                // so a message naming no rows would cost a state read and a snapshot
-                // round-trip per occurrence.
-                if (requested_rows === 0) {
-                    settle_resize(false);
-                    return;
-                }
-                if (requested_rows > MAX_PERSISTED_ROW_HEIGHTS) {
-                    show_owner_warning(ROW_HEIGHT_LIMIT_WARNING);
-                    settle_resize(false);
-                    return;
-                }
-                let mapped: Uint32Array;
-                try {
-                    mapped = core.map_display_rows_to_source(
-                        message.sheetIndex,
-                        message.rows,
-                    );
-                } catch {
-                    // `map_display_rows_to_source` throws for an interval outside the
-                    // installed view. On a current generation that is a malformed request
-                    // rather than a stale one, and there is nothing to write either way.
-                    settle_resize(false);
-                    return;
-                }
-                // Set by the updater when the accumulated map would pass the bound, and
-                // read after the write settles. The warning cannot be raised from inside
-                // the updater: `update_file_state` re-runs it once per losing CAS, so a
-                // warning there would pop once per retry. A flag is idempotent, and the
-                // updater's own return value cannot carry the reason — refusing and
-                // writing nothing both surface as `undefined`.
-                let refused_at_bound = false;
-                /**
-                 * Set by the updater when every mapped row already holds the requested
-                 * height. That is a *successful* resize that writes nothing, and it still
-                 * has to be acknowledged, because the webview has already painted an
-                 * optimistic layer for it and only drops a layer once a delivered
-                 * projection agrees with it (`row_height_layers_for_delivery`). Left
-                 * unanswered the layer sits over the projection for the rest of the
-                 * generation, and the case where that matters is not cosmetic: this panel
-                 * can hold a *stale* projection — a sibling's write moves the durable map
-                 * with no generation bump — so "the value is already durable" is exactly
-                 * the request a user makes when they drag a row back to the size another
-                 * panel just set. A later delivery carrying a different height would then
-                 * be masked by the disagreeing layer, hiding authoritative state.
-                 *
-                 * Distinguished from the two refusals rather than lumped with them, and
-                 * neither of those may be acknowledged: over the bound the write was
-                 * rejected and the layer *should* stand until the generation moves (see
-                 * `row_height_layers_for_delivery` on that residue), and a stale
-                 * generation is answered by the delivery that moved it, which is what
-                 * discards the whole overlay. Only a no-op success gets a delivery.
-                 *
-                 * Both flags are reset at the top of each updater run, and that reset is
-                 * unfalsifiable today — said so rather than dressed up as a fix. It is
-                 * there because `update_file_state` re-runs the updater once per losing
-                 * CAS, so a retry could in general reach a different verdict than the run
-                 * before it. It cannot as written: every run that sets either flag returns
-                 * `current` unchanged, which makes `update_file_state` return immediately,
-                 * so only the *last* run can have set anything. Probed by deleting the
-                 * reset, and nothing failed, exactly as that argument predicts. Kept on the
-                 * precedent `may_reserve_claim` and `resize_is_current`'s authority term set
-                 * in this file: the reset is what makes the flags mean "the verdict of the
-                 * write" rather than "the verdict of some attempt at it", and a refusal that
-                 * later did want a retry would otherwise leave a stale warning or a spurious
-                 * acknowledgement behind it.
-                 */
-                let unchanged_at_current_height = false;
-                /*
-                 * `resize_is_current` is consulted four times on the way to a durable
-                 * write — once before the first await, then inside the layout-write tail,
-                 * inside the CAS updater, and as `update_file_state`'s own validate hook —
-                 * and a mutation audit found that *no single one* of them can be deleted
-                 * and caught by a test. Recorded rather than trimmed, because the reason
-                 * is not that they are unnecessary.
-                 *
-                 * They are ordered in time, not in logic: each covers a distinct await the
-                 * request has to survive, and the interleaving that reaches one reaches
-                 * every later one too. So a test that opens a window anywhere is answered
-                 * by whichever check comes next, and any one of them alone is enough *at
-                 * that window* — which makes them individually unfalsifiable and jointly
-                 * load-bearing. Deleting all three post-await checks together does fail
-                 * ('abandons a resize whose sheet is permuted while its durable read is in
-                 * flight'), which is the assertion that pins the set.
-                 *
-                 * Kept as four because the windows they cover are not interchangeable in
-                 * production even though they are in any one test: the CAS check is the
-                 * only one re-evaluated per losing retry, and the validate hook is the only
-                 * one inside the store's own commit. What they prevent is not a wasted
-                 * write but a display-keyed request mapped through a permutation it never
-                 * saw — a height painted on rows the user did not drag.
-                 */
-                const committed = await enqueue_layout_write(async () => {
-                    if (!resize_is_current()) return undefined;
-                    const written = await update_file_state((current) => {
-                        if (!resize_is_current()) return current;
-                        refused_at_bound = false;
-                        unchanged_at_current_height = false;
-                        const rowHeights = [...(current.rowHeights ?? [])];
-                        const existing = rowHeights[message.sheetIndex];
-                        const next = { ...(existing ?? {}) };
-                        let changed = false;
-                        for (const source_row of mapped) {
-                            if (next[source_row] === height) continue;
-                            next[source_row] = height;
-                            changed = true;
-                        }
-                        // A drag ending on the height the rows already have writes
-                        // nothing, so `update_file_state` returns undefined — but it is a
-                        // success, and it is answered below with the freshly read
-                        // projection rather than with silence. See
-                        // `unchanged_at_current_height`. Worth being explicit about: a
-                        // resize reports its final size, and reporting an unchanged one is
-                        // the ordinary outcome of a click that moves a pixel and comes back.
-                        if (!changed) {
-                            unchanged_at_current_height = true;
-                            return current;
-                        }
-                        // The accumulated map, not this request: the cap is on what the
-                        // file ends up holding, so a hundred small resizes cannot walk
-                        // past a bound one large one would have been refused at.
-                        // All-or-nothing rather than partial, because a sheet resized up
-                        // to an arbitrary row and default below it reads as corruption.
-                        //
-                        // And not silent. This is the path a user reaches by a hundred
-                        // small resizes rather than one large one: nothing about the
-                        // gesture was unreasonable, the webview cannot predict the
-                        // refusal because it never sees the durable map, and without the
-                        // warning below the row simply fails to keep its new height with
-                        // no explanation anywhere.
-                        //
-                        // A *growth* check rather than a level check, and that is the
-                        // difference between a bound and a trap. Releases before this bound
-                        // existed could persist a select-all map, so a file on disk may
-                        // already hold far more than the cap; a level check would then
-                        // refuse every resize on that file forever, including one that only
-                        // changes the height of a row the map already names. The user has no
-                        // way out either — the webview never sees the durable map, so
-                        // nothing tells them to delete entries, and there is no UI to delete
-                        // them with. Refusing only writes that push the entry *count* higher
-                        // still stops any over-cap map from being created or grown, which is
-                        // all the bound was ever for. `next` only ever adds keys to
-                        // `existing`, so "grew" and "changed count" are the same question.
-                        const next_count = Object.keys(next).length;
+                    // `null` is a reset: the named rows lose their custom height.
+                    const reset = message.height === null;
+                    if (message.height !== null && !Number.isFinite(message.height)) return;
+                    // Clamped before anything durable is touched, so no arithmetic slip in
+                    // the webview can persist a zero- or negative-height row — a row the
+                    // user would then have no visible edge left to drag back.
+                    const height = message.height === null
+                        ? null
+                        : clamp_row_height(message.height);
+                    // Counted from the intervals *before* mapping, which is the only place it
+                    // can usefully be counted: `map_display_rows_to_source` allocates two
+                    // `Uint32Array`s the size of the request, so a select-all on a
+                    // ten-million-row sheet has already cost 80MB by the time a post-mapping
+                    // check could look at it.
+                    let requested_rows = 0;
+                    for (const interval of message.rows) {
                         if (
-                            next_count > MAX_PERSISTED_ROW_HEIGHTS
-                            && next_count > Object.keys(existing ?? {}).length
-                        ) {
-                            refused_at_bound = true;
-                            return current;
+                            !Number.isInteger(interval.start)
+                            || !Number.isInteger(interval.end)
+                            || interval.end < interval.start
+                        ) return;
+                        requested_rows += interval.end - interval.start + 1;
+                    }
+                    // Only reachable from an empty `rows` array: a guard against a
+                    // malformed message, which would otherwise cost a state read and a
+                    // delivery to change nothing.
+                    if (requested_rows === 0) return;
+                    let plan: RowHeightPlan;
+                    if (reset) {
+                        // A reset only removes, so it is not bounded by the cap, and it
+                        // must not pay the mapper's allocation for a select-all: it walks
+                        // the heights the worksheet holds and asks where each row is
+                        // shown. The request's intervals are validated one by one but not
+                        // for order, hence the merge.
+                        const intervals = merged_display_intervals(message.rows);
+                        const reset_core = core;
+                        plan = function* reset_rows(existing) {
+                            for (const key of Object.keys(existing ?? {})) {
+                                const source_row = Number(key);
+                                const display_row = reset_core.display_row_for_source(
+                                    message.sheetIndex,
+                                    source_row,
+                                );
+                                if (
+                                    display_row !== undefined
+                                    && display_intervals_contain(intervals, display_row)
+                                ) yield [source_row, null] as const;
+                            }
+                        };
+                    } else {
+                        if (requested_rows > MAX_PERSISTED_ROW_HEIGHTS) {
+                            show_owner_warning(ROW_HEIGHT_LIMIT_WARNING);
+                            answer = { applied: false, refused: 'limit' };
+                            return;
                         }
-                        rowHeights[message.sheetIndex] = next;
-                        return { ...current, rowHeights };
-                    }, undefined, resize_is_current, {
-                        expectedAuthorityRevision: expected_authority,
-                        expectedPhysicalRevision: expected_physical_revision,
-                        expectedProjectionRevision: expected_projection_revision,
+                        let mapped: Uint32Array;
+                        try {
+                            mapped = core.map_display_rows_to_source(
+                                message.sheetIndex,
+                                message.rows,
+                            );
+                        } catch {
+                            // `map_display_rows_to_source` throws for an interval outside
+                            // the installed view. On a current generation that is a
+                            // malformed request rather than a stale one, and there is
+                            // nothing to write either way.
+                            return;
+                        }
+                        plan = function* resized_rows() {
+                            for (const source_row of mapped) yield [source_row, height] as const;
+                        };
+                    }
+                    /*
+                     * `resize_is_current` is consulted on the way to the durable write —
+                     * before the first await, inside the layout-write tail, inside the
+                     * compare-and-set updater, and as `update_file_state`'s validate hook.
+                     * They are ordered in time, not in logic: each covers a distinct await
+                     * the request has to survive. What they prevent is a display-keyed
+                     * request mapped through a permutation it never saw: a height painted
+                     * on rows the user did not drag.
+                     *
+                     * It is not asked again after the write. A committed write is
+                     * committed whatever moved next (a transform reconciliation can move
+                     * the mapping generation between the commit and here), and the answer
+                     * is what undo history records from.
+                     */
+                    const written = await write_row_heights(
+                        message.sheetIndex,
+                        resize_is_current,
+                        authority.write_basis,
+                        plan,
+                    );
+                    if (written.refused_at_bound) {
+                        // The accumulated map, not this request: the path a person
+                        // reaches by a hundred small resizes. The window cannot predict
+                        // it (it never sees the durable map), so it is said here.
+                        show_owner_warning(ROW_HEIGHT_LIMIT_WARNING);
+                        answer = { applied: false, refused: 'limit' };
+                        return;
+                    }
+                    if (!written.applied) return;
+                    answer = { applied: true, change: { height, before: written.before } };
+                    await deliver_after_size_write(authority);
+                } finally {
+                    // After the delivery, so the answer never overtakes the state it
+                    // reports. Only a receiver that is gone gets none.
+                    if (
+                        message.requestId !== undefined
+                        && !disposed
+                        && session.current_receiver_epoch === authority.receiver_epoch
+                    ) {
+                        void post_to_receiver({
+                            type: 'rowHeightsChanged',
+                            requestId: message.requestId,
+                            sheetIndex: message.sheetIndex,
+                            applied: answer.applied,
+                            sourceGeneration: core?.source_generation
+                                ?? message.sourceGeneration,
+                            ...(answer.change === undefined ? {} : { change: answer.change }),
+                            ...(answer.refused === undefined ? {} : { refused: answer.refused }),
+                        }, authority.receiver_epoch);
+                    }
+                }
+                return;
+            }
+            /**
+             * Set or remove custom row heights by canonical source row: how undo and
+             * redo of a row-height step write.
+             *
+             * `setRowHeights`'s write without its mapping. Source rows do not depend
+             * on the installed permutation, so the generation range is not asked.
+             * The same growth bound applies; refused there, the answer says so and
+             * the host shows no warning of its own, because the window explains what
+             * its undo or redo did.
+             */
+            case 'setSourceRowHeights': {
+                const message = structuredClone(msg);
+                const authority = capture_size_write_authority();
+                let answer: { applied: boolean; refused?: 'limit' | 'unresolved' } = {
+                    applied: false,
+                };
+                const write_is_current = () => size_write_is_current(
+                    authority,
+                    message.sourceGeneration,
+                );
+                try {
+                    if (!core || !source || !write_is_current()) return;
+                    const sheet = source.meta().sheets[message.sheetIndex];
+                    if (!sheet || sheet.name !== message.sheetName) return;
+                    if (unresolved_structural_sheet(message.sheetIndex)) {
+                        answer = { applied: false, refused: 'unresolved' };
+                        return;
+                    }
+                    const runs: SourceRowHeightRun[] = [];
+                    for (const run of message.rows) {
+                        if (
+                            !Number.isInteger(run.start)
+                            || !Number.isInteger(run.end)
+                            || run.start < 0
+                            || run.end < run.start
+                            || run.end >= sheet.sourceRowCount
+                            || (run.height !== null && !Number.isFinite(run.height))
+                        ) return;
+                        runs.push({
+                            start: run.start,
+                            end: run.end,
+                            height: run.height === null ? null : clamp_row_height(run.height),
+                        });
+                    }
+                    if (runs.length === 0) return;
+                    const written = await write_row_heights(
+                        message.sheetIndex,
+                        write_is_current,
+                        authority.write_basis,
+                        function* source_rows() {
+                            for (const run of runs) {
+                                for (let row = run.start; row <= run.end; row += 1) {
+                                    yield [row, run.height] as const;
+                                }
+                            }
+                        },
+                    );
+                    if (written.refused_at_bound) {
+                        answer = { applied: false, refused: 'limit' };
+                        return;
+                    }
+                    if (!written.applied) return;
+                    answer = { applied: true };
+                    await deliver_after_size_write(authority);
+                } finally {
+                    if (!disposed && session.current_receiver_epoch === authority.receiver_epoch) {
+                        void post_to_receiver({
+                            type: 'rowHeightsChanged',
+                            requestId: message.requestId,
+                            sheetIndex: message.sheetIndex,
+                            applied: answer.applied,
+                            sourceGeneration: core?.source_generation
+                                ?? message.sourceGeneration,
+                            ...(answer.refused === undefined ? {} : { refused: answer.refused }),
+                        }, authority.receiver_epoch);
+                    }
+                }
+                return;
+            }
+            /**
+             * Set or remove stored column widths, by source column, on one or more
+             * worksheets in one durable write.
+             *
+             * A width used to travel in `stateChanged`, which has no answer and is
+             * refused whenever a delivery is in flight, after which the next refresh
+             * put the old width back. This names the columns it means, so it needs no
+             * snapshot identity, and it is answered, so undo history records a resize
+             * only when it was written and from what the write actually changed: the
+             * window's own widths can be stale (another window's write is not fanned
+             * out to it).
+             *
+             * All named worksheets or none. Widths are keyed by source column, so a
+             * worksheet an unresolved structural save restructured refuses the write.
+             */
+            case 'setColumnWidths': {
+                const message = structuredClone(msg);
+                const authority = capture_size_write_authority();
+                let answer: {
+                    applied: boolean;
+                    change?: readonly ColumnWidthsSheetChange[];
+                    refused?: 'unresolved';
+                } = { applied: false };
+                const write_is_current = () => size_write_is_current(
+                    authority,
+                    message.sourceGeneration,
+                );
+                try {
+                    if (!core || !source || !write_is_current()) return;
+                    const sheets = source.meta().sheets;
+                    const requested = new Map<number, Map<number, number | null>>();
+                    for (const entry of message.sheets) {
+                        const sheet = sheets[entry.sheetIndex];
+                        if (
+                            !sheet
+                            || sheet.name !== entry.sheetName
+                            || requested.has(entry.sheetIndex)
+                        ) return;
+                        const widths = new Map<number, number | null>();
+                        for (const { column, width } of entry.widths) {
+                            if (
+                                !Number.isInteger(column)
+                                || column < 0
+                                || column >= sheet.columnCount
+                                || (width !== null && !Number.isFinite(width))
+                            ) return;
+                            widths.set(column, width === null ? null : clamp_column_width(width));
+                        }
+                        requested.set(entry.sheetIndex, widths);
+                    }
+                    if (requested.size === 0) return;
+                    if ([...requested.keys()].some(unresolved_structural_sheet)) {
+                        answer = { applied: false, refused: 'unresolved' };
+                        return;
+                    }
+                    // Each is the verdict of the updater's last run.
+                    let unchanged = false;
+                    let change: ColumnWidthsSheetChange[] = [];
+                    const committed = await enqueue_layout_write(async () => {
+                        if (!write_is_current()) return undefined;
+                        return update_file_state((current) => {
+                            if (!write_is_current()) return current;
+                            unchanged = false;
+                            change = [];
+                            const columnWidths = [...(current.columnWidths ?? [])];
+                            for (const [sheet_index, widths] of requested) {
+                                const existing = columnWidths[sheet_index];
+                                const next: Record<number, number> = { ...(existing ?? {}) };
+                                const columns: ColumnWidthChange[] = [];
+                                for (const [column, width] of widths) {
+                                    const prior = Object.prototype.hasOwnProperty.call(next, column)
+                                        ? next[column]
+                                        : null;
+                                    if (prior === width) continue;
+                                    if (width === null) delete next[column];
+                                    else next[column] = width;
+                                    columns.push({ column, before: prior, after: width });
+                                }
+                                if (columns.length === 0) continue;
+                                columns.sort((left, right) => left.column - right.column);
+                                change.push({ sheetIndex: sheet_index, columns });
+                                columnWidths[sheet_index] = Object.keys(next).length === 0
+                                    ? undefined
+                                    : next;
+                            }
+                            if (change.length === 0) {
+                                unchanged = true;
+                                return current;
+                            }
+                            return { ...current, columnWidths };
+                        }, undefined, write_is_current, authority.write_basis);
                     });
-                    if (written || !unchanged_at_current_height) return written;
-                    // The acknowledgement for a no-op success. Read on the same serialized
-                    // tail as the write it stands in for, so the state it answers with
-                    // cannot predate a `persist_layout_state` queued behind it, and read
-                    // rather than reusing the updater's `current` because that is a
-                    // normalized `PerFileState` with no revision — `update_state_snapshot`
-                    // needs the revision to refuse an older read replacing a newer one.
-                    // The read also refreshes the durable-height latch, which is what
-                    // makes the delivered projection the *fresh* one rather than the stale
-                    // one this panel may have been holding.
-                    return resize_is_current() ? await read_file_state(false) : undefined;
-                });
-                if (refused_at_bound) show_owner_warning(ROW_HEIGHT_LIMIT_WARNING);
-                if (committed && resize_is_current()) {
-                    // Queued as its own step on the layout tail rather than delivered
-                    // straight from here, and that is a correctness requirement rather
-                    // than tidiness.
-                    //
-                    // Delivering clears the session's acknowledged identity, and
-                    // `layout_write_is_current` refuses any `stateChanged` whose identity
-                    // no longer matches. A layout change the user makes while this resize
-                    // is in flight — a column resize, a tab switch — arrives as exactly
-                    // such a message and is already queued behind the write above. Left
-                    // here, the delivery ran first and invalidated it: the queued write
-                    // was refused and the snapshot then reinstalled the pre-change layout
-                    // in the webview, so the second action vanished with nothing to notice
-                    // it by. Not a refusal the user could retry past, either, since the
-                    // webview had already been told its change did not happen.
-                    //
-                    // On the tail, those writes run first and are acknowledged normally,
-                    // and the delivery that clears the identity is the last thing to
-                    // happen. State is re-read at that point rather than reusing
-                    // `committed`, which by then may predate them.
-                    await enqueue_layout_write(async () => {
-                        if (!resize_is_current()) return;
-                        const fresh = await read_file_state(false);
-                        if (!fresh || !resize_is_current()) return;
-                        session.update_state_snapshot(
-                            project_state_for_panel(fresh),
-                            { deliver: true },
-                        );
-                    });
-                    settle_resize(true);
-                } else {
-                    settle_resize(false);
+                    if (committed === undefined && !unchanged) return;
+                    answer = { applied: true, change: committed === undefined ? [] : change };
+                    await deliver_after_size_write(authority);
+                } finally {
+                    if (!disposed && session.current_receiver_epoch === authority.receiver_epoch) {
+                        void post_to_receiver({
+                            type: 'columnWidthsChanged',
+                            requestId: message.requestId,
+                            applied: answer.applied,
+                            sourceGeneration: core?.source_generation
+                                ?? message.sourceGeneration,
+                            ...(answer.change === undefined ? {} : { change: answer.change }),
+                            ...(answer.refused === undefined ? {} : { refused: answer.refused }),
+                        }, authority.receiver_epoch);
+                    }
                 }
                 return;
             }

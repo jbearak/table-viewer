@@ -325,7 +325,7 @@ vi.mock('../webview/grid-shell', () => ({
                 'button',
                 {
                     className: 'stub-resize',
-                    onClick: () => props.on_column_resize(2, 222),
+                    onClick: () => props.on_columns_resized([{ column: 2, width: 222 }]),
                 },
                 'resize'
             ),
@@ -408,6 +408,7 @@ vi.mock('../webview/grid-shell', () => ({
                             { start: 8, end: 8 },
                         ],
                         50,
+                        { gesture: true },
                     ),
                 },
                 'row-resize'
@@ -422,6 +423,7 @@ vi.mock('../webview/grid-shell', () => ({
                     onClick: () => props.on_row_resize(
                         [{ start: 0, end: MAX_PERSISTED_ROW_HEIGHTS }],
                         50,
+                        { gesture: true },
                     ),
                 },
                 'row-resize-over-cap'
@@ -20812,7 +20814,7 @@ describe('view steps in history', () => {
             // The commit records its edit and starts a write the window waits for.
             const busy_commit = () => {
                 record_edit();
-                props().on_row_resize([{ start: 1, end: 1 }], 50, () => {});
+                props().on_row_resize([{ start: 1, end: 1 }], 50, { gesture: false, on_result: () => {} });
             };
             grid_shell_mock.commit_live_edit.mockImplementationOnce(busy_commit);
             post_message.mockClear();
@@ -20830,7 +20832,7 @@ describe('view steps in history', () => {
             grid_shell_mock.commit_live_edit.mockImplementationOnce(() => {
                 // Nothing recorded, so the view step is still on top, but a
                 // tracked write is now in flight.
-                props().on_row_resize([{ start: 1, end: 1 }], 50, () => {});
+                props().on_row_resize([{ start: 1, end: 1 }], 50, { gesture: false, on_result: () => {} });
                 resize_started = true;
             });
             post_message.mockClear();

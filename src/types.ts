@@ -437,6 +437,40 @@ export const MAX_PERSISTED_HIDDEN_ROWS = 1_000_000;
  */
 export const MAX_PERSISTED_ROW_HEIGHTS = 10_000;
 
+/** A run of consecutive canonical source rows and one height. `null`: no custom height. */
+export interface SourceRowHeightRun {
+    readonly start: number;
+    readonly end: number;
+    readonly height: number | null;
+}
+
+/** What a row-height write changed: the height it set, and what the changed rows held. */
+export interface RowHeightsChange {
+    readonly height: number | null;
+    /** Ascending, disjoint runs of the source rows whose stored height changed. */
+    readonly before: readonly SourceRowHeightRun[];
+}
+
+/** One source column's stored width before and after a write. `null`: none stored. */
+export interface ColumnWidthChange {
+    readonly column: number;
+    readonly before: number | null;
+    readonly after: number | null;
+}
+
+/** The columns of one worksheet whose stored width a write changed, ascending. */
+export interface ColumnWidthsSheetChange {
+    readonly sheetIndex: number;
+    readonly columns: readonly ColumnWidthChange[];
+}
+
+/** The widths one `setColumnWidths` asks for on one worksheet. */
+export interface ColumnWidthsSheetRequest {
+    readonly sheetIndex: number;
+    readonly sheetName: string;
+    readonly widths: readonly { readonly column: number; readonly width: number | null }[];
+}
+
 export interface SheetColumnVisibilityState {
     /** Canonical visibility stores exactly one side, choosing the smaller list. */
     hiddenColumns?: number[];
@@ -3549,7 +3583,42 @@ export type HostMessage =
      */
     | { type: 'cellHighlightsChanged'; sheetIndex?: number; requestId?: string; stateRevision: number; physicalRevision: number; state: CellHighlightState | undefined; deltas?: readonly HighlightCellDelta[]; sourceGeneration: number; error?: string }
     /** Correlated only for a mixed source/pending resize that must commit atomically. */
-    | { type: 'rowHeightsChanged'; requestId: string; sheetIndex: number; applied: boolean; sourceGeneration: number }
+    /**
+     * The answer to a `setRowHeights` or `setSourceRowHeights` that carried a
+     * request id. `applied` says the durable state holds what was asked,
+     * because of this request or already; it is decided by the write alone,
+     * and nothing after the write changes it.
+     *
+     * `change` (an applied `setRowHeights` only) is what the write changed: the
+     * height it set and, by canonical source row, what each changed row held
+     * before. Only the host knows either. Empty when nothing changed.
+     *
+     * `refused` names a refusal that will not clear by itself: the worksheet
+     * would hold too many custom heights, or it belongs to a structural save
+     * the person has not resolved.
+     */
+    | {
+        type: 'rowHeightsChanged';
+        requestId: string;
+        sheetIndex: number;
+        applied: boolean;
+        sourceGeneration: number;
+        change?: RowHeightsChange;
+        refused?: 'limit' | 'unresolved';
+    }
+    /**
+     * The answer to `setColumnWidths`. `applied` as for `rowHeightsChanged`.
+     * `change` is, per worksheet, the columns whose stored width the write
+     * changed, with what each held before; empty when nothing changed.
+     */
+    | {
+        type: 'columnWidthsChanged';
+        requestId: string;
+        applied: boolean;
+        sourceGeneration: number;
+        change?: readonly ColumnWidthsSheetChange[];
+        refused?: 'unresolved';
+    }
     /**
      * The answer to a `setColumnVisibility` that carried a `requestId`.
      *
@@ -3893,15 +3962,32 @@ export type WebviewMessage =
      * arithmetic slip cannot durably store a zero-height row, and bounded by
      * `MAX_PERSISTED_ROW_HEIGHTS`.
      *
-     * No `requestId`, unlike every other request above it. The others carry one because
-     * something correlates it: an ack the webview has to match against an in-flight
-     * request (`setTransform`, `hideRows`, `setExcelFirstRowHeader`), or a cancellation
-     * (`cancelFilterHistogram`). A resize is acknowledged only by the delivery of a new
-     * projection, which the webview reconciles by *value* — an overlay layer is dropped
-     * when the delivered heights agree with it — so an id here would be a protocol field
-     * nothing on either side reads.
+     * `height: null` is a reset: every named row that has a custom height loses it.
+     * A reset is not bounded by `MAX_PERSISTED_ROW_HEIGHTS`, since it only removes.
+     *
+     * `requestId` asks for an answer (`rowHeightsChanged`). A resize or reset the
+     * person made sends one: the answer says which source rows changed and what
+     * they held, which is the gesture's step in undo history. The row a committed
+     * multi-line edit grows sends none and is answered only by the delivery.
      */
-    | { type: 'setRowHeights'; sheetIndex: number; rows: DisplayRowInterval[]; height: number; generation: number; sourceGeneration: number; requestId?: string }
+    | { type: 'setRowHeights'; sheetIndex: number; rows: DisplayRowInterval[]; height: number | null; generation: number; sourceGeneration: number; requestId?: string }
+    /**
+     * Set or remove custom heights by canonical source row: how undo and redo
+     * of a row-height step write. Source rows do not depend on the installed
+     * permutation, so there is no `generation`. `height: null` removes a row's
+     * custom height. Answered by `rowHeightsChanged`.
+     */
+    | { type: 'setSourceRowHeights'; requestId: string; sheetIndex: number; sheetName: string; sourceGeneration: number; rows: readonly SourceRowHeightRun[] }
+    /**
+     * Set or remove stored column widths, by source column, on one or more
+     * worksheets in one write. `width: null` removes a column's stored width.
+     *
+     * Explicit entries, so it names no snapshot identity: there is no whole
+     * state for the host to diff against what the window had acknowledged,
+     * and a delivery in flight does not refuse a resize. Answered by
+     * `columnWidthsChanged`.
+     */
+    | { type: 'setColumnWidths'; requestId: string; sourceGeneration: number; sheets: readonly ColumnWidthsSheetRequest[] }
     /**
      * `requestId` asks for an answer (`columnVisibilityChanged`). A sender that
      * records the change in undo history, or moves history on it, sends one:

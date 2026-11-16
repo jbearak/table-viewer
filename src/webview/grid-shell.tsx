@@ -91,6 +91,7 @@ import {
     build_layout_grid_columns,
     clamp_column_width,
     column_letter,
+    DEFAULT_COLUMN_WIDTH_PX,
     LAST_COLUMN_RESIZE_GUTTER_PX,
     MAX_AUTO_FIT_COLUMN_WIDTH_PX,
     MAX_COLUMN_WIDTH_PX,
@@ -305,6 +306,7 @@ import {
     default_row_height_for_font,
     line_height_for_font,
     natural_row_height,
+    display_rows_have_custom_height,
     resolved_row_height,
     type RowHeightLayer,
     type RowHeightOverrides,
@@ -1507,7 +1509,21 @@ export interface GridShellProps {
     column_projection: ColumnProjection;
     /** Persisted widths keyed by canonical source column. */
     column_widths: Record<number, number>;
-    on_column_resize: (col: number, width: number) => void;
+    /**
+     * A finished column-width gesture: every source column it left at another
+     * width than it showed, once. A border drag (with the columns Glide fans
+     * it out to) or a double-click fit. Nothing is reported while a border is
+     * dragged: the widths are drafts drawn here until the press ends.
+     */
+    on_columns_resized: (
+        changes: readonly { readonly column: number; readonly width: number }[],
+    ) => void;
+    /**
+     * Whether a resize the person just finished may be written now. App folds
+     * the open cell editor first and says why when it may not. Asked before
+     * the gesture stages or stores anything; absent means always.
+     */
+    size_gesture_may_start?: () => boolean;
     /**
      * Heights keyed by *display* row: the host's projection of the durable
      * source-keyed map into the coordinate space of the view currently installed. So
@@ -1530,8 +1546,16 @@ export interface GridShellProps {
      */
     on_row_resize: (
         rows: readonly DisplayRowInterval[],
-        height: number,
-        on_result?: (applied: boolean) => void,
+        /** `null` resets the rows: each loses its custom height. */
+        height: number | null,
+        options: {
+            /**
+             * A resize or reset the person made, which becomes a step in undo
+             * history. False for the row a committed multi-line edit grows.
+             */
+            readonly gesture: boolean;
+            readonly on_result?: (applied: boolean) => void;
+        },
     ) => void;
     merges: MergeRange[];
     preview_mode?: boolean;
@@ -1800,7 +1824,8 @@ export function GridShell({
     auto_fit_active = false,
     column_projection: base_column_projection,
     column_widths,
-    on_column_resize,
+    on_columns_resized,
+    size_gesture_may_start,
     row_heights,
     row_height_overlay,
     on_row_resize,
@@ -2576,10 +2601,19 @@ export function GridShell({
     }, [history_capture]);
     const apply_row_resize = useCallback((
         intervals: readonly DisplayRowInterval[],
-        height: number,
-        _record_history = true,
+        /** `null` resets the saved rows; Pending Rows keep their height. */
+        height: number | null,
+        source: 'gesture' | 'auto-grow',
     ) => {
-        if (gestures_admitted !== undefined && !gestures_admitted()) return;
+        // A gesture asks App, which folds the open editor first, before
+        // anything below is staged: a fold that commits a cell of a Pending
+        // Row would otherwise invalidate the reservation, or be refused
+        // against it, and the gesture would land half. The row an edit grows
+        // is part of that edit's commit and asks the edit gate.
+        if (source === 'gesture') {
+            if (size_gesture_may_start !== undefined && !size_gesture_may_start()) return;
+        } else if (gestures_admitted !== undefined && !gestures_admitted()) return;
+        const gesture = source === 'gesture';
         const projection = pending_projection_ref.current;
         const compressed_source_intervals: DisplayRowInterval[] = [];
         const pending_ids = new Set<string>();
@@ -2613,8 +2647,8 @@ export function GridShell({
         const source_intervals = projection.source_display_intervals(
             compressed_source_intervals,
         );
-        if (pending_ids.size === 0) {
-            if (source_intervals.length > 0) on_row_resize(source_intervals, height);
+        if (pending_ids.size === 0 || height === null) {
+            if (source_intervals.length > 0) on_row_resize(source_intervals, height, { gesture });
             return;
         }
         const before = pending_store.snapshot();
@@ -2640,7 +2674,7 @@ export function GridShell({
             pending_stage.notify();
         };
         if (source_intervals.length > 0) {
-            on_row_resize(source_intervals, height, finish);
+            on_row_resize(source_intervals, height, { gesture, on_result: finish });
         } else {
             finish(true);
         }
@@ -2650,6 +2684,7 @@ export function GridShell({
         on_row_resize,
         pending_store,
         show_pending_size_warning,
+        size_gesture_may_start,
     ]);
     const has_row_layout = pending_rows.rowLayout !== undefined;
     /**
@@ -3037,6 +3072,39 @@ export function GridShell({
     ]);
     const [pending_column_width_drafts, set_pending_column_width_drafts] =
         useState<ReadonlyMap<string, number>>(() => new Map());
+    /**
+     * The column-width gesture in progress: a border press and what it has
+     * resized so far, or a fit.
+     *
+     * A ref, read synchronously. Glide makes the last fanned-out resize calls
+     * and the first end call in one event handler, before React has flushed
+     * anything, so state would hand the end call the widths of the render
+     * before. The drafts are drawn through the revision counter below.
+     */
+    interface ColumnResizeGesture {
+        /**
+         * The pressed border: its column and the width that column had.
+         * Absent for a resize that arrives with no press open, which is a
+         * fit (Glide makes one on a double-click, after the press has ended).
+         */
+        readonly press?: { readonly display_column: number; readonly start_width: number };
+        /** Whether the pressed column itself was resized to another width. */
+        moved: boolean;
+        /** Draft widths by source column. */
+        readonly source: Map<number, number>;
+        /** Draft widths by Pending Column ID. */
+        readonly pending: Map<string, number>;
+    }
+    const column_resize_ref = useRef<ColumnResizeGesture | null>(null);
+    const [source_column_draft_revision, set_source_column_draft_revision] = useState(0);
+    const shown_column_widths = useMemo(() => {
+        const drafts = column_resize_ref.current?.source;
+        if (drafts === undefined || drafts.size === 0) return column_widths;
+        const out: Record<number, number> = { ...column_widths };
+        for (const [column, width] of drafts) out[column] = width;
+        return out;
+        // The revision stands for the ref's contents.
+    }, [column_widths, source_column_draft_revision]);
     const pending_columns_by_id = useMemo(
         () => new Map((pending_rows.pendingColumns ?? []).map((column) => [column.id, column])),
         [pending_rows.pendingColumns],
@@ -3140,7 +3208,7 @@ export function GridShell({
         () => {
             const built = build_layout_grid_columns(
                 projected_columns,
-                column_widths,
+                shown_column_widths,
                 effective_column_names,
                 pending_column_headers,
                 (column) => {
@@ -3166,7 +3234,7 @@ export function GridShell({
             projected_columns,
             column_layout_index,
             pending_column_headers,
-            column_widths,
+            shown_column_widths,
             effective_column_names,
             compare_changed_column_names,
         ],
@@ -7448,14 +7516,14 @@ export function GridShell({
         display_row: number,
         text: string,
         display_column?: number,
-        record_history = true,
     ): boolean => {
         const height = planned_auto_grow_height(display_row, text, display_column);
         if (height === undefined) return false;
+        // Not a resize the person made: no step in undo history.
         apply_row_resize(
             [{ start: display_row, end: display_row }],
             height,
-            record_history,
+            'auto-grow',
         );
         return true;
     }, [
@@ -9550,7 +9618,6 @@ export function GridShell({
                     request.row,
                     request.text,
                     request.displayColumn,
-                    false,
                 )) grown_rows.add(request.row);
             }
 
@@ -10176,7 +10243,7 @@ export function GridShell({
                 pending_projection_ref.current.rowCount,
             )
             : null;
-        apply_row_resize(selected ?? [{ start: row, end: row }], height);
+        apply_row_resize(selected ?? [{ start: row, end: row }], height, 'gesture');
     }, [apply_row_resize]);
 
     // Armed by a header mousedown (Glide selects the column and reports it via
@@ -11660,49 +11727,120 @@ export function GridShell({
         merged_ranges,
     ]);
 
+    /**
+     * A press on a column border. Glide reports one on every mouse-down
+     * there, whether or not the border is then dragged.
+     */
+    const handle_column_resize_start = useCallback(
+        (_column: GridColumn, size: number, display_column: number) => {
+            column_resize_ref.current = {
+                press: { display_column, start_width: size },
+                moved: false,
+                source: new Map(),
+                pending: new Map(),
+            };
+        },
+        [],
+    );
+    /**
+     * A column's width while a border is dragged, or a fit's result. Drawn at
+     * once and stored nowhere until the gesture ends.
+     */
     const handle_column_resize = useCallback(
         (_column: GridColumn, new_size: number, display_column: number) => {
+            let gesture = column_resize_ref.current;
+            if (gesture === null) {
+                gesture = { moved: false, source: new Map(), pending: new Map() };
+                column_resize_ref.current = gesture;
+            }
+            if (
+                gesture.press !== undefined
+                && gesture.press.display_column === display_column
+                && new_size !== gesture.press.start_width
+            ) gesture.moved = true;
             const source_column = source_column_for_display(display_column);
             if (source_column !== undefined) {
-                on_column_resize(source_column, new_size);
+                if (gesture.source.get(source_column) === new_size) return;
+                gesture.source.set(source_column, new_size);
+                set_source_column_draft_revision((revision) => revision + 1);
                 return;
             }
             // A Pending Column carries its own width: shown live while the
             // drag runs, stored once it ends.
             const identity = projected_columns[display_column]?.identity;
             if (identity?.kind !== 'pending') return;
+            gesture.pending.set(identity.pendingColumnId, new_size);
             set_pending_column_width_drafts((current) =>
                 current.get(identity.pendingColumnId) === new_size
                     ? current
                     : new Map(current).set(identity.pendingColumnId, new_size));
         },
-        [on_column_resize, projected_columns, source_column_for_display],
+        [projected_columns, source_column_for_display],
     );
+    /**
+     * The end of a column-width gesture: one commit, with every column it
+     * resized.
+     *
+     * Glide calls this once per selected column, the pressed one first, after
+     * it has made every resize call of the gesture; the first call takes the
+     * whole gesture and the rest find none open.
+     *
+     * A press that did not move the pressed column is not a gesture. Glide
+     * ends a resize on every mouse-up on a border and, when the border is
+     * inside a column selection, first fans the pressed column's own width
+     * out to the other selected columns; committing that would make a plain
+     * click set the whole selection to one width.
+     */
     const handle_column_resize_end = useCallback(
-        (_column: GridColumn, new_size: number, display_column: number) => {
-            const identity = projected_columns[display_column]?.identity;
-            if (identity?.kind !== 'pending') return;
-            set_pending_column_width_drafts((current) => {
-                if (!current.has(identity.pendingColumnId)) return current;
-                const next = new Map(current);
-                next.delete(identity.pendingColumnId);
-                return next;
-            });
-            // View state, like a Pending Row's height: stored without a history entry.
+        () => {
+            const gesture = column_resize_ref.current;
+            if (gesture === null) return;
+            column_resize_ref.current = null;
+            if (gesture.source.size > 0) {
+                set_source_column_draft_revision((revision) => revision + 1);
+            }
+            if (gesture.pending.size > 0) {
+                set_pending_column_width_drafts((current) => current.size === 0 ? current : new Map());
+            }
+            if (gesture.press !== undefined && !gesture.moved) return;
+            const source_changes: { column: number; width: number }[] = [];
+            for (const [column, draft] of gesture.source) {
+                const width = clamp_column_width(draft);
+                const shown = clamp_column_width(column_widths[column] ?? DEFAULT_COLUMN_WIDTH_PX);
+                if (width !== shown) source_changes.push({ column, width });
+            }
+            source_changes.sort((left, right) => left.column - right.column);
             const before = pending_store.snapshot();
-            const columns = before.pendingColumns ?? [];
-            if (!columns.some((column) => column.id === identity.pendingColumnId)) return;
-            const staged = pending_store.stage_replace(edit_session_id, before, {
-                ...before,
-                pendingColumns: columns.map((column) => column.id === identity.pendingColumnId
-                    ? { ...column, viewerWidth: clamp_column_width(new_size) }
-                    : column),
-            });
-            if (staged === undefined || !staged.valid()) return;
-            staged.commit();
-            staged.notify();
+            const pending_columns = before.pendingColumns ?? [];
+            const pending_changes = new Map<string, number>();
+            for (const [id, draft] of gesture.pending) {
+                const column = pending_columns.find((candidate) => candidate.id === id);
+                const width = clamp_column_width(draft);
+                if (column !== undefined && column.viewerWidth !== width) pending_changes.set(id, width);
+            }
+            if (source_changes.length === 0 && pending_changes.size === 0) return;
+            // Asked once for the whole gesture, before anything is stored.
+            if (size_gesture_may_start !== undefined && !size_gesture_may_start()) return;
+            if (pending_changes.size > 0) {
+                // View state, like a Pending Row's height: stored without a
+                // history entry, and not tied to the saved columns' write.
+                // Read again: admission may have committed an open editor.
+                const current = pending_store.snapshot();
+                const staged = pending_store.stage_replace(edit_session_id, current, {
+                    ...current,
+                    pendingColumns: (current.pendingColumns ?? []).map((column) => {
+                        const width = pending_changes.get(column.id);
+                        return width === undefined ? column : { ...column, viewerWidth: width };
+                    }),
+                });
+                if (staged !== undefined && staged.valid()) {
+                    staged.commit();
+                    staged.notify();
+                }
+            }
+            if (source_changes.length > 0) on_columns_resized(source_changes);
         },
-        [edit_session_id, pending_store, projected_columns],
+        [column_widths, edit_session_id, on_columns_resized, pending_store, size_gesture_may_start],
     );
 
     /**
@@ -12100,6 +12238,7 @@ export function GridShell({
                 onHeaderClicked={focus_header_column}
                 onHeaderContextMenu={on_header_context_menu}
                 onVisibleRegionChanged={on_visible_region_changed}
+                onColumnResizeStart={handle_column_resize_start}
                 onColumnResize={handle_column_resize}
                 onColumnResizeEnd={handle_column_resize_end}
                 onItemHovered={on_item_hovered}
@@ -12321,6 +12460,26 @@ export function GridShell({
                                 || transform_pending
                                 || promote_row_to_header_waits,
                             on_hide_rows: () => on_hide_rows(row_menu.source_display_rows),
+                            // Offered when a saved row of the selection shows a
+                            // custom height. Pending Rows keep theirs.
+                            ...(row_menu.source_display_rows.some((interval) =>
+                                display_rows_have_custom_height(
+                                    row_heights,
+                                    row_height_overlay,
+                                    interval,
+                                ))
+                                ? {
+                                    reset_row_count: row_menu.source_display_rows.reduce(
+                                        (count, interval) => count + interval.end - interval.start + 1,
+                                        0,
+                                    ),
+                                    on_reset_row_heights: () => apply_row_resize(
+                                        row_menu.source_display_rows,
+                                        null,
+                                        'gesture',
+                                    ),
+                                }
+                                : {}),
                             ...(only_pending ? {
                                 pending_row_count: selected_pending_ids.size,
                                 on_remove_pending_rows: () => {
