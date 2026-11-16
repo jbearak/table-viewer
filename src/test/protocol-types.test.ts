@@ -1,9 +1,9 @@
 import { readdirSync, readFileSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import { describe, it, expect } from 'vitest';
-import type { HostMessage, WebviewMessage } from '../types';
+import { excel_header_target_request_valid, type HostMessage, type WebviewMessage } from '../types';
 import type { WorkbookMeta, RenderedCell } from '../data-source/interface';
-import type { RetainedSnapshotCommandResult } from '../viewer-snapshot';
+import type { ExcelHeaderSnapshotResult, RetainedSnapshotCommandResult } from '../viewer-snapshot';
 
 function protocol_sources(directory: string): string[] {
     return readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
@@ -415,6 +415,60 @@ describe('paginated protocol message shapes', () => {
         expect(request.headerRow).toBe(4);
         expect(visibility.type).toBe('setColumnVisibility');
         expect(visibility.snapshotIdentity.deliveryId).toBe(12);
+    });
+
+    it("carries a header step's replay as a target by source row, and the write's change back", () => {
+        const request: WebviewMessage = {
+            type: 'setExcelFirstRowHeader',
+            sheetIndex: 1,
+            sheetName: 'People',
+            enabled: true,
+            target: { mode: 'on', headerSourceRow: 3, hideRows: [0, 1, 2], showRows: [] },
+            requestId: 'header:2',
+            generation: 2,
+            sourceGeneration: 3,
+        };
+        expect(request.target?.headerSourceRow).toBe(3);
+        const valid = (partial: Record<string, unknown>) => excel_header_target_request_valid({
+            enabled: true,
+            target: { mode: 'on', headerSourceRow: 3 },
+            ...partial,
+        } as Parameters<typeof excel_header_target_request_valid>[0]);
+        expect(valid({})).toBe(true);
+        expect(valid({ target: { mode: 'on', headerSourceRow: null, hideRows: [0, 0, 1] } })).toBe(true);
+        expect(valid({ enabled: false, target: { mode: 'auto', hideRows: [], showRows: [2] } })).toBe(true);
+        expect(valid({ enabled: false, target: { mode: 'off' } })).toBe(true);
+        // A target replaces the gesture's fields, and `enabled` restates its mode.
+        expect(valid({ unhideAll: true })).toBe(false);
+        expect(valid({ headerRow: 2 })).toBe(false);
+        expect(valid({ enabled: false })).toBe(false);
+        expect(valid({ enabled: true, target: { mode: 'off' } })).toBe(false);
+        expect(valid({ target: { mode: 'sometimes', headerSourceRow: 0 } })).toBe(false);
+        // A source row goes with 'on', and only with it.
+        expect(valid({ target: { mode: 'on' } })).toBe(false);
+        expect(valid({ target: { mode: 'on', headerSourceRow: -1 } })).toBe(false);
+        expect(valid({ target: { mode: 'on', headerSourceRow: 1.5 } })).toBe(false);
+        expect(valid({ enabled: false, target: { mode: 'off', headerSourceRow: 0 } })).toBe(false);
+        expect(valid({ enabled: false, target: { mode: 'auto', headerSourceRow: null } })).toBe(false);
+        // Rows: non-negative integers, and no row in both lists.
+        expect(valid({ target: { mode: 'on', headerSourceRow: 3, hideRows: [1, -2] } })).toBe(false);
+        expect(valid({ target: { mode: 'on', headerSourceRow: 3, hideRows: 'all' } })).toBe(false);
+        expect(valid({ target: { mode: 'on', headerSourceRow: 3, hideRows: [1], showRows: [1] } }))
+            .toBe(false);
+        expect(valid({ target: null })).toBe(false);
+
+        const result: ExcelHeaderSnapshotResult = {
+            type: 'excelFirstRowHeader',
+            requestId: 'header:2',
+            outcome: 'applied',
+            change: {
+                before: { mode: 'auto', row: 0 },
+                after: { mode: 'on', row: 3 },
+                hidden: [0, 1, 2],
+                shown: [],
+            },
+        };
+        expect(result.change?.after.row).toBe(3);
     });
 
     it('rejects setColumnVisibility without a snapshot identity at compile time', () => {
