@@ -9210,6 +9210,89 @@ describe('CSV edit sessions', () => {
         expect(warning).not.toHaveBeenCalledWith('Wait for sorting and filtering to finish before editing.');
     });
 
+    it('waits for a restore still computing when a snapshot at an install\'s generation moves the renderer', async () => {
+        // An install the renderer may have ignored (its request was replaced)
+        // moves the core's generation without moving the renderer; the next
+        // snapshot at that generation does move it, and it drops its pending
+        // transforms. A restore still computing elsewhere is then waited out.
+        const warning = vi.spyOn(vscode_mock.window, 'showWarningMessage');
+        class TwoSheetGatedSource extends TrackingTransformSource {
+            readonly entered = deferred();
+            readonly gate = deferred();
+            private gating = true;
+            override meta(): WorkbookMeta {
+                const sheet = super.meta().sheets[0]!;
+                return { hasFormatting: false, sheets: [sheet, { ...sheet, name: 'Sheet2' }] };
+            }
+            async read_raw_columns_async(
+                sheet_index: number,
+                start_row: number,
+                count: number,
+                column_indices: readonly number[],
+            ): Promise<RawColumnWindow> {
+                if (this.gating && sheet_index === 0) {
+                    this.gating = false;
+                    this.entered.resolve();
+                    await this.gate.promise;
+                }
+                const plain: DataSource = {
+                    meta: () => this.meta(),
+                    read_rows: (sheet, start, rows) => this.read_rows(sheet, start, rows),
+                    close: () => undefined,
+                } as DataSource;
+                return read_source_raw_columns_async(plain, sheet_index, start_row, count, column_indices, () => false);
+            }
+        }
+        const source = new TwoSheetGatedSource();
+        const panel = open_csv_table(
+            uri('/tmp/session-after-ignored-install.csv'),
+            state_store().store,
+            { ...csv_table_profile(), build_source: async () => source },
+        );
+        await panel.__receive({ type: 'ready' });
+        const snapshot = latest_snapshot(panel);
+        const sort = (sheet_index: number, name: string, intent: 'restore' | 'user') => panel.__receive({
+            type: 'setTransform',
+            sheetIndex: sheet_index,
+            requestId: `sort-${sheet_index}`,
+            state: { sort: [{ colIndex: 0, direction: 'asc' }], filters: [], schema: `["${name}",1,null]` },
+            generation: snapshot.generation,
+            sourceGeneration: snapshot.sourceGeneration,
+            intent,
+        } as never);
+        const generations = () => panel.__messages.flatMap((message) => (
+            (message as { type?: string }).type === 'workbookSnapshot'
+                ? [(message as { snapshot: WorkbookSnapshot }).snapshot.generation]
+                : []
+        ));
+
+        const first = sort(0, 'Sheet1', 'restore');
+        await source.entered.promise;
+        await sort(1, 'Sheet2', 'user');
+        const before = generations().length;
+        await panel.__receive({
+            type: 'setColumnWidths',
+            requestId: 'widths',
+            sourceGeneration: snapshot.sourceGeneration,
+            sheets: [{ sheetIndex: 1, sheetName: 'Sheet2', widths: [{ column: 0, width: 140 }] }],
+        } as never);
+        await flush_promises();
+        // The install moved the core to a new generation, and a snapshot at
+        // that generation followed it.
+        expect(generations().slice(before)).toEqual([snapshot.generation + 1]);
+
+        const request = panel.__receive({ type: 'requestEditSession' } as never);
+        await flush_promises();
+        expect(edit_session_results(panel)).toEqual([]);
+        source.gate.resolve();
+        await first;
+        await request;
+        expect(edit_session_results(panel)).toEqual([
+            expect.objectContaining({ type: 'editSessionResult', granted: true }),
+        ]);
+        expect(warning).not.toHaveBeenCalledWith('Wait for sorting and filtering to finish before editing.');
+    });
+
     it('refuses a quiet request without announcing it', async () => {
         const warning = vi.spyOn(vscode_mock.window, 'showWarningMessage');
         const panel = open_csv_table(uri('/tmp/session.csv'), state_store().store);
