@@ -9693,12 +9693,17 @@ export function App(): React.JSX.Element {
         if (!quiet && pending_edit_request_ref.current === null) {
             const document = history_document_ref.current;
             const generation = generation_ref.current;
+            const sheet = active_sheet_index_for_focus_ref.current;
             const deadline = Date.now() + HISTORY_PRESS_HOLD_MS;
             const restoring = (sheet_index: number) => pending_transform_origins_ref.current[sheet_index] === 'restore';
             for (;;) {
                 const wait = next_window_transform_wait(restoring, deadline, document);
                 if (wait === 'clear' || wait === 'past-bound') break;
                 if (await wait === 'replaced') return false;
+                // The person moved to another sheet meanwhile: the grid that
+                // held the gesture is gone, and the gesture with it. Nothing is
+                // said; they left it.
+                if (active_sheet_index_for_focus_ref.current !== sheet) return false;
                 if (held()) return true;
             }
             // A restore that moved the view remounted the grid that holds the

@@ -11,7 +11,8 @@ import {
 } from '../state';
 import { create_memento_file_state_store } from './helpers/memento-file-state';
 import type { HostMessage, PerFileState, SheetViewRecord } from '../types';
-import type { DataSource, RowWindow, WorkbookMeta } from '../data-source/interface';
+import type { DataSource, RawColumnWindow, RowWindow, WorkbookMeta } from '../data-source/interface';
+import { read_source_raw_columns_async } from '../data-source/interface';
 import { versioned_state_store } from './helpers/versioned-state-store';
 import * as vscode_mock from './mocks/vscode';
 import { fake_viewer_host } from './mocks/host-ports';
@@ -9051,6 +9052,79 @@ describe('CSV edit sessions', () => {
         commit_gate.resolve();
         await sort;
         await reloaded;
+        await request;
+        expect(edit_session_results(panel)).toEqual([
+            expect.objectContaining({ type: 'editSessionResult', granted: true }),
+        ]);
+        expect(warning).not.toHaveBeenCalledWith('Wait for sorting and filtering to finish before editing.');
+    });
+
+    it('waits for a restore a Cancel superseded mid-computation, once the Cancel is answered', async () => {
+        const warning = vi.spyOn(vscode_mock.window, 'showWarningMessage');
+        // A source whose first column read for a transform is held: the
+        // restore is computing, unanswered, while the Cancel runs.
+        class GatedTransformSource extends TrackingTransformSource {
+            readonly entered = deferred();
+            readonly gate = deferred();
+            private gating = true;
+            async read_raw_columns_async(
+                sheet_index: number,
+                start_row: number,
+                count: number,
+                column_indices: readonly number[],
+            ): Promise<RawColumnWindow> {
+                if (this.gating) {
+                    this.gating = false;
+                    this.entered.resolve();
+                    await this.gate.promise;
+                }
+                // Read the way a source without the async reader is read.
+                const plain: DataSource = {
+                    meta: () => this.meta(),
+                    read_rows: (sheet, start, rows) => this.read_rows(sheet, start, rows),
+                    close: () => undefined,
+                } as DataSource;
+                return read_source_raw_columns_async(plain, sheet_index, start_row, count, column_indices, () => false);
+            }
+        }
+        const source = new GatedTransformSource();
+        const panel = open_csv_table(uri('/tmp/session-after-cancel-mid-compute.csv'), state_store().store, {
+            ...csv_table_profile(),
+            build_source: async () => source,
+        });
+        await panel.__receive({ type: 'ready' });
+        const snapshot = latest_snapshot(panel);
+        const answered = (id: string) => panel.__messages.some((message) => (
+            typeof message === 'object' && message !== null
+            && ['transformInstalled', 'transformRefused'].includes((message as { type?: string }).type ?? '')
+            && (message as { requestId?: string }).requestId === id
+        ));
+        const transform = (request_id: string, intent: 'restore' | 'cancel', sort: boolean) => panel.__receive({
+            type: 'setTransform',
+            sheetIndex: 0,
+            requestId: request_id,
+            state: {
+                sort: sort ? [{ colIndex: 0, direction: 'asc' }] : [],
+                filters: [],
+                schema: '["Sheet1",1,null]',
+            },
+            generation: snapshot.generation,
+            sourceGeneration: snapshot.sourceGeneration,
+            intent,
+        } as never);
+
+        const restore = transform('restore', 'restore', true);
+        await source.entered.promise;
+        const cancel = transform('cancel', 'cancel', false);
+        await vi.waitUntil(() => answered('cancel'));
+        expect(answered('restore')).toBe(false);
+
+        const request = panel.__receive({ type: 'requestEditSession' } as never);
+        await flush_promises();
+        expect(edit_session_results(panel)).toEqual([]);
+        source.gate.resolve();
+        await restore;
+        await cancel;
         await request;
         expect(edit_session_results(panel)).toEqual([
             expect.objectContaining({ type: 'editSessionResult', granted: true }),
