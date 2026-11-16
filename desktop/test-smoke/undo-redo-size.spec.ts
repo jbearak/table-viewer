@@ -310,8 +310,8 @@ async function drag_row_border(page: Page, shown: Layout, line: number, dy: numb
     const box = await canvas_box(page);
     const x = box.x + left_of(shown, 0) + 40;
     const y = box.y + top_of(shown, line) + shown.heights[line] - 2;
-    // Crossing the border is what offers the drag: the grid looks for a
-    // border when the pointer enters a cell.
+    // Onto the border from the row below it. "a row border reached from
+    // inside its own cell" comes at it the other way.
     await page.mouse.move(x, y + 12);
     await page.mouse.move(x, y);
     await expect(page.locator('.row-resize-strip')).toBeVisible();

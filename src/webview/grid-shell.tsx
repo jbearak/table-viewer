@@ -10115,8 +10115,47 @@ export function GridShell({
     }, [ensure_edit_session, notify_session_idle, open_held_edits]);
 
     // Arm/clear the row-resize strip as the pointer nears a row border. Glide's
-    // hover args give the cell's client `bounds` + in-cell `localEventY`.
-    // Also drives the truncated-cell tooltip: dwell on an overflowing cell
+    // mouse args give the cell's client `bounds` + in-cell `localEventY`.
+    //
+    // No `transformed` bail any more; the prop it read is gone with it. Arming
+    // the strip was suppressed under a permutation only because the resize it
+    // leads to used to persist a display-keyed height; the resize now names
+    // display intervals the host maps, so there is nothing left for a
+    // permutation to mis-key.
+    const arm_row_resize_strip = useCallback((args: GridMouseEventArgs) => {
+        if (args.kind !== 'cell') {
+            row_resize_ref.current?.set_target(null);
+            return;
+        }
+        // Physical geometry, not the merge-canonicalized location/bounds:
+        // inside a vertical merge the event reports the anchor row and the
+        // block's full bounds, but the boundary under the pointer belongs to
+        // the physical row — dragging a merge's bottom edge must resize its
+        // last row, and interior boundaries must stay reachable.
+        const row = (args.physicalLocation ?? args.location)[1];
+        const bounds = args.physicalBounds ?? args.bounds;
+        const hit = row_boundary_hit(
+            row,
+            bounds.y,
+            bounds.height,
+            // localEventY is relative to the canonicalized bounds; rebase it
+            // onto the physical cell.
+            args.localEventY + args.bounds.y - bounds.y,
+            ROW_RESIZE_TOLERANCE_PX,
+        );
+        row_resize_ref.current?.set_target(
+            hit
+                ? {
+                      row: hit.row,
+                      boundary_y: hit.boundary_y,
+                      height: effective_row_height(hit.row, false),
+                  }
+                : null,
+        );
+    }, [effective_row_height]);
+
+    // The hover half of the row-resize strip (see `on_mouse_move` for the
+    // other), and the truncated-cell tooltip: dwell on an overflowing cell
     // surfaces the full displayed value without changing selection or editing state.
     const on_item_hovered = useCallback(
         (args: GridMouseEventArgs) => {
@@ -10184,44 +10223,11 @@ export function GridShell({
                     args.bounds,
                 );
             }
-            // No `transformed` bail here any more; the prop it read is gone with it.
-            // Arming the strip was suppressed
-            // under a permutation only because the resize it leads to used to persist a
-            // display-keyed height; the resize now names display intervals the host
-            // maps, so there is nothing left for a permutation to mis-key.
-            if (args.kind !== 'cell') {
-                row_resize_ref.current?.set_target(null);
-                return;
-            }
-            // Physical geometry, not the merge-canonicalized location/bounds:
-            // inside a vertical merge the event reports the anchor row and the
-            // block's full bounds, but the boundary under the pointer belongs to
-            // the physical row — dragging a merge's bottom edge must resize its
-            // last row, and interior boundaries must stay reachable.
-            const row = (args.physicalLocation ?? args.location)[1];
-            const bounds = args.physicalBounds ?? args.bounds;
-            const hit = row_boundary_hit(
-                row,
-                bounds.y,
-                bounds.height,
-                // localEventY is relative to the canonicalized bounds; rebase it
-                // onto the physical cell.
-                args.localEventY + args.bounds.y - bounds.y,
-                ROW_RESIZE_TOLERANCE_PX,
-            );
-            row_resize_ref.current?.set_target(
-                hit
-                    ? {
-                          row: hit.row,
-                          boundary_y: hit.boundary_y,
-                          height: effective_row_height(hit.row, false),
-                      }
-                    : null,
-            );
+            arm_row_resize_strip(args);
         },
         [
+            arm_row_resize_strip,
             display_column_count,
-            effective_row_height,
             hide_cell_tooltip,
             row_markers,
             schedule_cell_tooltip,
@@ -10229,6 +10235,15 @@ export function GridShell({
             write_grid_selection,
         ],
     );
+
+    // Glide reports a hover only when the pointer changes cell, so a pointer
+    // that reaches a row border from inside the cell it is already over is
+    // seen only here. Not while a button is down: a drag owns the pointer
+    // then, and the hover handler above decides what it arms.
+    const on_mouse_move = useCallback((args: GridMouseEventArgs) => {
+        if (args.buttons !== 0) return;
+        arm_row_resize_strip(args);
+    }, [arm_row_resize_strip]);
 
     // Snapshot the compact row selection once. Live moves retain that compact
     // representation so even select-all previews stay bounded to the viewport;
@@ -12323,6 +12338,7 @@ export function GridShell({
                 onColumnResize={handle_column_resize}
                 onColumnResizeEnd={handle_column_resize_end}
                 onItemHovered={on_item_hovered}
+                onMouseMove={on_mouse_move}
                 onCellsEdited={on_cells_edited}
                 onPaste={editable_cells
                     ? on_append_rows === undefined ? true : allow_rectangular_paste

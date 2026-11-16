@@ -4198,6 +4198,43 @@ describe('GridShell column projection', () => {
         }).current?.cell).toEqual([1, 3]);
     });
 
+    it('offers the row-resize strip when the pointer reaches a row border from inside the same cell', async () => {
+        await render_grid(props({ row_count: 10 }));
+        const on_mouse_move = grid_mock.props!.onMouseMove as
+            (args: Record<string, unknown>) => void;
+        // Glide reports a hover when the pointer changes cell and a move every
+        // time it moves. Row 1's cell, 24 px tall, with its top at y = 60.
+        const over_row_one = (local_event_y: number, buttons = 0) => ({
+            kind: 'cell', location: [0, 1], buttons,
+            bounds: { x: 30, y: 60, width: 100, height: 24 },
+            localEventX: 10, localEventY: local_event_y,
+        });
+        grid_mock.row_resize_set_target.mockClear();
+
+        // The middle of the cell: no border, no strip.
+        on_mouse_move(over_row_one(12));
+        expect(grid_mock.row_resize_set_target).toHaveBeenLastCalledWith(null);
+
+        // Down to the bottom border without leaving the cell.
+        on_mouse_move(over_row_one(21));
+        expect(grid_mock.row_resize_set_target)
+            .toHaveBeenLastCalledWith({ row: 1, boundary_y: 84, height: 24 });
+
+        // Up to the top border: the row above is the one a drag there resizes.
+        on_mouse_move(over_row_one(2));
+        expect(grid_mock.row_resize_set_target)
+            .toHaveBeenLastCalledWith({ row: 0, boundary_y: 60, height: 24 });
+
+        // Back to the middle: the strip goes.
+        on_mouse_move(over_row_one(12));
+        expect(grid_mock.row_resize_set_target).toHaveBeenLastCalledWith(null);
+
+        // A drag in progress owns the pointer: a move with a button down arms nothing.
+        grid_mock.row_resize_set_target.mockClear();
+        on_mouse_move(over_row_one(21, 1));
+        expect(grid_mock.row_resize_set_target).not.toHaveBeenCalled();
+    });
+
     it('sweeps a row-marker drag through hovered rows and back', async () => {
         await render_grid(props({ row_count: 10 }));
         const on_selection_change = grid_mock.props!.onGridSelectionChange as
