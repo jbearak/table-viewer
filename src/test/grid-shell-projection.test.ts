@@ -10213,6 +10213,16 @@ describe('row Insert in the row-gutter menu', () => {
         expect(on_row_resize).toHaveBeenCalledExactlyOnceWith([{ start: 1, end: 1 }], null, { gesture: true });
     });
 
+    it('draws an inserted row that has no height of its own at the default height', async () => {
+        // Display rows 0 (source 0), 1 (inserted), 2 (source 1), 3 (source 2).
+        // The host holds source row 1's height under its own display row 1,
+        // which is the number of the inserted row's place in the grid.
+        await insert_after_first({ row_heights: { 1: 60 } });
+
+        const get_row_height = grid_mock.props!.rowHeight as (row: number) => number;
+        expect([0, 1, 2, 3].map(get_row_height)).toEqual([24, 24, 60, 24]);
+    });
+
     it('resets every saved row of a selection that spans an inserted row, and leaves the inserted row alone', async () => {
         const on_row_resize = vi.fn();
         const { pending } = await insert_after_first({ on_row_resize, row_heights: { 0: 50, 1: 60 } });

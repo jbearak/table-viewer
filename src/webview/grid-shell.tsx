@@ -7495,13 +7495,17 @@ export function GridShell({
             )
         ) return row_resize_preview.height;
         const projected = pending_projection.row_at(row);
-        const height_row = projected?.kind === 'source'
-            ? projected.sourceDisplayRow
-            : row;
-        return structural_row_height(row) ?? resolved_row_height(
+        // The stored heights and the layers over them are the host's, keyed
+        // by its display rows. An unsaved row is not one of those: with no
+        // height of its own it takes the default, not the height of the
+        // saved row that its place in the grid happens to number.
+        if (projected !== undefined && projected.kind !== 'source') {
+            return structural_row_height(row) ?? default_row_height;
+        }
+        return resolved_row_height(
             row_heights,
             row_height_overlay,
-            height_row,
+            projected?.sourceDisplayRow ?? row,
             default_row_height,
         );
     }, [
