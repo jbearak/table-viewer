@@ -3427,10 +3427,6 @@ export function App(): React.JSX.Element {
             // rekeying history, and neither its inserted nor its appended rows
             // feed cross-save undo (design "History" and "Receipt").
             history_store_ref.current!.install_structural_save_barrier();
-            // An open filter editor names its column by that numbering too,
-            // and the worksheet's schema need not show the change: columns
-            // with no names, or the same name, can trade places.
-            set_filter_editor(null);
             // Selection by identity: a cursor on a Pending Row lands on the
             // row it became, and a cursor on a source cell on the saved
             // coordinate the receipt maps it to.
@@ -4714,27 +4710,44 @@ export function App(): React.JSX.Element {
                     set_unresolved_lfs(snapshot.configuration.unresolvedLfs);
                     meta_ref.current = snapshot.meta;
                     set_meta(snapshot.meta);
+                    const source_changed =
+                        snapshot.presentation === 'initial'
+                        || source_generation_ref.current !== snapshot.sourceGeneration;
                     // An open filter editor names a column of the active
                     // worksheet by position, so it ends when that position can
                     // mean another column: another document, another worksheet,
                     // or a change of the worksheet's columns (the rule that drops
                     // installed filters, and the one the Columns menu closes by).
+                    // It also ends at new file contents when the column has no
+                    // name of its own to say it is still the one: columns with
+                    // no header, or sharing a name, can trade places in a save
+                    // or a rewrite and leave the schema as it was.
                     // Any other snapshot leaves it open with what the person has
                     // typed. One always follows "Filter…" in a header menu: the
                     // menu acquired an editing session, and its idle release is
                     // delivered as a snapshot a moment after the editor opens.
-                    if (
+                    const filter_editor_columns_changed =
                         snapshot.presentation === 'initial'
                         || next_active_sheet_index !== active_sheet_index
                         || active_sheet_changed
                         || previous_active_sheet === undefined
                         || next_active_sheet === undefined
                         || transform_schema_for_sheet(previous_active_sheet)
-                            !== transform_schema_for_sheet(next_active_sheet)
-                    ) set_filter_editor(null);
-                    const source_changed =
-                        snapshot.presentation === 'initial'
-                        || source_generation_ref.current !== snapshot.sourceGeneration;
+                            !== transform_schema_for_sheet(next_active_sheet);
+                    const reloaded_column_names = source_changed
+                        ? next_active_sheet?.columnNames ?? []
+                        : undefined;
+                    set_filter_editor((editor) => {
+                        if (editor === null || filter_editor_columns_changed) return null;
+                        if (reloaded_column_names === undefined) return editor;
+                        const name = reloaded_column_names[editor.column_index];
+                        return name !== undefined
+                            && name !== ''
+                            && reloaded_column_names.indexOf(name)
+                                === reloaded_column_names.lastIndexOf(name)
+                            ? editor
+                            : null;
+                    });
                     if (source_changed) {
                         histogram_cache_ref.current.clear();
                         set_filter_histogram({ key: '', value: { status: 'loading' } });
@@ -8474,12 +8487,14 @@ export function App(): React.JSX.Element {
                 // the columns remounts the grid, and another window can remove
                 // the filter whose chip opened it. The opener's callback then
                 // reaches nothing, and focus goes to the grid mounted now, or
-                // to the toolbar. Only when nothing holds focus: the person
+                // to the toolbar when there is no grid to take it (every
+                // column hidden). Only when nothing holds focus: the person
                 // may already have moved it.
-                if (!has_surviving_focus_target() && document.hasFocus()) {
-                    if (opened_from_grid) grid_focus_ref.current?.focus();
-                    else toolbar_focus_ref.current?.focus();
-                }
+                if (
+                    !has_surviving_focus_target()
+                    && document.hasFocus()
+                    && !(opened_from_grid && grid_focus_ref.current?.focus() === true)
+                ) toolbar_focus_ref.current?.focus();
             }, 0);
         } else {
             filter_restore_timer_ref.current = undefined;

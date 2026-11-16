@@ -177,10 +177,9 @@ vi.mock('../webview/grid-shell', () => ({
             const handle = {
                 generation: props.generation,
                 has_focus: () => grid_shell_mock.has_grid_focus(),
-                focus: () => {
-                    grid_shell_mock.focus_grid();
-                    return true;
-                },
+                // True unless a test makes `focus_grid` answer false: a grid
+                // with nothing to focus (every column hidden).
+                focus: () => (grid_shell_mock.focus_grid() as unknown) !== false,
                 pending_active_cell: () => grid_shell_mock.pending_active_cell(),
                 source_active_cell: () => grid_shell_mock.source_active_cell(),
             };
@@ -13208,40 +13207,22 @@ describe('sorting and filtering', () => {
         await open_grid_filter();
         const old_request = latest_histogram_request(post_message);
 
-        post_message.mockClear();
         await dispatch_host_message(refresh_snapshot_message(make_meta(['Sheet1']), {
             generation: 2,
             sourceGeneration: 2,
         }));
-        // The columns are the same, so the editor stays, and it asks for the
-        // reloaded file's values.
-        expect(document.querySelector('.filter-popover')).not.toBeNull();
-        const new_request = latest_histogram_request(post_message);
-        expect(new_request).toMatchObject({ generation: 2, sourceGeneration: 2 });
-        expect(new_request.requestId).not.toBe(old_request.requestId);
-
-        // The answer for the old file is not shown.
         await dispatch_host_message({
             type: 'filterHistogram', sheetIndex: 0, columnIndex: 0,
             requestId: old_request.requestId, generation: 1, sourceGeneration: 1,
             bins: [{ lo: 0, hi: 1, count: 7 }],
         });
-        expect((document.querySelector('#filter-condition') as HTMLSelectElement).value)
-            .toBe('contains');
-        await dispatch_host_message({
-            type: 'filterHistogram', sheetIndex: 0, columnIndex: 0,
-            requestId: new_request.requestId, generation: 2, sourceGeneration: 2,
-            bins: [{ lo: 0, hi: 1, count: 7 }],
-        });
-        expect((document.querySelector('#filter-condition') as HTMLSelectElement).value)
-            .toBe('between');
+        expect(document.querySelector('.filter-popover')).toBeNull();
 
-        await click_button('Cancel');
         post_message.mockClear();
         await open_grid_filter();
-        expect(post_message.mock.calls.some(
-            ([message]) => message.type === 'requestFilterHistogram',
-        )).toBe(false);
+        const new_request = latest_histogram_request(post_message);
+        expect(new_request).toMatchObject({ generation: 2, sourceGeneration: 2 });
+        expect(new_request.requestId).not.toBe(old_request.requestId);
     });
 
     describe('an open filter editor when a snapshot arrives', () => {
@@ -13252,6 +13233,13 @@ describe('sorting and filtering', () => {
                 columnCount: names.length,
                 columnNames: names,
             };
+            return meta;
+        }
+
+        /** Two columns with no header: nothing but position says which is which. */
+        function unnamed_two_column_meta(): WorkbookMeta {
+            const meta = make_meta(['Sheet1']);
+            meta.sheets[0] = { ...meta.sheets[0], columnCount: 2 };
             return meta;
         }
 
@@ -13271,12 +13259,15 @@ describe('sorting and filtering', () => {
             'input[aria-label="Filter value"]',
         ) as HTMLInputElement | null)?.value;
 
-        it('stays open, with what was typed, when the session a header menu acquired is released', async () => {
+        it.each([
+            ['named', () => two_column_meta()],
+            ['unnamed', () => unnamed_two_column_meta()],
+        ])('stays open, with what was typed, when the session a header menu acquired is released (%s columns)', async (_name, meta_of) => {
             // "Filter…" in a column's menu: the menu acquired an editing session,
             // the editor opens, and the session, holding nothing, is let go. The
             // host answers the release with a snapshot of the same file and view.
             const { post_message } = await render_app();
-            await dispatch_host_message(initial_snapshot_message(two_column_meta(), {
+            await dispatch_host_message(initial_snapshot_message(meta_of(), {
                 capabilities: { csvEditable: true, csvEditingSupported: true },
             }));
             await acquire_editing_session(post_message);
@@ -13287,7 +13278,7 @@ describe('sorting and filtering', () => {
                 expect.objectContaining({ type: 'releaseEditSession' }),
             );
 
-            await dispatch_host_message(workbook_snapshot_message(two_column_meta(), {
+            await dispatch_host_message(workbook_snapshot_message(meta_of(), {
                 presentation: 'refresh',
                 reason: 'other',
                 capabilities: { csvEditable: true, csvEditingSupported: true },
@@ -13304,19 +13295,49 @@ describe('sorting and filtering', () => {
             });
         });
 
-        it('stays open, with what was typed, across a reload that keeps the columns', async () => {
+        it('stays open, with what was typed, across a reload that keeps a column named only once', async () => {
             const { post_message } = await render_app();
             await dispatch_host_message(initial_snapshot_message(two_column_meta()));
+            post_message.mockClear();
             await open_grid_filter(1);
+            const old_request = latest_histogram_request(post_message);
             await type_filter_value('3');
 
             const reloaded = two_column_meta();
             reloaded.sheets[0].rowCount = 9;
             reloaded.sheets[0].sourceRowCount = 9;
+            post_message.mockClear();
             await dispatch_host_message(refresh_snapshot_message(reloaded));
 
             expect(document.querySelector('.filter-popover-colname')?.textContent).toBe('Age');
             expect(filter_value()).toBe('3');
+            // The values are asked for again, from the reloaded file, and an
+            // answer about the old one is not shown.
+            const new_request = latest_histogram_request(post_message);
+            expect(new_request).toMatchObject({ columnIndex: 1, generation: 2, sourceGeneration: 2 });
+            expect(new_request.requestId).not.toBe(old_request.requestId);
+            await dispatch_host_message({
+                type: 'filterHistogram', sheetIndex: 0, columnIndex: 1,
+                requestId: old_request.requestId, generation: 1, sourceGeneration: 1,
+                bins: [{ lo: 0, hi: 1, count: 7 }],
+            });
+            await act(async () => {
+                (document.querySelector('#filter-condition') as HTMLSelectElement).value = 'between';
+                document.querySelector('#filter-condition')!
+                    .dispatchEvent(new Event('change', { bubbles: true }));
+            });
+            expect(document.querySelectorAll('.filter-histogram-bar')).toHaveLength(0);
+            await dispatch_host_message({
+                type: 'filterHistogram', sheetIndex: 0, columnIndex: 1,
+                requestId: new_request.requestId, generation: 2, sourceGeneration: 2,
+                bins: [{ lo: 0, hi: 1, count: 7 }],
+            });
+            expect(document.querySelectorAll('.filter-histogram-bar')).toHaveLength(1);
+            await act(async () => {
+                (document.querySelector('#filter-condition') as HTMLSelectElement).value = 'contains';
+                document.querySelector('#filter-condition')!
+                    .dispatchEvent(new Event('change', { bubbles: true }));
+            });
             post_message.mockClear();
             await click_button('Apply');
             const request = latest_transform_request(post_message);
@@ -13436,69 +13457,35 @@ describe('sorting and filtering', () => {
             expect(grid_shell_mock.focus_grid).not.toHaveBeenCalled();
         });
 
-        it('closes when a save renumbers the columns, whatever the schema shows', async () => {
-            // Two columns with no names trade places in the save: the count
-            // and the names are what they were, and column 0 is now the other
-            // column.
+        it.each([
+            ['has no header', () => unnamed_two_column_meta()],
+            ['shares its name with another column', () => two_column_meta(['Total', 'Total'])],
+            ['has an empty name', () => two_column_meta(['Name', ''])],
+        ])('closes at new file contents when its column %s', async (_name, meta_of) => {
+            // A save in another window, or a rewrite of the file, can make
+            // such columns trade places and leave the count and the names as
+            // they were: column 1 may now be the other column.
             await render_app();
-            const meta = make_meta(['Sheet1'], false);
-            Object.assign(meta.sheets[0], { rowCount: 5, sourceRowCount: 5, columnCount: 2 });
-            await dispatch_host_message(initial_snapshot_message(meta, {
-                capabilities: { csvEditable: true, csvEditingSupported: true },
-            }));
-            await request_edit_session();
-            await dispatch_host_message({
-                type: 'editSessionResult',
-                granted: true,
-                editSessionId: 'moved-columns',
-                sheetIndex: 0,
-                pendingChanges: {
-                    sheetIndex: 0,
-                    sheetName: 'Sheet1',
-                    cells: { '0:0': { value: 'edited', base: 'a' } },
-                    formatTemplates: [],
-                    appendedRows: [],
-                    tailRemovals: [],
-                    conflicts: [],
-                    rowLayout: {
-                        runs: [{ kind: 'source', start: 0, count: 5 }],
-                        removedSourceRows: [{ start: 1, count: 1 }],
-                        discardedPendingRows: [],
-                    },
-                    structuralBasis: {
-                        kind: 'delimited', byteLength: 1, digest: 'x', sourceRowCount: 5, sourceColumnCount: 2,
-                    },
-                },
-            });
-            await open_grid_filter(0);
-            await type_filter_value('x');
-            await act(async () => {
-                (grid_shell_mock.latest_props as unknown as GridShellProps).on_save_request?.();
-            });
-            const operation = grid_shell_mock.latest_props?.save_operation as CsvSaveOperation;
-            expect(operation).toBeDefined();
-            expect(document.querySelector('.filter-popover')).not.toBeNull();
+            await dispatch_host_message(initial_snapshot_message(meta_of()));
+            await open_grid_filter(1);
+            await type_filter_value('3');
 
-            await dispatch_host_message({
-                type: 'saveResult',
-                success: true,
-                lifecycle: { revision: 1, state: 'succeeded', operation },
-                receipt: {
-                    appendedRows: [],
-                    removedSourceRows: [],
-                    structure: [{
-                        sheetIndex: 0,
-                        sheetName: 'Sheet1',
-                        rowRuns: [{ from: 0, count: 5, to: 0 }],
-                        removedRows: [],
-                        columnMap: [1, 0],
-                        insertedRows: [],
-                        insertedColumns: [],
-                    }],
-                },
-            });
+            await dispatch_host_message(refresh_snapshot_message(meta_of()));
 
             expect(document.querySelector('.filter-popover')).toBeNull();
+        });
+
+        it('gives focus to the toolbar when the grid has nothing to focus', async () => {
+            // Another window hid every column: the grid is mounted and has no
+            // cell to take focus.
+            const restore_to_unmounted_grid = await open_then_remount_grid();
+            grid_shell_mock.focus_grid.mockReturnValue(false);
+
+            await click_button('Cancel');
+            const toolbar = document.querySelector('.toolbar') as HTMLElement;
+            await vi.waitUntil(() => document.activeElement === toolbar);
+
+            expect(restore_to_unmounted_grid).toHaveBeenCalledOnce();
         });
 
         it.each([
