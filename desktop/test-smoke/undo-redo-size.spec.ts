@@ -216,11 +216,12 @@ interface Stored {
  * What the state database holds for the file, or undefined while it cannot be
  * read.
  *
- * Read from a copy, never in place: the app expects to be the database's only
- * user, and a reader's lock at the moment it commits makes its write fail
- * (the resize is then refused as "the file was refreshing"). A copy taken
- * while the app is inside a write is not read: under `journal_mode = DELETE`
- * the journal file exists for exactly that long.
+ * Read from a copy, never in place: a reader's lock at the moment the app
+ * commits makes its write wait until the reader is done, and no test here
+ * should be what the app waits for ("a column resize waits for an outside
+ * reader" holds one on purpose). A copy taken while the app is inside a write
+ * is not read: under `journal_mode = DELETE` the journal file exists for
+ * exactly that long.
  */
 function stored(file: string): Stored | undefined {
     try {

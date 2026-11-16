@@ -68,6 +68,26 @@ export const DESKTOP_STATE_IDENTITY: SqliteDesktopFileStateIdentity = Object.fre
 /** Client identification recorded on the writer session for diagnostics. */
 export const DESKTOP_STATE_CLIENT_KIND = 'desktop';
 
+/**
+ * How long a read or write waits for another process to let go of the
+ * database before it fails as busy.
+ *
+ * The app is the database's only writer, but not always its only reader: a
+ * backup tool that understands SQLite, or a person looking at the file with
+ * `sqlite3`, holds a shared lock while it reads, and a commit needs the file
+ * to itself. With no wait, a write that met such a reader failed at once: a
+ * column resize was refused as "the file was refreshing", a reload error
+ * followed it, and cells would not open for editing until the reader was
+ * done. A reader of a database this size is done in milliseconds, and SQLite
+ * retries for as long as it takes, up to this bound.
+ *
+ * Bounded well below the VS Code extension's five seconds because this
+ * connection is used from the app's main process, and the wait is
+ * synchronous: a lock nobody releases costs each write this long, with the
+ * app's menus and windows unresponsive meanwhile, and then fails as before.
+ */
+export const DESKTOP_STATE_BUSY_TIMEOUT_MS = 2_000;
+
 export function desktop_state_database_path(user_data_dir: string): string {
     return path.join(
         user_data_dir,
@@ -572,6 +592,7 @@ export async function open_desktop_state_database(
                 migration: { appliedAtMs: now(), appVersion: app_version },
                 clientKind: DESKTOP_STATE_CLIENT_KIND,
                 clientVersion: app_version,
+                timeoutMs: DESKTOP_STATE_BUSY_TIMEOUT_MS,
                 ...(options.now ? { now: options.now } : {}),
             },
             get_max_stored_files,

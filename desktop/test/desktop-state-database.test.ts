@@ -1,8 +1,10 @@
 import { randomUUID } from 'node:crypto';
+import { once } from 'node:events';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { Worker } from 'node:worker_threads';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { SqliteOpenRecoveryEvent } from '../../src/sqlite-open-recovery';
 import {
@@ -453,6 +455,56 @@ describe('desktop state database', () => {
         await expect(second.opened.store.read('/sheet.csv')).resolves.toMatchObject({
             state: { activeSheetIndex: 1 },
         });
+    });
+
+    it('waits for an outside reader to let go instead of failing a write', async () => {
+        // Whatever reads the database with SQLite (a backup tool, a person with
+        // `sqlite3`) holds a shared lock for as long as its read lasts, and a
+        // commit needs the file to itself. The wait is synchronous, so the
+        // reader has a thread of its own: it lets go once it sees the rollback
+        // journal, which exists only while the write is inside its transaction.
+        const result = await open();
+        if (result.type !== 'opened') throw new Error('expected an opened database');
+        const store = result.opened.store;
+        const first = await store.compare_and_set('/sheet.csv', 0, { activeSheetIndex: 1 });
+        if (first.type !== 'committed') throw new Error('expected the first write to commit');
+
+        const reader = new Worker(`
+            const { parentPort, workerData } = require('node:worker_threads');
+            const fs = require('node:fs');
+            const { DatabaseSync } = require('node:sqlite');
+            const reader = new DatabaseSync(workerData.database, { readOnly: true });
+            reader.exec('BEGIN');
+            reader.prepare('SELECT count(*) FROM entries').get();
+            parentPort.postMessage('reading');
+            const poll = setInterval(() => {
+                if (!fs.existsSync(workerData.database + '-journal')) return;
+                clearInterval(poll);
+                reader.exec('COMMIT');
+                reader.close();
+                parentPort.postMessage('let go during the write');
+            }, 1);
+        `, { eval: true, workerData: { database: desktop_state_database_path(userDataDir) } });
+        try {
+            expect(await once(reader, 'message')).toEqual(['reading']);
+            // Listened for before the write starts: it is posted while this
+            // thread is inside the write, waiting.
+            const let_go = once(reader, 'message');
+
+            const second = await store.compare_and_set(
+                '/sheet.csv',
+                first.snapshot.revision,
+                { activeSheetIndex: 2 },
+            );
+
+            expect(second.type).toBe('committed');
+            expect(await let_go).toEqual(['let go during the write']);
+            await expect(store.read('/sheet.csv')).resolves.toMatchObject({
+                state: { activeSheetIndex: 2 },
+            });
+        } finally {
+            await reader.terminate();
+        }
     });
 
     it('fails closed on a stray WAL beside a valid database and touches no bytes', async () => {
