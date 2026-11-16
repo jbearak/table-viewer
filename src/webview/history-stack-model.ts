@@ -29,6 +29,8 @@ import {
     worksheet_target_key,
     worksheet_target_matches,
     type CellHighlightColor,
+    type FilterEntry,
+    type SortKey,
     type WorksheetTarget,
 } from '../types';
 import {
@@ -48,6 +50,7 @@ import {
     type HistoryValue,
     type SavedCellContent,
 } from './history-cell-state-model';
+import type { MemberTransition, ViewHistoryDelta } from './view-history-model';
 
 /**
  * A cell highlight moving under one gesture.
@@ -140,7 +143,29 @@ export type HistoryChange =
     | { readonly kind: 'tailRemoval'; readonly delta: TailRemovalHistoryDelta }
     | { readonly kind: 'pendingRows'; readonly delta: PendingRowsHistoryDelta }
     | { readonly kind: 'rowLayout'; readonly delta: RowLayoutHistoryDelta }
-    | { readonly kind: 'columnLayout'; readonly delta: ColumnLayoutHistoryDelta };
+    | { readonly kind: 'columnLayout'; readonly delta: ColumnLayoutHistoryDelta }
+    /**
+     * A sort, a filter, hidden rows, or hidden columns: view state, not
+     * content. A view step is an action holding exactly one such change. It
+     * needs no editing session, and replay re-issues the view request the
+     * gesture used instead of the cell replay protocol (see
+     * `view-history-model.ts`).
+     */
+    | { readonly kind: 'view'; readonly delta: ViewHistoryDelta };
+
+/** The view arm. */
+export type ViewHistoryChange = Extract<HistoryChange, { kind: 'view' }>;
+
+/** The change of a view step, or undefined for any other action. */
+export function view_step_change(action: HistoryAction): ViewHistoryChange | undefined {
+    const change = action.changes.length === 1 ? action.changes[0] : undefined;
+    return change?.kind === 'view' ? change : undefined;
+}
+
+/** Whether an action holds a view change, alone (a view step) or not. */
+export function action_has_view_change(action: HistoryAction): boolean {
+    return action.changes.some((change) => change.kind === 'view');
+}
 
 /** The arms replayed against the worksheet structural store rather than the cell lease. */
 export type StructuralHistoryChange = Extract<
@@ -568,6 +593,10 @@ function estimate_change_bytes(change: HistoryChange, charge: ActionCharger): nu
             : change.kind === 'pendingRows' || change.kind === 'rowLayout'
                 || change.kind === 'columnLayout'
                 ? charge.structural(change.delta)
+            // Two bytes per JSON code unit of what the step holds: its lists
+            // and its row or column numbers.
+            : change.kind === 'view'
+                ? json_code_units({ ...change.delta, worksheet: null }) * 2
             : 0;
     return charge.worksheet(change.delta.worksheet) + (change.kind === 'cell'
         ? estimate_cell_delta_bytes(change.delta, charge)
@@ -644,6 +673,8 @@ function add_counted_cell(index: CellCountIndex, change: HistoryChange): void {
             : 1;
         return;
     }
+    // A view step touches no cell. It is bounded as an action and by its bytes.
+    if (change.kind === 'view') return;
     const { worksheet, sourceRow, sourceColumn } = change.delta;
     const sheets = change.kind === 'cell' ? index.cell : index.highlight;
     const rows = worksheet.worksheetId !== undefined
@@ -1426,6 +1457,7 @@ function rekey_change_provenance(
                 },
             };
         case 'highlight':
+        case 'view':
             return change;
         // A save that writes a layout change installs the `structural-save`
         // barrier, so a layout arm only meets append-only saves. Those move no
@@ -2186,7 +2218,7 @@ export function rekey_committed_tail_removal_history(
                     after: item.change.delta.after,
                 });
                 highlight_transitions.set(item.change.delta.sourceColumn, list);
-            } else {
+            } else if (item.change.kind !== 'view') {
                 existence.push({
                     index: item.index,
                     before: item.change.delta.before === null,
@@ -3106,6 +3138,92 @@ function own_structural_template(
     return normalized;
 }
 
+/** How many numbers a run's allowance covers when a view step's rows are charged. */
+const VIEW_NUMBERS_PER_RUN = 8;
+
+/**
+ * A view delta rebuilt from its declared fields into frozen objects history
+ * owns, charged against the budget as it goes so an oversized one (an Unhide
+ * all of a great many rows) is abandoned mid-copy.
+ */
+function own_view_history_delta(
+    delta: ViewHistoryDelta,
+    owner: HistoryActionOwner,
+): ViewHistoryDelta {
+    const numbers = (values: readonly number[]): readonly number[] => {
+        const owned = new Array<number>(values.length);
+        for (let index = 0; index < values.length; index += 1) {
+            if (index % VIEW_NUMBERS_PER_RUN === 0) owner.charge_run();
+            owned[index] = Number(values[index]);
+        }
+        return Object.freeze(owned);
+    };
+    const members = (transition: MemberTransition): MemberTransition => Object.freeze({
+        hidden: numbers(transition.hidden),
+        shown: numbers(transition.shown),
+    });
+    const worksheet = owner.own_worksheet_target(delta.worksheet);
+    const schema = owner.own_string(String(delta.schema));
+    if (delta.slice === 'columns') {
+        return Object.freeze({ worksheet, slice: 'columns', schema, ...members(delta) });
+    }
+    const sort_keys = (keys: readonly SortKey[]): readonly SortKey[] => Object.freeze(
+        keys.map((key) => {
+            owner.charge_run();
+            return Object.freeze({
+                colIndex: Number(key.colIndex),
+                direction: key.direction === 'desc' ? 'desc' as const : 'asc' as const,
+            });
+        }),
+    );
+    const filter_entries = (entries: readonly FilterEntry[]): readonly FilterEntry[] => Object.freeze(
+        entries.map((entry) => {
+            owner.charge_run();
+            return Object.freeze({
+                id: owner.own_string(String(entry.id)),
+                colIndex: Number(entry.colIndex),
+                operator: owner.own_string(String(entry.operator)) as FilterEntry['operator'],
+                ...(entry.value === undefined ? {} : { value: owner.own_string(String(entry.value)) }),
+                ...(entry.secondValue === undefined
+                    ? {}
+                    : { secondValue: owner.own_string(String(entry.secondValue)) }),
+                ...(entry.excludedValues === undefined
+                    ? {}
+                    : {
+                        excludedValues: Object.freeze(entry.excludedValues.map((value) => {
+                            owner.charge_run();
+                            return value === null ? null : owner.own_string(String(value));
+                        })) as (string | null)[],
+                    }),
+                caseSensitive: entry.caseSensitive === true,
+                enabled: entry.enabled === true,
+            });
+        }),
+    );
+    return Object.freeze({
+        worksheet,
+        slice: 'transform',
+        schema,
+        ...(delta.sort === undefined
+            ? {}
+            : {
+                sort: Object.freeze({
+                    before: sort_keys(delta.sort.before),
+                    after: sort_keys(delta.sort.after),
+                }),
+            }),
+        ...(delta.filters === undefined
+            ? {}
+            : {
+                filters: Object.freeze({
+                    before: filter_entries(delta.filters.before),
+                    after: filter_entries(delta.filters.after),
+                }),
+            }),
+        ...(delta.hiddenRows === undefined ? {} : { hiddenRows: members(delta.hiddenRows) }),
+    });
+}
+
 function own_history_change(
     change: HistoryChange,
     owner: HistoryActionOwner,
@@ -3201,6 +3319,9 @@ function own_history_change(
             kind: 'columnLayout',
             delta: own_layout_delta(change.delta, owner, structural_owner, own_column_layout),
         });
+    }
+    if (change.kind === 'view') {
+        return Object.freeze({ kind: 'view', delta: own_view_history_delta(change.delta, owner) });
     }
     const own_removal = (removal: PendingTailRemoval | null): PendingTailRemoval | null => {
         if (removal === null) return null;

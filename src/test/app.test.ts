@@ -2,11 +2,12 @@
 
 import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type {
     CsvDirtyEntry,
     CsvSaveOperation,
     HostMessage,
+    SheetColumnVisibilityState,
     SheetTransformState,
     SheetPendingEditCells,
     SheetViewRecord,
@@ -309,6 +310,9 @@ vi.mock('../webview/grid-shell', () => ({
                         .map((entry) => entry.action.label) ?? [],
                 ),
                 'data-highlight-in-flight': String(props.highlight_in_flight ?? false),
+                // A view request of this window awaiting the host: no cell
+                // opens an editor until it settles.
+                'data-view-request-in-flight': String(props.view_request_in_flight ?? false),
                 // Where App says an undo landed, and against which mapping. The
                 // real shell resolves this into a selection; the stub only has to
                 // show that App produced the right request and held it across the
@@ -736,6 +740,34 @@ async function acknowledge_transform(
     await dispatch_host_message(
         transform_installed_message(request, { generation, hiddenEditedCellKeys }),
     );
+}
+
+function latest_column_write(post_message: ReturnType<typeof vi.fn>) {
+    const request = post_message.mock.calls
+        .map((call) => call[0] as WebviewMessage)
+        .filter((message): message is Extract<WebviewMessage, { type: 'setColumnVisibility' }> => (
+            message.type === 'setColumnVisibility'
+        ))
+        .at(-1);
+    expect(request).toBeDefined();
+    return request!;
+}
+
+/** The host's answer to the latest column visibility write. */
+async function answer_column_write(
+    post_message: ReturnType<typeof vi.fn>,
+    applied = true,
+    source_generation?: number,
+) {
+    const request = latest_column_write(post_message);
+    expect(request.requestId).toEqual(expect.any(String));
+    await dispatch_host_message({
+        type: 'columnVisibilityChanged',
+        requestId: request.requestId!,
+        sheetIndex: request.sheetIndex,
+        applied,
+        sourceGeneration: source_generation ?? request.sourceGeneration,
+    });
 }
 
 async function flush_focus_restore() {
@@ -4639,6 +4671,8 @@ describe('column visibility projection', () => {
                 hiddenColumns: [1],
                 schema: '["Sheet1",3,["Name","Value","Notes"]]',
             },
+            // The write asks for an answer: its step is recorded on that.
+            requestId: expect.any(String),
         }]);
         expect(state_messages).toHaveLength(1);
         expect(visibility_messages.indexOf(targeted_messages[0]))
@@ -4659,6 +4693,7 @@ describe('column visibility projection', () => {
         expect(grid_shell_mock.commit_live_edit.mock.invocationCallOrder.at(-1))
             .toBeLessThan(post_message.mock.invocationCallOrder.at(-1)!);
 
+        await answer_column_write(post_message);
         post_message.mockClear();
         await click_button('Show all');
         expect(JSON.parse(grid_stub().getAttribute('data-projection')!))
@@ -4671,6 +4706,7 @@ describe('column visibility projection', () => {
             state: undefined,
             sourceGeneration: 1,
             snapshotIdentity: initial.snapshot.identity,
+            requestId: expect.any(String),
         });
         const restored = post_message.mock.calls.at(-1)![0];
         expect(restored.type).toBe('stateChanged');
@@ -4717,6 +4753,7 @@ describe('column visibility projection', () => {
             .map((call) => call[0])
             .some((message) => message.type === 'setTransform')).toBe(false);
 
+        await answer_column_write(post_message);
         await click_button('Show all');
         expect(JSON.parse(grid_stub().getAttribute('data-projection')!))
             .toEqual([0, 1]);
@@ -5317,7 +5354,7 @@ describe('merges', () => {
     });
 
     it('flattens merges on hide and restores them on Show all', async () => {
-        await render_app();
+        const { post_message } = await render_app();
         const meta = make_meta(['Sheet1']);
         meta.sheets[0].columnCount = 2;
         meta.sheets[0].columnNames = ['Left', 'Right'];
@@ -5335,6 +5372,7 @@ describe('merges', () => {
         expect(grid_stub().getAttribute('data-merges')).toBe('0');
         expect(document.body.textContent).toContain('Merged cells shown unmerged');
 
+        await answer_column_write(post_message);
         await click_button('Show all');
         expect(grid_stub().getAttribute('data-merges')).toBe('1');
         expect(document.body.textContent).not.toContain('Merged cells shown unmerged');
@@ -14600,20 +14638,46 @@ describe('snapshots arriving during an in-flight transform', () => {
         expect(grid_shell_mock.latest_props?.transform_pending).toBe(false);
     });
 
-    it('loses no edit across commits interleaved with a compute that lands last', async () => {
-        // The whole sequence the feature makes reachable: type and commit, keep
-        // typing while the sort is still computing, then let it land. Each commit
-        // provokes a same-basis refresh, and the landing bumps the generation and
-        // remounts the grid that owns the open overlay — three separate ways an edit
-        // could be dropped, exercised in one order.
-        const { request } = await sorting_while_editing();
+    it('folds the open cell when the sort is asked for, and loses no edit when the compute lands last', async () => {
+        // No cell editor is open while this window's own sort is computing: the
+        // open cell is committed before the request is posted, and the install
+        // has nothing left to fold. What still arrives during the compute is the
+        // refresh each commit provokes, and then the landing bumps the generation
+        // and remounts the grid: two ways an edit could be dropped.
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(
+            make_meta(['Sheet1'], false),
+            { capabilities: { csvEditable: true, csvEditingSupported: true } },
+        ));
+        await acquire_editing_session(post_message);
         const store = () => grid_shell_mock.latest_props?.edit_session as EditSessionStore;
         const store_edits = () => JSON.parse(grid_stub().getAttribute('data-store-edits')!);
-
         await act(async () => {
             store().commit('test-edit-session', '0:0', { value: 'first', base: 'a' });
         });
-        // The refresh that commit provokes: same rows, same generation, and the
+        // A second cell is still open in the editor when the sort is asked for.
+        grid_shell_mock.commit_live_edit.mockImplementation(() => {
+            store().commit('test-edit-session', '1:0', { value: 'live', base: 'b' });
+        });
+        post_message.mockClear();
+
+        await act(async () => (
+            container!.querySelector('.stub-shortcut-transform') as HTMLButtonElement
+        ).click());
+
+        // Folded once, before the request left, and under the option that lets
+        // an exiting session's fence pass when nothing is open.
+        expect(grid_shell_mock.commit_live_edit).toHaveBeenCalledTimes(1);
+        expect(grid_shell_mock.commit_live_edit).toHaveBeenCalledWith({ fenced_empty_ok: true });
+        const request = latest_transform_request(post_message);
+        expect(grid_shell_mock.commit_live_edit.mock.invocationCallOrder[0])
+            .toBeLessThan(post_message.mock.invocationCallOrder[
+                post_message.mock.calls.findIndex((call) => call[0] === request)
+            ]);
+        // And no cell opens until the sort lands.
+        expect(grid_shell_mock.latest_props?.view_request_in_flight).toBe(true);
+
+        // The refresh those commits provoke: same rows, same generation, and the
         // host's authoritative projection of what it has just written.
         await dispatch_host_message(refresh_snapshot_message(
             make_meta(['Sheet1'], false),
@@ -14622,32 +14686,30 @@ describe('snapshots arriving during an in-flight transform', () => {
                 sourceGeneration: 1,
                 reason: 'other',
                 capabilities: CSV_CAPABILITIES,
-                state: { pendingEdits: sheet_edits({ '0:0': { value: 'first', base: 'a' } }) },
+                state: {
+                    pendingEdits: sheet_edits({
+                        '0:0': { value: 'first', base: 'a' },
+                        '1:0': { value: 'live', base: 'b' },
+                    }),
+                },
             },
         ));
-        // A second confirmed edit, typed while the compute is still outstanding.
-        await act(async () => {
-            store().commit('test-edit-session', '2:0', { value: 'second', base: 'c' });
-        });
-        // And a third cell still open in the editor when the ack arrives, which only
-        // the fold can carry across the remount.
-        grid_shell_mock.commit_live_edit.mockImplementation(() => {
-            store().commit('test-edit-session', '1:0', { value: 'live', base: 'b' });
-        });
         const mount_id = grid_stub().getAttribute('data-mount-id');
+        const folds = grid_shell_mock.commit_live_edit.mock.calls.length;
 
         await acknowledge_transform(request, 7);
 
         // The remount really happened, so the survival below is not vacuous.
         expect(grid_stub().getAttribute('data-mount-id')).not.toBe(mount_id);
-        expect(grid_shell_mock.commit_live_edit).toHaveBeenCalledTimes(1);
-        // All three, under the source-row keys they were typed against. Display row 0
+        // The install folded nothing: there was nothing open to fold.
+        expect(grid_shell_mock.commit_live_edit).toHaveBeenCalledTimes(folds);
+        expect(grid_shell_mock.latest_props?.view_request_in_flight).toBe(false);
+        // Both, under the source-row keys they were typed against. Display row 0
         // under this sort is not source row 0, so a display-keyed map would name
         // different cells here.
         expect(store_edits()).toEqual({
             '0:0': { value: 'first', base: 'a' },
             '1:0': { value: 'live', base: 'b' },
-            '2:0': { value: 'second', base: 'c' },
         });
     });
 
@@ -19637,5 +19699,1794 @@ describe('rapid structural gestures against refresh echoes', () => {
         const expected_cells = typed === undefined ? {} : { '1:0': { value: typed, base: 'b' } };
         expect(Object.fromEntries(cell_store.snapshot())).toEqual(expected_cells);
         expect(written?.cells).toEqual(expected_cells);
+    });
+});
+
+// Sorts, filters, hidden rows, and hidden columns are steps in the same history
+// as edits. The webview replays them through the request the gesture used, and
+// history moves on the host's answer. No editing session is involved.
+describe('view steps in history', () => {
+    const CSV = { csvEditable: true, csvEditingSupported: true };
+    const SCHEMA = '["Sheet1",3,["Name","Value","Notes"]]';
+    const SORT_ASC: SheetTransformState['sort'] = [{ colIndex: 0, direction: 'asc' }];
+    const FILTER: SheetTransformState['filters'][number] = {
+        id: 'f1',
+        colIndex: 1,
+        operator: 'contains',
+        value: 'z',
+        caseSensitive: false,
+        enabled: true,
+    };
+    let view_generation = 1;
+
+    beforeEach(() => {
+        view_generation = 1;
+    });
+
+    function table_meta(names: string[] = ['Sheet1']): WorkbookMeta {
+        const meta = make_meta(names, false);
+        for (const sheet of meta.sheets) {
+            sheet.columnCount = 3;
+            sheet.columnNames = ['Name', 'Value', 'Notes'];
+            sheet.rowCount = 6;
+            sheet.sourceRowCount = 6;
+        }
+        return meta;
+    }
+
+    const props = () => grid_shell_mock.latest_props as unknown as GridShellProps;
+    const history = () => props().history_store!.snapshot();
+    const undo_labels = () => history().undoStack.map((entry) => entry.action.label);
+    const redo_labels = () => history().redoStack.map((entry) => entry.action.label);
+
+    function posted<T extends WebviewMessage['type']>(
+        post_message: ReturnType<typeof vi.fn>,
+        type: T,
+    ): Extract<WebviewMessage, { type: T }>[] {
+        return post_message.mock.calls
+            .map((call) => call[0] as WebviewMessage)
+            .filter((message): message is Extract<WebviewMessage, { type: T }> => (
+                message?.type === type
+            ));
+    }
+
+    const warnings = (post_message: ReturnType<typeof vi.fn>) => (
+        posted(post_message, 'showWarning').map((message) => message.message)
+    );
+    const undo = () => dispatch_host_message({ type: 'editCommand', command: 'undo' });
+    const redo = () => dispatch_host_message({ type: 'editCommand', command: 'redo' });
+
+    /** Whether a cell would open and an edit would be recorded right now. */
+    function cells_editable() {
+        return {
+            editor_offered: grid_stub().getAttribute('data-view-request-in-flight') === 'false',
+            edits_admitted: props().gestures_admitted?.() ?? true,
+        };
+    }
+    const EDITABLE = { editor_offered: true, edits_admitted: true };
+    const HELD = { editor_offered: false, edits_admitted: false };
+
+    async function open(
+        post_message: ReturnType<typeof vi.fn>,
+        extra: SnapshotExtra = {},
+        meta: WorkbookMeta = table_meta(),
+    ) {
+        const snapshot = initial_snapshot_message(meta, { capabilities: CSV, ...extra });
+        await dispatch_host_message(snapshot);
+        post_message.mockClear();
+        return snapshot;
+    }
+
+    /** Ask for a change of the active sheet's rules, as the grid or the toolbar does. */
+    async function ask(post_message: ReturnType<typeof vi.fn>, state: SheetTransformState) {
+        const before = posted(post_message, 'setTransform').length;
+        await act(async () => props().on_transform_change?.(state));
+        const requests = posted(post_message, 'setTransform');
+        return requests.length > before ? requests.at(-1)! : undefined;
+    }
+
+    /** The host installing a request, with the rules it asked for unless told otherwise. */
+    async function install(
+        request: {
+            sheetIndex: number;
+            requestId: string;
+            intent?: TransformIntent;
+            state?: SheetTransformState;
+            sourceGeneration: number;
+        },
+        rules?: SheetTransformState,
+    ) {
+        await dispatch_host_message(transform_installed_message(
+            {
+                sheetIndex: request.sheetIndex,
+                requestId: request.requestId,
+                intent: request.intent ?? 'user',
+                state: rules ?? request.state ?? { sort: [], filters: [] },
+                sourceGeneration: request.sourceGeneration,
+            },
+            { generation: ++view_generation, rowCount: 6 },
+        ));
+    }
+
+    /** A gesture, installed: one step on the undo stack. */
+    async function change_view(post_message: ReturnType<typeof vi.fn>, state: SheetTransformState) {
+        const request = await ask(post_message, state);
+        expect(request, 'the gesture was not posted').toBeDefined();
+        await install(request!);
+        return request!;
+    }
+
+    async function hide_rows(
+        post_message: ReturnType<typeof vi.fn>,
+        display_rows: { start: number; end: number }[],
+    ) {
+        const before = posted(post_message, 'hideRows').length;
+        await act(async () => props().on_hide_rows?.(display_rows));
+        const requests = posted(post_message, 'hideRows');
+        return requests.length > before ? requests.at(-1)! : undefined;
+    }
+
+    async function refuse(
+        request: { sheetIndex: number; requestId: string },
+        reason = 'The file is being saved.',
+        terminal = false,
+    ) {
+        await dispatch_host_message({
+            type: 'transformRefused',
+            sheetIndex: request.sheetIndex,
+            requestId: request.requestId,
+            intent: 'user',
+            reason,
+            terminal,
+        });
+    }
+
+    describe('recording', () => {
+        it('records a sort when the host installs it, with no editing session', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+
+            const request = await ask(post_message, { sort: SORT_ASC, filters: [] });
+            expect(undo_labels()).toEqual([]);
+            await install(request!);
+
+            expect(undo_labels()).toEqual(['Sort']);
+            expect(posted(post_message, 'historyMenuStateChanged').at(-1)!.state).toMatchObject({
+                undoAvailable: true,
+                undoLabel: 'Sort',
+                redoAvailable: false,
+            });
+            // A view step is not an edit: nothing asked for a session, and the
+            // document is not unsaved.
+            expect(posted(post_message, 'requestEditSession')).toEqual([]);
+            expect(get_button('Save').getAttribute('aria-disabled')).toBe('true');
+            expect(get_button('Save').classList.contains('has-unsaved')).toBe(false);
+        });
+
+        it('names each kind of step', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+
+            await change_view(post_message, { sort: SORT_ASC, filters: [] });
+            await change_view(post_message, { sort: SORT_ASC, filters: [FILTER] });
+            await change_view(post_message, { sort: [], filters: [FILTER] });
+            await change_view(post_message, { sort: [], filters: [] });
+            const hide = await hide_rows(post_message, [{ start: 1, end: 2 }]);
+            await install(hide!, { sort: [], filters: [], hiddenRows: [1, 2], schema: SCHEMA });
+            await click_button('Unhide all');
+            await install(latest_transform_request(post_message));
+
+            expect(undo_labels()).toEqual([
+                'Sort',
+                'Filter',
+                'Clear sort',
+                'Clear filter',
+                'Hide 2 rows',
+                'Unhide rows',
+            ]);
+        });
+
+        it('records nothing for a refusal, a restore, or a cancel', async () => {
+            const { post_message } = await render_app();
+            // A saved view: the window restores it on open.
+            await dispatch_host_message(initial_snapshot_message(table_meta(), {
+                capabilities: CSV,
+                state: { transforms: [{ sort: SORT_ASC, filters: [], schema: SCHEMA }] },
+            }));
+            const restore = latest_transform_request(post_message);
+            expect(restore.intent).toBe('restore');
+            await install(restore);
+            expect(undo_labels()).toEqual([]);
+
+            const refused = await ask(post_message, { sort: [], filters: [] });
+            await refuse(refused!);
+            expect(undo_labels()).toEqual([]);
+
+            const cancelled = await ask(post_message, { sort: [], filters: [] });
+            await click_button('Cancel');
+            const cancel = latest_transform_request(post_message);
+            expect(cancel.intent).toBe('cancel');
+            expect(cancel.requestId).not.toBe(cancelled!.requestId);
+            await install(cancel);
+            expect(undo_labels()).toEqual([]);
+            expect(redo_labels()).toEqual([]);
+        });
+
+        it('records nothing when the host installs no rules over none', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+
+            // An inactive filter is a request, and a host that drops it installs nothing.
+            const request = await ask(post_message, {
+                sort: [],
+                filters: [{ ...FILTER, enabled: false }],
+            });
+            await install(request!, { sort: [], filters: [] });
+
+            expect(undo_labels()).toEqual([]);
+        });
+
+        it('records one step, from the rules installed before, when a second request replaces the first', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+
+            const first = await ask(post_message, { sort: SORT_ASC, filters: [] });
+            const second = await ask(post_message, { sort: SORT_ASC, filters: [FILTER] });
+            expect(second).toBeDefined();
+            // The first never answers to this window.
+            await install(first!);
+            expect(undo_labels()).toEqual([]);
+            await install(second!);
+            expect(undo_labels()).toEqual(['Change view']);
+
+            // Undo goes back to what was installed before the first: nothing.
+            post_message.mockClear();
+            await undo();
+            const replay = latest_transform_request(post_message);
+            expect(replay.state.sort).toEqual([]);
+            expect(replay.state.filters).toEqual([]);
+        });
+
+        it('records the sort alone when it replaces a restore still in flight', async () => {
+            const { post_message } = await render_app();
+            await dispatch_host_message(initial_snapshot_message(table_meta(), {
+                capabilities: CSV,
+                state: { transforms: [{ sort: [], filters: [FILTER], schema: SCHEMA }] },
+            }));
+            expect(latest_transform_request(post_message).intent).toBe('restore');
+
+            await change_view(post_message, { sort: SORT_ASC, filters: [FILTER] });
+
+            expect(undo_labels()).toEqual(['Sort']);
+            post_message.mockClear();
+            await undo();
+            const replay = latest_transform_request(post_message);
+            expect(replay.state.sort).toEqual([]);
+            expect(replay.state.filters).toEqual([FILTER]);
+        });
+
+        it('takes the step from the request\'s baseline when a same-basis refresh arrives before the install', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+
+            const request = await ask(post_message, { sort: SORT_ASC, filters: [] });
+            // Another window's filter, made durable while this sort computes: the
+            // same rows and the same generation, so the request stays pending.
+            await dispatch_host_message(refresh_snapshot_message(table_meta(), {
+                generation: 1,
+                sourceGeneration: 1,
+                reason: 'other',
+                capabilities: CSV,
+                state: { transforms: [{ sort: [], filters: [FILTER], schema: SCHEMA }] },
+            }));
+            await install(request!);
+
+            // One step, and its "before" is what this window saw when it asked.
+            expect(undo_labels()).toEqual(['Sort']);
+            post_message.mockClear();
+            await undo();
+            expect(latest_transform_request(post_message).state.sort).toEqual([]);
+        });
+    });
+
+    describe('undo and redo', () => {
+        it('asks the host for the view before the step and moves when it is installed', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await change_view(post_message, { sort: SORT_ASC, filters: [FILTER] });
+            post_message.mockClear();
+
+            await undo();
+            const undone = latest_transform_request(post_message);
+            expect(undone).toMatchObject({
+                type: 'setTransform',
+                sheetIndex: 0,
+                intent: 'user',
+                state: { sort: [], filters: [] },
+            });
+            // Not yet: history moves on the host's answer.
+            expect(undo_labels()).toEqual(['Change view']);
+            expect(redo_labels()).toEqual([]);
+            await install(undone);
+            expect(undo_labels()).toEqual([]);
+            expect(redo_labels()).toEqual(['Change view']);
+            expect(posted(post_message, 'historyMenuStateChanged').at(-1)!.state).toMatchObject({
+                undoAvailable: false,
+                redoAvailable: true,
+                redoLabel: 'Change view',
+            });
+
+            await redo();
+            const redone = latest_transform_request(post_message);
+            expect(redone.requestId).not.toBe(undone.requestId);
+            expect(redone.state.sort).toEqual(SORT_ASC);
+            expect(redone.state.filters).toEqual([FILTER]);
+            await install(redone);
+            expect(undo_labels()).toEqual(['Change view']);
+            expect(redo_labels()).toEqual([]);
+
+            // No session, no replay protocol, no message, and no timer left behind.
+            expect(posted(post_message, 'requestEditSession')).toEqual([]);
+            expect(posted(post_message, 'prepareHistoryReplay')).toEqual([]);
+            expect(warnings(post_message)).toEqual([]);
+        });
+
+        it('undoes and redoes hidden rows by member, leaving rows hidden since alone', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            const first = await hide_rows(post_message, [{ start: 1, end: 2 }]);
+            await install(first!, { sort: [], filters: [], hiddenRows: [1, 2], schema: SCHEMA });
+            const second = await hide_rows(post_message, [{ start: 2, end: 2 }]);
+            await install(second!, { sort: [], filters: [], hiddenRows: [1, 2, 4], schema: SCHEMA });
+            expect(undo_labels()).toEqual(['Hide 2 rows', 'Hide row']);
+            post_message.mockClear();
+
+            await undo();
+            const undone = latest_transform_request(post_message);
+            expect(undone.state.hiddenRows).toEqual([1, 2]);
+            await install(undone);
+            await undo();
+            const older = latest_transform_request(post_message);
+            expect(older.state.hiddenRows ?? []).toEqual([]);
+            await install(older);
+            expect(redo_labels()).toEqual(['Hide row', 'Hide 2 rows']);
+
+            await redo();
+            const redone = latest_transform_request(post_message);
+            expect(redone.state.hiddenRows).toEqual([1, 2]);
+        });
+
+        it('keeps the entry and says why when the host refuses', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await change_view(post_message, { sort: SORT_ASC, filters: [] });
+            post_message.mockClear();
+
+            await undo();
+            await refuse(latest_transform_request(post_message), 'Sorting is unavailable.', true);
+
+            expect(undo_labels()).toEqual(['Sort']);
+            expect(redo_labels()).toEqual([]);
+            expect(warnings(post_message)).toEqual(["Can't undo “Sort”: Sorting is unavailable."]);
+            expect(cells_editable()).toEqual(EDITABLE);
+            // The view is as it was, and the same Undo can be tried again.
+            post_message.mockClear();
+            await undo();
+            expect(latest_transform_request(post_message).state.sort).toEqual([]);
+        });
+
+        it('holds a second undo and every edit while one is in flight, and a cancel releases it', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await change_view(post_message, { sort: SORT_ASC, filters: [] });
+            await change_view(post_message, { sort: SORT_ASC, filters: [FILTER] });
+            expect(cells_editable()).toEqual(EDITABLE);
+            post_message.mockClear();
+
+            await undo();
+            expect(posted(post_message, 'setTransform')).toHaveLength(1);
+            expect(cells_editable()).toEqual(HELD);
+            await undo();
+            await redo();
+            expect(posted(post_message, 'setTransform')).toHaveLength(1);
+            expect(warnings(post_message)).toEqual([]);
+
+            // Cancelling is how a slow one is abandoned.
+            await click_button('Cancel');
+            const cancel = latest_transform_request(post_message);
+            expect(cancel.intent).toBe('cancel');
+            expect(cells_editable()).toEqual(EDITABLE);
+            await install(cancel);
+            expect(undo_labels()).toEqual(['Sort', 'Filter']);
+            expect(redo_labels()).toEqual([]);
+        });
+
+        it('waits, with a message, while the saved view is still being restored on its sheet', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await change_view(post_message, { sort: SORT_ASC, filters: [] });
+            // A reload: the window asks for the saved view again.
+            await dispatch_host_message(refresh_snapshot_message(table_meta(), {
+                capabilities: CSV,
+                state: { transforms: [{ sort: SORT_ASC, filters: [], schema: SCHEMA }] },
+            }));
+            const restore = latest_transform_request(post_message);
+            expect(restore.intent).toBe('restore');
+            post_message.mockClear();
+
+            await undo();
+
+            expect(posted(post_message, 'setTransform')).toEqual([]);
+            expect(warnings(post_message)).toEqual([
+                'Undo did not run because the table view is still updating. Try again.',
+            ]);
+            expect(undo_labels()).toEqual(['Sort']);
+            // The restore is still the pending request: its answer installs.
+            await install(restore);
+            expect(grid_stub().getAttribute('data-generation')).toBe(String(view_generation));
+        });
+
+        it('moves the entry and says so when the host installs something else', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await change_view(post_message, { sort: SORT_ASC, filters: [] });
+            post_message.mockClear();
+
+            await undo();
+            // Asked for no sort; the host kept one.
+            await install(latest_transform_request(post_message), {
+                sort: [{ colIndex: 1, direction: 'desc' }],
+                filters: [],
+                schema: SCHEMA,
+            });
+
+            expect(undo_labels()).toEqual([]);
+            expect(redo_labels()).toEqual(['Sort']);
+            expect(warnings(post_message)).toEqual(['Undo of “Sort” was only partly applied.']);
+        });
+
+        it('moves a step whose effect is already in place without asking the host', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await change_view(post_message, { sort: SORT_ASC, filters: [] });
+            // Another window cleared the sort: the same rows, the durable rules changed.
+            await dispatch_host_message(refresh_snapshot_message(table_meta(), {
+                capabilities: CSV,
+                state: { transforms: [undefined] },
+            }));
+            post_message.mockClear();
+
+            await undo();
+
+            expect(posted(post_message, 'setTransform')).toEqual([]);
+            expect(warnings(post_message)).toEqual([]);
+            expect(undo_labels()).toEqual([]);
+            expect(redo_labels()).toEqual(['Sort']);
+        });
+
+        it('says an edit undo has to wait while this window\'s own sort is in flight', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await acquire_editing_session(post_message);
+            const record = props().history_store!.stage_record({
+                label: 'Edit cell',
+                changes: [{
+                    kind: 'cell' as const,
+                    delta: build_cell_history_delta({
+                        worksheet: { sheetIndex: 0, sheetName: 'Sheet1' },
+                        sourceRow: 0,
+                        sourceColumn: 0,
+                        before: absent_overlay(),
+                        after: value_only_overlay(history_value('edited'), history_value('Alice')),
+                        persistedValue: history_value('Alice'),
+                        persistedHyperlink: null,
+                    })!,
+                }],
+            });
+            expect(record.commit()).toBe(true);
+            record.notify();
+            const request = await ask(post_message, { sort: SORT_ASC, filters: [] });
+            post_message.mockClear();
+
+            await undo();
+
+            expect(warnings(post_message)).toEqual([
+                'Undo did not run because the table view is still updating. Try again.',
+            ]);
+            expect(posted(post_message, 'prepareHistoryReplay')).toEqual([]);
+            expect(undo_labels()).toEqual(['Edit cell']);
+            // The sort's step then lands above the edit, in gesture order.
+            await install(request!);
+            expect(undo_labels()).toEqual(['Edit cell', 'Sort']);
+        });
+    });
+
+    /** Record one committed edit of A1, the way the grid records a committed cell. */
+    function record_edit(text = 'edited') {
+        const record = props().history_store!.stage_record({
+            label: 'Edit cell',
+            changes: [{
+                kind: 'cell' as const,
+                delta: build_cell_history_delta({
+                    worksheet: { sheetIndex: 0, sheetName: 'Sheet1' },
+                    sourceRow: 0,
+                    sourceColumn: 0,
+                    before: absent_overlay(),
+                    after: value_only_overlay(history_value(text), history_value('Alice')),
+                    persistedValue: history_value('Alice'),
+                    persistedHyperlink: null,
+                })!,
+            }],
+        });
+        expect(record.commit()).toBe(true);
+        record.notify();
+    }
+
+    /** A reload of the same document: other rows, so pending view requests are dropped. */
+    function reload(
+        transforms: (SheetTransformState | undefined)[],
+        meta: WorkbookMeta = table_meta(),
+        extra: SnapshotExtra = {},
+    ) {
+        view_generation += 1;
+        return dispatch_host_message(refresh_snapshot_message(meta, {
+            generation: view_generation,
+            sourceGeneration: view_generation,
+            capabilities: CSV,
+            ...extra,
+            state: { transforms, ...extra.state },
+        }));
+    }
+
+    describe('a step that can no longer be applied', () => {
+        it('skips a sort whose columns changed, says so, and lets the older step through', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await change_view(post_message, { sort: [], filters: [FILTER] });
+            await change_view(post_message, { sort: SORT_ASC, filters: [FILTER] });
+            // A reload under which the worksheet has other columns: the host
+            // drops the rules that named the old ones.
+            const renamed = table_meta();
+            renamed.sheets[0].columnNames = ['Name', 'Amount', 'Notes'];
+            await reload([undefined], renamed);
+            post_message.mockClear();
+
+            await undo();
+
+            expect(posted(post_message, 'setTransform')).toEqual([]);
+            expect(warnings(post_message)).toEqual([
+                'Undo skipped “Sort”: the columns of this worksheet changed since then.',
+            ]);
+            // The step never stands in the way of the one under it.
+            expect(undo_labels()).toEqual(['Filter']);
+            expect(redo_labels()).toEqual(['Sort']);
+            expect(cells_editable()).toEqual(EDITABLE);
+        });
+
+        it('leaves out rows a reload removed, by name, and moves on', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            const hide = await hide_rows(post_message, [{ start: 4, end: 5 }]);
+            await install(hide!, { sort: [], filters: [], hiddenRows: [4, 5], schema: SCHEMA });
+            await undo();
+            await install(latest_transform_request(post_message));
+            expect(redo_labels()).toEqual(['Hide 2 rows']);
+            const shorter = table_meta();
+            shorter.sheets[0].rowCount = 3;
+            shorter.sheets[0].sourceRowCount = 3;
+            await reload([undefined], shorter);
+            post_message.mockClear();
+
+            await redo();
+
+            expect(posted(post_message, 'setTransform')).toEqual([]);
+            expect(warnings(post_message)).toEqual([
+                'Redo skipped “Hide 2 rows”: rows that are no longer in the worksheet were left out.',
+            ]);
+            expect(undo_labels()).toEqual(['Hide 2 rows']);
+            expect(redo_labels()).toEqual([]);
+        });
+
+        it('keeps rows above a promoted header hidden when a hide is undone', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            const hide = await hide_rows(post_message, [{ start: 0, end: 0 }, { start: 4, end: 4 }]);
+            await install(hide!, { sort: [], filters: [], hiddenRows: [0, 4], schema: SCHEMA });
+            // The header row is then chosen two rows down: the host hides what
+            // is above it, and those rows stay hidden while the header is on.
+            const promoted = table_meta();
+            promoted.sheets[0].columnNames = ['Ada', '36', 'x'];
+            promoted.sheets[0].excelFirstRowHeader = {
+                mode: 'on', detected: false, active: true, available: true, sourceRow: 2,
+            };
+            const promoted_schema = '["Sheet1",3,["Ada","36","x"]]';
+            await reload(
+                [{ sort: [], filters: [], hiddenRows: [0, 1, 4], schema: promoted_schema }],
+                promoted,
+            );
+            const restore = latest_transform_request(post_message);
+            await install(restore);
+            post_message.mockClear();
+
+            await undo();
+
+            const request = latest_transform_request(post_message);
+            expect(request.state.hiddenRows).toEqual([0, 1]);
+            await install(request);
+            expect(warnings(post_message)).toEqual([
+                'Undo skipped part of “Hide 2 rows”: rows above the header row stay hidden.',
+            ]);
+            expect(undo_labels()).toEqual([]);
+            expect(redo_labels()).toEqual(['Hide 2 rows']);
+        });
+    });
+
+    describe('an open cell editor', () => {
+        it('is committed before a sort is asked for, so its edit is under the sort', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await acquire_editing_session(post_message);
+            grid_shell_mock.commit_live_edit.mockImplementationOnce(() => record_edit());
+            post_message.mockClear();
+
+            const request = await ask(post_message, { sort: SORT_ASC, filters: [] });
+
+            expect(grid_shell_mock.commit_live_edit).toHaveBeenCalledTimes(1);
+            expect(grid_shell_mock.commit_live_edit).toHaveBeenCalledWith({ fenced_empty_ok: true });
+            expect(undo_labels()).toEqual(['Edit cell']);
+            await install(request!);
+            expect(undo_labels()).toEqual(['Edit cell', 'Sort']);
+            // The install had nothing to fold and did not try.
+            expect(grid_shell_mock.commit_live_edit).toHaveBeenCalledTimes(1);
+        });
+
+        it('that will not commit stops a sort, a hide, and a column change, with a message', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            grid_shell_mock.commit_live_edit.mockReturnValue(false);
+
+            expect(await ask(post_message, { sort: SORT_ASC, filters: [] })).toBeUndefined();
+            expect(await hide_rows(post_message, [{ start: 1, end: 1 }])).toBeUndefined();
+            await act(async () => props().on_hide_column?.(1));
+
+            expect(posted(post_message, 'setColumnVisibility')).toEqual([]);
+            expect(warnings(post_message)).toEqual([
+                'Finish or cancel the cell edit first.',
+                'Finish or cancel the cell edit first.',
+                'Finish or cancel the cell edit first.',
+            ]);
+            expect(cells_editable()).toEqual(EDITABLE);
+        });
+
+        it('is committed before Undo, which then undoes that edit and leaves the view step', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await change_view(post_message, { sort: SORT_ASC, filters: [] });
+            grid_shell_mock.commit_live_edit.mockImplementationOnce(() => record_edit());
+            post_message.mockClear();
+
+            await undo();
+
+            // Undo means the top entry after the commit: the edit, through the
+            // ordinary path, which starts by asking for a session.
+            expect(posted(post_message, 'setTransform')).toEqual([]);
+            await vi.waitUntil(() => posted(post_message, 'requestEditSession').length === 1);
+            expect(undo_labels()).toEqual(['Sort', 'Edit cell']);
+            expect(warnings(post_message)).toEqual([]);
+        });
+
+        it.each([
+            ['a sort', async (post_message: ReturnType<typeof vi.fn>) => {
+                await change_view(post_message, { sort: SORT_ASC, filters: [] });
+            }],
+            ['hidden columns', async (post_message: ReturnType<typeof vi.fn>) => {
+                await act(async () => props().on_hide_column?.(1));
+                await answer_column_write(post_message);
+            }],
+        ])('that will not commit stops the Undo of %s, with a message', async (_name, record_step) => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await record_step(post_message);
+            const before = undo_labels();
+            grid_shell_mock.commit_live_edit.mockReturnValue(false);
+            post_message.mockClear();
+
+            await undo();
+
+            expect(posted(post_message, 'setTransform')).toEqual([]);
+            expect(posted(post_message, 'setColumnVisibility')).toEqual([]);
+            expect(warnings(post_message)).toEqual(['Finish or cancel the cell edit first.']);
+            expect(undo_labels()).toEqual(before);
+        });
+
+        it('committed by Redo replaces what there was to redo, and Redo says so', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await change_view(post_message, { sort: SORT_ASC, filters: [] });
+            await undo();
+            await install(latest_transform_request(post_message));
+            expect(redo_labels()).toEqual(['Sort']);
+            grid_shell_mock.commit_live_edit.mockImplementationOnce(() => record_edit());
+            post_message.mockClear();
+
+            await redo();
+
+            expect(posted(post_message, 'setTransform')).toEqual([]);
+            expect(warnings(post_message)).toEqual([
+                'Nothing to redo: the cell edit you just finished replaced it.',
+            ]);
+            expect(undo_labels()).toEqual(['Edit cell']);
+            expect(redo_labels()).toEqual([]);
+        });
+
+        it('whose commit leaves the window busy stops the gesture and the Undo, each with a message', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await change_view(post_message, { sort: SORT_ASC, filters: [] });
+            // The commit records its edit and starts a write the window waits for.
+            const busy_commit = () => {
+                record_edit();
+                props().on_row_resize([{ start: 1, end: 1 }], 50, () => {});
+            };
+            grid_shell_mock.commit_live_edit.mockImplementationOnce(busy_commit);
+            post_message.mockClear();
+
+            expect(await ask(post_message, { sort: [], filters: [] })).toBeUndefined();
+            expect(warnings(post_message)).toEqual(['Wait for the table view to finish updating.']);
+            expect(undo_labels()).toEqual(['Sort', 'Edit cell']);
+        });
+
+        it('whose commit leaves the window busy stops the Undo of a view step, with a message', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await change_view(post_message, { sort: SORT_ASC, filters: [] });
+            let resize_started = false;
+            grid_shell_mock.commit_live_edit.mockImplementationOnce(() => {
+                // Nothing recorded, so the view step is still on top, but a
+                // tracked write is now in flight.
+                props().on_row_resize([{ start: 1, end: 1 }], 50, () => {});
+                resize_started = true;
+            });
+            post_message.mockClear();
+
+            await undo();
+
+            expect(resize_started).toBe(true);
+            expect(posted(post_message, 'setTransform')).toEqual([]);
+            expect(warnings(post_message)).toEqual([
+                'Undo did not run because another change is still being applied. Try again.',
+            ]);
+            expect(undo_labels()).toEqual(['Sort']);
+        });
+
+        it('is not folded by the install of a sort or of a replay, even where the fold would refuse', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            // An exiting session's fence: the fold refuses unless it is told
+            // that nothing open is fine.
+            grid_shell_mock.commit_live_edit.mockImplementation((
+                options?: { fenced_empty_ok?: boolean },
+            ) => options?.fenced_empty_ok === true);
+
+            const request = await ask(post_message, { sort: SORT_ASC, filters: [] });
+            expect(request, 'posted with nothing open and the fence up').toBeDefined();
+            await install(request!);
+            expect(grid_stub().getAttribute('data-generation')).toBe(String(view_generation));
+            expect(undo_labels()).toEqual(['Sort']);
+
+            await undo();
+            const replay = latest_transform_request(post_message);
+            await install(replay);
+            // The generation and the rules are adopted, the entry moved, and
+            // nothing is left pending.
+            expect(grid_stub().getAttribute('data-generation')).toBe(String(view_generation));
+            expect(redo_labels()).toEqual(['Sort']);
+            expect(props().transform_pending).toBe(false);
+            expect(cells_editable()).toEqual(EDITABLE);
+            for (const call of grid_shell_mock.commit_live_edit.mock.calls) {
+                expect(call).toEqual([{ fenced_empty_ok: true }]);
+            }
+        });
+
+        it('opened during a cancel round trip is folded by the cancel\'s install, as before', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await ask(post_message, { sort: SORT_ASC, filters: [] });
+            await click_button('Cancel');
+            const cancel = latest_transform_request(post_message);
+            // A cancel records nothing, so cells are editable while it is out.
+            expect(cells_editable()).toEqual(EDITABLE);
+            grid_shell_mock.commit_live_edit.mockClear();
+
+            await install(cancel);
+
+            expect(grid_shell_mock.commit_live_edit).toHaveBeenCalledTimes(1);
+            expect(grid_shell_mock.commit_live_edit).toHaveBeenCalledWith();
+        });
+    });
+
+    describe('one gesture at a time', () => {
+        it('does not start a column change, or a sort on another sheet, while a sort is pending', async () => {
+            const { post_message } = await render_app();
+            await open(post_message, {}, table_meta(['Sheet1', 'Sheet2']));
+
+            const first = await ask(post_message, { sort: SORT_ASC, filters: [] });
+            expect(cells_editable()).toEqual(HELD);
+            await act(async () => props().on_hide_column?.(1));
+            expect(posted(post_message, 'setColumnVisibility')).toEqual([]);
+            await click_button('Sheet2');
+            expect(grid_stub().getAttribute('data-sheet-index')).toBe('1');
+            expect(await ask(post_message, { sort: SORT_ASC, filters: [] })).toBeUndefined();
+            expect(warnings(post_message)).toEqual([
+                'Wait for the table view to finish updating.',
+                'Wait for the table view to finish updating.',
+            ]);
+
+            // So two installs cannot land in the other order: history holds the
+            // steps in the order of the gestures.
+            await install(first!);
+            expect(cells_editable()).toEqual(EDITABLE);
+            const second = await ask(post_message, { sort: SORT_ASC, filters: [] });
+            await install(second!);
+            const steps = history().undoStack.map((entry) => {
+                const change = entry.action.changes[0];
+                return change.kind === 'view' ? change.delta.worksheet.sheetName : change.kind;
+            });
+            expect(steps).toEqual(['Sheet1', 'Sheet2']);
+        });
+
+        it('does not start a sort while a column change is pending', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+
+            await act(async () => props().on_hide_column?.(1));
+            expect(posted(post_message, 'setColumnVisibility')).toHaveLength(1);
+            expect(cells_editable()).toEqual(HELD);
+            expect(await ask(post_message, { sort: SORT_ASC, filters: [] })).toBeUndefined();
+            await act(async () => props().on_hide_column?.(2));
+            expect(posted(post_message, 'setColumnVisibility')).toHaveLength(1);
+            expect(warnings(post_message)).toEqual([
+                'Wait for the table view to finish updating.',
+                'Wait for the table view to finish updating.',
+            ]);
+
+            await answer_column_write(post_message);
+            expect(cells_editable()).toEqual(EDITABLE);
+            expect(undo_labels()).toEqual(['Hide column']);
+        });
+
+        it('admits no edit while a sort is pending, and still lets a second sort replace it', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+
+            await ask(post_message, { sort: SORT_ASC, filters: [] });
+            // What a paste, a fill, and the hyperlink dialog ask before recording.
+            expect(props().gestures_admitted?.()).toBe(false);
+            expect(props().view_request_in_flight).toBe(true);
+
+            const second = await ask(post_message, { sort: [{ colIndex: 1, direction: 'desc' }], filters: [] });
+            expect(second).toBeDefined();
+            await install(second!);
+            expect(cells_editable()).toEqual(EDITABLE);
+        });
+    });
+
+    describe('every way out of a pending view request leaves cells editable', () => {
+        it.each([
+            ['an install', async (request: { sheetIndex: number; requestId: string; sourceGeneration: number }) => {
+                await install(request);
+            }],
+            ['a refusal', async (request: { sheetIndex: number; requestId: string }) => {
+                await refuse(request);
+            }],
+            ['a cancel', async () => {
+                await click_button('Cancel');
+            }],
+            ['a reload', async () => {
+                await reload([undefined]);
+            }],
+            ['another document', async () => {
+                await dispatch_host_message(initial_snapshot_message(table_meta(), {
+                    capabilities: CSV,
+                    identity: { authority: { fileId: 'file:other', revision: 1 } },
+                }));
+            }],
+        ])('%s', async (_name, leave) => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            const request = await ask(post_message, { sort: SORT_ASC, filters: [] });
+            expect(cells_editable()).toEqual(HELD);
+
+            await leave(request!);
+
+            expect(cells_editable()).toEqual(EDITABLE);
+        });
+
+        it('a column write the host did not make', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await act(async () => props().on_hide_column?.(1));
+            expect(cells_editable()).toEqual(HELD);
+
+            await answer_column_write(post_message, false);
+
+            expect(cells_editable()).toEqual(EDITABLE);
+        });
+    });
+
+    describe('while this window\'s editing session is being let go', () => {
+        /** A held session, one sort recorded, and the session then released. */
+        async function sorted_then_released(post_message: ReturnType<typeof vi.fn>) {
+            await open(post_message);
+            await acquire_editing_session(post_message);
+            await change_view(post_message, { sort: SORT_ASC, filters: [] });
+            // As after the Undo that took back the last unsaved edit: the grid
+            // has no more use for the session and the window lets it go.
+            await release_idle_edit_session();
+            expect(posted(post_message, 'releaseEditSession')).toHaveLength(1);
+            post_message.mockClear();
+        }
+
+        /** The host's snapshot once the session is gone. */
+        function session_gone() {
+            return dispatch_host_message(refresh_snapshot_message(table_meta(), {
+                generation: view_generation,
+                sourceGeneration: 1,
+                reason: 'other',
+                capabilities: CSV,
+                state: { transforms: [{ sort: SORT_ASC, filters: [], schema: SCHEMA }] },
+            }));
+        }
+
+        it('Undo of a view step waits, saying nothing, and runs once the session is gone', async () => {
+            const { post_message } = await render_app();
+            // The fence an exiting session raises: a fold refuses under it
+            // unless told that nothing open is fine.
+            grid_shell_mock.commit_live_edit.mockImplementation((
+                options?: { fenced_empty_ok?: boolean },
+            ) => options?.fenced_empty_ok === true);
+            await sorted_then_released(post_message);
+
+            await undo();
+            expect(posted(post_message, 'setTransform')).toEqual([]);
+            expect(warnings(post_message)).toEqual([]);
+            expect(cells_editable()).toEqual(HELD);
+            // A second press meanwhile is held, silently, like any press
+            // behind a replay in flight.
+            await undo();
+            await redo();
+            expect(posted(post_message, 'setTransform')).toEqual([]);
+            expect(warnings(post_message)).toEqual([]);
+
+            await session_gone();
+            await vi.waitUntil(() => posted(post_message, 'setTransform').length === 1);
+
+            const replay = latest_transform_request(post_message);
+            expect(replay.state.sort).toEqual([]);
+            expect(grid_stub().getAttribute('data-editing-session-held')).toBe('false');
+            await install(replay);
+            expect(redo_labels()).toEqual(['Sort']);
+            expect(warnings(post_message)).toEqual([]);
+            expect(cells_editable()).toEqual(EDITABLE);
+        });
+
+        it('gives up after a bound with a message, and leaves the window usable', async () => {
+            const { post_message } = await render_app();
+            await sorted_then_released(post_message);
+            vi.useFakeTimers();
+            try {
+                await undo();
+                expect(cells_editable()).toEqual(HELD);
+                await act(async () => { vi.advanceTimersByTime(4_999); });
+                expect(warnings(post_message)).toEqual([]);
+                await act(async () => { vi.advanceTimersByTime(1); });
+                await act(async () => { await Promise.resolve(); });
+
+                expect(warnings(post_message)).toEqual([
+                    'Undo did not run because editing is still finishing. Try again.',
+                ]);
+                expect(posted(post_message, 'setTransform')).toEqual([]);
+                expect(undo_labels()).toEqual(['Sort']);
+                expect(cells_editable()).toEqual(EDITABLE);
+                expect(vi.getTimerCount()).toBe(0);
+            } finally {
+                vi.useRealTimers();
+            }
+        });
+
+        it('is abandoned, with nothing posted, when another document arrives', async () => {
+            const { post_message } = await render_app();
+            await sorted_then_released(post_message);
+
+            await undo();
+            await dispatch_host_message(initial_snapshot_message(table_meta(), {
+                capabilities: CSV,
+                identity: { authority: { fileId: 'file:other', revision: 1 } },
+            }));
+            await act(async () => { await Promise.resolve(); });
+
+            expect(posted(post_message, 'setTransform')).toEqual([]);
+            expect(warnings(post_message)).toEqual([]);
+            expect(undo_labels()).toEqual([]);
+            expect(cells_editable()).toEqual(EDITABLE);
+        });
+
+        it('does not wait in a window that holds no session', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await change_view(post_message, { sort: SORT_ASC, filters: [] });
+            post_message.mockClear();
+            vi.useFakeTimers();
+            try {
+                await undo();
+                // Posted in the same turn, and no timer was started for it.
+                expect(posted(post_message, 'setTransform')).toHaveLength(1);
+                expect(vi.getTimerCount()).toBe(0);
+            } finally {
+                vi.useRealTimers();
+            }
+        });
+    });
+
+    describe('a reload that overtakes a pending sort', () => {
+        const SORTED: SheetTransformState = { sort: SORT_ASC, filters: [], schema: SCHEMA };
+        const OTHERS_FILTER: SheetTransformState = { sort: [], filters: [FILTER], schema: SCHEMA };
+
+        it('records the step when the reload carries the sort, and the late answer adds nothing', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            const request = await ask(post_message, { sort: SORT_ASC, filters: [] });
+
+            await reload([SORTED]);
+
+            expect(undo_labels()).toEqual(['Sort']);
+            // The window asks for the saved view again on the new rows.
+            const restore = latest_transform_request(post_message);
+            expect(restore.intent).toBe('restore');
+            await install(request!);
+            expect(undo_labels()).toEqual(['Sort']);
+            await install(restore);
+            expect(undo_labels()).toEqual(['Sort']);
+
+            // And the step undoes.
+            await undo();
+            const replay = latest_transform_request(post_message);
+            expect(replay.state.sort).toEqual([]);
+            await install(replay);
+            expect(redo_labels()).toEqual(['Sort']);
+        });
+
+        it('records nothing when the reload carries the rules from before', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await ask(post_message, { sort: SORT_ASC, filters: [] });
+
+            await reload([undefined]);
+
+            expect(undo_labels()).toEqual([]);
+            expect(cells_editable()).toEqual(EDITABLE);
+        });
+
+        it('records nothing, and keeps redo, when the reload carries only another window\'s filter', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await change_view(post_message, { sort: [], filters: [{ ...FILTER, id: 'mine' }] });
+            await undo();
+            await install(latest_transform_request(post_message));
+            expect(redo_labels()).toEqual(['Filter']);
+            await ask(post_message, { sort: SORT_ASC, filters: [] });
+
+            await reload([OTHERS_FILTER]);
+
+            expect(undo_labels()).toEqual([]);
+            expect(redo_labels()).toEqual(['Filter']);
+        });
+
+        it('records the sort alone when the reload carries it beside another window\'s filter', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await ask(post_message, { sort: SORT_ASC, filters: [] });
+
+            await reload([{ sort: SORT_ASC, filters: [FILTER], schema: SCHEMA }]);
+
+            expect(undo_labels()).toEqual(['Sort']);
+            const change = history().undoStack[0].action.changes[0];
+            expect(change.kind === 'view' && change.delta.slice === 'transform' && change.delta)
+                .toMatchObject({ sort: { before: [], after: SORT_ASC } });
+            expect(change.kind === 'view' && change.delta.slice === 'transform'
+                && change.delta.filters).toBeUndefined();
+        });
+
+        it('records nothing for hidden rows, which a reload cannot vouch for', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await hide_rows(post_message, [{ start: 1, end: 2 }]);
+            expect(cells_editable()).toEqual(HELD);
+
+            await reload([{ sort: [], filters: [], hiddenRows: [1, 2], schema: SCHEMA }]);
+
+            expect(undo_labels()).toEqual([]);
+            expect(cells_editable()).toEqual(EDITABLE);
+        });
+
+        it('moves a replay it overtook when the reload shows the replay\'s target', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await change_view(post_message, { sort: SORT_ASC, filters: [] });
+            await undo();
+            const replay = latest_transform_request(post_message);
+            post_message.mockClear();
+
+            await reload([undefined]);
+
+            expect(undo_labels()).toEqual([]);
+            expect(redo_labels()).toEqual(['Sort']);
+            expect(warnings(post_message)).toEqual([]);
+            // Its own answer no longer matches and changes nothing.
+            await install(replay);
+            expect(redo_labels()).toEqual(['Sort']);
+            expect(cells_editable()).toEqual(EDITABLE);
+        });
+
+        it('keeps a replay\'s entry, with a message, when the reload still shows the old rules', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await change_view(post_message, { sort: SORT_ASC, filters: [] });
+            await undo();
+            post_message.mockClear();
+
+            await reload([SORTED]);
+
+            expect(undo_labels()).toEqual(['Sort']);
+            expect(redo_labels()).toEqual([]);
+            expect(warnings(post_message)).toEqual([
+                'Undo did not run because the file was refreshing. Try again.',
+            ]);
+        });
+    });
+
+    describe('worksheets that move or go while a request is pending', () => {
+        function workbook(order: ('a' | 'b')[]): WorkbookMeta {
+            const meta = table_meta(order.map((id) => (id === 'a' ? 'Alpha' : 'Beta')));
+            order.forEach((id, index) => { meta.sheets[index].worksheetId = `ws-${id}`; });
+            return meta;
+        }
+        const ALPHA_SCHEMA = '["Alpha",3,["Name","Value","Notes"]]';
+        const BETA_SCHEMA = '["Beta",3,["Name","Value","Notes"]]';
+
+        it('records a sort on its own worksheet after a reload reorders them', async () => {
+            const { post_message } = await render_app();
+            await open(post_message, {}, workbook(['a', 'b']));
+            await ask(post_message, { sort: SORT_ASC, filters: [] });
+
+            await reload(
+                [undefined, { sort: SORT_ASC, filters: [], schema: ALPHA_SCHEMA }],
+                workbook(['b', 'a']),
+            );
+
+            expect(undo_labels()).toEqual(['Sort']);
+            const change = history().undoStack[0].action.changes[0];
+            expect(change.kind === 'view' && change.delta.worksheet).toEqual({
+                sheetIndex: 1,
+                sheetName: 'Alpha',
+                worksheetId: 'ws-a',
+            });
+        });
+
+        it('records nothing when only the sheet now at the old index holds the sort', async () => {
+            const { post_message } = await render_app();
+            await open(post_message, {}, workbook(['a', 'b']));
+            await ask(post_message, { sort: SORT_ASC, filters: [] });
+
+            // Beta sits where Alpha was, and happens to be sorted the same way.
+            await reload(
+                [{ sort: SORT_ASC, filters: [], schema: BETA_SCHEMA }, undefined],
+                workbook(['b', 'a']),
+            );
+
+            expect(undo_labels()).toEqual([]);
+        });
+
+        it('records nothing for a worksheet the reload removed, and says a replay is unavailable', async () => {
+            const { post_message } = await render_app();
+            await open(post_message, {}, workbook(['a', 'b']));
+            await change_view(post_message, { sort: SORT_ASC, filters: [] });
+            await ask(post_message, { sort: SORT_ASC, filters: [FILTER] });
+            await reload([undefined], workbook(['b']));
+            expect(undo_labels()).toEqual(['Sort']);
+            post_message.mockClear();
+
+            await undo();
+
+            expect(posted(post_message, 'setTransform')).toEqual([]);
+            expect(warnings(post_message)).toEqual([
+                'Undo is unavailable: the change it would apply can no longer be reached.',
+            ]);
+            expect(undo_labels()).toEqual(['Sort']);
+        });
+
+        it('says a replay is unavailable when a reload removes its worksheet under it', async () => {
+            const { post_message } = await render_app();
+            await open(post_message, {}, workbook(['a', 'b']));
+            await change_view(post_message, { sort: SORT_ASC, filters: [] });
+            await undo();
+            post_message.mockClear();
+
+            await reload([undefined], workbook(['b']));
+
+            expect(warnings(post_message)).toEqual([
+                'Undo is unavailable: the change it would apply can no longer be reached.',
+            ]);
+            expect(undo_labels()).toEqual(['Sort']);
+            expect(cells_editable()).toEqual(EDITABLE);
+        });
+
+        it('shows the step\'s worksheet before asking the host', async () => {
+            const { post_message } = await render_app();
+            await open(post_message, {}, workbook(['a', 'b']));
+            await click_button('Beta');
+            await change_view(post_message, { sort: SORT_ASC, filters: [] });
+            await act(async () => props().on_hide_column?.(1));
+            await answer_column_write(post_message);
+            await click_button('Alpha');
+            expect(grid_stub().getAttribute('data-sheet-index')).toBe('0');
+            post_message.mockClear();
+
+            await undo();
+            expect(grid_stub().getAttribute('data-sheet-index')).toBe('1');
+            expect(latest_column_write(post_message)).toMatchObject({ sheetIndex: 1, sheetName: 'Beta' });
+            await answer_column_write(post_message);
+            await click_button('Alpha');
+
+            await undo();
+            expect(grid_stub().getAttribute('data-sheet-index')).toBe('1');
+            expect(latest_transform_request(post_message).sheetIndex).toBe(1);
+        });
+    });
+
+    describe('hidden columns', () => {
+        const projection = () => JSON.parse(grid_stub().getAttribute('data-projection')!) as number[];
+        const hide_column = (column: number) => act(async () => props().on_hide_column?.(column));
+        const HIDDEN_VALUE = { hiddenColumns: [1], schema: SCHEMA };
+
+        /** A snapshot of the same rows carrying these columns, as a delivery after a write. */
+        function columns_delivery(visibility: SheetColumnVisibilityState | undefined) {
+            return dispatch_host_message(refresh_snapshot_message(table_meta(), {
+                generation: view_generation,
+                sourceGeneration: 1,
+                reason: 'other',
+                capabilities: CSV,
+                state: { columnVisibility: [visibility] },
+            }));
+        }
+
+        it('is a step once the host has written it, undone and redone on the host\'s answer', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+
+            await hide_column(1);
+            // Shown at once, recorded only when the write is known to have happened.
+            expect(projection()).toEqual([0, 2]);
+            expect(undo_labels()).toEqual([]);
+            await answer_column_write(post_message);
+            expect(undo_labels()).toEqual(['Hide column']);
+            expect(posted(post_message, 'historyMenuStateChanged').at(-1)!.state)
+                .toMatchObject({ undoLabel: 'Hide column' });
+            post_message.mockClear();
+
+            await undo();
+            expect(latest_column_write(post_message)).toMatchObject({
+                sheetIndex: 0,
+                sheetName: 'Sheet1',
+                state: undefined,
+                requestId: expect.any(String),
+            });
+            expect(projection()).toEqual([0, 1, 2]);
+            expect(undo_labels()).toEqual(['Hide column']);
+            await answer_column_write(post_message);
+            expect(undo_labels()).toEqual([]);
+            expect(redo_labels()).toEqual(['Hide column']);
+
+            await redo();
+            expect(latest_column_write(post_message).state).toEqual(HIDDEN_VALUE);
+            expect(projection()).toEqual([0, 2]);
+            await answer_column_write(post_message);
+            expect(undo_labels()).toEqual(['Hide column']);
+            expect(redo_labels()).toEqual([]);
+
+            expect(posted(post_message, 'requestEditSession')).toEqual([]);
+            expect(posted(post_message, 'setTransform')).toEqual([]);
+            expect(warnings(post_message)).toEqual([]);
+        });
+
+        it('names a hide and a show by how many columns they changed', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+
+            await act(async () => props().on_hide_columns?.([0, 2]));
+            await answer_column_write(post_message);
+            await open_columns();
+            await click_button('Show all');
+            await answer_column_write(post_message);
+            await act(async () => props().on_hide_column?.(2));
+            await answer_column_write(post_message);
+            // The toggle in the Columns popover shows one again.
+            await act(async () => document.querySelector<HTMLInputElement>(
+                'input[aria-label="Show Notes"]',
+            )!.click());
+            await answer_column_write(post_message);
+
+            expect(undo_labels()).toEqual([
+                'Hide 2 columns',
+                'Show 2 columns',
+                'Hide column',
+                'Show column',
+            ]);
+        });
+
+        it('undoes a show by hiding only the columns it showed', async () => {
+            const { post_message } = await render_app();
+            await open(post_message, { state: { columnVisibility: [{ hiddenColumns: [0, 1], schema: SCHEMA }] } });
+            await open_columns();
+            await click_button('Show all');
+            await answer_column_write(post_message);
+            // Another column hidden since, by this window.
+            await hide_column(2);
+            await answer_column_write(post_message);
+            // Focus leaves the Columns popover's search field, where Undo is
+            // the field's own text undo.
+            await act(async () => (document.activeElement as HTMLElement | null)?.blur());
+            await undo();
+            await answer_column_write(post_message);
+            expect(undo_labels()).toEqual(['Show 2 columns']);
+            post_message.mockClear();
+
+            await undo();
+
+            // Columns 0 and 1 hidden again, in the shorter of the two stored forms.
+            expect(latest_column_write(post_message).state)
+                .toEqual({ visibleColumns: [2], schema: SCHEMA });
+        });
+
+        it('is put back, with a message and no step, when the host did not write it', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+
+            await hide_column(1);
+            await answer_column_write(post_message, false);
+
+            expect(projection()).toEqual([0, 1, 2]);
+            expect(undo_labels()).toEqual([]);
+            expect(warnings(post_message)).toEqual([
+                'Could not change the columns because the file was refreshing. Try again.',
+            ]);
+        });
+
+        it('keeps its entry and its columns when the host did not write an Undo', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await hide_column(1);
+            await answer_column_write(post_message);
+            post_message.mockClear();
+
+            await undo();
+            expect(projection()).toEqual([0, 1, 2]);
+            await answer_column_write(post_message, false);
+
+            expect(projection()).toEqual([0, 2]);
+            expect(undo_labels()).toEqual(['Hide column']);
+            expect(redo_labels()).toEqual([]);
+            expect(warnings(post_message)).toEqual([
+                'Undo did not run because the file was refreshing. Try again.',
+            ]);
+            expect(cells_editable()).toEqual(EDITABLE);
+        });
+
+        it('stays as a refresh set it when the answer then says nothing was written', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+
+            await hide_column(1);
+            // Another window hid the same column; this window's write was refused.
+            await columns_delivery(HIDDEN_VALUE);
+            await answer_column_write(post_message, false);
+
+            expect(projection()).toEqual([0, 2]);
+            expect(undo_labels()).toEqual([]);
+        });
+
+        it.each([
+            ['before the answer', true],
+            ['after the answer', false],
+        ])('ends on the written columns with one step when an older refresh arrives %s', async (_name, refresh_first) => {
+            const { post_message } = await render_app();
+            await open(post_message);
+
+            await hide_column(1);
+            const old_refresh = () => columns_delivery(undefined);
+            if (refresh_first) await old_refresh();
+            await answer_column_write(post_message);
+            if (!refresh_first) await old_refresh();
+            // The delivery the host posts after its commit follows.
+            await columns_delivery(HIDDEN_VALUE);
+
+            expect(projection()).toEqual([0, 2]);
+            expect(undo_labels()).toEqual(['Hide column']);
+            expect(warnings(post_message)).toEqual([]);
+        });
+
+        it('does not put its own columns back over a newer state another window wrote', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+
+            await hide_column(1);
+            // The delivery after the commit already carries the other window's
+            // later change to the same sheet.
+            await columns_delivery({ hiddenColumns: [2], schema: SCHEMA });
+            await answer_column_write(post_message);
+
+            // The answer settles history and never writes the view.
+            expect(projection()).toEqual([0, 1]);
+            expect(undo_labels()).toEqual(['Hide column']);
+        });
+
+        it('is recorded by a reload that shows it, and the late answer adds nothing', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await hide_column(1);
+            const write = latest_column_write(post_message);
+
+            // An answer that names the newer source arrives first: it changes
+            // nothing, and the snapshot of that source decides.
+            await dispatch_host_message({
+                type: 'columnVisibilityChanged',
+                requestId: write.requestId!,
+                sheetIndex: 0,
+                applied: true,
+                sourceGeneration: 2,
+            });
+            expect(undo_labels()).toEqual([]);
+            expect(cells_editable()).toEqual(HELD);
+            await reload([undefined], table_meta(), { state: { columnVisibility: [HIDDEN_VALUE] } });
+
+            expect(undo_labels()).toEqual(['Hide column']);
+            expect(cells_editable()).toEqual(EDITABLE);
+            await answer_column_write(post_message, true, view_generation);
+            expect(undo_labels()).toEqual(['Hide column']);
+        });
+
+        it('is not recorded by a reload that shows the columns from before', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await hide_column(1);
+
+            await reload([undefined], table_meta(), { state: { columnVisibility: [undefined] } });
+
+            expect(projection()).toEqual([0, 1, 2]);
+            expect(undo_labels()).toEqual([]);
+            expect(cells_editable()).toEqual(EDITABLE);
+            await answer_column_write(post_message, false);
+            expect(undo_labels()).toEqual([]);
+        });
+
+        it('is forgotten, with history, when another document arrives, whatever that document shows', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await hide_column(1);
+
+            // The other document happens to hide the same column.
+            await dispatch_host_message(initial_snapshot_message(table_meta(), {
+                capabilities: CSV,
+                identity: { authority: { fileId: 'file:other', revision: 1 } },
+                state: { columnVisibility: [HIDDEN_VALUE] },
+            }));
+            await answer_column_write(post_message);
+
+            expect(undo_labels()).toEqual([]);
+            expect(redo_labels()).toEqual([]);
+            expect(cells_editable()).toEqual(EDITABLE);
+        });
+
+        it('says a column step skipped when the worksheet has other columns now', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await hide_column(1);
+            await answer_column_write(post_message);
+            const renamed = table_meta();
+            renamed.sheets[0].columnNames = ['Name', 'Amount', 'Notes'];
+            await reload([undefined], renamed);
+            post_message.mockClear();
+
+            await undo();
+
+            expect(posted(post_message, 'setColumnVisibility')).toEqual([]);
+            expect(warnings(post_message)).toEqual([
+                'Undo skipped “Hide column”: the columns of this worksheet changed since then.',
+            ]);
+            expect(redo_labels()).toEqual(['Hide column']);
+        });
+
+        it('works in preview, where sorts and filters do not', async () => {
+            const { post_message } = await render_app();
+            await open(post_message, { configuration: { previewMode: true } });
+            expect(grid_stub().getAttribute('data-preview')).toBe('true');
+
+            await hide_column(1);
+            expect(latest_column_write(post_message).state).toEqual(HIDDEN_VALUE);
+            await answer_column_write(post_message);
+            expect(undo_labels()).toEqual(['Hide column']);
+
+            await undo();
+            expect(latest_column_write(post_message).state).toBeUndefined();
+            await answer_column_write(post_message);
+            expect(redo_labels()).toEqual(['Hide column']);
+
+            await redo();
+            expect(latest_column_write(post_message).state).toEqual(HIDDEN_VALUE);
+            await answer_column_write(post_message);
+            expect(undo_labels()).toEqual(['Hide column']);
+            expect(posted(post_message, 'setColumnVisibility')).toHaveLength(3);
+            expect(warnings(post_message)).toEqual([]);
+        });
+    });
+
+    describe('folds that are not for a view request', () => {
+        // Under an exiting session's fence the fold answers false unless it is
+        // told that nothing open is fine. Only view requests and the snapshot
+        // handler tell it so.
+        const fenced = (options?: { fenced_empty_ok?: boolean }) => options?.fenced_empty_ok === true;
+
+        it('adopts a reload that remounts the grid while the fence is up and nothing is open', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            grid_shell_mock.commit_live_edit.mockImplementation(fenced);
+            grid_shell_mock.flush_live_edit.mockImplementation(fenced);
+
+            await reload([undefined]);
+
+            expect(grid_stub().getAttribute('data-generation')).toBe(String(view_generation));
+            expect(grid_shell_mock.commit_live_edit).toHaveBeenCalledWith({ fenced_empty_ok: true });
+        });
+
+        it('adopts a snapshot that changes the active sheet while the fence is up and nothing is open', async () => {
+            const { post_message } = await render_app();
+            await open(post_message, {}, table_meta(['Sheet1', 'Sheet2']));
+            await click_button('Sheet2');
+            expect(grid_stub().getAttribute('data-sheet-index')).toBe('1');
+            grid_shell_mock.commit_live_edit.mockImplementation(fenced);
+            grid_shell_mock.flush_live_edit.mockImplementation(fenced);
+
+            // The worksheet on screen is gone after the reload.
+            await reload([undefined], table_meta(['Sheet1']));
+
+            expect(grid_stub().getAttribute('data-sheet-index')).toBe('0');
+            expect(grid_stub().getAttribute('data-generation')).toBe(String(view_generation));
+            expect(grid_shell_mock.flush_live_edit).toHaveBeenCalledWith({ fenced_empty_ok: true });
+        });
+
+        it('leaves a worksheet switch and Clear all highlights refusing under the fence, as before', async () => {
+            const { post_message } = await render_app();
+            await open(post_message, {}, table_meta(['Sheet1', 'Sheet2']));
+            await acquire_editing_session(post_message);
+            grid_shell_mock.commit_live_edit.mockImplementation(fenced);
+            post_message.mockClear();
+
+            await click_button('Sheet2');
+            expect(grid_stub().getAttribute('data-sheet-index')).toBe('0');
+            await click_button('Highlight');
+            await click_button('Clear all highlights');
+            expect(posted(post_message, 'clearAllCellHighlights')).toEqual([]);
+
+            expect(grid_shell_mock.commit_live_edit.mock.calls.length).toBeGreaterThanOrEqual(2);
+            for (const call of grid_shell_mock.commit_live_edit.mock.calls) {
+                expect(call).toEqual([]);
+            }
+        });
+    });
+
+    describe('with edits', () => {
+        /** Answer the cell replay in flight the way the host does: prepared, then committed. */
+        async function complete_cell_replay(post_message: ReturnType<typeof vi.fn>) {
+            await vi.waitUntil(() => posted(post_message, 'prepareHistoryReplay').length > 0);
+            const prepare = posted(post_message, 'prepareHistoryReplay').at(-1)!;
+            await dispatch_host_message({
+                type: 'historyReplayPrepared',
+                prepared: {
+                    requestId: prepare.request.requestId,
+                    replayId: prepare.request.replayId,
+                    leaseId: `lease:${prepare.request.requestId}`,
+                    focusSheetIndex: 0,
+                    focus: prepare.request.focus,
+                    cells: prepare.request.cells.map((cell) => ({
+                        ...cell,
+                        resolvedSheetIndex: 0,
+                        persisted: { text: 'Alice' },
+                        persistedHyperlink: null,
+                    })),
+                },
+            });
+            const commit = posted(post_message, 'commitHistoryReplay').at(-1)!;
+            await dispatch_host_message({
+                type: 'historyReplayCommitted',
+                committed: {
+                    requestId: commit.request.requestId,
+                    replayId: commit.request.replayId,
+                    leaseId: commit.request.leaseId,
+                    mutationId: commit.request.mutationId,
+                    sourceGeneration: 1,
+                    cells: commit.request.cells.map((write) => ({
+                        ordinal: write.ordinal,
+                        resolvedSheetIndex: 0,
+                        key: '0:0',
+                        entry: write.entry,
+                    })),
+                    focusSheetIndex: 0,
+                    focus: prepare.request.focus,
+                    displayFocus: null,
+                },
+            });
+            post_message.mockClear();
+        }
+
+        it('undoes a sort and then the edit under it, lets the session go, and redoes both', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await acquire_editing_session(post_message, 'first-session');
+            await act(async () => {
+                props().edit_session!.commit('first-session', '0:0', { value: 'edited', base: 'Alice' });
+            });
+            record_edit('edited');
+            await change_view(post_message, { sort: SORT_ASC, filters: [] });
+            expect(undo_labels()).toEqual(['Edit cell', 'Sort']);
+            post_message.mockClear();
+
+            // Undo the sort: no session is asked for, the held one is enough.
+            await undo();
+            await install(latest_transform_request(post_message));
+            expect(undo_labels()).toEqual(['Edit cell']);
+            // Undo the edit, through the cell replay.
+            await undo();
+            await complete_cell_replay(post_message);
+            expect(undo_labels()).toEqual([]);
+            expect(redo_labels()).toEqual(['Sort', 'Edit cell']);
+            expect(latest_store_edits()).toEqual({});
+
+            // Nothing is unsaved any more: the window lets the session go.
+            await release_idle_edit_session();
+            expect(posted(post_message, 'releaseEditSession')).toHaveLength(1);
+            await dispatch_host_message(refresh_snapshot_message(table_meta(), {
+                generation: view_generation,
+                sourceGeneration: 1,
+                reason: 'other',
+                capabilities: CSV,
+            }));
+            expect(grid_stub().getAttribute('data-editing-session-held')).toBe('false');
+            // Every step is still there to redo.
+            expect(redo_labels()).toEqual(['Sort', 'Edit cell']);
+            post_message.mockClear();
+
+            // Redo the edit: that one needs a session again.
+            await redo();
+            await vi.waitUntil(() => posted(post_message, 'requestEditSession').length === 1);
+            await dispatch_host_message({
+                type: 'editSessionResult',
+                granted: true,
+                editSessionId: 'second-session',
+            });
+            await dispatch_host_message(refresh_snapshot_message(table_meta(), {
+                generation: view_generation,
+                sourceGeneration: 1,
+                reason: 'other',
+                capabilities: { ...CSV, csvEditSessionId: 'second-session' },
+            }));
+            await complete_cell_replay(post_message);
+            expect(undo_labels()).toEqual(['Edit cell']);
+            expect(latest_store_edits()).toEqual({ '0:0': expect.objectContaining({ value: 'edited' }) });
+
+            // Redo the sort.
+            await redo();
+            const redone = latest_transform_request(post_message);
+            expect(redone.state.sort).toEqual(SORT_ASC);
+            await install(redone);
+            expect(undo_labels()).toEqual(['Edit cell', 'Sort']);
+            expect(redo_labels()).toEqual([]);
+            expect(warnings(post_message)).toEqual([]);
+        });
+
+        it('does not hold an edit Undo behind a cancel', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await acquire_editing_session(post_message);
+            record_edit();
+            await ask(post_message, { sort: SORT_ASC, filters: [] });
+            await click_button('Cancel');
+            post_message.mockClear();
+
+            await undo();
+
+            await vi.waitUntil(() => posted(post_message, 'prepareHistoryReplay').length === 1);
+            expect(warnings(post_message)).toEqual([]);
+        });
+    });
+
+    // The host drops rules and hidden columns that named columns a reload
+    // replaced, so "nothing sorted" and "nothing hidden" are what the reload
+    // shows whether or not the pending request landed. A step taken from that
+    // would name old column positions among the new columns.
+    describe('a reload that brings other columns while a request is pending', () => {
+        function other_columns(): WorkbookMeta {
+            const meta = table_meta();
+            meta.sheets[0].columnNames = ['Id', 'Amount', 'Notes'];
+            return meta;
+        }
+
+        it('records nothing for a pending Clear sort, though the reload shows no sort', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await change_view(post_message, { sort: SORT_ASC, filters: [] });
+            await ask(post_message, { sort: [], filters: [] });
+
+            await reload([undefined], other_columns());
+
+            expect(undo_labels()).toEqual(['Sort']);
+            expect(cells_editable()).toEqual(EDITABLE);
+        });
+
+        it('records nothing for a pending Show all, though the reload shows every column', async () => {
+            const { post_message } = await render_app();
+            await open(post_message, {
+                state: { columnVisibility: [{ hiddenColumns: [0, 1], schema: SCHEMA }] },
+            });
+            await open_columns();
+            await click_button('Show all');
+            expect(latest_column_write(post_message).state).toBeUndefined();
+
+            await reload([undefined], other_columns(), { state: { columnVisibility: [undefined] } });
+
+            expect(undo_labels()).toEqual([]);
+            expect(cells_editable()).toEqual(EDITABLE);
+        });
+
+        it('keeps the entry of a replay it overtook, with a message, and the next Undo skips it', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await change_view(post_message, { sort: SORT_ASC, filters: [] });
+            await undo();
+            expect(posted(post_message, 'setTransform')).toHaveLength(2);
+            post_message.mockClear();
+
+            await reload([undefined], other_columns());
+
+            expect(undo_labels()).toEqual(['Sort']);
+            expect(redo_labels()).toEqual([]);
+            expect(warnings(post_message)).toEqual([
+                'Undo did not run because the file was refreshing. Try again.',
+            ]);
+            post_message.mockClear();
+            await undo();
+            expect(warnings(post_message)).toEqual([
+                'Undo skipped “Sort”: the columns of this worksheet changed since then.',
+            ]);
+            expect(redo_labels()).toEqual(['Sort']);
+        });
+    });
+
+    describe('a gesture that changes nothing', () => {
+        it('does not fold the open editor: the same sort again, and Show all with nothing hidden', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await change_view(post_message, { sort: SORT_ASC, filters: [] });
+            grid_shell_mock.commit_live_edit.mockClear();
+            post_message.mockClear();
+
+            expect(await ask(post_message, { sort: SORT_ASC, filters: [] })).toBeUndefined();
+            await open_columns();
+            await click_button('Show all');
+
+            expect(grid_shell_mock.commit_live_edit).not.toHaveBeenCalled();
+            expect(posted(post_message, 'setColumnVisibility')).toEqual([]);
+            expect(warnings(post_message)).toEqual([]);
+            expect(undo_labels()).toEqual(['Sort']);
+        });
     });
 });

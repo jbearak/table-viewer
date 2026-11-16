@@ -1264,6 +1264,12 @@ export interface StructuralColumnInsertAdmission {
     readonly settle: (accepted: boolean) => void;
 }
 
+/** How a fold of the open cell editor treats an exiting session's fence. */
+export interface LiveEditFoldOptions {
+    /** Fenced with no changed overlay answers true (and dismisses) instead of false. */
+    readonly fenced_empty_ok?: boolean;
+}
+
 /**
  * Imperative editing actions GridShell exposes to {@link App} (the toolbar
  * toggle and file-change notice live in App's layout, but the dirty map lives here
@@ -1301,12 +1307,27 @@ export interface EditingHandle {
     cancel_tail_removals(append_history_ids: readonly string[]): boolean;
     /** Fence every renderer-side mutation before a host close/reload flush. */
     stop_edit_admission(): void;
-    /** Snapshot the current Glide overlay into the source-keyed dirty map. */
-    commit_live_edit(): boolean;
+    /**
+     * Snapshot the current Glide overlay into the source-keyed dirty map.
+     *
+     * Under an exiting session's fence it answers false before it looks at the
+     * overlay, so it refuses with nothing open. `fenced_empty_ok` asks it to
+     * look first: fenced with a changed overlay still answers false; fenced
+     * with no overlay, or an unchanged one, dismisses the overlay and answers
+     * true, since nothing would be written. Only a caller that must not be
+     * stopped by a fence with nothing behind it passes the option (a view
+     * gesture's fold, a remounting snapshot); every other caller gets the
+     * plain answer.
+     */
+    commit_live_edit(options?: LiveEditFoldOptions): boolean;
     /** Fold the overlay that was open when the close/reload fence was raised, once. */
     commit_live_edit_at_close_barrier(): boolean;
-    /** Commit the overlay and synchronously publish this worksheet's complete map. */
-    flush_live_edit(): boolean;
+    /**
+     * Commit the overlay and synchronously publish this worksheet's complete map.
+     * With `fenced_empty_ok`, fenced and nothing changed answers true without
+     * publishing: publication is what the fence forbids.
+     */
+    flush_live_edit(options?: LiveEditFoldOptions): boolean;
     /** True when there are committed edits or an open editor with changes. */
     has_uncommitted_changes(): boolean;
     /**
@@ -1565,6 +1586,20 @@ export interface GridShellProps {
      */
     highlight_in_flight?: boolean;
     /**
+     * A view request of this window is awaiting the host: a sort, filter, or
+     * hide the person made, a column visibility write, or a view step's
+     * replay. No cell opens an editor until it settles, for the reason above:
+     * its history step is recorded, or moved, only on the host's answer.
+     *
+     * Unlike a highlight in flight it can last as long as a sort takes, so a
+     * menu opened meanwhile lists the editing items it will list once the
+     * request lands, disabled. Unlisting them would move the rest of the menu
+     * under the pointer when it lands.
+     *
+     * The affordance only, as above; App's `gestures_admitted` is the barrier.
+     */
+    view_request_in_flight?: boolean;
+    /**
      * A Header Row change is being prepared or is in flight. Its Pending Changes
      * move with it in one durable write, so no editing affordance opens until
      * it lands: like a highlight in flight, but App's own fence.
@@ -1780,6 +1815,7 @@ export function GridShell({
     edit_activation_id,
     csv_editable = false,
     highlight_in_flight = false,
+    view_request_in_flight = false,
     edits_paused = false,
     on_edit_paused_gesture,
     append_in_flight = false,
@@ -3287,31 +3323,42 @@ export function GridShell({
     // Keep the underlying activation separate so the post-await fence can ignore
     // only this request's `append_in_flight` affordance, while still observing a
     // save, highlight, close barrier, or deactivated edit session.
-    const append_admission_active = editing_session_held
+    const append_admission_but_for_view = editing_session_held
         && csv_editable
         && !save_in_flight
         && !highlight_in_flight
         && !edits_paused
         && !close_barrier_active;
+    const append_admission_active = append_admission_but_for_view && !view_request_in_flight;
     const editable_cells = append_admission_active && !append_in_flight;
     // Editable, with no session behind it yet. Cells accept the same gestures
     // they do under a session; each one asks App for the session first and runs
     // on the grant. Nothing else about the grid changes, so a file that is only
     // being read costs exactly what a read-only one does.
-    const edit_armed = !editing_session_held
+    const edit_armed_but_for_view = !editing_session_held
         && on_request_edit_session !== undefined
         && !preview_mode
         && !save_in_flight
         && !highlight_in_flight
         && !edits_paused
         && !close_barrier_active;
+    const edit_armed = edit_armed_but_for_view && !view_request_in_flight;
     // Whether a cell answers an editing gesture at all, session or not.
     const cells_accept_edits = editable_cells || edit_armed;
+    // What a menu lists while a view request of this window is in flight: the
+    // editing items it lists once the request lands. Their being listed is
+    // all these two decide; each item is enabled from `editable_cells`, which
+    // the request holds false, and nothing acquires a session for them until
+    // it lands.
+    const menu_lists_editable_cells = editable_cells
+        || (view_request_in_flight && append_admission_but_for_view && !append_in_flight);
+    const menu_lists_edit_armed = edit_armed_but_for_view;
     // Cells would take edits but for `edits_paused`: an edit gesture is then
     // refused for App's reason, which App explains.
     const edits_held_by_pause = edits_paused
         && !save_in_flight
         && !highlight_in_flight
+        && !view_request_in_flight
         && !close_barrier_active
         && (editing_session_held
             ? csv_editable && !append_in_flight
@@ -3723,8 +3770,10 @@ export function GridShell({
     const structure_items_offered = structural_support !== undefined
         && ((editing_session_held && csv_editable && edit_session_id !== undefined)
             // Before a session exists the items are offered all the same; the
-            // menu, shortcut, or drag that reaches for one acquires it.
-            || edit_armed);
+            // menu, shortcut, or drag that reaches for one acquires it. While
+            // a view request is in flight they stay offered and none of those
+            // acts: each asks `editable_cells` or `edit_armed` first.
+            || menu_lists_edit_armed);
     const promoted_header_row = sheet_meta.excelFirstRowHeader?.active === true
         ? sheet_meta.excelFirstRowHeader.sourceRow ?? 0
         : undefined;
@@ -7465,10 +7514,20 @@ export function GridShell({
         save_in_flight_ref,
     ]);
 
-    const commit_live_edit = useCallback((): boolean => {
-        if (edit_admission_is_fenced()) return false;
+    /** Fenced, and the caller accepts a fence with no changed overlay behind it. */
+    const dismiss_unchanged_under_fence = useCallback((options?: LiveEditFoldOptions): boolean => {
+        if (options?.fenced_empty_ok !== true) return false;
+        const live = read_live_edit();
+        if (live && live.value !== live.original) return false;
+        set_live_uncommitted(false);
+        grid_ref.current?.dismissOverlay();
+        return true;
+    }, [read_live_edit]);
+
+    const commit_live_edit = useCallback((options?: LiveEditFoldOptions): boolean => {
+        if (edit_admission_is_fenced()) return dismiss_unchanged_under_fence(options);
         return commit_live_edit_unfenced();
-    }, [commit_live_edit_unfenced, edit_admission_is_fenced]);
+    }, [commit_live_edit_unfenced, dismiss_unchanged_under_fence, edit_admission_is_fenced]);
 
     const commit_live_edit_at_close_barrier = useCallback((): boolean => {
         if (!edit_admission_is_fenced()) return false;
@@ -7477,14 +7536,21 @@ export function GridShell({
         return commit_live_edit_unfenced();
     }, [commit_live_edit_unfenced, edit_activation_id, edit_admission_is_fenced]);
 
-    const flush_live_edit = useCallback((): boolean => {
-        if (edit_admission_is_fenced() || !commit_live_edit_unfenced()) return false;
+    const flush_live_edit = useCallback((options?: LiveEditFoldOptions): boolean => {
+        if (edit_admission_is_fenced()) return dismiss_unchanged_under_fence(options);
+        if (!commit_live_edit_unfenced()) return false;
         const snapshot = store.snapshot();
         post_pending_edits(
             snapshot.size > 0 ? Object.fromEntries(snapshot) : null,
         );
         return true;
-    }, [commit_live_edit_unfenced, edit_admission_is_fenced, post_pending_edits, store]);
+    }, [
+        commit_live_edit_unfenced,
+        dismiss_unchanged_under_fence,
+        edit_admission_is_fenced,
+        post_pending_edits,
+        store,
+    ]);
 
     const has_uncommitted_changes = useCallback((): boolean => {
         if (store.size() > 0) return true;
@@ -11021,8 +11087,8 @@ export function GridShell({
     // Its items are those the session permits, shown from the moment it opens:
     // an item the grant would add mid-menu moves the rest under the pointer.
     // Until the grant lands they are disabled; a refusal leaves them so.
-    const menu_session_coming = edit_armed && menu_offers_edits;
-    const menu_edits_shown = editable_cells || menu_session_coming;
+    const menu_session_coming = menu_lists_edit_armed && menu_offers_edits;
+    const menu_edits_shown = menu_lists_editable_cells || menu_session_coming;
     const transform_menu_sections = transform_sections || transform_waits_for_claim;
     // Which items a menu offers follows the rules a transform in flight will
     // install; its being in flight only disables them.

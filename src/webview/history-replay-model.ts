@@ -160,6 +160,9 @@ export function plan_history_replay(
         // Structural-only actions are replayed synchronously against the
         // session-owned PendingRowStore. They never enter the source-cell lease.
         if (is_structural_history_change(change)) continue;
+        // A view step is replayed by its own view request, never planned here
+        // (`build_prepare_request` refuses to build a request for one).
+        if (change.kind === 'view') continue;
         if (change.kind === 'highlight') {
             highlights.push(change.delta);
             continue;

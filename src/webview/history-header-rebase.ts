@@ -185,7 +185,13 @@ function carry_column_transitions(
 }
 
 function carry_change(change: HistoryChange, move: Move): Carried<HistoryChange> {
-    if (change.kind === 'highlight' || change.kind === 'rowAppend') return carried(change);
+    // A view change names canonical source rows and columns, which a Header
+    // Row change does not renumber.
+    if (
+        change.kind === 'highlight'
+        || change.kind === 'rowAppend'
+        || change.kind === 'view'
+    ) return carried(change);
     if (change.kind === 'cell') {
         return row_switched_header_role(change.delta.sourceRow, move.from, move.to)
             ? waits('header-cell', change.delta.sourceRow)

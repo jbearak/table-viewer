@@ -55,6 +55,7 @@ import {
     type ReplayRequestSources,
 } from './history-replay-request-model';
 import {
+    action_has_view_change,
     peek_history,
     type HistoryEntry,
     type HistoryStackState,
@@ -312,6 +313,15 @@ export function create_history_replay_coordinator(
             // Before acquiring, for the same reason: an entry that cannot be
             // replayed under the current Header Row must not put the user into
             // an editing session on its way to saying so.
+            // A view step is not this protocol's to replay: it writes no
+            // document content, and its caller replays it through the view
+            // request its gesture used. That caller never gets here with one;
+            // if one arrives all the same, it is refused as `busy`, which says
+            // nothing and changes nothing, never built into a cell request.
+            if (action_has_view_change(before_acquiring.entry.action)) {
+                resolve({ kind: 'refused', reason: 'busy' });
+                return;
+            }
             if (entry_for_replay(before_acquiring.entry) === undefined) {
                 resolve({ kind: 'refused', reason: 'header-row' });
                 return;
@@ -359,6 +369,11 @@ export function create_history_replay_coordinator(
                 // We only await here when the original entry needed a session, so
                 // the session now held is sufficient for any replacement entry
                 // (and harmless for a highlight-only one).
+                // A view step that reached the top across the acquisition.
+                if (action_has_view_change(peek.entry.action)) {
+                    release(held, { kind: 'refused', reason: 'busy' });
+                    return;
+                }
                 const replay_entry = entry_for_replay(peek.entry);
                 if (replay_entry === undefined) {
                     release(held, { kind: 'refused', reason: 'header-row' });

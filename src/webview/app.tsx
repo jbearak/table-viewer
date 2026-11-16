@@ -222,7 +222,32 @@ import {
     type AcceptedReplay,
     type HistoryReplayCoordinator,
 } from './history-replay-coordinator';
-import { header_wait_warning, history_refusal_warning, replayed_verb } from './history-command-model';
+import {
+    COLUMN_WRITE_REFUSED_MESSAGE,
+    FOLD_REFUSED_MESSAGE,
+    REDO_REPLACED_BY_FOLD_MESSAGE,
+    VIEW_GESTURE_WAIT_MESSAGE,
+    header_wait_warning,
+    history_refusal_warning,
+    replayed_verb,
+    view_partly_applied_warning,
+    view_replay_dropped_warning,
+    view_replay_refusal_warning,
+    view_replay_wait_warning,
+    view_skip_warning,
+    type ViewReplayWait,
+} from './history-command-model';
+import {
+    columns_replay_target,
+    columns_view_step,
+    overtaken_transform_step,
+    transform_replay_target,
+    transform_slices_equal,
+    transform_view_step,
+    type TransformViewDelta,
+    type ViewSkipReason,
+    type ViewStep,
+} from './view-history-model';
 import { entry_for_current_header, type HeaderSheet, type HeaderWait } from './history-header-rebase';
 import {
     history_menu_projection,
@@ -244,6 +269,8 @@ import {
 } from './history-cell-state-model';
 import {
     peek_history,
+    action_has_view_change,
+    view_step_change,
     retained_pending_row_authorities,
     is_structural_history_change,
     retained_saved_append_authorities,
@@ -292,7 +319,9 @@ import {
     create_column_projection,
     hide_all_columns,
     hide_source_columns,
+    hidden_source_columns,
     sanitize_column_visibility_state,
+    visibility_from_hidden_columns,
     show_all_columns,
     toggle_source_column,
 } from './column-projection';
@@ -321,7 +350,62 @@ type ColumnVisibilityUpdater = (
     schema: string,
 ) => SheetColumnVisibilityState | undefined;
 
-type TransformOrigin = 'grid' | 'toolbar' | 'restore';
+/**
+ * Where a transform request came from. `'history'` is a view step's replay:
+ * it restores grid focus like `'grid'`, records nothing, and moves its entry
+ * when it installs.
+ */
+type TransformOrigin = 'grid' | 'toolbar' | 'restore' | 'history';
+
+/**
+ * How long a view step's replay waits, saying nothing, for this window's
+ * editing session to finish leaving before it gives up with a message.
+ */
+const SESSION_RELEASE_WAIT_MS = 5_000;
+
+/** A view step's replay in flight: the entry it moves when the host answers. */
+interface ViewReplay {
+    readonly entry: HistoryEntry;
+    readonly direction: HistoryDirection;
+    /** Why parts of the step were left out, for the message once it lands. */
+    readonly skipped: readonly ViewSkipReason[];
+}
+
+/**
+ * A sort, filter, or hide of this window awaiting `transformInstalled`: a
+ * gesture, which records its step when it installs, or a replay, which moves
+ * its entry. A restore and a cancel are neither and hold no record.
+ */
+interface PendingViewTransform {
+    readonly requestId: string;
+    /** The worksheet by identity: a reload can reorder or remove sheets. */
+    readonly worksheet: WorksheetTarget;
+    /**
+     * The worksheet's columns when the request was composed. Its step names
+     * columns as they were then, and a reload that overtakes the request can
+     * bring other columns.
+     */
+    readonly schema: string;
+    /** The rules this window held for the sheet when the request was composed. */
+    readonly baseline: SheetTransformState | undefined;
+    /** The rules requested. Absent for Hide rows: only the host knows its source rows. */
+    readonly target?: SheetTransformState;
+    readonly replay?: ViewReplay & { readonly delta: TransformViewDelta };
+}
+
+/** The one column visibility write awaiting `columnVisibilityChanged`. */
+interface PendingColumnWrite {
+    readonly requestId: string;
+    readonly worksheet: WorksheetTarget;
+    /** The worksheet's columns when the write was posted; see `PendingViewTransform.schema`. */
+    readonly schema: string;
+    readonly sourceGeneration: number;
+    readonly before: SheetColumnVisibilityState | undefined;
+    readonly after: SheetColumnVisibilityState | undefined;
+    readonly replay?: ViewReplay;
+    /** A snapshot has adopted column visibility since the write was posted. */
+    snapshotAdopted: boolean;
+}
 
 /**
  * A sheet the header queue still owes a change, by identity: a refresh while
@@ -1366,6 +1450,252 @@ export function App(): React.JSX.Element {
         commit_staged_transaction([record]);
     }, []);
 
+    const show_warning = useCallback((message: string) => {
+        host_bridge.postMessage({ type: 'showWarning', message });
+    }, []);
+
+    /**
+     * Fold the open cell editor before a view request is posted.
+     *
+     * No cell editor is open while a view request of this window is in
+     * flight: its text is committed here first, and cells offer no editor
+     * until the request settles (`view_request_pending`). So the install has
+     * nothing to fold, the window can always adopt what the host installed,
+     * and nothing is recorded between a gesture's request and its step.
+     *
+     * `fenced_empty_ok`: under an exiting session's fence the fold would
+     * otherwise refuse with nothing open.
+     *
+     * `'refused'` has said why; the draft stays open and nothing is posted.
+     * `'folded'` committed an edit, which recorded a step.
+     */
+    const fold_before_view_request = useCallback((): 'refused' | 'folded' | 'nothing' => {
+        const before = history_store_ref.current!.snapshot();
+        if (editing_ref.current?.commit_live_edit({ fenced_empty_ok: true }) === false) {
+            show_warning(FOLD_REFUSED_MESSAGE);
+            return 'refused';
+        }
+        return history_store_ref.current!.snapshot() === before ? 'nothing' : 'folded';
+    }, [show_warning]);
+
+    /**
+     * Record a view gesture this window made (a sort, a filter, hidden rows,
+     * hidden columns), once the host has applied it.
+     *
+     * Like a highlight, with nothing staged alongside and no editing session:
+     * the change has already happened on the host and in durable state. A
+     * view step does not make the document unsaved.
+     */
+    const record_view_step = useCallback((step: ViewStep | undefined) => {
+        if (step === undefined) return;
+        const record = history_store_ref.current!.stage_record({
+            label: step.label,
+            changes: [{ kind: 'view', delta: step.delta }],
+        });
+        commit_staged_transaction([record]);
+    }, []);
+
+    /**
+     * Move a replayed view step to the other stack, and say what the replay
+     * did less than the step says, if anything.
+     *
+     * `whole` is true when nothing of the step was applied (every part was
+     * skipped). `partly` is true when the host installed something other than
+     * what the replay asked for.
+     */
+    const land_view_replay = useCallback((
+        replay: ViewReplay,
+        worksheet: WorksheetTarget,
+        whole: boolean,
+        partly = false,
+    ) => {
+        const move = history_store_ref.current!.stage_move(replay.direction, replay.entry);
+        commit_staged_transaction([move]);
+        const label = replay.entry.action.label;
+        if (move.outcome.kind === 'dropped') {
+            // History was cleared or cut off behind a barrier during the round
+            // trip. The view change stands; it has no entry any more.
+            host_bridge.postMessage({
+                type: 'showWarning',
+                message: view_replay_dropped_warning(replay.direction),
+            });
+            return;
+        }
+        if (replay.skipped.length > 0) {
+            // In a workbook with several worksheets the message says which one.
+            const sheets = meta_ref.current?.sheets ?? [];
+            const index = worksheet_target_index(sheets, worksheet);
+            const sheet_name = sheets.length > 1
+                ? (index === undefined ? undefined : sheets[index]?.name) ?? worksheet.sheetName
+                : undefined;
+            host_bridge.postMessage({
+                type: 'showWarning',
+                message: view_skip_warning(replay.direction, label, replay.skipped, whole, sheet_name),
+            });
+        } else if (partly) {
+            host_bridge.postMessage({
+                type: 'showWarning',
+                message: view_partly_applied_warning(replay.direction, label),
+            });
+        }
+    }, []);
+
+    /**
+     * Settle a column visibility write.
+     *
+     * `landed`: the durable state holds it. A gesture records its step and a
+     * replay moves its entry. Neither writes the view: after the write was
+     * posted only a snapshot changes what the sheet shows, so a newer state
+     * another window made durable is never overwritten by an answer.
+     *
+     * Not landed, by the host's answer: nothing was written. The sheet is put
+     * back to what it showed before, unless a snapshot has adopted column
+     * visibility since the write was posted; then the view is already the
+     * host's and is left alone. Not landed, by a snapshot that overtook the
+     * write: the view is the snapshot's and nothing is put back.
+     */
+    const settle_column_write = useCallback((
+        pending: PendingColumnWrite,
+        landed: boolean,
+        by: 'answer' | 'snapshot',
+    ) => {
+        const sheets = meta_ref.current?.sheets ?? [];
+        const index = worksheet_target_index(sheets, pending.worksheet);
+        const sheet = index === undefined ? undefined : sheets[index];
+        if (landed) {
+            if (pending.replay !== undefined) {
+                land_view_replay(pending.replay, pending.worksheet, false);
+            } else if (sheet !== undefined && index !== undefined) {
+                record_view_step(columns_view_step(
+                    {
+                        sheetIndex: index,
+                        sheetName: sheet.name,
+                        ...(sheet.worksheetId === undefined ? {} : { worksheetId: sheet.worksheetId }),
+                    },
+                    pending.schema,
+                    hidden_source_columns(pending.before, sheet.columnCount),
+                    hidden_source_columns(pending.after, sheet.columnCount),
+                ));
+            }
+            return;
+        }
+        // Auto-fit, ended for the sheet when the write was posted, stays
+        // ended: its fitted widths were dropped then, and the person turns it
+        // back on with the toolbar.
+        if (by === 'answer' && !pending.snapshotAdopted && index !== undefined) {
+            const restored = [...(state_ref.current.columnVisibility ?? [])];
+            restored[index] = pending.before;
+            state_ref.current = { ...state_ref.current, columnVisibility: restored };
+            set_column_visibility(restored);
+        }
+        if (pending.replay !== undefined) {
+            host_bridge.postMessage({
+                type: 'showWarning',
+                message: view_replay_wait_warning('refreshing', pending.replay.direction),
+            });
+        } else if (by === 'answer') {
+            host_bridge.postMessage({ type: 'showWarning', message: COLUMN_WRITE_REFUSED_MESSAGE });
+        }
+    }, [land_view_replay, record_view_step]);
+
+    /**
+     * View requests a refresh of the same document overtook: their pending
+     * records, taken where the snapshot handler drops them and settled once it
+     * has adopted the snapshot's state.
+     */
+    const overtaken_view_requests_ref = useRef<{
+        views: PendingViewTransform[];
+        column: PendingColumnWrite | null;
+    }>({ views: [], column: null });
+
+    /**
+     * When a refresh overtakes a pending view request, the refresh decides
+     * whether it landed. Its own answer no longer matches and is ignored, and
+     * the host may or may not have applied it.
+     *
+     * Each request's worksheet is resolved by identity first: a reload can
+     * reorder or remove worksheets, and the sheet now at the old index is not
+     * the one the request was for.
+     *
+     *  - A sort or filter gesture landed only if the adopted rules equal its
+     *    target in every slice it changed; its step is then that difference
+     *    and nothing else the refresh carried.
+     *  - A Hide rows gesture has no target this window knows, so a snapshot
+     *    cannot say whether it landed. Nothing is recorded for it.
+     *  - A replay moves if the adopted rules hold its target; otherwise its
+     *    entry stays and the person is told.
+     *  - A column write landed if the sheet's adopted hidden columns are the
+     *    ones it asked for.
+     *
+     * None of them landed if the refresh brought the worksheet other columns
+     * than the request was composed against. The host drops rules and hidden
+     * columns that named the old ones, so "nothing sorted" or "nothing
+     * hidden" can equal the target of a gesture that cleared something, and a
+     * step recorded from that would name old column positions among the new
+     * columns.
+     */
+    const settle_overtaken_view_requests = useCallback(() => {
+        const { views, column } = overtaken_view_requests_ref.current;
+        if (views.length === 0 && column === null) return;
+        overtaken_view_requests_ref.current = { views: [], column: null };
+        const sheets = meta_ref.current?.sheets ?? [];
+        for (const pending of views) {
+            const index = worksheet_target_index(sheets, pending.worksheet);
+            const sheet = index === undefined ? undefined : sheets[index];
+            const adopted = index === undefined ? undefined : state_ref.current.transforms?.[index];
+            const same_columns = sheet !== undefined
+                && transform_schema_for_sheet(sheet) === pending.schema;
+            if (pending.replay !== undefined) {
+                if (sheet === undefined) {
+                    const gone = history_refusal_warning('unavailable', pending.replay.direction, undefined);
+                    if (gone !== null) host_bridge.postMessage({ type: 'showWarning', message: gone });
+                } else if (
+                    same_columns
+                    && pending.target !== undefined
+                    && transform_slices_equal(pending.replay.delta, pending.target, adopted)
+                ) {
+                    land_view_replay(pending.replay, pending.worksheet, false);
+                } else {
+                    host_bridge.postMessage({
+                        type: 'showWarning',
+                        message: view_replay_wait_warning('refreshing', pending.replay.direction),
+                    });
+                }
+                continue;
+            }
+            if (
+                sheet === undefined
+                || index === undefined
+                || pending.target === undefined
+                || !same_columns
+            ) continue;
+            record_view_step(overtaken_transform_step(
+                {
+                    sheetIndex: index,
+                    sheetName: sheet.name,
+                    ...(sheet.worksheetId === undefined ? {} : { worksheetId: sheet.worksheetId }),
+                },
+                pending.schema,
+                pending.baseline,
+                pending.target,
+                adopted,
+            ));
+        }
+        if (column !== null) {
+            const index = worksheet_target_index(sheets, column.worksheet);
+            const sheet = index === undefined ? undefined : sheets[index];
+            const landed = sheet !== undefined
+                && index !== undefined
+                && transform_schema_for_sheet(sheet) === column.schema
+                && JSON.stringify(
+                    hidden_source_columns(state_ref.current.columnVisibility?.[index], sheet.columnCount),
+                ) === JSON.stringify(hidden_source_columns(column.after, sheet.columnCount));
+            settle_column_write(column, landed, 'snapshot');
+        }
+        // A settled replay renders nothing; a queued header change waits on it.
+        wake_header_drain();
+    }, [land_view_replay, record_view_step, settle_column_write]);
+
     /**
      * The one outstanding replay, if any.
      *
@@ -1609,6 +1939,8 @@ export function App(): React.JSX.Element {
         if (previous !== next) append_composer_drafts_ref.current.clear();
         csv_edit_session_id_ref.current = next;
         set_csv_edit_session_id_state(next);
+        // A view replay waiting for the outgoing session to be gone.
+        if (previous !== next) view_replay_wait_ref.current?.finish(true);
     }, []);
     // The Save-refusal notice's input: an `.xlsx` conditional-formatting
     // element or data-validation rule on this worksheet that the current
@@ -2041,6 +2373,31 @@ export function App(): React.JSX.Element {
     const pending_transform_request_ids_ref = useRef<(string | undefined)[]>([]);
     const pending_transform_states_ref = useRef<(SheetTransformState | undefined)[]>([]);
     const pending_transform_origins_ref = useRef<(TransformOrigin | undefined)[]>([]);
+    /**
+     * The view requests of this window awaiting the host's answer, by sheet
+     * index: a sort, filter, or hide the person made, or a view step's replay.
+     * Set where the request is posted and cleared wherever its pending request
+     * id is cleared or replaced.
+     */
+    const pending_view_transforms_ref = useRef<(PendingViewTransform | undefined)[]>([]);
+    const pending_column_write_ref = useRef<PendingColumnWrite | null>(null);
+    /** A view replay holding its turn while this window's editing session is on its way out. */
+    const view_replay_wait_ref = useRef<{ readonly finish: (go: boolean) => void } | null>(null);
+    /**
+     * Whether a view request of this window is pending: the three refs above,
+     * read into state so the grid stops offering an editor meanwhile. Never
+     * set on its own; `sync_view_request_pending` is called at every site
+     * that sets or clears one of them, so no exit can leave it up.
+     */
+    const [view_request_pending, set_view_request_pending] = useState(false);
+    const view_request_is_pending = useCallback((): boolean => (
+        pending_view_transforms_ref.current.some((pending) => pending !== undefined)
+        || pending_column_write_ref.current !== null
+        || view_replay_wait_ref.current !== null
+    ), []);
+    const sync_view_request_pending = useCallback(() => {
+        set_view_request_pending(view_request_is_pending());
+    }, [view_request_is_pending]);
     // Request-dedup bookkeeping, both of these, and deliberately *not* part of
     // `sheet_views`: they record what has already been asked of the host, which is a
     // different fact from what the host installed, and folding them into the view
@@ -2141,7 +2498,7 @@ export function App(): React.JSX.Element {
     const [cell_focus, set_cell_focus] = useState<CellFocus | null>(null);
     const cell_focus_sequence_ref = useRef(0);
     /** `handle_sheet_select`, defined below with the sheet tabs. */
-    const handle_sheet_select_ref = useRef<(sheet_index: number) => void>(() => {});
+    const handle_sheet_select_ref = useRef<(sheet_index: number) => unknown>(() => {});
     const [pending_change_notice_status, set_pending_change_notice_status] = useState('');
     // The Save warnings' formula question (ADR 0006): which formulas Save
     // will write #REF! into and which ranges a move or delete changed in a
@@ -2613,6 +2970,9 @@ export function App(): React.JSX.Element {
         state: SheetTransformState,
         intent: TransformIntent,
         origin: TransformOrigin = 'toolbar',
+        // Given for a gesture that records a step and for a replay; a restore
+        // and a cancel give none.
+        view?: Omit<PendingViewTransform, 'requestId'>,
     ) => {
         const request_id = [
             'transform',
@@ -2623,6 +2983,13 @@ export function App(): React.JSX.Element {
         pending_transform_request_ids_ref.current[sheet_index] = request_id;
         pending_transform_states_ref.current[sheet_index] = state;
         pending_transform_origins_ref.current[sheet_index] = origin;
+        // Replaces whatever was pending on this sheet: a replaced gesture never
+        // answers to this window and records nothing, and a replaced replay (a
+        // cancel) leaves its entry where it was.
+        pending_view_transforms_ref.current[sheet_index] = view === undefined
+            ? undefined
+            : { ...view, requestId: request_id };
+        sync_view_request_pending();
         set_pending_transforms((prev) => {
             const next = [...prev];
             next[sheet_index] = true;
@@ -2646,7 +3013,7 @@ export function App(): React.JSX.Element {
             sourceGeneration: source_generation_ref.current,
             intent,
         });
-    }, []);
+    }, [sync_view_request_pending]);
 
     /** Drop a save verdict and any informational notice tied to that verdict. */
     const clear_save_verdict = useCallback(() => {
@@ -3379,6 +3746,24 @@ export function App(): React.JSX.Element {
                 wake_header_drain();
             }
 
+            if (msg.type === 'columnVisibilityChanged') {
+                const pending = pending_column_write_ref.current;
+                if (pending === null || pending.requestId !== msg.requestId) return;
+                // Applied under another source generation: a snapshot of that
+                // source is on its way and decides. (One that already arrived
+                // has settled this write, and it is not pending.)
+                if (
+                    msg.applied
+                    && (msg.sourceGeneration !== pending.sourceGeneration
+                        || msg.sourceGeneration !== source_generation_ref.current)
+                ) return;
+                pending_column_write_ref.current = null;
+                sync_view_request_pending();
+                settle_column_write(pending, msg.applied, 'answer');
+                // A settled write renders nothing; a queued header change waits on it.
+                wake_header_drain();
+            }
+
             if (msg.type === 'filterHistogram') {
                 const pending = pending_histogram_ref.current;
                 if (!pending || pending.requestId !== msg.requestId) return;
@@ -3610,10 +3995,15 @@ export function App(): React.JSX.Element {
                     } else if (snapshot.presentation === 'initial') {
                         set_pending_row_focus(null);
                     }
+                    // `fenced_empty_ok`: under an exiting session's fence these
+                    // answer false with nothing open, which threw away a
+                    // remounting snapshot that arrived during a release before
+                    // it could clear the session. With a changed overlay that
+                    // will not commit the snapshot still waits, as before.
                     if (active_sheet_changed) {
-                        if (editing_ref.current?.flush_live_edit() === false) return;
+                        if (editing_ref.current?.flush_live_edit({ fenced_empty_ok: true }) === false) return;
                     } else if (remounts_the_grid) {
-                        if (editing_ref.current?.commit_live_edit() === false) return;
+                        if (editing_ref.current?.commit_live_edit({ fenced_empty_ok: true }) === false) return;
                     }
                     // The basis a pending highlight request was sent against, read
                     // BEFORE this snapshot overwrites either — see the abandonment
@@ -3908,6 +4298,15 @@ export function App(): React.JSX.Element {
                         // worksheet identity happened to match here.
                         history_store_ref.current!.clear();
                         history_document_ref.current += 1;
+                        // Every view request of the outgoing document is
+                        // abandoned outright: nothing is compared, nothing is
+                        // recorded into the new document's history, and a late
+                        // answer finds no pending request.
+                        pending_view_transforms_ref.current = [];
+                        pending_column_write_ref.current = null;
+                        overtaken_view_requests_ref.current = { views: [], column: null };
+                        view_replay_wait_ref.current?.finish(false);
+                        sync_view_request_pending();
                         // And any replay still in flight was planned against the
                         // document that just left. Its caller is awaiting an
                         // answer, so it is settled rather than dropped — a promise
@@ -4389,6 +4788,21 @@ export function App(): React.JSX.Element {
                         pending_row_resize_requests_ref.current.delete(request_id);
                         pending.finish(false);
                     }
+                    // A pending column write: a refresh of another source
+                    // generation overtook it and decides whether it landed
+                    // (settled below, once the snapshot's state is adopted); a
+                    // refresh of the same source has adopted column visibility
+                    // while it was pending, which its answer needs to know.
+                    const pending_column_write = pending_column_write_ref.current;
+                    if (pending_column_write !== null) {
+                        if (pending_column_write.sourceGeneration !== snapshot.sourceGeneration) {
+                            pending_column_write_ref.current = null;
+                            overtaken_view_requests_ref.current.column = pending_column_write;
+                            sync_view_request_pending();
+                        } else if (snapshot.presentation !== 'initial') {
+                            pending_column_write.snapshotAdopted = true;
+                        }
+                    }
                     set_source_epoch((n) => n + 1);
                     // What the rows *are* changes with a new source, a new view
                     // generation (durable transform reconciliation bumps the
@@ -4495,6 +4909,15 @@ export function App(): React.JSX.Element {
                         pending_transform_request_ids_ref.current = [];
                         pending_transform_states_ref.current = [];
                         pending_transform_origins_ref.current = [];
+                        // The view requests dropped with them are settled below
+                        // by what this snapshot shows.
+                        overtaken_view_requests_ref.current.views.push(
+                            ...pending_view_transforms_ref.current.filter(
+                                (pending): pending is PendingViewTransform => pending !== undefined,
+                            ),
+                        );
+                        pending_view_transforms_ref.current = [];
+                        sync_view_request_pending();
                         // Different rows mean the earlier refusal was about a basis
                         // that no longer exists, and the permutation the host dropped
                         // has to be asked for again regardless of what is blocking.
@@ -4929,6 +5352,9 @@ export function App(): React.JSX.Element {
                     );
                     set_structural_editing(snapshot.capabilities.structuralEditing);
 
+                    // View requests this snapshot overtook, judged by the state
+                    // it has just installed.
+                    settle_overtaken_view_requests();
                     // Acknowledge the exact delivered identity before an optional
                     // corrective CAS write.
                     snapshot_applied_seq_ref.current += 1;
@@ -4938,6 +5364,8 @@ export function App(): React.JSX.Element {
                         disposition,
                     });
                     if (correction_required) persist_immediate();
+                    // A view replay waiting for the editing session to go.
+                    view_replay_wait_ref.current?.finish(true);
                 } else {
                     snapshot_applied_seq_ref.current += 1;
                     host_bridge.postMessage({
@@ -5000,7 +5428,19 @@ export function App(): React.JSX.Element {
                 pending_transform_request_ids_ref.current[msg.sheetIndex] = undefined;
                 pending_transform_states_ref.current[msg.sheetIndex] = undefined;
                 pending_transform_origins_ref.current[msg.sheetIndex] = undefined;
-                if (msg.terminal) {
+                // A refused view request records nothing and moves nothing: a
+                // gesture did not happen, and a replay's entry stays where it
+                // was, to be tried again.
+                const refused_view = pending_view_transforms_ref.current[msg.sheetIndex];
+                const refused_replay = refused_view?.requestId === msg.requestId
+                    ? refused_view.replay
+                    : undefined;
+                pending_view_transforms_ref.current[msg.sheetIndex] = undefined;
+                sync_view_request_pending();
+                // Not for a replay: this latch stops the sheet's saved view from
+                // being re-requested, and a refused undo says nothing about the
+                // saved view.
+                if (msg.terminal && refused_replay === undefined) {
                     // Retrying validation only fails again, so stop asking. This is
                     // what keeps a saved transform the sheet can no longer support
                     // from being re-requested — with its warning — once per snapshot.
@@ -5017,7 +5457,7 @@ export function App(): React.JSX.Element {
                 // `grid_focus_restore.generation !== generation` check wants — and
                 // reading it locally rather than from the message is now the only
                 // option, which is the point.
-                if (refusal_origin === 'grid') {
+                if (refusal_origin === 'grid' || refusal_origin === 'history') {
                     set_grid_focus_restore({
                         sheet_index: msg.sheetIndex,
                         generation: generation_ref.current,
@@ -5054,7 +5494,18 @@ export function App(): React.JSX.Element {
                 //
                 // `refusal_origin` deliberately read above, before the pending refs
                 // were cleared.
-                if (!(refusal_origin === 'restore' && !msg.terminal)) {
+                if (refused_replay !== undefined) {
+                    host_bridge.postMessage({
+                        type: 'showWarning',
+                        message: view_replay_refusal_warning(
+                            refused_replay.direction,
+                            refused_replay.entry.action.label,
+                            msg.reason,
+                        ),
+                    });
+                    // A refused replay renders nothing; a queued header change waits on it.
+                    wake_header_drain();
+                } else if (!(refusal_origin === 'restore' && !msg.terminal)) {
                     host_bridge.postMessage({
                         type: 'showWarning',
                         message: `Could not update the table view: ${msg.reason}`,
@@ -5103,15 +5554,47 @@ export function App(): React.JSX.Element {
                 // pending edits follows, it runs after the fold and still wins,
                 // preserving "the grant/refresh owns the complete pending-edit
                 // projection, including authoritative absence".
+                // A view request of this window (a gesture that records, or a
+                // replay) folded the open editor before it was posted, and cells
+                // have offered no editor since, so there is nothing to fold here
+                // and the fold is not attempted: it can answer false with
+                // nothing open (an exiting session's fence), and returning on
+                // that would leave this window on a generation the host has
+                // left. A restore and a cancel keep the fold-or-return.
+                const pending_view = pending_view_transforms_ref.current[msg.sheetIndex];
+                const view_request = pending_view?.requestId === msg.requestId
+                    ? pending_view
+                    : undefined;
+                if (view_request !== undefined) {
+                    pending_view_transforms_ref.current[msg.sheetIndex] = undefined;
+                    sync_view_request_pending();
+                    if (view_request.replay !== undefined) {
+                        // The replay landed: history moves on the host's answer.
+                        land_view_replay(
+                            view_request.replay,
+                            view_request.worksheet,
+                            false,
+                            view_request.target !== undefined && !transform_slices_equal(
+                                view_request.replay.delta,
+                                view_request.target,
+                                msg.rules,
+                            ),
+                        );
+                        wake_header_drain();
+                    }
+                }
                 if (view.basis.generation !== generation_ref.current) {
-                    if (editing_ref.current?.commit_live_edit() === false) return;
+                    if (
+                        view_request === undefined
+                        && editing_ref.current?.commit_live_edit() === false
+                    ) return;
                     set_grid_mount_epoch((epoch) => epoch + 1);
                 }
                 const origin = pending_transform_origins_ref.current[msg.sheetIndex];
                 pending_transform_request_ids_ref.current[msg.sheetIndex] = undefined;
                 pending_transform_states_ref.current[msg.sheetIndex] = undefined;
                 pending_transform_origins_ref.current[msg.sheetIndex] = undefined;
-                if (origin === 'grid') {
+                if (origin === 'grid' || origin === 'history') {
                     set_grid_focus_restore({
                         sheet_index: msg.sheetIndex,
                         generation: view.basis.generation,
@@ -5273,6 +5756,17 @@ export function App(): React.JSX.Element {
                     transforms: next_transforms,
                 };
                 set_transforms(next_transforms);
+                // The gesture landed: its step is what it changed, from the
+                // rules it was composed against to the rules installed. Hide
+                // rows learns its source rows here.
+                if (view_request !== undefined && view_request.replay === undefined) {
+                    record_view_step(transform_view_step(
+                        view_request.worksheet,
+                        view_request.schema,
+                        view_request.baseline,
+                        msg.rules,
+                    ));
+                }
                 // Only an advanced mapping changes the population sampled by
                 // auto-fit. A rules-only no-op install moves the core generation but
                 // leaves the measured rows intact.
@@ -5575,7 +6069,7 @@ export function App(): React.JSX.Element {
      * callbacks mid-gesture, and a wide paste is assembled across many of them.
      * Both reservations therefore live in refs.
      */
-    const edit_gestures_admitted = useCallback(
+    const base_gestures_admitted = useCallback(
         () => !header_fence_ref.current
             && !(replay_coordinator_ref.current?.is_busy() ?? false)
             && !pending_row_replay_busy_ref.current
@@ -5589,6 +6083,33 @@ export function App(): React.JSX.Element {
                 && pending_changes_durability.structural_backlog_full(csv_edit_session_id_ref.current)),
         [],
     );
+    /**
+     * Whether history's next move is free: the terms above, and no view step's
+     * replay or column write in flight. A view replay moves its entry only when
+     * the host answers, and a column write records or moves only on its answer,
+     * so until then the next undo, redo, or view request has to wait.
+     *
+     * A person's own sort, filter, or hide in flight does not count here: a
+     * second one on the same sheet may still replace it, as it always could.
+     */
+    const history_free = useCallback(
+        () => base_gestures_admitted()
+            && view_replay_wait_ref.current === null
+            && pending_column_write_ref.current === null
+            && !pending_view_transforms_ref.current.some((pending) => pending?.replay !== undefined),
+        [base_gestures_admitted],
+    );
+    /**
+     * Whether an edit may be recorded now: `history_free`, and no sort, filter,
+     * or hide of this window still in flight. That one records its step only
+     * when it installs, so an edit recorded meanwhile would enter history ahead
+     * of the gesture the person made first.
+     */
+    const edit_gestures_admitted = useCallback(
+        () => history_free()
+            && !pending_view_transforms_ref.current.some((pending) => pending !== undefined),
+        [history_free],
+    );
 
     const handle_sheet_select = useCallback(
         (sheet_index: number) => {
@@ -5600,7 +6121,7 @@ export function App(): React.JSX.Element {
             if (
                 editing_session_held_ref.current
                 && editing_ref.current?.commit_live_edit() === false
-            ) return;
+            ) return false;
             set_filter_editor(null);
             set_grid_focus_restore(null);
             set_toolbar_focus_restore(null);
@@ -5613,6 +6134,7 @@ export function App(): React.JSX.Element {
                 activeSheetIndex: sheet_index,
             };
             persist_immediate();
+            return true;
         },
         [cancel_external_change_navigation, persist_immediate]
     );
@@ -5654,7 +6176,7 @@ export function App(): React.JSX.Element {
         if (sheet_index !== active_sheet_index) {
             handle_sheet_select(sheet_index);
         }
-    }, [active_sheet_index, edit_gestures_admitted, handle_sheet_select]);
+    }, [active_sheet_index, handle_sheet_select]);
 
     /**
      * Where the last undo or redo landed, held until a GridShell consumes it.
@@ -5704,9 +6226,10 @@ export function App(): React.JSX.Element {
         if (outcome.kind === 'rows-hidden' || outcome.kind === 'columns-hidden') {
             // Said out loud, because the replay DID land: the durable state
             // changed and the cursor did not move, and silence would read as
-            // nothing having happened. The filters are deliberately left alone —
-            // they are not part of history, and clearing one to expose the row
-            // would make undo mutate view state the user never asked about.
+            // nothing having happened. The filters are deliberately left alone:
+            // undoing an edit keeps the view as it is. A filter is its own step
+            // in history, and clearing one here to expose the row would make
+            // this undo change view state the person never asked about.
             host_bridge.postMessage({
                 type: 'showWarning',
                 message: `The change was ${replayed_verb(answered.direction)}, but the affected cells are hidden by the current view.`,
@@ -5924,6 +6447,185 @@ export function App(): React.JSX.Element {
         };
     }, [publish_history_menu_state, publish_retained_saved_append_authorities]);
 
+    const run_history_command_ref = useRef<(
+        direction: HistoryDirection,
+        after_release_wait?: boolean,
+    ) => Promise<void>>(async () => {});
+    /** `post_column_visibility`, which is declared further down. */
+    const post_column_visibility_ref = useRef<((
+        sheet_index: number,
+        before: SheetColumnVisibilityState | undefined,
+        after: SheetColumnVisibilityState | undefined,
+        replay?: ViewReplay,
+    ) => boolean) | null>(null);
+
+    /**
+     * Undo or redo a view step: a sort, a filter, hidden rows, hidden columns.
+     *
+     * Replayed through the request its gesture used (`setTransform`,
+     * `setColumnVisibility`), with no editing session and not through the
+     * cell replay protocol, which exists to compare-and-swap document content.
+     * The host keeps every rule it has and persists what it installs, so the
+     * saved view follows undo and redo. History moves on the host's answer.
+     *
+     * Replay writes from the live state and never compares (see
+     * `view-history-model.ts`). The parts of a step that cannot apply now, for
+     * a reason this window can see, are skipped with a message and the entry
+     * moves on all the same: a view step never stands in the way of an older
+     * step. Everything that says "did not run" leaves the entry where it was.
+     */
+    const replay_view_step = useCallback((entry: HistoryEntry, direction: HistoryDirection) => {
+        const say_wait = (wait: ViewReplayWait) => {
+            show_warning(view_replay_wait_warning(wait, direction));
+        };
+        const say_unavailable = () => {
+            const message = history_refusal_warning('unavailable', direction, undefined);
+            if (message !== null) show_warning(message);
+        };
+        const change = view_step_change(entry.action);
+        const sheets = meta_ref.current?.sheets;
+        if (change === undefined || sheets === undefined) {
+            say_unavailable();
+            return;
+        }
+        const delta = change.delta;
+        const index = worksheet_target_index(sheets, delta.worksheet);
+        const sheet = index === undefined ? undefined : sheets[index];
+        if (index === undefined || sheet === undefined) {
+            say_unavailable();
+            return;
+        }
+        // The windows in which the host would refuse the request anyway.
+        if (
+            save_in_flight_ref.current
+            || edit_session_pending
+            || pending_excel_header_ref.current !== null
+        ) {
+            say_wait('applying');
+            return;
+        }
+        const schema = transform_schema_for_sheet(sheet);
+        const worksheet: WorksheetTarget = {
+            sheetIndex: index,
+            sheetName: sheet.name,
+            ...(sheet.worksheetId === undefined ? {} : { worksheetId: sheet.worksheetId }),
+        };
+        // Undo shows the worksheet its step belongs to, as a cell undo does,
+        // and before anything is posted. The switch is not rolled back if the
+        // host then refuses: the message is about that worksheet.
+        const show_sheet = (): boolean => {
+            if (index === active_sheet_index) return true;
+            if (handle_sheet_select(index)) return true;
+            say_wait('applying');
+            return false;
+        };
+        if (delta.slice === 'transform') {
+            if (preview_mode) {
+                say_wait('preview');
+                return;
+            }
+            // Any request pending on this sheet, a restore included: a replay
+            // never replaces one. The replaced request's answer would no longer
+            // match, and this window would sit on a generation the host has left.
+            if (pending_transform_request_ids_ref.current[index] !== undefined) {
+                say_wait('updating');
+                return;
+            }
+            const live = sanitize_transform_state(
+                state_ref.current.transforms?.[index],
+                sheet.columnCount,
+                schema,
+                sheet.sourceRowCount,
+            );
+            // The rows the Header Row holds, as the host states them: with the
+            // header on, every row above it must stay hidden and the header
+            // row itself cannot be hidden.
+            const header = sheet.excelFirstRowHeader;
+            const header_on = header?.mode === 'on';
+            const plan = transform_replay_target(delta, direction, live, {
+                schema,
+                sourceRowCount: sheet.sourceRowCount,
+                protectedRows: header_on ? header.sourceRow ?? sheet.sourceRowCount : 0,
+                ...(header_on && header.sourceRow !== undefined
+                    ? { headerRow: header.sourceRow }
+                    : {}),
+            });
+            const replay: ViewReplay = { entry, direction, skipped: plan.skipped };
+            // Not reachable walking in order: the insert is a newer step and is
+            // undone first, and no transform installs while such rows exist.
+            if (
+                plan.changes
+                && (plan.target.sort.length > 0
+                    || plan.target.filters.some((filter) => filter.enabled)
+                    || (plan.target.hiddenRows?.length ?? 0) > 0)
+            ) {
+                for (const [pending_index, store] of
+                    edit_session_registry_ref.current?.pending_entries() ?? []) {
+                    if (pending_index !== index || !has_inserted_or_moved_rows(store.snapshot())) continue;
+                    show_warning(view_replay_refusal_warning(
+                        direction,
+                        entry.action.label,
+                        INSERTED_ROWS_TRANSFORM_MESSAGE,
+                    ));
+                    return;
+                }
+            }
+            if (!show_sheet()) return;
+            if (!plan.changes) {
+                // The step's effect is already in place, or all of it was skipped.
+                land_view_replay(replay, worksheet, true);
+                wake_header_drain();
+                return;
+            }
+            request_transform(index, plan.target, 'user', 'history', {
+                worksheet,
+                schema,
+                baseline: live,
+                target: plan.target,
+                replay: { ...replay, delta },
+            });
+            return;
+        }
+        if (!snapshot_identity_ref.current) {
+            say_wait('refreshing');
+            return;
+        }
+        const current = sanitize_column_visibility_state(
+            state_ref.current.columnVisibility?.[index],
+            sheet.columnCount,
+            schema,
+        );
+        const plan = columns_replay_target(
+            delta,
+            direction,
+            hidden_source_columns(current, sheet.columnCount),
+            { schema, columnCount: sheet.columnCount },
+        );
+        const replay: ViewReplay = { entry, direction, skipped: plan.skipped };
+        if (!show_sheet()) return;
+        if (!plan.changes) {
+            land_view_replay(replay, worksheet, true);
+            wake_header_drain();
+            return;
+        }
+        const posted = post_column_visibility_ref.current?.(
+            index,
+            current,
+            visibility_from_hidden_columns(plan.hidden, sheet.columnCount, schema),
+            replay,
+        );
+        if (posted !== true) say_wait('refreshing');
+    }, [
+        active_sheet_index,
+        edit_session_pending,
+        handle_sheet_select,
+        land_view_replay,
+        preview_mode,
+        request_transform,
+        show_warning,
+        wake_header_drain,
+    ]);
+
     /**
      * Undo or redo, from a keystroke or the desktop Edit menu.
      *
@@ -5935,13 +6637,25 @@ export function App(): React.JSX.Element {
      * to restore an overlay, and an empty one is released by the same rule as
      * any other (`release_edit_session_if_idle`), not by the replay.
      */
-    const run_history_command = useCallback(async (direction: HistoryDirection) => {
+    const run_history_command = useCallback(async (
+        direction: HistoryDirection,
+        // Set when this call resumes after waiting for an editing session to go.
+        after_release_wait = false,
+    ): Promise<void> => {
         const coordinator = replay_coordinator_ref.current;
         if (coordinator === null) return;
         const replay_document = history_document_ref.current;
-        if (!edit_gestures_admitted()) {
+        if (!history_free()) {
             // Says nothing unless the header fence is what holds edits.
             warn_edit_waits_for_header();
+            return;
+        }
+        // A sort, filter, or hide of this window is still in flight. Its step
+        // is recorded only when it installs, so a move made now would be
+        // followed by a recording that clears the redo it just made. (A replay
+        // in flight failed the gate above, silently.)
+        if (pending_view_transforms_ref.current.some((pending) => pending !== undefined)) {
+            show_warning(view_replay_wait_warning('updating', direction));
             return;
         }
         const warn_header_wait = () => {
@@ -5959,7 +6673,78 @@ export function App(): React.JSX.Element {
                 message: header_wait_warning(wait, direction, sheet_name),
             });
         };
-        const initial = peek_history(history_store_ref.current!.snapshot(), direction);
+        let initial = peek_history(history_store_ref.current!.snapshot(), direction);
+        if (initial.kind === 'available' && action_has_view_change(initial.entry.action)) {
+            // This window's editing session is on its way out (a release or a
+            // Discard; both raise the same fence). Undoing the last unsaved edit
+            // releases the session, and until the host has finished, its
+            // transform admission answers "try again in a moment". A person
+            // holding Undo to walk back through an edit and then a sort must
+            // not get that as a dialog, so the replay holds its turn and waits,
+            // saying nothing, until the session id clears or the next snapshot
+            // is applied. Holding the turn also holds off the idle-session
+            // release, which is safe: the fence is only ever raised together
+            // with the release or discard post, so that is already on its way.
+            const session_id = csv_edit_session_id_ref.current;
+            if (
+                !after_release_wait
+                && session_id !== undefined
+                && renderer_publication_fenced_session_ref.current === session_id
+            ) {
+                const outcome = await new Promise<'settled' | 'timeout' | 'abandoned'>((resolve) => {
+                    const finish_with = (settled: 'settled' | 'timeout' | 'abandoned') => {
+                        if (view_replay_wait_ref.current !== held) return;
+                        view_replay_wait_ref.current = null;
+                        window.clearTimeout(timer);
+                        sync_view_request_pending();
+                        // A released turn renders nothing; a queued header change waits on it.
+                        wake_header_drain();
+                        resolve(settled);
+                    };
+                    const held = {
+                        finish: (go: boolean) => finish_with(go ? 'settled' : 'abandoned'),
+                    };
+                    // Bounded: a release that never settles must not leave
+                    // the window refusing every edit and every undo.
+                    const timer = window.setTimeout(
+                        () => finish_with('timeout'),
+                        SESSION_RELEASE_WAIT_MS,
+                    );
+                    view_replay_wait_ref.current = held;
+                    sync_view_request_pending();
+                });
+                if (history_document_ref.current !== replay_document || outcome === 'abandoned') return;
+                if (outcome === 'timeout') {
+                    show_warning(view_replay_wait_warning('finishing', direction));
+                    return;
+                }
+                // Start again from the peek; if the release has still not
+                // settled, the replay goes ahead and the host's answer decides.
+                return run_history_command_ref.current(direction, true);
+            }
+            // Fold the open editor first: committing it records a cell edit,
+            // and Undo means the top entry after that commit.
+            const fold = fold_before_view_request();
+            if (fold === 'refused') return;
+            // The checks run on the state the fold left.
+            if (!history_free()) {
+                show_warning(view_replay_wait_warning('applying', direction));
+                return;
+            }
+            initial = peek_history(history_store_ref.current!.snapshot(), direction);
+            if (initial.kind !== 'available') {
+                // The commit cleared the redo stack.
+                if (direction === 'redo' && fold === 'folded') {
+                    show_warning(REDO_REPLACED_BY_FOLD_MESSAGE);
+                }
+                return;
+            }
+            if (action_has_view_change(initial.entry.action)) {
+                replay_view_step(initial.entry, direction);
+                return;
+            }
+            // Otherwise the top is the edit just committed: the ordinary path.
+        }
         // Before a session is acquired for it: a change that has no form under
         // the current Header Row says so and stays where it is.
         if (initial.kind === 'available' && entry_for_replay_ref.current(initial.entry) === undefined) {
@@ -6259,7 +7044,18 @@ export function App(): React.JSX.Element {
             barrier?.reason,
         );
         if (warning !== null) host_bridge.postMessage({ type: 'showWarning', message: warning });
-    }, [active_sheet_index, handle_sheet_select, wake_header_drain, warn_edit_waits_for_header]);
+    }, [
+        active_sheet_index,
+        fold_before_view_request,
+        handle_sheet_select,
+        history_free,
+        replay_view_step,
+        show_warning,
+        sync_view_request_pending,
+        wake_header_drain,
+        warn_edit_waits_for_header,
+    ]);
+    run_history_command_ref.current = run_history_command;
 
     /**
      * Undo and redo from the keyboard, for the VS Code webview.
@@ -6711,6 +7507,7 @@ export function App(): React.JSX.Element {
             || pending_row_resize_requests_ref.current.size > 0
             || pending_append_requests_ref.current.size > 0
             || discard_cleanup_ref.current !== undefined
+            || view_request_is_pending()
         ) return;
         if (!queue.fenced) {
             // Keys typed while an appended row waited for admission open in
@@ -7144,8 +7941,68 @@ export function App(): React.JSX.Element {
         || edit_session_pending
         || preview_mode
         || pending_excel_header_ref.current !== null
-        || !edit_gestures_admitted()
-    ), [edit_gestures_admitted, edit_session_pending, preview_mode]);
+        // `history_free`, not `edit_gestures_admitted`: a person's second
+        // sort may replace their first while it is still in flight.
+        || !history_free()
+    ), [edit_session_pending, history_free, preview_mode]);
+
+    /**
+     * Cancel's own gate: the same windows, on the terms that held before view
+     * requests were counted. A cancel has to stay reachable while a view
+     * step's replay is in flight, since cancelling is how a slow one is
+     * abandoned; `request_transform` then drops the replay's record and its
+     * entry stays where it was.
+     */
+    const cancel_blocked = useCallback((): boolean => (
+        save_in_flight_ref.current
+        || edit_session_pending
+        || preview_mode
+        || pending_excel_header_ref.current !== null
+        || !base_gestures_admitted()
+    ), [base_gestures_admitted, edit_session_pending, preview_mode]);
+
+    /**
+     * Whether a view gesture may start now, having folded the open editor.
+     *
+     * One gesture at a time, across kinds and sheets: the host does not
+     * serialize a transform's computation with a column write or with a
+     * transform on another sheet, so two in flight could land, and be
+     * recorded, in the other order. A transform on the same sheet may still
+     * replace the one pending there.
+     *
+     * Every check runs after the fold, on the state the fold left. If the
+     * window is busy only then, the edit is committed and the person is told
+     * to repeat the gesture, instead of a click that silently did nothing.
+     *
+     * `transform_sheet_index` is the sheet a sort, filter, or hide is for;
+     * undefined for a column gesture.
+     */
+    const view_gesture_may_start = useCallback((
+        transform_sheet_index: number | undefined,
+    ): boolean => {
+        const fold = fold_before_view_request();
+        if (fold === 'refused') return false;
+        const column_write = pending_column_write_ref.current;
+        if (
+            (column_write !== null && column_write.replay === undefined)
+            || pending_view_transforms_ref.current.some((pending, index) => (
+                pending !== undefined
+                && pending.replay === undefined
+                && index !== transform_sheet_index
+            ))
+        ) {
+            show_warning(VIEW_GESTURE_WAIT_MESSAGE);
+            return false;
+        }
+        const blocked = transform_sheet_index === undefined
+            ? !edit_gestures_admitted()
+            : transform_request_blocked();
+        // With nothing folded this refusal is silent, as it always was (a
+        // click behind a save or a replay in flight). After a fold it is not:
+        // the click did commit the edit, and only the gesture is left to repeat.
+        if (blocked && fold === 'folded') show_warning(VIEW_GESTURE_WAIT_MESSAGE);
+        return !blocked;
+    }, [edit_gestures_admitted, fold_before_view_request, show_warning, transform_request_blocked]);
 
     /**
      * While a worksheet holds Pending Inserted Rows its display order must
@@ -7164,7 +8021,6 @@ export function App(): React.JSX.Element {
 
     const handle_transform_change = useCallback(
         (next_state: SheetTransformState, origin: TransformOrigin): boolean => {
-            if (transform_request_blocked()) return false;
             const schema = meta?.sheets[active_sheet_index]
                 ? transform_schema_for_sheet(meta.sheets[active_sheet_index])
                 : undefined;
@@ -7188,14 +8044,38 @@ export function App(): React.JSX.Element {
                 schema,
                 source_row_count,
             );
+            // A request that changes nothing is not a gesture: it folds no
+            // open editor and says nothing.
             if (transforms_semantically_equal(current, sanitized)) return false;
+            if (!view_gesture_may_start(active_sheet_index)) return false;
             if (
                 (sanitized.sort.length > 0
                     || sanitized.filters.some((filter) => filter.enabled)
                     || (sanitized.hiddenRows?.length ?? 0) > 0)
                 && inserted_rows_refuse_transform(active_sheet_index)
             ) return false;
-            request_transform(active_sheet_index, sanitized, 'user', origin);
+            request_transform(
+                active_sheet_index,
+                sanitized,
+                'user',
+                origin,
+                // The baseline is the rules this window last saw installed,
+                // never a pending request's target: a request this one
+                // replaces never answers here, and this one's install then
+                // carries both gestures, recorded as one step.
+                active_sheet === undefined || schema === undefined ? undefined : {
+                    worksheet: {
+                        sheetIndex: active_sheet_index,
+                        sheetName: active_sheet.name,
+                        ...(active_sheet.worksheetId === undefined
+                            ? {}
+                            : { worksheetId: active_sheet.worksheetId }),
+                    },
+                    schema,
+                    baseline: state_ref.current.transforms?.[active_sheet_index],
+                    target: sanitized,
+                },
+            );
             return true;
         },
         [
@@ -7203,13 +8083,13 @@ export function App(): React.JSX.Element {
             inserted_rows_refuse_transform,
             meta,
             request_transform,
-            transform_request_blocked,
+            view_gesture_may_start,
         ],
     );
 
     const handle_hide_rows = useCallback((display_rows: DisplayRowInterval[]) => {
         if (
-            transform_request_blocked()
+            !view_gesture_may_start(active_sheet_index)
             || pending_transforms[active_sheet_index]
             || inserted_rows_refuse_transform(active_sheet_index)
         ) return;
@@ -7222,6 +8102,24 @@ export function App(): React.JSX.Element {
         pending_transform_request_ids_ref.current[active_sheet_index] = request_id;
         pending_transform_states_ref.current[active_sheet_index] = undefined;
         pending_transform_origins_ref.current[active_sheet_index] = 'grid';
+        // No target: this window sends display rows and learns the source rows
+        // it hid only from the install.
+        const hidden_sheet = meta_ref.current?.sheets[active_sheet_index];
+        pending_view_transforms_ref.current[active_sheet_index] = hidden_sheet === undefined
+            ? undefined
+            : {
+                requestId: request_id,
+                worksheet: {
+                    sheetIndex: active_sheet_index,
+                    sheetName: hidden_sheet.name,
+                    ...(hidden_sheet.worksheetId === undefined
+                        ? {}
+                        : { worksheetId: hidden_sheet.worksheetId }),
+                },
+                schema: transform_schema_for_sheet(hidden_sheet),
+                baseline: state_ref.current.transforms?.[active_sheet_index],
+            };
+        sync_view_request_pending();
         set_pending_transforms((prev) => {
             const next = [...prev];
             next[active_sheet_index] = true;
@@ -7244,7 +8142,8 @@ export function App(): React.JSX.Element {
         active_sheet_index,
         inserted_rows_refuse_transform,
         pending_transforms,
-        transform_request_blocked,
+        sync_view_request_pending,
+        view_gesture_may_start,
     ]);
 
     const request_append_rows = useCallback((count: number): Promise<
@@ -7470,7 +8369,7 @@ export function App(): React.JSX.Element {
             filter_restore_timer_ref.current = undefined;
         }
         if (
-            transform_request_blocked()
+            !view_gesture_may_start(active_sheet_index)
             || pending_transforms[active_sheet_index]
             || inserted_rows_refuse_transform(active_sheet_index)
         ) return;
@@ -7479,7 +8378,7 @@ export function App(): React.JSX.Element {
         active_sheet_index,
         inserted_rows_refuse_transform,
         pending_transforms,
-        transform_request_blocked,
+        view_gesture_may_start,
     ]);
 
     const open_grid_filter_editor = useCallback((
@@ -7595,8 +8494,9 @@ export function App(): React.JSX.Element {
         // cancelling: request_transform overwrites the pending requestId, so the
         // original in-flight response would stop matching and the webview would sit
         // on a stale generation. That is why a cancel asks the same question every
-        // other transform request asks — see `transform_request_blocked`.
-        if (transform_request_blocked()) return;
+        // other transform request asks — see `transform_request_blocked` — on
+        // the terms `cancel_blocked` keeps.
+        if (cancel_blocked()) return;
         const previous = transform_rollback_baseline(
             sheet_views[active_sheet_index],
             state_ref.current.transforms?.[active_sheet_index],
@@ -7614,10 +8514,10 @@ export function App(): React.JSX.Element {
         request_transform(active_sheet_index, previous, 'cancel');
     }, [
         active_sheet_index,
+        cancel_blocked,
         meta,
         request_transform,
         sheet_views,
-        transform_request_blocked,
     ]);
 
     const request_save_or_remain_dirty = useCallback(() => {
@@ -8376,13 +9276,78 @@ export function App(): React.JSX.Element {
         }
     }, []);
 
+    const column_write_seq_ref = useRef(0);
+    /**
+     * Show one worksheet's columns as `after` and ask the host to make it
+     * durable, keeping the pending write its answer settles. Answers false
+     * when it could not be posted (no snapshot identity yet).
+     *
+     * The one writer behind the column gestures and a column step's replay.
+     * History never moves, and no step is recorded, on a write that may not
+     * have happened: the host can decline it, so it is asked for an answer
+     * (`columnVisibilityChanged`) and `settle_column_write` acts on that.
+     *
+     * Ends auto-fit for the sheet whichever way it is reached: changing which
+     * columns show is what makes the fitted widths stale.
+     */
+    const post_column_visibility = useCallback((
+        sheet_index: number,
+        before: SheetColumnVisibilityState | undefined,
+        after: SheetColumnVisibilityState | undefined,
+        replay?: ViewReplay,
+    ): boolean => {
+        const sheet = meta_ref.current?.sheets[sheet_index];
+        const snapshot_identity = snapshot_identity_ref.current;
+        if (!sheet || !snapshot_identity) return false;
+        deactivate_auto_fit_for_sheet(sheet_index);
+        const next_visibility = [
+            ...(state_ref.current.columnVisibility ?? []),
+        ];
+        next_visibility[sheet_index] = after;
+        state_ref.current = {
+            ...state_ref.current,
+            columnVisibility: next_visibility,
+        };
+        set_column_visibility(next_visibility);
+        const request_id = [
+            'columns',
+            highlight_request_prefix_ref.current,
+            ++column_write_seq_ref.current,
+        ].join(':');
+        pending_column_write_ref.current = {
+            requestId: request_id,
+            worksheet: {
+                sheetIndex: sheet_index,
+                sheetName: sheet.name,
+                ...(sheet.worksheetId === undefined ? {} : { worksheetId: sheet.worksheetId }),
+            },
+            schema: transform_schema_for_sheet(sheet),
+            sourceGeneration: source_generation_ref.current,
+            before,
+            after,
+            ...(replay === undefined ? {} : { replay }),
+            snapshotAdopted: false,
+        };
+        sync_view_request_pending();
+        host_bridge.postMessage({
+            type: 'setColumnVisibility',
+            sheetIndex: sheet_index,
+            sheetName: sheet.name,
+            state: after,
+            sourceGeneration: source_generation_ref.current,
+            snapshotIdentity: snapshot_identity,
+            requestId: request_id,
+        });
+        persist_immediate();
+        return true;
+    }, [deactivate_auto_fit_for_sheet, persist_immediate, sync_view_request_pending]);
+    post_column_visibility_ref.current = post_column_visibility;
+
     const update_column_visibility = useCallback((
         updater: ColumnVisibilityUpdater,
     ) => {
-        if (!edit_gestures_admitted()) return;
         const sheet = meta?.sheets[active_sheet_index];
-        const snapshot_identity = snapshot_identity_ref.current;
-        if (!sheet || !snapshot_identity) return;
+        if (!sheet || !snapshot_identity_ref.current) return;
         const schema = transform_schema_for_sheet(sheet);
         const current = sanitize_column_visibility_state(
             state_ref.current.columnVisibility?.[active_sheet_index],
@@ -8394,37 +9359,15 @@ export function App(): React.JSX.Element {
             sheet.columnCount,
             schema,
         );
+        // A gesture that changes nothing folds no open editor and says nothing.
         if (column_visibility_equal(current, next_sheet_visibility)) return;
-
-        // Glide's overlay editor is portalled outside the grid. Capture its live
-        // source-coordinate value before changing the displayed-column projection.
-        if (editing_ref.current?.commit_live_edit() === false) return;
-        deactivate_auto_fit_for_sheet(active_sheet_index);
-
-        const next_visibility = [
-            ...(state_ref.current.columnVisibility ?? []),
-        ];
-        next_visibility[active_sheet_index] = next_sheet_visibility;
-        state_ref.current = {
-            ...state_ref.current,
-            columnVisibility: next_visibility,
-        };
-        set_column_visibility(next_visibility);
-        host_bridge.postMessage({
-            type: 'setColumnVisibility',
-            sheetIndex: active_sheet_index,
-            sheetName: sheet.name,
-            state: next_sheet_visibility,
-            sourceGeneration: source_generation_ref.current,
-            snapshotIdentity: snapshot_identity,
-        });
-        persist_immediate();
+        if (!view_gesture_may_start(undefined)) return;
+        post_column_visibility(active_sheet_index, current, next_sheet_visibility);
     }, [
         active_sheet_index,
-        deactivate_auto_fit_for_sheet,
-        edit_gestures_admitted,
         meta,
-        persist_immediate,
+        post_column_visibility,
+        view_gesture_may_start,
     ]);
 
     const handle_toggle_column = useCallback((source_index: number) => {
@@ -8611,7 +9554,7 @@ export function App(): React.JSX.Element {
         // gesture (a highlight awaiting the host) has staged against: a write
         // now would make that gesture's commit fail half-applied. The caller
         // keeps the fit owed until the slot is free.
-        if (pending_ids.length > 0 && !edit_gestures_admitted()) return false;
+        if (pending_ids.length > 0 && !base_gestures_admitted()) return false;
         if (pending_ids.length > 0) {
             const before = new Map((edit_session_registry_ref.current!
                 .pending_rows_for_sheet(sheet_index).snapshot().pendingColumns ?? [])
@@ -8652,7 +9595,7 @@ export function App(): React.JSX.Element {
     }, [
         active_sheet_index,
         column_widths,
-        edit_gestures_admitted,
+        base_gestures_admitted,
         persist_immediate,
         write_pending_column_widths,
     ]);
@@ -8671,7 +9614,7 @@ export function App(): React.JSX.Element {
         // held gesture rather than break it.
         if (
             fitted.some((index) => pending_auto_fit_snapshot_ref.current[index] !== undefined)
-            && !edit_gestures_admitted()
+            && !base_gestures_admitted()
         ) return;
         for (const index of fitted) {
             const pending = pending_auto_fit_snapshot_ref.current[index];
@@ -8697,12 +9640,12 @@ export function App(): React.JSX.Element {
             auto_fit_snapshot_ref.current = next;
             return next;
         });
-    }, [edit_gestures_admitted, persist_immediate, write_pending_column_widths]);
+    }, [base_gestures_admitted, persist_immediate, write_pending_column_widths]);
 
     const handle_toggle_auto_fit = useCallback(() => {
         if (auto_fit_active[active_sheet_index]) {
             restore_widths_for_sheets([active_sheet_index]);
-        } else if (!apply_auto_fit_to_active_sheet() && !edit_gestures_admitted()) {
+        } else if (!apply_auto_fit_to_active_sheet() && !base_gestures_admitted()) {
             // Held off for a gesture in flight: owe the fit, as the all-sheets
             // action owes one to a sheet it cannot measure yet.
             update_pending_auto_fit_sheets((prev) => (
@@ -8713,7 +9656,7 @@ export function App(): React.JSX.Element {
         active_sheet_index,
         apply_auto_fit_to_active_sheet,
         auto_fit_active,
-        edit_gestures_admitted,
+        base_gestures_admitted,
         restore_widths_for_sheets,
         update_pending_auto_fit_sheets,
     ]);
@@ -9781,6 +10724,7 @@ export function App(): React.JSX.Element {
             }
             edit_activation_id={edit_activation_id}
             highlight_in_flight={highlight_request_pending}
+            view_request_in_flight={view_request_pending}
             edits_paused={header_fence}
             on_edit_paused_gesture={warn_edit_waits_for_header}
             append_in_flight={append_request_pending}

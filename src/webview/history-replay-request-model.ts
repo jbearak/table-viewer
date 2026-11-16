@@ -138,6 +138,10 @@ export function build_prepare_request(
 
     for (const change of action_replay_changes(entry.action, direction)) {
         if (is_structural_history_change(change)) continue;
+        // A view step writes no document content and has no cell to lease: it
+        // is replayed by its own view request. The coordinator refuses one
+        // before it gets here; this keeps one from ever becoming a cell request.
+        if (change.kind === 'view') return undefined;
         const { worksheet, sourceRow, sourceColumn } = change.delta;
         focus = extend_focus(focus, worksheet, sourceRow, sourceColumn);
         if (change.kind === 'highlight') {
