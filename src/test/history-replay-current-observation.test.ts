@@ -8,7 +8,9 @@
  *  - A view that moved while `commit_history_replay`'s own compare-and-swap was
  *    running was answered as `conflict` or `unavailable` depending on where it
  *    landed, and a view that moved after the write landed was answered as
- *    `document-changed`, which the window tries again.
+ *    `document-changed`, which the window tries again. Once written, a
+ *    replay is answered as committed, `viewMoved` when the view moved after
+ *    the write.
  *
  * "A delivery" below is a snapshot the host posts and the window has not
  * acknowledged yet. Snapshots are not acknowledged automatically here, so one
@@ -184,6 +186,12 @@ function durable_highlight(base: ReturnType<typeof versioned_state_store>): unkn
     return base.get_state(file_path).cellHighlights?.sheets?.[0]?.cells?.['0:0'];
 }
 
+/** The replayed cell's highlight in a delivered snapshot, or undefined. */
+function snapshot_highlight(snapshot: unknown): unknown {
+    return (snapshot as { state?: { cellHighlights?: { sheets?: { cells?: Record<string, unknown> }[] } } })
+        .state?.cellHighlights?.sheets?.[0]?.cells?.['0:0'];
+}
+
 let bytes = enc.encode(CONTENT);
 let mtime = 1;
 
@@ -308,7 +316,7 @@ describe('a replay whose view moves while its commit runs', () => {
         expect(durable_highlight(base)).toBeUndefined();
     });
 
-    it('answers changed-after-write when the view moves after the commit\'s write landed', async () => {
+    it('answers committed, saying the view moved, when the view moves after the commit\'s write landed', async () => {
         const { base, store, hooks } = hooked_store();
         const { panel } = open_csv_table(store);
         await ready(panel);
@@ -322,8 +330,129 @@ describe('a replay whose view moves while its commit runs', () => {
         const answer = await commit(panel, prepared);
 
         expect(moved).toBe(true);
-        expect(refusal_reason(answer)).toBe('changed-after-write');
+        expect(answer.type).toBe('historyReplayCommitted');
+        expect(answer.type === 'historyReplayCommitted' && answer.committed.viewMoved).toBe(true);
+        // The revision its write produced: the floor for later deliveries.
+        expect(answer.type === 'historyReplayCommitted' && answer.committed.stateRevision)
+            .toBe((await base.store.read(file_path)).revision);
         expect(durable_highlight(base)).toBe('yellow');
+    });
+
+    it('after a commit whose view moved after the write, delivers the view with the write in it', async () => {
+        // The delivery that moved the view went out before the session held
+        // the write, so it shows the cell as it was. The window takes its
+        // stores from the delivery after the answer: one must follow.
+        const { store, hooks } = hooked_store();
+        const { panel } = open_csv_table(store);
+        await ready(panel);
+        const prepared = await prepare_highlight(panel);
+        let moved_view: unknown;
+        hooks.after_write = async () => {
+            await post_delivery(panel);
+            moved_view = messages_of(panel, 'workbookSnapshot').at(-1)!.snapshot;
+        };
+
+        const answer = await commit(panel, prepared);
+
+        expect(answer.type === 'historyReplayCommitted' && answer.committed.viewMoved).toBe(true);
+        expect(snapshot_highlight(moved_view)).toBeUndefined();
+        const after_answer = () => panel.__messages.slice(panel.__messages.indexOf(answer))
+            .filter((message): message is Extract<HostMessage, { type: 'workbookSnapshot' }> =>
+                (message as { type?: string }).type === 'workbookSnapshot');
+        await vi.waitFor(() => expect(after_answer().length).toBeGreaterThan(0));
+        expect(snapshot_highlight(after_answer().at(-1)!.snapshot)).toBe('yellow');
+    });
+
+    it('answers committed when recording the committed write fails after it landed', async () => {
+        // The bookkeeping after a durable write throws (here, a committed
+        // result it cannot read). The write is in the file all the same.
+        const { base, store } = hooked_store();
+        const compare_and_set = store.compare_and_set.bind(store);
+        let broken = false;
+        store.compare_and_set = async (...args) => {
+            const result = await compare_and_set(...args);
+            if (broken || result.type !== 'committed') return result;
+            broken = true;
+            return { ...result, snapshot: { ...result.snapshot, state: null as never } };
+        };
+        // The state read back to repair the session is held until the
+        // answer has gone out: the read `refresh_session_state_material`
+        // makes, picked out by its caller. (Matched by name, in the async
+        // stack: a rename there leaves `held` false, which is asserted.)
+        let release_read!: () => void;
+        const read_held = new Promise<void>((resolve) => { release_read = resolve; });
+        const read = store.read.bind(store);
+        let held = false;
+        store.read = async (...args) => {
+            if (!held && new Error().stack?.includes('refresh_session_state_material')) {
+                held = true;
+                await read_held;
+            }
+            return read(...args);
+        };
+        const { panel } = open_csv_table(store);
+        await ready(panel);
+        const prepared = await prepare_highlight(panel);
+        broken = false;
+        vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+        const answer = await commit(panel, prepared);
+
+        expect(broken).toBe(true);
+        expect(answer.type).toBe('historyReplayCommitted');
+        expect(durable_highlight(base)).toBe('yellow');
+        await vi.waitFor(() => expect(held).toBe(true));
+
+        // Once the read lands, a delivery carries the write.
+        const delivered_before = messages_of(panel, 'workbookSnapshot').length;
+        release_read();
+        await vi.waitFor(() => expect(messages_of(panel, 'workbookSnapshot').length)
+            .toBeGreaterThan(delivered_before));
+        expect(snapshot_highlight(messages_of(panel, 'workbookSnapshot').at(-1)!.snapshot)).toBe('yellow');
+    });
+
+    it('delivers the repaired state only after the answer, when recording the committed write fails', async () => {
+        // The repair runs while the replay that wrote is still to be
+        // answered. Its delivery must not reach the window first: the window
+        // would take the written state before the answer that moves history.
+        const { base, store } = hooked_store();
+        const compare_and_set = store.compare_and_set.bind(store);
+        // Set once the replay is prepared: only its write is broken.
+        let armed = false;
+        let broken = false;
+        let messages: unknown[] = [];
+        let messages_at_break = 0;
+        store.compare_and_set = async (...args) => {
+            const result = await compare_and_set(...args);
+            if (!armed || broken || result.type !== 'committed') return result;
+            broken = true;
+            messages_at_break = messages.length;
+            return { ...result, snapshot: { ...result.snapshot, state: null as never } };
+        };
+        const { panel } = open_csv_table(store);
+        messages = panel.__messages;
+        await ready(panel);
+        const prepared = await prepare_highlight(panel);
+        armed = true;
+        vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+        const answer = await commit(panel, prepared);
+        expect(broken).toBe(true);
+        expect(answer.type).toBe('historyReplayCommitted');
+        expect(durable_highlight(base)).toBe('yellow');
+        // Everything after the write, in order: the answer comes before any
+        // delivery that carries the write.
+        await vi.waitFor(() => expect(panel.__messages.slice(messages_at_break)
+            .some((message) => (message as { type?: string }).type === 'workbookSnapshot'
+                && snapshot_highlight((message as { snapshot: unknown }).snapshot) === 'yellow')).toBe(true));
+        const after = panel.__messages.slice(messages_at_break);
+        const answered_at = after.indexOf(answer);
+        const first_written = after.findIndex((message) => (message as { type?: string }).type === 'workbookSnapshot'
+            && snapshot_highlight((message as { snapshot: unknown }).snapshot) === 'yellow');
+        expect(answered_at).toBeGreaterThanOrEqual(0);
+        expect(answered_at).toBeLessThan(first_written);
+        // And the window is left with the write.
+        expect(snapshot_highlight(messages_of(panel, 'workbookSnapshot').at(-1)!.snapshot)).toBe('yellow');
     });
 
     it('still answers conflict when the durable highlight differs from the one the replay expects', async () => {

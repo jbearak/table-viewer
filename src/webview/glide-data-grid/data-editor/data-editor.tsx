@@ -1570,6 +1570,13 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
     React.useLayoutEffect(() => {
         getMangledCellContentRef.current = getMangledCellContent;
     }, [getMangledCellContent]);
+    // Fork addition: a paste that waited for rows commits through the edit
+    // callback rendered with them. The one from the render the paste began in
+    // has never seen those rows, so it cannot place an edit on them.
+    const mangledOnCellsEditedRef = React.useRef(mangledOnCellsEdited);
+    React.useLayoutEffect(() => {
+        mangledOnCellsEditedRef.current = mangledOnCellsEdited;
+    }, [mangledOnCellsEdited]);
 
     const mangledGetGroupDetails = React.useCallback<NonNullable<DataEditorProps["getGroupDetails"]>>(
         group => {
@@ -4055,7 +4062,7 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
                     editList.unshift(...deletions);
                 }
 
-                const result = mangledOnCellsEdited(editList, "paste");
+                const result = mangledOnCellsEditedRef.current(editList, "paste");
                 if (result === "refused") {
                     rowAdmission?.rollback();
                     onClipboardPasteError?.(
@@ -4079,7 +4086,6 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
             gridSelection,
             keybindings.paste,
             mangledCols.length,
-            mangledOnCellsEdited,
             mangledRows,
             onPaste,
             onPasteRowsNeeded,

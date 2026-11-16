@@ -3621,14 +3621,20 @@ export function GridShell({
         append_answered_ref.current = null;
         answered?.settle(editable_cells);
     }, [append_in_flight, editable_cells]);
-    useEffect(() => () => {
-        // A gesture still waiting when this grid goes away is told no.
-        const committed = editable_commit_ref.current;
-        editable_commit_ref.current = null;
-        committed?.settle(false);
-        const answered = append_answered_ref.current;
-        append_answered_ref.current = null;
-        answered?.settle(false);
+    /** Set when this grid goes away, for what was waiting on it. */
+    const grid_unmounted_ref = useRef(false);
+    useEffect(() => {
+        grid_unmounted_ref.current = false;
+        return () => {
+            grid_unmounted_ref.current = true;
+            // A gesture still waiting when this grid goes away is told no.
+            const committed = editable_commit_ref.current;
+            editable_commit_ref.current = null;
+            committed?.settle(false);
+            const answered = append_answered_ref.current;
+            append_answered_ref.current = null;
+            answered?.settle(false);
+        };
     }, []);
     // Gestures waiting on the session. Counted so the session they are about
     // to use is not released as empty in the moment before they run.
@@ -3735,6 +3741,12 @@ export function GridShell({
         session_requests_ref.current += 1;
         try {
             if (!await request(quiet)) return false;
+            // A grid gone meanwhile has settled what was waiting on it, and a
+            // signal made now would never be: the gesture is told no. (The
+            // session the host granted stays App's, and is let go once a
+            // grid is there to answer that it is idle; until then it is
+            // held, as before.)
+            if (grid_unmounted_ref.current) return false;
             if (editable_cells_ref.current) return true;
             const committed = editable_commit_ref.current ?? pending_signal<boolean>();
             editable_commit_ref.current = committed;
@@ -6751,14 +6763,35 @@ export function GridShell({
                             pendingRowId,
                         }) !== undefined)) {
                     let rolled_back = false;
-                    resolve({
+                    const admission = {
                         topologyKey: admitted_topology_key,
                         rollback: () => {
                             if (rolled_back) return;
                             rolled_back = true;
                             rollback();
                         },
-                    });
+                    };
+                    // The rows can be rendered before App's answer to their
+                    // request is, and until it is the grid takes no edit:
+                    // the paste would be refused as busy. Wait for that
+                    // commit; whatever it leaves closed refuses the paste
+                    // there, and Glide rolls the rows back and says so. A
+                    // grid that went away meanwhile (another sheet, the
+                    // session over) ends the paste with it, quietly.
+                    if (append_in_flight_ref.current) {
+                        const answered = append_answered_ref.current ?? pending_signal<boolean>();
+                        append_answered_ref.current = answered;
+                        void answered.settled.then((open) => {
+                            if (!open && grid_unmounted_ref.current) {
+                                admission.rollback();
+                                resolve(false);
+                                return;
+                            }
+                            resolve(admission);
+                        });
+                        return;
+                    }
+                    resolve(admission);
                     return;
                 }
                 attempts += 1;

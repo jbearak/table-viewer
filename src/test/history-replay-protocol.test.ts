@@ -13,6 +13,7 @@ import {
     sanitized_wire_history_replay_display_focus,
     sanitized_wire_history_replay_focus,
     type HistoryReplayCommitRefusalReason,
+    type HistoryReplayCommitted,
 } from '../history-replay-protocol';
 
 const LINK: CellHyperlink = { kind: 'external', target: 'https://example.com/' };
@@ -783,19 +784,18 @@ describe('history_replay_proposal_digest', () => {
 });
 
 describe('commit refusal reasons', () => {
-    // Host-to-window answers are not sanitized, so the set is pinned by type:
-    // `changed-after-write` (the write landed, then the view moved) is its own
-    // reason, apart from `document-changed` (nothing written), because the
-    // window tries the second again and must not try the first.
-    it('says apart a view that moved after the write from one that moved before it', () => {
+    // Host-to-window answers are not sanitized, so the set is pinned by type.
+    // A write that landed is never refused: when the view moved after it the
+    // commit is answered as committed, with `viewMoved`.
+    it('has no refusal for a commit whose write landed', () => {
         expectTypeOf<HistoryReplayCommitRefusalReason>().toEqualTypeOf<
             | 'malformed'
             | 'expired'
             | 'proposal-mismatch'
             | 'conflict'
             | 'document-changed'
-            | 'changed-after-write'
             | 'unavailable'
         >();
+        expectTypeOf<HistoryReplayCommitted['viewMoved']>().toEqualTypeOf<true | undefined>();
     });
 });

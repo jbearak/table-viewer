@@ -79,7 +79,10 @@ export type ReplayRefusalReason =
      * tries again once the refresh it lost to has been applied.
      */
     | 'not-current'
-    /** The view moved after the commit's write landed. Not tried again. */
+    /**
+     * The document this history belongs to has gone (the coordinator's
+     * `reset`). Its caller has moved on and says nothing.
+     */
     | 'document-changed'
     | 'unavailable'
     | 'malformed'
@@ -460,7 +463,5 @@ export function commit_refusal_reason(
             // against is gone, the host wrote nothing, and a fresh preparation
             // is the only way forward.
             return 'not-current';
-        case 'changed-after-write':
-            return 'document-changed';
     }
 }

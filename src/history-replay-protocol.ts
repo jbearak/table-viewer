@@ -434,6 +434,21 @@ export interface HistoryReplayCommitted extends HistoryReplayLeaseIdentity {
      * succeeded; there is simply nowhere visible to put the cursor.
      */
     readonly displayFocus: HistoryReplayDisplayFocus | null;
+    /**
+     * The view this replay was prepared against moved after its write landed.
+     * The write is in the file, so the answer is still a commit: the renderer
+     * lands it as any other, against sheets it checks are still the ones the
+     * commit was sent for, and a delivery of the host's current state follows.
+     */
+    readonly viewMoved?: true;
+    /**
+     * With `viewMoved`: the durable state revision the write produced. The
+     * renderer turns away one delivery below it that arrives after this
+     * answer (one made before the write, posted late), however often that
+     * delivery is retried. A different delivery below it means the host's
+     * material never reached the write, and the renderer takes it as usual.
+     */
+    readonly stateRevision?: number;
 }
 
 /**
@@ -456,12 +471,6 @@ export type HistoryReplayCommitRefusalReason =
      * wrote nothing. A fresh preparation is the way forward.
      */
     | 'document-changed'
-    /**
-     * The commit's write landed, and the view moved before it could be
-     * answered as committed. Not `document-changed`: the write is in the file,
-     * so the same replay prepared again would not be a second attempt.
-     */
-    | 'changed-after-write'
     | 'unavailable';
 
 export interface HistoryReplayCommitRefused extends HistoryReplayLeaseIdentity {

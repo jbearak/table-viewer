@@ -17974,6 +17974,8 @@ describe('undo and redo, from the keyboard and the desktop menu', () => {
                 sourceColumnStart: number;
                 sourceColumnEnd: number;
             };
+            /** Answered as a commit whose view moved after its write. */
+            readonly viewMoved?: true;
         } = {},
     ) {
         const prepare = sent(post_message, 'prepareHistoryReplay');
@@ -18009,6 +18011,7 @@ describe('undo and redo, from the keyboard and the desktop menu', () => {
                 displayFocus: options.displayFocus === undefined
                     ? { displayRowStart: 3, displayRowEnd: 3, mappingGeneration: 1 }
                     : options.displayFocus,
+                ...(options.viewMoved === undefined ? {} : { viewMoved: options.viewMoved }),
             },
         });
     }
@@ -18836,6 +18839,366 @@ describe('undo and redo, from the keyboard and the desktop menu', () => {
             type: 'showWarning',
             message: 'Undo could not be completed because the workbook changed. No changes were applied.',
         });
+    });
+
+    it.each([
+        ['already in place, on any commit', 'desired', false, true],
+        ['moved only in its conflicts, on a commit whose view moved after its write', 'conflicts', true, true],
+        ['already in place but for newer conflicts, on a commit whose view moved after its write', 'desired-conflicts', true, true],
+        // An answer re-sent after a lost one, once a refresh installed it.
+        ['already in place but for newer conflicts, on an ordinary commit', 'desired-conflicts', false, true],
+        ['moved in its rows, on a commit whose view moved after its write', 'rows', true, false],
+        ['moved in its rows and kept by this window, on a commit whose view moved after its write', 'rows-kept', true, false],
+        ['moved only in its conflicts, on an ordinary commit', 'conflicts', false, false],
+    ] as const)('lands a structural undo whose store is %s', async (_name, store_state, view_moved, lands) => {
+        const { post_message } = await render_app();
+        const meta = make_meta(['Sheet1'], false);
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        await acquire_editing_session(post_message, 'structural-landing-session');
+        const props = grid_shell_mock.latest_props as unknown as GridShellProps;
+        const pending_store = props.pending_row_store!;
+        const template = { id: 'plain', format: { kind: 'none' as const } };
+        const basis = {
+            sourceRowCount: 1,
+            provisionalStartRow: 1,
+            provisionalRowCount: 1,
+            columnCount: 1,
+            schemaFingerprint: transform_schema_for_sheet(meta.sheets[0]),
+        };
+        await act(async () => {
+            expect(pending_store.append_rows(
+                'structural-landing-session',
+                ['pending-a'],
+                template,
+                1,
+                basis,
+            )).toBe(true);
+        });
+        const after = pending_store.snapshot();
+        const record = props.history_store!.stage_record({
+            label: 'Append row',
+            changes: [{
+                kind: 'rowAppend',
+                delta: {
+                    worksheet: { sheetIndex: 0, sheetName: 'Sheet1' },
+                    pendingRowId: after.appendedRows[0].id,
+                    before: null,
+                    after: after.appendedRows[0],
+                    beforeIndex: null,
+                    afterIndex: 0,
+                    formatTemplates: [template],
+                },
+            }, {
+                kind: 'pendingRows',
+                delta: {
+                    worksheet: { sheetIndex: 0, sheetName: 'Sheet1' },
+                    before: { ...after, appendBasis: undefined },
+                    after,
+                },
+            }],
+        });
+        expect(record.commit()).toBe(true);
+        record.notify();
+        post_message.mockClear();
+
+        await undo_via_menu();
+        await vi.waitUntil(() => sent(post_message, 'prepareHistoryReplay') !== undefined);
+        const prepare = sent(post_message, 'prepareHistoryReplay');
+        const structures = prepare.request.structures.map((structure: object) => ({
+            ...structure,
+            resolvedSheetIndex: 0,
+        }));
+        await dispatch_host_message({
+            type: 'historyReplayPrepared',
+            prepared: {
+                requestId: prepare.request.requestId,
+                replayId: prepare.request.replayId,
+                leaseId: 'structural-landing-lease',
+                focusSheetIndex: 0,
+                focus: prepare.request.focus,
+                cells: [],
+                structures,
+            },
+        });
+        const commit = sent(post_message, 'commitHistoryReplay');
+        // What a delivery made the store before the answer arrived.
+        const desired = prepare.request.structures[0].desired;
+        const moved = store_state === 'desired'
+            ? desired
+            : store_state === 'desired-conflicts'
+                ? { ...desired, conflicts: [{
+                    reason: 'ambiguousPendingFormula' as const,
+                    pendingRowIds: [],
+                    tailRemovalIds: [],
+                    formulaCells: [{
+                        rowIdentity: { kind: 'source' as const, sourceRow: 0 },
+                        sourceColumn: 0,
+                    }],
+                }] }
+            : store_state === 'rows' || store_state === 'rows-kept'
+                // The row gone, its append basis kept: neither where the
+                // replay found it nor where it leaves it.
+                ? { ...after, appendedRows: [], formatTemplates: [] }
+                : {
+                ...after,
+                conflicts: [{
+                    reason: 'ambiguousPendingFormula' as const,
+                    pendingRowIds: [],
+                    tailRemovalIds: [],
+                    formulaCells: [{
+                        rowIdentity: { kind: 'source' as const, sourceRow: 0 },
+                        sourceColumn: 0,
+                    }],
+                }],
+            };
+        await act(async () => {
+            expect(pending_store.install({ session_id: 'structural-landing-session' }, moved)).toBe(true);
+        });
+        if (store_state === 'rows-kept') {
+            // A publication of it the host has not acknowledged: a delivery
+            // would not reconcile this store.
+            const { pending_changes_durability } = await import('../webview/host-bridge');
+            pending_changes_durability.publish('structural-landing-session', {
+                sheetIndex: 0,
+                sheetName: 'Sheet1',
+                cells: {},
+                ...moved,
+            }, 1, true);
+        }
+        await dispatch_host_message({
+            type: 'historyReplayCommitted',
+            committed: {
+                requestId: commit.request.requestId,
+                replayId: commit.request.replayId,
+                leaseId: commit.request.leaseId,
+                mutationId: commit.request.mutationId,
+                sourceGeneration: 1,
+                cells: [],
+                structures,
+                focusSheetIndex: 0,
+                focus: prepare.request.focus,
+                displayFocus: null,
+                ...(view_moved ? { viewMoved: true as const } : {}),
+            },
+        });
+
+        const labels = props.history_store!.snapshot().undoStack.map((entry) => entry.action.label);
+        if (lands) {
+            expect(labels).toEqual([]);
+            expect(sent(post_message, 'showWarning')).toBeUndefined();
+            expect(pending_store.snapshot()).toEqual(
+                store_state === 'desired' || store_state === 'desired-conflicts'
+                    ? moved
+                    // The replay lands, with the conflicts the host has now.
+                    : { ...desired, conflicts: moved.conflicts },
+            );
+        } else {
+            expect(labels).toEqual(['Append row']);
+            expect(sent(post_message, 'showWarning')?.message).toBe(
+                'The change was undone in the file, but this view could not be updated. Reopen the file to resynchronize.',
+            );
+        }
+    });
+
+    it('lands a re-sent answer whose sibling conflict arm the host has since recomputed, keeping the newer conflicts', async () => {
+        const { post_message } = await render_app();
+        const meta = make_meta(['Sheet1', 'Sheet2'], false);
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        await acquire_editing_session(post_message, 'sibling-session');
+        const props = grid_shell_mock.latest_props as unknown as GridShellProps;
+        const pending_store = props.pending_row_store!;
+        const template = { id: 'plain', format: { kind: 'none' as const } };
+        await act(async () => {
+            expect(pending_store.append_rows('sibling-session', ['pending-a'], template, 1, {
+                sourceRowCount: 1,
+                provisionalStartRow: 1,
+                provisionalRowCount: 1,
+                columnCount: 1,
+                schemaFingerprint: transform_schema_for_sheet(meta.sheets[0]),
+            })).toBe(true);
+        });
+        const after = pending_store.snapshot();
+        const record = props.history_store!.stage_record({
+            label: 'Append row',
+            changes: [{
+                kind: 'rowAppend',
+                delta: {
+                    worksheet: { sheetIndex: 0, sheetName: 'Sheet1' },
+                    pendingRowId: after.appendedRows[0].id,
+                    before: null,
+                    after: after.appendedRows[0],
+                    beforeIndex: null,
+                    afterIndex: 0,
+                    formatTemplates: [template],
+                },
+            }, {
+                kind: 'pendingRows',
+                delta: {
+                    worksheet: { sheetIndex: 0, sheetName: 'Sheet1' },
+                    before: { ...after, appendBasis: undefined },
+                    after,
+                },
+            }],
+        });
+        expect(record.commit()).toBe(true);
+        record.notify();
+        await click_sheet_tab('Sheet2');
+        const sibling_store = (grid_shell_mock.latest_props as unknown as GridShellProps).pending_row_store!;
+        const conflict = (sourceRow: number) => [{
+            reason: 'ambiguousPendingFormula' as const,
+            pendingRowIds: [],
+            tailRemovalIds: [],
+            formulaCells: [{ rowIdentity: { kind: 'source' as const, sourceRow }, sourceColumn: 0 }],
+        }];
+        expect(sibling_store.install(
+            { session_id: 'sibling-session' },
+            { formatTemplates: [], appendedRows: [], tailRemovals: [], conflicts: conflict(0) },
+        )).toBe(true);
+        await click_sheet_tab('Sheet1');
+        post_message.mockClear();
+
+        await undo_via_menu();
+        await vi.waitUntil(() => sent(post_message, 'prepareHistoryReplay') !== undefined);
+        const prepare = sent(post_message, 'prepareHistoryReplay');
+        const structures = prepare.request.structures.map((structure: object) => ({
+            ...structure,
+            resolvedSheetIndex: 0,
+        }));
+        await dispatch_host_message({
+            type: 'historyReplayPrepared',
+            prepared: {
+                requestId: prepare.request.requestId,
+                replayId: prepare.request.replayId,
+                leaseId: 'sibling-lease',
+                focusSheetIndex: 0,
+                focus: prepare.request.focus,
+                cells: [],
+                structures,
+            },
+        });
+        const commit = sent(post_message, 'commitHistoryReplay');
+        // The answer is lost; a refresh installs the written rows and a
+        // sibling conflict the host recomputed since.
+        await act(async () => {
+            expect(pending_store.install(
+                { session_id: 'sibling-session' },
+                prepare.request.structures[0].desired,
+            )).toBe(true);
+            expect(sibling_store.install(
+                { session_id: 'sibling-session' },
+                { formatTemplates: [], appendedRows: [], tailRemovals: [], conflicts: conflict(1) },
+            )).toBe(true);
+        });
+        // The answer, re-sent, as it was: ordinary.
+        await dispatch_host_message({
+            type: 'historyReplayCommitted',
+            committed: {
+                requestId: commit.request.requestId,
+                replayId: commit.request.replayId,
+                leaseId: commit.request.leaseId,
+                mutationId: commit.request.mutationId,
+                sourceGeneration: 1,
+                cells: [],
+                structures: [...structures, {
+                    ordinal: 1,
+                    resolvedSheetIndex: 1,
+                    expectedConflicts: conflict(0),
+                    desiredConflicts: [],
+                    hostDerived: true,
+                }],
+                focusSheetIndex: 0,
+                focus: prepare.request.focus,
+                displayFocus: null,
+            },
+        });
+
+        expect(props.history_store!.snapshot().undoStack).toEqual([]);
+        expect(sent(post_message, 'showWarning')).toBeUndefined();
+        expect(sibling_store.snapshot().conflicts).toEqual(conflict(1));
+    });
+
+    it('stages a structural undo that changes only conflicts, from the store where the replay found it', async () => {
+        const { post_message } = await render_app();
+        const meta = make_meta(['Sheet1'], false);
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        await acquire_editing_session(post_message, 'conflict-only-session');
+        const props = grid_shell_mock.latest_props as unknown as GridShellProps;
+        const pending_store = props.pending_row_store!;
+        const conflicts = [{
+            reason: 'ambiguousPendingFormula' as const,
+            pendingRowIds: [],
+            tailRemovalIds: [],
+            formulaCells: [{
+                rowIdentity: { kind: 'source' as const, sourceRow: 0 },
+                sourceColumn: 0,
+            }],
+        }];
+        const with_conflict = { ...pending_store.snapshot(), conflicts };
+        const resolved = { ...with_conflict, conflicts: [] };
+        await act(async () => {
+            expect(pending_store.install({ session_id: 'conflict-only-session' }, resolved)).toBe(true);
+        });
+        // The gesture that resolved the conflict, recorded as its own step.
+        const record = props.history_store!.stage_record({
+            label: 'Edit cell',
+            changes: [{
+                kind: 'pendingRows',
+                delta: {
+                    worksheet: { sheetIndex: 0, sheetName: 'Sheet1' },
+                    before: with_conflict,
+                    after: resolved,
+                },
+            }],
+        });
+        expect(record.commit()).toBe(true);
+        record.notify();
+        post_message.mockClear();
+
+        await undo_via_menu();
+        await vi.waitUntil(() => sent(post_message, 'prepareHistoryReplay') !== undefined);
+        const prepare = sent(post_message, 'prepareHistoryReplay');
+        const structures = prepare.request.structures.map((structure: object) => ({
+            ...structure,
+            resolvedSheetIndex: 0,
+        }));
+        await dispatch_host_message({
+            type: 'historyReplayPrepared',
+            prepared: {
+                requestId: prepare.request.requestId,
+                replayId: prepare.request.replayId,
+                leaseId: 'conflict-only-lease',
+                focusSheetIndex: 0,
+                focus: prepare.request.focus,
+                cells: [],
+                structures,
+            },
+        });
+        const commit = sent(post_message, 'commitHistoryReplay');
+        await dispatch_host_message({
+            type: 'historyReplayCommitted',
+            committed: {
+                requestId: commit.request.requestId,
+                replayId: commit.request.replayId,
+                leaseId: commit.request.leaseId,
+                mutationId: commit.request.mutationId,
+                sourceGeneration: 1,
+                cells: [],
+                structures,
+                focusSheetIndex: 0,
+                focus: prepare.request.focus,
+                displayFocus: null,
+            },
+        });
+
+        // The conflict is back, with history moved.
+        expect(pending_store.snapshot().conflicts).toEqual(conflicts);
+        expect(props.history_store!.snapshot().undoStack).toEqual([]);
     });
 
     it('routes structural-only undo and redo through the host transaction', async () => {
@@ -20376,48 +20739,57 @@ describe('undo and redo, from the keyboard and the desktop menu', () => {
                 expect(props().gestures_admitted?.()).toBe(true);
             });
 
-            it('is tried again after a commit refused as expired, and not after one refused after its write', async () => {
+            it('is tried again after a commit refused as expired', async () => {
                 const { post_message } = await render_app();
                 await two_steps(post_message);
-                const refuse_commit = async (reason: 'expired' | 'changed-after-write') => {
-                    const prepare = sent(post_message, 'prepareHistoryReplay');
-                    await dispatch_host_message({
-                        type: 'historyReplayPrepared',
-                        prepared: {
-                            requestId: prepare.request.requestId,
-                            replayId: prepare.request.replayId,
-                            leaseId: `lease-${reason}`,
-                            focusSheetIndex: 0,
-                            focus: prepare.request.focus,
-                            cells: [],
-                        },
-                    });
-                    const commit = sent(post_message, 'commitHistoryReplay');
-                    await refresh();
-                    await dispatch_host_message({
-                        type: 'historyReplayCommitRefused',
-                        refusal: {
-                            requestId: commit.request.requestId,
-                            replayId: commit.request.replayId,
-                            leaseId: commit.request.leaseId,
-                            mutationId: commit.request.mutationId,
-                            reason,
-                        },
-                    });
-                };
 
                 await undo_via_menu();
-                await refuse_commit('expired');
+                const prepare = sent(post_message, 'prepareHistoryReplay');
+                await dispatch_host_message({
+                    type: 'historyReplayPrepared',
+                    prepared: {
+                        requestId: prepare.request.requestId,
+                        replayId: prepare.request.replayId,
+                        leaseId: 'lease-expired',
+                        focusSheetIndex: 0,
+                        focus: prepare.request.focus,
+                        cells: [],
+                    },
+                });
+                const commit = sent(post_message, 'commitHistoryReplay');
+                await refresh();
+                await dispatch_host_message({
+                    type: 'historyReplayCommitRefused',
+                    refusal: {
+                        requestId: commit.request.requestId,
+                        replayId: commit.request.replayId,
+                        leaseId: commit.request.leaseId,
+                        mutationId: commit.request.mutationId,
+                        reason: 'expired',
+                    },
+                });
                 expect(prepares(post_message)).toHaveLength(2);
                 expect(warnings(post_message)).toEqual([]);
+                expect(undo_labels()).toEqual([CLEAR, CLEAR]);
+            });
 
-                // The write is in the file: preparing it again would not be a
-                // second try at something that did not happen.
-                await refuse_commit('changed-after-write');
+            it('lands a commit whose view moved after its write, and carries out a press held behind it on the entry under it', async () => {
+                const { post_message } = await render_app();
+                await two_steps(post_message);
+
+                await undo_via_menu();
+                await undo_via_menu();
+                expect(props().history_press_held?.()).toBe(true);
+                await refresh();
+                await complete_replay(post_message, { viewMoved: true });
+                // Done: not tried again, nothing said, and the held press runs.
+                expect(undo_labels()).toEqual([CLEAR]);
                 expect(prepares(post_message)).toHaveLength(2);
-                expect(warnings(post_message)).toEqual([
-                    'Undo did not run because the file was refreshing. Try again.',
-                ]);
+                await complete_replay(post_message);
+                expect(undo_labels()).toEqual([]);
+                expect(redo_labels()).toEqual([CLEAR, CLEAR]);
+                expect(warnings(post_message)).toEqual([]);
+                expect(props().history_press_held?.()).toBe(false);
             });
 
             it('admits work made before the retry\'s press, and refuses work made between it and a press held behind it', async () => {
@@ -24025,7 +24397,25 @@ describe('view steps in history', () => {
 
     describe('with edits', () => {
         /** Answer the cell replay in flight the way the host does: prepared, then committed. */
-        async function complete_cell_replay(post_message: ReturnType<typeof vi.fn>) {
+        async function complete_cell_replay(
+            post_message: ReturnType<typeof vi.fn>,
+            options: {
+                /** Answered as a commit whose view moved after its write. */
+                readonly viewMoved?: true;
+                /** With `viewMoved`: the state revision the write produced. */
+                readonly stateRevision?: number;
+                /** Keep what the answer posted, for the test to read. */
+                readonly keep_messages?: true;
+                /** Where the host found the replayed rows; none by default. */
+                readonly displayFocus?: {
+                    displayRowStart: number;
+                    displayRowEnd: number;
+                    mappingGeneration: number;
+                };
+                /** What reaches the window between the commit and its answer. */
+                readonly before_answer?: () => Promise<void>;
+            } = {},
+        ) {
             await vi.waitUntil(() => posted(post_message, 'prepareHistoryReplay').length > 0);
             const prepare = posted(post_message, 'prepareHistoryReplay').at(-1)!;
             await dispatch_host_message({
@@ -24045,6 +24435,7 @@ describe('view steps in history', () => {
                 },
             });
             const commit = posted(post_message, 'commitHistoryReplay').at(-1)!;
+            await options.before_answer?.();
             await dispatch_host_message({
                 type: 'historyReplayCommitted',
                 committed: {
@@ -24061,11 +24452,188 @@ describe('view steps in history', () => {
                     })),
                     focusSheetIndex: 0,
                     focus: prepare.request.focus,
-                    displayFocus: null,
+                    displayFocus: options.displayFocus ?? null,
+                    ...(options.viewMoved === undefined ? {} : { viewMoved: options.viewMoved }),
+                    ...(options.stateRevision === undefined ? {} : { stateRevision: options.stateRevision }),
                 },
             });
-            post_message.mockClear();
+            // Kept where the test reads what the answer itself posted.
+            if (options.viewMoved === undefined && options.keep_messages === undefined) post_message.mockClear();
         }
+
+        describe('a commit whose view moved after its write landed', () => {
+            const ROW_0 = { displayRowStart: 0, displayRowEnd: 0, mappingGeneration: 1 };
+            async function edited(post_message: ReturnType<typeof vi.fn>, meta = table_meta()) {
+                await open(post_message, {}, meta);
+                await acquire_editing_session(post_message, 'first-session');
+                await act(async () => {
+                    props().edit_session!.commit('first-session', '0:0', { value: 'edited', base: 'Alice' });
+                });
+                record_edit('edited');
+                expect(undo_labels()).toEqual(['Edit cell']);
+                post_message.mockClear();
+            }
+
+            it('is landed as done: the stores and history move, nothing is said, nothing is tried again', async () => {
+                const { post_message } = await render_app();
+                await edited(post_message);
+
+                await undo();
+                await complete_cell_replay(post_message, { viewMoved: true, displayFocus: ROW_0 });
+
+                expect(undo_labels()).toEqual([]);
+                expect(redo_labels()).toEqual(['Edit cell']);
+                expect(latest_store_edits()).toEqual({});
+                expect(posted(post_message, 'prepareHistoryReplay')).toHaveLength(1);
+                expect(warnings(post_message)).toEqual([]);
+            });
+
+            it('is landed after a refresh that reached the window first', async () => {
+                const { post_message } = await render_app();
+                await edited(post_message);
+
+                await undo();
+                await complete_cell_replay(post_message, {
+                    viewMoved: true,
+                    displayFocus: ROW_0,
+                    before_answer: () => dispatch_host_message(refresh_snapshot_message(table_meta(), {
+                        generation: view_generation,
+                        sourceGeneration: 1,
+                        reason: 'other',
+                        capabilities: { ...CSV, csvEditSessionId: 'first-session' },
+                    })),
+                });
+
+                expect(undo_labels()).toEqual([]);
+                expect(redo_labels()).toEqual(['Edit cell']);
+                expect(latest_store_edits()).toEqual({});
+                expect(warnings(post_message)).toEqual([]);
+            });
+
+            it('is landed on the same worksheet when a reorder reached the window first', async () => {
+                const { post_message } = await render_app();
+                await edited(post_message, table_meta(['Sheet1', 'Sheet2']));
+
+                await undo();
+                await complete_cell_replay(post_message, {
+                    viewMoved: true,
+                    displayFocus: ROW_0,
+                    before_answer: () => dispatch_host_message(refresh_snapshot_message(
+                        table_meta(['Sheet2', 'Sheet1']),
+                        {
+                            generation: view_generation,
+                            sourceGeneration: 1,
+                            reason: 'other',
+                            capabilities: { ...CSV, csvEditSessionId: 'first-session' },
+                        },
+                    )),
+                });
+
+                expect(undo_labels()).toEqual([]);
+                expect(redo_labels()).toEqual(['Edit cell']);
+                expect(warnings(post_message)).toEqual([]);
+                // Sheet1 is second now, and its store holds the write.
+                await click_button('Sheet1');
+                expect(grid_stub().getAttribute('data-sheet-index')).toBe('1');
+                expect(latest_store_edits()).toEqual({});
+            });
+
+            it('says the view needs reopening when its worksheet has gone before the answer', async () => {
+                const { post_message } = await render_app();
+                await edited(post_message, table_meta(['Sheet1', 'Sheet2']));
+
+                await undo();
+                await complete_cell_replay(post_message, {
+                    viewMoved: true,
+                    displayFocus: ROW_0,
+                    before_answer: () => dispatch_host_message(refresh_snapshot_message(
+                        table_meta(['Sheet2']),
+                        {
+                            generation: view_generation,
+                            sourceGeneration: 1,
+                            reason: 'other',
+                            capabilities: { ...CSV, csvEditSessionId: 'first-session' },
+                        },
+                    )),
+                });
+
+                // The worksheet's parked store still holds what it held:
+                // this view cannot follow the file, and says so.
+                expect(undo_labels()).toEqual(['Edit cell']);
+                expect(warnings(post_message)).toEqual([
+                    'The change was undone in the file, but this view could not be updated. Reopen the file to resynchronize.',
+                ]);
+            });
+
+            it('does not apply a delivery made before the write that arrives after the answer', async () => {
+                const { post_message } = await render_app();
+                await edited(post_message);
+
+                await undo();
+                // State revision 1: made before the write, whose revision is 2.
+                const pre_write = refresh_snapshot_message(table_meta(), {
+                    generation: view_generation,
+                    sourceGeneration: 1,
+                    reason: 'other',
+                    capabilities: { ...CSV, csvEditSessionId: 'first-session' },
+                    identity: { stateRevision: 1 },
+                    state: {
+                        pendingEdits: [{
+                            sheetName: 'Sheet1',
+                            cells: { '0:0': { value: 'edited', base: 'Alice' } },
+                        }],
+                    } as never,
+                });
+                await complete_cell_replay(post_message, { viewMoved: true, displayFocus: ROW_0, stateRevision: 2 });
+                expect(latest_store_edits()).toEqual({});
+
+                // A retried post of a delivery the host made before the write,
+                // and the same delivery retried again.
+                await dispatch_host_message(pre_write);
+                expect(posted(post_message, 'snapshotApplied').at(-1)).toMatchObject({ disposition: 'stale' });
+                await dispatch_host_message(pre_write);
+                expect(posted(post_message, 'snapshotApplied').at(-1)).toMatchObject({ disposition: 'stale' });
+                expect(latest_store_edits()).toEqual({});
+                expect(undo_labels()).toEqual([]);
+
+                // Another delivery below the floor: the host's material never
+                // reached the write, and this view does not stop taking them.
+                await dispatch_host_message(refresh_snapshot_message(table_meta(), {
+                    generation: view_generation,
+                    sourceGeneration: 1,
+                    reason: 'other',
+                    capabilities: { ...CSV, csvEditSessionId: 'first-session' },
+                    identity: { stateRevision: 1 },
+                }));
+                expect(posted(post_message, 'snapshotApplied').at(-1)).toMatchObject({ disposition: 'applied' });
+            });
+
+            it('lands an ordinary answer on the same worksheet when a reorder reached the window before it', async () => {
+                const { post_message } = await render_app();
+                await edited(post_message, table_meta(['Sheet1', 'Sheet2']));
+
+                await undo();
+                await complete_cell_replay(post_message, {
+                    displayFocus: ROW_0,
+                    keep_messages: true,
+                    before_answer: () => dispatch_host_message(refresh_snapshot_message(
+                        table_meta(['Sheet2', 'Sheet1']),
+                        {
+                            generation: view_generation,
+                            sourceGeneration: 1,
+                            reason: 'other',
+                            capabilities: { ...CSV, csvEditSessionId: 'first-session' },
+                        },
+                    )),
+                });
+
+                expect(undo_labels()).toEqual([]);
+                expect(warnings(post_message)).toEqual([]);
+                await click_button('Sheet1');
+                expect(grid_stub().getAttribute('data-sheet-index')).toBe('1');
+                expect(latest_store_edits()).toEqual({});
+            });
+        });
 
         it('undoes a sort and then the edit under it, lets the session go, and redoes both', async () => {
             const { post_message } = await render_app();

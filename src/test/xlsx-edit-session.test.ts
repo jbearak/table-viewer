@@ -7633,6 +7633,103 @@ describe('xlsx edit sessions', () => {
         }));
     });
 
+    it('answers a restoration replay whose view moved after its write as committed, with the rows durable', async () => {
+        // The view moves after the write: a delivery goes out between the
+        // commit's compare-and-swap and its answer. The write is
+        // in the file, so the replay is a step carried out, not a refusal.
+        const state = versioned_state_store({});
+        const panel = await open_ready_xlsx(file_path, state);
+        const restoration = await prepare_saved_row_restoration(panel, 'moved-after-write');
+        await panel.__receive({
+            type: 'prepareHistoryReplay',
+            request: {
+                requestId: 'moved-after-write-prepare',
+                replayId: 'moved-after-write-replay',
+                rowAdmissionRequestIds: [restoration.restoreRequestId],
+                cells: [],
+                highlights: [],
+                structures: [{
+                    ordinal: 0,
+                    worksheet: { sheetIndex: 0, sheetName: 'People', worksheetId: '1' },
+                    expected: {
+                        formatTemplates: [],
+                        appendedRows: [],
+                        tailRemovals: [],
+                        conflicts: [],
+                    },
+                    desired: restoration.desired,
+                }],
+                focus: {
+                    worksheet: { sheetIndex: 0, sheetName: 'People', worksheetId: '1' },
+                    sourceRowStart: 2,
+                    sourceRowEnd: 2,
+                    sourceColumnStart: 0,
+                    sourceColumnEnd: 0,
+                },
+            },
+        });
+        await wait_for_observable(() => panel.__messages.some((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { prepared?: { replayId?: unknown } }).prepared?.replayId
+                === 'moved-after-write-replay'
+        )));
+        const prepared = panel.__messages.find((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { type?: unknown }).type === 'historyReplayPrepared'
+            && (message as { prepared?: { replayId?: unknown } }).prepared?.replayId
+                === 'moved-after-write-replay'
+        )) as Extract<import('../types').HostMessage, { type: 'historyReplayPrepared' }>;
+        const compare_and_set = state.store.compare_and_set.bind(state.store);
+        let moved = false;
+        state.store.compare_and_set = async (...args) => {
+            const result = await compare_and_set(...args);
+            const pending = (args[2] as { pendingEdits?: unknown }).pendingEdits;
+            if (!moved && result.type === 'committed' && pending !== undefined) {
+                moved = true;
+                // A delivery the window has not acknowledged yet.
+                panel.__autoAckSnapshots = false;
+                const before = panel.__messages.filter((message) =>
+                    (message as { type?: unknown }).type === 'workbookSnapshot').length;
+                void panel.__receive({ type: 'releaseEditSession', editSessionId: restoration.restoreSession } as never);
+                await wait_for_observable(() => panel.__messages.filter((message) =>
+                    (message as { type?: unknown }).type === 'workbookSnapshot').length > before);
+            }
+            return result;
+        };
+        await panel.__receive({
+            type: 'commitHistoryReplay',
+            request: {
+                requestId: prepared.prepared.requestId,
+                replayId: prepared.prepared.replayId,
+                leaseId: prepared.prepared.leaseId,
+                mutationId: 'moved-after-write-mutation',
+                cells: [],
+                highlights: [],
+                structures: [{ ordinal: 0 }],
+            },
+        });
+        await wait_for_observable(() => panel.__messages.some((message) => (
+            typeof message === 'object'
+            && message !== null
+            && ((message as { committed?: { replayId?: unknown } }).committed?.replayId
+                === 'moved-after-write-replay'
+                || (message as { refusal?: { replayId?: unknown } }).refusal?.replayId
+                    === 'moved-after-write-replay')
+        )));
+        expect(moved).toBe(true);
+        expect(panel.__messages).toContainEqual(expect.objectContaining({
+            type: 'historyReplayCommitted',
+            committed: expect.objectContaining({
+                replayId: 'moved-after-write-replay',
+                viewMoved: true,
+            }),
+        }));
+        expect(JSON.stringify(state.get_state(file_path).pendingEdits))
+            .toContain(restoration.assignment.pendingRowId);
+    });
+
     it('cancels restoration reservations when replay preparation delivery fails', async () => {
         const panel = await open_ready_xlsx(file_path, versioned_state_store({}));
         const restoration = await prepare_saved_row_restoration(panel, 'undelivered-lease');

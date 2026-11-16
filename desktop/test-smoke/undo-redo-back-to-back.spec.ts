@@ -532,41 +532,35 @@ async function select_cell(page: Page, column: number, row: number): Promise<voi
     await expect(page.locator(`#glide-cell-${column}-${row}`)).toHaveAttribute('aria-selected', 'true');
 }
 
-// A paste that needs rows added is not used here: on the desktop it is
-// refused ("The table is busy, so the paste was not applied.") whether or not
-// a press is made, on main too. Reported separately.
-test('csv: a paste with no session yet, and Undo in the same instant: the paste lands whole, then is undone', async () => {
+test('csv: two rows pasted onto the last row with no session yet, and Undo in the same instant: the paste and the row it added land whole, then are undone', async () => {
     const { page } = await open_file('paste.csv', CSV);
     await expect_shown(page, { body: NATURAL });
     await expect(page.locator('.grid-shell-root')).toHaveAttribute('data-edit-session', 'none');
-    await select_cell(page, 1, 2);
-    // The paste crosses the session grant while the press is held, and is
-    // recorded before the press undoes it.
+    await select_cell(page, 1, 3);
+    // The paste crosses the session grant and the admission of the row it
+    // needs while the press is held, and is recorded before the press undoes it.
     await paste_and_undo(page, 'P1\tP2\nP3\tP4');
     await expect_shown(page, { body: NATURAL, undo: 'Undo', redo: 'Redo Paste' });
-    // Whole: redone, every destination has its value.
+    // Whole: redone, every destination has its value, in the row it added.
     await history(page, 'redo');
     await expect_shown(page, {
-        body: [...NATURAL.slice(0, 2), 'P1|P2|Paris', 'P3|P4|Oslo'],
+        body: [...NATURAL.slice(0, 3), 'P1|P2|Oslo', 'P3|P4|'],
         undo: 'Undo Paste',
         redo: 'Redo',
     });
 });
 
-test('xlsx: a paste across a new column and a saved one, with Undo in the same instant, writes every destination before it is undone', async () => {
+test('xlsx: two rows pasted onto the last row across a new column and a saved one, with Undo in the same instant, write every destination before they are undone', async () => {
     const { page } = await open_file('paste.xlsx', fixture('xlsx'));
     await choose(await open_column_menu(page, 0), 'Insert column right');
-    await expect_shown(page, { body: ['Alice||30|New York', 'Bob||25|London', 'Charlie||35|Paris', 'Dora||28|Oslo'], undo: 'Undo Insert column' });
-    await select_cell(page, 2, 2);
+    const inserted = ['Alice||30|New York', 'Bob||25|London', 'Charlie||35|Paris', 'Dora||28|Oslo'];
+    await expect_shown(page, { body: inserted, undo: 'Undo Insert column' });
+    await select_cell(page, 2, 3);
     await paste_and_undo(page, 'P1\tP2\nP3\tP4');
-    await expect_shown(page, {
-        body: ['Alice||30|New York', 'Bob||25|London', 'Charlie||35|Paris', 'Dora||28|Oslo'],
-        undo: 'Undo Insert column',
-        redo: 'Redo Paste',
-    });
+    await expect_shown(page, { body: inserted, undo: 'Undo Insert column', redo: 'Redo Paste' });
     await history(page, 'redo');
     await expect_shown(page, {
-        body: ['Alice||30|New York', 'Bob||25|London', 'Charlie|P1|P2|Paris', 'Dora|P3|P4|Oslo'],
+        body: [...inserted.slice(0, 3), 'Dora|P1|P2|Oslo', '|P3|P4|'],
         undo: 'Undo Paste',
         redo: 'Redo',
     });
