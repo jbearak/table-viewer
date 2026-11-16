@@ -3130,6 +3130,19 @@ export function attach_viewer(
     // Transform work whose answer the renderer already has, still reconciling
     // durable state and holding the transform admission until it ends.
     const answered_transform_authorities = new Set<TransformAuthority>();
+    /**
+     * The renderer is being told the answer to `request_id` on `sheet_index`:
+     * that transform, and any earlier one on the sheet it superseded (a
+     * restore a Cancel replaced, still observing its cancellation), are done
+     * as far as the renderer knows. Marked before the post settles, because
+     * the renderer may ask for a session as soon as the answer arrives.
+     */
+    function note_transform_answered(sheet_index: number, request_id: string): void {
+        const on_sheet = [...transform_authorities].filter(([message]) => message.sheetIndex === sheet_index);
+        const answered_at = on_sheet.findIndex(([message]) => message.requestId === request_id);
+        const answered = answered_at < 0 ? on_sheet : on_sheet.slice(0, answered_at + 1);
+        for (const [, authority] of answered) answered_transform_authorities.add(authority);
+    }
     const transform_commit_barriers = new Set<TransformAuthority>();
     let load_seq = 0;
     let latest_refresh_event: FileRefreshEvent | undefined;
@@ -9253,6 +9266,7 @@ export function attach_viewer(
                     durablePendingEditKeys: durable_pending_edit_keys,
                     durableRowHeights: durable_row_heights,
                     ...(compare_mode ? { onRowWindowServed: start_compare_diff } : {}),
+                    onTransformAnswered: note_transform_answered,
                 },
                 (installed) => {
                     installed.begin_receiver_epoch(session.current_receiver_epoch);

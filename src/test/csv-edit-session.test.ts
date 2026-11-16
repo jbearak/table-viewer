@@ -8948,6 +8948,90 @@ describe('CSV edit sessions', () => {
         expect(warning).not.toHaveBeenCalledWith('Wait for sorting and filtering to finish before editing.');
     });
 
+    /**
+     * A panel whose post of the answer to `request_id` is held: the message
+     * reaches the renderer (it is recorded) but the post's promise does not
+     * settle until `release`.
+     */
+    function panel_holding_answer(file: string, request_id: string) {
+        const panel = open_csv_table(uri(file), state_store().store);
+        const gate = deferred();
+        const webview = panel.webview as unknown as { postMessage: (message: unknown) => unknown };
+        const post = webview.postMessage.bind(webview);
+        webview.postMessage = (message: unknown) => {
+            const posted = post(message);
+            const answer = message as { type?: string; requestId?: string };
+            return answer.type === 'transformInstalled' && answer.requestId === request_id
+                ? gate.promise.then(() => posted)
+                : posted;
+        };
+        const answered = (id: string) => panel.__messages.some((message) => (
+            typeof message === 'object' && message !== null
+            && (message as { type?: string }).type === 'transformInstalled'
+            && (message as { requestId?: string }).requestId === id
+        ));
+        return { panel, release: () => gate.resolve(), answered };
+    }
+    const set_transform = (
+        panel: ReturnType<typeof open_csv_table>,
+        request_id: string,
+        intent: 'restore' | 'cancel',
+    ) => panel.__receive({
+        type: 'setTransform',
+        sheetIndex: 0,
+        requestId: request_id,
+        sourceGeneration: 1,
+        intent,
+        state: {
+            sort: intent === 'restore' ? [{ colIndex: 0, direction: 'asc' }] : [],
+            filters: [],
+            schema: '["Sheet1",1,["h"]]',
+        },
+    } as never);
+
+    it('waits for a transform whose answer the renderer already has while its post is still settling', async () => {
+        const warning = vi.spyOn(vscode_mock.window, 'showWarningMessage');
+        const { panel, release, answered } = panel_holding_answer('/tmp/session-answer-in-transit.csv', 'restore');
+        await panel.__receive({ type: 'ready' });
+        const transform = set_transform(panel, 'restore', 'restore');
+        await vi.waitUntil(() => answered('restore'));
+
+        const request = panel.__receive({ type: 'requestEditSession' } as never);
+        await Promise.resolve();
+        expect(edit_session_results(panel)).toEqual([]);
+        release();
+        await transform;
+        await request;
+        expect(edit_session_results(panel)).toEqual([
+            expect.objectContaining({ type: 'editSessionResult', granted: true }),
+        ]);
+        expect(warning).not.toHaveBeenCalledWith('Wait for sorting and filtering to finish before editing.');
+    });
+
+    it('waits for a restore a Cancel superseded once the Cancel is answered', async () => {
+        const warning = vi.spyOn(vscode_mock.window, 'showWarningMessage');
+        const { panel, release, answered } = panel_holding_answer('/tmp/session-after-cancel.csv', 'restore');
+        await panel.__receive({ type: 'ready' });
+        const restore = set_transform(panel, 'restore', 'restore');
+        await vi.waitUntil(() => answered('restore'));
+        // A Cancel replaces the restore; the renderer has the Cancel's answer
+        // while the restore it superseded is still running.
+        const cancel = set_transform(panel, 'cancel', 'cancel');
+        await vi.waitUntil(() => answered('cancel'));
+
+        const request = panel.__receive({ type: 'requestEditSession' } as never);
+        await Promise.resolve();
+        expect(edit_session_results(panel)).toEqual([]);
+        release();
+        await restore;
+        await cancel;
+        await request;
+        expect(edit_session_results(panel)).toEqual([
+            expect.objectContaining({ type: 'editSessionResult', granted: true }),
+        ]);
+        expect(warning).not.toHaveBeenCalledWith('Wait for sorting and filtering to finish before editing.');
+    });
+
     it('refuses a quiet request without announcing it', async () => {
         const warning = vi.spyOn(vscode_mock.window, 'showWarningMessage');
         const panel = open_csv_table(uri('/tmp/session.csv'), state_store().store);
