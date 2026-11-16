@@ -177,13 +177,16 @@ export function set_row_height(
  * bounded by the number of *in-flight* resizes rather than by the sheet.
  */
 export interface RowHeightLayer {
-    /** Inclusive display-row intervals, disjoint and ascending. */
+    /**
+     * Inclusive display-row intervals, disjoint and ascending. None, for the
+     * place of a request that paints nothing (`row_height_order_marker`).
+     */
     readonly rows: readonly Readonly<DisplayRowInterval>[];
     readonly height: number;
     /**
      * The request this layer was painted for, when that request is answered.
      * Its answer retires the layer, whatever it says: see
-     * `row_height_layers_without_request`.
+     * `row_height_layers_after_answer`.
      */
     readonly requestId?: string;
 }
@@ -335,15 +338,43 @@ export function resolved_row_height(
  * retire two kinds of layer, and each would mask a height a later undo
  * restores: one whose write was refused, and one whose write landed and was
  * then overtaken by another window's write to the same row before the
- * delivery was built. Returns `layers` itself when none matches.
+ * delivery was built.
+ *
+ * Applied, the answer retires every layer older than the request as well.
+ * The host writes in the order the requests were posted (the ordering
+ * argument at `row_height_layers_for_delivery`), so each older write was
+ * settled before this one, and the delivery ahead of this answer carries
+ * whatever it stored. An older layer still standing is then one no delivery
+ * agreed with: a write the host refused, painting a height nothing holds,
+ * over rows whose stored heights this request may just have changed. Refused,
+ * the host delivered nothing for this request, so only its own layer goes.
+ *
+ * Returns `layers` itself when none holds the request's place.
  */
-export function row_height_layers_without_request(
+export function row_height_layers_after_answer(
     layers: readonly RowHeightLayer[],
     request_id: string,
+    applied: boolean,
 ): readonly RowHeightLayer[] {
-    return layers.some((layer) => layer.requestId === request_id)
-        ? layers.filter((layer) => layer.requestId !== request_id)
-        : layers;
+    const index = layers.findIndex((layer) => layer.requestId === request_id);
+    if (index === -1) return layers;
+    return applied
+        ? layers.slice(index + 1)
+        : [...layers.slice(0, index), ...layers.slice(index + 1)];
+}
+
+/**
+ * The place, among a worksheet's layers, of a request that paints nothing: a
+ * reset, or the replay of a row-height step.
+ *
+ * Which rows such a request changes, and to what, is the host's to say, so
+ * there is no height to paint ahead of it. It still has a place in the order
+ * the writes were posted, and its applied answer retires what is older
+ * (`row_height_layers_after_answer`). A layer with no rows holds that place:
+ * it paints no row, offers no reset, and no delivery agrees with it.
+ */
+export function row_height_order_marker(request_id: string): RowHeightLayer {
+    return { rows: [], height: DEFAULT_ROW_HEIGHT_PX, requestId: request_id };
 }
 
 /**
@@ -429,6 +460,9 @@ function projection_agrees_with_layer(
     overrides: RowHeightOverrides,
     layer: RowHeightLayer,
 ): boolean {
+    // A layer with no rows says nothing a projection could agree with: it
+    // holds a request's place (`row_height_order_marker`).
+    if (layer.rows.length === 0) return false;
     let matched = 0;
     for (const [key, height] of Object.entries(overrides)) {
         if (height !== layer.height) continue;
@@ -470,8 +504,9 @@ export function row_height_layers_with(
  * height has answered, whichever write produced it.
  *
  * It is not the only way a layer goes. A resize or reset a person makes carries a request
- * id and is answered, and the answer retires its layer whatever it says
- * (`row_height_layers_without_request`). What reconciliation by value still does:
+ * id and is answered, and the answer retires its layer whatever it says, with every older
+ * layer when the write was applied (`row_height_layers_after_answer`). What reconciliation
+ * by value still does:
  *
  * - retire the layer of the one write that is not answered, the row a committed
  *   multi-line edit grows;
@@ -526,10 +561,11 @@ export function row_height_layers_with(
  * outcome: the host refused it on the accumulated-map bound (`MAX_PERSISTED_ROW_HEIGHTS`).
  * No delivery will ever agree with that layer, because nothing was persisted; so it sits
  * over the projection, showing a height no file holds, until the view generation next
- * moves and the whole overlay is discarded — or until a *newer* layer is agreed with,
- * which retires it along with everything else that old (see above). The user does learn
- * what happened — the host warns, naming the limit — but the row the edit grew keeps its
- * new size on screen meanwhile.
+ * moves and the whole overlay is discarded — or until a *newer* layer is agreed with, or a
+ * newer request is answered as applied (a resize, a reset, an undo or redo of a row-height
+ * step), either of which retires it along with everything else that old (see above). The
+ * user does learn what happened — the host warns, naming the limit — but the row the edit
+ * grew keeps its new size on screen meanwhile.
  *
  * A person's own resize does not leave it: its answer says the write was refused and
  * retires the layer. The row an edit grows is not answered because it is not a gesture:

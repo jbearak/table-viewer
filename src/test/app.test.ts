@@ -19860,6 +19860,75 @@ describe('auto-fit with Pending Columns', () => {
         expect(pending_width()).toBe(200);
     });
 
+    it('puts back a worksheet whose fit sized only a Pending Column when "restore on all sheets" is refused', async () => {
+        // Sheet1's fit measured only a Pending Column, so it asked the host
+        // for nothing; Sheet2's fit is stored. "Restore on all sheets" asks
+        // the host for Sheet2 alone. Refused, it did not happen on either
+        // worksheet: Sheet1 is fitted again too, at its fitted width.
+        grid_shell_mock.auto_fit_result = null;
+        const { post_message } = await render_app();
+        const meta = make_meta(['Sheet1', 'Sheet2'], false);
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        await acquire_editing_session(post_message, 'mixed-session');
+        const store = (grid_shell_mock.latest_props as unknown as GridShellProps).pending_row_store!;
+        const before = store.snapshot();
+        await act(async () => {
+            const staged = store.stage_replace('mixed-session', before, {
+                ...before,
+                columnLayout: {
+                    columns: [{ kind: 'source', sourceColumn: 0 }, { kind: 'pending', pendingColumnId: 'column-a' }],
+                    removedSourceColumns: [],
+                    discardedPendingColumns: [],
+                },
+                pendingColumns: [{
+                    id: 'column-a', header: 'New column', cells: {}, viewerWidth: 90,
+                    format: { kind: 'none' }, createdOrder: 1,
+                }],
+            });
+            staged!.commit();
+            staged!.notify();
+        });
+        const pending_width = () => store.snapshot().pendingColumns?.[0]?.viewerWidth;
+        const fitted = () => grid_shell_mock.latest_props!.auto_fit_active;
+        grid_shell_mock.pending_auto_fit_result = { 'column-a': 180 };
+        await click_button('Auto-fit Columns');
+        expect(width_writes(post_message)).toEqual([]);
+        expect(fitted()).toBe(true);
+        expect(pending_width()).toBe(180);
+        grid_shell_mock.pending_auto_fit_result = {};
+        grid_shell_mock.auto_fit_result = { 0: 120 };
+        await click_button('Sheet2');
+        await click_button('Auto-fit Columns');
+        await answer_width_write(post_message);
+        expect(fitted()).toBe(true);
+
+        await open_scope_menu('Auto-fit scope');
+        await click_menu_item('Restore original widths on all 2 sheets');
+
+        expect(latest_width_write(post_message).sheets).toEqual([
+            { sheetIndex: 1, sheetName: 'Sheet2', widths: [{ column: 0, width: null }] },
+        ]);
+        expect(fitted()).toBe(false);
+        expect(pending_width()).toBe(90);
+        await answer_width_write(post_message, { applied: false });
+        expect(fitted()).toBe(true);
+        await click_button('Sheet1');
+        expect(fitted()).toBe(true);
+        expect(pending_width()).toBe(180);
+
+        // Restored again and stored, both worksheets end restored, and
+        // Sheet1 still knows the width from before its fit.
+        await open_scope_menu('Auto-fit scope');
+        await click_menu_item('Restore original widths on all 2 sheets');
+        await answer_width_write(post_message, { stored: [undefined, { 0: 120 }] });
+        expect(fitted()).toBe(false);
+        expect(pending_width()).toBe(90);
+        await click_button('Sheet2');
+        expect(fitted()).toBe(false);
+    });
+
     it('does not start a fit while a highlight request holds the gesture slot, and says to wait', async () => {
         const { post_message } = await render_app();
         const meta = make_meta(['Sheet1'], false);
@@ -22834,6 +22903,69 @@ describe('view steps in history', () => {
                 expect(undo_labels()).toEqual(['Reset 2 row heights']);
             });
 
+            /** The row a committed edit grows: painted at once, its write not answered. */
+            async function grow_row(row: number, height: number) {
+                await act(async () => {
+                    props().on_row_resize([{ start: row, end: row }], height, { gesture: false });
+                });
+            }
+
+            it('takes down a height painted for a write the host never stored', async () => {
+                // The row an edit grows is painted at once and its write is
+                // not answered. Refused at the limit, nothing is stored, so
+                // no delivery agrees with the paint and Reset is offered for
+                // a height that is only on screen. The reset changes nothing
+                // stored, and still has to leave the row as the host has it.
+                const { post_message } = await render_app();
+                await open(post_message);
+                await grow_row(1, 54);
+                const painted = { rows: [{ start: 1, end: 1 }], height: 54 };
+                expect(row_overlay()).toEqual([painted]);
+
+                await resize_rows([{ start: 1, end: 1 }], null);
+
+                // Nothing changes ahead of the host.
+                expect((row_overlay() as unknown[])[0]).toEqual(painted);
+                await answer_row_heights(post_message);
+                expect(row_overlay()).toBeNull();
+                expect(undo_labels()).toEqual([]);
+            });
+
+            it('leaves a painted height alone when the host refuses the reset', async () => {
+                const { post_message } = await render_app();
+                await open(post_message);
+                await grow_row(1, 54);
+
+                await resize_rows([{ start: 1, end: 1 }], null);
+                await answer_row_heights(post_message, { applied: false, refused: 'unresolved' });
+
+                expect(row_overlay()).toEqual([{ rows: [{ start: 1, end: 1 }], height: 54 }]);
+            });
+
+            it('leaves a height painted after the reset was posted', async () => {
+                // That write reaches the host after the reset, so the reset's
+                // answer says nothing about it. The one painted before goes.
+                const { post_message } = await render_app();
+                await open(post_message, { rowHeightProjection: [{ 1: 60 }] });
+                await grow_row(2, 40);
+
+                await resize_rows([{ start: 1, end: 2 }], null);
+                const reset = row_height_writes(post_message).at(-1)!;
+                await grow_row(1, 54);
+                await deliver_heights([undefined]);
+                await dispatch_host_message({
+                    type: 'rowHeightsChanged',
+                    requestId: reset.requestId!,
+                    sheetIndex: 0,
+                    applied: true,
+                    sourceGeneration: reset.sourceGeneration,
+                    change: { height: null, before: [{ start: 4, end: 4, height: 60 }] },
+                });
+
+                expect(row_overlay()).toEqual([{ rows: [{ start: 1, end: 1 }], height: 54 }]);
+                expect(undo_labels()).toEqual(['Reset row height']);
+            });
+
             it('is "Reset row height" for one row', async () => {
                 const { post_message } = await render_app();
                 await open(post_message, { rowHeightProjection: [{ 1: 60 }] });
@@ -22844,6 +22976,35 @@ describe('view steps in history', () => {
         });
 
         describe('undo and redo of a row step', () => {
+            it('show what the host delivers over a height painted for a write it never stored', async () => {
+                const { post_message } = await render_app();
+                await open(post_message);
+                await resized_rows(post_message);
+                // An edit then grows row 1, and the host refuses that write
+                // at the limit: painted, not stored, never answered.
+                await act(async () => {
+                    props().on_row_resize([{ start: 1, end: 1 }], 80, { gesture: false });
+                });
+                expect(row_overlay()).toEqual([{ rows: [{ start: 1, end: 1 }], height: 80 }]);
+
+                await undo();
+                await deliver_heights([{ 2: 30 }]);
+                await answer_row_heights(post_message);
+
+                expect(row_overlay()).toBeNull();
+                expect(JSON.parse(grid_stub().getAttribute('data-row-heights')!)).toEqual({ 2: 30 });
+                expect(redo_labels()).toEqual(['Resize 2 rows']);
+
+                // A replay the host refuses takes nothing down.
+                await act(async () => {
+                    props().on_row_resize([{ start: 1, end: 1 }], 80, { gesture: false });
+                });
+                await redo();
+                await answer_row_heights(post_message, { applied: false });
+                expect(row_overlay()).toEqual([{ rows: [{ start: 1, end: 1 }], height: 80 }]);
+                expect(redo_labels()).toEqual(['Resize 2 rows']);
+            });
+
             it('post the heights by source row and move when the host answers', async () => {
                 const { post_message } = await render_app();
                 await open(post_message);

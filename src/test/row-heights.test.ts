@@ -11,9 +11,10 @@ import {
     resolved_row_height,
     retained_row_height_overlay,
     row_height,
+    row_height_layers_after_answer,
     row_height_layers_for_delivery,
     row_height_layers_with,
-    row_height_layers_without_request,
+    row_height_order_marker,
     set_row_height,
     span_height,
     type RowHeightLayer,
@@ -527,16 +528,46 @@ describe('a layer and the answer to its request', () => {
         { rows: [{ start: 0, end: 2 }], height: 60, requestId: 'first' },
         { rows: [{ start: 5, end: 5 }], height: 40 },
         { rows: [{ start: 1, end: 1 }], height: 80, requestId: 'second' },
+        { rows: [{ start: 7, end: 7 }], height: 30 },
     ];
 
-    it('retires the layer painted for the request, and only that one', () => {
-        expect(row_height_layers_without_request(layers, 'first')).toEqual([layers[1], layers[2]]);
-        expect(row_height_layers_without_request(layers, 'second')).toEqual([layers[0], layers[1]]);
+    it('refused, retires the layer painted for the request, and only that one', () => {
+        expect(row_height_layers_after_answer(layers, 'first', false)).toEqual([layers[1], layers[2], layers[3]]);
+        expect(row_height_layers_after_answer(layers, 'second', false)).toEqual([layers[0], layers[1], layers[3]]);
     });
 
-    it('returns the same layers when none was painted for the request', () => {
-        expect(row_height_layers_without_request(layers, 'unknown')).toBe(layers);
-        expect(row_height_layers_without_request([], 'first')).toEqual([]);
+    it('applied, retires every layer older than the request too, and none newer', () => {
+        expect(row_height_layers_after_answer(layers, 'first', true)).toEqual([layers[1], layers[2], layers[3]]);
+        expect(row_height_layers_after_answer(layers, 'second', true)).toEqual([layers[3]]);
+    });
+
+    it('returns the same layers when none holds the request\'s place', () => {
+        expect(row_height_layers_after_answer(layers, 'unknown', true)).toBe(layers);
+        expect(row_height_layers_after_answer(layers, 'unknown', false)).toBe(layers);
+        expect(row_height_layers_after_answer([], 'first', true)).toEqual([]);
+    });
+});
+
+describe('the place of a request that paints nothing (a reset, an undo or redo)', () => {
+    const painted: RowHeightLayer = { rows: [{ start: 1, end: 1 }], height: 54 };
+    const marker = row_height_order_marker('reset');
+
+    it('paints no row and offers no reset', () => {
+        expect(resolved_row_height({}, [marker], 0)).toBe(DEFAULT_ROW_HEIGHT_PX);
+        expect(resolved_row_height({ 1: 60 }, [painted, marker], 1)).toBe(54);
+        expect(display_rows_have_custom_height({}, [marker], { start: 0, end: 2 ** 40 })).toBe(false);
+    });
+
+    it('is never what a delivery agrees with, so a delivery retires nothing on its account', () => {
+        const layers = [painted, marker];
+        expect(row_height_layers_for_delivery(layers, {})).toBe(layers);
+        expect(row_height_layers_for_delivery(layers, { 3: 40 })).toBe(layers);
+    });
+
+    it('goes with its answer, and applied takes the older layers with it', () => {
+        const newer: RowHeightLayer = { rows: [{ start: 4, end: 4 }], height: 70 };
+        expect(row_height_layers_after_answer([painted, marker, newer], 'reset', true)).toEqual([newer]);
+        expect(row_height_layers_after_answer([painted, marker, newer], 'reset', false)).toEqual([painted, newer]);
     });
 });
 

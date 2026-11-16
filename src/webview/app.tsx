@@ -323,9 +323,10 @@ import {
     clamp_row_height,
     mapped_row_height_overlays,
     retained_row_height_overlay,
+    row_height_layers_after_answer,
     row_height_layers_for_delivery,
     row_height_layers_with,
-    row_height_layers_without_request,
+    row_height_order_marker,
     type RowHeightLayer,
     type RowHeightOverlay,
 } from './row-heights';
@@ -505,6 +506,11 @@ type WidthWriteOutcome =
 /** One worksheet of a column-width write to post. */
 interface WidthWriteSheet {
     readonly sheet_index: number;
+    /**
+     * The widths to ask the host for. None, on a sheet whose Auto-fit and
+     * Pending Columns change with the other sheets of the write: the host is
+     * not asked about it, and a refusal puts it back with them.
+     */
     readonly widths: readonly { readonly column: number; readonly width: number | null }[];
     /** Auto-fit for the sheet from the post on: on with the widths to restore, or off. */
     readonly auto_fit:
@@ -1069,6 +1075,24 @@ export function App(): React.JSX.Element {
     const [row_height_overlay, set_row_height_overlay] = useState<
         readonly (RowHeightOverlay | undefined)[]
     >(NO_ROW_HEIGHT_OVERLAYS);
+    /**
+     * Give a row-height request that paints nothing (a reset, an undo or redo)
+     * its place among the heights painted on its worksheet, so that its
+     * applied answer retires the ones painted before it. With none painted
+     * there is nothing to come after.
+     */
+    const mark_row_height_request = useCallback((sheet_index: number, request_id: string) => {
+        set_row_height_overlay((previous) => {
+            const existing = previous[sheet_index];
+            if (existing === undefined) return previous;
+            const next = [...previous];
+            next[sheet_index] = {
+                ...existing,
+                layers: row_height_layers_with(existing.layers, row_height_order_marker(request_id)),
+            };
+            return next;
+        });
+    }, []);
     const [auto_fit_active, set_auto_fit_active] = useState<boolean[]>([]);
     /**
      * Whether history has something to redo, and how many snapshots have been
@@ -3891,26 +3915,29 @@ export function App(): React.JSX.Element {
                 if (pending === undefined) return;
                 pending_row_resize_requests_ref.current.delete(msg.requestId);
                 sync_view_request_pending();
+                const applied = msg.applied
+                    && msg.sourceGeneration === pending.sourceGeneration
+                    && msg.sourceGeneration === source_generation_ref.current;
                 // Any answer retires the layer painted for this request. The
                 // host delivers what is stored before it answers, so from
                 // here the row shows the projection. A layer left standing
                 // (a refused write, or one another window overtook before the
                 // delivery was built) would mask the height a later undo
-                // restores.
+                // restores. Applied, the layers older than the request go
+                // with it: the host settled their writes first, so one still
+                // standing paints a height nothing holds.
                 set_row_height_overlay((previous) => mapped_row_height_overlays(
                     previous,
                     (overlay) => {
-                        const layers = row_height_layers_without_request(
+                        const layers = row_height_layers_after_answer(
                             overlay.layers,
                             msg.requestId,
+                            applied,
                         );
                         if (layers === overlay.layers) return overlay;
                         return layers.length === 0 ? undefined : { ...overlay, layers };
                     },
                 ));
-                const applied = msg.applied
-                    && msg.sourceGeneration === pending.sourceGeneration
-                    && msg.sourceGeneration === source_generation_ref.current;
                 pending.finish?.(applied);
                 if (pending.replay !== undefined && pending.worksheet !== undefined) {
                     const { replay, worksheet } = pending;
@@ -7045,6 +7072,7 @@ export function App(): React.JSX.Element {
                 gesture: false,
                 replay,
             });
+            mark_row_height_request(index, request_id);
             sync_view_request_pending();
             host_bridge.postMessage({
                 type: 'setSourceRowHeights',
@@ -7090,6 +7118,7 @@ export function App(): React.JSX.Element {
         edit_session_pending,
         handle_sheet_select,
         land_view_replay,
+        mark_row_height_request,
         preview_mode,
         request_transform,
         show_warning,
@@ -9819,7 +9848,8 @@ export function App(): React.JSX.Element {
         } = {},
     ): boolean => {
         const meta_sheets = meta_ref.current?.sheets;
-        if (meta_sheets === undefined || sheets.length === 0) return false;
+        if (meta_sheets === undefined) return false;
+        if (sheets.every((entry) => entry.widths.length === 0)) return false;
         if (sheets.some((entry) => meta_sheets[entry.sheet_index] === undefined)) return false;
         // One at a time. Every caller is admitted first (a gesture by
         // `size_gesture_may_start`, a replay by `history_free`); this keeps a
@@ -9892,7 +9922,9 @@ export function App(): React.JSX.Element {
             type: 'setColumnWidths',
             requestId: request_id,
             sourceGeneration: source_generation_ref.current,
-            sheets: sheets.map((entry) => ({
+            // A sheet with no widths is the caller's to settle with the rest
+            // and nothing to ask the host for.
+            sheets: sheets.filter((entry) => entry.widths.length > 0).map((entry) => ({
                 sheetIndex: entry.sheet_index,
                 sheetName: meta_sheets[entry.sheet_index]!.name,
                 widths: entry.widths.map(({ column, width }) => ({ column, width })),
@@ -10319,7 +10351,12 @@ export function App(): React.JSX.Element {
             //
             // A reset paints nothing ahead of the host either: which rows hold a
             // custom height is the host's to say, and they change with its delivery.
-            if (clamped === null || requested_rows > MAX_PERSISTED_ROW_HEIGHTS) return;
+            // It only takes its place among the heights already painted.
+            if (clamped === null) {
+                if (request_id !== undefined) mark_row_height_request(active_sheet_index, request_id);
+                return;
+            }
+            if (requested_rows > MAX_PERSISTED_ROW_HEIGHTS) return;
             set_row_height_overlay((previous) => {
                 // Tagged with its request: the answer retires it, whatever it says.
                 const layer: RowHeightLayer = {
@@ -10362,7 +10399,7 @@ export function App(): React.JSX.Element {
                 return next;
             });
         },
-        [active_sheet_index, sync_view_request_pending]
+        [active_sheet_index, mark_row_height_request, sync_view_request_pending]
     );
 
     /**
@@ -10500,11 +10537,10 @@ export function App(): React.JSX.Element {
                     widths.push({ column, width: null });
                 }
             }
-            if (widths.length === 0) {
-                // No width before the fit and none now: nothing to ask for.
-                set_auto_fit_for_sheet(index, false, undefined);
-                continue;
-            }
+            // No width before the fit and none now leaves nothing to ask the
+            // host for on this sheet. It goes with the others all the same:
+            // its toolbar and Pending Columns are restored with theirs, and
+            // put back with theirs if the host refuses.
             widths.sort((left, right) => left.column - right.column);
             const pending_column_widths_before = pending_widths_before.get(index);
             writes.push({
@@ -10515,7 +10551,13 @@ export function App(): React.JSX.Element {
                 ...(pending_column_widths_before === undefined ? {} : { pending_column_widths_before }),
             });
         }
-        if (writes.length > 0) post_column_widths(writes, { auto_fit_extras_before });
+        if (writes.some((write) => write.widths.length > 0)) {
+            post_column_widths(writes, { auto_fit_extras_before });
+            return;
+        }
+        // Nothing to ask the host for on any sheet, so nothing to refuse and
+        // no step: only the toolbar turns off.
+        for (const write of writes) set_auto_fit_for_sheet(write.sheet_index, false, undefined);
     }, [auto_fit_extras, post_column_widths, set_auto_fit_for_sheet, write_pending_column_widths]);
 
     /**
