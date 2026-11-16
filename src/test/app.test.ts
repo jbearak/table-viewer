@@ -18636,6 +18636,16 @@ describe('undo and redo, from the keyboard and the desktop menu', () => {
         expect(sent(post_message, 'showWarning')).toBeUndefined();
     });
 
+    it('refuses a quiet request for a session at once while a restore is pending, saying nothing', async () => {
+        const { post_message } = await saved_edit_with_restore_pending();
+        const props = grid_shell_mock.latest_props as unknown as GridShellProps;
+        let granted: boolean | undefined;
+        await act(async () => { granted = await props.on_request_edit_session!(true); });
+        expect(granted).toBe(false);
+        expect(sent(post_message, 'requestEditSession')).toBeUndefined();
+        expect(sent(post_message, 'showWarning')).toBeUndefined();
+    });
+
     it('lets an edit wait for a restore of the saved view instead of refusing it', async () => {
         const { post_message, restore } = await saved_edit_with_restore_pending();
         const props = grid_shell_mock.latest_props as unknown as GridShellProps;

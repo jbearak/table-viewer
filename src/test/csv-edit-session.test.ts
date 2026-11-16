@@ -8884,6 +8884,70 @@ describe('CSV edit sessions', () => {
         expect(warning).not.toHaveBeenCalledWith('Wait for sorting and filtering to finish before editing.');
     });
 
+    it('waits for every transform answered while a session request waits, not only the first', async () => {
+        const warning = vi.spyOn(vscode_mock.window, 'showWarningMessage');
+        const versioned = state_store();
+        const read_gate = () => ({ started: deferred(), gate: deferred() });
+        const gates = new Map<string, ReturnType<typeof read_gate>>();
+        for (const id of ['restore', 'cancel']) gates.set(id, read_gate());
+        const held = new Set<string>();
+        let panel!: ReturnType<typeof open_csv_table>;
+        const answered = (id: string) => panel.__messages.some((message) => (
+            typeof message === 'object' && message !== null
+            && (message as { type?: string }).type === 'transformInstalled'
+            && (message as { requestId?: string }).requestId === id
+        ));
+        const store: FileStateStore = {
+            ...versioned.store,
+            async read(path) {
+                const snapshot = await versioned.store.read(path);
+                for (const [id, { started, gate }] of gates) {
+                    if (!held.has(id) && answered(id)) {
+                        held.add(id);
+                        started.resolve();
+                        await gate.promise;
+                        break;
+                    }
+                }
+                return snapshot;
+            },
+        };
+        panel = open_csv_table(uri('/tmp/session-after-two-transforms.csv'), store);
+        await panel.__receive({ type: 'ready' });
+        const transform = (id: string, intent: 'restore' | 'cancel') => panel.__receive({
+            type: 'setTransform',
+            sheetIndex: 0,
+            requestId: id,
+            sourceGeneration: 1,
+            intent,
+            state: {
+                sort: intent === 'restore' ? [{ colIndex: 0, direction: 'asc' }] : [],
+                filters: [],
+                schema: '["Sheet1",1,["h"]]',
+            },
+        } as never);
+
+        const first = transform('restore', 'restore');
+        await gates.get('restore')!.started.promise;
+        const request = panel.__receive({ type: 'requestEditSession' } as never);
+        await Promise.resolve();
+        // A second transform is answered while the request waits for the first.
+        const second = transform('cancel', 'cancel');
+        await gates.get('cancel')!.started.promise;
+        gates.get('restore')!.gate.resolve();
+        await first;
+        await Promise.resolve();
+        expect(edit_session_results(panel)).toEqual([]);
+
+        gates.get('cancel')!.gate.resolve();
+        await second;
+        await request;
+        expect(edit_session_results(panel)).toEqual([
+            expect.objectContaining({ type: 'editSessionResult', granted: true }),
+        ]);
+        expect(warning).not.toHaveBeenCalledWith('Wait for sorting and filtering to finish before editing.');
+    });
+
     it('refuses a quiet request without announcing it', async () => {
         const warning = vi.spyOn(vscode_mock.window, 'showWarningMessage');
         const panel = open_csv_table(uri('/tmp/session.csv'), state_store().store);

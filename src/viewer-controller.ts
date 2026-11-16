@@ -14385,10 +14385,10 @@ export function attach_viewer(
                 // admission until it has. A request made after the answer (a
                 // replay or an edit the renderer held back for it) waits for that
                 // instead of being refused for a sort nobody is waiting on. Work
-                // not yet answered still refuses, as below.
-                const reconciling = [...answered_transform_authorities].map((authority) => authority.completion);
-                if (reconciling.length > 0) {
-                    await Promise.all(reconciling);
+                // not yet answered still refuses, as below. Asked again after
+                // each wait: another may have been answered meanwhile.
+                while (answered_transform_authorities.size > 0) {
+                    await Promise.all([...answered_transform_authorities].map((authority) => authority.completion));
                     if (!request_is_current()) return;
                 }
                 let phase = edit_phase();
