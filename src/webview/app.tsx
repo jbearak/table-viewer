@@ -3427,6 +3427,10 @@ export function App(): React.JSX.Element {
             // rekeying history, and neither its inserted nor its appended rows
             // feed cross-save undo (design "History" and "Receipt").
             history_store_ref.current!.install_structural_save_barrier();
+            // An open filter editor names its column by that numbering too,
+            // and the worksheet's schema need not show the change: columns
+            // with no names, or the same name, can trade places.
+            set_filter_editor(null);
             // Selection by identity: a cursor on a Pending Row lands on the
             // row it became, and a cursor on a source cell on the saved
             // coordinate the receipt maps it to.
@@ -8466,12 +8470,15 @@ export function App(): React.JSX.Element {
             filter_restore_timer_ref.current = window.setTimeout(() => {
                 filter_restore_timer_ref.current = undefined;
                 restore?.();
-                // The editor can outlive the grid that opened it: a reload
-                // that keeps the columns remounts the grid, and the callback
-                // of the one unmounted reaches nothing. Focus goes to the
-                // grid mounted now.
-                if (opened_from_grid && grid_focus_ref.current?.has_focus() !== true) {
-                    grid_focus_ref.current?.focus();
+                // The editor can outlive what opened it: a reload that keeps
+                // the columns remounts the grid, and another window can remove
+                // the filter whose chip opened it. The opener's callback then
+                // reaches nothing, and focus goes to the grid mounted now, or
+                // to the toolbar. Only when nothing holds focus: the person
+                // may already have moved it.
+                if (!has_surviving_focus_target() && document.hasFocus()) {
+                    if (opened_from_grid) grid_focus_ref.current?.focus();
+                    else toolbar_focus_ref.current?.focus();
                 }
             }, 0);
         } else {

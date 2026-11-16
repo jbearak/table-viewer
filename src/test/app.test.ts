@@ -13324,12 +13324,21 @@ describe('sorting and filtering', () => {
             expect(request.state.filters[0]).toMatchObject({ colIndex: 1, value: '3' });
         });
 
-        it.each([
-            ['Cancel', () => click_button('Cancel')],
-            ['Escape', () => act(async () => {
-                document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
-            })],
-        ])('gives focus to the grid mounted now when %s follows a reload that remounted it', async (_name, dismiss) => {
+        type OpenFilter = (
+            source_column: number,
+            anchor: { left: number; top: number },
+            restore_focus: () => void,
+        ) => void;
+        const open_filter_with = (restore_focus: () => void) => act(async () => (
+            grid_shell_mock.latest_props!.on_open_filter as OpenFilter
+        )(1, { left: 20, top: 20 }, restore_focus));
+        const press_escape = () => act(async () => {
+            document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+        });
+
+        /** Open from the grid, then reload with the same columns: the grid is remounted. */
+        async function open_then_remount_grid() {
+            vi.spyOn(document, 'hasFocus').mockReturnValue(true);
             await render_app();
             await dispatch_host_message(initial_snapshot_message(two_column_meta()));
             const first_mount = grid_stub().getAttribute('data-mount-id');
@@ -13338,18 +13347,20 @@ describe('sorting and filtering', () => {
             // What the grid that opened the editor hands over: once that grid
             // is unmounted, calling it focuses nothing.
             const restore_to_unmounted_grid = vi.fn();
-            const open_filter = grid_shell_mock.latest_props!.on_open_filter as (
-                source_column: number,
-                anchor: { left: number; top: number },
-                restore_focus: () => void,
-            ) => void;
-            await act(async () => open_filter(1, { left: 20, top: 20 }, restore_to_unmounted_grid));
+            await open_filter_with(restore_to_unmounted_grid);
             await type_filter_value('3');
-
             await dispatch_host_message(refresh_snapshot_message(two_column_meta()));
             expect(grid_stub().getAttribute('data-mount-id')).not.toBe(first_mount);
             expect(filter_value()).toBe('3');
             grid_shell_mock.focus_grid.mockClear();
+            return restore_to_unmounted_grid;
+        }
+
+        it.each([
+            ['Cancel', () => click_button('Cancel')],
+            ['Escape', press_escape],
+        ])('gives focus to the grid mounted now when %s follows a reload that remounted it', async (_name, dismiss) => {
+            const restore_to_unmounted_grid = await open_then_remount_grid();
 
             await dismiss();
             await vi.waitUntil(() => restore_to_unmounted_grid.mock.calls.length > 0);
@@ -13358,24 +13369,136 @@ describe('sorting and filtering', () => {
             expect(grid_shell_mock.focus_grid).toHaveBeenCalledOnce();
         });
 
+        it('leaves focus on a control the person moved to before it was handed back', async () => {
+            const restore_to_unmounted_grid = await open_then_remount_grid();
+
+            await act(async () => {
+                document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+                columns_trigger().focus();
+            });
+            await vi.waitUntil(() => restore_to_unmounted_grid.mock.calls.length > 0);
+
+            expect(grid_shell_mock.focus_grid).not.toHaveBeenCalled();
+            expect(document.activeElement).toBe(columns_trigger());
+        });
+
         it('leaves focus where the opener\'s own callback put it when the grid was not remounted', async () => {
+            vi.spyOn(document, 'hasFocus').mockReturnValue(true);
             await render_app();
             await dispatch_host_message(initial_snapshot_message(two_column_meta()));
             grid_shell_mock.has_grid_focus.mockReturnValue(false);
             // The mounted grid's callback focuses it.
-            const restore = vi.fn(() => { grid_shell_mock.has_grid_focus.mockReturnValue(true); });
-            const open_filter = grid_shell_mock.latest_props!.on_open_filter as (
-                source_column: number,
-                anchor: { left: number; top: number },
-                restore_focus: () => void,
-            ) => void;
-            await act(async () => open_filter(1, { left: 20, top: 20 }, restore));
+            const restore = vi.fn(() => {
+                grid_stub().tabIndex = -1;
+                grid_stub().focus();
+            });
+            await open_filter_with(restore);
             grid_shell_mock.focus_grid.mockClear();
 
             await click_button('Cancel');
             await vi.waitUntil(() => restore.mock.calls.length > 0);
 
+            expect(document.activeElement).toBe(grid_stub());
             expect(grid_shell_mock.focus_grid).not.toHaveBeenCalled();
+        });
+
+        it('gives focus to the toolbar when the chip that opened it is gone', async () => {
+            // Opened from a filter's chip; another window then removes that
+            // filter, which leaves the columns alone and unmounts the chip.
+            vi.spyOn(document, 'hasFocus').mockReturnValue(true);
+            const { post_message } = await render_app();
+            await load_acknowledged_transform(post_message, {
+                sort: [],
+                filters: [{
+                    id: 'theirs', colIndex: 0, operator: 'equals', value: 'x',
+                    caseSensitive: false, enabled: true,
+                }],
+                schema: '["Sheet1",1,null]',
+            });
+            grid_shell_mock.has_grid_focus.mockReturnValue(false);
+            await act(async () => (
+                document.querySelector('.filter-chip-body') as HTMLButtonElement
+            ).click());
+            expect(document.querySelector('.filter-popover')).not.toBeNull();
+
+            await dispatch_host_message(refresh_snapshot_message(make_meta(['Sheet1']), {
+                generation: 3,
+                sourceGeneration: 1,
+            }));
+            expect(document.querySelector('.filter-chip-body')).toBeNull();
+            expect(document.querySelector('.filter-popover')).not.toBeNull();
+            grid_shell_mock.focus_grid.mockClear();
+
+            await click_button('Cancel');
+            const toolbar = document.querySelector('.toolbar') as HTMLElement;
+            await vi.waitUntil(() => document.activeElement === toolbar);
+
+            expect(grid_shell_mock.focus_grid).not.toHaveBeenCalled();
+        });
+
+        it('closes when a save renumbers the columns, whatever the schema shows', async () => {
+            // Two columns with no names trade places in the save: the count
+            // and the names are what they were, and column 0 is now the other
+            // column.
+            await render_app();
+            const meta = make_meta(['Sheet1'], false);
+            Object.assign(meta.sheets[0], { rowCount: 5, sourceRowCount: 5, columnCount: 2 });
+            await dispatch_host_message(initial_snapshot_message(meta, {
+                capabilities: { csvEditable: true, csvEditingSupported: true },
+            }));
+            await request_edit_session();
+            await dispatch_host_message({
+                type: 'editSessionResult',
+                granted: true,
+                editSessionId: 'moved-columns',
+                sheetIndex: 0,
+                pendingChanges: {
+                    sheetIndex: 0,
+                    sheetName: 'Sheet1',
+                    cells: { '0:0': { value: 'edited', base: 'a' } },
+                    formatTemplates: [],
+                    appendedRows: [],
+                    tailRemovals: [],
+                    conflicts: [],
+                    rowLayout: {
+                        runs: [{ kind: 'source', start: 0, count: 5 }],
+                        removedSourceRows: [{ start: 1, count: 1 }],
+                        discardedPendingRows: [],
+                    },
+                    structuralBasis: {
+                        kind: 'delimited', byteLength: 1, digest: 'x', sourceRowCount: 5, sourceColumnCount: 2,
+                    },
+                },
+            });
+            await open_grid_filter(0);
+            await type_filter_value('x');
+            await act(async () => {
+                (grid_shell_mock.latest_props as unknown as GridShellProps).on_save_request?.();
+            });
+            const operation = grid_shell_mock.latest_props?.save_operation as CsvSaveOperation;
+            expect(operation).toBeDefined();
+            expect(document.querySelector('.filter-popover')).not.toBeNull();
+
+            await dispatch_host_message({
+                type: 'saveResult',
+                success: true,
+                lifecycle: { revision: 1, state: 'succeeded', operation },
+                receipt: {
+                    appendedRows: [],
+                    removedSourceRows: [],
+                    structure: [{
+                        sheetIndex: 0,
+                        sheetName: 'Sheet1',
+                        rowRuns: [{ from: 0, count: 5, to: 0 }],
+                        removedRows: [],
+                        columnMap: [1, 0],
+                        insertedRows: [],
+                        insertedColumns: [],
+                    }],
+                },
+            });
+
+            expect(document.querySelector('.filter-popover')).toBeNull();
         });
 
         it.each([
