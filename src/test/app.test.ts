@@ -13354,6 +13354,100 @@ describe('sorting and filtering', () => {
         });
     });
 
+    describe('the name a column is shown by', () => {
+        const EDITABLE = { csvEditable: true, csvEditingSupported: true };
+        const FILTER_ON_NAME = {
+            id: 'name-filter', colIndex: 0, operator: 'contains' as const, value: 'Bob',
+            caseSensitive: false, enabled: true,
+        };
+
+        function people_meta(header?: 'on' | 'off'): WorkbookMeta {
+            const meta = make_meta(['people'], false);
+            meta.sheets[0] = {
+                ...meta.sheets[0],
+                rowCount: 3,
+                sourceRowCount: header === 'on' ? 4 : 3,
+                columnCount: 2,
+                columnNames: header === 'off' ? undefined : ['Name', 'Age'],
+                ...(header === undefined ? {} : {
+                    excelFirstRowHeader: {
+                        mode: header,
+                        detected: true,
+                        active: header === 'on',
+                        available: true,
+                    },
+                }),
+            };
+            return meta;
+        }
+
+        /** Open on a sort and a filter of column 0, then edit source row 0's cell there. */
+        async function load_sorted_filtered_and_edit_first_row(meta: WorkbookMeta) {
+            const { post_message } = await render_app();
+            await dispatch_host_message(initial_snapshot_message(meta, {
+                capabilities: EDITABLE,
+                state: {
+                    transforms: [{
+                        sort: [{ colIndex: 0, direction: 'asc' }],
+                        filters: [FILTER_ON_NAME],
+                        schema: JSON.stringify([
+                            'people', 2, meta.sheets[0].columnNames ?? null,
+                        ]),
+                    }],
+                },
+            }));
+            await acknowledge_transform(latest_transform_request(post_message), 2);
+            await acquire_editing_session(post_message);
+            seed_mounted_store({ '0:0': { value: 'Ann', base: 'Alice' } });
+        }
+
+        /** The names shown for column 0: sort chip, filter chip, filter editor, Columns list. */
+        async function shown_names() {
+            const names = {
+                sort: document.querySelector('.sort-chip-name')?.textContent,
+                filter: document.querySelector('.filter-chip-body')?.textContent,
+                editor: '' as string | null | undefined,
+                columns: '' as string | null | undefined,
+            };
+            await open_grid_filter(0);
+            names.editor = document.querySelector('.filter-popover-colname')?.textContent;
+            await click_button('Cancel');
+            await open_columns();
+            names.columns = document.querySelector('.column-visibility-name')?.textContent;
+            return names;
+        }
+
+        it('is the header in a .csv, whatever is unsaved in the first row of data', async () => {
+            await load_sorted_filtered_and_edit_first_row(people_meta());
+            expect(await shown_names()).toEqual({
+                sort: 'Name',
+                filter: 'Name contains “Bob”',
+                editor: 'Name',
+                columns: 'Name',
+            });
+        });
+
+        it('is the column letter with the Header Row off, whatever is unsaved in row 1', async () => {
+            await load_sorted_filtered_and_edit_first_row(people_meta('off'));
+            expect(await shown_names()).toEqual({
+                sort: 'A',
+                filter: 'A contains “Bob”',
+                editor: 'A',
+                columns: 'A',
+            });
+        });
+
+        it('is the unsaved header cell with the Header Row on', async () => {
+            await load_sorted_filtered_and_edit_first_row(people_meta('on'));
+            expect(await shown_names()).toEqual({
+                sort: 'Ann',
+                filter: 'Ann contains “Bob”',
+                editor: 'Ann',
+                columns: 'Ann',
+            });
+        });
+    });
+
     it('disables transform controls while an edit-session request is pending', async () => {
         const { post_message } = await render_app();
         const identified_meta = make_meta(['Sheet1'], false);

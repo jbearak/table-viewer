@@ -9825,11 +9825,17 @@ export function App(): React.JSX.Element {
         ? transform_schema_for_sheet(current_sheet)
         : '';
     const current_header_row = current_sheet?.excelFirstRowHeader?.sourceRow ?? 0;
+    // An unsaved edit names a column only where the worksheet has a header row
+    // of cells: with the Header Row on. Anywhere else (a .csv, or the Header
+    // Row off) source row 0 is a row of data, and an edit there is not a rename.
+    const current_header_row_active = current_sheet?.excelFirstRowHeader?.active === true;
     const current_pending_header_names = Array.from(
         { length: current_sheet?.columnCount ?? 0 },
-        (_, index) => edit_session_registry_ref.current!
-            .for_sheet(active_sheet_index)
-            .get(`${current_header_row}:${index}`)?.value.trim(),
+        (_, index) => current_header_row_active
+            ? edit_session_registry_ref.current!
+                .for_sheet(active_sheet_index)
+                .get(`${current_header_row}:${index}`)?.value.trim()
+            : undefined,
     );
     const current_pending_header_signature = JSON.stringify(current_pending_header_names);
     const column_names = useMemo(() => Array.from(

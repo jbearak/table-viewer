@@ -799,3 +799,29 @@ test('Filter… in a column menu opens a filter that stays open after the menu\'
     await expect_nothing_unsaved();
     await expect(page.locator('.grid-shell-root')).toHaveAttribute('data-edit-session', 'none');
 });
+
+test('a filter on a column with an unsaved edit in its first row is named by the column\'s header', async () => {
+    await select_cell(1, 0);
+    await page.keyboard.type('Ann');
+    await page.keyboard.press('Enter');
+    await expect(editor()).toBeHidden();
+    await expect(cell(1, 0)).toHaveText('Ann');
+    await expect(save()).toHaveClass(/has-unsaved/);
+
+    // The unsaved edit keeps the session, so the menu acquires none and
+    // nothing is released: the editor has only to name its column.
+    const popover = await open_filter_from_header_menu(0);
+    await expect(popover).toBeVisible();
+    await expect(popover.locator('.filter-popover-colname')).toHaveText('Name');
+    await apply_contains('Bob');
+    await expect.poll(strip).toContain('Name contains “Bob”');
+    await expect.poll(shown_rows).toEqual(['Bob|25|London']);
+
+    // The chip's own editor and the Columns list name it the same way.
+    await page.locator('.filter-chip-body').click();
+    await expect(popover.locator('.filter-popover-colname')).toHaveText('Name');
+    await popover.getByRole('button', { name: 'Cancel' }).click();
+    await expect(popover).toBeHidden();
+    await page.locator('.column-visibility-trigger').click();
+    await expect(page.locator('.column-visibility-name').first()).toHaveText('Name');
+});
