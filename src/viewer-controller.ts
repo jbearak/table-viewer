@@ -4623,6 +4623,12 @@ export function attach_viewer(
     const released_cores = new WeakSet<ViewerPanelCore>();
     const compare_diff_failure_notified = new WeakSet<CompareDataSource>();
     const compare_diff_sidecars = new Set<Promise<void>>();
+    /**
+     * Header writes in flight, from admission to their last step. The
+     * extension closes the state database once every controller has drained,
+     * so the drain waits for these as it does for a transform's commit.
+     */
+    const header_commits = new Set<Promise<void>>();
 
     function reject_pending_edit_protocol(error: Error): void {
         for (const waiter of pending_edit_flush_waiters.values()) waiter.reject(error);
@@ -13971,6 +13977,9 @@ export function attach_viewer(
                     );
                     return;
                 }
+                let finish_header_commit!: () => void;
+                const header_commit = new Promise<void>((resolve) => { finish_header_commit = resolve; });
+                header_commits.add(header_commit);
                 try {
                     const command_source = source;
                     const command_sheet = command_source.meta().sheets[msg.sheetIndex];
@@ -14055,6 +14064,8 @@ export function attach_viewer(
                     }
                 } finally {
                     if (editing_supported) finish_transform_admission(header_admission.operation);
+                    header_commits.delete(header_commit);
+                    finish_header_commit();
                 }
                 return;
             }
@@ -18241,6 +18252,7 @@ export function attach_viewer(
             const transform_tails = [...transform_commit_barriers]
                 .map((barrier) => barrier.completion);
             const compare_tails = [...compare_diff_sidecars];
+            const header_tails = [...header_commits];
             const drain_work: Array<{
                 readonly kind: string;
                 readonly completion: Promise<unknown>;
@@ -18255,6 +18267,10 @@ export function attach_viewer(
                 })),
                 ...compare_tails.map((completion) => ({
                     kind: 'compareDiff',
+                    completion,
+                })),
+                ...header_tails.map((completion) => ({
+                    kind: 'headerCommit',
                     completion,
                 })),
             ];
@@ -18275,6 +18291,7 @@ export function attach_viewer(
                 )
                 && transform_commit_barriers.size === 0
                 && compare_diff_sidecars.size === 0
+                && header_commits.size === 0
             ) return;
         }
     }

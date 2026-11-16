@@ -1370,6 +1370,62 @@ describe('Excel workbook snapshot controller', () => {
         expect(snapshots(panel_b).at(-1)?.commandResult).toBeUndefined();
     });
 
+    it('keeps the shutdown drain behind a header write in flight', async () => {
+        // The extension closes the state database once every controller has
+        // drained: a header write the drain does not wait for can be cut off.
+        const state = gated_state_store();
+        let header_written = false;
+        const store: FileStateStore = {
+            ...state.store,
+            async compare_and_set(path, expected, next, validate) {
+                const result = await state.store.compare_and_set(path, expected, next, validate);
+                if (result.type === 'committed' && next.excelFirstRowHeaders?.People === 'off') {
+                    header_written = true;
+                }
+                return result;
+            },
+        };
+        const drain_work: (readonly string[])[] = [];
+        const panel = vscode_mock.window.createWebviewPanel('tableViewer.editor', 'excel');
+        const controller = attach_viewer(
+            panel as unknown as Parameters<typeof attach_viewer>[0],
+            vscode_mock.Uri.file('/native-drain.xlsx') as unknown as vscode.Uri,
+            with_in_memory_authority_transactions(store),
+            excel_profile({ count: 0 }),
+            fake_viewer_host,
+            {
+                integrationTestPort: {
+                    on_host_message() {},
+                    on_webview_message() {},
+                    register_webview_message_receiver() {},
+                    on_controller_drain_wait(work) { drain_work.push(work); },
+                },
+            },
+        );
+        panel.onDidDispose(() => controller.dispose());
+        const initial = await ready(panel);
+        await controller.drain();
+        drain_work.length = 0;
+
+        const started = state.block_next_update();
+        const command = toggle(panel, initial, 'held-header', false);
+        await started;
+        controller.dispose();
+        let written_when_drained: boolean | undefined;
+        const drained = controller.drain().then(() => { written_when_drained = header_written; });
+        expect(drain_work[0]).toContain('headerCommit');
+        // Still waiting once everything already queued has run: a turn of the
+        // event loop, not a timed wait. The write cannot finish while held.
+        const turn = new Promise<'waiting'>((resolve) => { setImmediate(() => resolve('waiting')); });
+        expect(await Promise.race([drained.then(() => 'drained' as const), turn])).toBe('waiting');
+
+        state.release_update();
+        await command;
+        await drained;
+        expect(written_when_drained).toBe(true);
+        panel.dispose();
+    });
+
     it('surfaces physical warnings only after ACK and deduplicates across tabs', async () => {
         const warning = vi.spyOn(vscode_mock.window, 'showWarningMessage');
         const state = mutable_state_store();
