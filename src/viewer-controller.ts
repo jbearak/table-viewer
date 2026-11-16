@@ -3136,6 +3136,10 @@ export function attach_viewer(
     // and refuse a session. Compared with snapshots only, a redelivery after an
     // install can count as a move, which only makes a request wait.
     let last_posted_view: { readonly generation: number; readonly sourceGeneration: number } | undefined;
+    // The view of the last snapshot handed to the renderer, delivered or not:
+    // a transform the renderer asked for from an older view arrives after it,
+    // and the renderer drops that request when it applies the snapshot.
+    let last_offered_view: { readonly generation: number; readonly sourceGeneration: number } | undefined;
     /**
      * A snapshot is being posted. One that moves the view (a new generation
      * or source generation) makes the renderer drop every transform it was
@@ -3144,10 +3148,6 @@ export function attach_viewer(
      * renderer knows, done, and a session request waits it out rather than
      * being refused for it.
      */
-    // The view of the last snapshot handed to the renderer, delivered or not:
-    // a transform the renderer asked for from an older view arrives after it,
-    // and the renderer drops that request when it applies the snapshot.
-    let last_offered_view: { readonly generation: number; readonly sourceGeneration: number } | undefined;
     function note_snapshot_posted(snapshot: { readonly generation: number; readonly sourceGeneration: number }): () => void {
         const view = { generation: snapshot.generation, sourceGeneration: snapshot.sourceGeneration };
         last_offered_view = view;
@@ -13539,9 +13539,12 @@ export function attach_viewer(
             transform_authority,
         );
         // Asked for from a view older than the last snapshot handed to the
-        // renderer: it drops this request when it applies that snapshot (or
-        // already has), so a session request waits this out rather than being
-        // refused for it.
+        // renderer. Usually the renderer drops this request when it applies
+        // that snapshot (or already has). If an install already moved the
+        // renderer to that view, it keeps the request until it is answered and
+        // asks for no session meanwhile, so marking it here changes nothing
+        // there. Either way a session request waits this out rather than being
+        // refused for it. Do not narrow this to snapshots the renderer saw move.
         if (
             last_offered_view !== undefined
             && (message.generation < last_offered_view.generation
