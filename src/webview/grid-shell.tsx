@@ -3623,15 +3623,18 @@ export function GridShell({
     }, [append_in_flight, editable_cells]);
     /** Set when this grid goes away, for what was waiting on it. */
     const grid_unmounted_ref = useRef(false);
-    useEffect(() => () => {
-        grid_unmounted_ref.current = true;
-        // A gesture still waiting when this grid goes away is told no.
-        const committed = editable_commit_ref.current;
-        editable_commit_ref.current = null;
-        committed?.settle(false);
-        const answered = append_answered_ref.current;
-        append_answered_ref.current = null;
-        answered?.settle(false);
+    useEffect(() => {
+        grid_unmounted_ref.current = false;
+        return () => {
+            grid_unmounted_ref.current = true;
+            // A gesture still waiting when this grid goes away is told no.
+            const committed = editable_commit_ref.current;
+            editable_commit_ref.current = null;
+            committed?.settle(false);
+            const answered = append_answered_ref.current;
+            append_answered_ref.current = null;
+            answered?.settle(false);
+        };
     }, []);
     // Gestures waiting on the session. Counted so the session they are about
     // to use is not released as empty in the moment before they run.

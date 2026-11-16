@@ -377,7 +377,8 @@ describe('a replay whose view moves while its commit runs', () => {
         };
         // The state read back to repair the session is held until the
         // answer has gone out: the read `refresh_session_state_material`
-        // makes, picked out by its caller.
+        // makes, picked out by its caller. (Matched by name, in the async
+        // stack: a rename there leaves `held` false, which is asserted.)
         let release_read!: () => void;
         const read_held = new Promise<void>((resolve) => { release_read = resolve; });
         const read = store.read.bind(store);
@@ -394,7 +395,6 @@ describe('a replay whose view moves while its commit runs', () => {
         const prepared = await prepare_highlight(panel);
         broken = false;
         vi.spyOn(console, 'warn').mockImplementation(() => {});
-
 
         const answer = await commit(panel, prepared);
 

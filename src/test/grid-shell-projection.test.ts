@@ -6827,6 +6827,7 @@ describe('GridShell edit-admission lifetime', () => {
             frames.push(callback);
             return frames.length;
         });
+        onTestFinished(() => raf.mockRestore());
         const run_frames = async () => {
             await act(async () => {
                 for (const callback of frames.splice(0)) callback(0);
