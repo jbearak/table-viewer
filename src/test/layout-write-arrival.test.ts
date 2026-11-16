@@ -16,7 +16,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type * as vscode from 'vscode';
 import { attach_viewer, csv_table_profile } from '../viewer-controller';
-import type { FileStateStore } from '../state';
 import type { PerFileState, WebviewMessage } from '../types';
 import type { WorkbookSnapshot } from '../viewer-snapshot';
 import { with_in_memory_authority_transactions } from '../state-authority';

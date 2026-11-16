@@ -91,7 +91,6 @@ import {
     build_layout_grid_columns,
     clamp_column_width,
     column_letter,
-    DEFAULT_COLUMN_WIDTH_PX,
     LAST_COLUMN_RESIZE_GUTTER_PX,
     MAX_AUTO_FIT_COLUMN_WIDTH_PX,
     MAX_COLUMN_WIDTH_PX,
@@ -1539,10 +1538,12 @@ export interface GridShellProps {
     /** Persisted widths keyed by canonical source column. */
     column_widths: Record<number, number>;
     /**
-     * A finished column-width gesture: every source column it left at another
-     * width than it showed, once. A border drag (with the columns Glide fans
-     * it out to) or a double-click fit. Nothing is reported while a border is
-     * dragged: the widths are drafts drawn here until the press ends.
+     * A finished column-width gesture: every source column it sized, once,
+     * with the width it left each at, whether or not this window showed
+     * another width for it before (its copy can be behind what is stored). A
+     * border drag (with the columns Glide fans it out to) or a double-click
+     * fit. Nothing is reported while a border is dragged: the widths are
+     * drafts drawn here until the press ends.
      */
     on_columns_resized: (
         changes: readonly { readonly column: number; readonly width: number }[],
