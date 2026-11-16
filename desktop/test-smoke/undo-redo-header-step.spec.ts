@@ -165,28 +165,33 @@ async function history(page: Page, command: 'undo' | 'redo', times = 1): Promise
  * watcher's refresh for the save can land while the edit is being replayed,
  * and the host then refuses the replay and says "… did not run because the
  * file was refreshing. Try again." The helper does what the message says.
- * Any other message fails, with its text.
+ * A message in `also_said` is waited for and set aside. Any other message
+ * fails, with its text.
  */
 async function history_after_save(
     page: Page,
     command: 'undo' | 'redo',
     expected: Partial<Shown>,
-    // Messages that may be said and are not this test's subject.
-    beside_the_point: readonly string[] = [],
+    // Messages the app says here that are not this test's subject. Each is
+    // waited for, so none can arrive later and be read as something else.
+    also_said: readonly string[] = [],
 ): Promise<void> {
     const try_again = `${command === 'undo' ? 'Undo' : 'Redo'} did not run because the file was refreshing. Try again.`;
     await history(page, command);
     const said: string[] = [];
+    const awaited = new Set(also_said);
     await expect.poll(async () => {
         for (const dialog of await take_dialogs(app!)) {
-            if (dialog.message === try_again) await history(page, command);
-            else if (!beside_the_point.includes(dialog.message ?? '')) said.push(dialog.message ?? '');
+            const message = dialog.message ?? '';
+            if (message === try_again) await history(page, command);
+            else if (also_said.includes(message)) awaited.delete(message);
+            else said.push(message);
         }
         const now = await shown(page);
         const picked: Record<string, unknown> = {};
         for (const key of Object.keys(expected) as (keyof Shown)[]) picked[key] = now[key];
-        return { ...picked, dialogs: [...said] };
-    }).toEqual({ ...expected, dialogs: [] });
+        return { ...picked, dialogs: [...said], awaited: [...awaited] };
+    }).toEqual({ ...expected, dialogs: [], awaited: [] });
 }
 
 interface Remembered {
@@ -774,7 +779,8 @@ test('header, rename, Save, Undo, Undo: the header step waits while the header r
     await expect.poll(() => saved(file)).toEqual(['1|2', 'title|qty', ...FRUIT]);
 
     // The saved name is undone: the header cell is unsaved against the file.
-    // (Where the app says the undone cell went is not what this test is about.)
+    // The app also says the undone cell is hidden by the view, every time; the
+    // message is waited for here so that it is not read as the next step's.
     await history_after_save(
         page,
         'undo',
