@@ -4710,7 +4710,24 @@ export function App(): React.JSX.Element {
                     set_unresolved_lfs(snapshot.configuration.unresolvedLfs);
                     meta_ref.current = snapshot.meta;
                     set_meta(snapshot.meta);
-                    set_filter_editor(null);
+                    // An open filter editor names a column of the active
+                    // worksheet by position, so it ends when that position can
+                    // mean another column: another document, another worksheet,
+                    // or a change of the worksheet's columns (the rule that drops
+                    // installed filters, and the one the Columns menu closes by).
+                    // Any other snapshot leaves it open with what the person has
+                    // typed. One always follows "Filter…" in a header menu: the
+                    // menu acquired an editing session, and its idle release is
+                    // delivered as a snapshot a moment after the editor opens.
+                    if (
+                        snapshot.presentation === 'initial'
+                        || next_active_sheet_index !== active_sheet_index
+                        || active_sheet_changed
+                        || previous_active_sheet === undefined
+                        || next_active_sheet === undefined
+                        || transform_schema_for_sheet(previous_active_sheet)
+                            !== transform_schema_for_sheet(next_active_sheet)
+                    ) set_filter_editor(null);
                     const source_changed =
                         snapshot.presentation === 'initial'
                         || source_generation_ref.current !== snapshot.sourceGeneration;
@@ -10984,7 +11001,9 @@ export function App(): React.JSX.Element {
             />
             {filter_editor && (
                 <FilterPopover
-                    key={`${source_generation_ref.current}:${active_sheet_index}:${filter_editor.column_index}`}
+                    // Not keyed by the source generation: a reload that keeps
+                    // the columns keeps the editor, and its draft with it.
+                    key={`${active_sheet_index}:${filter_editor.column_index}`}
                     column_index={filter_editor.column_index}
                     column_name={column_names[filter_editor.column_index]
                         ?? `Column ${filter_editor.column_index + 1}`}

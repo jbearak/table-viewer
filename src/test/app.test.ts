@@ -13208,22 +13208,150 @@ describe('sorting and filtering', () => {
         await open_grid_filter();
         const old_request = latest_histogram_request(post_message);
 
+        post_message.mockClear();
         await dispatch_host_message(refresh_snapshot_message(make_meta(['Sheet1']), {
             generation: 2,
             sourceGeneration: 2,
         }));
+        // The columns are the same, so the editor stays, and it asks for the
+        // reloaded file's values.
+        expect(document.querySelector('.filter-popover')).not.toBeNull();
+        const new_request = latest_histogram_request(post_message);
+        expect(new_request).toMatchObject({ generation: 2, sourceGeneration: 2 });
+        expect(new_request.requestId).not.toBe(old_request.requestId);
+
+        // The answer for the old file is not shown.
         await dispatch_host_message({
             type: 'filterHistogram', sheetIndex: 0, columnIndex: 0,
             requestId: old_request.requestId, generation: 1, sourceGeneration: 1,
             bins: [{ lo: 0, hi: 1, count: 7 }],
         });
-        expect(document.querySelector('.filter-popover')).toBeNull();
+        expect((document.querySelector('#filter-condition') as HTMLSelectElement).value)
+            .toBe('contains');
+        await dispatch_host_message({
+            type: 'filterHistogram', sheetIndex: 0, columnIndex: 0,
+            requestId: new_request.requestId, generation: 2, sourceGeneration: 2,
+            bins: [{ lo: 0, hi: 1, count: 7 }],
+        });
+        expect((document.querySelector('#filter-condition') as HTMLSelectElement).value)
+            .toBe('between');
 
+        await click_button('Cancel');
         post_message.mockClear();
         await open_grid_filter();
-        const new_request = latest_histogram_request(post_message);
-        expect(new_request).toMatchObject({ generation: 2, sourceGeneration: 2 });
-        expect(new_request.requestId).not.toBe(old_request.requestId);
+        expect(post_message.mock.calls.some(
+            ([message]) => message.type === 'requestFilterHistogram',
+        )).toBe(false);
+    });
+
+    describe('an open filter editor when a snapshot arrives', () => {
+        function two_column_meta(names: string[] = ['Name', 'Age']): WorkbookMeta {
+            const meta = make_meta(['Sheet1']);
+            meta.sheets[0] = {
+                ...meta.sheets[0],
+                columnCount: names.length,
+                columnNames: names,
+            };
+            return meta;
+        }
+
+        async function type_filter_value(text: string) {
+            const input = document.querySelector(
+                'input[aria-label="Filter value"]',
+            ) as HTMLInputElement;
+            expect(input).not.toBeNull();
+            await act(async () => {
+                Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!
+                    .set!.call(input, text);
+                input.dispatchEvent(new Event('input', { bubbles: true }));
+            });
+        }
+
+        const filter_value = () => (document.querySelector(
+            'input[aria-label="Filter value"]',
+        ) as HTMLInputElement | null)?.value;
+
+        it('stays open, with what was typed, when the session a header menu acquired is released', async () => {
+            // "Filter…" in a column's menu: the menu acquired an editing session,
+            // the editor opens, and the session, holding nothing, is let go. The
+            // host answers the release with a snapshot of the same file and view.
+            const { post_message } = await render_app();
+            await dispatch_host_message(initial_snapshot_message(two_column_meta(), {
+                capabilities: { csvEditable: true, csvEditingSupported: true },
+            }));
+            await acquire_editing_session(post_message);
+            await open_grid_filter(0);
+            await type_filter_value('Bob');
+            await release_idle_edit_session();
+            expect(post_message).toHaveBeenCalledWith(
+                expect.objectContaining({ type: 'releaseEditSession' }),
+            );
+
+            await dispatch_host_message(workbook_snapshot_message(two_column_meta(), {
+                presentation: 'refresh',
+                reason: 'other',
+                capabilities: { csvEditable: true, csvEditingSupported: true },
+            }));
+
+            expect(document.querySelector('.filter-popover')).not.toBeNull();
+            expect(filter_value()).toBe('Bob');
+            post_message.mockClear();
+            await click_button('Apply');
+            expect(latest_transform_request(post_message).state.filters[0]).toMatchObject({
+                colIndex: 0,
+                operator: 'contains',
+                value: 'Bob',
+            });
+        });
+
+        it('stays open, with what was typed, across a reload that keeps the columns', async () => {
+            const { post_message } = await render_app();
+            await dispatch_host_message(initial_snapshot_message(two_column_meta()));
+            await open_grid_filter(1);
+            await type_filter_value('3');
+
+            const reloaded = two_column_meta();
+            reloaded.sheets[0].rowCount = 9;
+            reloaded.sheets[0].sourceRowCount = 9;
+            await dispatch_host_message(refresh_snapshot_message(reloaded));
+
+            expect(document.querySelector('.filter-popover-colname')?.textContent).toBe('Age');
+            expect(filter_value()).toBe('3');
+            post_message.mockClear();
+            await click_button('Apply');
+            const request = latest_transform_request(post_message);
+            expect(request).toMatchObject({ generation: 2, sourceGeneration: 2 });
+            expect(request.state.filters[0]).toMatchObject({ colIndex: 1, value: '3' });
+        });
+
+        it.each([
+            ['renames a column', () => refresh_snapshot_message(two_column_meta(['Name', 'Years']))],
+            ['adds a column', () => refresh_snapshot_message(two_column_meta(['Name', 'Age', 'City']))],
+            ['is another worksheet under the same name and columns', () => {
+                const meta = two_column_meta();
+                meta.sheets[0].worksheetId = '9';
+                return refresh_snapshot_message(meta);
+            }],
+            ['loads a document', () => initial_snapshot_message(two_column_meta(), {
+                generation: 2,
+                sourceGeneration: 2,
+            })],
+        ])('closes when the snapshot %s', async (_name, snapshot) => {
+            await render_app();
+            const meta = two_column_meta();
+            meta.sheets[0].worksheetId = '7';
+            await dispatch_host_message(initial_snapshot_message(meta));
+            await open_grid_filter(1);
+            await type_filter_value('3');
+
+            const next = snapshot();
+            if (next.snapshot.meta.sheets[0].worksheetId === undefined) {
+                next.snapshot.meta.sheets[0].worksheetId = '7';
+            }
+            await dispatch_host_message(next);
+
+            expect(document.querySelector('.filter-popover')).toBeNull();
+        });
     });
 
     it('disables transform controls while an edit-session request is pending', async () => {
