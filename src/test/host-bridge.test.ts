@@ -431,6 +431,102 @@ describe('host-bridge', () => {
         expect(pending_changes_durability.structural_backlog_full('session:echo')).toBe(false);
     });
 
+    describe('the publication fence', () => {
+        const changes = (value: string) => ({
+            sheetIndex: 0,
+            sheetName: 'Sheet1',
+            cells: { '0:0': { value, base: 'a' } },
+            formatTemplates: [],
+            appendedRows: [],
+            tailRemovals: [],
+            conflicts: [],
+        });
+
+        it('posts nothing while up, from either publisher, and resumes at the next sequence when lowered', async () => {
+            const injected = { postMessage: vi.fn() };
+            (globalThis as { __tableViewerHostBridge?: unknown })
+                .__tableViewerHostBridge = injected;
+            const { pending_edit_durability, pending_changes_durability, publication_fence } =
+                await import('../webview/host-bridge');
+            const first = pending_edit_durability.publish('session:f', { '0:0': { value: 'b', base: 'a' } }, 0, 'Sheet1');
+            pending_edit_durability.acknowledge('session:f', first);
+            injected.postMessage.mockClear();
+
+            publication_fence.raise();
+            expect(publication_fence.is_raised()).toBe(true);
+            expect(pending_edit_durability.publish('session:f', { '0:0': { value: 'c', base: 'a' } }, 0, 'Sheet1', true))
+                .toBe(1);
+            expect(pending_changes_durability.publish('session:f', changes('d'), 1, true)).toBe(1);
+            // A session the window has never published for gets no channel.
+            expect(pending_changes_durability.publish('session:other', changes('d'), 1, true)).toBe(0);
+            expect(injected.postMessage).not.toHaveBeenCalled();
+            expect(pending_changes_durability.has_unacknowledged('session:f')).toBe(false);
+
+            publication_fence.lower();
+            expect(publication_fence.is_raised()).toBe(false);
+            expect(pending_changes_durability.publish('session:f', changes('e'), 1)).toBe(2);
+            expect(injected.postMessage).toHaveBeenCalledTimes(1);
+            expect(pending_changes_durability.snapshot('session:f')).toEqual({ highestProducedSequence: 2 });
+        });
+
+        it('vouches only for what the host acknowledged before it rose, though a later publication superseded a dropped one', async () => {
+            const injected = { postMessage: vi.fn() };
+            (globalThis as { __tableViewerHostBridge?: unknown })
+                .__tableViewerHostBridge = injected;
+            const { pending_changes_durability, publication_fence } =
+                await import('../webview/host-bridge');
+            const acknowledged = pending_changes_durability.publish('session:v', changes('b'), 1);
+            pending_changes_durability.acknowledge('session:v', acknowledged);
+            // Two more on the same sheet, the second superseding the first
+            // before either answers: the host takes one (2) and drops the
+            // other (3, a replay commit was running).
+            pending_changes_durability.publish('session:v', changes('c'), 1);
+            const latest = pending_changes_durability.publish('session:v', changes('d'), 1);
+            expect(latest).toBe(3);
+
+            publication_fence.raise();
+            expect(pending_changes_durability.snapshot('session:v')).toEqual({ highestProducedSequence: 1 });
+            // The one the host took, acknowledged late, is vouched for.
+            pending_changes_durability.acknowledge('session:v', 2);
+            expect(pending_changes_durability.snapshot('session:v')).toEqual({ highestProducedSequence: 2 });
+            // A session with no channel answers zero and gets none.
+            expect(pending_changes_durability.snapshot('session:none')).toEqual({ highestProducedSequence: 0 });
+
+            publication_fence.lower();
+            // Nothing produced since: still only what was acknowledged.
+            expect(pending_changes_durability.snapshot('session:v')).toEqual({ highestProducedSequence: 2 });
+            expect(pending_changes_durability.publish('session:v', changes('e'), 1)).toBe(4);
+            expect(pending_changes_durability.snapshot('session:v')).toEqual({ highestProducedSequence: 4 });
+        });
+
+        it('forgets the outstanding publications of the stores a new document replaced', async () => {
+            const injected = { postMessage: vi.fn() };
+            (globalThis as { __tableViewerHostBridge?: unknown })
+                .__tableViewerHostBridge = injected;
+            const { pending_changes_durability, publication_fence } =
+                await import('../webview/host-bridge');
+            const structural = (value: string) => ({
+                ...changes(value),
+                rowLayout: { runs: [{ kind: 'source' as const, start: 0, count: 1 }], removedSourceRows: [], discardedPendingRows: [] },
+            });
+            // Two structural publications, the first superseded by the second
+            // before either is acknowledged.
+            pending_changes_durability.publish('session:r', structural('b'), 1);
+            pending_changes_durability.publish('session:r', structural('c'), 1);
+            expect(pending_changes_durability.has_unacknowledged('session:r')).toBe(true);
+            expect(pending_changes_durability.superseded_structural_payloads('session:r', 0, 'Sheet1')).toHaveLength(1);
+
+            publication_fence.raise();
+            publication_fence.forget_outstanding();
+            publication_fence.lower();
+
+            expect(pending_changes_durability.has_unacknowledged('session:r')).toBe(false);
+            expect(pending_changes_durability.superseded_structural_payloads('session:r', 0, 'Sheet1')).toEqual([]);
+            // The sequence never goes back: the host refuses one that does.
+            expect(pending_changes_durability.publish('session:r', changes('d'), 1)).toBe(3);
+        });
+    });
+
     it('prefers an injected global bridge over acquireVsCodeApi', async () => {
         const injected = { postMessage: vi.fn() };
         (globalThis as { __tableViewerHostBridge?: unknown })

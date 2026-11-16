@@ -61,6 +61,7 @@ const grid_mock = vi.hoisted(() => ({
     // The imperative half of the DataEditor stub: what the shell asks the grid
     // to do, as opposed to what it hands it.
     open_overlay: vi.fn((_cell: [number, number], _initial?: string): boolean => true),
+    dismiss_overlay: vi.fn(),
     focus: vi.fn(),
     // Display row → canonical source row, and source row → that row's raw text.
     //
@@ -103,7 +104,7 @@ vi.mock('../webview/glide-data-grid', () => {
             React.useImperativeHandle(ref, () => ({
                 updateCells: vi.fn(),
                 scrollTo: vi.fn(),
-                dismissOverlay: vi.fn(),
+                dismissOverlay: grid_mock.dismiss_overlay,
                 openOverlay: grid_mock.open_overlay,
                 focus: grid_mock.focus,
             }));
@@ -487,6 +488,7 @@ afterEach(() => {
     document.body.innerHTML = '';
     grid_mock.props = null;
     grid_mock.open_overlay.mockReset();
+    grid_mock.dismiss_overlay.mockReset();
     grid_mock.open_overlay.mockImplementation(() => true);
     grid_mock.focus.mockReset();
     // Back to the identity mapping: a leaked permutation would silently change
@@ -2749,6 +2751,81 @@ describe('GridShell editing with no session held yet', () => {
             root = null;
             container?.remove();
         }
+    });
+});
+
+describe('GridShell when App pauses edits, or its publications are fenced', () => {
+    it('closes the editor without committing what it holds', async () => {
+        // Pins existing behaviour the reopen fence relies on (the
+        // `editable_cells` layout effect): App pauses edits when it says the
+        // view no longer matches the file, and an editor open then would
+        // otherwise commit into a store that is never sent.
+        const store = create_edit_session_store({ session_id: 'session-1' });
+        const { rerender } = await render_grid(undefined, { edit_session: store, generation: 1 });
+        const clip = document.createElement('div');
+        clip.className = 'gdg-clip-region';
+        const input = document.createElement('input');
+        input.value = 'typed but not closed';
+        clip.appendChild(input);
+        document.body.appendChild(clip);
+        await act(async () => {
+            grid_mock.props!.onGridSelectionChange!({
+                columns: {},
+                rows: {},
+                current: { cell: [0, 0], range: { x: 0, y: 0, width: 1, height: 1 }, rangeStack: [] },
+            });
+        });
+        grid_mock.dismiss_overlay.mockClear();
+
+        await rerender({ edits_paused: true, on_edit_paused_gesture: vi.fn() });
+
+        expect(grid_mock.dismiss_overlay).toHaveBeenCalled();
+        expect([...store.snapshot()]).toEqual([]);
+        clip.remove();
+    });
+
+    it('publishes no store change while the publication fence is up', async () => {
+        const { post_message } = await render_grid();
+        const { publication_fence } = await import('../webview/host-bridge');
+        publication_fence.raise();
+        try {
+            await edit_cell('held back');
+            expect(pending_edit_messages(post_message)).toEqual([]);
+        } finally {
+            publication_fence.lower();
+        }
+        await edit_cell('sent');
+        expect(pending_edit_messages(post_message)).toEqual([
+            { edits: { '0:0': { value: 'sent', base: 'base', formattingKnown: true } } },
+        ]);
+    });
+
+    it('says why a Delete of whole rows is refused while App pauses edits', async () => {
+        const on_edit_paused_gesture = vi.fn();
+        const { rerender, edit_session } = await render_grid();
+        await rerender({ edits_paused: true, on_edit_paused_gesture });
+        let result: unknown;
+        await act(async () => {
+            result = grid_mock.props!.onCellsEdited!(
+                [{ location: [0, 0], value: { kind: 'text', data: '' } }],
+                'delete',
+            );
+        });
+        expect(result).toBe('refused');
+        expect(on_edit_paused_gesture).toHaveBeenCalledTimes(1);
+        expect([...(edit_session?.snapshot() ?? [])]).toEqual([]);
+    });
+
+    it('hands Cmd+S to App, which says why nothing is saved, and starts no Save', async () => {
+        const on_save_request = vi.fn(() => undefined);
+        const on_save_paused = vi.fn();
+        const { rerender } = await render_grid(undefined, { on_save_request });
+        await rerender({ edits_paused: true, on_edit_paused_gesture: vi.fn(), on_save_request, on_save_paused });
+        await act(async () => {
+            window.dispatchEvent(new KeyboardEvent('keydown', { key: 's', metaKey: true, cancelable: true }));
+        });
+        expect(on_save_paused).toHaveBeenCalledTimes(1);
+        expect(on_save_request).not.toHaveBeenCalled();
     });
 });
 

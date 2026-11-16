@@ -29,9 +29,11 @@ import {
     grid_headers,
     grid_rows,
     header_point,
+    install_applied_snapshot_capture,
     install_dialog_capture,
     install_history_menu_capture,
     launch_structural_viewer,
+    save_and_reread,
     save_changes,
     open_column_menu,
     open_row_menu,
@@ -77,6 +79,7 @@ async function open_file(name: string, content: string | Buffer): Promise<{ file
     app = launched.app;
     await install_dialog_capture(app);
     await install_history_menu_capture(app);
+    await install_applied_snapshot_capture(app);
     return { file, page: launched.page };
 }
 
@@ -302,7 +305,8 @@ test('a row drag and a column drag are the first edits to a file', async () => {
     await expect(page.locator('.grid-shell-root')).toHaveAttribute('data-edit-session', 'held');
     await page.mouse.up();
     await expect_undo_label('Move row');
-    await save_changes(page);
+    // Past the read-back, which replaces the rows the column drag below starts on.
+    await save_and_reread(app!, page);
     await expect.poll(() => fs.readFileSync(file, 'utf8')).toBe('name,qty\ncherry,3\napple,1\nbanana,2\n');
 
     await expect(save_button(page)).toBeDisabled();
@@ -443,7 +447,9 @@ test('an .xlsx formula recalculated before Save shows General digits, as it does
     await expect(await hovered_formula()).toHaveText('1.888888889 → 2.111111111');
 
     // Save writes the result, and the file's cached value displays the same way.
-    await save_changes(page);
+    // Waited past the read-back: it replaces the rows, which would close the
+    // cell menu opened below under its click.
+    await save_and_reread(app!, page);
     await save_screenshot(page, '12-xlsx-recalculated-after-save');
     const parsed = await parse_xlsx(new Uint8Array(fs.readFileSync(file)));
     expect(parsed.data.sheets[0].rows[0][1]?.formatted).toBe('2.111111111');
@@ -893,7 +899,8 @@ test('an external change conflicts, and both salvage actions resolve it', async 
         .toEqual(['apple|10', 'banana|2', 'cherry|3', 'date|4', 'kiwi|']);
     await expect.poll(() => grid_headers(page)).toEqual(['|name', '|qty']);
     await save_screenshot(page, '05-kept-new-rows-at-end');
-    await save_changes(page);
+    // Past the read-back, which would close the row menu opened below.
+    await save_and_reread(app!, page);
     await expect.poll(() => fs.readFileSync(file, 'utf8'))
         .toBe('name,qty\napple,10\nbanana,2\ncherry,3\ndate,4\nkiwi,\n');
 

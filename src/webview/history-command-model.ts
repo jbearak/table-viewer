@@ -133,6 +133,15 @@ export function header_wait_warning(
         + `${remedy} to ${direction} it.`;
 }
 
+/**
+ * Said for a change refused after this window told the person it could not
+ * follow a change the file took ("…Reopen the file to resynchronize."): until
+ * the file is reopened, nothing the window holds is sent to the file.
+ */
+export const REOPEN_REQUIRED_MESSAGE = 'This view no longer matches the file. Reopen the file to keep editing.';
+/** The same, for Save. */
+export const REOPEN_REQUIRED_SAVE_MESSAGE = 'This view no longer matches the file. Reopen the file, then save.';
+
 // ---- View steps (a sort, a filter, hidden rows, hidden columns, column widths, row heights) ----
 
 /** A view gesture that cannot start while another one of this window is in flight. */

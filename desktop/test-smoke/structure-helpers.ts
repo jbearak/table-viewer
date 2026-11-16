@@ -167,6 +167,55 @@ export async function wait_for_grid(page: Page): Promise<void> {
         .toBeGreaterThan(0);
 }
 
+interface AppliedSnapshotGlobals {
+    /** The file revision of every snapshot the window applied, in order. */
+    __tableViewerSmokeAppliedRevisions?: number[];
+}
+
+/** Record the file revision of each snapshot the viewer reports it applied. */
+export async function install_applied_snapshot_capture(app: ElectronApplication): Promise<void> {
+    await app.evaluate(({ ipcMain }, channel) => {
+        const main = globalThis as typeof globalThis & AppliedSnapshotGlobals;
+        main.__tableViewerSmokeAppliedRevisions = [];
+        ipcMain.on(channel, (_event, envelope: {
+            message?: {
+                type?: string;
+                disposition?: string;
+                identity?: { sourceBasis?: { physicalRevision?: number } };
+            };
+        }) => {
+            const message = envelope?.message;
+            const revision = message?.identity?.sourceBasis?.physicalRevision;
+            if (message?.type !== 'snapshotApplied' || message.disposition !== 'applied') return;
+            if (typeof revision === 'number') main.__tableViewerSmokeAppliedRevisions!.push(revision);
+        });
+    }, CHANNEL_WEBVIEW_MESSAGE);
+}
+
+/** The highest file revision the viewer has applied, -1 before any. */
+export async function applied_revision(app: ElectronApplication): Promise<number> {
+    const revisions = await app.evaluate(() =>
+        (globalThis as typeof globalThis & AppliedSnapshotGlobals).__tableViewerSmokeAppliedRevisions);
+    if (revisions === undefined) {
+        throw new Error('Call install_applied_snapshot_capture when the app is launched.');
+    }
+    return Math.max(-1, ...revisions);
+}
+
+/**
+ * Save, and wait until the window has applied the table read back from the
+ * file the save wrote. The Save button is clean before that read lands, and
+ * when it lands it replaces the rows a menu was opened on, so it closes any
+ * menu that is open: one opened in between would close under the click.
+ * Needs `install_applied_snapshot_capture` at launch, and a Save that changes
+ * the file's bytes: only a new digest raises the file revision.
+ */
+export async function save_and_reread(app: ElectronApplication, page: Page): Promise<void> {
+    const before = await applied_revision(app);
+    await save_changes(page);
+    await expect.poll(() => applied_revision(app), { timeout: 30_000 }).toBeGreaterThan(before);
+}
+
 /** Save through the toolbar and wait until nothing is left unsaved. */
 export async function save_changes(page: Page): Promise<void> {
     await expect(save_button(page)).toHaveClass(/has-unsaved/);

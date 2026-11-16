@@ -1684,6 +1684,11 @@ export interface GridShellProps {
      * say why nothing happened.
      */
     on_edit_paused_gesture?: () => void;
+    /**
+     * Cmd/Ctrl+S met cells App alone keeps from taking edits: App says why
+     * nothing is saved. Refusal only; a Save is never started from here.
+     */
+    on_save_paused?: () => void;
     /** A host-backed append reservation is outstanding; all edits are fenced. */
     append_in_flight?: boolean;
     /**
@@ -1926,6 +1931,7 @@ export function GridShell({
     view_request_in_flight = false,
     edits_paused = false,
     on_edit_paused_gesture,
+    on_save_paused,
     append_in_flight = false,
     append_row_ceiling = MAX_SHEET_ROWS,
     structural_support,
@@ -3367,12 +3373,26 @@ export function GridShell({
             compare_changed_column_names,
         ],
     );
+    // Whether App alone keeps the cells from taking an edit, for callbacks that
+    // outlive their render (an open dialog's), so a commit refused for it says
+    // why rather than nothing. Set from the committed tree, below.
+    const edits_held_by_pause_ref = useRef(false);
+    const on_edit_paused_gesture_ref = useRef(on_edit_paused_gesture);
+    const say_edits_paused = useCallback((): void => {
+        if (edits_held_by_pause_ref.current) on_edit_paused_gesture_ref.current?.();
+    }, []);
     const [rename_column, set_rename_column] = useState<{
         sourceColumn: number;
         initial: string;
     } | null>(null);
     const apply_column_rename = useCallback((value: string): boolean => {
         if (!rename_column) return false;
+        // Opened before App paused edits: refused, as App's admission would
+        // refuse it, and told why.
+        if (edits_held_by_pause_ref.current) {
+            say_edits_paused();
+            return false;
+        }
         const source_column = rename_column.sourceColumn;
         return commit_edits([{
             source_row: header_source_row,
@@ -3386,7 +3406,7 @@ export function GridShell({
                 italic: false,
             },
         }], 'Rename column');
-    }, [commit_edits, header_source_row, rename_column, sheet_meta]);
+    }, [commit_edits, header_source_row, rename_column, say_edits_paused, sheet_meta]);
     useEffect(() => {
         if (!host_observed_bases) return;
         store.observe_file_bases(
@@ -3607,6 +3627,11 @@ export function GridShell({
         on_edit_session_idle,
         on_request_edit_session,
     ]);
+    // Declared above, with the dialogs that read them.
+    useLayoutEffect(() => {
+        edits_held_by_pause_ref.current = edits_held_by_pause;
+        on_edit_paused_gesture_ref.current = on_edit_paused_gesture;
+    }, [edits_held_by_pause, on_edit_paused_gesture]);
     /**
      * Settled by the commit that renders App's answer to a row admission,
      * with whether the grid takes edits again. The admission resolves before
@@ -4220,8 +4245,9 @@ export function GridShell({
     }, [column_projection, merges, pending_projection, projected_columns, row_count]);
     const mutate_highlight_selection = useCallback((mutation: CellHighlightMutation): boolean => {
         if (gestures_admitted !== undefined && !gestures_admitted()) {
-            // Said only while a press of Undo or Redo is waiting.
-            refused_for_history_press();
+            // Said while a press of Undo or Redo is waiting, or while App
+            // pauses edits (a pending row's highlight is an edit of its store).
+            if (!refused_for_history_press() && edits_held_by_pause) on_edit_paused_gesture?.();
             return false;
         }
         const target = current_highlight_selection();
@@ -4387,8 +4413,10 @@ export function GridShell({
     }, [
         current_highlight_selection,
         edit_session_id,
+        edits_held_by_pause,
         gestures_admitted,
         history_capture,
+        on_edit_paused_gesture,
         on_highlight_selection,
         pending_column_row_target,
         pending_projection,
@@ -6659,7 +6687,13 @@ export function GridShell({
     }, [column_display_name, column_layout, projected_columns, sheet_meta.columnCount]);
     const apply_pending_column_rename = useCallback((value: string): boolean => {
         const target = rename_pending_column;
-        if (target === null || !structure_gesture_admitted()) return false;
+        if (target === null) return false;
+        // Opened before App paused edits: told why.
+        if (edits_held_by_pause_ref.current) {
+            say_edits_paused();
+            return false;
+        }
+        if (!structure_gesture_admitted()) return false;
         const before = pending_store.snapshot();
         const plan = plan_pending_column_update(
             before,
@@ -6683,6 +6717,7 @@ export function GridShell({
         history_capture,
         pending_store,
         rename_pending_column,
+        say_edits_paused,
         show_pending_size_warning,
         structure_context.worksheet,
         structure_gesture_admitted,
@@ -7995,17 +8030,22 @@ export function GridShell({
 
     // Cmd/Ctrl+S saves while editing. The custom editor lets this bubble; here we
     // catch it at the window so it works whether or not an overlay is focused.
+    // While App alone pauses edits (a header change, a window that must be
+    // reopened) App says why nothing is saved; nothing is started from here,
+    // even if the pause has just ended and this render has not caught up. A
+    // press in that one tick is taken and says nothing; the next one saves.
     useEffect(() => {
-        if (!editable_cells) return;
+        if (!editable_cells && !edits_held_by_pause) return;
         const handler = (e: KeyboardEvent) => {
             if ((e.metaKey || e.ctrlKey) && (e.key === 's' || e.key === 'S')) {
                 e.preventDefault();
-                request_save();
+                if (editable_cells) request_save();
+                else on_save_paused?.();
             }
         };
         window.addEventListener('keydown', handler);
         return () => window.removeEventListener('keydown', handler);
-    }, [editable_cells, request_save]);
+    }, [editable_cells, edits_held_by_pause, on_save_paused, request_save]);
 
     const guarded_clear_dirty = useCallback(() => {
         if (edit_admission_is_fenced() || save_in_flight_ref.current) return;
@@ -9340,7 +9380,13 @@ export function GridShell({
                 !editable_cells_ref.current
                 || edit_admission_is_fenced()
                 || save_in_flight_ref.current
-            ) return 'refused';
+            ) {
+                // Refused while App alone pauses edits (a Delete on a selection
+                // of whole rows reaches here with no cell for the key to name):
+                // told why. A paste is told by Glide.
+                if (source !== 'paste') say_edits_paused();
+                return 'refused';
+            }
             if (source === 'edit' && overlay_admission_revoked_ref.current) return 'refused';
             const open_overlay = open_overlay_row_ref.current;
             if (
@@ -10198,6 +10244,7 @@ export function GridShell({
         refresh_live_uncommitted,
         release_open_overlay_row,
         save_in_flight_ref,
+        say_edits_paused,
         store,
     ]);
 

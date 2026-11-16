@@ -3783,6 +3783,52 @@ describe('GridShell column projection', () => {
         expect(button('Rename').disabled).toBe(true);
     });
 
+    it('says why a Rename column opened before App paused edits is refused', async () => {
+        grid_mock.source_row_for_display = (row) => row + 1;
+        const store = create_edit_session_store({ session_id: 'session' });
+        const initial = props({
+            editing_session_held: true,
+            csv_editable: true,
+            edit_syntax: 'markdown',
+            edit_session_id: 'session',
+            edit_session: store,
+            sheet_meta: {
+                ...props().sheet_meta,
+                sourceRowCount: 2,
+                columnHeaderEditTexts: ['A name', 'B name', 'C name'],
+                columnHeaderEditable: [true, true, true],
+                excelFirstRowHeader: {
+                    mode: 'on', detected: true, active: true, available: true, sourceRow: 0,
+                },
+            },
+        });
+        const GridShell = await render_grid(initial);
+        const on_header_context_menu = grid_mock.props!.onHeaderContextMenu as
+            (column: number, event: Record<string, unknown>) => void;
+        await act(async () => on_header_context_menu(1, {
+            preventDefault: vi.fn(),
+            bounds: { x: 100, y: 0, width: 100, height: 36 },
+            localEventX: 20,
+            localEventY: 10,
+        }));
+        await act(async () => button('Rename column…').click());
+        const on_edit_paused_gesture = vi.fn();
+        // The window says it no longer matches its file while the dialog is open.
+        await act(async () => {
+            root!.render(React.createElement(GridShell, {
+                ...initial,
+                edits_paused: true,
+                on_edit_paused_gesture,
+            }));
+        });
+        const input = document.querySelector('#rename-column-name') as HTMLInputElement;
+        await act(async () => set_input_value(input, 'Renamed'));
+        await act(async () => button('Rename').click());
+
+        expect(on_edit_paused_gesture).toHaveBeenCalledTimes(1);
+        expect([...store.snapshot()]).toEqual([]);
+    });
+
     it('copies a committed dirty edit instead of the resident source value', async () => {
         const write_text = vi.fn(async () => {});
         Object.defineProperty(navigator, 'clipboard', {
@@ -12151,6 +12197,21 @@ describe('columns: Insert, Delete, Restore, Move, rename, Pending Column cells, 
         expect(pending.snapshot().pendingColumns?.[0]?.header).toBe('origin');
         expect(last_action(history).label).toBe('Rename column');
         expect(column_ids()[1]).toBe('p:c1=origin');
+    });
+
+    it('says why a Pending Column rename opened before App paused edits is refused', async () => {
+        const { pending, history, rerender } = await render_columns();
+        await insert_right_of_first();
+        await open_header_menu(1);
+        await act(async () => menu_item('Rename column…')!.click());
+        const on_edit_paused_gesture = vi.fn();
+        await rerender({ edits_paused: true, on_edit_paused_gesture });
+        const input = document.querySelector<HTMLInputElement>('#rename-column-name')!;
+        await act(async () => set_input_value(input, 'origin'));
+        await act(async () => find_button((text) => text === 'Rename')!.click());
+        expect(on_edit_paused_gesture).toHaveBeenCalledTimes(1);
+        expect(pending.snapshot().pendingColumns?.[0]?.header).not.toBe('origin');
+        expect(last_action(history).label).toBe('Insert column');
     });
 
     it('deletes a column in place, read-only and labelled, and restores it', async () => {
