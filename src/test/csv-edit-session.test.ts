@@ -8828,6 +8828,62 @@ describe('CSV edit sessions', () => {
         );
     });
 
+    it('grants a session asked for after a transform was answered, once that transform has finished reconciling', async () => {
+        // The window asks for a session when its transform is answered. The
+        // host is still reconciling durable state for that transform, which
+        // holds its admission: the request waits for that instead of being
+        // refused with a message about a sort nobody is waiting for.
+        const warning = vi.spyOn(vscode_mock.window, 'showWarningMessage');
+        const versioned = state_store();
+        const read_started = deferred();
+        const read_gate = deferred();
+        let panel!: ReturnType<typeof open_csv_table>;
+        let held = false;
+        const answered = () => panel.__messages.some((message) => (
+            typeof message === 'object' && message !== null
+            && (message as { type?: string }).type === 'transformInstalled'
+        ));
+        const store: FileStateStore = {
+            ...versioned.store,
+            async read(path) {
+                const snapshot = await versioned.store.read(path);
+                if (!held && answered()) {
+                    held = true;
+                    read_started.resolve();
+                    await read_gate.promise;
+                }
+                return snapshot;
+            },
+        };
+        panel = open_csv_table(uri('/tmp/session-after-transform.csv'), store);
+        await panel.__receive({ type: 'ready' });
+
+        const transform = panel.__receive({
+            type: 'setTransform',
+            sheetIndex: 0,
+            requestId: 'restore',
+            sourceGeneration: 1,
+            intent: 'restore',
+            state: {
+                sort: [{ colIndex: 0, direction: 'asc' }],
+                filters: [],
+                schema: '["Sheet1",1,["h"]]',
+            },
+        } as never);
+        await read_started.promise;
+        const request = panel.__receive({ type: 'requestEditSession' } as never);
+        await Promise.resolve();
+        expect(edit_session_results(panel)).toEqual([]);
+
+        read_gate.resolve();
+        await transform;
+        await request;
+        expect(edit_session_results(panel)).toEqual([
+            expect.objectContaining({ type: 'editSessionResult', granted: true }),
+        ]);
+        expect(warning).not.toHaveBeenCalledWith('Wait for sorting and filtering to finish before editing.');
+    });
+
     it('refuses a quiet request without announcing it', async () => {
         const warning = vi.spyOn(vscode_mock.window, 'showWarningMessage');
         const panel = open_csv_table(uri('/tmp/session.csv'), state_store().store);

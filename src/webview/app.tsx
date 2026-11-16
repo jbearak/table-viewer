@@ -3051,6 +3051,8 @@ export function App(): React.JSX.Element {
     // Settled each time a transform of this window is answered or dropped, for a
     // replay that has to wait for every one of them before it asks for a session.
     const transform_settled_ref = useRef<PendingSignal<void> | null>(null);
+    // Replays in `ensure_replay_session` waiting for those transforms.
+    const replay_waiting_for_transforms_ref = useRef(0);
     const notify_transform_settled = useCallback(() => {
         const settled = transform_settled_ref.current;
         transform_settled_ref.current = null;
@@ -7091,9 +7093,14 @@ export function App(): React.JSX.Element {
      * Both reservations therefore live in refs.
      */
     const base_gestures_admitted = useCallback(
-        () => !header_fence_ref.current
-            && !(replay_coordinator_ref.current?.is_busy() ?? false)
-            && !pending_row_replay_busy_ref.current
+        (replay_waiting_may_pass = false) => !header_fence_ref.current
+            && (
+                (replay_waiting_may_pass && replay_waiting_for_transforms_ref.current > 0)
+                || (
+                    !(replay_coordinator_ref.current?.is_busy() ?? false)
+                    && !pending_row_replay_busy_ref.current
+                )
+            )
             && pending_highlight_request_ref.current === null
             && pending_row_resize_requests_ref.current.size === 0
             && pending_append_requests_ref.current.size === 0
@@ -9584,7 +9591,14 @@ export function App(): React.JSX.Element {
         // posted after the press was let through, say): the host refuses a
         // session until it has, so the request waits for it instead of being
         // refused. A replaced document ends the wait, and the replay with it.
-        if (!await await_window_transforms(() => true)) return false;
+        replay_waiting_for_transforms_ref.current += 1;
+        let waited: boolean;
+        try {
+            waited = await await_window_transforms(() => true);
+        } finally {
+            replay_waiting_for_transforms_ref.current -= 1;
+        }
+        if (!waited) return false;
         const discarding_now = discard_cleanup_ref.current;
         if (
             discarding_now !== undefined
@@ -9777,7 +9791,10 @@ export function App(): React.JSX.Element {
         || edit_session_pending
         || preview_mode
         || pending_excel_header_ref.current !== null
-        || !base_gestures_admitted()
+        // A replay still waiting for this window's transforms has asked the
+        // host for nothing yet: a Cancel of one of them goes through, and the
+        // replay waits for the cancel's answer instead.
+        || !base_gestures_admitted(true)
     ), [base_gestures_admitted, edit_session_pending, preview_mode]);
 
     /**

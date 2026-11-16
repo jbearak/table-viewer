@@ -18622,6 +18622,20 @@ describe('undo and redo, from the keyboard and the desktop menu', () => {
         expect(sent(post_message, 'showWarning')).toBeUndefined();
     });
 
+    it('takes a Cancel of a restore an Undo is waiting for, and the Undo asks for its session once the cancel is answered', async () => {
+        const { post_message } = await saved_edit_with_restore_pending();
+        await undo_via_menu();
+        expect(sent(post_message, 'requestEditSession')).toBeUndefined();
+
+        await click_button('Cancel');
+        const cancel = latest_transform_request(post_message);
+        expect(cancel.intent).toBe('cancel');
+        expect(sent(post_message, 'requestEditSession')).toBeUndefined();
+        await acknowledge_transform(cancel, 3);
+        await vi.waitUntil(() => sent(post_message, 'requestEditSession') !== undefined);
+        expect(sent(post_message, 'showWarning')).toBeUndefined();
+    });
+
     it('lets an edit wait for a restore of the saved view instead of refusing it', async () => {
         const { post_message, restore } = await saved_edit_with_restore_pending();
         const props = grid_shell_mock.latest_props as unknown as GridShellProps;
