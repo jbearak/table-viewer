@@ -3048,6 +3048,14 @@ export function App(): React.JSX.Element {
     const processed_save_receipts_ref = useRef(new Set<string>());
     const meta_ref = useRef<WorkbookMeta | null>(null);
     const pending_transform_request_ids_ref = useRef<(string | undefined)[]>([]);
+    // Settled each time a transform of this window is answered or dropped, for a
+    // replay that has to wait for every one of them before it asks for a session.
+    const transform_settled_ref = useRef<PendingSignal<void> | null>(null);
+    const notify_transform_settled = useCallback(() => {
+        const settled = transform_settled_ref.current;
+        transform_settled_ref.current = null;
+        settled?.settle();
+    }, []);
     const pending_transform_states_ref = useRef<(SheetTransformState | undefined)[]>([]);
     const pending_transform_origins_ref = useRef<(TransformOrigin | undefined)[]>([]);
     /**
@@ -5839,6 +5847,7 @@ export function App(): React.JSX.Element {
                         pending_transform_request_ids_ref.current = [];
                         pending_transform_states_ref.current = [];
                         pending_transform_origins_ref.current = [];
+                        notify_transform_settled();
                         // The view requests dropped with them are settled below
                         // by what this snapshot shows.
                         overtaken_view_requests_ref.current.views.push(
@@ -6386,6 +6395,7 @@ export function App(): React.JSX.Element {
                 pending_transform_request_ids_ref.current[msg.sheetIndex] = undefined;
                 pending_transform_states_ref.current[msg.sheetIndex] = undefined;
                 pending_transform_origins_ref.current[msg.sheetIndex] = undefined;
+                notify_transform_settled();
                 // A refused view request records nothing and moves nothing: a
                 // gesture did not happen, and a replay's entry stays where it
                 // was, to be tried again.
@@ -6557,6 +6567,7 @@ export function App(): React.JSX.Element {
                 pending_transform_request_ids_ref.current[msg.sheetIndex] = undefined;
                 pending_transform_states_ref.current[msg.sheetIndex] = undefined;
                 pending_transform_origins_ref.current[msg.sheetIndex] = undefined;
+                notify_transform_settled();
                 if (origin === 'grid' || origin === 'history') {
                     set_grid_focus_restore({
                         sheet_index: msg.sheetIndex,
@@ -6915,6 +6926,14 @@ export function App(): React.JSX.Element {
     useEffect(() => {
         if (!meta || preview_mode || pending_excel_header !== null) return;
         if (save_in_flight) return;
+        // Not while this window's request for an editing session is out: the
+        // host may still be settling the session a Save let go when the
+        // restore reaches it, and a transform it starts meanwhile refuses that
+        // session ("Wait for sorting and filtering to finish before editing."),
+        // and with it the edit or the Undo that asked. The restore goes once
+        // the request is answered. (The ref is the request as posted, before
+        // the render that shows it; the state re-runs this when it ends.)
+        if (edit_session_pending || pending_edit_request_ref.current !== null) return;
         const sheet = meta.sheets[active_sheet_index];
         if (!sheet) return;
         if (
@@ -7006,6 +7025,7 @@ export function App(): React.JSX.Element {
         sheet_views,
         request_transform,
         save_in_flight,
+        edit_session_pending,
         restore_blocker_epoch,
     ]);
 
@@ -9522,6 +9542,18 @@ export function App(): React.JSX.Element {
         // Held, not merely named: a session released a moment ago keeps its id
         // here until the host's next snapshot, and a replay prepared against
         // it would be refused for a session this panel no longer owns.
+        if (editing_session_held_ref.current && csv_edit_session_id_ref.current !== undefined) return true;
+        // A transform of this window still installing (a restore the window
+        // posted after the press was let through, say): the host refuses a
+        // session until it has, so the request waits for it instead of being
+        // refused. A replaced document ends the wait, and the replay with it.
+        const document = history_document_ref.current;
+        while (pending_transform_request_ids_ref.current.some((id) => id !== undefined)) {
+            const settled = transform_settled_ref.current ?? pending_signal<void>();
+            transform_settled_ref.current = settled;
+            await settled.settled;
+            if (history_document_ref.current !== document) return false;
+        }
         if (editing_session_held_ref.current && csv_edit_session_id_ref.current !== undefined) return true;
         // A request already in flight — an editing gesture made a moment ago —
         // is joined rather than duplicated: the host answers one request, and a

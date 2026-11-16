@@ -18349,6 +18349,127 @@ describe('undo and redo, from the keyboard and the desktop menu', () => {
         expect(sent(post_message, 'showWarning')).toBeUndefined();
     });
 
+    it('asks for an Undo\'s session only once a restore this window asked for has installed', async () => {
+        // After a Save the window may reconcile the view it holds with the rules
+        // the file keeps, by asking the host to install them. While that runs
+        // the host starts no editing session, so an Undo that needs one asks
+        // for it once the restore is answered.
+        const { post_message } = await render_app();
+        const meta = make_meta(['Sheet1'], false);
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        await acquire_editing_session(post_message, 'saved-edit-session');
+        const props = grid_shell_mock.latest_props as unknown as GridShellProps;
+        props.edit_session!.commit('saved-edit-session', '0:0', { value: 'edited', base: 'Alice' });
+        record_cell_edit(props.history_store!, 'edited', 'Alice');
+        const operation: CsvSaveOperation = {
+            editSessionId: 'saved-edit-session',
+            saveRequestId: 'save-1',
+            worksheets: [{
+                sheetIndex: 0,
+                sheetName: 'Sheet1',
+                edits: { '0:0': 'edited' },
+                dirtyEdits: { '0:0': { value: 'edited', base: 'Alice' } },
+            }],
+        };
+        await dispatch_host_message({
+            type: 'saveOperationStarted',
+            lifecycle: { revision: 1, state: 'active', operation },
+        });
+        await dispatch_host_message({
+            type: 'saveResult',
+            success: true,
+            lifecycle: { revision: 2, state: 'succeeded', operation },
+        });
+        // The refresh after the save carries rules the view does not hold yet.
+        post_message.mockClear();
+        await dispatch_host_message(refresh_snapshot_message(meta, {
+            state: { transforms: [{
+                sort: [{ colIndex: 0, direction: 'asc' }],
+                filters: [],
+                schema: transform_schema_for_sheet(meta.sheets[0]),
+            }] },
+            generation: 2,
+            sourceGeneration: 2,
+        }));
+        const restore = latest_transform_request(post_message);
+        expect(restore.intent).toBe('restore');
+        post_message.mockClear();
+
+        await undo_via_menu();
+        // No session is asked for while the restore installs (the host would
+        // refuse it), and nothing is said.
+        expect(sent(post_message, 'requestEditSession')).toBeUndefined();
+        expect(sent(post_message, 'showWarning')).toBeUndefined();
+
+        await acknowledge_transform(restore, 3);
+        await vi.waitUntil(() => sent(post_message, 'requestEditSession') !== undefined);
+        expect(sent(post_message, 'showWarning')).toBeUndefined();
+    });
+
+    it('posts the restore a refresh after a Save asks for only once the Undo\'s session is granted', async () => {
+        // The press is let through with nothing in flight and asks for its
+        // session; the refresh the save brought wants a restore. The host may
+        // still be settling the session the save let go, and a transform it
+        // started meanwhile would refuse the Undo's session: the restore waits.
+        const { post_message } = await render_app();
+        const meta = make_meta(['Sheet1'], false);
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        await acquire_editing_session(post_message, 'saved-edit-session');
+        const props = grid_shell_mock.latest_props as unknown as GridShellProps;
+        props.edit_session!.commit('saved-edit-session', '0:0', { value: 'edited', base: 'Alice' });
+        record_cell_edit(props.history_store!, 'edited', 'Alice');
+        const operation: CsvSaveOperation = {
+            editSessionId: 'saved-edit-session',
+            saveRequestId: 'save-1',
+            worksheets: [{
+                sheetIndex: 0,
+                sheetName: 'Sheet1',
+                edits: { '0:0': 'edited' },
+                dirtyEdits: { '0:0': { value: 'edited', base: 'Alice' } },
+            }],
+        };
+        await dispatch_host_message({
+            type: 'saveOperationStarted',
+            lifecycle: { revision: 1, state: 'active', operation },
+        });
+        await dispatch_host_message({
+            type: 'saveResult',
+            success: true,
+            lifecycle: { revision: 2, state: 'succeeded', operation },
+        });
+        // The press, and in the same task the refresh after the save, which
+        // carries rules the view does not hold yet.
+        post_message.mockClear();
+        await act(async () => {
+            window.dispatchEvent(new MessageEvent('message', { data: { type: 'editCommand', command: 'undo' } }));
+            window.dispatchEvent(new MessageEvent('message', {
+                data: refresh_snapshot_message(meta, {
+                    state: { transforms: [{
+                        sort: [{ colIndex: 0, direction: 'asc' }],
+                        filters: [],
+                        schema: transform_schema_for_sheet(meta.sheets[0]),
+                    }] },
+                    generation: 2,
+                    sourceGeneration: 2,
+                }),
+            }));
+        });
+        expect(sent(post_message, 'requestEditSession')).toBeDefined();
+        const transforms = () => post_message.mock.calls
+            .map((call) => call[0] as WebviewMessage)
+            .filter((message) => message.type === 'setTransform');
+        expect(transforms()).toEqual([]);
+
+        await grant_replay_session(meta, 'undo-session');
+        await vi.waitUntil(() => transforms().length > 0);
+        expect(latest_transform_request(post_message).intent).toBe('restore');
+        expect(sent(post_message, 'showWarning')).toBeUndefined();
+    });
+
     it('reports a refusal on the press that had to acquire a session', async () => {
         // Acquiring a session delivers a snapshot. That is not the document
         // leaving, and the refusal it precedes still has to be reported: a first
