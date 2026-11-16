@@ -10846,8 +10846,8 @@ export function App(): React.JSX.Element {
         // on a stale generation. That is why a cancel asks the same question every
         // other transform request asks — see `transform_request_blocked` — on
         // the terms `cancel_blocked` keeps. A window that must be reopened
-        // cancels nothing either: a sort already on its way when it said so
-        // lands, and stays until the reopen.
+        // cancels nothing either: were a sort on its way when it said so, it
+        // would land and stay until the reopen.
         if (refused_for_reopen()) return;
         if (cancel_blocked()) return;
         const previous = transform_rollback_baseline(
