@@ -6803,6 +6803,86 @@ describe('GridShell edit-admission lifetime', () => {
             .toEqual(['pending-b']);
     });
 
+    it('answers a paste admission once App has rendered its answer, so the paste then lands on the row', async () => {
+        // App marks the row request in flight while the host has it, and the
+        // grid takes no edit until App renders the answer. Resolved before
+        // that, the paste would meet a grid that refuses it.
+        const pending = create_pending_row_store({ session_id: 'session-1' });
+        let settle_admission!: (result: AppendRowsAdmission | undefined) => void;
+        const on_append_rows = vi.fn(() => new Promise<
+            AppendRowsAdmission | undefined
+        >((resolve) => { settle_admission = resolve; }));
+        const history = create_history_store();
+        const initial = editable({
+            pending_row_store: pending,
+            on_append_rows,
+            history_store: history,
+        });
+        const GridShell = await render_grid(initial);
+        const admit_for_paste = grid_mock.props!.onPasteRowsNeeded as (
+            count: number,
+            topology_key: unknown,
+        ) => Promise<unknown>;
+        let admitted: unknown;
+        void admit_for_paste(1, grid_mock.props!.pasteTopologyKey).then((result) => { admitted = result; });
+        await vi.waitUntil(() => on_append_rows.mock.calls.length === 1);
+        await act(async () => {
+            root!.render(React.createElement(GridShell, { ...initial, append_in_flight: true }));
+        });
+        await act(async () => {
+            settle_admission({
+                rowIds: ['host-row-1'],
+                formatTemplate: { id: 'plain', format: { kind: 'none' } },
+                appendBasis: {
+                    sourceRowCount: 1,
+                    provisionalStartRow: 1,
+                    columnCount: 3,
+                    schemaFingerprint: 'schema',
+                },
+                settle: vi.fn(),
+            });
+        });
+        // The row is in the grid, and frames go by: still not answered.
+        await vi.waitUntil(() => grid_mock.props!.rows === 2);
+        for (let frame = 0; frame < 5; frame += 1) {
+            await act(async () => {
+                await new Promise((resolve) => window.requestAnimationFrame(resolve));
+            });
+        }
+        expect(admitted).toBeUndefined();
+
+        await act(async () => {
+            root!.render(React.createElement(GridShell, { ...initial, append_in_flight: false }));
+        });
+        await vi.waitFor(async () => {
+            await act(async () => {});
+            expect(admitted).toBeDefined();
+        });
+        expect(admitted).not.toBe(false);
+        const paste = grid_mock.props!.onCellsEdited as (
+            items: readonly {
+                location: [number, number];
+                value: { kind: string; data: string };
+                targetRowIdentity?: { kind: 'pending'; pendingRowId: string };
+                targetSourceColumn?: number;
+            }[],
+            source: string,
+        ) => unknown;
+        let result: unknown;
+        await act(async () => {
+            result = paste([{
+                location: [0, 1],
+                value: { kind: 'text', data: 'below' },
+                targetRowIdentity: { kind: 'pending', pendingRowId: 'host-row-1' },
+                targetSourceColumn: 0,
+            }], 'paste');
+        });
+        expect(result).not.toBe('refused');
+        expect(pending.snapshot().appendedRows[0]?.cells[0]?.value).toBe('below');
+        const undo = peek_history(history.snapshot(), 'undo');
+        expect(undo.kind === 'available' ? undo.entry.action.label : undo.kind).toBe('Paste');
+    });
+
     it('keeps an edit admission fenced across an ordinary rerender', async () => {
         // A failed close/reload remains fenced. The boundary is a real new
         // activation, not "some render happened after stop_edit_admission".

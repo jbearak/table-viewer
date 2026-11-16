@@ -6751,14 +6751,26 @@ export function GridShell({
                             pendingRowId,
                         }) !== undefined)) {
                     let rolled_back = false;
-                    resolve({
+                    const admission = {
                         topologyKey: admitted_topology_key,
                         rollback: () => {
                             if (rolled_back) return;
                             rolled_back = true;
                             rollback();
                         },
-                    });
+                    };
+                    // The rows can be rendered before App's answer to their
+                    // request is, and until it is the grid takes no edit:
+                    // the paste would be refused as busy. Wait for that
+                    // commit; whatever it leaves closed refuses the paste
+                    // there, and Glide rolls the rows back and says so.
+                    if (append_in_flight_ref.current) {
+                        const answered = append_answered_ref.current ?? pending_signal<boolean>();
+                        append_answered_ref.current = answered;
+                        void answered.settled.then(() => resolve(admission));
+                        return;
+                    }
+                    resolve(admission);
                     return;
                 }
                 attempts += 1;

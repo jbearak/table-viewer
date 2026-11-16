@@ -3320,6 +3320,77 @@ a new line char ""more quotes"" plus a tab  ."	https://google.com`)
         expect(rollback).not.toHaveBeenCalled();
     });
 
+    test("a paste that admitted rows commits through the onCellsEdited rendered with them", async () => {
+        // The owner's edit callback reads the rows it knows; the one from the
+        // render before the admission has never seen the rows the paste lands on.
+        vi.useFakeTimers();
+        let resolveAdmission!: (value: { topologyKey: unknown; rollback: () => void }) => void;
+        const rollback = vi.fn();
+        const admit = vi.fn(() => new Promise<{
+            topologyKey: unknown;
+            rollback: () => void;
+        }>((resolve) => {
+            resolveAdmission = resolve;
+        }));
+        const before = vi.fn((_edits: readonly EditListItem[], _source: string) => true);
+        const after = vi.fn((_edits: readonly EditListItem[], _source: string) => true);
+        const pasteError = vi.fn();
+        Object.assign(navigator, {
+            clipboard: { read: undefined, readText: vi.fn(async () => "one\ntwo") },
+        });
+        const selection = {
+            columns: CompactSelection.empty(),
+            rows: CompactSelection.empty(),
+            current: {
+                cell: [1, 2] as Item,
+                range: { x: 1, y: 2, width: 1, height: 1 },
+                rangeStack: [],
+            },
+        };
+        const rendered = render(
+            <DataEditor
+                {...basicProps}
+                rows={3}
+                pasteTopologyKey="topology-1"
+                gridSelection={selection}
+                onPaste={true}
+                onPasteRowsNeeded={admit}
+                onCellsEdited={before}
+                onClipboardPasteError={pasteError}
+            />,
+            { wrapper: Context }
+        );
+        prep(false);
+        vi.useRealTimers();
+        const canvas = screen.getByTestId("data-grid-canvas");
+        vi.spyOn(document, "activeElement", "get").mockImplementation(() => canvas);
+
+        fireEvent.paste(window);
+        await vi.waitFor(() => expect(admit).toHaveBeenCalledOnce());
+        rendered.rerender(
+            <DataEditor
+                {...basicProps}
+                rows={4}
+                pasteTopologyKey="topology-2"
+                gridSelection={selection}
+                onPaste={true}
+                onPasteRowsNeeded={admit}
+                onCellsEdited={after}
+                onClipboardPasteError={pasteError}
+            />
+        );
+        resolveAdmission({ topologyKey: "topology-2", rollback });
+
+        await vi.waitFor(() => expect(after).toHaveBeenCalledOnce());
+        expect(after.mock.calls[0]?.[0]).toEqual([
+            expect.objectContaining({ location: [1, 2] }),
+            expect.objectContaining({ location: [1, 3] }),
+        ]);
+        expect(before).not.toHaveBeenCalled();
+        expect(pasteError).not.toHaveBeenCalled();
+        expect(rollback).not.toHaveBeenCalled();
+    });
+
     test("a paste waits for the host's admission and runs against the props rendered by then", async () => {
         vi.useFakeTimers();
         Object.assign(navigator, {
