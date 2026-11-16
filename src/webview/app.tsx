@@ -4065,7 +4065,8 @@ export function App(): React.JSX.Element {
         // A window that no longer matches its file would save its own stores,
         // which disagree with it, over the file.
         if (reopen_required_ref.current) {
-            host_bridge.postMessage({ type: 'showWarning', message: REOPEN_REQUIRED_SAVE_MESSAGE });
+            // Once for a held Cmd+S, by `say_history`'s repeat rule.
+            say_history(REOPEN_REQUIRED_SAVE_MESSAGE);
             return undefined;
         }
         // A Header Row change carries the session's Pending Changes to the new
@@ -4142,7 +4143,7 @@ export function App(): React.JSX.Element {
         save_in_flight_ref.current = true;
         host_bridge.postMessage({ type: 'saveCsv', operation });
         return operation;
-    }, [csv_edit_session_id, view_request_is_pending]);
+    }, [csv_edit_session_id, say_history, view_request_is_pending]);
 
     const reset_save_projection = useCallback(() => {
         save_projection_ref.current = INITIAL_CSV_SAVE_PROJECTION;
@@ -10870,7 +10871,7 @@ export function App(): React.JSX.Element {
         // See `begin_save_operation`: nothing is saved from a window that must
         // be reopened, or across a header change.
         if (reopen_required_ref.current) {
-            show_warning(REOPEN_REQUIRED_SAVE_MESSAGE);
+            say_history(REOPEN_REQUIRED_SAVE_MESSAGE);
             return true;
         }
         const editing = editing_ref.current;
@@ -10885,7 +10886,7 @@ export function App(): React.JSX.Element {
         const requested = editing.request_save();
         return requested
             || edit_session_registry_ref.current!.has_dirty_entries();
-    }, [show_warning]);
+    }, [say_history]);
 
     const handle_save = useCallback(() => {
         request_save_or_remain_dirty();

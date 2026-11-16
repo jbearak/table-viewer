@@ -25020,8 +25020,9 @@ describe('view steps in history', () => {
                  */
                 async function diverge(post_message: ReturnType<typeof vi.fn>) {
                     await edited(post_message, table_meta(['Sheet1', 'Sheet2']));
-                    // Published before the Undo and dropped by the host (it
-                    // never answers): a sequence nothing will acknowledge.
+                    // Published before the Undo and never acknowledged here,
+                    // as when the host drops it: a sequence the close must
+                    // not wait on.
                     const before = await flush(post_message, 'before-undo');
                     expect(before.highestProducedSequence).toBe(1);
                     post_message.mockClear();
@@ -25076,6 +25077,8 @@ describe('view steps in history', () => {
                     expect(props().edits_paused).toBe(true);
                     expect(props().gestures_admitted?.()).toBe(false);
                     await click_button('Save');
+                    // A held Cmd+S, or a second click: said once.
+                    act(() => { (props().on_save_request as () => unknown)(); });
                     expect(posted(post_message, 'saveCsv')).toEqual([]);
                     expect(warnings(post_message)).toEqual([REOPEN_SAVE]);
 

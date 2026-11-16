@@ -9373,7 +9373,13 @@ export function GridShell({
                 !editable_cells_ref.current
                 || edit_admission_is_fenced()
                 || save_in_flight_ref.current
-            ) return 'refused';
+            ) {
+                // Refused while App alone pauses edits (a Delete on a selection
+                // of whole rows reaches here with no cell for the key to name):
+                // told why. A paste is told by Glide.
+                if (source !== 'paste') say_edits_paused();
+                return 'refused';
+            }
             if (source === 'edit' && overlay_admission_revoked_ref.current) return 'refused';
             const open_overlay = open_overlay_row_ref.current;
             if (
@@ -10231,6 +10237,7 @@ export function GridShell({
         refresh_live_uncommitted,
         release_open_overlay_row,
         save_in_flight_ref,
+        say_edits_paused,
         store,
     ]);
 

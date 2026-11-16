@@ -2800,6 +2800,22 @@ describe('GridShell when App pauses edits, or its publications are fenced', () =
         ]);
     });
 
+    it('says why a Delete of whole rows is refused while App pauses edits', async () => {
+        const on_edit_paused_gesture = vi.fn();
+        const { rerender, edit_session } = await render_grid();
+        await rerender({ edits_paused: true, on_edit_paused_gesture });
+        let result: unknown;
+        await act(async () => {
+            result = grid_mock.props!.onCellsEdited!(
+                [{ location: [0, 0], value: { kind: 'text', data: '' } }],
+                'delete',
+            );
+        });
+        expect(result).toBe('refused');
+        expect(on_edit_paused_gesture).toHaveBeenCalledTimes(1);
+        expect([...(edit_session?.snapshot() ?? [])]).toEqual([]);
+    });
+
     it('hands Cmd+S to App, which says why nothing is saved', async () => {
         const on_save_request = vi.fn(() => undefined);
         const { rerender } = await render_grid(undefined, { on_save_request });
