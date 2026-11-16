@@ -8032,7 +8032,8 @@ export function GridShell({
     // catch it at the window so it works whether or not an overlay is focused.
     // While App alone pauses edits (a header change, a window that must be
     // reopened) App says why nothing is saved; nothing is started from here,
-    // even if the pause has just ended and this render has not caught up.
+    // even if the pause has just ended and this render has not caught up. A
+    // press in that one tick is taken and says nothing; the next one saves.
     useEffect(() => {
         if (!editable_cells && !edits_held_by_pause) return;
         const handler = (e: KeyboardEvent) => {
