@@ -9708,14 +9708,15 @@ export function App(): React.JSX.Element {
             }
             // A restore that moved the view remounted the grid that holds the
             // gesture's keys: nothing is left to open an editor for, so the
-            // edit is refused with the reason, as it was before it could wait.
+            // edit is refused with a reason, as it was before it could wait.
             // That is most restores (one computed afresh after a refresh moves
             // the generation); only one the host acknowledges as already in
-            // place lets the edit through.
+            // place lets the edit through. A refresh can move it too, so the
+            // reason names the view, not a sort.
             if (generation_ref.current !== generation) {
                 host_bridge.postMessage({
                     type: 'showWarning',
-                    message: 'Wait for sorting and filtering to finish before editing.',
+                    message: 'The table view changed before the edit could start. Try again.',
                 });
                 return false;
             }

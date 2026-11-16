@@ -14406,7 +14406,10 @@ export function attach_viewer(
                 // still refuses, as below. Asked again after each wait: more may
                 // have joined meanwhile. Each wait ends with a reconciliation (a
                 // bounded number of state reads) or a stale computation's next
-                // check, so the loop needs no bound of its own.
+                // cancellation check, so the loop needs no bound of its own. (The
+                // renderer's own 5 s bound covers only its wait before posting
+                // this request; a press it holds is told it has not finished
+                // after the replay lease, as for any slow answer.)
                 const settling = () => [...transform_authorities]
                     .filter(([message, authority]) => (
                         answered_transform_authorities.has(authority)

@@ -18706,7 +18706,7 @@ describe('undo and redo, from the keyboard and the desktop menu', () => {
         expect(post_message.mock.calls.map((call) => call[0] as WebviewMessage)
             .filter((message) => message.type === 'showWarning')
             .map((message) => (message as { message: string }).message))
-            .toEqual(['Wait for sorting and filtering to finish before editing.']);
+            .toEqual(['The table view changed before the edit could start. Try again.']);
     });
 
     it('reports a refusal on the press that had to acquire a session', async () => {
