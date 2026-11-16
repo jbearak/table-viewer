@@ -88,8 +88,52 @@ async function open_file(name: string, content?: Buffer): Promise<{ file: string
     app = launched.app;
     await install_dialog_capture(app);
     await install_history_menu_capture(app);
+    await install_applied_snapshot_capture(app);
     await wait_for_grid(launched.page);
     return { file, page: launched.page };
+}
+
+interface AppliedSnapshotGlobals {
+    /** The file revision of every snapshot the window applied, in order. */
+    __tableViewerSmokeAppliedRevisions?: number[];
+}
+
+/** Record the file revision of each snapshot the viewer reports it applied. */
+async function install_applied_snapshot_capture(electron_app: ElectronApplication): Promise<void> {
+    await electron_app.evaluate(({ ipcMain }, channel) => {
+        const main = globalThis as typeof globalThis & AppliedSnapshotGlobals;
+        main.__tableViewerSmokeAppliedRevisions = [];
+        ipcMain.on(channel, (_event, envelope: {
+            message?: {
+                type?: string;
+                disposition?: string;
+                identity?: { sourceBasis?: { physicalRevision?: number } };
+            };
+        }) => {
+            const message = envelope?.message;
+            const revision = message?.identity?.sourceBasis?.physicalRevision;
+            if (message?.type !== 'snapshotApplied' || message.disposition !== 'applied') return;
+            if (typeof revision === 'number') main.__tableViewerSmokeAppliedRevisions!.push(revision);
+        });
+    }, CHANNEL_WEBVIEW_MESSAGE);
+}
+
+async function applied_revision(): Promise<number> {
+    const revisions = await app!.evaluate(() =>
+        (globalThis as typeof globalThis & AppliedSnapshotGlobals).__tableViewerSmokeAppliedRevisions ?? []);
+    return Math.max(-1, ...revisions);
+}
+
+/**
+ * Save, and wait until the window has applied the table read back from the
+ * file the save wrote. The Save button is clean before that read lands, and
+ * when it lands it replaces the rows a menu was opened on, so it closes any
+ * menu that is open: one opened in between would close under the click.
+ */
+async function save_and_reread(page: Page): Promise<void> {
+    const before = await applied_revision();
+    await save_changes(page);
+    await expect.poll(applied_revision).toBeGreaterThan(before);
 }
 
 async function relaunch(name: string): Promise<Page> {
@@ -413,7 +457,7 @@ test('an edit on the row that then became the header is undone after the header 
     await expect_shown(page, { headers: NO_HEADER, body: TITLED_BODY });
     await type_into_cell(page, 1, 1, 'title');
     const edited = ['1|2', 'title|qty', ...FRUIT];
-    await save_changes(page);
+    await save_and_reread(page);
     await expect.poll(() => saved(file)).toEqual(edited);
 
     await use_row_as_header(page, 1);
@@ -819,7 +863,7 @@ test('edit, Save, header, Undo, Undo, Save, Redo, Redo: the header step waits wh
     await expect_shown(page, { headers: NO_HEADER, body: TITLED_BODY });
     await type_into_cell(page, 1, 1, 'title');
     const edited = ['1|2', 'title|qty', ...FRUIT];
-    await save_changes(page);
+    await save_and_reread(page);
     await expect.poll(() => saved(file)).toEqual(edited);
     await use_row_as_header(page, 1);
     await expect_shown(page, { headers: ['title', 'qty'], body: FRUIT, undo: 'Undo Use row 2 as header' });
