@@ -7994,9 +7994,8 @@ export function App(): React.JSX.Element {
                 refuse_history_press(null);
                 return;
             }
-            // The checks run on the state the fold left: the row a committed
-            // edit grew is being measured, and the press waits for it.
-            if (!ask_window()) return;
+            // What the commit left to replay is read first: a press held
+            // below would come back to an empty redo stack and say nothing.
             initial = peek_history(history_store_ref.current!.snapshot(), direction);
             if (initial.kind !== 'available') {
                 if (initial.kind === 'blocked') {
@@ -8009,6 +8008,9 @@ export function App(): React.JSX.Element {
                 }
                 return;
             }
+            // The checks run on the state the fold left: the row a committed
+            // edit grew is being measured, and the press waits for it.
+            if (!ask_window()) return;
             if (action_has_view_change(initial.entry.action)) {
                 replay_view_step(initial.entry, press);
                 return;

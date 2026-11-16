@@ -22618,6 +22618,31 @@ describe('view steps in history', () => {
             expect(redo_labels()).toEqual([]);
         });
 
+        it('committed by Redo with a write it started still says Redo was replaced', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await change_view(post_message, { sort: SORT_ASC, filters: [] });
+            await undo();
+            await install(latest_transform_request(post_message));
+            expect(redo_labels()).toEqual(['Sort']);
+            // The commit records its edit and starts a write the window waits for.
+            grid_shell_mock.commit_live_edit.mockImplementationOnce(() => {
+                record_edit();
+                props().on_row_resize([{ start: 1, end: 1 }], 50, { gesture: false, on_result: () => {} });
+            });
+            post_message.mockClear();
+
+            await redo();
+
+            expect(posted(post_message, 'setTransform')).toEqual([]);
+            expect(warnings(post_message)).toEqual([
+                'Nothing to redo: the cell edit you just finished replaced it.',
+            ]);
+            expect(press_held()).toBe(false);
+            expect(undo_labels()).toEqual(['Edit cell']);
+            expect(redo_labels()).toEqual([]);
+        });
+
         it('whose commit leaves the window busy stops the gesture and the Undo, each with a message', async () => {
             const { post_message } = await render_app();
             await open(post_message);
