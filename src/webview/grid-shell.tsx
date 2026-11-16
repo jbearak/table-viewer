@@ -11941,7 +11941,10 @@ export function GridShell({
                 border_presses_ref.current = [
                     {
                         display_column: gesture.press.display_column,
-                        dragged: gesture.moved,
+                        // A drag discarded because the columns moved under it
+                        // was still a drag, not a click: it is no half of a
+                        // double-click.
+                        dragged: gesture.moved || gesture.discarded,
                         ordinal: gesture.press.ordinal,
                     },
                     ...border_presses_ref.current.slice(0, 1),

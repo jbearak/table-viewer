@@ -2584,6 +2584,52 @@ describe('GridShell column projection', () => {
             expect(on_columns_resized).toHaveBeenCalledExactlyOnceWith([{ column: 0, width: 71 }]);
         });
 
+        it('takes no fit from one click on a border after a drag there that the columns moving discarded', async () => {
+            const on_columns_resized = vi.fn();
+            const initial = props({ on_columns_resized, column_projection: all_columns });
+            const GridShell = await render_grid(initial);
+            await act(async () => {
+                window.dispatchEvent(new Event('pointerdown'));
+                callbacks().start({}, 100, 0);
+            });
+            await act(async () => {
+                root!.render(React.createElement(GridShell, { ...initial, column_projection: swapped }));
+            });
+            await act(async () => {
+                callbacks().resize({}, 140, 0);
+                callbacks().end({}, 140, 0);
+            });
+            // The drag was no click: with one click after it, no double-click.
+            await act(async () => {
+                click_border(0, 150);
+                callbacks().resize({}, 71, 0);
+                callbacks().end({}, 71, 0);
+            });
+            expect(on_columns_resized).not.toHaveBeenCalled();
+        });
+
+        it('commits no fit when the columns change places during it', async () => {
+            // A fit's calls come in one handler, so this cannot happen from
+            // Glide; the fit takes the columns' places all the same.
+            const on_columns_resized = vi.fn();
+            const initial = props({ on_columns_resized, column_projection: all_columns });
+            const GridShell = await render_grid(initial);
+            await act(async () => {
+                click_border(1, 150);
+                click_border(1, 150);
+                callbacks().resize({}, 77, 1);
+            });
+            await act(async () => {
+                root!.render(React.createElement(GridShell, { ...initial, column_projection: swapped }));
+            });
+            await act(async () => {
+                callbacks().resize({}, 77, 1);
+                callbacks().end({}, 77, 1);
+            });
+            expect(on_columns_resized).not.toHaveBeenCalled();
+            expect(shown_widths()).toEqual([['s:1', 150], ['s:0', 100], ['s:2', 200]]);
+        });
+
         const with_pending_column = async (overrides: Partial<GridShellProps>) => {
             const pending = create_pending_row_store({ session_id: 'session-1' });
             const before = pending.snapshot();
@@ -2655,6 +2701,41 @@ describe('GridShell column projection', () => {
             expect(pending.snapshot().pendingColumns?.[0]?.viewerWidth).toBeUndefined();
             // No draft is left drawn, for the saved columns or the Pending one.
             expect(shown_widths()).toEqual(before);
+        });
+
+        it('stores no width and leaves no draft on a Pending Column when the columns change places under the drag', async () => {
+            const pending = await with_pending_column({});
+            const before = shown_widths();
+            await act(async () => {
+                callbacks().start({}, 120, 1);
+                callbacks().resize({}, 160, 1);
+            });
+            expect(shown_widths()[1]).toEqual(['p:c1', 160]);
+            // The Pending Column moves after source column 1.
+            await act(async () => {
+                const now = pending.snapshot();
+                const moved = pending.stage_replace('session-1', now, {
+                    ...now,
+                    columnLayout: {
+                        ...now.columnLayout!,
+                        columns: [
+                            { kind: 'source', sourceColumn: 0 },
+                            { kind: 'source', sourceColumn: 1 },
+                            { kind: 'pending', pendingColumnId: 'c1' },
+                            { kind: 'source', sourceColumn: 2 },
+                        ],
+                    },
+                })!;
+                moved.commit();
+                moved.notify();
+            });
+            expect(shown_widths().map(([id]) => id)).toEqual(['s:0', 's:1', 'p:c1', 's:2']);
+            await act(async () => {
+                callbacks().resize({}, 180, 1);
+                callbacks().end({}, 180, 1);
+            });
+            expect(pending.snapshot().pendingColumns?.[0]?.viewerWidth).toBeUndefined();
+            expect(shown_widths()).toEqual([before[0], before[2], before[1], before[3]]);
         });
     });
 

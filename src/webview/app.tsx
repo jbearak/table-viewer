@@ -6813,7 +6813,8 @@ export function App(): React.JSX.Element {
             });
         } else if (accepted.committed.focusSheetIndex === active_sheet_index) {
             // Structural-only replay has no source-keyed cells from which the
-            // host can derive a display row. The store transaction has already
+            // host can derive a display row, and a replay that landed in the
+            // column headers has no body row. The store transaction has already
             // clamped any removed selection or installed the restored pending
             // row, so retain keyboard ownership without pretending the row was
             // filtered out.

@@ -72,6 +72,11 @@ export interface HistoryFocusView {
  * name changed where the person can see it. A header whose every column is
  * hidden is not on screen, the rule `resolve_history_focus` applies to a focus
  * it can place.
+ *
+ * The focus is the bounding box of what the replay touched, so, as in
+ * `resolve_history_focus`, a shown column between two hidden touched ones
+ * counts. Header cells change only through Rename column, one cell at a time,
+ * so no header-only replay has such a gap today.
  */
 export function replay_focus_is_shown_header(
     focus: {
