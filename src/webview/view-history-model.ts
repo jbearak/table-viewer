@@ -96,8 +96,6 @@ export interface RowHeightsViewDelta {
     readonly before: readonly SourceRowHeightRun[];
 }
 
-export type SizeViewDelta = ColumnWidthsViewDelta | RowHeightsViewDelta;
-
 export type ViewHistoryDelta =
     | TransformViewDelta
     | ColumnsViewDelta
