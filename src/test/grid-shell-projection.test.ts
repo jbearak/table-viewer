@@ -2312,6 +2312,92 @@ describe('GridShell column projection', () => {
             expect(shown_widths()).toEqual([['s:0', 100], ['s:1', 150], ['s:2', 200]]);
         });
 
+        // The order of the columns changing while a border is held: a column
+        // move undone from the keyboard. Glide goes on naming columns by the
+        // display index, which now holds another column.
+        const swapped = {
+            visible_to_source: [1, 0, 2],
+            source_to_visible: [1, 0, 2],
+            hidden_count: 0,
+        };
+
+        it('commits nothing when the columns change places after the border has moved', async () => {
+            const on_columns_resized = vi.fn();
+            const initial = props({ on_columns_resized, column_projection: all_columns });
+            const GridShell = await render_grid(initial);
+            const { start, resize } = callbacks();
+            await act(async () => {
+                start({}, 100, 0);
+                resize({}, 130, 0);
+            });
+            expect(shown_widths()).toEqual([['s:0', 130], ['s:1', 150], ['s:2', 200]]);
+            await act(async () => {
+                root!.render(React.createElement(GridShell, { ...initial, column_projection: swapped }));
+            });
+            await act(async () => {
+                callbacks().resize({}, 140, 0);
+                callbacks().end({}, 140, 0);
+            });
+            expect(on_columns_resized).not.toHaveBeenCalled();
+            // No draft is left on either column.
+            expect(shown_widths()).toEqual([['s:1', 150], ['s:0', 100], ['s:2', 200]]);
+        });
+
+        it('commits nothing when the columns change places between the press and the first move', async () => {
+            const on_columns_resized = vi.fn();
+            const initial = props({ on_columns_resized, column_projection: all_columns });
+            const GridShell = await render_grid(initial);
+            await act(async () => callbacks().start({}, 100, 0));
+            await act(async () => {
+                root!.render(React.createElement(GridShell, { ...initial, column_projection: swapped }));
+            });
+            await act(async () => {
+                callbacks().resize({}, 140, 0);
+                callbacks().end({}, 140, 0);
+            });
+            expect(on_columns_resized).not.toHaveBeenCalled();
+            expect(shown_widths()).toEqual([['s:1', 150], ['s:0', 100], ['s:2', 200]]);
+        });
+
+        it('commits nothing when the columns change places and the border is let go where it was moved to', async () => {
+            const on_columns_resized = vi.fn();
+            const initial = props({ on_columns_resized, column_projection: all_columns });
+            const GridShell = await render_grid(initial);
+            await act(async () => {
+                callbacks().start({}, 100, 0);
+                callbacks().resize({}, 130, 0);
+                // The selection's other columns, fanned out as Glide does.
+                callbacks().resize({}, 130, 1);
+                callbacks().resize({}, 130, 2);
+            });
+            await act(async () => {
+                root!.render(React.createElement(GridShell, { ...initial, column_projection: swapped }));
+            });
+            // The mouse-up, with no further move.
+            await act(async () => {
+                callbacks().end({}, 130, 0);
+                callbacks().end({}, 130, 1);
+                callbacks().end({}, 130, 2);
+            });
+            expect(on_columns_resized).not.toHaveBeenCalled();
+            expect(shown_widths()).toEqual([['s:1', 150], ['s:0', 100], ['s:2', 200]]);
+        });
+
+        it('still commits a drag when a render in the middle leaves the columns where they were', async () => {
+            const on_columns_resized = vi.fn();
+            const initial = props({ on_columns_resized, column_projection: all_columns });
+            const GridShell = await render_grid(initial);
+            await act(async () => {
+                callbacks().start({}, 100, 0);
+                callbacks().resize({}, 130, 0);
+            });
+            await act(async () => {
+                root!.render(React.createElement(GridShell, { ...initial, column_projection: { ...all_columns } }));
+            });
+            await act(async () => callbacks().end({}, 130, 0));
+            expect(on_columns_resized).toHaveBeenCalledExactlyOnceWith([{ column: 0, width: 130 }]);
+        });
+
         /** A press somewhere in the window that is not on a column border. */
         const press_elsewhere = () => { window.dispatchEvent(new Event('pointerdown')); };
         /** A press on a column's border and its release, without moving: what Glide reports for a click there. */
@@ -7646,6 +7732,46 @@ describe('GridShell row resizing', () => {
         expect(on_row_resize).toHaveBeenCalledOnce();
         expect(on_row_resize).toHaveBeenCalledWith([{ start: 2, end: 2 }], 48, { gesture: true });
         expect(grid_mock.update_cells).not.toHaveBeenCalled();
+    });
+
+    it('commits nothing when the rows under a held border change', async () => {
+        // A row insert undone from the keyboard while a row border is held:
+        // the drag's display indexes, the dragged row and the selection it
+        // resizes with, name other rows by the time the button comes up.
+        const on_row_resize = vi.fn();
+        const pending = create_pending_row_store({ session_id: 'session' });
+        const template = { id: 'plain', format: { kind: 'none' as const } };
+        pending.append_rows('session', ['pending-row-1', 'pending-row-2'], template, 1);
+        await render_grid(props({
+            editing_session_held: true,
+            csv_editable: true,
+            edit_session_id: 'session',
+            pending_row_store: pending,
+            on_row_resize,
+        }));
+        const on_selection_change = grid_mock.props!.onGridSelectionChange as
+            (selection: unknown) => void;
+        await act(async () => on_selection_change({ columns: compact([]), rows: compact([0, 2]) }));
+        const on_resize_start = grid_mock.row_resize_props!.on_resize_start as
+            (row: number, height: number) => void;
+        const on_resize = grid_mock.row_resize_props!.on_resize as
+            (row: number, height: number) => void;
+        act(() => on_resize_start(0, 24));
+        act(() => on_resize(0, 48));
+        // One of the rows is taken out from under the drag.
+        await act(async () => {
+            pending.remove_rows('session', new Set(['pending-row-1']));
+        });
+        const on_resize_end = grid_mock.row_resize_props!.on_resize_end as
+            (row: number, height: number) => void;
+        act(() => on_resize_end(0, 48));
+        expect(on_row_resize).not.toHaveBeenCalled();
+
+        // The next drag, on the rows as they now stand, is an ordinary one.
+        act(() => (grid_mock.row_resize_props!.on_resize_start as typeof on_resize_start)(0, 24));
+        act(() => (grid_mock.row_resize_props!.on_resize as typeof on_resize)(0, 40));
+        act(() => (grid_mock.row_resize_props!.on_resize_end as typeof on_resize_end)(0, 40));
+        expect(on_row_resize).toHaveBeenCalledOnce();
     });
 
     it('bounds repaint damage for a large selected range to the visible viewport', async () => {
