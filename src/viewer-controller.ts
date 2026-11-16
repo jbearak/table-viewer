@@ -3144,8 +3144,13 @@ export function attach_viewer(
      * renderer knows, done, and a session request waits it out rather than
      * being refused for it.
      */
+    // The view of the last snapshot handed to the renderer, delivered or not:
+    // a transform the renderer asked for from an older view arrives after it,
+    // and the renderer drops that request when it applies the snapshot.
+    let last_offered_view: { readonly generation: number; readonly sourceGeneration: number } | undefined;
     function note_snapshot_posted(snapshot: { readonly generation: number; readonly sourceGeneration: number }): () => void {
         const view = { generation: snapshot.generation, sourceGeneration: snapshot.sourceGeneration };
+        last_offered_view = view;
         const moved = last_posted_view !== undefined && (
             last_posted_view.generation !== view.generation
             || last_posted_view.sourceGeneration !== view.sourceGeneration
@@ -13533,6 +13538,15 @@ export function attach_viewer(
             message.sheetIndex,
             transform_authority,
         );
+        // Asked for from a view older than the last snapshot handed to the
+        // renderer: it drops this request when it applies that snapshot (or
+        // already has), so a session request waits this out rather than being
+        // refused for it.
+        if (
+            last_offered_view !== undefined
+            && (message.generation < last_offered_view.generation
+                || message.sourceGeneration < last_offered_view.sourceGeneration)
+        ) answered_transform_authorities.add(transform_authority);
         try {
             await core?.handle_message(message);
             answered_transform_authorities.add(transform_authority);
@@ -14452,7 +14466,9 @@ export function attach_viewer(
                         || !transform_authority_is_current(message, authority)
                     ))
                     .map(([, authority]) => authority.completion);
-                for (let waiting = settling(); waiting.length > 0; waiting = settling()) {
+                // Not for a quiet request (a menu opening): it is refused quietly
+                // as before, and must not hold the next request behind it.
+                for (let waiting = settling(); msg.quiet !== true && waiting.length > 0; waiting = settling()) {
                     await Promise.all(waiting);
                     if (!request_is_current()) return;
                 }

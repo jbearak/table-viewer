@@ -9293,6 +9293,116 @@ describe('CSV edit sessions', () => {
         expect(warning).not.toHaveBeenCalledWith('Wait for sorting and filtering to finish before editing.');
     });
 
+    /**
+     * A two-sheet panel whose first column read on Sheet1 for a transform is
+     * held until `source.gate` resolves.
+     */
+    async function two_sheet_gated_panel(file: string) {
+        class TwoSheetGatedSource extends TrackingTransformSource {
+            readonly entered = deferred();
+            readonly gate = deferred();
+            private gating = true;
+            override meta(): WorkbookMeta {
+                const sheet = super.meta().sheets[0]!;
+                return { hasFormatting: false, sheets: [sheet, { ...sheet, name: 'Sheet2' }] };
+            }
+            async read_raw_columns_async(
+                sheet_index: number,
+                start_row: number,
+                count: number,
+                column_indices: readonly number[],
+            ): Promise<RawColumnWindow> {
+                if (this.gating && sheet_index === 0) {
+                    this.gating = false;
+                    this.entered.resolve();
+                    await this.gate.promise;
+                }
+                const plain: DataSource = {
+                    meta: () => this.meta(),
+                    read_rows: (sheet, start, rows) => this.read_rows(sheet, start, rows),
+                    close: () => undefined,
+                } as DataSource;
+                return read_source_raw_columns_async(plain, sheet_index, start_row, count, column_indices, () => false);
+            }
+        }
+        const source = new TwoSheetGatedSource();
+        const panel = open_csv_table(uri(file), state_store().store, {
+            ...csv_table_profile(),
+            build_source: async () => source,
+        });
+        await panel.__receive({ type: 'ready' });
+        const snapshot = latest_snapshot(panel);
+        const sort = (
+            sheet_index: number,
+            name: string,
+            intent: 'restore' | 'user',
+            basis: { generation: number; sourceGeneration: number } = snapshot,
+        ) => panel.__receive({
+            type: 'setTransform',
+            sheetIndex: sheet_index,
+            requestId: `sort-${sheet_index}`,
+            state: { sort: [{ colIndex: 0, direction: 'asc' }], filters: [], schema: `["${name}",1,null]` },
+            generation: basis.generation,
+            sourceGeneration: basis.sourceGeneration,
+            intent,
+        } as never);
+        const generations = () => panel.__messages.flatMap((message) => (
+            (message as { type?: string }).type === 'workbookSnapshot'
+                ? [(message as { snapshot: WorkbookSnapshot }).snapshot.generation]
+                : []
+        ));
+        /** Sheet2 sorted, then a snapshot at the generation that install moved to. */
+        const move_view = async () => {
+            await sort(1, 'Sheet2', 'user');
+            await panel.__receive({
+                type: 'setColumnWidths',
+                requestId: 'widths',
+                sourceGeneration: snapshot.sourceGeneration,
+                sheets: [{ sheetIndex: 1, sheetName: 'Sheet2', widths: [{ column: 0, width: 140 }] }],
+            } as never);
+            await vi.waitUntil(() => generations().includes(snapshot.generation + 1));
+        };
+        return { panel, source, snapshot, sort, move_view };
+    }
+
+    it('waits for a restore asked for from the view before a snapshot that moved it', async () => {
+        const warning = vi.spyOn(vscode_mock.window, 'showWarningMessage');
+        const { panel, source, snapshot, sort, move_view } = await two_sheet_gated_panel('/tmp/session-older-view.csv');
+        await move_view();
+        // The renderer asked for this from the view it held before the snapshot.
+        const restore = sort(0, 'Sheet1', 'restore', snapshot);
+        await source.entered.promise;
+
+        const request = panel.__receive({ type: 'requestEditSession' } as never);
+        await flush_promises();
+        expect(edit_session_results(panel)).toEqual([]);
+        source.gate.resolve();
+        await restore;
+        await request;
+        expect(edit_session_results(panel)).toEqual([
+            expect.objectContaining({ type: 'editSessionResult', granted: true }),
+        ]);
+        expect(warning).not.toHaveBeenCalledWith('Wait for sorting and filtering to finish before editing.');
+    });
+
+    it('refuses a quiet request at once, saying nothing, while a transform it would wait for runs', async () => {
+        const warning = vi.spyOn(vscode_mock.window, 'showWarningMessage');
+        const { panel, source, sort, move_view } = await two_sheet_gated_panel('/tmp/session-quiet-wait.csv');
+        // A restore computing when a snapshot moves the view: a session
+        // request that is not quiet would wait for it.
+        const restore = sort(0, 'Sheet1', 'restore');
+        await source.entered.promise;
+        await move_view();
+
+        await panel.__receive({ type: 'requestEditSession', quiet: true } as never);
+        expect(edit_session_results(panel)).toEqual([
+            expect.objectContaining({ type: 'editSessionResult', granted: false }),
+        ]);
+        expect(warning).not.toHaveBeenCalled();
+        source.gate.resolve();
+        await restore;
+    });
+
     it('refuses a quiet request without announcing it', async () => {
         const warning = vi.spyOn(vscode_mock.window, 'showWarningMessage');
         const panel = open_csv_table(uri('/tmp/session.csv'), state_store().store);
