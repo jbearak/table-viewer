@@ -13325,6 +13325,60 @@ describe('sorting and filtering', () => {
         });
 
         it.each([
+            ['Cancel', () => click_button('Cancel')],
+            ['Escape', () => act(async () => {
+                document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+            })],
+        ])('gives focus to the grid mounted now when %s follows a reload that remounted it', async (_name, dismiss) => {
+            await render_app();
+            await dispatch_host_message(initial_snapshot_message(two_column_meta()));
+            const first_mount = grid_stub().getAttribute('data-mount-id');
+            // Focus is in the editor, not in the grid, as it is for a person.
+            grid_shell_mock.has_grid_focus.mockReturnValue(false);
+            // What the grid that opened the editor hands over: once that grid
+            // is unmounted, calling it focuses nothing.
+            const restore_to_unmounted_grid = vi.fn();
+            const open_filter = grid_shell_mock.latest_props!.on_open_filter as (
+                source_column: number,
+                anchor: { left: number; top: number },
+                restore_focus: () => void,
+            ) => void;
+            await act(async () => open_filter(1, { left: 20, top: 20 }, restore_to_unmounted_grid));
+            await type_filter_value('3');
+
+            await dispatch_host_message(refresh_snapshot_message(two_column_meta()));
+            expect(grid_stub().getAttribute('data-mount-id')).not.toBe(first_mount);
+            expect(filter_value()).toBe('3');
+            grid_shell_mock.focus_grid.mockClear();
+
+            await dismiss();
+            await vi.waitUntil(() => restore_to_unmounted_grid.mock.calls.length > 0);
+
+            expect(document.querySelector('.filter-popover')).toBeNull();
+            expect(grid_shell_mock.focus_grid).toHaveBeenCalledOnce();
+        });
+
+        it('leaves focus where the opener\'s own callback put it when the grid was not remounted', async () => {
+            await render_app();
+            await dispatch_host_message(initial_snapshot_message(two_column_meta()));
+            grid_shell_mock.has_grid_focus.mockReturnValue(false);
+            // The mounted grid's callback focuses it.
+            const restore = vi.fn(() => { grid_shell_mock.has_grid_focus.mockReturnValue(true); });
+            const open_filter = grid_shell_mock.latest_props!.on_open_filter as (
+                source_column: number,
+                anchor: { left: number; top: number },
+                restore_focus: () => void,
+            ) => void;
+            await act(async () => open_filter(1, { left: 20, top: 20 }, restore));
+            grid_shell_mock.focus_grid.mockClear();
+
+            await click_button('Cancel');
+            await vi.waitUntil(() => restore.mock.calls.length > 0);
+
+            expect(grid_shell_mock.focus_grid).not.toHaveBeenCalled();
+        });
+
+        it.each([
             ['renames a column', () => refresh_snapshot_message(two_column_meta(['Name', 'Years']))],
             ['adds a column', () => refresh_snapshot_message(two_column_meta(['Name', 'Age', 'City']))],
             ['is another worksheet under the same name and columns', () => {

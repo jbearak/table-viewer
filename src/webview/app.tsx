@@ -8457,6 +8457,7 @@ export function App(): React.JSX.Element {
 
     const close_filter_editor = useCallback((restore_focus = true) => {
         const restore = filter_editor?.restore_focus;
+        const opened_from_grid = filter_editor?.origin === 'grid';
         set_filter_editor(null);
         if (filter_restore_timer_ref.current !== undefined) {
             window.clearTimeout(filter_restore_timer_ref.current);
@@ -8465,6 +8466,13 @@ export function App(): React.JSX.Element {
             filter_restore_timer_ref.current = window.setTimeout(() => {
                 filter_restore_timer_ref.current = undefined;
                 restore?.();
+                // The editor can outlive the grid that opened it: a reload
+                // that keeps the columns remounts the grid, and the callback
+                // of the one unmounted reaches nothing. Focus goes to the
+                // grid mounted now.
+                if (opened_from_grid && grid_focus_ref.current?.has_focus() !== true) {
+                    grid_focus_ref.current?.focus();
+                }
             }, 0);
         } else {
             filter_restore_timer_ref.current = undefined;
