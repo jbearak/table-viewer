@@ -299,7 +299,7 @@ import { AppendAdmissionTemplateAuthorityStore } from './append-admission-templa
 // `sanitize_transform_state` and `sanitize_column_visibility_state` above already cross
 // this boundary.
 import { clamp_row_height } from './webview/row-heights';
-import { clamp_column_width } from './webview/grid-model';
+import { clamp_column_width } from './webview/column-widths';
 import {
     apply_cell_highlight_patch,
     cell_highlight_states_equal,
