@@ -5465,6 +5465,19 @@ export function App(): React.JSX.Element {
                             cellHighlights: authoritative_state.cellHighlights,
                         });
                         set_column_widths(next_column_widths);
+                        // The choice is stored for the file, so another window
+                        // on it can change it, and `state_ref` below takes the
+                        // delivered one either way: what the sheets show has
+                        // to be the same choice, or the Formatting button
+                        // would say one thing and the next layout change store
+                        // another. The same array when nothing changed.
+                        const next_show_formatting = authoritative_state.showFormatting ?? [];
+                        set_show_formatting_by_sheet((shown) => (
+                            shown.length === next_show_formatting.length
+                            && shown.every((value, index) => value === next_show_formatting[index])
+                                ? shown
+                                : next_show_formatting
+                        ));
                         set_transforms(next_transforms);
                         set_column_visibility(next_column_visibility);
                         set_active_sheet_index(next_active_sheet_index);
@@ -7772,7 +7785,8 @@ export function App(): React.JSX.Element {
     }, [open_find, run_history_command]);
 
     /**
-     * The only writer, so the live array and the persisted copy cannot drift.
+     * The only writer besides a snapshot, which installs both, so the live
+     * array and the persisted copy cannot drift.
      *
      * Persisted per file: reloading the same file after an external edit keeps the
      * choice, and opening a different file in this panel gets that file's own rather

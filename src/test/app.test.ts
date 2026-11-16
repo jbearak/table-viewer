@@ -2131,6 +2131,41 @@ describe('formatting toggle', () => {
         expect(next?.snapshotIdentity).toEqual(following.snapshot.identity);
     });
 
+    it('shows the choice a refresh of the same file carries, when another window made it', async () => {
+        // The choice is stored for the file. A second window on it (a
+        // comparison beside the plain window, a split editor) turns
+        // formatting off, and this window hears of it in its next snapshot:
+        // a session let go, an edit elsewhere, anything that leaves the file
+        // as it is.
+        const { post_message } = await render_app();
+        const meta = make_meta(['First', 'Second']);
+        await dispatch_host_message(initial_snapshot_message(meta));
+        expect(grid_stub().getAttribute('data-show-formatting')).toBe('true');
+
+        await dispatch_host_message(refresh_snapshot_message(meta, {
+            generation: 1,
+            sourceGeneration: 1,
+            reason: 'other',
+            state: { showFormatting: [false, true] },
+        }));
+
+        expect(grid_stub().getAttribute('data-show-formatting')).toBe('false');
+        await click_sheet_tab('Second');
+        expect(grid_stub().getAttribute('data-show-formatting')).toBe('true');
+        await click_sheet_tab('First');
+
+        // The button then turns on what is shown off, and stores that.
+        post_message.mockClear();
+        await click_button('Formatting');
+        expect(grid_stub().getAttribute('data-show-formatting')).toBe('true');
+        const stored = post_message.mock.calls
+            .map((call) => call[0] as WebviewMessage)
+            .filter((message): message is Extract<WebviewMessage, { type: 'stateChanged' }> => (
+                message.type === 'stateChanged'
+            )).at(-1);
+        expect(stored?.state.showFormatting).toEqual([true, true]);
+    });
+
     it('restores saved formatting from initial snapshot state', async () => {
         // Reloading the same file after an external edit keeps the choice, rather
         // than snapping every sheet back to formatted.
