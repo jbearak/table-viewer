@@ -24292,7 +24292,7 @@ describe('view steps in history', () => {
                 await dispatch_host_message(refresh_snapshot_message(table_meta(), {
                     generation: 2,
                     sourceGeneration: 2,
-                    reason: 'external',
+                    reason: 'fileReload',
                     capabilities: CSV,
                 }));
                 expect(props().transform_pending).toBe(false);
