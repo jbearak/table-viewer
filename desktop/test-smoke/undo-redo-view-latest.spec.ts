@@ -82,6 +82,18 @@ async function menu_label(direction: 'undo' | 'redo'): Promise<string> {
 const undo_label = () => menu_label('undo');
 const redo_label = () => menu_label('redo');
 
+/**
+ * Click an Edit menu item once the native menu has it. The capture above sees
+ * the window's post before main.ts rebuilds the menu from it, so the label
+ * there can be ahead of the menu's.
+ */
+async function click_edit_item(label: string): Promise<void> {
+    await expect.poll(() => app!.evaluate(({ Menu }, wanted) => Menu.getApplicationMenu()
+        ?.items.find((item) => item.label === 'Edit')
+        ?.submenu?.items.some((item) => item.label === wanted) ?? false, label)).toBe(true);
+    await click_menu_item(app!, 'Edit', label);
+}
+
 async function choose_sort(page: Page, column: number, direction: 'ascending' | 'descending'): Promise<void> {
     const menu = await open_column_menu(page, column);
     const entry = menu.getByRole('menuitemcheckbox', { name: `Sort ${direction}` });
@@ -119,15 +131,15 @@ test('a second sort during the first replaces it as one step, and Undo during a 
     await expect.poll(undo_label).toBe('Undo Sort');
 
     // One step: one Undo, from the Edit menu, is back at the natural order.
-    await click_menu_item(app, 'Edit', 'Undo Sort');
+    await click_edit_item('Undo Sort');
     await expect.poll(() => shown_first_row(page), { timeout: 60_000 }).toBe(natural);
     await expect(in_flight(page)).toHaveCount(0);
     await expect.poll(undo_label).toBe('Undo');
     await expect.poll(redo_label).toBe('Redo Sort');
-    await click_menu_item(app, 'Edit', 'Redo Sort');
+    await click_edit_item('Redo Sort');
     await expect.poll(() => shown_first_row(page), { timeout: 60_000 })
         .toBe(first_row(2, 'descending'));
-    await click_menu_item(app, 'Edit', 'Undo Sort');
+    await click_edit_item('Undo Sort');
     await expect.poll(() => shown_first_row(page), { timeout: 60_000 }).toBe(natural);
     await expect(in_flight(page)).toHaveCount(0);
 
@@ -138,12 +150,12 @@ test('a second sort during the first replaces it as one step, and Undo during a 
     await choose_sort(page, 1, 'ascending');
     await expect(in_flight(page)).toBeVisible();
     await expect.poll(undo_label).toBe('Undo Sort');
-    await click_menu_item(app, 'Edit', 'Undo Sort');
+    await click_edit_item('Undo Sort');
     await expect(in_flight(page)).toHaveCount(0, { timeout: 60_000 });
     await expect.poll(() => shown_first_row(page), { timeout: 60_000 }).toBe(natural);
     await expect.poll(undo_label).toBe('Undo');
     await expect.poll(redo_label).toBe('Redo Sort');
-    await click_menu_item(app, 'Edit', 'Redo Sort');
+    await click_edit_item('Redo Sort');
     await expect.poll(() => shown_first_row(page), { timeout: 60_000 })
         .toBe(first_row(2, 'descending'));
     expect((await take_dialogs(app)).map((dialog) => dialog.message)).toEqual([]);
