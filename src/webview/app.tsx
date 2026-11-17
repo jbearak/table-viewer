@@ -1,5 +1,6 @@
 import { cell_key, parse_cell_key } from '../cell-key';
 import { perf_mark } from './perf-marks';
+import { transform_states_equal } from '../transform-state-equality';
 import {
     begin_view_action,
     cancel_view_action,
@@ -3920,9 +3921,10 @@ export function App(): React.JSX.Element {
         pending_transform_request_ids_ref.current[sheet_index] = request_id;
         pending_transform_states_ref.current[sheet_index] = state;
         pending_transform_origins_ref.current[sheet_index] = origin;
-        // Replaces whatever was pending on this sheet: a replaced gesture never
-        // answers to this window and records nothing, and a replaced replay (a
-        // cancel) leaves its entry where it was.
+        // Replaces whatever was pending on this sheet. A replaced request of the
+        // person's view action is still answered, and the action keeps its id for
+        // that answer and records once the host has settled all it sent; a replaced
+        // replay (a cancel) leaves its entry where it was.
         pending_view_transforms_ref.current[sheet_index] = view === undefined
             ? undefined
             : { ...view, requestId: request_id };
@@ -4039,8 +4041,11 @@ export function App(): React.JSX.Element {
         const sheet_index = pending.action.sheetIndex;
         const durable = state_ref.current.transforms?.[sheet_index];
         const record = snapshot.transformCommits?.[sheet_index];
+        // The host's own comparison, ids and schema included (I3): rules that only
+        // look the same were not committed by this window.
+        const { onlyChangedRows: _session_only, ...durable_rules } = durable ?? EMPTY_TRANSFORM;
         const committed_by = record !== undefined
-            && transforms_semantically_equal(record.rules, durable)
+            && transform_states_equal(durable_rules, record.rules ?? EMPTY_TRANSFORM)
             ? record.requestId
             : undefined;
         // The compare toggle is session state and never durable: the snapshot's
@@ -13538,14 +13543,18 @@ export function App(): React.JSX.Element {
     // than there. If you are looking for what a permutation still *changes* on screen,
     // `merges` is the answer.
     const transform_active = installed_view?.permuted ?? false;
-    const any_transform_pending = pending_transforms.some(Boolean);
+    // The person's view action is pending until the host settles all it sent,
+    // which can outlast its newest request's answer: a newer request refused
+    // before it took the sheet leaves the older one computing (I3).
+    const view_action_here = view_action_ref.current?.action.sheetIndex === active_sheet_index;
+    const any_transform_pending = pending_transforms.some(Boolean) || view_action_ref.current !== undefined;
     const has_hidden_columns =
         current_column_projection.visible_to_source.length
         < current_sheet.columnCount;
     const merges_flattened =
         current_sheet.merges.length > 0
         && (transform_active || has_hidden_columns || active_layout_changed);
-    const transform_pending = pending_transforms[active_sheet_index] ?? false;
+    const transform_pending = (pending_transforms[active_sheet_index] ?? false) || view_action_here;
     const hidden_row_count = visible_transform.hiddenRows?.length ?? 0;
     const show_formatting = show_formatting_by_sheet[active_sheet_index] ?? true;
     const excel_header = current_sheet.excelFirstRowHeader;

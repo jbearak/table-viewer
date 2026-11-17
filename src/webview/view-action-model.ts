@@ -3,12 +3,14 @@
  * since that sheet's last install, and the requests sent for them. Pure; App
  * keeps at most one (plan I1) and feeds it the host's answers.
  *
- * The action holds two sets of rules. `baseline` is what was installed when its
- * first choice was made, or what a change from elsewhere installed since (I3).
- * `requested` is what the newest choice asked for. What the person changed is the
- * difference between the two, slice by slice (I6), so composing onto a moved
- * baseline needs no list of choices: the newest choice already won in
- * `requested`.
+ * The action holds two sets of rules and what the person changed. `baseline` is
+ * what was installed when its first choice was made, or what a change from
+ * elsewhere installed since (I3). `requested` is what the newest choice asked
+ * for. `delta` is every change the person made in the action, slice by slice
+ * (I6), merged choice by choice so the newest wins in each slice; a moved
+ * baseline gets that delta composed onto it. It is kept, not derived from the
+ * baseline and `requested`: a change made elsewhere can equal one of the
+ * person's, and the difference would then lose it.
  *
  * It ends when the host has settled every request it sent (I3), and its step
  * runs from the baseline to what is then installed (I2). An install written by
@@ -131,6 +133,42 @@ export function view_action_delta(
     };
 }
 
+const EMPTY_DELTA: ViewActionDelta = { upserts: [], removals: [], hidden: [], shown: [] };
+
+/** `next` made after `earlier`: the newest wins in each slice, and hidden rows combine. */
+export function merge_view_action_delta(
+    earlier: ViewActionDelta,
+    next: ViewActionDelta,
+): ViewActionDelta {
+    const replaced = (filter: FilterEntry) => next.removals.includes(filter.id)
+        || next.upserts.some((entry) => entry.id === filter.id || entry.colIndex === filter.colIndex);
+    const upserts = [...earlier.upserts.filter((filter) => !replaced(filter)), ...next.upserts];
+    const removals = [
+        ...earlier.removals.filter((id) => (
+            !next.removals.includes(id) && !next.upserts.some((entry) => entry.id === id)
+        )),
+        ...next.removals,
+    ];
+    const hidden = [
+        ...earlier.hidden.filter((row) => !next.shown.includes(row) && !next.hidden.includes(row)),
+        ...next.hidden,
+    ];
+    const shown = [
+        ...earlier.shown.filter((row) => !next.hidden.includes(row) && !next.shown.includes(row)),
+        ...next.shown,
+    ];
+    const sort = next.sort ?? earlier.sort;
+    const only_changed = next.onlyChangedRows ?? earlier.onlyChangedRows;
+    return {
+        ...(sort === undefined ? {} : { sort }),
+        upserts,
+        removals,
+        hidden,
+        shown,
+        ...(only_changed === undefined ? {} : { onlyChangedRows: only_changed }),
+    };
+}
+
 export function apply_view_action_delta(
     delta: ViewActionDelta,
     onto: SheetTransformState | undefined,
@@ -164,6 +202,8 @@ export interface ViewAction {
     readonly schema: string | undefined;
     readonly baseline: SheetTransformState | undefined;
     readonly requested: SheetTransformState;
+    /** Every change the person made in the action, merged; empty after a cancel. */
+    readonly delta: ViewActionDelta;
     /** The newest request is a cancel back to the baseline. */
     readonly cancelled: boolean;
     readonly requests: readonly ViewActionRequest[];
@@ -179,6 +219,7 @@ export function begin_view_action(
         schema,
         baseline: installed,
         requested: rules_or_empty(installed),
+        delta: EMPTY_DELTA,
         cancelled: false,
         requests: [],
     };
@@ -193,6 +234,10 @@ export function choose_in_view_action(
     return {
         ...action,
         requested,
+        delta: merge_view_action_delta(
+            action.cancelled ? EMPTY_DELTA : action.delta,
+            view_action_delta(action.requested, requested),
+        ),
         cancelled: false,
         requests: [...action.requests, { requestId: request_id, target: requested, settled: false }],
     };
@@ -217,6 +262,7 @@ export function cancel_view_action(action: ViewAction, request_id: string): View
     return {
         ...action,
         requested: target,
+        delta: EMPTY_DELTA,
         cancelled: true,
         requests: [...action.requests, { requestId: request_id, target, settled: false }],
     };
@@ -253,12 +299,11 @@ function adopt_from_elsewhere(
     rules: SheetTransformState | undefined,
 ): { readonly action: ViewAction; readonly resend: boolean } {
     if (transforms_semantically_equal(rules, action.baseline)) return { action, resend: false };
-    const delta = view_action_delta(action.baseline, action.requested);
     const moved: ViewAction = { ...action, baseline: rules };
     if (!view_action_in_flight(action)) return { action: moved, resend: false };
     const requested = action.cancelled
         ? view_action_cancel_target(moved)
-        : apply_view_action_delta(delta, rules, action.schema);
+        : apply_view_action_delta(action.delta, rules, action.schema);
     const newest = action.requests.at(-1)!;
     return {
         action: { ...moved, requested },
@@ -299,7 +344,11 @@ export function settle_view_action(
     rules: SheetTransformState | undefined,
     committed_by: string | undefined,
 ): ViewActionSettlement {
-    if (!view_action_owns(action, request_id)) return { kind: 'pending', action, resend: false };
+    // Once per request id (I3): a settlement already taken changes nothing.
+    if (
+        !view_action_owns(action, request_id)
+        || action.requests.some((request) => request.requestId === request_id && request.settled)
+    ) return { kind: 'pending', action, resend: false };
     const marked: ViewAction = {
         ...action,
         requests: action.requests.map((request) => (

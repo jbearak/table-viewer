@@ -13,7 +13,13 @@ import * as os from 'os';
 import * as path from 'path';
 import { _electron as electron, expect, test } from '@playwright/test';
 import type { ElectronApplication, Page } from '@playwright/test';
-import { cell_point, open_column_menu, type_into_cell } from '../test-smoke/structure-helpers';
+import {
+    cell_point,
+    choose,
+    open_column_menu,
+    open_row_menu,
+    type_into_cell,
+} from '../test-smoke/structure-helpers';
 
 const repo_dir = path.resolve(__dirname, '..', '..');
 const STAGE_MAIN = path.join(repo_dir, 'dist', 'desktop', 'main.js');
@@ -147,6 +153,15 @@ async function wait_mark(page: Page, name: string, since: number): Promise<Mark>
     return found!;
 }
 
+/** The generation the grid last rendered, by its marks; 0 before any. */
+async function rendered_generation(page: Page): Promise<number> {
+    return page.evaluate(() => {
+        const marks = performance.getEntriesByName('tv:view-generation-rendered');
+        const detail = (marks.at(-1) as PerformanceMark | undefined)?.detail as { generation?: number } | undefined;
+        return detail?.generation ?? 0;
+    });
+}
+
 async function first_row(page: Page): Promise<string> {
     return page.evaluate(() => [...(document.querySelector('tbody tr')?.querySelectorAll('td') ?? [])]
         .map((cell) => cell.textContent ?? '').join('|'));
@@ -185,19 +200,28 @@ async function undo_cell_edit(page: Page, row: number, round: number): Promise<n
     return (await page.evaluate(() => (globalThis as unknown as Record<string, unknown>).__undone as number)) - posted;
 }
 
-/** One-character keys in an open editor, timed from the key to the frame after its input. */
-async function type_keys(page: Page): Promise<number[]> {
+/**
+ * One-character keys in an open editor: for each, how many frames began from
+ * the key to the frame after its input, so 1 is the next frame. Answers those
+ * counts and how many keys reached the editor.
+ */
+async function type_keys(page: Page): Promise<{ frames: number[]; typed: number }> {
     await page.evaluate(() => {
         const w = globalThis as Record<string, unknown>;
-        const keys: number[] = [];
-        w.__keys = keys;
+        const frames: number[] = [];
+        w.__frames = frames;
+        w.__typed = 0;
+        let frame = 0;
+        const tick = () => { frame += 1; requestAnimationFrame(tick); };
+        requestAnimationFrame(tick);
         document.addEventListener('keydown', (event) => {
-            const stamp = event.timeStamp;
             const target = event.target as HTMLElement;
             if (!target.classList?.contains('cell-editor-input')) return;
             if (event.key.length !== 1 || event.metaKey || event.ctrlKey || event.altKey) return;
+            w.__typed = (w.__typed as number) + 1;
+            const at = frame;
             target.addEventListener('input', () => {
-                requestAnimationFrame(() => keys.push(performance.now() - stamp));
+                requestAnimationFrame(() => frames.push(frame - at));
             }, { once: true });
         }, { capture: true });
     });
@@ -209,7 +233,15 @@ async function type_keys(page: Page): Promise<number[]> {
         await page.keyboard.press('Escape');
         await expect(page.locator('.cell-editor-input')).toHaveCount(0);
     }
-    return page.evaluate(() => (globalThis as unknown as Record<string, unknown>).__keys as number[]);
+    // Every key that reached the editor has shown, or the counts are short.
+    await expect.poll(() => page.evaluate(() => {
+        const w = globalThis as unknown as Record<string, unknown>;
+        return (w.__frames as number[]).length === w.__typed;
+    })).toBe(true);
+    return page.evaluate(() => {
+        const w = globalThis as unknown as Record<string, unknown>;
+        return { frames: w.__frames as number[], typed: w.__typed as number };
+    });
 }
 
 test('idle Undo of a cell edit and typing, against the baseline build', async () => {
@@ -218,7 +250,10 @@ test('idle Undo of a cell edit and typing, against the baseline build', async ()
     const file = path.join(root, 'small.csv');
     const builds = { stage: STAGE_MAIN, baseline: BASELINE_MAIN! };
     const undo: Record<keyof typeof builds, number[]> = { stage: [], baseline: [] };
-    const typing: Record<keyof typeof builds, number[]> = { stage: [], baseline: [] };
+    const typing: Record<keyof typeof builds, { frames: number[]; typed: number }> = {
+        stage: { frames: [], typed: 0 },
+        baseline: { frames: [], typed: 0 },
+    };
     // Four blocks of ten rounds each, alternating builds, so drift falls on both.
     const orders: readonly (readonly ('stage' | 'baseline')[])[] = [['stage', 'baseline'], ['baseline', 'stage']];
     for (let block = 0; block < 4; block += 1) {
@@ -232,20 +267,25 @@ test('idle Undo of a cell edit and typing, against the baseline build', async ()
         }
     }
     const paired = undo.stage.map((value, index) => value - undo.baseline[index]);
-    const within_two_frames = (keys: readonly number[]) => keys.filter((ms) => ms <= 1000 / 30).length;
+    // The frame after the input's frame: at most two frame starts after the key.
+    const within_next_frame = (keys: { frames: readonly number[] }) => keys.frames.filter((frames) => frames <= 2).length;
     record({
         kind: 'paired',
         undo_stage_ms: undo.stage.map(Math.round),
         undo_baseline_ms: undo.baseline.map(Math.round),
         undo_paired_difference_median_ms: Math.round(median(paired) * 10) / 10,
-        typing_stage_keys: typing.stage.length,
-        typing_baseline_keys: typing.baseline.length,
-        typing_stage_within_next_frame: within_two_frames(typing.stage),
-        typing_baseline_within_next_frame: within_two_frames(typing.baseline),
+        typing_stage_keys: typing.stage.typed,
+        typing_baseline_keys: typing.baseline.typed,
+        typing_stage_within_next_frame: within_next_frame(typing.stage),
+        typing_baseline_within_next_frame: within_next_frame(typing.baseline),
     });
     expect(Math.abs(median(paired))).toBeLessThanOrEqual(10);
-    expect(within_two_frames(typing.stage))
-        .toBeGreaterThanOrEqual(Math.floor(within_two_frames(typing.baseline) * 0.98));
+    // Both builds saw every key (8 editors, 9 keys each), and this one shows at least
+    // 98 % as many by the next frame.
+    expect(typing.stage.typed).toBe(72);
+    expect(typing.baseline.typed).toBe(72);
+    expect(within_next_frame(typing.stage))
+        .toBeGreaterThanOrEqual(Math.ceil(within_next_frame(typing.baseline) * 0.98));
 });
 
 // ---------------------------------------------------------------- this build, by its marks
@@ -308,28 +348,69 @@ test('a 1M-row sort: Undo before it installs, and a second sort during the first
     // A second sort during the first, against the same sort alone.
     const lone: number[] = [];
     const second: number[] = [];
+    let sorted_desc = '';
     for (let round = 0; round < 3; round += 1) {
         const lone_click = await click_sort(page, 2, 'descending');
         lone.push((await wait_mark(page, 'tv:view-action-ended', lone_click)).startTime - lone_click);
         await settled(page);
+        await expect.poll(() => first_row(page), { timeout: 60_000 }).not.toBe(natural);
+        sorted_desc = await first_row(page);
         since = await post_history(page, 'undo');
         await wait_mark(page, 'tv:history-changed', since);
         await settled(page);
 
+        const before = await rendered_generation(page);
         const first_click = await click_sort(page, 1, 'ascending');
         await expect(page.locator('.toolbar-progress')).toBeVisible();
         const second_click = await click_sort(page, 2, 'descending');
         const ended = await wait_mark(page, 'tv:view-action-ended', second_click);
-        const rendered = (await marks_after(page, first_click))
-            .filter((mark) => mark.name === 'tv:view-generation-rendered' && mark.startTime <= ended.startTime + 1000);
-        // Only the second's generation renders: the first never installed.
-        expect(rendered.length, 'one generation rendered').toBe(1);
-        second.push(ended.startTime - second_click);
+        // Wait for a render past the generation before, then look at every render
+        // since the first click: the first sort never installed, so there is one,
+        // and it is the next generation.
+        await expect.poll(async () => (await rendered_generation(page)) > before, { timeout: 60_000 }).toBe(true);
         await settled(page);
+        await expect.poll(() => first_row(page), { timeout: 60_000 }).toBe(sorted_desc);
+        const rendered = (await marks_after(page, first_click))
+            .filter((mark) => mark.name === 'tv:view-generation-rendered')
+            .map((mark) => mark.detail?.generation);
+        expect(rendered, 'only the second sort rendered').toEqual([before + 1]);
+        second.push(ended.startTime - second_click);
         since = await post_history(page, 'undo');
         await wait_mark(page, 'tv:history-changed', since);
         await settled(page);
     }
+
+    // Recorded only: a filter composed onto a sort still computing, from its
+    // Apply to the end of the action.
+    await click_sort(page, 1, 'ascending');
+    await expect(page.locator('.toolbar-progress')).toBeVisible();
+    await choose(await open_column_menu(page, 0), 'Filter…');
+    const popover = page.locator('.filter-popover');
+    await expect(popover).toBeVisible();
+    await popover.locator('#filter-condition').selectOption('contains');
+    await popover.getByLabel('Filter value').fill('7');
+    const apply_at = await page.evaluate(() => performance.now());
+    await popover.getByRole('button', { name: 'Apply' }).click();
+    const late_filter = (await wait_mark(page, 'tv:view-action-ended', apply_at)).startTime - apply_at;
+    await settled(page);
+    since = await post_history(page, 'undo');
+    await wait_mark(page, 'tv:history-changed', since);
+    await settled(page);
+    await expect.poll(() => first_row(page), { timeout: 120_000 }).toBe(natural);
+
+    // Recorded only: Hide rows on the large table, to the host's settlement.
+    const row_menu = await open_row_menu(page, 0);
+    const hide_at = await page.evaluate(() => performance.now());
+    await choose(row_menu, 'Hide row');
+    const hide = (await wait_mark(page, 'tv:view-request-settled', hide_at)).startTime - hide_at;
+    await settled(page);
+    since = await post_history(page, 'undo');
+    await wait_mark(page, 'tv:history-changed', since);
+    await settled(page);
+    await expect.poll(() => first_row(page), { timeout: 120_000 }).toBe(natural);
+
+    // Not measured: a cancel after "Only changed rows" is toggled. The toggle is
+    // only in a compare window, which this table does not open.
 
     // Recorded only: Undo of a sort the host has installed.
     await click_sort(page, 1, 'ascending');
@@ -345,6 +426,8 @@ test('a 1M-row sort: Undo before it installs, and a second sort during the first
         lone_sort_ms: lone.map(Math.round),
         second_sort_ms: second.map(Math.round),
         undo_after_install_ms: Math.round(undo_installed),
+        filter_composed_late_ms: Math.round(late_filter),
+        hide_rows_ms: Math.round(hide),
     });
     expect(median(undo_without)).toBeLessThanOrEqual(500);
     expect(median(undo_with)).toBeLessThanOrEqual(500);

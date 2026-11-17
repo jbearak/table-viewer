@@ -1864,8 +1864,9 @@ export interface GridShellProps {
     transform_choice_pending?: boolean;
     /**
      * The rules the transform in flight will install. Menus offer their items
-     * by these, and `transform_pending` only disables them, so an item does not
-     * appear or vanish under the pointer when the transform lands.
+     * by these, so an item does not appear or vanish under the pointer when the
+     * transform lands; `transform_choice_pending` decides whether they are
+     * disabled.
      */
     pending_transform_target?: SheetTransformState;
     on_transform_change?: (state: SheetTransformState) => void;
@@ -11649,8 +11650,9 @@ export function GridShell({
     const menu_session_coming = menu_lists_edit_armed && menu_offers_edits;
     const menu_edits_shown = menu_lists_editable_cells || menu_session_coming;
     const transform_menu_sections = transform_sections || transform_waits_for_claim;
-    // Which items a menu offers follows the rules a transform in flight will
-    // install; its being in flight only disables them.
+    // Which items a menu offers follows the rules asked for. Whether the sort
+    // and filter items are disabled is `transform_choice_pending`: a hide, a
+    // replay, or a restore in flight, not the person's own request.
     const menu_transform_state = requested_transform_state;
     const hide_rows_disabled_reason = inserted_rows_lock
         ? INSERTED_ROWS_TRANSFORM_MESSAGE

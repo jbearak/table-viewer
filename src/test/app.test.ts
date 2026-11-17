@@ -620,8 +620,10 @@ async function dispatch_host_message(input: HostMessage | Record<string, unknown
         && !settled_transform_ids.has(msg.requestId)
         ? msg as Extract<HostMessage, { type: 'transformInstalled' | 'transformRefused' }>
         : undefined;
-    if (answer !== undefined) {
-        // The requests this one took the sheet from were settled when it did.
+    if (answer !== undefined && answer.type === 'transformInstalled') {
+        // The requests this one took the sheet from were settled when it did. A
+        // refusal is not taken for a takeover: one before admission leaves the
+        // older request computing, and a test that means otherwise settles it.
         const requests = sent_transform_requests.filter((candidate) => (
             candidate.sheetIndex === answer.sheetIndex
         ));
@@ -23673,6 +23675,76 @@ describe('view steps in history', () => {
 
             expect(undo_labels()).toEqual(['Sort']);
             expect(cells_editable()).toEqual(EDITABLE);
+        });
+
+        it('keeps the action pending while an older request computes after a newer one is refused before admission', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+
+            const first = await ask(post_message, { sort: SORT_ASC, filters: [] });
+            const second = await ask(post_message, { sort: SORT_ASC, filters: [FILTER] });
+            await refuse(second!);
+
+            // The first still computes: the indicator, Cancel, and the held cells stay.
+            expect(props().transform_pending).toBe(true);
+            expect(document.querySelector('.toolbar-progress')).not.toBeNull();
+            expect(cells_editable()).toEqual(HELD);
+            await install(first!);
+
+            expect(undo_labels()).toEqual(['Sort']);
+            expect(props().transform_pending).toBe(false);
+            expect(cells_editable()).toEqual(EDITABLE);
+        });
+
+        it('records the request still computing when its cancel is refused before admission', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+
+            const request = await ask(post_message, { sort: SORT_ASC, filters: [] });
+            await undo();
+            const cancel = latest_transform_request(post_message);
+            expect(cancel.intent).toBe('cancel');
+            await refuse(cancel, 'The file is being saved.');
+            expect(cells_editable()).toEqual(HELD);
+            await install(request!);
+
+            expect(undo_labels()).toEqual(['Sort']);
+            expect(cells_editable()).toEqual(EDITABLE);
+        });
+
+        it('builds a toolbar choice made during a request from the rules asked for', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+
+            await ask(post_message, { sort: SORT_ASC, filters: [FILTER] });
+            const clear_sorts = document.querySelector('[aria-label="Clear all sorts"]') as HTMLButtonElement;
+            expect(clear_sorts).not.toBeNull();
+            expect(clear_sorts.getAttribute('aria-disabled')).toBeNull();
+            await act(async () => clear_sorts.click());
+
+            expect(latest_transform_request(post_message).state).toMatchObject({ sort: [], filters: [FILTER] });
+        });
+
+        it('opens the filter editor during a request, and its Apply keeps the sort asked for', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+
+            await ask(post_message, { sort: SORT_ASC, filters: [] });
+            await act(async () => props().on_open_filter?.(1, { left: 10, top: 10 }, () => {}));
+            const input = document.querySelector('[aria-label="Filter value"]') as HTMLInputElement;
+            expect(input).not.toBeNull();
+            await act(async () => {
+                Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!
+                    .set!.call(input, 'z');
+                input.dispatchEvent(new Event('input', { bubbles: true }));
+            });
+            await click_button('Apply');
+
+            const applied = latest_transform_request(post_message);
+            expect(applied.state.sort).toEqual(SORT_ASC);
+            expect(applied.state.filters).toEqual([expect.objectContaining({ colIndex: 1, value: 'z' })]);
+            await install(applied);
+            expect(undo_labels()).toEqual(['Change view']);
         });
 
         it('keeps a choice made before the cancel is answered in the same action', async () => {

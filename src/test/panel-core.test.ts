@@ -3268,11 +3268,14 @@ describe('transform settlement', () => {
         const message = request(core, 'A', sort('asc'));
         const a = core.handle_message(message);
         await first_commit_started.promise;
-        core.dispose();
+        // The window sees the new source generation, and ends its action on it.
+        core.adopt_source(new StubSource(5));
         release_first_commit.resolve();
         await a;
         core.settle_transform(message);
         expect(settled(posted)).toEqual([]);
+        expect(transform_answers(posted)).toEqual([]);
+        expect(core.transform_state(0).sort).toEqual([]);
     });
 });
 

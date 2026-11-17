@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import type { FilterEntry, SheetTransformState } from '../types';
 import {
     apply_view_action_delta,
+    merge_view_action_delta,
     begin_view_action,
     cancel_view_action,
     choose_in_view_action,
@@ -55,6 +56,25 @@ describe('view action deltas', () => {
     it('removes a filter by id and carries the compare toggle', () => {
         const delta = view_action_delta(filtered, rules({ onlyChangedRows: true }));
         expect(apply_view_action_delta(delta, filtered, schema)).toEqual(rules({ onlyChangedRows: true }));
+    });
+});
+
+describe('merging deltas', () => {
+    it('keeps the newest per slice and combines hidden rows', () => {
+        const earlier = view_action_delta(rules({}), rules({
+            sort: [{ colIndex: 0, direction: 'asc' }],
+            filters: [filter('f1', 1, 'a')],
+            hiddenRows: [1, 2],
+        }));
+        const next = view_action_delta(
+            rules({ sort: [{ colIndex: 0, direction: 'asc' }], filters: [filter('f1', 1, 'a')], hiddenRows: [1, 2] }),
+            rules({ sort: [], filters: [filter('f2', 1, 'b')], hiddenRows: [2, 3] }),
+        );
+        expect(apply_view_action_delta(merge_view_action_delta(earlier, next), rules({}), schema)).toEqual(rules({
+            sort: [],
+            filters: [filter('f2', 1, 'b')],
+            hiddenRows: [2, 3],
+        }));
     });
 });
 
@@ -136,6 +156,43 @@ describe('a view action', () => {
         action = cancel_view_action(action, 'C');
         const refreshed = refresh_view_action(action, filtered, undefined);
         expect(refreshed).toMatchObject({ resend: true, action: { requested: filtered, cancelled: true } });
+    });
+
+    it('keeps the person\'s choice when a change made elsewhere equals it, then another changes the sheet', () => {
+        let action = begin_view_action(0, schema, undefined);
+        action = choose_in_view_action(action, by_a, 'A');
+        const equal = refresh_view_action(action, by_a, undefined);
+        expect(equal.resend).toBe(false);
+        const other = refresh_view_action(equal.action, filtered, undefined);
+        expect(other.action.requested).toEqual(rules({
+            sort: [{ colIndex: 0, direction: 'asc' }],
+            filters: [filter('f1', 2, 'x')],
+        }));
+        expect(other.resend).toBe(true);
+    });
+
+    it('takes each settlement once', () => {
+        let action = begin_view_action(0, schema, undefined);
+        action = choose_in_view_action(action, by_a, 'A');
+        action = choose_in_view_action(action, by_b, 'B');
+        const first = settle_view_action(action, 'A', undefined, undefined);
+        if (first.kind !== 'pending') throw new Error('unreachable');
+        // The same settlement again, with a stale projection, moves nothing.
+        expect(settle_view_action(first.action, 'A', filtered, undefined)).toEqual({
+            kind: 'pending', action: first.action, resend: false,
+        });
+    });
+
+    it('starts the delta again after a cancel', () => {
+        let action = begin_view_action(0, schema, undefined);
+        action = choose_in_view_action(action, by_a, 'A');
+        action = cancel_view_action(action, 'C');
+        action = choose_in_view_action(action, filtered, 'F');
+        const moved = refresh_view_action(action, by_b, undefined);
+        expect(moved.action.requested).toEqual(rules({
+            sort: [{ colIndex: 1, direction: 'desc' }],
+            filters: [filter('f1', 2, 'x')],
+        }));
     });
 
     it('does not move for a refresh showing its own commit', () => {

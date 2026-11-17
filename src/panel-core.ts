@@ -1,4 +1,5 @@
 import { createHash } from 'crypto';
+import { transform_states_equal } from './transform-state-equality';
 import type { DataSource, SheetMeta } from './data-source/interface';
 import {
     projected_row_for_source,
@@ -2366,57 +2367,4 @@ export function adopt_source_into_core(
 }
 
 /** Compare transform descriptors by their ordered semantic fields. */
-export function transform_states_equal(
-    left: SheetTransformState,
-    right: SheetTransformState,
-): boolean {
-    if (
-        left.sort.length === 0
-        && left.filters.length === 0
-        && (left.hiddenRows?.length ?? 0) === 0
-        && left.onlyChangedRows !== true
-        && right.sort.length === 0
-        && right.filters.length === 0
-        && (right.hiddenRows?.length ?? 0) === 0
-        && right.onlyChangedRows !== true
-    ) return true;
-    return left.schema === right.schema
-        && (left.onlyChangedRows === true) === (right.onlyChangedRows === true)
-        && left.sort.length === right.sort.length
-        && left.sort.every((key, index) => (
-            key.colIndex === right.sort[index].colIndex
-            && key.direction === right.sort[index].direction
-        ))
-        && array_values_equal(left.hiddenRows, right.hiddenRows)
-        && left.filters.length === right.filters.length
-        && left.filters.every((entry, index) => {
-            const candidate = right.filters[index];
-            return entry.id === candidate.id
-                && entry.colIndex === candidate.colIndex
-                && entry.operator === candidate.operator
-                && entry.value === candidate.value
-                && entry.secondValue === candidate.secondValue
-                && excluded_values_equal(entry.excludedValues, candidate.excludedValues)
-                && entry.caseSensitive === candidate.caseSensitive
-                && entry.enabled === candidate.enabled;
-        });
-}
-
-function array_values_equal(
-    left: readonly number[] | undefined,
-    right: readonly number[] | undefined,
-): boolean {
-    if ((left?.length ?? 0) === 0 && (right?.length ?? 0) === 0) return true;
-    return !!left && !!right
-        && left.length === right.length
-        && left.every((value, index) => value === right[index]);
-}
-
-function excluded_values_equal(
-    left: readonly (string | null)[] | undefined,
-    right: readonly (string | null)[] | undefined,
-): boolean {
-    if (left === right) return true;
-    if (!left || !right || left.length !== right.length) return false;
-    return left.every((value, index) => value === right[index]);
-}
+export { transform_states_equal } from './transform-state-equality';
