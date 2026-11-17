@@ -126,23 +126,27 @@ function write_small(file: string): void {
 
 // ---------------------------------------------------------------- page helpers
 
-/**
- * Click a sort item; answers the click's time in the page. `before_click` runs
- * once the item is offered enabled, just before the click.
- */
 /** Note the time of the page's next click, read back by `last_click_time`. */
 async function arm_click_time(page: Page): Promise<void> {
     await page.evaluate(() => {
+        const page_globals = globalThis as unknown as Record<string, unknown>;
+        page_globals.__last_click = undefined;
         document.addEventListener('click', (event) => {
-            (globalThis as unknown as Record<string, unknown>).__last_click = event.timeStamp;
+            page_globals.__last_click = event.timeStamp;
         }, { capture: true, once: true });
     });
 }
 
 async function last_click_time(page: Page): Promise<number> {
-    return page.evaluate(() => (globalThis as unknown as Record<string, unknown>).__last_click as number);
+    const time = await page.evaluate(() => (globalThis as unknown as Record<string, unknown>).__last_click);
+    if (typeof time !== 'number') throw new Error('The armed click never reached the page.');
+    return time;
 }
 
+/**
+ * Click a sort item; answers the click's time in the page. `before_click` runs
+ * once the item is offered enabled, just before the click.
+ */
 async function click_sort(
     page: Page,
     column: number,

@@ -11190,8 +11190,8 @@ export function App(): React.JSX.Element {
 
     /**
      * Cancel the view action on a sheet, back to its baseline (I4): the rules
-     * installed when its first choice was made, with the compare toggle kept as
-     * asked. The cancel is the action's newest request, so the action ends when
+     * installed when its first choice was made, or those a refresh from elsewhere
+     * moved it onto, with the compare toggle kept as asked. The cancel is the action's newest request, so the action ends when
      * the host settles it, with no step if the baseline is what is installed
      * then. Presses waiting behind the action are dropped silently, as Cancel
      * drops them. Answers whether there was an action to cancel.
