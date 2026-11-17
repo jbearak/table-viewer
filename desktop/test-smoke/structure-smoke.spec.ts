@@ -1463,11 +1463,21 @@ async function open_cell_hide_menu(page: Page): Promise<Locator> {
     return menu;
 }
 
+/**
+ * Wait for the window's sort or filter change to have ended: the host has
+ * answered and settled everything it asked for. The chips alone do not say
+ * so, since they show the rules asked for from the moment they are asked for.
+ */
+async function view_change_ended(page: Page): Promise<void> {
+    await expect(page.locator('.toolbar-progress')).toHaveCount(0);
+}
+
 /** Sort ascending by the column of the cell clicked, and wait for the sort to land. */
 async function sort_by_column(page: Page, column = 1): Promise<void> {
     await focus_cell(page, column, 1);
     await page.keyboard.press('Shift+Alt+A');
     await expect(page.locator('.sort-strip .sort-chip')).toHaveCount(1);
+    await view_change_ended(page);
 }
 
 /**
@@ -1476,6 +1486,9 @@ async function sort_by_column(page: Page, column = 1): Promise<void> {
  * change lands: `item` disabled, `absent` absent. Landing remounts the grid,
  * closing the menu; the same menu opened afterwards lists the same items,
  * `item` now enabled.
+ *
+ * A sort or filter item is enabled throughout (`live_in_flight`): a new choice
+ * replaces the person's own request in flight (docs/plans/window-queue.md, V1).
  */
 async function expect_menu_offers_settled_items(page: Page, options: {
     name: string;
@@ -1484,17 +1497,23 @@ async function expect_menu_offers_settled_items(page: Page, options: {
     open: () => Promise<Locator>;
     item: string;
     absent?: readonly string[];
+    live_in_flight?: boolean;
 }): Promise<void> {
-    const { name, start, settled, open, item, absent = [] } = options;
+    const { name, start, settled, open, item, absent = [], live_in_flight = false } = options;
     await hold_host_messages();
     await start();
     await expect_host_message_held('transformInstalled');
     const pending_menu = await open();
-    await expect(menu_item(pending_menu, item)).toHaveAttribute('aria-disabled', 'true');
+    if (live_in_flight) {
+        await expect(menu_item(pending_menu, item)).not.toHaveAttribute('aria-disabled', 'true');
+    } else {
+        await expect(menu_item(pending_menu, item)).toHaveAttribute('aria-disabled', 'true');
+    }
     for (const label of absent) await expect(menu_item(pending_menu, label)).toHaveCount(0);
     const pending_labels = await menu_labels(pending_menu);
     await release_host_messages();
     await settled();
+    await view_change_ended(page);
     if (await page.locator('[role="menu"]').count() > 0) await page.keyboard.press('Escape');
     await expect(page.locator('[role="menu"]')).toHaveCount(0);
     await expect(page.locator('.grid-shell-root')).toHaveAttribute('data-edit-session', 'none');
@@ -1511,9 +1530,12 @@ async function expect_menu_offers_settled_items(page: Page, options: {
 }
 
 /**
- * Keep the page's next sort or filter request from reaching the host, as if
- * the host were still computing it. Its Cancel then asks for the rules the
- * host already holds, which the host acknowledges without remounting the grid.
+ * Keep the page's next sort or filter request from reaching the host until
+ * its Cancel is sent, as if the host were still computing it. The request then
+ * reaches the host just ahead of the Cancel, which takes the sheet from it
+ * before it computes; the Cancel asks for the rules the host already holds, so
+ * the host acknowledges it without remounting the grid, and settles both: the
+ * window waits for every request it sent to be settled (plan I3).
  */
 async function withhold_next_transform_request(): Promise<void> {
     await app!.evaluate(({ ipcMain }, channel) => {
@@ -1526,11 +1548,18 @@ async function withhold_next_transform_request(): Promise<void> {
         main.__transform_withholder = true;
         const listeners = ipcMain.listeners(channel) as ((...args: unknown[]) => void)[];
         ipcMain.removeAllListeners(channel);
+        let withheld: unknown[] | undefined;
         ipcMain.on(channel, (...args: unknown[]) => {
             const message = (args[1] as { message?: { type?: string; intent?: string } })?.message;
             if (main.__withhold_transform && message?.type === 'setTransform' && message.intent !== 'cancel') {
                 main.__withhold_transform = false;
+                withheld = args;
                 return;
+            }
+            if (withheld !== undefined && message?.type === 'setTransform' && message.intent === 'cancel') {
+                const earlier = withheld;
+                withheld = undefined;
+                for (const listener of listeners) listener(...earlier);
             }
             for (const listener of listeners) listener(...args);
         });
@@ -1541,7 +1570,8 @@ async function withhold_next_transform_request(): Promise<void> {
  * Open a menu while a cancelled sort or filter change is in flight, then let
  * the cancel's answer through. The menu stays open and shows one list of
  * items throughout: `item` disabled while the cancel is in flight and enabled
- * once it lands, and nothing appears, vanishes, or moves as it lands.
+ * once it lands (a sort or filter item, `live_in_flight`, is enabled
+ * throughout), and nothing appears, vanishes, or moves as it lands.
  */
 async function expect_menu_steady_through_cancel(page: Page, options: {
     name: string;
@@ -1549,8 +1579,9 @@ async function expect_menu_steady_through_cancel(page: Page, options: {
     open: () => Promise<Locator>;
     item: string;
     absent?: readonly string[];
+    live_in_flight?: boolean;
 }): Promise<void> {
-    const { name, change, open, item, absent = [] } = options;
+    const { name, change, open, item, absent = [], live_in_flight = false } = options;
     const root = page.locator('.grid-shell-root');
     await withhold_next_transform_request();
     await change();
@@ -1561,8 +1592,9 @@ async function expect_menu_steady_through_cancel(page: Page, options: {
     await expect_host_message_held('transformInstalled');
     const menu = await open();
     await watch_menu_items(page);
-    await expect(menu_item(menu, item)).toHaveAttribute('aria-disabled', 'true');
+    if (!live_in_flight) await expect(menu_item(menu, item)).toHaveAttribute('aria-disabled', 'true');
     await release_host_messages();
+    await view_change_ended(page);
     await expect(menu_item(menu, item)).not.toHaveAttribute('aria-disabled', 'true');
     await expect(root).toHaveAttribute('data-edit-session', 'held');
     for (const label of absent) await expect(menu_item(menu, label)).toHaveCount(0);
@@ -1613,13 +1645,15 @@ test('a workbook menu opened while a sort is added offers the items it offers on
         open: () => open_cell_hide_menu(page),
         item: 'Hide row',
     });
-    // The column's own sort items follow the sort that is landing.
+    // The column's own sort items follow the sort that is landing, and stay
+    // enabled: a new choice replaces it.
     await expect_menu_offers_settled_items(page, {
         name: 'the column menu',
         start: () => add_sort('Shift+Alt+A', 0),
         settled: () => expect(page.getByRole('button', { name: /^Sort key 1: Name, ascending/ })).toHaveCount(1),
         open: () => open_column_menu(page, 0),
         item: 'Clear sort on this column',
+        live_in_flight: true,
     });
 });
 
@@ -1633,7 +1667,7 @@ test('a workbook menu opened while its only sort is cleared offers the items it 
     const cleared = () => expect(sort_chips(page)).toHaveCount(0);
     // With the sort cleared the view offers "Use row as header": shown,
     // disabled, while the change is in flight.
-    for (const { name, open, item, absent } of [
+    for (const { name, open, item, absent, live_in_flight } of [
         { name: 'the row menu', open: () => open_row_menu(page, 0), item: 'Use row as header' },
         { name: 'the row menu', open: () => open_row_menu(page, 1), item: 'Hide row' },
         { name: 'the cell menu', open: () => open_cell_hide_menu(page), item: 'Hide row' },
@@ -1642,11 +1676,14 @@ test('a workbook menu opened while its only sort is cleared offers the items it 
             open: () => open_column_menu(page, 1),
             item: 'Sort ascending',
             absent: ['Clear sort on this column', 'Clear all sorts'],
+            live_in_flight: true,
         },
     ]) {
         await sort_by_column(page);
         await expect_menu_offers_settled_items(page, {
-            name, start: clear_sorts, settled: cleared, open, item, ...(absent ? { absent } : {}),
+            name, start: clear_sorts, settled: cleared, open, item,
+            ...(absent ? { absent } : {}),
+            ...(live_in_flight ? { live_in_flight } : {}),
         });
     }
 });
@@ -1659,6 +1696,7 @@ test('a workbook menu opened while a sort is cancelled keeps its items as the ca
     await focus_cell(page, 1, 1);
     await page.keyboard.press('Shift+Alt+0');
     await expect(sort_chips(page)).toHaveCount(0);
+    await view_change_ended(page);
     const add_sort = async () => {
         await focus_cell(page, 1, 1);
         await page.keyboard.press('Shift+Alt+A');
@@ -1687,6 +1725,7 @@ test('a workbook menu opened while a sort is cancelled keeps its items as the ca
         open: () => open_column_menu(page, 1),
         item: 'Sort ascending',
         absent: ['Clear sort on this column', 'Clear all sorts'],
+        live_in_flight: true,
     });
     await expect(sort_chips(page)).toHaveCount(0);
 });
