@@ -1494,8 +1494,9 @@ async function sort_by_column(page: Page, column = 1): Promise<void> {
  * closing the menu; the same menu opened afterwards lists the same items,
  * `item` now enabled.
  *
- * A sort or filter item is enabled throughout (`live_in_flight`): a new choice
- * replaces the person's own request in flight (docs/plans/window-queue.md, V1).
+ * A sort, filter, or Hide rows item is enabled throughout (`live_in_flight`): a
+ * new choice replaces the person's own request in flight
+ * (docs/plans/window-queue.md, V1 and V2).
  */
 async function expect_menu_offers_settled_items(page: Page, options: {
     name: string;
@@ -1649,6 +1650,7 @@ test('a workbook menu opened while a sort is added offers the items it offers on
         settled: () => expect(sort_chips(page)).toHaveCount(1),
         open: () => open_row_menu(page, 0),
         item: 'Hide row',
+        live_in_flight: true,
         absent: ['Use row as header'],
     });
     await expect_menu_offers_settled_items(page, {
@@ -1657,6 +1659,7 @@ test('a workbook menu opened while a sort is added offers the items it offers on
         settled: () => expect(page.getByRole('button', { name: /^Sort key 1: Name, descending/ })).toHaveCount(1),
         open: () => open_cell_hide_menu(page),
         item: 'Hide row',
+        live_in_flight: true,
     });
     // The column's own sort items follow the sort that is landing, and stay
     // enabled: a new choice replaces it.
@@ -1682,8 +1685,8 @@ test('a workbook menu opened while its only sort is cleared offers the items it 
     // disabled, while the change is in flight.
     for (const { name, open, item, absent, live_in_flight } of [
         { name: 'the row menu', open: () => open_row_menu(page, 0), item: 'Use row as header' },
-        { name: 'the row menu', open: () => open_row_menu(page, 1), item: 'Hide row' },
-        { name: 'the cell menu', open: () => open_cell_hide_menu(page), item: 'Hide row' },
+        { name: 'the row menu', open: () => open_row_menu(page, 1), item: 'Hide row', live_in_flight: true },
+        { name: 'the cell menu', open: () => open_cell_hide_menu(page), item: 'Hide row', live_in_flight: true },
         {
             name: 'the column menu',
             open: () => open_column_menu(page, 1),
@@ -1725,12 +1728,14 @@ test('a workbook menu opened while a sort is cancelled keeps its items as the ca
         change: add_sort,
         open: () => open_row_menu(page, 1),
         item: 'Hide row',
+        live_in_flight: true,
     });
     await expect_menu_steady_through_cancel(page, {
         name: 'the cell menu',
         change: add_sort,
         open: () => open_cell_hide_menu(page),
         item: 'Hide row',
+        live_in_flight: true,
     });
     await expect_menu_steady_through_cancel(page, {
         name: 'the column menu',

@@ -11,11 +11,13 @@ import type { ElectronApplication, Page } from '@playwright/test';
 import { history_menu_item, type HistoryMenuState } from '../main/history-menu-model';
 import { isolated_user_data } from './smoke-helpers';
 import {
+    choose,
     exit_app,
     install_dialog_capture,
     install_history_menu_capture,
     launch_structural_viewer,
     open_column_menu,
+    open_row_menu,
     take_dialogs,
     wait_for_grid,
 } from './structure-helpers';
@@ -92,7 +94,7 @@ const redo_label = () => menu_label('redo');
  * is the real one, found by its id, and its click routes on the window it is
  * given (`route_edit_command`), so it is given the viewer.
  */
-async function click_edit_item(label: 'Undo Sort' | 'Redo Sort'): Promise<void> {
+async function click_edit_item(label: string): Promise<void> {
     const direction = label.startsWith('Undo') ? 'undo' : 'redo';
     await expect.poll(() => menu_label(direction)).toBe(label);
     const clicked = await app!.evaluate(({ BrowserWindow, Menu }, id) => {
@@ -170,5 +172,49 @@ test('a second sort during the first replaces it as one step, and Undo during a 
     await click_edit_item('Redo Sort');
     await expect.poll(() => shown_first_row(page), { timeout: 60_000 })
         .toBe(first_row(2, 'descending'));
+    expect((await take_dialogs(app)).map((dialog) => dialog.message)).toEqual([]);
+});
+
+test('Hide rows during a sort keeps both as one step, and one Undo takes both back', async () => {
+    test.setTimeout(240_000);
+    const file = path.join(test_root, 'large.csv');
+    write_table(file);
+    const user_data_dir = path.join(test_root, 'user-data');
+    fs.mkdirSync(user_data_dir, { recursive: true });
+    const launched = await launch_structural_viewer(user_data_dir, file);
+    app = launched.app;
+    const page = launched.page;
+    await install_dialog_capture(app);
+    await install_history_menu_capture(app);
+    await wait_for_grid(page);
+    const natural = '1|7919|104729';
+    await expect.poll(() => shown_first_row(page), { timeout: 60_000 }).toBe(natural);
+    const hidden_count = page.getByText(/^\d+ hidden rows?$/);
+
+    // A sort, and while it computes, Hide row on the first row as it is shown.
+    // The sort computes for about 2 s; the hide is chosen well within that, and
+    // each step checks the sort is still in flight and the rows still in order.
+    await choose_sort(page, 1, 'ascending');
+    await expect(in_flight(page)).toBeVisible();
+    const row_menu = await open_row_menu(page, 0);
+    await expect(in_flight(page)).toBeVisible();
+    expect(await shown_first_row(page)).toBe(natural);
+    // Enabled during the person's own sort, as the sort items are.
+    await choose(row_menu, 'Hide row');
+
+    // One step for both: the sort, without the hidden row.
+    await expect.poll(undo_label).toBe('Undo Change view');
+    await expect.poll(() => shown_first_row(page), { timeout: 60_000 }).toBe(first_row(1, 'ascending'));
+    await expect(in_flight(page)).toHaveCount(0, { timeout: 60_000 });
+    await expect(hidden_count).toHaveText('1 hidden row');
+    await expect.poll(undo_label).toBe('Undo Change view');
+
+    // One Undo takes both back.
+    await click_edit_item('Undo Change view');
+    await expect.poll(() => shown_first_row(page), { timeout: 60_000 }).toBe(natural);
+    await expect(in_flight(page)).toHaveCount(0, { timeout: 60_000 });
+    await expect(hidden_count).toHaveCount(0);
+    await expect.poll(undo_label).toBe('Undo');
+    await expect.poll(redo_label).toBe('Redo Change view');
     expect((await take_dialogs(app)).map((dialog) => dialog.message)).toEqual([]);
 });
