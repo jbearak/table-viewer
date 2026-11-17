@@ -546,6 +546,8 @@ For N2, "long" means it can exceed 1 s on a file the app supports.
    - A transform with more hidden rows than can be saved is refused with "Too many hidden rows to persist." Today the host cuts the list silently.
    - While a hide's request computes, and while a Redo of a hide does, the toolbar says "Hiding rows…", not "Filtering…" or "Sorting…".
    - Undo or Cancel of a hide alone says "Filtering…" while it computes, or "Sorting…" on a sorted sheet, as Unhide all does today.
+   - A sort or filter still computing after a newer choice was refused is named by what it asks for ("Sorting…"), not "Applying sort & filters…".
+   - "Only changed rows" stays on when a snapshot's durable rules, which never carry it, arrive before a hide, Unhide all, or a refusal's fallback. Today Unhide all after such a snapshot turns it off.
 
 Message wording stays the same. Existing messages appear in new places only in changes 2 and 5.
 

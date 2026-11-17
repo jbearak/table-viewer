@@ -23914,9 +23914,10 @@ describe('view steps in history', () => {
             const second = await ask(post_message, { sort: SORT_ASC, filters: [FILTER] });
             await refuse(second!);
 
-            // The first still computes: the indicator, Cancel, and the held cells stay.
+            // The first still computes: the indicator, named for it, Cancel,
+            // and the held cells stay.
             expect(props().transform_pending).toBe(true);
-            expect(document.querySelector('.toolbar-progress')?.textContent).toBe('Applying sort & filters…');
+            expect(document.querySelector('.toolbar-progress')?.textContent).toBe('Sorting…');
             expect(cells_editable()).toEqual(HELD);
             await install(first!);
 
@@ -24276,6 +24277,45 @@ describe('view steps in history', () => {
                 .toMatchObject({ sort: SORT_ASC, filters: [FILTER], hiddenRows: [1] });
         });
 
+        it('keeps "Only changed rows" in a hide chosen after a snapshot without it', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await change_view(post_message, { sort: [], filters: [], onlyChangedRows: true });
+            // The durable rules never carry the session toggle; the rows, on
+            // the same basis, are the view on screen, toggle and all.
+            await dispatch_host_message(refresh_snapshot_message(table_meta(), {
+                generation: view_generation,
+                sourceGeneration: 1,
+                reason: 'other',
+                capabilities: CSV,
+                state: { transforms: [{ sort: [], filters: [], schema: SCHEMA }] },
+            }));
+
+            await hide_rows(post_message, [{ start: 1, end: 1 }]);
+
+            expect(latest_transform_request(post_message).state)
+                .toMatchObject({ hiddenRows: [1], onlyChangedRows: true });
+        });
+
+        it('keeps "Only changed rows" in an Unhide all chosen after a snapshot without it', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await change_view(post_message, { sort: [], filters: [], hiddenRows: [1], onlyChangedRows: true });
+            await dispatch_host_message(refresh_snapshot_message(table_meta(), {
+                generation: view_generation,
+                sourceGeneration: 1,
+                reason: 'other',
+                capabilities: CSV,
+                state: { transforms: [{ sort: [], filters: [], hiddenRows: [1], schema: SCHEMA }] },
+            }));
+
+            await click_button('Unhide all');
+
+            const unhide = latest_transform_request(post_message);
+            expect(unhide.state.hiddenRows ?? []).toEqual([]);
+            expect(unhide.state.onlyChangedRows).toBe(true);
+        });
+
         it('keeps "Only changed rows" in a hide\'s answer after a refused sort and a snapshot without it', async () => {
             const { post_message } = await render_app();
             await open(post_message);
@@ -24560,6 +24600,18 @@ describe('view steps in history', () => {
             await hide_rows_unanswered(post_message, [{ start: 1, end: 1 }]);
 
             expect(document.querySelector('.toolbar-progress')?.textContent).toBe('Hiding rows…');
+        });
+
+        it('says it is sorting while an older sort computes past a newer one refused, a hide resolving', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+
+            await ask(post_message, { sort: SORT_ASC, filters: [] });
+            await hide_rows_unanswered(post_message, [{ start: 1, end: 1 }]);
+            const newer = await ask(post_message, { sort: [{ colIndex: 1, direction: 'desc' }], filters: [] });
+            await refuse(newer!);
+
+            expect(document.querySelector('.toolbar-progress')?.textContent).toBe('Sorting…');
         });
 
         it('says it is hiding rows once the sort beside the hide has installed', async () => {

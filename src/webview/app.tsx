@@ -3346,7 +3346,7 @@ export function App(): React.JSX.Element {
     const requested_rules = (sheet_index: number): SheetTransformState | undefined => {
         const pending = view_action_ref.current;
         if (pending !== undefined && pending.action.sheetIndex === sheet_index) return pending.action.requested;
-        return pending_transform_states_ref.current[sheet_index] ?? state_ref.current.transforms?.[sheet_index];
+        return pending_transform_states_ref.current[sheet_index] ?? installed_rules_on_screen(sheet_index);
     };
     /** `publish_history_menu_state`, declared further down: the Edit menu names the action. */
     const publish_history_menu_ref = useRef<() => void>(() => {});
@@ -7358,9 +7358,9 @@ export function App(): React.JSX.Element {
                 };
                 set_transforms(next_transforms);
                 // The gesture landed: its step is what it changed, from the
-                // rules it was composed against to the rules installed. Hide
-                // rows learns its source rows here. A view action's step waits
-                // for the host to settle everything the action sent (I2, I3).
+                // rules it was composed against to the rules installed. A view
+                // action's step waits for the host to settle everything the
+                // action sent (I2, I3).
                 if (view_request !== undefined && view_request.replay === undefined && !action_owned) {
                     record_view_step(transform_view_step(
                         view_request.worksheet,
@@ -10858,7 +10858,7 @@ export function App(): React.JSX.Element {
             const action = pending_action?.action ?? begin_view_action(
                 active_sheet_index,
                 schema,
-                state_ref.current.transforms?.[active_sheet_index],
+                installed_rules_on_screen(active_sheet_index),
             );
             const request_id = request_transform(
                 active_sheet_index,
@@ -11067,10 +11067,12 @@ export function App(): React.JSX.Element {
         const pending_action = view_action_ref.current?.action.sheetIndex === sheet_index
             ? view_action_ref.current
             : undefined;
+        // From what is on screen, compare toggle included: the answer composes
+        // onto it, and durable rules a snapshot brought never carry the toggle.
         const action = pending_action?.action ?? begin_view_action(
             sheet_index,
             schema,
-            state_ref.current.transforms?.[sheet_index],
+            installed_rules_on_screen(sheet_index),
         );
         view_action_ref.current = {
             action: resolve_in_view_action(action, request_id, rows),
@@ -13996,10 +13998,35 @@ export function App(): React.JSX.Element {
     );
     // A transform in flight only disables promotion (see the prop below).
     const promote_row_blocked = !!excel_header && excel_header_change_pending;
-    // Nothing of the sheet's action is out but hides asking for their rows.
-    const hiding_rows_only = view_action_ref.current?.action.sheetIndex === active_sheet_index
-        && view_action_ref.current.action.resolving.length > 0
-        && pending_transform_request_ids_ref.current[active_sheet_index] === undefined;
+    const sheet_action = view_action_ref.current?.action.sheetIndex === active_sheet_index
+        ? view_action_ref.current.action
+        : undefined;
+    // Whether a request of the sheet is still computing: the newest one in
+    // flight, or one of the action not yet on screen, still computing after a
+    // newer one was refused, whose label went with the newer one. A request
+    // installed and not yet settled computes nothing more.
+    const installed_on_screen = installed_rules_on_screen(active_sheet_index);
+    const sheet_request_computing = pending_transform_request_ids_ref.current[active_sheet_index] !== undefined
+        || (sheet_action !== undefined
+            && !sheet_action.cancelled
+            && sheet_action.requests.some((request) => !request.settled)
+            && !transforms_semantically_equal(installed_on_screen, sheet_action.requested));
+    // Nothing of the sheet's action computes but hides asking for their rows.
+    const hiding_rows_only = sheet_action !== undefined
+        && sheet_action.resolving.length > 0
+        && !sheet_request_computing;
+    // What the toolbar says the sheet is doing; a request whose label went
+    // with a newer one is named from what the action asks for.
+    const transform_progress = hiding_rows_only
+        ? 'Hiding rows…'
+        : pending_transform_labels[active_sheet_index]
+            || (sheet_action !== undefined && sheet_request_computing
+                ? transform_progress_label(
+                    installed_on_screen ?? EMPTY_TRANSFORM,
+                    sheet_action.requested,
+                    'user',
+                )
+                : undefined);
     // While this sheet's sort, filter, or Hide rows is in flight, the menus
     // offer items by the rules it will install, so nothing appears or vanishes
     // under the pointer when it lands. A hide still asking for its rows adds
@@ -14609,7 +14636,7 @@ export function App(): React.JSX.Element {
                 transform_disabled={transform_ui_blocked}
                 transform_pending={transform_pending}
                 transform_choice_pending={transform_choice_pending}
-                transform_progress={hiding_rows_only ? 'Hiding rows…' : pending_transform_labels[active_sheet_index]}
+                transform_progress={transform_progress}
                 hidden_rows={{
                     count: hidden_row_count,
                     pending: transform_choice_pending,
