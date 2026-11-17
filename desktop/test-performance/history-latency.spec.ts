@@ -130,6 +130,19 @@ function write_small(file: string): void {
  * Click a sort item; answers the click's time in the page. `before_click` runs
  * once the item is offered enabled, just before the click.
  */
+/** Note the time of the page's next click, read back by `last_click_time`. */
+async function arm_click_time(page: Page): Promise<void> {
+    await page.evaluate(() => {
+        document.addEventListener('click', (event) => {
+            (globalThis as unknown as Record<string, unknown>).__last_click = event.timeStamp;
+        }, { capture: true, once: true });
+    });
+}
+
+async function last_click_time(page: Page): Promise<number> {
+    return page.evaluate(() => (globalThis as unknown as Record<string, unknown>).__last_click as number);
+}
+
 async function click_sort(
     page: Page,
     column: number,
@@ -140,14 +153,10 @@ async function click_sort(
     const entry = menu.getByRole('menuitemcheckbox', { name: `Sort ${direction}` });
     await expect(entry).not.toHaveAttribute('aria-disabled', 'true');
     await before_click?.();
-    await page.evaluate(() => {
-        document.addEventListener('click', (event) => {
-            (globalThis as unknown as Record<string, unknown>).__last_click = event.timeStamp;
-        }, { capture: true, once: true });
-    });
+    await arm_click_time(page);
     await entry.click();
     await expect(menu).toHaveCount(0);
-    return page.evaluate(() => (globalThis as unknown as Record<string, unknown>).__last_click as number);
+    return last_click_time(page);
 }
 
 async function post_history(page: Page, command: 'undo' | 'redo'): Promise<number> {
@@ -461,8 +470,9 @@ test('a 1M-row sort: Undo before it installs, and a second sort during the first
     await expect(popover).toBeVisible();
     await popover.locator('#filter-condition').selectOption('contains');
     await popover.getByLabel('Filter value').fill('7');
-    const apply_at = await page.evaluate(() => performance.now());
+    await arm_click_time(page);
     await popover.getByRole('button', { name: 'Apply' }).click();
+    const apply_at = await last_click_time(page);
     await expect(popover).toHaveCount(0);
     await release_host_messages();
     const late_filter = (await wait_mark(page, 'tv:view-action-ended', apply_at)).startTime - apply_at;
@@ -474,8 +484,9 @@ test('a 1M-row sort: Undo before it installs, and a second sort during the first
 
     // Recorded only: Hide rows on the large table, to the host's settlement.
     const row_menu = await open_row_menu(page, 0);
-    const hide_at = await page.evaluate(() => performance.now());
+    await arm_click_time(page);
     await choose(row_menu, 'Hide row');
+    const hide_at = await last_click_time(page);
     const hide = (await wait_mark(page, 'tv:view-request-settled', hide_at)).startTime - hide_at;
     await settled(page);
     since = await post_history(page, 'undo');
