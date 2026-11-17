@@ -86,16 +86,6 @@ const undo_label = () => menu_label('undo');
 const redo_label = () => menu_label('redo');
 
 /**
- * Click the Edit menu's Undo or Redo item, as the native menu would, once the
- * item reads `label` by the menu's own label rule.
- *
- * Read through the capture above, not off the native menu: main.ts rebuilds
- * the menu only for the focused window, and a smoke run cannot count on its
- * window being in front (desktop-smoke.spec.ts covers the rebuild). The item
- * is the real one, found by its id, and its click routes on the window it is
- * given (`route_edit_command`), so it is given the viewer.
- */
-/**
  * Keep the page's next sort or filter request from reaching the host until the
  * page asks which source rows a hide hides. The two then reach the host back to
  * back, the sort first, so the host answers the hide while the sort computes,
@@ -126,6 +116,16 @@ async function withhold_transform_until_hide(): Promise<void> {
     }, CHANNEL_WEBVIEW_MESSAGE);
 }
 
+/**
+ * Click the Edit menu's Undo or Redo item, as the native menu would, once the
+ * item reads `label` by the menu's own label rule.
+ *
+ * Read through the capture above, not off the native menu: main.ts rebuilds
+ * the menu only for the focused window, and a smoke run cannot count on its
+ * window being in front (desktop-smoke.spec.ts covers the rebuild). The item
+ * is the real one, found by its id, and its click routes on the window it is
+ * given (`route_edit_command`), so it is given the viewer.
+ */
 async function click_edit_item(label: string): Promise<void> {
     const direction = label.startsWith('Undo') ? 'undo' : 'redo';
     await expect.poll(() => menu_label(direction)).toBe(label);

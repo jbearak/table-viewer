@@ -341,7 +341,7 @@ export function ordered_skips(found: ReadonlySet<ViewSkipReason>): ViewSkipReaso
  *    (the host requires the first and refuses the second);
  *  - hiding a row past the end of the worksheet, and hiding at all when the
  *    set would pass `MAX_PERSISTED_HIDDEN_ROWS` (the host drops the first and
- *    truncates at the second).
+ *    refuses the second).
  */
 export function transform_replay_target(
     delta: TransformViewDelta,

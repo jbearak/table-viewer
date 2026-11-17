@@ -10812,6 +10812,8 @@ export function App(): React.JSX.Element {
                 worksheet: pending_action?.worksheet ?? worksheet,
                 schema: pending_action?.schema ?? schema,
                 initialBaseline: pending_action?.initialBaseline ?? action.baseline,
+                // The newest choice decides a press behind the action: a sort
+                // or hide refused before it no longer does (`hide_refused` goes).
                 refused: false,
                 origin,
             };
@@ -10832,6 +10834,10 @@ export function App(): React.JSX.Element {
 
     /** Per resolving hide, the timer that ends it unanswered (V2). */
     const resolution_timers_ref = useRef(new Map<string, number>());
+    useEffect(() => () => {
+        for (const timer of resolution_timers_ref.current.values()) window.clearTimeout(timer);
+        resolution_timers_ref.current.clear();
+    }, []);
 
     /**
      * A resolving hide is over without a choice: refused, unanswered, or its
@@ -10848,20 +10854,22 @@ export function App(): React.JSX.Element {
         const taken = take_resolution(pending.action, request_id);
         if (taken === undefined) return;
         // A hide that came to nothing is a refused gesture for a press behind
-        // it, decided when the action ends, whenever that is (I5).
-        const hide_refused = true;
+        // it, decided when the action ends, whenever that is (I5), unless a
+        // later choice decides it, as after a refused sort.
         if (!view_action_idle(taken)) {
-            view_action_ref.current = { ...pending, action: taken, hide_refused };
+            view_action_ref.current = { ...pending, action: taken, hide_refused: true };
             publish_history_menu_ref.current();
             return;
         }
         end_view_action(
-            { ...pending, action: taken, hide_refused },
+            { ...pending, action: taken, hide_refused: true },
             taken.baseline,
             state_ref.current.transforms?.[taken.sheetIndex],
             request_id,
         );
     }, [end_view_action]);
+    const end_resolution_ref = useRef(end_resolution);
+    end_resolution_ref.current = end_resolution;
 
     /**
      * The host said which source rows a resolving hide hides, or why not. The
@@ -10925,7 +10933,10 @@ export function App(): React.JSX.Element {
         view_action_ref.current = {
             ...pending,
             action: choose_in_view_action(taken, requested, request_id),
+            // The newest choice decides a press behind the action, as in
+            // `handle_transform_change`: what was refused before it no longer does.
             refused: false,
+            hide_refused: false,
         };
         sync_view_request_pending();
         publish_history_menu_ref.current();
@@ -10998,7 +11009,7 @@ export function App(): React.JSX.Element {
             const still = view_action_ref.current;
             if (still === undefined || take_resolution(still.action, request_id) === undefined) return;
             show_warning(HIDE_RESOLUTION_TIMEOUT_MESSAGE);
-            end_resolution(request_id);
+            end_resolution_ref.current(request_id);
         }, HIDE_RESOLUTION_BOUND_MS));
         sync_view_request_pending();
         publish_history_menu_ref.current();
@@ -11013,7 +11024,6 @@ export function App(): React.JSX.Element {
     }, [
         active_sheet_index,
         drop_presses_for_choice,
-        end_resolution,
         inserted_rows_refuse_transform,
         show_warning,
         sync_view_request_pending,
@@ -11201,7 +11211,12 @@ export function App(): React.JSX.Element {
                 show_warning(VIEW_GESTURE_WAIT_MESSAGE);
                 return;
             }
-            if (!view_gesture_may_start(active_sheet_index)) {
+            // Every gate `handle_transform_change` makes, so the hides are not
+            // dropped for an Unhide all it then refuses.
+            if (
+                !view_gesture_may_start(active_sheet_index)
+                || inserted_rows_refuse_transform(active_sheet_index)
+            ) {
                 keep_dropped_press();
                 return;
             }
@@ -11241,6 +11256,7 @@ export function App(): React.JSX.Element {
         end_view_action,
         enqueue_excel_header_change,
         handle_transform_change,
+        inserted_rows_refuse_transform,
         meta,
         show_warning,
         transforms,

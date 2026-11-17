@@ -24328,6 +24328,27 @@ describe('view steps in history', () => {
             expect(undo_labels()).toEqual([]);
         });
 
+        it('lets a Redo run behind a choice made after a hide came to nothing, when the choice installs no step', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await redo_available(post_message);
+
+            await ask(post_message, { sort: SORT_ASC, filters: [] });
+            const question = await hide_rows_unanswered(post_message, [{ start: 1, end: 1 }]);
+            await answer_hide(question!, 'The view changed before this table view request arrived.');
+            // The newest choice decides the press, as after a refused sort (V1).
+            const clear = await ask(post_message, { sort: [], filters: [] });
+            await redo();
+            expect(press_held()).toBe(true);
+            await install(clear!);
+
+            expect(press_held()).toBe(false);
+            expect(undo_labels()).toEqual([]);
+            const replay = latest_transform_request(post_message);
+            expect(replay.requestId).not.toBe(clear!.requestId);
+            expect(replay.state.filters).toEqual([FILTER]);
+        });
+
         it('builds the controls from what the action asks for, after a change made elsewhere while a hide resolved', async () => {
             const { post_message } = await render_app();
             await open(post_message);
@@ -24373,18 +24394,21 @@ describe('view steps in history', () => {
             expect(document.querySelector('.toolbar-progress')?.textContent).toBe('Hiding rows…');
         });
 
-        it('forgets a hide still resolving when a new source arrives, and its time finds nothing', async () => {
+        it.each([
+            ['a new source arrives', () => refresh_snapshot_message(table_meta(), {
+                generation: 2,
+                sourceGeneration: 2,
+                reason: 'fileReload',
+                capabilities: CSV,
+            })],
+            ['the document is replaced', () => initial_snapshot_message(table_meta(), { capabilities: CSV })],
+        ])('forgets a hide still resolving when %s, and its time finds nothing', async (_name, snapshot) => {
             const { post_message } = await render_app();
             await open(post_message);
             vi.useFakeTimers();
             try {
                 const question = await hide_rows_unanswered(post_message, [{ start: 1, end: 1 }]);
-                await dispatch_host_message(refresh_snapshot_message(table_meta(), {
-                    generation: 2,
-                    sourceGeneration: 2,
-                    reason: 'fileReload',
-                    capabilities: CSV,
-                }));
+                await dispatch_host_message(snapshot());
                 expect(props().transform_pending).toBe(false);
                 await act(async () => { vi.advanceTimersByTime(5_000); });
                 await answer_hide(question!, [1]);

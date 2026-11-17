@@ -7209,56 +7209,6 @@ describe('CSV edit sessions', () => {
     // transform inside the medium's write, proves the reopening panel cannot even read
     // durable state there, and then proves the order it does get is the harmless one —
     // the rules arrive *with* the session's first view, never as a change to it.
-    it('answers which source rows a hide hides while a sort is still in flight, by the rows before it', async () => {
-        // The sort's durable write is held, so it has not installed: the
-        // resolution is answered meanwhile, against the mapping still in place.
-        const file_path = '/tmp/resolve-during-transform.csv';
-        let blob: unknown = {};
-        const write_started = deferred();
-        const write_gate = deferred();
-        let arm = false;
-        const store = create_authority_store({
-            runtime_key: {},
-            read: () => blob,
-            write: async (envelope) => {
-                if (arm && JSON.stringify(envelope).includes('"direction"')) {
-                    arm = false;
-                    write_started.resolve();
-                    await write_gate.promise;
-                }
-                blob = envelope;
-            },
-        });
-        const bytes = enc.encode('h\nc\na\nb\n');
-        vscode_mock.__setStatImplementation(async () => ({ size: bytes.byteLength, mtime: 1 }));
-        vscode_mock.__setReadFileImplementation(async () => bytes);
-        const panel = open_csv_table(uri(file_path), store);
-        await panel.__receive({ type: 'ready' });
-        const snapshot = latest_snapshot(panel);
-        arm = true;
-        const sort = panel.__receive({
-            type: 'setTransform', sheetIndex: 0, requestId: 'sort',
-            generation: snapshot.generation, sourceGeneration: snapshot.sourceGeneration,
-            intent: 'user',
-            state: { sort: [{ colIndex: 0, direction: 'asc' }], filters: [], schema: '["Sheet1",1,["h"]]' },
-        });
-        await write_started.promise;
-
-        await panel.__receive({
-            type: 'resolveHiddenRows', sheetIndex: 0, requestId: 'hide',
-            displayRows: [{ start: 0, end: 0 }],
-            mappingGeneration: snapshot.mappingGenerations[0],
-            sourceGeneration: snapshot.sourceGeneration,
-        });
-        const answers = () => (panel.__messages as any[]).filter((message) => message.type === 'hiddenRowsResolved');
-        // Display row 0 is still source row 0, c: the sort has not moved it.
-        expect(answers()).toEqual([{ type: 'hiddenRowsResolved', sheetIndex: 0, requestId: 'hide', sourceRows: [0] }]);
-        expect((panel.__messages as any[]).some((message) => message.type === 'transformInstalled')).toBe(false);
-
-        write_gate.resolve();
-        await sort;
-    });
-
     it('rehydrates over a transform whose durable write is still in flight, never under it', async () => {
         const file_path = '/tmp/sibling-transform-write-after-rehydrate.csv';
         let blob: unknown = {};
@@ -7404,6 +7354,56 @@ describe('CSV edit sessions', () => {
         // No transform traffic of its own: this panel neither requested nor was refused
         // one, so the rules it holds arrived only through the projection above.
         expect(transform_answers(reopened)).toEqual([]);
+    });
+
+    it('answers which source rows a hide hides while a sort is still in flight, by the rows before it', async () => {
+        // The sort's durable write is held, so it has not installed: the
+        // resolution is answered meanwhile, against the mapping still in place.
+        const file_path = '/tmp/resolve-during-transform.csv';
+        let blob: unknown = {};
+        const write_started = deferred();
+        const write_gate = deferred();
+        let arm = false;
+        const store = create_authority_store({
+            runtime_key: {},
+            read: () => blob,
+            write: async (envelope) => {
+                if (arm && JSON.stringify(envelope).includes('"direction"')) {
+                    arm = false;
+                    write_started.resolve();
+                    await write_gate.promise;
+                }
+                blob = envelope;
+            },
+        });
+        const bytes = enc.encode('h\nc\na\nb\n');
+        vscode_mock.__setStatImplementation(async () => ({ size: bytes.byteLength, mtime: 1 }));
+        vscode_mock.__setReadFileImplementation(async () => bytes);
+        const panel = open_csv_table(uri(file_path), store);
+        await panel.__receive({ type: 'ready' });
+        const snapshot = latest_snapshot(panel);
+        arm = true;
+        const sort = panel.__receive({
+            type: 'setTransform', sheetIndex: 0, requestId: 'sort',
+            generation: snapshot.generation, sourceGeneration: snapshot.sourceGeneration,
+            intent: 'user',
+            state: { sort: [{ colIndex: 0, direction: 'asc' }], filters: [], schema: '["Sheet1",1,["h"]]' },
+        });
+        await write_started.promise;
+
+        await panel.__receive({
+            type: 'resolveHiddenRows', sheetIndex: 0, requestId: 'hide',
+            displayRows: [{ start: 0, end: 0 }],
+            mappingGeneration: snapshot.mappingGenerations[0],
+            sourceGeneration: snapshot.sourceGeneration,
+        });
+        const answers = () => (panel.__messages as any[]).filter((message) => message.type === 'hiddenRowsResolved');
+        // Display row 0 is still source row 0, c: the sort has not moved it.
+        expect(answers()).toEqual([{ type: 'hiddenRowsResolved', sheetIndex: 0, requestId: 'hide', sourceRows: [0] }]);
+        expect((panel.__messages as any[]).some((message) => message.type === 'transformInstalled')).toBe(false);
+
+        write_gate.resolve();
+        await sort;
     });
 
     it('persists the owning panel\'s own transform requested during its own session', async () => {
