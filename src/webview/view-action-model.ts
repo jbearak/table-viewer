@@ -357,6 +357,12 @@ function live_request(action: ViewAction): ViewActionRequest | undefined {
 export function resolve_in_view_action(action: ViewAction, request_id: string, rows: number): ViewAction {
     return {
         ...action,
+        // After a cancel the action is back at its baseline, and what it asks
+        // for, the toggle the cancel kept, is measured from there, as a choice
+        // after a cancel is (`choose_in_view_action`).
+        ...(action.cancelled
+            ? { delta: view_action_delta(rules_or_empty(action.baseline), action.requested) }
+            : {}),
         cancelled: false,
         resolving: [...action.resolving, { requestId: request_id, rows }],
     };

@@ -316,6 +316,15 @@ describe('a hide resolving in a view action', () => {
         expect(take_resolution(cancel_view_action(action, 'C'), 'H')).toBeUndefined();
     });
 
+    it('keeps the toggle a cancel kept when a hide made after it meets a change made elsewhere', () => {
+        let action = begin_view_action(0, schema, undefined);
+        action = choose_in_view_action(action, { ...by_a, onlyChangedRows: true }, 'A');
+        action = cancel_view_action(action, 'C');
+        action = resolve_in_view_action(action, 'H', 1);
+        const moved = refresh_view_action(action, filtered, undefined);
+        expect(moved.action.requested).toEqual({ ...filtered, onlyChangedRows: true });
+    });
+
     it('is a choice after a cancel: the action is no longer cancelled', () => {
         let action = begin_view_action(0, schema, undefined);
         action = choose_in_view_action(action, by_a, 'A');

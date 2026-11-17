@@ -15112,9 +15112,10 @@ export function attach_viewer(
              * the window holds its other gestures until the answer, and records the
              * resize in undo history from it. `applied` is decided by the write alone.
              *
-             * The display→source mapping and the generation pair guarding it are
-             * `hideRows`'s, because the request names rows in a coordinate space only
-             * one specific permutation defines.
+             * The display→source mapping and the generation pair guarding it are the
+             * ones Hide rows used to send, before `resolveHiddenRows` moved to the
+             * sheet's mapping generation, because the request names rows in a
+             * coordinate space only one specific permutation defines.
              *
              * Currency is the generation pair *plus the authority half* of
              * `layout_write_is_current`, and deliberately not that predicate whole. The
@@ -15159,8 +15160,8 @@ export function attach_viewer(
              * and the webview's overlay lifecycle is scoped the same way, so the two
              * halves agree about which requests die.
              *
-             * No preview-mode refusal, unlike `hideRows` directly above, and the difference
-             * is not an oversight. `hideRows` is a *view transform*: it changes which rows
+             * No preview-mode refusal, unlike `resolveHiddenRows` above, and the difference
+             * is not an oversight. Hiding rows is a *view transform*: it changes which rows
              * the view contains, which is a claim about the document that a read-only
              * preview has no business making. A row height changes nothing about row
              * identity or membership — it is layout, in the same class as `columnWidths` and

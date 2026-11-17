@@ -1856,9 +1856,9 @@ export interface GridShellProps {
     transform_waits_for_claim?: boolean;
     transform_pending?: boolean;
     /**
-     * Whether the sort and filter controls wait: a hide, a replay, or a restore
-     * is in flight on the sheet. The person's own sort or filter in flight does
-     * not hold them, because a new choice replaces it. Defaults to
+     * Whether the sort, filter, and Hide rows controls wait: a replay or a
+     * restore is in flight on the sheet. The person's own request in flight,
+     * hides included, does not hold them, because a new choice replaces it. Defaults to
      * `transform_pending`.
      */
     transform_choice_pending?: boolean;
