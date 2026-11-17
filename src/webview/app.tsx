@@ -1,4 +1,5 @@
 import { cell_key, parse_cell_key } from '../cell-key';
+import { perf_mark } from './perf-marks';
 import {
     begin_view_action,
     cancel_view_action,
@@ -1135,6 +1136,8 @@ type ReplayLanding = 'applied' | 'unstaged' | 'diverged';
 export function App(): React.JSX.Element {
     const [meta, set_meta] = useState<WorkbookMeta | null>(null);
     const [generation, set_generation] = useState(0);
+    // After the commit that renders it, for the latency spec.
+    useEffect(() => { perf_mark('tv:view-generation-rendered', { generation }); }, [generation]);
     // Bumped on every initial snapshot (a fresh document load — including the
     // preview pane reusing its panel for a different file). Folded into the GridShell key
     // so the row loader remounts clean; a new file can otherwise collide with the
@@ -3994,6 +3997,7 @@ export function App(): React.JSX.Element {
             return;
         }
         view_action_ref.current = undefined;
+        perf_mark('tv:view-action-ended', { requestId: msg.requestId });
         const step = transform_view_step(
             pending.worksheet,
             pending.schema,
@@ -6885,6 +6889,7 @@ export function App(): React.JSX.Element {
             }
 
             if (msg.type === 'transformSettled') {
+                perf_mark('tv:view-request-settled', { requestId: msg.requestId });
                 const settled_action = view_action_ref.current;
                 if (
                     settled_action === undefined
@@ -8045,6 +8050,7 @@ export function App(): React.JSX.Element {
         publish_history_menu_state();
         publish_retained_saved_append_authorities();
         const unsubscribe = history_store_ref.current!.subscribe(() => {
+            perf_mark('tv:history-changed');
             publish_history_menu_state();
             publish_retained_saved_append_authorities();
             set_redo_available(
@@ -9044,6 +9050,7 @@ export function App(): React.JSX.Element {
      * `epoch` it was given when the key was pressed.
      */
     const press_history = useCallback((direction: HistoryDirection, handed_on?: HistoryPress) => {
+        if (handed_on === undefined) perf_mark('tv:press', { direction });
         if (handed_on !== undefined) {
             void run_history_command(handed_on);
             return;
