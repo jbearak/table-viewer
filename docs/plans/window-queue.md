@@ -497,27 +497,48 @@ Written against main at a83ac382 (V2 merged, #396); line numbers are at that com
 
 **The bug.** Sort A installs, and the host settles it, while a newer sort B of the same view action is still out. A source reload then overtakes B. A was installed and saved, and the reload carries it, but A gets no Undo step. Main has had this since V1. The window test "records a sort that installed before a newer sort a reload overtakes" fails on main.
 
-**Why.** A's pending record leaves `pending_view_transforms_ref` when A installs (`app.tsx:4009`), so only the view action remembers that A installed. At a new source the window drops an action that still has a request out (`app.tsx:6377`, the `else` of V2's hides-only branch). B's record is settled by `settle_overtaken_view_requests` (`app.tsx:2375`), which records B's step from the baseline only if the snapshot shows B's own target (`overtaken_transform_step`). It doesn't, so nothing is recorded, and a press waiting behind B is dropped.
+**Why.** The sheet keeps one pending record, `pending_view_transforms_ref`, which describes its newest request. Sending B replaced A's record (`app.tsx:4009`), so only the view action remembers that A installed. The record also goes when the newest request installs (`app.tsx:7177`) or is refused (`app.tsx:6983`). At a new source the window drops an action that still has a request out (`app.tsx:6377`, the `else` of V2's hides-only branch). B's record is settled by `settle_overtaken_view_requests` (`app.tsx:2375`), which records B's step only if the snapshot shows B's own target (`overtaken_transform_step`). It doesn't, so nothing is recorded, and the press waiting behind B is dropped (`app.tsx:2443`).
 
-**The rule.** At a new source, an action that still has a request out hands what it had installed under the old source to the overtaken settlement. That applies when what was installed differs from its baseline by a step (`transform_view_step`, which ignores the compare toggle). `state_ref` still holds the old source's rules there, as V2's hides-only branch uses. The installed rules ride on the action's newest record as `installed`. When the action has no record (its newest request installed and is not settled, or its newest request is a cancel, which keeps none), a record of its own is added: the action's baseline, with `installed` as its target. The settlement then tries, in order:
-1. the request's own target, from the baseline, as today: one step for the whole action when the snapshot shows it;
-2. else what was installed, from the baseline, when the snapshot shows it.
+**The rule.** At a new source, an action that still has a request out hands what it had installed under the old source to the overtaken settlement. That applies when what was installed differs from the action's current baseline by a step (`transform_view_step`, which ignores the compare toggle). `state_ref` still holds the old source's rules there, as V2's hides-only branch uses.
+- If the sheet's record belongs to the action (`view_action_owns`), the window replaces it with a copy before the record is pushed to the overtaken list. The copy's baseline is the action's current baseline, and it carries `installed` when there is one. The baseline is replaced even with nothing installed: another window can move the action's baseline without a resend, when the recomposed target is unchanged (`view-action-model.ts:486`), and a step measured from the old baseline would hold that window's change (I3).
+- If the sheet has no record, the window adds one of its own: the action's worksheet, schema, and current baseline, with `installed` and no target. This happens when the newest request installed and is not settled, the newest was refused, or the newest is a cancel, which keeps no record.
+- A record the action doesn't own is left as it is.
 
-Each is judged by the rule overtaken requests already follow: a step is recorded only if the snapshot shows it, and rows a request would hide are left out (V2). If neither records, the press waiting behind the action is dropped, as today.
+For each record, the settlement makes both tries in one pass:
+1. the request's own target, from the action's current baseline. When the snapshot shows it, that is one step for the whole action, since the target holds everything the action asked for (I6);
+2. otherwise what was installed, from the same baseline (as `end_view_action` uses), when the snapshot shows it. What was installed may be no rules at all, after a Clear sort, which is a step too.
+
+Each try is judged by the rule overtaken requests already follow: a step is recorded only if the snapshot shows it, and rows a request would hide are left out (V2). At most one step is recorded. The press is decided once, after both tries:
+- a recorded step decides it as any recorded overtaken step does today;
+- a record that exists today and records nothing drops it, as today;
+- a record the window added and that records nothing leaves it alone, as today, when no record was settled at all. A cancel that landed therefore keeps the press waiting behind it, as `end_view_action` does for a cancelled action.
 
 **The cases, and what each records:**
 - The reload carries A: A's step.
 - The reload carries B, which had landed: one step from the baseline to B, as today.
 - The reload carries neither: nothing, and the press is dropped, as today.
-- Only "Only changed rows" was installed: no step, since the step ignores the toggle; as today.
-- A cancel is out. If the cancel never landed, the reload carries A, and A's step is recorded, since A is what the person sees and Undo can then take it back. If the cancel landed, the reload carries the baseline, and nothing is recorded.
-- A press waiting behind the action: a recorded step decides it as any recorded overtaken step does today; nothing recorded drops it.
+- Only "Only changed rows" was installed: no step, since the step ignores the toggle, as today.
+- A cancel is out. If it never landed, the reload carries A, and A's step is recorded: A is what the person sees, and Undo can then take it back. If it landed, the reload carries the baseline: nothing is recorded, and the press is left alone.
+- The newest request installed and is not settled: its rules are what was installed, so A's step is recorded if the reload carries them.
+- Another window moved the baseline before the reload: both tries are measured from the moved baseline, so the step holds only this window's change, and Undo keeps the other window's.
+- A hid rows beside its sort: only the sort is recorded (V2's rule).
 
 **Not changed:** a refresh on the same source, V2's branch for an action that has only hides left, replays, column and width writes, and how a step is judged against the snapshot.
 
-**Size.** About 40 lines in `app.tsx`: a field on `PendingViewTransform`, the hand-off in the new-source branch, and the fallback in `settle_overtaken_view_requests`.
+**Size.** About 40 lines in `app.tsx`: two fields on `PendingViewTransform` (`installed`, and `added` for a record the window added), the hand-off in the new-source branch, and the second try in `settle_overtaken_view_requests`.
 
-**Tests first, all in `src/test/app.test.ts`:** each case above, plus a sort beside a hide still composing (V2's case, which already records), and a toggle-only action with a press waiting.
+**Tests first, all in `src/test/app.test.ts`:**
+- the reload carrying A, B, or neither, pinning the order of the tries;
+- a cancel that landed and one that didn't, each with a press waiting;
+- a press waiting when A is recorded, with one step and one decision;
+- the newest request installed and not settled, and late install and settle messages for it after the reload, which record nothing more and decide no press;
+- an installed Clear sort, whose rules are none;
+- the newest refused, with the older request installed;
+- a toggle-only action;
+- another window's change before the reload, with no resend (B's target already held it), and Undo keeping that change;
+- a reload that reorders sheets, and one that changes the columns, with A carried;
+- what was installed holding a sort and newly hidden rows: one sort step, without the rows;
+- a sort beside a hide still composing (V2's case, which already records).
 
 **Proof:** the typecheck and the full unit suite; CI's unfocused smoke list; the undo and redo smoke set, 3 runs; the stress runs under load.
 
