@@ -2358,8 +2358,8 @@ export function App(): React.JSX.Element {
      *    target in every slice it changed; its step is then that difference
      *    and nothing else the refresh carried.
      *  - A gesture that hides rows names source rows, which a reload can
-     *    number anew, so a snapshot cannot say whether it landed. Nothing is
-     *    recorded for it.
+     *    number anew, so the rows it would hide are left out; the rest of
+     *    the request is judged as above.
      *  - A replay moves if the adopted rules hold its target; otherwise its
      *    entry stays and the person is told.
      *  - A column write landed if the sheet's adopted hidden columns are the
