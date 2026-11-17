@@ -319,6 +319,38 @@ describe('a view action', () => {
 });
 
 describe('a hide resolving in a view action', () => {
+    it('keeps another window\'s change when the request sent again onto it is refused', () => {
+        let action = begin_view_action(0, schema, undefined);
+        action = choose_in_view_action(action, by_a, 'A');
+        action = resolve_in_view_action(action, 'H', 1);
+        const refreshed = refresh_view_action(action, filtered, undefined);
+        action = resend_in_view_action(refreshed.action, 'A2');
+        // Refused before it took the sheet: A is still out, and still the choice.
+        action = refuse_in_view_action(action, 'A2', filtered);
+
+        expect(action.requested).toEqual(rules({
+            sort: [{ colIndex: 0, direction: 'asc' }],
+            filters: [filter('f1', 2, 'x')],
+        }));
+        expect(action.delta.removals).toEqual([]);
+    });
+
+    it('falls back onto the moved baseline past a newer choice refused after a refresh', () => {
+        let action = begin_view_action(0, schema, undefined);
+        action = choose_in_view_action(action, by_a, 'A');
+        action = resolve_in_view_action(action, 'H', 1);
+        action = refresh_view_action(action, filtered, undefined).action;
+        action = resend_in_view_action(action, 'A2');
+        action = choose_in_view_action(action, rules({ ...by_b, filters: filtered.filters }), 'B');
+        action = refuse_in_view_action(action, 'B', filtered);
+
+        // A2, still out, carries the sort onto the other window's filter.
+        expect(action.requested).toEqual(rules({
+            sort: [{ colIndex: 0, direction: 'asc' }],
+            filters: [filter('f1', 2, 'x')],
+        }));
+    });
+
     it('keeps the action from ending until it is answered, though its other request settled', () => {
         let action = begin_view_action(0, schema, undefined);
         action = choose_in_view_action(action, by_a, 'A');

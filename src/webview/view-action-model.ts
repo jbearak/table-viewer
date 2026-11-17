@@ -203,6 +203,12 @@ export function apply_view_action_delta(
 export interface ViewActionRequest {
     readonly requestId: string;
     readonly target: SheetTransformState;
+    /**
+     * The person's choices it carries, from the baseline: what a fallback to
+     * it applies onto the baseline as it is then, which another window's
+     * change may have moved since it was sent (I3).
+     */
+    readonly delta: ViewActionDelta;
     readonly settled: boolean;
     /** The host refused it: its target is not asked for again (I3). */
     readonly refused?: boolean;
@@ -250,17 +256,18 @@ export function choose_in_view_action(
     requested: SheetTransformState,
     request_id: string,
 ): ViewAction {
+    // After a cancel the action is back at its baseline, so a choice is
+    // measured from there, as its first one was: from the cancel's target it
+    // would miss what that target kept, the compare toggle.
+    const delta = action.cancelled
+        ? view_action_delta(rules_or_empty(action.baseline), requested)
+        : merge_view_action_delta(action.delta, view_action_delta(action.requested, requested));
     return {
         ...action,
         requested,
-        // After a cancel the action is back at its baseline, so a choice is
-        // measured from there, as its first one was: from the cancel's target
-        // it would miss what that target kept, the compare toggle.
-        delta: action.cancelled
-            ? view_action_delta(rules_or_empty(action.baseline), requested)
-            : merge_view_action_delta(action.delta, view_action_delta(action.requested, requested)),
+        delta,
         cancelled: false,
-        requests: [...action.requests, { requestId: request_id, target: requested, settled: false }],
+        requests: [...action.requests, { requestId: request_id, target: requested, delta, settled: false }],
     };
 }
 
@@ -295,7 +302,12 @@ export function cancel_view_action(action: ViewAction, request_id: string, keep_
         delta: EMPTY_DELTA,
         cancelled: true,
         resolving: [],
-        requests: [...action.requests, { requestId: request_id, target, settled: false }],
+        requests: [...action.requests, {
+            requestId: request_id,
+            target,
+            delta: view_action_delta(rules_or_empty(action.baseline), target),
+            settled: false,
+        }],
     };
 }
 
@@ -305,7 +317,14 @@ export function resend_in_view_action(action: ViewAction, request_id: string): V
         ...action,
         requests: [
             ...action.requests,
-            { requestId: request_id, target: action.requested, settled: false },
+            {
+                requestId: request_id,
+                target: action.requested,
+                delta: action.cancelled
+                    ? view_action_delta(rules_or_empty(action.baseline), action.requested)
+                    : action.delta,
+                settled: false,
+            },
         ],
     };
 }
@@ -342,13 +361,22 @@ export function refuse_in_view_action(
     if (action.cancelled) return marked;
     const newest = action.requests.at(-1)!;
     if (newest.requestId !== request_id && live_before?.requestId !== request_id) return marked;
-    // Falls back to what is still live: the newest request out and not
-    // refused, which may itself be refused later, or else what is installed.
-    const live = live_request(marked)?.target ?? rules_or_empty(installed);
+    // Falls back to what is still live: the choices of the newest request out
+    // and not refused, which may itself be refused later, onto the baseline as
+    // it is now, or else what is installed.
+    const live = live_request(marked);
+    if (live !== undefined) {
+        return {
+            ...marked,
+            requested: apply_view_action_delta(live.delta, action.baseline, action.schema),
+            delta: live.delta,
+        };
+    }
+    const fallback = rules_or_empty(installed);
     return {
         ...marked,
-        requested: live,
-        delta: view_action_delta(rules_or_empty(action.baseline), live),
+        requested: fallback,
+        delta: view_action_delta(rules_or_empty(action.baseline), fallback),
     };
 }
 

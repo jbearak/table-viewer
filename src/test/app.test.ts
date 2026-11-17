@@ -24249,6 +24249,33 @@ describe('view steps in history', () => {
             expect(user.at(-1)!.state).toMatchObject({ filters: [FILTER], hiddenRows: [1] });
         });
 
+        it('keeps another window\'s filter in a hide\'s answer when the sort sent again onto it is refused', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+
+            const sort = await ask(post_message, { sort: SORT_ASC, filters: [] });
+            const question = await hide_rows_unanswered(post_message, [{ start: 1, end: 1 }]);
+            await dispatch_host_message(refresh_snapshot_message(table_meta(), {
+                generation: 1,
+                sourceGeneration: 1,
+                reason: 'other',
+                capabilities: CSV,
+                state: { transforms: [{ sort: [], filters: [FILTER], schema: SCHEMA }] },
+            }));
+            const sent = posted(post_message, 'setTransform');
+            const again = sent.filter((request) => request.intent === 'user').at(-1)!;
+            expect(again.requestId).not.toBe(sort!.requestId);
+            expect(again.state).toMatchObject({ sort: SORT_ASC, filters: [FILTER] });
+            const restore = sent.filter((request) => request.intent === 'restore').at(-1);
+            if (restore !== undefined) await install(restore);
+            // Refused before it took the sheet: the first sort is still out.
+            await refuse(again);
+            await answer_hide(question!, [1]);
+
+            expect(latest_transform_request(post_message).state)
+                .toMatchObject({ sort: SORT_ASC, filters: [FILTER], hiddenRows: [1] });
+        });
+
         it('ends a hide whose composed request the host refuses, with nothing recorded', async () => {
             const { post_message } = await render_app();
             await open(post_message);
