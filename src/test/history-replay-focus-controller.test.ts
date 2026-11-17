@@ -79,16 +79,41 @@ async function hide_display_row(
     panel: ReturnType<typeof open_csv_table>,
     display_row: number,
 ): Promise<void> {
+    // As the window does: ask which source row the display row is, then send
+    // the rules with it hidden.
     const basis = messages_of(panel, 'workbookSnapshot').at(-1)!.snapshot;
+    const installed = messages_of(panel, 'transformInstalled').at(-1);
     const request_id = `hide-${display_row}`;
     await panel.__receive({
-        type: 'hideRows',
+        type: 'resolveHiddenRows',
         sheetIndex: 0,
         displayRows: [{ start: display_row, end: display_row }],
-        requestId: request_id,
-        generation: basis.generation,
+        requestId: `${request_id}-resolve`,
+        mappingGeneration: installed?.mappingGeneration ?? basis.mappingGenerations[0],
         sourceGeneration: basis.sourceGeneration,
-    } satisfies Extract<WebviewMessage, { type: 'hideRows' }>);
+    } satisfies Extract<WebviewMessage, { type: 'resolveHiddenRows' }>);
+    let source_rows: number[] = [];
+    await vi.waitFor(() => {
+        const resolved = messages_of(panel, 'hiddenRowsResolved')
+            .find((message) => message.requestId === `${request_id}-resolve`);
+        expect(resolved && 'sourceRows' in resolved).toBe(true);
+        source_rows = (resolved as { sourceRows: number[] }).sourceRows;
+    });
+    const rules = installed?.rules ?? basis.state.transforms?.[0];
+    await panel.__receive({
+        type: 'setTransform',
+        sheetIndex: 0,
+        requestId: request_id,
+        generation: installed?.view.basis.generation ?? basis.generation,
+        sourceGeneration: basis.sourceGeneration,
+        intent: 'user',
+        state: {
+            sort: rules?.sort ?? [],
+            filters: rules?.filters ?? [],
+            hiddenRows: [...new Set([...(rules?.hiddenRows ?? []), ...source_rows])].sort((a, b) => a - b),
+            schema: rules?.schema ?? '["Sheet1",1,["h"]]',
+        },
+    } satisfies Extract<WebviewMessage, { type: 'setTransform' }>);
     await vi.waitFor(() => expect([
         ...messages_of(panel, 'transformInstalled'),
         ...messages_of(panel, 'transformRefused'),

@@ -399,6 +399,8 @@ export type SheetViewRecord =
 
 /** Allocation/persistence guard shared by webview sanitization and host plans. */
 export const MAX_PERSISTED_HIDDEN_ROWS = 1_000_000;
+/** Said by the host's transform admission and by the window's Hide rows, past that guard. */
+export const TOO_MANY_HIDDEN_ROWS_MESSAGE = 'Too many hidden rows to persist.';
 
 /**
  * Cap on one sheet's durable custom row heights.
@@ -3734,6 +3736,9 @@ export type HostMessage =
      * posted before this answer.
      */
     | { type: 'columnVisibilityChanged'; requestId: string; sheetIndex: number; applied: boolean; sourceGeneration: number }
+    /** The answer to `resolveHiddenRows`: the sorted, distinct source rows, or why not. */
+    | ({ type: 'hiddenRowsResolved'; sheetIndex: number; requestId: string }
+        & ({ sourceRows: number[] } | { refusal: string }))
     /**
      * The host installed a view. This is the *only* answer that describes one, and
      * the only message that can move the view generation, so a consumer that reads
@@ -4037,7 +4042,13 @@ export type WebviewMessage =
      */
     | { type: 'setExcelFirstRowHeader'; sheetIndex: number; sheetName: string; enabled: boolean; unhideAll?: boolean; headerRow?: number; target?: ExcelHeaderTarget; requestId: string; generation: number; sourceGeneration: number }
     | { type: 'setTransform'; sheetIndex: number; state: SheetTransformState; requestId: string; generation: number; sourceGeneration: number; intent: TransformIntent }
-    | { type: 'hideRows'; sheetIndex: number; displayRows: DisplayRowInterval[]; requestId: string; generation: number; sourceGeneration: number }
+    /**
+     * Which source rows these display rows of the sheet are. It computes and
+     * saves nothing: Hide rows composes the answer onto the rules it asks for
+     * (docs/plans/window-queue.md, V2). Quoted against the sheet's mapping
+     * generation, since only a move of this sheet's rows makes it stale.
+     */
+    | { type: 'resolveHiddenRows'; sheetIndex: number; displayRows: DisplayRowInterval[]; requestId: string; mappingGeneration: number; sourceGeneration: number }
     /** Ask the host to authorize replaying one history action. */
     | { type: 'prepareHistoryReplay'; request: PrepareHistoryReplayRequest }
     /** Spend the lease that preparation issued. */

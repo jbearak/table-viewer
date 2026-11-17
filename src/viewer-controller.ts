@@ -144,6 +144,7 @@ import {
 import {
     EMPTY_TRANSFORM,
     MAX_PERSISTED_HIDDEN_ROWS,
+    TOO_MANY_HIDDEN_ROWS_MESSAGE,
     excel_header_target_request_valid,
     MAX_PERSISTED_ROW_HEIGHTS,
     type ColumnWidthChange,
@@ -13539,6 +13540,17 @@ export function attach_viewer(
             await core?.reject_transform(message, UNRESOLVED_STRUCTURAL_SAVE_EDIT_MESSAGE, 'terminal');
             return;
         }
+        // More hidden rows than can be saved is refused, before the sanitizing
+        // below would quietly drop the rest; the window checks the same limit.
+        const asked_hidden = message.state.hiddenRows;
+        if (
+            asked_hidden !== undefined
+            && asked_hidden.length > MAX_PERSISTED_HIDDEN_ROWS
+            && new Set(asked_hidden).size > MAX_PERSISTED_HIDDEN_ROWS
+        ) {
+            await core?.reject_transform(message, TOO_MANY_HIDDEN_ROWS_MESSAGE, 'terminal');
+            return;
+        }
         const transform_sheet = source?.meta().sheets[message.sheetIndex];
         if (transform_sheet) {
             if (
@@ -15042,73 +15054,48 @@ export function attach_viewer(
                 }
                 return;
             }
-            case 'hideRows': {
-                const installed = core?.transform_state(msg.sheetIndex) ?? EMPTY_TRANSFORM;
-                const synthesize = (state: SheetTransformState): Extract<
-                    WebviewMessage,
-                    { type: 'setTransform' }
-                > => ({
-                    type: 'setTransform',
-                    sheetIndex: msg.sheetIndex,
-                    state,
-                    requestId: msg.requestId,
-                    generation: msg.generation,
-                    sourceGeneration: msg.sourceGeneration,
-                    intent: 'user',
-                });
-                // Every refusal below is a validation one — preview mode, a stale
-                // generation, an out-of-range sheet, an unmappable row, too many
-                // hidden rows — so none of them is worth asking again. The admission
-                // matrix's transient refusals are reached through
-                // `handle_transform_message`, not here.
-                const reject = async (error: string) => {
-                    await core?.reject_transform(
-                        synthesize(installed),
-                        error,
-                        'terminal',
-                    );
+            case 'resolveHiddenRows': {
+                // Which source rows the display rows are, and nothing else: no
+                // transform, no admission, no durable write. Hide rows composes
+                // the answer onto the rules it asks for and sends those as its
+                // action's request. A window that gets no answer (no core) ends
+                // the hide after a bound of its own.
+                const receiver_epoch = session.current_receiver_epoch;
+                const answer = (result: { sourceRows: number[] } | { refusal: string }) => {
+                    void post_to_receiver({
+                        type: 'hiddenRowsResolved',
+                        sheetIndex: msg.sheetIndex,
+                        requestId: msg.requestId,
+                        ...result,
+                    }, receiver_epoch);
                 };
                 if (profile.previewMode === true) {
-                    await reject('Row hiding is unavailable in preview mode.');
+                    answer({ refusal: 'Row hiding is unavailable in preview mode.' });
                     return;
                 }
                 if (!core) return;
-                if (msg.generation !== core.generation) {
-                    await reject('The view changed before this table view request arrived.');
-                    return;
-                }
                 if (msg.sourceGeneration !== core.source_generation) {
-                    await reject('The source changed before this table view request arrived.');
+                    answer({ refusal: 'The source changed before this table view request arrived.' });
                     return;
                 }
-                const sheet = source?.meta().sheets[msg.sheetIndex];
-                if (!sheet) {
-                    await reject(`Sheet index ${msg.sheetIndex} is out of range.`);
+                if (!source?.meta().sheets[msg.sheetIndex]) {
+                    answer({ refusal: `Sheet index ${msg.sheetIndex} is out of range.` });
+                    return;
+                }
+                // Only a move of this sheet's rows makes the display rows mean
+                // other source rows; another install on the core does not.
+                if (msg.mappingGeneration !== core.mapping_generation(msg.sheetIndex)) {
+                    answer({ refusal: 'The view changed before this table view request arrived.' });
                     return;
                 }
                 let mapped: Uint32Array;
                 try {
-                    mapped = core.map_display_rows_to_source(
-                        msg.sheetIndex,
-                        msg.displayRows,
-                    );
+                    mapped = core.map_display_rows_to_source(msg.sheetIndex, msg.displayRows);
                 } catch (error) {
-                    await reject(error instanceof Error ? error.message : String(error));
+                    answer({ refusal: error instanceof Error ? error.message : String(error) });
                     return;
                 }
-                const hidden_rows = [...new Set([
-                    ...(installed.hiddenRows ?? []),
-                    ...mapped,
-                ])].sort((a, b) => a - b);
-                if (hidden_rows.length > MAX_PERSISTED_HIDDEN_ROWS) {
-                    await reject('Too many hidden rows to persist.');
-                    return;
-                }
-                await handle_transform_message(synthesize({
-                    ...installed,
-                    hiddenRows: hidden_rows,
-                    schema: transform_schema_for_sheet(sheet),
-                }));
+                answer({ sourceRows: [...new Set(mapped)].sort((a, b) => a - b) });
                 return;
             }
             /**
