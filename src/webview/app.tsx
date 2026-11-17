@@ -4028,8 +4028,13 @@ export function App(): React.JSX.Element {
         if (
             step === undefined
             && !pending.action.cancelled
+            // Moved by a change made elsewhere, by the same strict comparison
+            // that moved it (I3).
             && (pending.refused
-                || !transforms_semantically_equal(settlement.baseline, pending.initialBaseline))
+                || !transform_states_equal(
+                    settlement.baseline ?? EMPTY_TRANSFORM,
+                    pending.initialBaseline ?? EMPTY_TRANSFORM,
+                ))
         ) {
             drop_press_behind_unrecorded_gesture();
         }
@@ -4060,7 +4065,10 @@ export function App(): React.JSX.Element {
         // The compare toggle is session state and never durable: the snapshot's
         // rules carry the action's own.
         const rules = pending.action.baseline?.onlyChangedRows === true
-            ? { ...(durable ?? { sort: [], filters: [] }), onlyChangedRows: true as const }
+            ? {
+                ...(durable ?? { ...EMPTY_TRANSFORM, schema: pending.action.schema }),
+                onlyChangedRows: true as const,
+            }
             : durable;
         const refreshed = refresh_view_action(pending.action, rules, committed_by);
         if (refreshed.action === pending.action) return;

@@ -299,8 +299,9 @@ const NO_RULES: SheetTransformState = { sort: [], filters: [], schema: '' };
  *
  * "Differ" is the host's strict comparison, filter ids included: rules another
  * window wrote that only mean the same as the baseline are still its change,
- * and the step this action records must not include it. Whether to send again
- * is semantic, since the host would compute the same view.
+ * and the step this action records must not include it. So is the decision to
+ * send again: a request still carrying the old ids would install them over
+ * the other window's, and the step would hold a filter change nobody chose.
  */
 function adopt_from_elsewhere(
     action: ViewAction,
@@ -315,7 +316,7 @@ function adopt_from_elsewhere(
     const newest = action.requests.at(-1)!;
     return {
         action: { ...moved, requested },
-        resend: !transforms_semantically_equal(requested, newest.target),
+        resend: !transform_states_equal(requested ?? NO_RULES, newest.target ?? NO_RULES),
     };
 }
 

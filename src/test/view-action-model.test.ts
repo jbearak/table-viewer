@@ -13,6 +13,7 @@ import {
     view_action_in_flight,
     view_action_owns,
 } from '../webview/view-action-model';
+import { transform_view_step } from '../webview/view-history-model';
 
 const schema = '["Sheet1",3,["a","b","c"]]';
 const filter = (id: string, colIndex: number, value: string): FilterEntry => ({
@@ -203,6 +204,23 @@ describe('a view action', () => {
         expect(settle_view_action(action, 'A', foreign, undefined)).toEqual({
             kind: 'ended', baseline: foreign, installed: foreign,
         });
+    });
+
+    it('sends again onto a filter rewritten elsewhere under another id, and records the sort alone', () => {
+        let action = begin_view_action(0, schema, filtered);
+        const sorted = { ...by_a, filters: filtered.filters };
+        action = choose_in_view_action(action, sorted, 'A');
+        const foreign = rules({ filters: [filter('f9', 2, 'x')] });
+        const refreshed = refresh_view_action(action, foreign, undefined);
+        expect(refreshed.resend).toBe(true);
+        expect(refreshed.action.requested).toEqual({ ...by_a, filters: foreign.filters });
+        action = resend_in_view_action(refreshed.action, 'A2');
+        let outcome = settle_view_action(action, 'A', foreign, undefined);
+        if (outcome.kind !== 'pending') throw new Error('unreachable');
+        outcome = settle_view_action(outcome.action, 'A2', refreshed.action.requested, 'A2');
+        if (outcome.kind !== 'ended') throw new Error('unreachable');
+        const sheet = { sheetIndex: 0, sheetName: 'Sheet1' };
+        expect(transform_view_step(sheet, schema, outcome.baseline, outcome.installed)?.label).toBe('Sort');
     });
 
     it('does not move for a refresh showing its own commit', () => {
