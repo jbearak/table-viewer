@@ -23641,6 +23641,89 @@ describe('view steps in history', () => {
             expect(props().transform_pending).toBe(false);
         });
 
+        it('keeps what an older "Only changed rows" installed when the newer one is refused', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await change_view(post_message, { sort: [], filters: [FILTER] });
+
+            const on = await ask(post_message, { sort: [], filters: [FILTER], onlyChangedRows: true });
+            const off = await ask(post_message, { sort: [], filters: [FILTER], onlyChangedRows: false });
+            auto_settle_transforms = false;
+            // The host installed the first before the second took the sheet, and the
+            // second then failed to persist.
+            await install(on!);
+            expect(props().transform_state?.onlyChangedRows).toBe(true);
+            await dispatch_host_message({ type: 'transformSettled', sheetIndex: 0, requestId: on!.requestId, committedBy: on!.requestId });
+            expect(props().transform_pending).toBe(true);
+            await refuse(off!, 'The view could not be saved.', true);
+            await dispatch_host_message({ type: 'transformSettled', sheetIndex: 0, requestId: off!.requestId, committedBy: on!.requestId });
+
+            expect(props().transform_pending).toBe(false);
+            expect(props().transform_state?.onlyChangedRows).toBe(true);
+            expect(undo_labels()).toEqual(['Filter']);
+        });
+
+        it('gives the toolbar focus when Cancel goes at the settlement, after the install', async () => {
+            vi.spyOn(document, 'hasFocus').mockReturnValue(true);
+            const { post_message } = await render_app();
+            await open(post_message);
+
+            const sort = await ask(post_message, { sort: SORT_ASC, filters: [] });
+            const cancel_button = get_button('Cancel');
+            await act(async () => {
+                cancel_button.focus();
+                cancel_button.click();
+            });
+            const cancel = latest_transform_request(post_message);
+            auto_settle_transforms = false;
+            await install(cancel);
+            await flush_focus_restore();
+            // Installed, but the action has not settled: Cancel is still there.
+            expect(document.activeElement).toBe(cancel_button);
+
+            await dispatch_host_message({ type: 'transformSettled', sheetIndex: 0, requestId: sort!.requestId });
+            await dispatch_host_message({ type: 'transformSettled', sheetIndex: 0, requestId: cancel.requestId, committedBy: cancel.requestId });
+            await flush_focus_restore();
+
+            expect(Array.from(document.querySelectorAll('button')).some((button) => button.textContent === 'Cancel')).toBe(false);
+            expect(document.activeElement).toBe(document.querySelector('.toolbar'));
+        });
+
+        it('takes "Only changed rows" alone back on Cancel', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await change_view(post_message, { sort: [], filters: [FILTER] });
+
+            await ask(post_message, { sort: [], filters: [FILTER], onlyChangedRows: true });
+            await click_button('Cancel');
+            const cancel = latest_transform_request(post_message);
+            expect(cancel.intent).toBe('cancel');
+            expect(cancel.state.onlyChangedRows ?? false).toBe(false);
+            expect(cancel.state.filters).toEqual([FILTER]);
+            await install(cancel);
+
+            expect(props().transform_pending).toBe(false);
+            expect(undo_labels()).toEqual(['Filter']);
+        });
+
+        it('drops an Undo waiting behind "Only changed rows", silently, when it is toggled again', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await change_view(post_message, { sort: [], filters: [FILTER] });
+
+            await ask(post_message, { sort: [], filters: [FILTER], onlyChangedRows: true });
+            await undo();
+            expect(press_held()).toBe(true);
+            const off = await ask(post_message, { sort: [], filters: [FILTER], onlyChangedRows: false });
+            expect(off).toBeDefined();
+            expect(press_held()).toBe(false);
+            await install(off!);
+
+            expect(latest_transform_request(post_message).requestId).toBe(off!.requestId);
+            expect(undo_labels()).toEqual(['Filter']);
+            expect(warnings(post_message)).toEqual([]);
+        });
+
         it('records "Only changed rows" chosen during a sort with the sort, as the sort\'s step alone', async () => {
             const { post_message } = await render_app();
             await open(post_message);

@@ -248,18 +248,27 @@ export function choose_in_view_action(
  * What a cancel asks for: the baseline, keeping the compare toggle as asked
  * (I4). It is not a choice and records nothing.
  */
-export function view_action_cancel_target(action: ViewAction): SheetTransformState {
+export function view_action_cancel_target(
+    action: ViewAction,
+    keep_toggle = true,
+): SheetTransformState {
     const baseline = rules_or_empty(action.baseline);
-    const { onlyChangedRows: _baseline_toggle, ...rest } = baseline;
+    const { onlyChangedRows: baseline_toggle, ...rest } = baseline;
+    const toggle = keep_toggle ? action.requested.onlyChangedRows : baseline_toggle;
     return {
         ...rest,
         ...(action.schema === undefined ? {} : { schema: action.schema }),
-        ...(action.requested.onlyChangedRows === true ? { onlyChangedRows: true as const } : {}),
+        ...(toggle === true ? { onlyChangedRows: true as const } : {}),
     };
 }
 
-export function cancel_view_action(action: ViewAction, request_id: string): ViewAction {
-    const target = view_action_cancel_target(action);
+/**
+ * Cancel the action: ask for its baseline. The compare toggle asked for is kept
+ * (I4), unless `keep_toggle` is false: an action that changes nothing but the
+ * toggle has only the toggle to cancel.
+ */
+export function cancel_view_action(action: ViewAction, request_id: string, keep_toggle = true): ViewAction {
+    const target = view_action_cancel_target(action, keep_toggle);
     return {
         ...action,
         requested: target,

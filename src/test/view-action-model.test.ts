@@ -132,6 +132,13 @@ describe('a view action', () => {
         expect(action.requested).toEqual({ ...by_a, onlyChangedRows: true });
     });
 
+    it('takes the compare toggle back when it cancels an action that changed nothing else', () => {
+        let action = begin_view_action(0, schema, by_a);
+        action = choose_in_view_action(action, { ...by_a, onlyChangedRows: true }, 'T');
+        action = cancel_view_action(action, 'C', false);
+        expect(action.requested).toEqual(by_a);
+    });
+
     it('composes again onto rules another window installed, and sends again', () => {
         let action = begin_view_action(0, schema, undefined);
         action = choose_in_view_action(action, by_a, 'A');

@@ -3277,21 +3277,14 @@ export function App(): React.JSX.Element {
      */
     const view_action_ref = useRef<PendingViewAction | undefined>(undefined);
     /**
-     * Per sheet, the request a change of "Only changed rows" alone sent with no
-     * action pending. It is the person's own choice, though no action (I1), so
-     * a new choice replaces it as it would the action's request.
-     */
-    const toggle_request_ids_ref = useRef<(string | undefined)[]>([]);
-    /**
      * Whether a sort or filter choice on a sheet waits: a request is pending
-     * there that is not the person's own, that is a hide, a replay, or a
-     * restore. The person's own request, the action's or a toggle's, does not
-     * hold a choice, because a new choice replaces it.
+     * there that is not the person's own view action's, that is a hide, a
+     * replay, or a restore. The action's own request does not hold a choice,
+     * because a new choice replaces it.
      */
     const view_choice_waits = (sheet_index: number): boolean => {
         const request_id = pending_transform_request_ids_ref.current[sheet_index];
         if (request_id === undefined) return false;
-        if (toggle_request_ids_ref.current[sheet_index] === request_id) return false;
         const pending = view_action_ref.current;
         return pending === undefined
             || pending.action.sheetIndex !== sheet_index
@@ -4016,6 +4009,15 @@ export function App(): React.JSX.Element {
         }
         view_action_ref.current = undefined;
         perf_mark('tv:view-action-ended', { requestId: msg.requestId });
+        // The progress text and Cancel go only now, after the install: a toolbar
+        // control that started the action, Cancel above all, may be what goes, so
+        // the toolbar takes focus back as it does on an install.
+        if (pending.origin === 'toolbar') {
+            set_toolbar_focus_restore({
+                sheet_index: pending.action.sheetIndex,
+                document_epoch: document_epoch_ref.current,
+            });
+        }
         const step = transform_view_step(
             pending.worksheet,
             pending.schema,
@@ -10619,7 +10621,9 @@ export function App(): React.JSX.Element {
             // as Cancel does: the press was made for a stack the choice changes
             // (I5). It is dropped before the checks below, which a waiting press
             // would otherwise refuse the choice for, and put back if the choice
-            // is refused anyway: a choice that never happened drops nothing.
+            // is refused anyway: a choice that never happened drops nothing. A
+            // change of "Only changed rows" drops it too: kept, the press would
+            // refuse the change.
             let keep_dropped_press = () => {};
             if (
                 view_action_ref.current?.action.sheetIndex === active_sheet_index
@@ -10669,32 +10673,11 @@ export function App(): React.JSX.Element {
             const pending_action = view_action_ref.current?.action.sheetIndex === active_sheet_index
                 ? view_action_ref.current
                 : undefined;
-            // "Only changed rows" on its own is no choice (I1): it makes no action,
-            // has no label, and is not undone. It is sent as before; with an action
-            // pending, it rides along in that action's request.
-            if (
-                pending_action === undefined
-                && transform_view_step(
-                    worksheet,
-                    schema,
-                    state_ref.current.transforms?.[active_sheet_index],
-                    sanitized,
-                ) === undefined
-            ) {
-                toggle_request_ids_ref.current[active_sheet_index] = request_transform(
-                    active_sheet_index,
-                    sanitized,
-                    'user',
-                    origin,
-                    {
-                        worksheet,
-                        schema,
-                        baseline: state_ref.current.transforms?.[active_sheet_index],
-                        target: sanitized,
-                    },
-                );
-                return true;
-            }
+            // "Only changed rows" on its own is no choice (I1): it has no step, so
+            // it records nothing, names nothing on the Edit menu, and Undo does not
+            // cancel it. It is still carried by an action, which keeps each request
+            // it sends until the host settles it, so a newer toggle that replaces
+            // an older one cannot lose what the older one installed.
             const action = pending_action?.action ?? begin_view_action(
                 active_sheet_index,
                 schema,
@@ -11222,15 +11205,23 @@ export function App(): React.JSX.Element {
         // A cancel already out is not sent twice; one the host refused is sent again.
         if (pending.action.cancelled && !pending.refused) return true;
         drop_history_presses({ keep_typing: true });
+        // An action with no step has changed nothing but the compare toggle, so
+        // that is what its cancel takes back (I4 keeps the toggle otherwise).
+        const keep_toggle = transform_view_step(
+            pending.worksheet,
+            pending.schema,
+            pending.action.baseline,
+            pending.action.requested,
+        ) !== undefined;
         const request_id = request_transform(
             sheet_index,
-            view_action_cancel_target(pending.action),
+            view_action_cancel_target(pending.action, keep_toggle),
             'cancel',
             origin,
         );
         view_action_ref.current = {
             ...pending,
-            action: cancel_view_action(pending.action, request_id),
+            action: cancel_view_action(pending.action, request_id, keep_toggle),
             refused: false,
             origin,
         };
